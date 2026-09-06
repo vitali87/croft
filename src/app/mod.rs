@@ -24414,6 +24414,62 @@ impl App {
         self.status = format!("Diff: ignore whitespace {}", mode.label());
     }
 
+    /// Turn the group-by-seat lens on or off for the diff in view (#349),
+    /// so a change can be read as "the agent's part" and "my part".
+    ///
+    /// Offered only on the Source Control HEAD-vs-working view, the one diff
+    /// whose right side IS the working tree: there the row's `right` index
+    /// is a real file line and the seat map is keyed on the same index. A
+    /// diff parsed out of raw `git diff` text numbers its rows by position
+    /// in that text, so the same join would paint confident wrong seats.
+    pub fn diff_toggle_group_by_seat(&mut self) {
+        let history_root = self.history_root.clone();
+        let Some(diff) = self.editor.diff.as_mut() else {
+            self.status = String::from("Group by seat applies to a diff view");
+            return;
+        };
+        if !diff.left_is_git_head {
+            self.status =
+                String::from("Group by seat applies to a Source Control diff of the working tree");
+            return;
+        }
+        diff.group_by_seat = !diff.group_by_seat;
+        if !diff.group_by_seat {
+            self.status = String::from("Diff: group by seat off");
+            return;
+        }
+        // Read the map fresh each time the lens comes on: the working file
+        // may have been saved since the view was built, and a map from
+        // before that describes text this diff no longer shows.
+        diff.seats = crate::provenance::Provenance::new();
+        let path = diff.right_path.clone();
+        let seats = Self::seats_for_working_file(&history_root, &path);
+        let Some(diff) = self.editor.diff.as_mut() else {
+            return;
+        };
+        if let Some(seats) = seats {
+            diff.seats = seats;
+        }
+        self.status = format!("Diff: group by seat \u{2022} {}", diff.seat_summary());
+    }
+
+    /// The persisted provenance map for a working-tree file, but only when
+    /// the newest snapshot still holds exactly the bytes on disk (#349) -
+    /// the same rule `sync_provenance_for` applies before putting a map on a
+    /// buffer. A file saved since its last snapshot reads as no map at all,
+    /// never as a map of the text it used to hold.
+    fn seats_for_working_file(
+        history_root: &Path,
+        path: &Path,
+    ) -> Option<crate::provenance::Provenance> {
+        let newest = crate::history::entries_in(history_root, path)
+            .into_iter()
+            .next()?;
+        let seats = crate::history::seats_for(history_root, path, newest.millis)?;
+        let (on_disk, snapshot) = (std::fs::read(path).ok()?, std::fs::read(&newest.file).ok()?);
+        (on_disk == snapshot).then_some(seats)
+    }
+
     /// Stage only the hunk under the diff caret (`git apply --cached`).
     pub fn stage_hunk_at_caret(&mut self) {
         // A selection spanning changed rows narrows the action to those
@@ -33300,6 +33356,7 @@ impl App {
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
             Cmd::ToggleProvenance => self.toggle_provenance(),
+            Cmd::DiffToggleGroupBySeat => self.diff_toggle_group_by_seat(),
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
             Cmd::ToggleRenderWhitespace => self.toggle_render_whitespace(),

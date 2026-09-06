@@ -183,6 +183,15 @@ pub struct DiffData {
     /// How to rebuild this view when a side changes (#471). `Static` for
     /// builders that have nothing to re-read; the openers overwrite it.
     pub source: DiffSource,
+    /// Who typed each line of the RIGHT side (#349), for the group-by-seat
+    /// lens: the working tree's provenance map, keyed on the same 0-based
+    /// line index `DiffRow`'s `right` carries. Empty for every diff whose
+    /// right side is not the working tree, and empty when nothing is
+    /// recorded - an added line with no seat reads as unrecorded, never as
+    /// anyone's.
+    pub seats: crate::provenance::Provenance,
+    /// Whether the group-by-seat lens is on for this view.
+    pub group_by_seat: bool,
     /// `(mtime, len)` of each side's file when the view was last built, so
     /// the per-tick refresh can tell "moved on disk" from a stat instead of
     /// re-reading and re-diffing the file. `None` for a side that is not a
@@ -322,6 +331,8 @@ impl DiffData {
         let (right_crlf, right_no_final_nl) = side_meta(right_raw, right_lines.len());
         Self {
             source: DiffSource::Static,
+            seats: crate::provenance::Provenance::new(),
+            group_by_seat: false,
             left_stamp: None,
             right_stamp: None,
             left_path,
@@ -358,6 +369,8 @@ impl DiffData {
             .collect();
         Self {
             source: DiffSource::Static,
+            seats: crate::provenance::Provenance::new(),
+            group_by_seat: false,
             left_stamp: None,
             right_stamp: None,
             left_path: label,
@@ -413,6 +426,8 @@ impl DiffData {
             rows.push(DiffRow::Equal { left: 0, right: 0 });
             return Self {
                 source: DiffSource::Static,
+                seats: crate::provenance::Provenance::new(),
+                group_by_seat: false,
                 left_stamp: None,
                 right_stamp: None,
                 left_path: label,
@@ -502,6 +517,8 @@ impl DiffData {
         flush(&mut pending_remove, &mut pending_add, &mut rows);
         Self {
             source: DiffSource::Static,
+            seats: crate::provenance::Provenance::new(),
+            group_by_seat: false,
             left_stamp: None,
             right_stamp: None,
             left_path: label,
@@ -1182,6 +1199,50 @@ impl DiffData {
             Self::normalised_rows(&self.rows, &self.left_lines, &self.right_lines, mode);
     }
 
+    /// Who typed each ADDED line of this diff, newest-seat-first counts
+    /// (#349): the summary the group-by-seat lens puts in the header, and
+    /// the answer to "which part of this change is the agent's". Only rows
+    /// the diff calls added or replaced count, since an unchanged line's
+    /// seat describes work this change did not do. Lines with no record
+    /// are counted under `None`.
+    pub fn added_lines_by_seat(&self) -> Vec<(Option<crate::provenance::Seat>, usize)> {
+        // The REAL rows, like staging: the whitespace lens reclassifies a
+        // changed line as Equal, and a line this change wrote should not
+        // drop out of the tally because of how the view is currently read.
+        let mut counts: std::collections::BTreeMap<Option<crate::provenance::Seat>, usize> =
+            std::collections::BTreeMap::new();
+        for row in &self.rows {
+            let right = match row {
+                DiffRow::Added { right } | DiffRow::Replaced { right, .. } => *right,
+                // An unchanged or removed line's seat describes work this
+                // change did not do; a removed line has no right side at all.
+                DiffRow::Equal { .. } | DiffRow::Removed { .. } => continue,
+            };
+            *counts.entry(self.seats.seat(right).cloned()).or_default() += 1;
+        }
+        // Named seats first, in the enum's own order, and the unrecorded
+        // bucket last: it is the one entry that is not a claim about anyone.
+        let mut out: Vec<_> = counts.into_iter().collect();
+        out.sort_by(|a, b| a.0.is_none().cmp(&b.0.is_none()).then(a.0.cmp(&b.0)));
+        out
+    }
+
+    /// The group-by-seat lens's header text (#349): who wrote the lines
+    /// this change adds, as `you 3 \u{2022} agent (pane 2) 1`, with anything
+    /// unattributed named `unrecorded` rather than left out.
+    pub fn seat_summary(&self) -> String {
+        self.added_lines_by_seat()
+            .into_iter()
+            .map(|(seat, n)| match seat {
+                Some(s) => format!("{} {n}", s.label()),
+                // Named, not omitted: a change croft did not watch being
+                // written must read as unrecorded rather than as nothing.
+                None => format!("unrecorded {n}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" \u{2022} ")
+    }
+
     /// Reclassify each real row under `mode`. A `Replaced` row whose two
     /// lines share a normalised key becomes `Equal`; everything else is
     /// carried through untouched, so `Added`/`Removed` rows (a line with no
@@ -1627,6 +1688,126 @@ pub fn build_diff_rows(left: &[String], right: &[String]) -> Vec<DiffRow> {
         }
     }
     rows
+}
+
+#[cfg(test)]
+mod seat_group_tests {
+    use super::*;
+    use crate::provenance::Seat;
+
+    /// The lens paints each added line in its seat's hue, and paints
+    /// nothing on a line with no record (#349): the module invariant is that
+    /// an unwatched line is never credited, and a bar IS a credit.
+    #[test]
+    fn the_lens_paints_a_seat_bar_on_added_lines_only() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget as _;
+        let mut e = crate::widgets::editor::Editor::new();
+        let mut d = head_diff(&["kept"], &["kept", "mine", "nobody's"]);
+        d.seats.record(1..2, Seat::Me);
+        e.diff = Some(d);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let bar = |b: &Buffer| {
+            (0..area.height)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| b[(x, y)].symbol() == "\u{258e}")
+                .count()
+        };
+        assert_eq!(bar(&buf), 0, "off, the lens paints nothing");
+        e.diff.as_mut().unwrap().group_by_seat = true;
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        assert_eq!(
+            bar(&buf),
+            1,
+            "exactly the one added line with a seat wears a bar"
+        );
+    }
+
+    /// The header says which part of the change is whose (#349): a lens that
+    /// paints seats must name them, or a reader has colours and no key.
+    #[test]
+    fn the_seat_summary_reads_as_counts_per_seat() {
+        let mut d = head_diff(&["one"], &["one", "mine", "theirs", "nobody's"]);
+        d.seats.record(1..2, Seat::Me);
+        d.seats.record(2..3, Seat::Agent(String::from("pane 2")));
+        assert_eq!(
+            d.seat_summary(),
+            "you 1 \u{2022} agent (pane 2) 1 \u{2022} unrecorded 1"
+        );
+    }
+
+    /// A change nobody was watched making says so plainly rather than
+    /// naming a seat or reading as an empty summary.
+    #[test]
+    fn the_seat_summary_of_an_unrecorded_change_says_unrecorded() {
+        let d = head_diff(&["one"], &["one", "two"]);
+        assert_eq!(d.seat_summary(), "unrecorded 1");
+    }
+
+    fn head_diff(left: &[&str], right: &[&str]) -> DiffData {
+        let mut d = DiffData::build(
+            std::path::PathBuf::from("f.txt (HEAD)"),
+            std::path::PathBuf::from("f.txt"),
+            left.iter().map(|s| (*s).to_string()).collect(),
+            right.iter().map(|s| (*s).to_string()).collect(),
+        );
+        d.left_is_git_head = true;
+        d
+    }
+
+    /// The lens answers "which part of this change is whose" (#349, the
+    /// issue's slice four): only the lines this change ADDED count, tallied
+    /// per seat, with unrecorded lines their own bucket rather than folded
+    /// into anyone's total.
+    #[test]
+    fn added_lines_are_tallied_by_seat() {
+        let mut d = head_diff(&["one"], &["one", "mine", "theirs", "nobody's"]);
+        // Line 0 is unchanged: its seat describes work this change did not do.
+        d.seats.record(0..1, Seat::Navigator);
+        d.seats.record(1..2, Seat::Me);
+        d.seats.record(2..3, Seat::Agent(String::from("pane 2")));
+        let tally = d.added_lines_by_seat();
+        assert_eq!(
+            tally,
+            vec![
+                (Some(Seat::Me), 1),
+                (Some(Seat::Agent(String::from("pane 2"))), 1),
+                (None, 1),
+            ],
+            "each added line counts once, under its own seat: {tally:?}"
+        );
+    }
+
+    /// An added line nobody was watched typing is never credited (the
+    /// module invariant), and a diff with no map at all is all-unrecorded
+    /// rather than empty.
+    #[test]
+    fn added_lines_with_no_record_are_their_own_bucket() {
+        let d = head_diff(&["one"], &["one", "two", "three"]);
+        assert_eq!(
+            d.added_lines_by_seat(),
+            vec![(None, 2)],
+            "no map means every added line is unrecorded, not absent"
+        );
+    }
+
+    /// A replaced line is an added line for this purpose: the right side
+    /// carries new text, and that text has an author.
+    #[test]
+    fn a_replaced_line_counts_as_added_for_its_seat() {
+        let mut d = head_diff(&["one", "two"], &["one", "rewritten"]);
+        d.seats.record(1..2, Seat::Me);
+        assert_eq!(d.added_lines_by_seat(), vec![(Some(Seat::Me), 1)]);
+    }
 }
 
 #[cfg(test)]
