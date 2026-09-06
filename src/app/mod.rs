@@ -39611,13 +39611,13 @@ impl App {
         }
         // Not eligible yet is not the same as considered: a dirty buffer, one
         // that already knows its seats, or a viewer tab (the file shown
-        // through its own path, `lines` a placeholder no map should credit)
+        // through its own path, `lines` a placeholder no map should credit;
+        // a markdown preview is NOT one, its `lines` are the file's own text)
         // leaves the marker unset, so a later tick, after a save or a swap
         // back to text, reconsiders instead of staying burnt for the session.
         if self.editor.dirty
             || self.editor.provenance.attributed() > 0
             || self.editor.has_non_text_view()
-            || self.editor.markdown_preview.is_some()
         {
             return;
         }
@@ -39673,8 +39673,10 @@ impl App {
         }
         // A viewer tab (hex, sheet, ...) saves bytes no line map describes:
         // the openers clear the map, and this refuses to read one regardless.
+        // The predicate is the save path's own: a tab it lets through writes
+        // `lines`, and the map describes `lines` (a markdown preview included).
         fn map_of(ed: &crate::widgets::editor::Editor) -> crate::provenance::Provenance {
-            if ed.has_non_text_view() || ed.markdown_preview.is_some() {
+            if ed.has_non_text_view() {
                 return crate::provenance::Provenance::new();
             }
             ed.provenance.clone()

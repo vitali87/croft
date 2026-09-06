@@ -12716,6 +12716,43 @@ fn a_viewer_swap_drops_the_map_and_the_text_reopen_gets_it_back() {
     );
 }
 
+/// A markdown preview is not a viewer (#349 review): `lines` still holds the
+/// file's own text and the tab is saveable, so a save taken while the
+/// preview is up records the map rather than dropping it (and, inside the
+/// merge window, deleting the previous snapshot's sidecar with nothing to
+/// replace it).
+#[test]
+fn a_markdown_preview_save_keeps_the_map() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.md");
+    std::fs::write(&f, "# one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.provenance.record(0..1, Seat::Navigator);
+    assert!(
+        app.editor.toggle_markdown_preview(),
+        "staging: the preview is up"
+    );
+    assert!(
+        !app.editor.has_non_text_view(),
+        "staging: a markdown preview tab is still saveable text"
+    );
+    assert_eq!(
+        app.provenance_of_tab(&f).seat(0),
+        Some(&Seat::Navigator),
+        "the buffer's own text is in `lines`; its map still describes it"
+    );
+    app.editor.dirty = true;
+    app.save();
+    let snaps = wait_for_snapshots(&app.history_root, &f);
+    assert_eq!(snaps.len(), 1, "staging: the save recorded a snapshot");
+    wait_for_seats(&app.history_root, &f, snaps[0].millis);
+}
+
 /// A restore of a snapshot with no sidecar restores every line unknown
 /// (#349 review): the buffer's previous map described the text the restore
 /// replaced, and keeping it would credit lines nobody observed.
