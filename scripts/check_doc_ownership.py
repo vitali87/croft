@@ -438,9 +438,10 @@ def explained_orphans(head_text, candidates, lost, explained):
     silence a stranded copy that never documented it. Taking the nearest
     block regardless of text, rather than the nearest MATCHING one, is what
     stops a loss whose own prose the branch also rewrote from reaching past
-    that rewritten block to an identical one further up. Each lost
-    definition explains at most one block, and a block with no victim below
-    it is reported as usual.
+    that rewritten block to an identical one further up, and when two blocks
+    above the victim carry that text the pairing is ambiguous and stands
+    nothing down. Each lost definition explains at most one block, and a
+    block with no victim below it is reported as usual.
     """
     remaining = list(explained)
     stood_down = set()
@@ -450,9 +451,17 @@ def explained_orphans(head_text, candidates, lost, explained):
         if not above:
             continue
         nearest = max(above, key=lambda o: o[0])
-        if nearest[3] in remaining:
-            stood_down.add(nearest[0])
-            remaining.remove(nearest[3])
+        if nearest[3] not in remaining:
+            continue
+        # Two blocks with the victim's prose above it: nothing says which one
+        # it lost, and the nearer may be an independent capture that reads
+        # the same. Standing it down would hide that defect and leave the
+        # report pointing at the other block, so an ambiguous pairing stands
+        # nothing down and every block prints.
+        if sum(1 for o in above if o[3] == nearest[3]) > 1:
+            continue
+        stood_down.add(nearest[0])
+        remaining.remove(nearest[3])
     return stood_down
 
 

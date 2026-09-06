@@ -782,6 +782,39 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             self.assertIn("line=2::", text, f"the block at end of file is reported: {text}")
             self.assertEqual(text.count("::error"), 2, f"loss and stranded block both print: {text}")
 
+    def test_two_identical_blocks_above_one_victim_are_both_reported(self):
+        """When two stranded blocks with the victim's prose both sit above it,
+        nothing says which one it lost: the nearer may be an independent
+        capture that happens to read the same. Standing the nearer one down
+        hides that defect and leaves the report pointing at the other block,
+        so an ambiguous pairing stands nothing down and all three print."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "impl A {\n    /// Creates a new instance.\n    pub fn new() {}\n}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "impl A {\n    /// Creates a new instance.\n\n    /// Helper.\n"
+                "    pub fn helper() {}\n\n    /// Creates a new instance.\n\n    /// Other.\n"
+                "    pub fn other() {}\n\n    pub fn new() {}\n}\n",
+            )
+            out = io.StringIO()
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            text = out.getvalue()
+            self.assertIn("`A::new` had a doc comment", text)
+            self.assertIn("line=2::", text, f"the farther copy is reported: {text}")
+            self.assertIn("line=7::", text, f"and so is the nearer one: {text}")
+            self.assertEqual(text.count("::error"), 3, f"an ambiguous pairing stands nothing down: {text}")
+
     def test_ordinary_docs_are_not_reported(self):
         """The control. A gate that cries wolf stops being read, so the
         shapes a real file is full of must stay silent: attributes and
