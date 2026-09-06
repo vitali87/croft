@@ -401,6 +401,16 @@ impl EditorLayout {
     pub fn prune_blank_inactive(&mut self, is_blank: impl Fn(&EditorTabs) -> bool) {
         prune_blank_rec(&mut self.root, &is_blank);
     }
+
+    /// Drop the inactive groups at the given positions in
+    /// [`inactive_groups`](Self::inactive_groups) order, collapsing any split
+    /// left with a single child. For a caller that emptied specific groups
+    /// and must not sweep up a blank group it did not touch; the active
+    /// (hoisted) leaf is never touched.
+    pub fn prune_inactive_at(&mut self, doomed: &[usize]) {
+        let mut next = 0;
+        prune_at_rec(&mut self.root, doomed, &mut next);
+    }
 }
 
 /// Cells of vertical overlap between two rects (0 when they don't share rows).
@@ -423,6 +433,37 @@ fn prune_blank_rec<F: Fn(&EditorTabs) -> bool>(node: &mut LayoutNode, is_blank: 
             prune_blank_rec(&mut c.node, is_blank);
         }
         children.retain(|c| !matches!(&c.node, LayoutNode::Leaf(Some(t)) if is_blank(t)));
+        if children.len() == 1 {
+            let only = children.remove(0);
+            *node = only.node;
+        }
+    }
+}
+
+/// Inactive leaves are numbered in the order `collect_inactive` visits them:
+/// children in order, depth first, so `next` advances exactly as that walk
+/// would and a position from `inactive_groups()` names the same leaf here.
+fn prune_at_rec(node: &mut LayoutNode, doomed: &[usize], next: &mut usize) {
+    if let LayoutNode::Split { children, .. } = node {
+        let mut kept = Vec::with_capacity(children.len());
+        for mut child in children.drain(..) {
+            let drop = match &mut child.node {
+                LayoutNode::Leaf(Some(_)) => {
+                    let here = *next;
+                    *next += 1;
+                    doomed.contains(&here)
+                }
+                LayoutNode::Leaf(None) => false,
+                inner @ LayoutNode::Split { .. } => {
+                    prune_at_rec(inner, doomed, next);
+                    false
+                }
+            };
+            if !drop {
+                kept.push(child);
+            }
+        }
+        *children = kept;
         if children.len() == 1 {
             let only = children.remove(0);
             *node = only.node;
@@ -1149,6 +1190,35 @@ mod tests {
         assert_eq!(Dir::Up.split_dir(), SplitDir::Vertical);
         assert!(Dir::Right.places_new_after() && Dir::Down.places_new_after());
         assert!(!Dir::Left.places_new_after() && !Dir::Up.places_new_after());
+    }
+
+    /// `prune_inactive_at` drops the named inactive groups and no other: with
+    /// two inactive leaves, dooming the first leaves the second in place.
+    #[test]
+    fn prune_inactive_at_drops_only_the_named_groups() {
+        let mut layout = EditorLayout::single();
+        layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true);
+        layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true);
+        assert_eq!(
+            layout.inactive_groups().len(),
+            2,
+            "fixture: two inactive leaves"
+        );
+        layout.prune_inactive_at(&[0]);
+        assert_eq!(layout.inactive_groups().len(), 1, "one named group is gone");
+        assert!(layout.is_split(), "the other keeps its split");
+        layout.prune_inactive_at(&[5]);
+        assert_eq!(
+            layout.inactive_groups().len(),
+            1,
+            "a position past the end drops nothing"
+        );
+        layout.prune_inactive_at(&[0]);
+        assert!(
+            !layout.is_split(),
+            "the last inactive group gone collapses the split"
+        );
+        assert_eq!(layout.active_dfs_index(), 0);
     }
 
     #[test]

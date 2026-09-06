@@ -1389,6 +1389,82 @@ impl PtyTerminal {
         (lines, top)
     }
 
+    /// Every readable grid row as `(plain, coloured)`: the plain text
+    /// exactly as [`Self::grid_lines`] gives it, and the same row with the
+    /// cells' colours and attributes written back as SGR, so the text can be
+    /// re-rendered elsewhere with the colours the pane showed (#257: "open
+    /// scrollback in an editor tab" through the rendered log view). Both
+    /// forms come from ONE pass under ONE term lock, so a caller that masks
+    /// the plain row and writes the coloured one can never pair a row with
+    /// its neighbour after output landed between two reads. Wide-char
+    /// spacers are skipped as in `grid_lines`; trailing default-styled
+    /// blanks are trimmed (a row padded with a coloured background keeps
+    /// those cells, which the plain twin drops, so the two forms can differ
+    /// in length there); every row that set a style ends with a reset.
+    pub fn grid_lines_ansi(&self) -> Vec<(String, String)> {
+        let term = self.term.lock();
+        if term.columns() == 0 {
+            return Vec::new();
+        }
+        let top = term.grid().topmost_line().0;
+        let bottom = term.screen_lines() as i32 - 1;
+        let ncols = term.columns();
+        let mut lines = Vec::new();
+        let mut l = top;
+        while l <= bottom {
+            // Cells are collected as (char, style key) - three Copy values,
+            // no allocation per cell - so trailing default-styled blanks can
+            // be trimmed before anything is serialised, and the SGR string
+            // is built once per run of equal style rather than once per
+            // cell. This runs under the term lock the reader thread shares,
+            // and a saturated scrollback is hundreds of thousands of rows.
+            let mut cells: Vec<(char, (AnsiColor, AnsiColor, Flags))> = Vec::with_capacity(ncols);
+            for c in 0..ncols {
+                let cell = &term.grid()[Point::new(Line(l), Column(c))];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                cells.push((ch, (cell.fg, cell.bg, cell.flags)));
+            }
+            let plain: String = cells
+                .iter()
+                .map(|(ch, _)| *ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            while cells.last().is_some_and(|(ch, (fg, bg, flags))| {
+                *ch == ' ' && style_is_default(*fg, *bg, *flags)
+            }) {
+                cells.pop();
+            }
+            let mut out = String::new();
+            let mut current: Option<(AnsiColor, AnsiColor, Flags)> = None;
+            let mut styled = false;
+            for (ch, key) in cells {
+                if current != Some(key) {
+                    if styled {
+                        out.push_str("\x1b[0m");
+                    }
+                    let sgr = cell_sgr(key.0, key.1, key.2);
+                    styled = !sgr.is_empty();
+                    out.push_str(&sgr);
+                    current = Some(key);
+                }
+                out.push(ch);
+            }
+            if styled {
+                out.push_str("\x1b[0m");
+            }
+            lines.push((plain, out));
+            l += 1;
+        }
+        lines
+    }
+
     /// [`Self::grid_lines`] plus the scroll-clock reading, captured under
     /// ONE term lock. Terminal find stamps its match anchor with the clock;
     /// separate reads would let output land between them and mis-pair a
@@ -4221,6 +4297,119 @@ pub fn osc52_copy_seq(text: &str) -> Vec<u8> {
     out.extend_from_slice(encoded.as_bytes());
     out.push(0x07);
     out
+}
+
+/// The SGR sequence that reproduces a cell's colours and attributes, or an
+/// empty string for a default cell (#257). Named and low-indexed colours go
+/// out as the 16 standard codes so the reader resolves them through ITS
+/// theme palette, the way the pane does; the 256-cube and truecolour pass
+/// through as `38;5;n` / `38;2;r;g;b`.
+fn cell_sgr(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> String {
+    let mut codes: Vec<String> = Vec::new();
+    if flags.contains(Flags::BOLD) {
+        codes.push("1".into());
+    }
+    if flags.contains(Flags::DIM) {
+        codes.push("2".into());
+    }
+    if flags.contains(Flags::ITALIC) {
+        codes.push("3".into());
+    }
+    if flags.intersects(
+        Flags::UNDERLINE
+            | Flags::DOUBLE_UNDERLINE
+            | Flags::UNDERCURL
+            | Flags::DOTTED_UNDERLINE
+            | Flags::DASHED_UNDERLINE,
+    ) {
+        codes.push("4".into());
+    }
+    if flags.contains(Flags::INVERSE) {
+        codes.push("7".into());
+    }
+    if flags.contains(Flags::STRIKEOUT) {
+        codes.push("9".into());
+    }
+    if let Some(code) = color_sgr(fg, false) {
+        codes.push(code);
+    }
+    if let Some(code) = color_sgr(bg, true) {
+        codes.push(code);
+    }
+    if codes.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", codes.join(";"))
+    }
+}
+
+/// Whether a cell carries no colour and no attribute the export would
+/// write: the cheap test the trailing-blank trim uses, with no SGR string
+/// built to find out.
+fn style_is_default(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> bool {
+    let plain = |c: AnsiColor| matches!(c, AnsiColor::Named(n) if named_slot(n).is_none());
+    plain(fg)
+        && plain(bg)
+        && !flags.intersects(
+            Flags::BOLD
+                | Flags::DIM
+                | Flags::ITALIC
+                | Flags::UNDERLINE
+                | Flags::DOUBLE_UNDERLINE
+                | Flags::UNDERCURL
+                | Flags::DOTTED_UNDERLINE
+                | Flags::DASHED_UNDERLINE
+                | Flags::INVERSE
+                | Flags::STRIKEOUT,
+        )
+}
+
+/// One colour as its SGR parameter(s): `30..37`/`90..97` (or the `40..`
+/// / `100..` background forms) for the 16 slots, `38;5;n` beyond them,
+/// `38;2;r;g;b` for truecolour, `None` for the default colour.
+fn color_sgr(c: AnsiColor, background: bool) -> Option<String> {
+    let base = if background { 40 } else { 30 };
+    let bright = if background { 100 } else { 90 };
+    let extended = if background { 48 } else { 38 };
+    let slot = |i: u8| {
+        if i < 8 {
+            (base + i as u16).to_string()
+        } else {
+            (bright + (i - 8) as u16).to_string()
+        }
+    };
+    match c {
+        AnsiColor::Spec(rgb) => Some(format!("{extended};2;{};{};{}", rgb.r, rgb.g, rgb.b)),
+        AnsiColor::Indexed(i) if i < 16 => Some(slot(i)),
+        AnsiColor::Indexed(i) => Some(format!("{extended};5;{i}")),
+        AnsiColor::Named(named) => named_slot(named).map(slot),
+    }
+}
+
+/// The 16-slot index a named colour maps to, mirroring `named_to_ratatui`;
+/// the terminal's own defaults (`Foreground`, `Background`, cursor colours)
+/// have no slot and stay default.
+fn named_slot(n: NamedColor) -> Option<u8> {
+    use NamedColor::*;
+    Some(match n {
+        Foreground | Background | Cursor | DimForeground | BrightForeground => return None,
+        Black | DimBlack => 0,
+        Red | DimRed => 1,
+        Green | DimGreen => 2,
+        Yellow | DimYellow => 3,
+        Blue | DimBlue => 4,
+        Magenta | DimMagenta => 5,
+        Cyan | DimCyan => 6,
+        White | DimWhite => 7,
+        BrightBlack => 8,
+        BrightRed => 9,
+        BrightGreen => 10,
+        BrightYellow => 11,
+        BrightBlue => 12,
+        BrightMagenta => 13,
+        BrightCyan => 14,
+        BrightWhite => 15,
+    })
 }
 
 /// Map an alacritty cell color to ratatui through the theme's 16-color ANSI
@@ -7332,6 +7521,62 @@ mod tests {
         assert!(
             !term.take_bell(),
             "take_bell drains the flag — a second read is false"
+        );
+    }
+
+    /// #257: the colour export round-trips through the log parser: the
+    /// text is what the pane showed and the coloured run keeps its colour
+    /// and weight, as the 16 symbolic slots the theme resolves.
+    #[test]
+    fn grid_lines_ansi_carries_the_pane_colours_as_sgr() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The sentinel is assembled at runtime so the pane's run-label header
+        // can never match the scan below.
+        let term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from("s=QQ; printf \"\\033[1;31m${s}RED\\033[0m plain\\n\"; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("QQRED plain")));
+        let exported = term.grid_lines_ansi();
+        let (plain, raw) = exported
+            .iter()
+            .find(|(p, _)| p.contains("QQRED"))
+            .expect("the coloured row is exported");
+        let mut style = crate::ansi_text::AnsiStyle::default();
+        let parsed = crate::ansi_text::parse_line(raw, &mut style);
+        assert_eq!(
+            parsed.text.trim_end(),
+            plain.trim_end(),
+            "the plain twin is the coloured row with its escapes stripped"
+        );
+        assert!(
+            parsed.text.starts_with("QQRED plain"),
+            "escapes never reach the text: {:?}",
+            parsed.text
+        );
+        let red = parsed
+            .spans
+            .iter()
+            .find(|s| s.start == 0 && s.end >= 5)
+            .unwrap_or_else(|| {
+                panic!("a span covers the red run: {:?} from {raw:?}", parsed.spans)
+            });
+        assert_eq!(
+            red.style.fg,
+            Some(crate::ansi_text::AnsiColor::Indexed(1)),
+            "SGR 31 comes back as the symbolic red slot"
+        );
+        assert!(red.style.bold, "SGR 1 comes back as bold");
+        let plain = parsed.spans.iter().find(|s| s.start >= 5);
+        assert!(
+            plain.is_none_or(|s| s.style.fg.is_none() && !s.style.bold),
+            "the reset ends the run: {:?}",
+            parsed.spans
         );
     }
 
