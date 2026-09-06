@@ -129,6 +129,18 @@ pub fn uninstall(id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// #465: csvlens is offered under AVAILABLE and leaves the list once added.
+    #[test]
+    fn csvlens_is_in_the_catalog_until_installed() {
+        let none = BTreeSet::new();
+        assert!(
+            available_from(&none).iter().any(|s| s.id == "csvlens"),
+            "csvlens is a catalog entry"
+        );
+        let installed: BTreeSet<String> = ["csvlens".to_string()].into_iter().collect();
+        assert!(!available_from(&installed).iter().any(|s| s.id == "csvlens"));
+    }
+
     #[test]
     fn catalog_lists_the_seeded_servers() {
         let ids: Vec<String> = catalog_summaries().into_iter().map(|s| s.id).collect();

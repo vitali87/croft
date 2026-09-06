@@ -128,6 +128,91 @@ fn resolved(ext_id: &str, cmd: &CommandDecl, server: &McpServerDecl) -> Resolved
     }
 }
 
+/// One `[[viewers]]` entry from an enabled extension (#465): a terminal
+/// program that opens a file kind in a pane of its own.
+#[derive(Clone)]
+pub struct ContributedViewer {
+    pub ext_id: String,
+    pub id: String,
+    pub label: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub extensions: Vec<String>,
+    pub provision: Option<crate::lsp::install::Provision>,
+}
+
+/// Palette command id for a viewer: `viewer:<id>`.
+pub const VIEWER_COMMAND_PREFIX: &str = "viewer:";
+
+/// Pure: every viewer across `sources` whose extension is enabled, in
+/// source order. Extensions are lower-cased once here so a lookup is a
+/// plain comparison.
+fn viewers_in(sources: &[String], disabled: &BTreeSet<String>) -> Vec<ContributedViewer> {
+    sources
+        .iter()
+        .filter_map(|s| manifest::parse(s).ok())
+        .filter(|m| !disabled.contains(&m.id))
+        .flat_map(|m| {
+            let ext_id = m.id;
+            m.viewers.into_iter().map(move |v| ContributedViewer {
+                ext_id: ext_id.clone(),
+                id: v.id,
+                label: v.label,
+                command: v.command,
+                args: v.args,
+                extensions: v.extensions.iter().map(|e| e.to_lowercase()).collect(),
+                provision: v.provision.as_ref().map(|p| p.to_provision()),
+            })
+        })
+        .collect()
+}
+
+/// Pure: the first enabled viewer offered for `path`'s extension, compared
+/// case-insensitively (`data.CSV` is a CSV).
+fn viewer_for_path_in(
+    sources: &[String],
+    disabled: &BTreeSet<String>,
+    path: &std::path::Path,
+) -> Option<ContributedViewer> {
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    viewers_in(sources, disabled)
+        .into_iter()
+        .find(|v| v.extensions.iter().any(|e| *e == ext))
+}
+
+/// Pure: the palette rows for every enabled viewer, titled
+/// `<extension id>: <label>` with id `viewer:<id>`.
+fn viewer_commands_in(sources: &[String], disabled: &BTreeSet<String>) -> Vec<ContributedCommand> {
+    viewers_in(sources, disabled)
+        .into_iter()
+        .map(|v| ContributedCommand {
+            title: format!("{}: {}", v.ext_id, v.label),
+            id: format!("{VIEWER_COMMAND_PREFIX}{}", v.id),
+            ext_id: v.ext_id,
+        })
+        .collect()
+}
+
+/// The enabled viewer for `path`, if any extension contributes one.
+pub fn viewer_for_path(path: &std::path::Path) -> Option<ContributedViewer> {
+    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    viewer_for_path_in(&all_sources(), &disabled, path)
+}
+
+/// The enabled viewer with this id, if any.
+pub fn viewer_by_id(id: &str) -> Option<ContributedViewer> {
+    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    viewers_in(&all_sources(), &disabled)
+        .into_iter()
+        .find(|v| v.id == id)
+}
+
+/// Palette rows for the enabled viewers.
+pub fn contributed_viewer_commands() -> Vec<ContributedCommand> {
+    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    viewer_commands_in(&all_sources(), &disabled)
+}
+
 /// The contributed commands to register eagerly in the palette (enabled
 /// extensions only). Reads prefs + manifests fresh; invoked when the palette is
 /// built, not on a hot path.
@@ -146,6 +231,57 @@ pub fn resolve_command(command_id: &str) -> Option<ResolvedCommand> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CSVLENS: &str = r#"id = "csvlens"
+name = "csvlens"
+description = "Browse CSV and TSV files in csvlens, a terminal spreadsheet viewer."
+builtin = false
+api_version = 1
+
+[[viewers]]
+id = "csvlens"
+label = "Open in csvlens"
+command = "csvlens"
+args = ["{file}"]
+extensions = ["csv", "tsv"]
+provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { "macos-aarch64" = "https://example.invalid/csvlens-aarch64-apple-darwin.tar.xz" } }
+"#;
+
+    /// #465: a viewer is offered for its file kinds, case-insensitively, and
+    /// only while its extension is enabled; it reaches the palette as one row.
+    #[test]
+    fn an_enabled_viewer_is_offered_for_its_file_kinds_and_a_disabled_one_is_not() {
+        let sources = vec![CSVLENS.to_string()];
+        let none = BTreeSet::new();
+        let v = viewer_for_path_in(&sources, &none, std::path::Path::new("/tmp/data.CSV"))
+            .expect("csv is one of the viewer's kinds");
+        assert_eq!(
+            (v.ext_id.as_str(), v.id.as_str(), v.command.as_str()),
+            ("csvlens", "csvlens", "csvlens")
+        );
+        assert_eq!(v.args, vec!["{file}"]);
+        assert!(
+            viewer_for_path_in(&sources, &none, std::path::Path::new("/tmp/notes.md")).is_none(),
+            "a kind no viewer claims gets nothing"
+        );
+        let disabled: BTreeSet<String> = ["csvlens".to_string()].into_iter().collect();
+        assert!(
+            viewer_for_path_in(&sources, &disabled, std::path::Path::new("/tmp/data.csv"))
+                .is_none(),
+            "a disabled extension contributes nothing"
+        );
+        let cmds = viewer_commands_in(&sources, &none);
+        assert_eq!(cmds.len(), 1, "one palette row per viewer");
+        assert_eq!(
+            (
+                cmds[0].ext_id.as_str(),
+                cmds[0].id.as_str(),
+                cmds[0].title.as_str()
+            ),
+            ("csvlens", "viewer:csvlens", "csvlens: Open in csvlens")
+        );
+        assert!(viewer_commands_in(&sources, &disabled).is_empty());
+    }
 
     const FETCH: &str = r#"
 id = "mcp-fetch"

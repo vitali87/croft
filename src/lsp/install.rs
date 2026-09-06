@@ -96,6 +96,10 @@ pub enum ArchiveKind {
     Gz,
     /// A zip holding the binary plus any sibling files it needs; extracted whole.
     Zip,
+    /// A `.tar.xz` (cargo-dist's archive) holding the binary, usually inside a
+    /// per-target folder; extracted whole, then the named binary is placed at
+    /// `<name>/<bin>` wherever it sat in the tree.
+    TarXz,
 }
 
 /// Latest one-line status of a managed install, polled by the app each tick and
@@ -390,6 +394,55 @@ fn extract_zip(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Extract a `.tar.xz` payload whole into `dir` and place the binary at
+/// `target` (#465). cargo-dist nests the binary in a per-target folder
+/// (`csvlens-aarch64-apple-darwin/csvlens`), whose name differs per platform,
+/// so when `target` is not there after unpacking the tree is searched for a
+/// file with the binary's name and that file is moved into place.
+fn extract_tar_xz(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
+    let mut tar_bytes = Vec::new();
+    lzma_rs::xz_decompress(&mut std::io::Cursor::new(bytes), &mut tar_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+    tar::Archive::new(std::io::Cursor::new(tar_bytes)).unpack(dir)?;
+    if !target.is_file()
+        && let Some(name) = target.file_name()
+        && let Some(found) = find_file_named(dir, name)
+    {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::rename(&found, target).is_err() {
+            std::fs::copy(&found, target)?;
+        }
+    }
+    if !target.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "the archive holds no {:?}",
+                target.file_name().unwrap_or_default()
+            ),
+        ));
+    }
+    set_executable(target)
+}
+
+/// First regular file named `name` under `dir`, depth-first.
+fn find_file_named(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).ok()?.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name() == Some(name) && p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 /// Download + unpack a prebuilt release binary into `~/.croft/servers/<name>/`.
 /// Resolves the platform tokens, builds the URL, fetches, extracts per archive
 /// kind, and marks the language installed on success. A platform the project
@@ -459,6 +512,7 @@ fn run_binary_install(
     let extracted = match archive {
         ArchiveKind::Gz => extract_gz(&bytes, &target),
         ArchiveKind::Zip => extract_zip(&bytes, &dir, &target),
+        ArchiveKind::TarXz => extract_tar_xz(&bytes, &dir, &target),
     };
     if let Err(e) = extracted {
         log_file::log(&format!("lsp[{name}] extract failed: {e}"));
@@ -1215,6 +1269,42 @@ mod tests {
             v.to_lowercase().contains("clangd"),
             "clangd reports itself: {v}"
         );
+    }
+
+    /// #465: cargo-dist ships tar.xz archives with the binary inside a
+    /// per-target folder, so the extractor has to find it by name rather than
+    /// expect it at the root, and it must come out executable.
+    #[test]
+    fn a_tar_xz_archive_yields_the_named_binary_wherever_it_sits() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let script: &[u8] = b"#!/bin/sh\necho csvlens-ok\n";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(script.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "csvlens-x86_64-unknown-linux-gnu/csvlens", script)
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("csvlens");
+        extract_tar_xz(&xz, &dir, &target).expect("unpack the tar.xz");
+        assert!(
+            target.is_file(),
+            "the binary lands at <dir>/<bin>: {target:?}"
+        );
+        let out = Command::new(&target)
+            .output()
+            .expect("run the extracted binary");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "the extracted binary is executable");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("csvlens-ok"));
     }
 
     #[test]

@@ -1084,6 +1084,9 @@ enum MenuAction {
     /// Finder exists, so the menu omits this entry entirely rather than
     /// offering a no-op.
     RevealInFinder(PathBuf),
+    /// Open the file in an extension-contributed viewer (#465): the viewer's
+    /// id and the file.
+    OpenInViewer(String, PathBuf),
     /// Close the editor tab at `idx`. Mirrors clicking the tab's `×`
     /// glyph; surfaces in the tab-strip right-click menu so the four
     /// close actions (Close / Others / Right / All) live in one place.
@@ -1763,6 +1766,14 @@ fn build_tree_context_menu_items(
             .filter(|_| paths_for_action.len() == 1)
             .filter(|pp| pp.is_file());
         if let Some(file) = single_file_target {
+            // An installed viewer for this file kind (#465): `Open in csvlens`
+            // on a .csv, once the csvlens extension has been added.
+            if let Some(viewer) = crate::mcp::registry::viewer_for_path(file) {
+                items.push((
+                    viewer.label.clone(),
+                    MenuAction::OpenInViewer(viewer.id.clone(), file.clone()),
+                ));
+            }
             match compare_anchor {
                 Some(anchor) if anchor != file.as_path() => {
                     items.push((
@@ -30970,6 +30981,7 @@ impl App {
         let ext_commands: Vec<crate::widgets::command_palette::ExtensionCommand> =
             crate::mcp::registry::contributed_commands()
                 .into_iter()
+                .chain(crate::mcp::registry::contributed_viewer_commands())
                 .map(|c| crate::widgets::command_palette::ExtensionCommand {
                     ext_id: c.ext_id,
                     id: c.id,
@@ -31616,6 +31628,95 @@ impl App {
         }
     }
 
+    /// Open `path` in an extension-contributed viewer (#465): a new terminal
+    /// pane running the tool on the file, focused. `{file}` in the declared
+    /// args is the file's path. A provisioned tool that is not installed yet
+    /// has its managed install kicked off and the user is told to run the
+    /// command again once it lands, the way a sidecar's first run behaves.
+    pub fn open_in_viewer(
+        &mut self,
+        viewer: &crate::mcp::registry::ContributedViewer,
+        path: &Path,
+    ) {
+        let program = match viewer.provision.as_ref() {
+            None => viewer.command.clone(),
+            Some(provision) => {
+                match crate::lsp::install::provisioned_command(&viewer.id, provision) {
+                    Some((command, _extra_paths)) => command,
+                    None => {
+                        let name: &'static str = Box::leak(viewer.id.clone().into_boxed_str());
+                        let config = crate::lsp::config::ServerConfig {
+                            name,
+                            command: viewer.command.clone(),
+                            args: viewer.args.clone(),
+                            language: crate::lsp::config::Language("viewer"),
+                            initialization_options: None,
+                            provision: Some(provision.clone()),
+                        };
+                        crate::lsp::install::resolve_managed(&config, provision, true);
+                        self.status = format!(
+                            "Installing {}; run {} again once it lands",
+                            viewer.id, viewer.label
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        let file = path.to_string_lossy().into_owned();
+        let args: Vec<String> = viewer
+            .args
+            .iter()
+            .map(|a| a.replace("{file}", &file))
+            .collect();
+        let cwd = path
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.workspace_root().to_path_buf());
+        match PtyTerminal::new_running(&program, &args, &cwd) {
+            Ok(term) => {
+                let slot = (self.active_terminal + 1).min(self.terminals.len());
+                self.terminals.insert(slot, term);
+                self.active_terminal = slot;
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.focus_pane(Pane::Terminal);
+                self.status = format!("{}: {}", viewer.label, self.status_path(path));
+            }
+            Err(e) => {
+                self.status = format!("{} failed to start: {e}", viewer.label);
+            }
+        }
+    }
+
+    /// A palette `viewer:<id>` row: open the active editor file in that
+    /// viewer, if the file is a kind it handles.
+    fn run_viewer_command(&mut self, viewer_id: &str) {
+        let Some(viewer) = crate::mcp::registry::viewer_by_id(viewer_id) else {
+            self.status = format!("Viewer '{viewer_id}' is unavailable");
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            self.status = format!("{}: open a file first", viewer.label);
+            return;
+        };
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !viewer.extensions.iter().any(|e| *e == ext) {
+            self.status = format!(
+                "{}: the active file is not one of .{}",
+                viewer.label,
+                viewer.extensions.join(" / .")
+            );
+            return;
+        }
+        self.open_in_viewer(&viewer, &path);
+    }
+
     /// Dispatch a chosen palette row: a built-in command runs inline; an
     /// extension-contributed command routes through the MCP sidecar path.
     fn run_palette_item(&mut self, item: crate::widgets::command_palette::PaletteItem) {
@@ -31631,6 +31732,14 @@ impl App {
     /// argument (if any) via an input popup, then spawns the server off-thread.
     fn run_extension_command(&mut self, command_id: &str) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        // Viewer rows (#465) run a terminal program on the active file; no
+        // sidecar, so none of the MCP consent or argument flow below applies.
+        if let Some(viewer_id) =
+            command_id.strip_prefix(crate::mcp::registry::VIEWER_COMMAND_PREFIX)
+        {
+            self.run_viewer_command(viewer_id);
+            return;
+        }
         let Some(resolved) = crate::mcp::registry::resolve_command(command_id) else {
             self.status = format!("Extension command '{command_id}' is unavailable");
             return;
@@ -39220,6 +39329,11 @@ impl App {
                 self.change_workspace_root(folder);
             }
             MenuAction::RevealInFinder(path) => self.reveal_in_finder(path),
+            MenuAction::OpenInViewer(id, path) => {
+                if let Some(viewer) = crate::mcp::registry::viewer_by_id(&id) {
+                    self.open_in_viewer(&viewer, &path);
+                }
+            }
             MenuAction::CopyTabPath(path) => self.copy_path_to_clipboard(path),
             MenuAction::CopyTabRelativePath(path) => self.copy_relative_path_to_clipboard(path),
             MenuAction::RevealInExplorer(path) => self.reveal_in_explorer(path),

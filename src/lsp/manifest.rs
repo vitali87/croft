@@ -65,6 +65,7 @@ pub const CATALOG_MANIFESTS: &[&str] = &[
     include_str!("../../assets/catalog/mcp-fetch/extension.toml"),
     include_str!("../../assets/catalog/mcp-time/extension.toml"),
     include_str!("../../assets/catalog/mcp-markitdown/extension.toml"),
+    include_str!("../../assets/catalog/csvlens/extension.toml"),
 ];
 
 /// A parsed `extension.toml`. Only the fields phase B1 consumes are modelled;
@@ -111,6 +112,27 @@ pub struct ExtensionManifest {
     /// in the command palette, the server is spawned lazily on first invocation.
     #[serde(default)]
     pub commands: Vec<CommandDecl>,
+    /// External viewers this extension contributes (#465): a terminal program
+    /// that opens a file kind in a pane of its own, such as csvlens for CSV.
+    #[serde(default)]
+    pub viewers: Vec<ViewerDecl>,
+}
+
+/// One `[[viewers]]` entry: a terminal program croft runs on a file in a new
+/// pane. `args` may carry `{file}`, replaced by the file's absolute path;
+/// `extensions` are the lower-cased file extensions it is offered for;
+/// `provision` installs it pinned when absent from PATH, as for servers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewerDecl {
+    pub id: String,
+    pub label: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub provision: Option<ProvisionDecl>,
 }
 
 /// One `[[mcp_servers]]` entry: a sidecar server croft spawns and drives over
@@ -399,6 +421,10 @@ pub enum ProvisionKind {
 pub enum ArchiveKindDecl {
     Gz,
     Zip,
+    /// A `.tar.xz` holding the binary, possibly inside a per-target folder
+    /// (cargo-dist's layout).
+    #[serde(rename = "tar.xz")]
+    TarXz,
 }
 
 /// A server registration extracted from a manifest: its priority, the language
@@ -481,6 +507,7 @@ impl ProvisionDecl {
                 archive: match self.archive.unwrap_or(ArchiveKindDecl::Gz) {
                     ArchiveKindDecl::Gz => ArchiveKind::Gz,
                     ArchiveKindDecl::Zip => ArchiveKind::Zip,
+                    ArchiveKindDecl::TarXz => ArchiveKind::TarXz,
                 },
                 bin_path: self.bin_path.as_deref().map(intern),
                 termux_pkg: self.termux_pkg.as_deref().map(intern),
@@ -560,6 +587,44 @@ pub fn read_extension_sources(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #465: a catalog entry that opens a file kind in an external TUI.
+    #[test]
+    fn a_viewers_block_parses_with_its_provision() {
+        const CSVLENS: &str = r#"id = "csvlens"
+name = "csvlens"
+description = "Browse CSV and TSV files in csvlens, a terminal spreadsheet viewer."
+builtin = false
+api_version = 1
+
+[[viewers]]
+id = "csvlens"
+label = "Open in csvlens"
+command = "csvlens"
+args = ["{file}"]
+extensions = ["csv", "tsv"]
+provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { "macos-aarch64" = "https://example.invalid/csvlens-aarch64-apple-darwin.tar.xz" } }
+"#;
+        let m = parse(CSVLENS).expect("the manifest parses");
+        assert_eq!(m.viewers.len(), 1, "one viewer: {:?}", m.viewers);
+        let v = &m.viewers[0];
+        assert_eq!(
+            (v.id.as_str(), v.label.as_str(), v.command.as_str()),
+            ("csvlens", "Open in csvlens", "csvlens")
+        );
+        assert_eq!(v.args, vec!["{file}"]);
+        assert_eq!(v.extensions, vec!["csv", "tsv"]);
+        let p = v.provision.as_ref().expect("provisioned").to_provision();
+        let Provision::Binary { archive, bin, .. } = p else {
+            panic!("a binary provision was declared");
+        };
+        assert_eq!(
+            archive,
+            ArchiveKind::TarXz,
+            "the archive kind reads `tar.xz`"
+        );
+        assert_eq!(bin, "csvlens");
+    }
 
     const PYTHON: &str = include_str!("../../assets/extensions/lsp-python/extension.toml");
 

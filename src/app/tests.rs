@@ -13455,6 +13455,49 @@ fn enter_in_file_finder_opens_the_selected_file_and_closes_the_modal() {
     );
 }
 
+/// #465: a viewer runs the declared program on the file in a pane of its own,
+/// with `{file}` replaced by the file's path, and the pane takes focus. The
+/// program here is `sh`, so nothing has to be installed for the test.
+#[test]
+fn opening_a_file_in_a_viewer_runs_the_tool_on_it_in_a_new_terminal_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n1,2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let before = app.terminals.len();
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: "csvlens".into(),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "echo VIEWING \"$1\"; sleep 30".into(),
+            "sh".into(),
+            "{file}".into(),
+        ],
+        extensions: vec!["csv".into()],
+        provision: None,
+    };
+    app.open_in_viewer(&viewer, &data);
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "the viewer gets a pane of its own"
+    );
+    assert!(app.show_terminal, "the panel is shown");
+    assert!(
+        matches!(app.focus, Pane::Terminal),
+        "and the pane takes focus"
+    );
+    let want = format!("VIEWING {}", data.display());
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the viewer to print the file it was handed",
+        || app.terminal().visible_text().contains(&want),
+    );
+}
+
 #[test]
 fn down_arrow_moves_selection_in_the_file_finder() {
     let tmp = tempfile::tempdir().unwrap();
