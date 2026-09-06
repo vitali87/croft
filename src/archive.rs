@@ -482,6 +482,41 @@ mod tests {
         );
     }
 
+    /// A note must not outlive the condition that armed it (#493 review).
+    /// Keying stops a note explaining a DIFFERENT file; it does not stop one
+    /// going stale against its own. `open_hex`'s same-path refresh returns
+    /// without consuming the note, so a reload of an over-cap archive leaves
+    /// one armed, and if the file then comes under the cap that reason must
+    /// not explain the next open.
+    #[test]
+    fn a_stale_refusal_reason_does_not_explain_the_same_file_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("shrinking.zip");
+        write_zip_with_entries(&p, (ZIP_LIST_CAP / 80) as usize);
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(&p).unwrap();
+        assert!(
+            e.hex.is_some() && crate::archive::is_list_cap_refusal(&e.status),
+            "staging: over the cap, hex with the reason: {}",
+            e.status
+        );
+        // A same-path reload: the note is re-armed and the refresh returns
+        // without consuming it.
+        e.open(&p).unwrap();
+        // The file now lists fine.
+        write_zip_with_entries(&p, 10);
+        e.open(&p).unwrap();
+        assert!(e.archive.is_some(), "staging: it lists now");
+        // "Reopen as Hex" on the same path.
+        e.open_hex(&p).unwrap();
+        assert!(
+            !crate::archive::is_list_cap_refusal(&e.status),
+            "a reason from when it was over the cap must not explain it \
+             now that it is not: {}",
+            e.status
+        );
+    }
+
     /// The reason describes only the file it was recorded for (#493
     /// review). An open can arm the note and then fail before reaching any
     /// viewer, and "Reopen as Hex" reaches `open_hex` without passing

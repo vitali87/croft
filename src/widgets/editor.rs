@@ -2343,8 +2343,12 @@ pub struct Editor {
     /// can set it and then fail before reaching any viewer, and `open_hex`
     /// is also reached directly by "Reopen as Hex" without passing through
     /// `open`. Keying makes a surviving note explain only its own file,
-    /// which is a stronger guarantee than the clear-after-open the sibling
-    /// `pdf_restore_page` uses, and does not depend on finding every path.
+    /// which the
+    /// clear-after-open the sibling `pdf_restore_page` uses cannot do on
+    /// its own. It is not sufficient alone, though: a note can outlive its
+    /// open and go stale against the SAME path, so the two places that
+    /// reach no fresh status line clear it too - `open_hex`'s same-path
+    /// refresh, and a listing that succeeds and thereby disproves it.
     route_note: Option<(std::path::PathBuf, String)>,
     /// The `edit_seq` at which `App::sync_provenance` last considered THIS
     /// buffer for a persisted map (#349), so the history read happens once
@@ -4427,6 +4431,9 @@ impl Editor {
     fn open_archive(&mut self, path: &Path, kind: crate::archive::ArchiveKind) -> Result<()> {
         let view = crate::archive::list(path, kind)
             .map_err(|e| anyhow::anyhow!("Archive open failed: {e}"))?;
+        // A listing that succeeds positively disproves any refusal armed
+        // for this path, so it cannot be left to explain a later view.
+        self.route_note = None;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
@@ -4797,6 +4804,10 @@ impl Editor {
         if self.path.as_deref() == Some(path)
             && let Some(view) = self.hex.as_mut()
         {
+            // A refresh writes no status line, so a note armed by the open
+            // that called us would outlive its open and go stale against a
+            // file that may since have come under the cap.
+            self.route_note = None;
             // Pending overwrites survive a same-path re-open (a tree
             // re-click must not silently drop them); the FS sweep never
             // reloads a dirty tab, and an explicit Revert discards via
