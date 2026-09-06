@@ -8780,8 +8780,12 @@ impl App {
             crate::history::seats_for(&self.history_root, &file, millis).unwrap_or_default();
         // If that file is the active tab (the snapshot diff opened it), reload
         // so the editor shows the restored contents and the disk stamp resyncs.
+        // `holds_exactly` re-checks rather than assuming the reload landed the
+        // restored bytes: another process can rewrite the file between the
+        // write above and the read inside the revert.
         if self.editor.path.as_deref() == Some(file.as_path())
             && self.editor.revert_to_disk().is_ok()
+            && self.editor.holds_exactly(&content)
         {
             let mut onto_buffer = seats.clone();
             onto_buffer.truncate(self.editor.lines.len());

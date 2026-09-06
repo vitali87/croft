@@ -4624,8 +4624,17 @@ impl Editor {
         let enc = encoding_rs::Encoding::for_bom(bytes)
             .map(|(e, _)| e)
             .unwrap_or(self.encoding);
-        let (text, _, had_errors) = enc.decode(bytes);
-        !had_errors && split_into_lines(&text) == self.lines
+        // Built exactly as `open` builds `lines` from the same bytes: the
+        // replacement-character text of an undecodable byte on both sides
+        // (`open` discards `had_errors` too), and the empty file's one
+        // sentinel line. Any divergence here reads as "not this text" and
+        // silently withholds a map that should have come back.
+        let (text, _, _) = enc.decode(bytes);
+        let mut want = split_into_lines(&text);
+        if want.is_empty() {
+            want.push(String::new());
+        }
+        want == self.lines
     }
 
     /// The map a save of this tab records beside its history snapshot

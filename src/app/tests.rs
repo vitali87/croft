@@ -12908,6 +12908,72 @@ fn a_stale_tab_is_not_credited_with_the_map_of_the_saving_tab() {
     );
 }
 
+/// An empty file gets its map back too (#349 review): `open` gives an empty
+/// buffer one sentinel line, so a comparison against the snapshot's bare
+/// (zero-line) split would withhold the map from every emptied file.
+#[test]
+fn the_map_of_an_emptied_file_survives_a_restart() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "").unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(0..1, Seat::Navigator);
+    crate::history::record_with_seats_in(hist.path(), &f, b"", 1_000, &seats).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    assert_eq!(
+        app.editor.lines,
+        vec![String::new()],
+        "staging: an empty file opens as one empty line"
+    );
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "the emptied file's map comes back: {:?}",
+        app.editor.provenance
+    );
+}
+
+/// A UTF-16 file's map comes back too (#349 review): the snapshot holds the
+/// file's raw bytes, so the comparison must decode them the way `open` does,
+/// through the BOM, rather than assuming UTF-8.
+#[test]
+fn the_map_of_a_utf16_file_survives_a_restart() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "one
+two
+"
+    .encode_utf16()
+    {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&f, &bytes).unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(0..1, Seat::Navigator);
+    crate::history::record_with_seats_in(hist.path(), &f, &bytes, 1_000, &seats).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    assert_eq!(
+        app.editor.lines,
+        vec![String::from("one"), String::from("two")],
+        "staging: the file opened as UTF-16 text"
+    );
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "the UTF-16 file's map comes back: {:?}",
+        app.editor.provenance
+    );
+}
+
 /// A restore of a snapshot with no sidecar restores every line unknown
 /// (#349 review): the buffer's previous map described the text the restore
 /// replaced, and keeping it would credit lines nobody observed.
