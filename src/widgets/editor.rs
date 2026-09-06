@@ -13023,6 +13023,8 @@ impl EditorTabs {
             right_lines,
         );
         data.left_is_real_file = true;
+        data.source = crate::widgets::diff::DiffSource::TwoFiles;
+        data.stamp_sides();
         data.set_whitespace_mode(self.diff_ws_default);
 
         let mut e = Editor::new();

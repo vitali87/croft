@@ -65,6 +65,37 @@ impl DiffWhitespace {
     }
 }
 
+/// Where a diff view's two sides come from, recorded at open so the view can
+/// be rebuilt when either side moves (#471): an agent or a save rewrites the
+/// working file, a commit moves HEAD, the index changes under a staged view.
+/// `App::refresh_open_diff_views` reads this; the openers set it.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum DiffSource {
+    /// Nothing to re-read (a deletion tombstone, a one-off text diff).
+    #[default]
+    Static,
+    /// Source Control's HEAD-vs-working-tree view: the left side is
+    /// `git show HEAD:<rel>` in `root`, the right side is `right_path` on
+    /// disk. Both can move.
+    HeadVsWorking { root: PathBuf, rel: String },
+    /// A fixed left text (a TIMELINE local snapshot) against `right_path` on
+    /// disk. Only the right side can move.
+    FixedLeft { left_text: String },
+    /// Two real files (`left_path`, `right_path`), both re-read from disk.
+    TwoFiles,
+    /// A raw `git diff` re-run in `root`; the whole view is rebuilt from
+    /// the command's output.
+    GitCommand { root: PathBuf, kind: GitDiffKind },
+}
+
+/// Which `git diff` a [`DiffSource::GitCommand`] view shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitDiffKind {
+    Staged,
+    AgainstBranch(String),
+    PreviousCommit,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffData {
     pub left_path: PathBuf,
@@ -150,6 +181,15 @@ pub struct DiffData {
     pub right_crlf: Vec<bool>,
     pub left_no_final_nl: bool,
     pub right_no_final_nl: bool,
+    /// How to rebuild this view when a side changes (#471). `Static` for
+    /// builders that have nothing to re-read; the openers overwrite it.
+    pub source: DiffSource,
+    /// `(mtime, len)` of each side's file when the view was last built, so
+    /// the per-tick refresh can tell "moved on disk" from a stat instead of
+    /// re-reading and re-diffing the file. `None` for a side that is not a
+    /// file (a HEAD blob, a snapshot, a git command's output).
+    pub left_stamp: Option<(std::time::SystemTime, u64)>,
+    pub right_stamp: Option<(std::time::SystemTime, u64)>,
 }
 
 /// A single occurrence of the find needle inside a diff, located by the
@@ -282,6 +322,9 @@ impl DiffData {
         let (left_crlf, left_no_final_nl) = side_meta(left_raw, left_lines.len());
         let (right_crlf, right_no_final_nl) = side_meta(right_raw, right_lines.len());
         Self {
+            source: DiffSource::Static,
+            left_stamp: None,
+            right_stamp: None,
             left_path,
             right_path,
             left_is_real_file: false,
@@ -315,6 +358,9 @@ impl DiffData {
             .map(|i| DiffRow::Removed { left: i })
             .collect();
         Self {
+            source: DiffSource::Static,
+            left_stamp: None,
+            right_stamp: None,
             left_path: label,
             right_path: PathBuf::from("/dev/null"),
             left_is_real_file: false,
@@ -367,6 +413,9 @@ impl DiffData {
             right_lines.push(String::from("(no changes)"));
             rows.push(DiffRow::Equal { left: 0, right: 0 });
             return Self {
+                source: DiffSource::Static,
+                left_stamp: None,
+                right_stamp: None,
                 left_path: label,
                 right_path: PathBuf::new(),
                 left_is_real_file: false,
@@ -453,6 +502,9 @@ impl DiffData {
         }
         flush(&mut pending_remove, &mut pending_add, &mut rows);
         Self {
+            source: DiffSource::Static,
+            left_stamp: None,
+            right_stamp: None,
             left_path: label,
             right_path: PathBuf::new(),
             left_is_real_file: false,
@@ -1015,6 +1067,87 @@ impl DiffData {
     /// line each one points at — so a row index means the same thing to both.
     pub fn display_rows(&self) -> &[DiffRow] {
         self.display_rows.as_deref().unwrap_or(&self.rows)
+    }
+
+    /// Take over the reader's view state from the version of this diff being
+    /// replaced (#471): the whitespace mode, the viewport (clamped to the new
+    /// row count), the horizontal pan, the hunk-navigation anchor, the find
+    /// needle and the source. A rebuild must read as "the rows updated under
+    /// me", never as "the tab reopened at the first hunk".
+    pub fn carry_view_from(&mut self, old: &DiffData) {
+        self.set_whitespace_mode(old.ws_mode);
+        self.scroll = old.scroll.min(self.rows.len().saturating_sub(1));
+        self.scroll_x = old.scroll_x;
+        self.nav_anchor = old.nav_anchor.filter(|&row| row < self.rows.len());
+        self.find = old.find.clone();
+        self.left_is_git_head = old.left_is_git_head;
+        self.left_is_real_file = old.left_is_real_file;
+        self.source = old.source.clone();
+    }
+
+    /// `(mtime, len)` of a real file, or `None` when it cannot be stat'ed.
+    fn stamp_of(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    /// Record the on-disk stamps of whichever sides are files: the right
+    /// side for every source but a git command, the left side only when it
+    /// is a real file. Called by the openers and after every rebuild so the
+    /// next `sides_moved_on_disk` compares against what is on screen.
+    pub fn stamp_sides(&mut self) {
+        let right_is_file = !matches!(
+            self.source,
+            DiffSource::Static | DiffSource::GitCommand { .. }
+        );
+        self.right_stamp = right_is_file
+            .then(|| Self::stamp_of(&self.right_path))
+            .flatten();
+        self.left_stamp = self
+            .left_is_real_file
+            .then(|| Self::stamp_of(&self.left_path))
+            .flatten();
+    }
+
+    /// True when a file-backed side's stamp no longer matches the one taken
+    /// at the last build: something rewrote it. A side that was never
+    /// stamped but exists now counts as moved, so the first refresh after an
+    /// opener that forgot to stamp self-corrects. A side whose file is gone
+    /// does not count: there is nothing to rebuild from, and the reader
+    /// keeps the last good view.
+    pub fn sides_moved_on_disk(&self) -> bool {
+        let right_is_file = !matches!(
+            self.source,
+            DiffSource::Static | DiffSource::GitCommand { .. }
+        );
+        let moved = |stamp: Option<(std::time::SystemTime, u64)>, path: &std::path::Path| {
+            match Self::stamp_of(path) {
+                Some(now) => stamp != Some(now),
+                None => false,
+            }
+        };
+        (right_is_file && moved(self.right_stamp, &self.right_path))
+            || (self.left_is_real_file && moved(self.left_stamp, &self.left_path))
+    }
+
+    /// True when a rebuild produced exactly what the reader already has:
+    /// the same line texts, rows, and BYTE facts on both sides. The byte
+    /// facts matter because they feed things the lines do not show -- the
+    /// "bytes differ, lines equal" banner, and the `\r` / `\ No newline at
+    /// end of file` handling in the hunk patches stage and revert send to
+    /// git. A rewrite that only adds a final newline changes no line text,
+    /// and skipping it would leave a patch built from bytes no longer on
+    /// disk. Used to skip a redraw-and-reset when nothing at all changed.
+    pub fn same_content_as(&self, other: &DiffData) -> bool {
+        self.left_lines == other.left_lines
+            && self.right_lines == other.right_lines
+            && self.rows == other.rows
+            && self.unified == other.unified
+            && self.left_crlf == other.left_crlf
+            && self.right_crlf == other.right_crlf
+            && self.left_no_final_nl == other.left_no_final_nl
+            && self.right_no_final_nl == other.right_no_final_nl
+            && self.bytes_differ_but_lines_equal == other.bytes_differ_but_lines_equal
     }
 
     /// Switch whitespace mode, recomputing the display classification.

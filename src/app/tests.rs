@@ -39104,3 +39104,310 @@ fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
         "no strip survives maximize, or a click could land on a pane that is not painted"
     );
 }
+
+/// #471 fixtures: a repo with one committed file, and the app rooted there.
+fn repo_with_seed(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(&args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+    let f = root.join("seed.txt");
+    std::fs::write(&f, text).unwrap();
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "init", "--quiet"]);
+    (tmp, f)
+}
+
+fn git_ok(root: &std::path::Path, args: &[&str]) {
+    let st = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(st.success(), "git {args:?}");
+}
+
+/// Write `text` to `path` so that its `(mtime, len)` stamp differs from the
+/// one before the write: a stamp-gated refresh must not miss a rewrite that
+/// lands within the filesystem's mtime granularity of the previous one. A
+/// different length differs at once; an equal length waits for the clock.
+fn rewrite_later(path: &std::path::Path, text: &str) {
+    let stamp = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len())))
+    };
+    let before = stamp(path);
+    std::fs::write(path, text).unwrap();
+    let mut spins = 0;
+    while stamp(path) == before && spins < 400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(path, text).unwrap();
+        spins += 1;
+    }
+    assert_ne!(
+        stamp(path),
+        before,
+        "the rewrite must move the file's stamp"
+    );
+}
+
+#[test]
+fn an_open_head_diff_follows_the_working_file_and_head() {
+    // The Source Control diff used to be a snapshot: an agent rewriting the
+    // file, or a save from a sibling tab, left the rows stale until the tab
+    // was reopened (#471). Now the view is rebuilt in place -- from disk on
+    // a filesystem trigger, from HEAD too on a git-status trigger -- with
+    // the reader's viewport kept.
+    let (tmp, f) = repo_with_seed("one\ntwo\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    // Open exactly what open_source_control_entry opens for a Modified row.
+    std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "one\ntwo\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    assert_eq!(app.editor.diff.as_ref().unwrap().right_lines.len(), 3);
+    assert!(
+        !app.refresh_open_diff_views(false, &[]),
+        "nothing moved yet: the refresh is a no-op"
+    );
+
+    // The working file grows under the open view.
+    rewrite_later(&f, "one\ntwo\nthree\nfour\nfive\n");
+    app.editor.diff.as_mut().unwrap().scroll = 1;
+    assert!(
+        app.refresh_open_diff_views(false, &[]),
+        "a filesystem trigger rebuilds the view from the changed file"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(d.right_lines, vec!["one", "two", "three", "four", "five"]);
+    assert_eq!(d.left_lines, vec!["one", "two"], "HEAD side untouched");
+    assert_eq!(
+        d.scroll, 1,
+        "the reader's viewport is kept, not reset to the first hunk"
+    );
+    assert!(
+        d.left_is_git_head,
+        "the rebuilt view still gates stage/revert like the original"
+    );
+    assert!(
+        matches!(
+            d.source,
+            crate::widgets::diff::DiffSource::HeadVsWorking { .. }
+        ),
+        "the source survives the rebuild"
+    );
+    assert!(
+        !app.refresh_open_diff_views(false, &[]),
+        "the stamps were taken: a second tick does not rebuild again"
+    );
+
+    // A commit moves HEAD: the git-status trigger re-reads the left side.
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "grow", "--quiet"]);
+    assert!(
+        !app.refresh_open_diff_views(false, &[]),
+        "a filesystem-only trigger does not re-read HEAD"
+    );
+    assert!(
+        !app.refresh_open_diff_views(true, &[]),
+        "nor does a git-status drain in which THIS root's HEAD did not move"
+    );
+    assert!(
+        app.refresh_open_diff_views(true, std::slice::from_ref(&root)),
+        "the drain that saw this root's HEAD move does"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(
+        d.left_lines, d.right_lines,
+        "after the commit both sides agree"
+    );
+}
+
+#[test]
+fn a_staged_diff_view_reruns_git_on_a_status_trigger_only() {
+    let (tmp, f) = repo_with_seed("alpha\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    let raw = crate::git::diff_staged(&root).unwrap();
+    app.editor
+        .open_git_diff_side_by_side(std::path::Path::new("git diff --staged"), &raw)
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+        root: root.clone(),
+        kind: crate::widgets::diff::GitDiffKind::Staged,
+    });
+    assert!(
+        app.editor
+            .diff
+            .as_ref()
+            .unwrap()
+            .right_lines
+            .contains(&String::from("(no changes)")),
+        "nothing is staged yet"
+    );
+
+    std::fs::write(&f, "alpha\nbeta\n").unwrap();
+    git_ok(&root, &["add", "seed.txt"]);
+    assert!(
+        !app.refresh_open_diff_views(false, &[]),
+        "a git-command view is not re-run on a filesystem tick: the index is not a file it watches"
+    );
+    assert!(
+        app.refresh_open_diff_views(true, &[]),
+        "the git-status drain re-runs it"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        d.right_lines.iter().any(|l| l == "beta"),
+        "the staged line now shows: {:?}",
+        d.right_lines
+    );
+    assert!(
+        !app.refresh_open_diff_views(true, &[]),
+        "identical output changes nothing"
+    );
+}
+
+#[test]
+fn a_snapshot_and_a_two_file_diff_follow_their_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "x\n").unwrap();
+    std::fs::write(&b, "x\ny\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Timeline snapshot: fixed left text against the working file.
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("b.txt (local snapshot)"),
+            "x\n",
+            &b,
+            false,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft {
+        left_text: String::from("x\n"),
+    });
+    rewrite_later(&b, "x\ny\nz\n");
+    assert!(app.refresh_open_diff_views(false, &[]));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(d.right_lines, vec!["x", "y", "z"]);
+    assert_eq!(d.left_lines, vec!["x"], "the snapshot side never changes");
+    assert!(!d.left_is_git_head, "a snapshot view still cannot stage");
+
+    // Two real files: either side moving rebuilds.
+    app.editor.open_diff(&a, &b).unwrap();
+    rewrite_later(&a, "x\nw\n");
+    assert!(app.refresh_open_diff_views(false, &[]));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(d.left_lines, vec!["x", "w"]);
+    assert!(
+        d.left_is_real_file,
+        "Enter on a Removed row still opens the left file"
+    );
+    assert!(!app.refresh_open_diff_views(false, &[]));
+}
+
+#[test]
+fn a_diff_view_in_an_inactive_split_group_is_refreshed_too() {
+    // Every group is swept, not just the focused one: the diff the user
+    // parked in the other split is exactly the one they are watching while
+    // they type in this one.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "1\n").unwrap();
+    std::fs::write(&b, "1\n2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_diff(&a, &b).unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&a).unwrap();
+    assert!(
+        app.editor.diff.is_none(),
+        "the focused group shows a plain buffer"
+    );
+
+    rewrite_later(&b, "1\n2\n3\n");
+    assert!(app.refresh_open_diff_views(false, &[]));
+    let stale = app
+        .editor_layout
+        .inactive_groups_mut()
+        .into_iter()
+        .flat_map(|g| g.editors.iter())
+        .filter_map(|e| e.diff.as_ref())
+        .any(|d| d.right_lines.len() != 3);
+    assert!(!stale, "the inactive group's diff shows the third line");
+}
+
+#[test]
+fn a_rewrite_that_only_changes_bytes_still_refreshes_the_byte_facts() {
+    // A final newline added to the working file changes no line text, so the
+    // rows come back identical -- but `right_no_final_nl` and the "bytes
+    // differ, lines equal" banner feed the hunk patch and the header. The
+    // same-content skip must see those facts as content, or stage/revert
+    // would build a patch from bytes no longer on disk.
+    let (tmp, f) = repo_with_seed("a\nb\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "a\nb").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "a\nb\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        d.right_no_final_nl && d.bytes_differ_but_lines_equal,
+        "precondition: {d:?}"
+    );
+
+    rewrite_later(&f, "a\nb\n");
+    assert!(
+        app.refresh_open_diff_views(false, &[]),
+        "the byte-only rewrite counts as a change"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        !d.right_no_final_nl,
+        "the working side now ends in a newline"
+    );
+    assert!(
+        !d.bytes_differ_but_lines_equal,
+        "and the banner's fact is cleared"
+    );
+    assert!(
+        !app.refresh_open_diff_views(false, &[]),
+        "and it is not rebuilt again"
+    );
+}
