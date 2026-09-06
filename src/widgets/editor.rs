@@ -4615,6 +4615,17 @@ impl Editor {
                 .is_some_and(|md| md.doc_path.is_some())
     }
 
+    /// The map a save of this tab records beside its history snapshot
+    /// (#349): the buffer's own for text, empty for a viewer, whose
+    /// placeholder line no seat wrote. Read off the tab that was saved, never
+    /// looked up by path: two tabs on one file are two buffers with two maps.
+    pub fn provenance_to_record(&self) -> crate::provenance::Provenance {
+        if self.has_non_text_view() {
+            return crate::provenance::Provenance::new();
+        }
+        self.provenance.clone()
+    }
+
     /// Open `path` as a rendered ANSI log (#257): colours paint through the
     /// theme's palette and escapes never reach the text. Windowed, so the
     /// file is not read whole. Fails (and the caller falls through to the

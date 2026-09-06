@@ -12704,7 +12704,7 @@ fn a_viewer_swap_drops_the_map_and_the_text_reopen_gets_it_back() {
         "and a sync does not credit the viewer's placeholder line"
     );
     assert_eq!(
-        app.provenance_of_tab(&f).attributed(),
+        app.editor.provenance_to_record().attributed(),
         0,
         "a save from the viewer would record no map"
     );
@@ -12742,7 +12742,7 @@ fn a_markdown_preview_save_keeps_the_map() {
         "staging: a markdown preview tab is still saveable text"
     );
     assert_eq!(
-        app.provenance_of_tab(&f).seat(0),
+        app.editor.provenance_to_record().seat(0),
         Some(&Seat::Navigator),
         "the buffer's own text is in `lines`; its map still describes it"
     );
@@ -12751,6 +12751,106 @@ fn a_markdown_preview_save_keeps_the_map() {
     let snaps = wait_for_snapshots(&app.history_root, &f);
     assert_eq!(snaps.len(), 1, "staging: the save recorded a snapshot");
     wait_for_seats(&app.history_root, &f, snaps[0].millis);
+}
+
+/// The lens paints in every pane, so the map is restored onto every open
+/// buffer (#349 review), not only the focused one: a split whose other
+/// group holds the file must not show the lens on with every line blank.
+#[test]
+fn provenance_is_synced_onto_the_inactive_group_too() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\n").unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(0..1, Seat::Navigator);
+    crate::history::record_with_seats_in(
+        hist.path(),
+        &f,
+        &std::fs::read(&f).unwrap(),
+        1_000,
+        &seats,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    // Split before any sync: both groups hold the file, neither knows its map.
+    app.split_editor();
+    let inactive = app.editor_layout.inactive_groups();
+    assert_eq!(inactive.len(), 1, "staging: one inactive group");
+    assert_eq!(
+        inactive[0].path.as_deref(),
+        Some(f.as_path()),
+        "staging: the inactive group holds the file"
+    );
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "staging: the focused tab is synced"
+    );
+    assert_eq!(
+        app.editor_layout.inactive_groups()[0].provenance,
+        seats,
+        "the inactive group's tab is synced too"
+    );
+}
+
+/// A save records the saved tab's own map (#349 review): with the same file
+/// open in two groups, an auto save of the inactive group's buffer must not
+/// persist the focused group's map against bytes it never described.
+#[test]
+fn an_inactive_group_save_records_the_map_of_that_buffer() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    // The focused group's buffer: clean, and wearing a map of its own.
+    app.editor
+        .provenance
+        .record(0..1, Seat::Peer(String::from("ana")));
+    // The inactive group's buffer: the navigator types, so it is dirty and
+    // due, and its map says navigator.
+    {
+        let mut groups = app.editor_layout.inactive_groups_mut();
+        let other: &mut crate::widgets::editor::Editor = &mut *groups[0];
+        assert_eq!(
+            other.path.as_deref(),
+            Some(f.as_path()),
+            "staging: same file"
+        );
+        other.cursor_row = 0;
+        other.cursor_col = 0;
+        other.insert_str_as("nav\n", Seat::Navigator);
+        assert!(other.dirty, "staging: the inactive buffer is dirty");
+        age_last_edit(other);
+    }
+    app.auto_save = true;
+    assert!(
+        app.tick_auto_save(),
+        "staging: the sweep saved the dirty buffer"
+    );
+    assert!(
+        std::fs::read_to_string(&f).unwrap().starts_with("nav\n"),
+        "staging: the inactive buffer's text is what hit the disk"
+    );
+    let snaps = wait_for_snapshots(&app.history_root, &f);
+    assert_eq!(snaps.len(), 1, "staging: the save recorded a snapshot");
+    wait_for_seats(&app.history_root, &f, snaps[0].millis);
+    let recorded = crate::history::seats_for(&app.history_root, &f, snaps[0].millis).unwrap();
+    assert_eq!(
+        recorded.seat(0),
+        Some(&Seat::Navigator),
+        "the sidecar holds the saved buffer's map, not the focused tab's: {recorded:?}"
+    );
 }
 
 /// A restore of a snapshot with no sidecar restores every line unknown
