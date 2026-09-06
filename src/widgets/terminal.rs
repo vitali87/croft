@@ -1398,7 +1398,9 @@ impl PtyTerminal {
     /// the plain row and writes the coloured one can never pair a row with
     /// its neighbour after output landed between two reads. Wide-char
     /// spacers are skipped as in `grid_lines`; trailing default-styled
-    /// blanks are trimmed; every row that set a style ends with a reset.
+    /// blanks are trimmed (a row padded with a coloured background keeps
+    /// those cells, which the plain twin drops, so the two forms can differ
+    /// in length there); every row that set a style ends with a reset.
     pub fn grid_lines_ansi(&self) -> Vec<(String, String)> {
         let term = self.term.lock();
         if term.columns() == 0 {
@@ -1410,9 +1412,13 @@ impl PtyTerminal {
         let mut lines = Vec::new();
         let mut l = top;
         while l <= bottom {
-            // Collect (char, sgr) per cell first so trailing default-styled
-            // blanks can be trimmed before anything is serialised.
-            let mut cells: Vec<(char, String)> = Vec::with_capacity(ncols);
+            // Cells are collected as (char, style key) - three Copy values,
+            // no allocation per cell - so trailing default-styled blanks can
+            // be trimmed before anything is serialised, and the SGR string
+            // is built once per run of equal style rather than once per
+            // cell. This runs under the term lock the reader thread shares,
+            // and a saturated scrollback is hundreds of thousands of rows.
+            let mut cells: Vec<(char, (AnsiColor, AnsiColor, Flags))> = Vec::with_capacity(ncols);
             for c in 0..ncols {
                 let cell = &term.grid()[Point::new(Line(l), Column(c))];
                 if cell
@@ -1422,7 +1428,7 @@ impl PtyTerminal {
                     continue;
                 }
                 let ch = if cell.c == '\0' { ' ' } else { cell.c };
-                cells.push((ch, cell_sgr(cell.fg, cell.bg, cell.flags)));
+                cells.push((ch, (cell.fg, cell.bg, cell.flags)));
             }
             let plain: String = cells
                 .iter()
@@ -1430,27 +1436,27 @@ impl PtyTerminal {
                 .collect::<String>()
                 .trim_end()
                 .to_string();
-            while cells
-                .last()
-                .is_some_and(|(ch, sgr)| *ch == ' ' && sgr.is_empty())
-            {
+            while cells.last().is_some_and(|(ch, (fg, bg, flags))| {
+                *ch == ' ' && style_is_default(*fg, *bg, *flags)
+            }) {
                 cells.pop();
             }
             let mut out = String::new();
-            let mut current = String::new();
-            for (ch, sgr) in cells {
-                if sgr != current {
-                    if !current.is_empty() {
+            let mut current: Option<(AnsiColor, AnsiColor, Flags)> = None;
+            let mut styled = false;
+            for (ch, key) in cells {
+                if current != Some(key) {
+                    if styled {
                         out.push_str("\x1b[0m");
                     }
-                    if !sgr.is_empty() {
-                        out.push_str(&sgr);
-                    }
-                    current = sgr;
+                    let sgr = cell_sgr(key.0, key.1, key.2);
+                    styled = !sgr.is_empty();
+                    out.push_str(&sgr);
+                    current = Some(key);
                 }
                 out.push(ch);
             }
-            if !current.is_empty() {
+            if styled {
                 out.push_str("\x1b[0m");
             }
             lines.push((plain, out));
@@ -4274,6 +4280,27 @@ fn cell_sgr(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> String {
     } else {
         format!("\x1b[{}m", codes.join(";"))
     }
+}
+
+/// Whether a cell carries no colour and no attribute the export would
+/// write: the cheap test the trailing-blank trim uses, with no SGR string
+/// built to find out.
+fn style_is_default(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> bool {
+    let plain = |c: AnsiColor| matches!(c, AnsiColor::Named(n) if named_slot(n).is_none());
+    plain(fg)
+        && plain(bg)
+        && !flags.intersects(
+            Flags::BOLD
+                | Flags::DIM
+                | Flags::ITALIC
+                | Flags::UNDERLINE
+                | Flags::DOUBLE_UNDERLINE
+                | Flags::UNDERCURL
+                | Flags::DOTTED_UNDERLINE
+                | Flags::DASHED_UNDERLINE
+                | Flags::INVERSE
+                | Flags::STRIKEOUT,
+        )
 }
 
 /// One colour as its SGR parameter(s): `30..37`/`90..97` (or the `40..`

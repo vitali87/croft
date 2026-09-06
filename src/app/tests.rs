@@ -26136,6 +26136,155 @@ fn a_scrollback_dump_is_owner_only_on_disk() {
     assert_eq!(dir_mode, 0o700, "and so is the dir that holds it");
 }
 
+/// A dump file must not be shared across croft processes: the pane uid is
+/// a per-process counter that restarts at 1, so the file name carries the
+/// pid too, as the session handoff file does.
+#[test]
+fn a_scrollback_dump_file_is_scoped_to_this_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}PID\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQPID"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let name = app
+        .editor
+        .path
+        .clone()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .expect("the dump has a file name");
+    assert!(
+        name.contains(&format!("-{}-", std::process::id())),
+        "the file name carries this process's pid: {name}"
+    );
+}
+
+/// A stale tab from an earlier dump can live in ANY editor group, not only
+/// the focused one, and every copy must go before the file is rewritten:
+/// a tab left in another group would read the new bytes through its old
+/// index and paint garbage, with nothing to heal it.
+#[test]
+fn a_second_dump_closes_the_stale_tab_in_every_editor_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}GRP\\033[0m\\n\"; read line; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQGRP"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the first dump has a path");
+    // Split: the dump tab now sits in the left group; the right is focused.
+    app.split_editor();
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let stale_elsewhere = app
+        .editor_layout
+        .inactive_groups()
+        .iter()
+        .any(|g| g.find_tab_with_path(&path).is_some());
+    assert!(
+        !stale_elsewhere,
+        "no other group keeps a tab over the rewritten dump file"
+    );
+    assert!(
+        app.editor.find_tab_with_path(&path).is_some(),
+        "the focused group holds the rebuilt dump"
+    );
+}
+
+/// The dump is a new on-disk copy of pane output, so the redact rules must
+/// hold on disk too: the matching row is written masked (and gives up its
+/// colour), while a neighbouring row keeps its colour.
+#[test]
+fn a_scrollback_dump_is_redacted_on_disk_and_only_the_masked_row_loses_colour() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[{ "regex": "token \\S+", "action": "redact" }]"#,
+    ));
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from(
+                "s=QQ; printf \"\\033[32m${s}SAFE\\033[0m\\n\"; \
+                 printf \"\\033[31mtoken ${s}SECRET99\\033[0m\\n\"; sleep 30",
+            ),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "both rows", || {
+        app.terminals[0]
+            .grid_lines()
+            .0
+            .iter()
+            .any(|l| l.contains("QQSECRET99"))
+    });
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the dump has a path");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !on_disk.contains("QQSECRET99"),
+        "the secret never reaches the disk: {on_disk:?}"
+    );
+    let masked_row = on_disk
+        .lines()
+        .find(|l| l.contains(crate::triggers::MASK))
+        .expect("the matching row is written masked");
+    assert!(
+        !masked_row.contains('\x1b'),
+        "the masked row gives up its colour: {masked_row:?}"
+    );
+    let safe_row = on_disk
+        .lines()
+        .find(|l| l.contains("QQSAFE"))
+        .expect("the neighbouring row is there");
+    assert!(
+        safe_row.contains("\x1b[32m"),
+        "and keeps its colour: {safe_row:?}"
+    );
+}
+
 #[test]
 fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
     let tmp = tempfile::tempdir().unwrap();

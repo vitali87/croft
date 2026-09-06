@@ -27329,6 +27329,7 @@ impl App {
         // colour, since a mask spliced between escapes could break them.
         let mut plain_rows: Vec<String> = Vec::with_capacity(last);
         let mut rows: Vec<String> = Vec::with_capacity(last);
+        let mut fallback_reason: Option<String> = None;
         for (plain, ansi) in &rows_both[..last] {
             let masked = crate::triggers::mask_text(plain, &self.triggers, false);
             rows.push(if masked == *plain {
@@ -27349,8 +27350,11 @@ impl App {
             // unnamed shells both read `terminal`, and two labels can
             // sanitise to one name, and neither may overwrite the other's
             // dump or close its tab.
+            // The uid is a per-process counter that restarts at 1, so two
+            // croft processes would share a name without the pid, as the
+            // session handoff file learned before this one.
             let file = self.scrollback_dir.join(format!(
-                "{}-{}-scrollback.log",
+                "{}-{}-{}-scrollback.log",
                 pane.chars()
                     .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' {
                         c
@@ -27358,14 +27362,13 @@ impl App {
                         '_'
                     })
                     .collect::<String>(),
+                std::process::id(),
                 self.terminal().uid()
             ));
             // A tab from an earlier dump holds a byte index over the OLD
             // file; it is closed so the open below rebuilds the view over the
             // new bytes rather than reading them through the stale index.
-            if let Some(idx) = self.editor.find_tab_with_path(&file) {
-                self.editor.close_tab(idx);
-            }
+            self.close_tabs_with_path_everywhere(&file);
             // Terminal output is written owner-only whatever the umask: the
             // redaction rules are finite, and another local account has no
             // business reading a shell's history.
@@ -27385,15 +27388,17 @@ impl App {
                 Ok(()) => {
                     // The open path decided this was not a log after all:
                     // never leave the user an editable file of raw escapes.
-                    if let Some(idx) = self.editor.find_tab_with_path(&file) {
-                        self.editor.close_tab(idx);
-                    }
-                    self.status = String::from("Rendered scrollback unavailable; opened as text");
+                    self.close_tabs_with_path_everywhere(&file);
+                    fallback_reason = Some(String::from(
+                        "Rendered scrollback unavailable; opened as text",
+                    ));
                 }
                 Err(e) => {
                     // Fall through to the plain scratch buffer rather than
                     // lose the dump: a full disk still leaves the text.
-                    self.status = format!("Rendered scrollback unavailable ({e}); opened as text");
+                    fallback_reason = Some(format!(
+                        "Rendered scrollback unavailable ({e}); opened as text"
+                    ));
                 }
             }
         }
@@ -27402,11 +27407,27 @@ impl App {
             Ok(()) => {
                 self.focus_pane(Pane::Editor);
                 self.sync_open_file_poll_mtime();
-                if !self.status.starts_with("Rendered scrollback unavailable") {
-                    self.status = format!("Opened {last} scrollback lines in the editor");
-                }
+                // The reason travels in a local, not in `status`: a message
+                // left by an earlier action must not be mistaken for one
+                // this dump produced.
+                self.status = fallback_reason
+                    .unwrap_or_else(|| format!("Opened {last} scrollback lines in the editor"));
             }
             Err(e) => self.status = format!("Open scrollback failed: {e}"),
+        }
+    }
+
+    /// Close every tab holding `path`, in the focused group and in every
+    /// other one: a tab in an unfocused group would otherwise keep reading a
+    /// rewritten file through its old index, and nothing heals it.
+    fn close_tabs_with_path_everywhere(&mut self, path: &Path) {
+        if let Some(idx) = self.editor.find_tab_with_path(path) {
+            self.editor.close_tab(idx);
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            if let Some(idx) = group.find_tab_with_path(path) {
+                group.close_tab(idx);
+            }
         }
     }
 
@@ -44675,8 +44696,12 @@ fn write_private(dir: &Path, file: &Path, contents: String) -> std::io::Result<(
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        // An existing dir keeps whatever mode it had; make it owner-only too.
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        // Only a dir this call created gets its mode set: `set_permissions`
+        // follows links, and an existing entry here is not this code's to
+        // re-mode blindly.
+        if std::fs::symlink_metadata(dir)?.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
