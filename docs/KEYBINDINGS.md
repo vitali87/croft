@@ -43,6 +43,7 @@ On macOS, the `Cmd` chords below only reach croft after you run a one-time setup
 | Keys | Action |
 |------|--------|
 | `Cmd+K` `Cmd+T` | Open the Color Theme picker |
+| `Cmd+K` `G` | Remote: accept the ssh-pane workspace offer. When a pane's foreground becomes `ssh <host>` for a host in `~/.ssh/config`, the status bar says `Connected to <host> · Open workspace here?`; this chord runs the same remote flow as "Remote: Open Workspace on This Pane's Host" for that host, `Esc` dismisses the offer, and it clears itself when the ssh ends or after 90 s. Off globally with `disable_remote_offer`, per host with `remote_offer_excluded_hosts`; a host whose provisioning failed is not offered again for a week |
 | `Cmd+K` `A` | Session: Participants (who is attached to this persistent session); `Enter` on a row grants/revokes write control or disconnects them |
 | `Cmd+K` `X` | Collab: Cancel AI Stream — stop a `croft pair` collaborator streaming into a shared file; the streamed text is reverted (same action as clicking the orange `■` stop button in the editor gutter while a stream is live) |
 | `Cmd+K` `Q` | Navigator: ask the resident AI pair programmer about the caret line, or the selected lines when a selection is active (opens the instruction box; also on the gutter and body right-click menus) |

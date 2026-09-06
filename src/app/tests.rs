@@ -41698,6 +41698,420 @@ fn a_background_diff_keeps_its_find_band_across_a_rebuild() {
     assert!(seen >= 1, "the background split still holds the diff");
 }
 
+#[test]
+fn an_ssh_session_raises_the_offer_once_and_drops_it_when_the_session_ends() {
+    // #364: the offer appears when a pane's foreground BECOMES `ssh <host>`
+    // for a known host, not on every sample of the same session, and it
+    // leaves with the session.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The refusal memory is read from the real cache directory at startup;
+    // this machine's must not decide the test.
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer
+            .as_ref()
+            .is_some_and(|o| o.pane == pane && o.host == "db-1"),
+        "a new session offers"
+    );
+    assert!(
+        app.status.starts_with("Connected to db-1"),
+        "{:?}",
+        app.status
+    );
+    app.status = String::from("something else happened");
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert_eq!(
+        app.status, "something else happened",
+        "the same session sampled again does not re-prompt"
+    );
+    app.status = String::from("Connected to db-1 · Open workspace here?");
+    app.consider_ssh_offer(pane, None);
+    assert!(
+        app.ssh_offer.is_none(),
+        "the session ended: the offer is gone"
+    );
+    assert!(app.status.is_empty(), "and its status line with it");
+    // A NEW session to the same host offers again.
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+}
+
+#[test]
+fn the_offer_respects_the_global_switch_the_host_list_and_learned_refusals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.remote_offer_excluded = vec![String::from("DB-1")];
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "per-host opt-out, case-insensitive"
+    );
+    app.remote_offer_excluded.clear();
+    app.remote_offer_refused
+        .insert(String::from("db-1"), std::time::SystemTime::now());
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "a host that refused provisioning is not offered"
+    );
+    app.remote_offer_refused.clear();
+    app.remote_offer_disabled = true;
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_none(), "the global switch");
+    app.remote_offer_disabled = false;
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_some(),
+        "and with every gate open it offers"
+    );
+}
+
+#[test]
+fn accepting_or_dismissing_the_offer_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The refusal memory is read from the real cache directory at startup;
+    // this machine's must not decide the test.
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert_eq!(app.accept_ssh_offer().as_deref(), Some("db-1"));
+    assert!(app.ssh_offer.is_none() && app.status.is_empty());
+    assert_eq!(app.accept_ssh_offer(), None, "nothing to accept twice");
+
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+    // Esc dismisses through the ordinary key path, whatever pane has focus.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.ssh_offer.is_none(), "Esc dismissed the offer");
+    assert!(app.status.is_empty());
+}
+
+#[test]
+fn an_untouched_offer_expires_and_a_closed_pane_takes_its_offer_along() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The refusal memory is read from the real cache directory at startup;
+    // this machine's must not decide the test.
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    app.ssh_offer.as_mut().unwrap().since =
+        std::time::Instant::now() - SSH_OFFER_TTL - std::time::Duration::from_secs(1);
+    app.expire_ssh_offer();
+    assert!(
+        app.ssh_offer.is_none(),
+        "an offer past its TTL clears itself"
+    );
+
+    app.split_terminal().unwrap();
+    let second = app.terminals[1].uid();
+    app.consider_ssh_offer(second, Some(String::from("db-1")));
+    assert!(app.ssh_offer.as_ref().is_some_and(|o| o.pane == second));
+    assert!(app.close_terminal_at(1));
+    app.expire_ssh_offer();
+    assert!(
+        app.ssh_offer.is_none(),
+        "the pane that owned the offer is gone"
+    );
+    assert!(
+        !app.ssh_offer_seen.contains_key(&second),
+        "and its per-pane memory went with it"
+    );
+}
+
+#[test]
+fn a_pane_that_moves_to_another_host_loses_the_old_offer_even_if_the_new_one_is_excluded() {
+    // `ssh a cmd; ssh b cmd` inside one sample gap: the offer for A must not
+    // stay up (and be accepted with Cmd+K G) once the pane is on B, whether
+    // or not B itself is offerable.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.remote_offer_excluded = vec![String::from("b")];
+    app.consider_ssh_offer(pane, Some(String::from("a")));
+    assert!(app.ssh_offer.as_ref().is_some_and(|o| o.host == "a"));
+    app.consider_ssh_offer(pane, Some(String::from("b")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "the offer for A fell when the pane moved to B"
+    );
+    assert!(app.status.is_empty());
+}
+
+#[test]
+fn the_offer_switches_apply_on_a_settings_remerge() {
+    // The two prefs re-apply on a config save like every other boolean pref,
+    // and switching the offer off takes down one already on screen.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The refusal memory is read from the real cache directory at startup;
+    // this machine's must not decide the test.
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+    let mut prefs = crate::prefs::Prefs {
+        disable_remote_offer: true,
+        remote_offer_excluded_hosts: vec![String::from("jump")],
+        ..Default::default()
+    };
+    app.apply_merged_settings(&prefs);
+    assert!(app.remote_offer_disabled && app.remote_offer_excluded == vec![String::from("jump")]);
+    assert!(
+        app.ssh_offer.is_none(),
+        "the live offer went down with the switch"
+    );
+    prefs.disable_remote_offer = false;
+    app.apply_merged_settings(&prefs);
+    assert!(!app.remote_offer_disabled);
+    // An offer on screen for a host that just joined the exclusion list
+    // goes down too, not only on the global switch.
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+    prefs.remote_offer_excluded_hosts = vec![String::from("db-1")];
+    app.apply_merged_settings(&prefs);
+    assert!(
+        app.ssh_offer.is_none(),
+        "the newly excluded host's offer went down"
+    );
+}
+
+#[test]
+fn switching_the_offer_off_and_on_forgets_what_each_pane_was_last_seen_on() {
+    // While the offer is off the label thread ships no samples, so the
+    // per-pane memory stops tracking reality. Session A on db-1, offer off,
+    // session A ends and session B to db-1 starts, offer on: B is a new
+    // session and must be offered, not mistaken for a continuation of A.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+    let mut prefs = crate::prefs::Prefs {
+        disable_remote_offer: true,
+        ..Default::default()
+    };
+    app.apply_merged_settings(&prefs);
+    assert!(app.ssh_offer.is_none(), "the switch took the offer down");
+    // No `None` sample in between: nothing observed the gap.
+    prefs.disable_remote_offer = false;
+    app.apply_merged_settings(&prefs);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.as_ref().is_some_and(|o| o.host == "db-1"),
+        "the first session seen after a re-enable is offered"
+    );
+}
+
+#[test]
+fn taking_a_host_off_the_exclusion_list_offers_the_session_already_on_it() {
+    // A pane sampled on db-1 while db-1 was excluded is remembered as seen
+    // there; the same host on the next sample would read as the same
+    // session and never prompt. Un-excluding the host forgets that, so the
+    // next sample offers it.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    let mut prefs = crate::prefs::Prefs {
+        remote_offer_excluded_hosts: vec![String::from("DB-1")],
+        ..Default::default()
+    };
+    app.apply_merged_settings(&prefs);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_none(), "excluded: no offer");
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "still the same session, still excluded"
+    );
+    prefs.remote_offer_excluded_hosts.clear();
+    app.apply_merged_settings(&prefs);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer
+            .as_ref()
+            .is_some_and(|o| o.pane == pane && o.host == "db-1"),
+        "the live session is offered once its host is allowed again"
+    );
+    // A pane on a host that stayed excluded is untouched by the change.
+    prefs.remote_offer_excluded_hosts = vec![String::from("jump"), String::from("db-1")];
+    app.apply_merged_settings(&prefs);
+    assert!(
+        app.ssh_offer.is_none(),
+        "re-excluding db-1 takes its offer down"
+    );
+    app.consider_ssh_offer(pane, Some(String::from("jump")));
+    prefs.remote_offer_excluded_hosts = vec![String::from("jump")];
+    app.apply_merged_settings(&prefs);
+    app.consider_ssh_offer(pane, Some(String::from("jump")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "jump stayed excluded and stayed quiet"
+    );
+}
+
+#[test]
+fn an_in_memory_refusal_stops_blocking_once_its_window_has_passed() {
+    // The TTL is applied when the policy is asked, not only when the file
+    // is loaded: a croft left open past the window offers the host again.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.remote_offer_refused.insert(
+        String::from("db-1"),
+        std::time::SystemTime::now()
+            - crate::remote::REFUSED_HOST_TTL
+            - std::time::Duration::from_secs(60),
+    );
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_some(),
+        "a refusal older than the TTL no longer suppresses the offer"
+    );
+}
+
+#[test]
+fn cmd_k_g_with_no_offer_open_says_so_instead_of_connecting() {
+    // The chord's guidance branch: nothing to accept, nothing launched, a
+    // status that says where the offer comes from. (The accept branch runs
+    // `request_remote_launch`, which spawns a real ssh; `accept_ssh_offer`
+    // is covered directly instead of reaching the network from a test.)
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.ssh_offer.is_none());
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('g'), KeyModifiers::NONE)));
+    assert!(
+        app.status.starts_with("No ssh workspace offer is open"),
+        "status: {}",
+        app.status
+    );
+    assert!(app.connect_dialog.is_none(), "nothing was launched");
+    assert!(app.pending_remote_launch_host.is_none());
+}
+
+#[test]
+fn ssh_samples_from_the_label_thread_drive_the_offer_by_shell_pid() {
+    // The label thread ships `(shell pid, host)`; the app maps the shell pid
+    // to the pane's uid and feeds the same transition logic the direct tests
+    // cover. An unknown shell pid is ignored.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let shell = app.terminals[0]
+        .shell_pid()
+        .expect("the pane has a shell pid");
+    let uid = app.terminals[0].uid();
+    app.apply_ssh_samples(vec![
+        (shell, Some(String::from("db-1"))),
+        (-42, Some(String::from("x"))),
+    ]);
+    assert!(
+        app.ssh_offer
+            .as_ref()
+            .is_some_and(|o| o.pane == uid && o.host == "db-1")
+    );
+    app.apply_ssh_samples(vec![(shell, None)]);
+    assert!(
+        app.ssh_offer.is_none(),
+        "the session ended through the same path"
+    );
+}
+
+#[test]
+fn a_failed_provisioning_is_remembered_and_a_later_success_forgets_it() {
+    // Drives the two notes the install session calls, against the cache-dir
+    // override so nothing touches this machine's real memory.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+        }
+    }
+    let _restore = Restore;
+    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        app.remote_offer_refused.is_empty(),
+        "a fresh cache dir remembers nothing"
+    );
+    let pane = app.terminals[0].uid();
+
+    app.note_provisioning_failed("DB-1");
+    assert!(
+        app.remote_offer_refused.contains_key("db-1"),
+        "remembered in memory, lower-cased"
+    );
+    let refused_path = crate::remote::refused_hosts_path(&tmp.path().join("cache"));
+    let on_disk = crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now());
+    assert!(on_disk.contains_key("db-1"), "and on disk: {on_disk:?}");
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_none(), "a refused host is not offered");
+
+    app.note_provisioning_succeeded("db-1");
+    assert!(
+        !app.remote_offer_refused.contains_key("db-1"),
+        "a success forgets it in memory"
+    );
+    let on_disk = crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now());
+    assert!(!on_disk.contains_key("db-1"), "and on disk");
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some(), "and the host is offered again");
+}
+
+#[test]
+fn a_success_forgets_a_refusal_another_croft_recorded() {
+    // The refusal file is shared by every croft on the machine. A refusal
+    // this instance never loaded (recorded by another one after this one
+    // started) must still be erased by a success here, or it outlives the
+    // host that demonstrably works for its whole seven-day TTL.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+        }
+    }
+    let _restore = Restore;
+    let cache = tmp.path().join("cache");
+    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(cache.clone());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let refused_path = crate::remote::refused_hosts_path(&cache);
+    // "Another instance" writes the refusal behind this one's back.
+    crate::remote::remember_refused_host(&refused_path, "db-1", std::time::SystemTime::now())
+        .unwrap();
+    assert!(
+        crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now())
+            .contains_key("db-1")
+    );
+    app.note_provisioning_succeeded("DB-1");
+    assert!(
+        !crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now())
+            .contains_key("db-1"),
+        "the disk refusal is gone even though this instance never held it"
+    );
+}
+
 /// Stand up a `croft view` listener on `app` without touching process env.
 ///
 /// The real `bind_view_socket` also exports `CROFT_VIEW_SOCK`, which is
