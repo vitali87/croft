@@ -212,14 +212,17 @@ jobs:
         env:
           RUST_TEST_THREADS: 4
       - name: fs-sync 200 ms invariant (serial, wall clock)
-        # The product invariant that an external file change reaches the
-        # Explorer within 200 ms, measured as wall clock. It is #[ignore]d in
-        # the suite because a parallel run is itself the load (#483): the
-        # scheduler, not croft, decides whether a test thread runs again
-        # inside 200 ms while its neighbours spawn shells. Run alone, after
-        # the suite, on a runner with nothing else to do, the clock means
-        # what it says.
-        run: cargo test --locked fs_sync_reflects -- --ignored --test-threads=1
+        # The #[ignore]d wall-clock test (see
+        # fs_sync_reflects_external_changes_within_200ms_wall_clock in
+        # src/app/tests.rs for why it runs alone, #483). The filter is coupled
+        # to that name by nothing but convention, and a filter that selects
+        # no test exits 0, so the step requires the bin target to report
+        # exactly one test before it counts as run.
+        run: |
+          set -o pipefail
+          cargo test --locked fs_sync_reflects -- --ignored --test-threads=1 2>&1 | tee fs-sync.log
+          grep -q '^running 1 test$' fs-sync.log \
+            || { echo "::error::fs_sync_reflects selected no test: the filter and the test name have drifted"; exit 1; }
 
   cross-musl:
     name: ship-path build (${{ matrix.target }})
