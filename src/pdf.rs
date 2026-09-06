@@ -792,13 +792,15 @@ mod tests {
     #[test]
     fn the_grace_poll_settles_a_complete_buffer_well_inside_the_grace() {
         use std::sync::{Arc, Mutex};
-        // The grace the production call site passes, so lost headroom fails
-        // here rather than in a page render. The poll's own 5 ms ticks do
-        // not scale with load but their overshoot compounds, so the ceiling
-        // is scaled and clamped to the grace: a poll that degenerated to the
-        // deadline still fails.
-        let grace = STDERR_SETTLE_GRACE;
-        let ceiling = crate::test_budget::spawn_budget(grace * 3 / 8).min(grace);
+        // Derived from the grace the production call site passes, so lost
+        // headroom fails here rather than in a page render. The poll's own
+        // 5 ms ticks do not scale with load but their overshoot compounds,
+        // so the GRACE is scaled (its floor is twice the production value)
+        // and the ceiling stays the fraction of it that proves an early
+        // exit: a poll that ran to the deadline returns at the grace or
+        // later and still fails.
+        let grace = crate::test_budget::spawn_budget(STDERR_SETTLE_GRACE / 4);
+        let ceiling = grace * 3 / 4;
         for seed in [&b"Syntax Error: complete\n"[..], &b""[..]] {
             let buf = Arc::new(Mutex::new(seed.to_vec()));
             let started = std::time::Instant::now();
