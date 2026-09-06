@@ -334,6 +334,14 @@ fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
 /// open reports a failure instead of parking the frame loop (#493).
 const PDF_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a failed render's stderr is given to finish arriving after the
+/// exit was observed (#493). The settle poll reads it once it has been
+/// quiet for ~60 ms of ticks (≈85 ms of wall clock with per-tick overhead),
+/// so this is sized to leave that early exit real headroom rather than
+/// being the exit itself; the worst case, a renderer that keeps writing,
+/// pays the whole grace once, on a path that has already failed.
+const STDERR_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Test-only: the next `rasterize_page` call for exactly this (path, page)
 /// fails once, simulating a transient rasteriser failure (a spawn refused
 /// under load, an OOM-killed child). Keyed on the full path so parallel
@@ -396,7 +404,7 @@ fn run_pdftoppm(
     use std::process::Stdio;
     use std::sync::{Arc, Mutex};
     let dir = unique_temp_dir("croft-pdf")?;
-    let _guard = TempDirGuard(dir.clone());
+    let guard = TempDirGuard(dir.clone());
     let prefix = dir.join("page");
     // Null and piped, never inherited: the child must not touch croft's TTY.
     // A half-written PDF (pdflatex rewriting the open file) made pdftoppm
@@ -455,7 +463,7 @@ fn run_pdftoppm(
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
             Ok(None) => {
-                kill_group(child);
+                kill_group(child, guard);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
@@ -466,13 +474,13 @@ fn run_pdftoppm(
                 ));
             }
             Err(e) => {
-                kill_group(child);
+                kill_group(child, guard);
                 return Err(e);
             }
         }
     };
     if !status.success() {
-        let text = settle_stderr(&stderr_buf, std::time::Duration::from_millis(100));
+        let text = settle_stderr(&stderr_buf, STDERR_SETTLE_GRACE);
         return Err(std::io::Error::other(format!(
             "{} exited with {status}: {text}",
             program.display()
@@ -523,13 +531,18 @@ fn settle_stderr(
 
 /// Kill the renderer's whole process group on the budget's overrun (and on
 /// a wait error); a renderer that exited on its own is not chased, whatever
-/// it forked. The reap happens on its own thread: a renderer stalled in
-/// uninterruptible I/O (a stuck filesystem is one of the hangs this bound
-/// exists for) keeps SIGKILL pending until the kernel lets it go, and a
-/// synchronous `wait` here would hold the frame loop for exactly as long
-/// as the budget was meant to stop it being held. Off unix only the child
-/// itself can be killed.
-fn kill_group(mut child: std::process::Child) {
+/// it forked. The reap still happens, on its own thread: a renderer stalled
+/// in uninterruptible I/O (a stuck filesystem is one of the hangs this
+/// bound exists for) keeps SIGKILL pending until the kernel lets it go, and
+/// a synchronous `wait` here would hold the frame loop for exactly as long
+/// as the budget was meant to stop it being held. The scratch dir's guard
+/// goes with the child, so the dir is removed only once the renderer is
+/// reaped; deleting it under a child still stalled in I/O would orphan its
+/// output. One such thread exists per overrun of a user-initiated render,
+/// each blocked in `wait` for as long as its renderer stays stuck, which is
+/// bounded by the user's page turns rather than by the frame rate. Off unix
+/// only the child itself can be killed.
+fn kill_group(mut child: std::process::Child, scratch: TempDirGuard) {
     #[cfg(unix)]
     {
         // SAFETY: a negative pid addresses the process group the child was
@@ -544,6 +557,7 @@ fn kill_group(mut child: std::process::Child) {
         // The non-unix path, and a no-op on unix after the group signal.
         let _ = child.kill();
         let _ = child.wait();
+        drop(scratch);
     });
 }
 
@@ -776,14 +790,17 @@ mod tests {
     #[test]
     fn the_grace_poll_settles_a_complete_buffer_well_inside_the_grace() {
         use std::sync::{Arc, Mutex};
-        let grace = std::time::Duration::from_millis(500);
+        // The grace the production call site passes, so lost headroom fails
+        // here rather than in a page render; three quarters leaves the
+        // ~85 ms quiet exit room to stretch under load.
+        let grace = STDERR_SETTLE_GRACE;
         for seed in [&b"Syntax Error: complete\n"[..], &b""[..]] {
             let buf = Arc::new(Mutex::new(seed.to_vec()));
             let started = std::time::Instant::now();
             let _ = settle_stderr(&buf, grace);
             let took = started.elapsed();
             assert!(
-                took < grace / 2,
+                took < grace * 3 / 4,
                 "a settled buffer does not pay the whole grace: {took:?} for seed {seed:?}"
             );
         }
