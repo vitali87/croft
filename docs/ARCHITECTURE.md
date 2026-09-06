@@ -132,7 +132,6 @@ src/
 │   ├── registry.rs           data-driven command registry: `contributed_commands()` for eager palette registration and `resolve_command_in_dir()` for lazy tool/server resolution from `[[commands]]`/`[[mcp_servers]]`, plus the `[[viewers]]` lookups
 │   ├── catalog.rs            the curated MCP catalog (AVAILABLE tier of the Extensions panel): bundled CATALOG_MANIFESTS merged with the remote signed index, with install/uninstall gated by provenance so croft removes only what it added, never a hand-dropped user manifest
 │   └── registry_index.rs the remote vetted index (extensions.croft.software): fetches index.json plus its signature and verifies ed25519 against a baked `INDEX_PUBLIC_KEY` BEFORE caching; stale-while-revalidate, disarmed when the key is all-zero
-│                     the remote vetted index (extensions.croft.software): fetches index.json plus its signature and verifies ed25519 against a baked `INDEX_PUBLIC_KEY` BEFORE caching; stale-while-revalidate, disarmed when the key is all-zero
 ├── lsp/                 LSP client stack
 │   ├── mod.rs
 │   ├── client.rs             async-lsp client wrapper: routes diagnostics and `$/progress` to the status bar, acknowledges refresh requests into shared re-pull flags, declares `workspace.workspaceFolders` and answers the server→client folder request from the same list initialize carried
@@ -144,7 +143,6 @@ src/
 │   ├── manifest.rs           declarative `extension.toml` loader for the extension system: parses a manifest's `[[languages]]`, `[[language_servers]]`, `[[themes]]`, `[[debug_adapters]]`, `[[test_runners]]`, `[[mcp_servers]]`, `[[commands]]` and `[[viewers]]` blocks
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
-│                     content-keyed disk cache of semantic-token batches at `~/.croft/sem-cache`; a batch is applied or stored only while its `seq` still matches the live buffer, so a stale reply is never decoded over rewritten lines
 │   ├── semantic_cache.rs content-keyed disk cache of semantic-token batches at `~/.croft/sem-cache`; a batch is applied or stored only while its `seq` still matches the live buffer, so a stale reply is never decoded over rewritten lines
 │   └── trace.rs         raw JSON-RPC trace tee (OUTPUT panel RPC toggle): TraceRead/TraceWrite wrap a server's stdio and, only while tracing is enabled, reassemble Content-Length frames each way into the server's "<name> (trace)" channel (Zed's RPC-messages equivalent)
 └── widgets/
@@ -790,6 +788,294 @@ An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, mul
 The Source Control sidebar widget, including the multi-root REPOSITORIES overview.
 
 **The repositories overview.** One row per workspace folder that is a repo, each with a disambiguated label, its branch, and a porcelain change count from `GitStatus.changed_count`. The active row is highlighted, and the overview paints in the no-repo state too so other folders' repos stay reachable. Clicking a row PINS the panel via `App::scm_pin`, released when the focus-derived folder changes. The activity badge sums `changed_count` across all workers.
+### agents.rs
+
+Tracks agent lanes: which panes are running a coding agent, and whether that agent is working, waiting for the user, or idle. `claude`, `codex`, `aider` and `gemini` are built in, and `~/.config/croft/agents.json` extends or replaces those rows and is reloaded on save. A row's `launch` is the command a worktree lane starts the agent with.
+
+**How the state is judged.** The status comes from the pane's last-output stamp and its last visible rows, matched against the agent's prompt patterns. An agent in the foreground never emits OSC 133 marks, so there is no shell-integration signal to read instead.
+
+**What the UI shows.** The pill wears `◆ claude ◐`, and the status bar counts seated agents with a click that reveals the waiting pane. `AgentEvent::{Seated, Working, Waiting, Gone}` are queued for the tick, with `Waiting` fired once per prompt.
+
+### ansi_text.rs
+
+An SGR span parser for colour-bearing text. One pass turns a raw line into visible text plus styled spans, covering 16 / 256 / truecolor, bold, dim, italic, underline and inverse.
+
+**Why non-SGR escapes are dropped.** Cursor movement, OSC and DCS sequences are discarded because a log file is a stream transcript, not a screen.
+
+**Two entry points, one allocation.** `parse_into` writes into a caller-owned line so a bulk scan reuses one allocation instead of building a String and a span Vec per line. `parse_line` wraps it for one-shot callers.
+
+**One implementation on purpose.** There is a single copy of the stripping rules. A second "just strip the escapes" implementation would drift from this one, and everything that trusts the stripped text — find, copy, `path:line` scanning — must see the same characters the renderer painted.
+
+### archive.rs
+
+The archive browser core. It lists members without reading payloads: zip/jar/whl through the central directory, tar and tar.gz through a header walk.
+
+**Why the size gate comes before the parse.** Each branch is bounded by FILE SIZE before parsing. Tar is capped at `TAR_LIST_CAP`, with an additional decoded-byte cap while a `.tar.gz` streams. Zip is capped at `ZIP_LIST_CAP`, because a zip's members cost ~87 bytes each, so a file under the editor's 50MB cap can declare 400k of them and take 1.65s to list on the frame loop. `ZipArchive::new` parses the whole central directory before any count exists, so the gate has to precede it.
+
+**Extraction is lexically contained.** `extract_member` writes ONE member into a destination under a strictly LEXICAL containment check: absolute paths, drive prefixes and `..`-traversal are refused before anything is written, and zip-slip is tested. Extraction is capped at 100MB.
+
+**How it reaches the editor.** The editor holds the read-only browser tab with selection nav and click-select/click-open. Enter extracts to the session scratch dir and reopens the copy through the standard open dispatch, so every member renders with its real viewer. Sniffed zip, gzip and tar containers route here before the hex fallback.
+
+### captures.rs
+
+The panel group's CAPTURES tab, modelled on iTerm2's Capture Output. It holds output lines collected by `capture` triggers — the pane label, the interpolated message, and the whole escape-stripped line — with the newest selected. It is a pure widget, capped at 500 entries.
+
+**Jumping back to the line.** Enter or a click has the App switch to TERMINAL, find the pane by shell pid, locate the newest grid row matching the captured text, scroll it into view and select it. The match is a prefix match, since long lines wrap.
+
+**Asking Navigator about a line.** It also shapes the "Ask Navigator about this line" turn: `context_window` gives the rows around the hit, `first_file_ref` gives the leftmost `path:line` in the line, and `ask_prompt` masks the line, the trigger message and the context through the caller's redaction, capping the excerpt at `ASK_CONTEXT_CHARS`.
+
+### catalog.rs
+
+The curated MCP catalog, the AVAILABLE tier of the Extensions panel. Bundled `CATALOG_MANIFESTS` (Web Fetch, Time, MarkItDown and csvlens) are merged with the remote signed index. csvlens is a `[[viewers]]` entry: a terminal program run on a file in its own pane rather than an MCP sidecar.
+
+**Install and uninstall paths.** `install()` writes a bundled entry's manifest, or delegates a remote id to `registry_index::install_remote` (Available → Add → Installed). `uninstall_in()` removes it (Installed → Available).
+
+**The provenance gate.** `is_removable()` is `is_catalog_entry() ‖ registry_index::is_index_entry()`, so croft removes only what it added — bundled or vetted-index — and never a hand-dropped user manifest.
+
+**Destructive actions need confirmation.** Add goes through the panel's +Add. Remove goes through the trash button or Delete, and both open a confirmation popup (`InputPurpose::ExtensionUninstall`, Enter uninstalls, Esc keeps), so a destructive action never fires from a single click or keypress.
+
+### client.rs
+
+The async-lsp client wrapper. Its router forwards diagnostics and work-done progress (`$/progress`, for example rust-analyzer's "Indexing…") to the status bar, and acknowledges workspace refresh requests (`semanticTokens/refresh`, `inlayHint/refresh`) into shared re-pull flags the app polls.
+
+**Workspace folders declared and answered from one list.** It declares the `workspace.workspaceFolders` capability, because without it a server may legally ignore the folders array in `initialize`. It answers the LSP 3.6 server→client `workspace/workspaceFolders` request with the same folder list `initialize` carried — one list serves both, so they can never disagree. `didChangeWorkspaceFolders` waits for a multi-root add/remove-folder lifecycle.
+
+**Server stderr keeps its severity.** stderr lines land in OUTPUT at the severity of their tracing level token (`stderr_level`), not a blanket info.
+
+### command_history.rs
+
+Durable cross-session shell command history, the atuin model embedded in the editor. Every command a shell-integrated pane finishes is appended as one JSONL line under `~/.config/croft/command_history.jsonl` with cwd, exit, duration and timestamp.
+
+**No shell-side hooks needed.** The reader thread extracts the typed text from the OSC 133 B→C mark span at the `133;D` mark (`FinishedCommand`), so the record needs nothing installed on the shell side.
+
+**Search and compaction.** `search` is newest-first, case-insensitive substring, deduped to the newest run per command text, with scopes all / this-directory / failed-only. The file compacts back to the newest 10k entries once it doubles past the cap.
+
+**Using it.** Ctrl+Shift+H opens the popup (`widgets/history_popup.rs`); Enter types the pick at the prompt without running it.
+
+### extensions.rs
+
+The Extensions sidebar widget. It projects the bundled and user extension manifests (`lsp/manifest.rs` summaries) into a theme-aware list, grouped under BUILT-IN, INSTALLED and AVAILABLE headers.
+
+**Row anatomy and affordances.** Each row is a coloured language/file mark, a name, a blurb, and a rounded pill toggle (Powerline caps plus knob, brand-teal on, grey off). AVAILABLE rows get a +Add affordance; removable INSTALLED rows get a trash button, just left of the switch. A local filter box narrows by name, blurb or id — there is no marketplace — with a clear (✕) and a refresh (⟳) affordance.
+
+**The widget reports, App owns the state.** Row, switch, trash, clear and refresh clicks are reported back to App through `click_uninstall` / `click_action` / `click_clear` / `click_refresh` / `item_at`. App owns the disabled-set prefs, the catalog install/uninstall, the remote-index refresh, and the per-control hover tooltips, which fire only over a control and never over the row body.
+
+### hover_popup.rs
+
+An anchored popup with a 300 ms dwell. It serves the LSP hover (wide), the tab-path tooltip, and `new_compact` button hints (shrink-to-fit) for chrome controls, all driven off one `ui_tooltip_at` dispatch in `app/mod.rs`.
+
+**Peek Definition.** It also renders Peek Definition (Alt+F12 or the palette). The same LSP definition request, tagged with `peek_definition_request_id`, opens a caret-anchored excerpt popup: a `status_path(path):line` header, a `peek_excerpt` window (4 above, 12 total, clamped), and the definition row marked `▶`. Text comes from the buffer when the target file is the open one, so unsaved edits are visible, and from disk otherwise. Enter converts to the real jump, Esc closes, and any other key closes and keeps its meaning.
+
+**F12 no longer tolerates a stray ALT bit.** Bare F12 now rejects it, so that fold-noise lands on the strictly-less-disruptive peek instead.
+
+### http_file.rs
+
+Support for `.http` and `.rest` request files. The REST-Client format is parsed — `###` blocks, headers, bodies, and `{{variables}}` from a `.http.env.json` beside the file or from `{{$env.NAME}}` — and sent on a worker thread through `ureq`.
+
+**What counts as an error.** A non-2xx status is a response, not an error. Bodies are capped at 8 MiB.
+
+**The response is an ordinary tab.** The result renders as a response document the editor opens like any other tab: `.jsonc` with the status and headers as `//` comments and the body pretty-printed, or `.xml`, `.txt`, or the image bytes themselves.
+
+**Secrets never leave substitution.** History and the response document carry the RAW request line with variables unresolved, and a `{{name}}` with no value refuses to send rather than leak the hole to a server.
+
+### import_vscode.rs
+
+A one-shot VS Code profile import behind `croft import-vscode`. It locates the user directory per platform (VS Code, Insiders, VSCodium, Cursor, Windsurf) and converts `settings.json`, `keybindings.json`, `snippets/*.json`, and the colour theme named by `workbench.colorTheme` — resolved from the product's extensions directory and converted through `vscode_theme.rs` — into croft's own files.
+
+**Three conversions of very different difficulty.** Snippets are nearly free, since croft's format already mirrors VS Code's; the only real work is that VS Code carries a snippet's language in the FILE NAME while croft carries it in a `scope` field. Keybindings share a file shape but no command ids, so they convert through a table whose every entry is checked against `Command::from_id` by a test. Settings genuinely differ, so only keys croft has a real equivalent for are mapped.
+
+**Unmapped items are reported, not dropped.** "My settings imported" and "my settings are gone" must not look the same.
+
+**Merge, never overwrite.** An existing croft value always wins and the conflict is listed, which is also what makes a second run a no-op.
+
+### launcher.rs
+
+The macOS `croft install-launcher` command. It builds a clickable Croft.app via `osacompile`, then brands the plist with PlistBuddy.
+
+**Why an AppleScript applet, not a shell bundle.** A double-clicked document arrives as an `odoc` Apple Event that only an `on open` handler can receive, so a `#!/bin/sh` bundle cannot work. Opened files launch `--zen`.
+
+**Why the deletes are separate best-effort calls.** PlistBuddy exits non-zero on deleting an absent key, and the cleanup deletes target keys `osacompile` never emits: `CFBundleIconName` is always absent, and `CFBundleDocumentTypes` is cleared before the rebuild. One shared exit status failed every install before signing and registration, so the deletes now run as separate best-effort invocations while the required Add/Set batch stays fatal.
+
+**Signing and registration.** It finishes with an ad-hoc `codesign`, because editing `Info.plist` invalidates `osacompile`'s signature, plus an `lsregister` nudge so Spotlight sees the bundle.
+
+### locate.rs
+
+Maps a test name to a source location. `--list` carries no file or line, so `find_test_source` walks the workspace grepping `fn <leaf>` and ranks files by module-path match.
+
+**What the walk skips.** `.gitignore` is honoured even outside a git checkout, via `require_git(false)`. `target` and `node_modules` are always skipped, because build output can define a same-named fn.
+
+**Languages that carry their own file.** pytest and JS node IDs carry their file, so those grep just that file with the escaped title. JS prefers a `test(`/`it(` declaration line over a comment or fixture that merely mentions the title, falling back to the bare title.
+
+**Kept off the render loop.** The app runs it on a background thread, with `test_jump_rx` drained in `sync_explorer_panels` and replies from before a re-root dropped, so a big workspace cannot freeze the render loop.
+
+**Buffer-local scans.** `enclosing_fn_name` (run-at-cursor, total on an empty buffer) and `test_fn_on_line` (the gutter play glyph) scan the open buffer.
+
+### magic.rs
+
+Content-based format detection: a pure magic-byte signature table covering PNG, JPEG, GIF, WebP and BMP, PDF, the zip family, gzip, tar's offset-257 `ustar`, and SQLite.
+
+**Second hint, not first.** It is consulted as the SECOND routing hint in `Editor::open`. The extension stays first, and sniffing decides when the extension gave no answer or lied — an image or sheet extension whose decode or parse fails falls through rather than failing the open.
+
+**Where sniffed types go.** Sniffed images and PDFs re-route to their viewers. A zip container gets one xlsx attempt through `open_sheet_with_kind`, which bypasses calamine's extension-resolved `open_workbook_auto`. Every failed attempt continues into the text/binary path, whose hex fallback guarantees the open never dead-ends.
+
+### merge.rs
+
+Merge-conflict machinery. It scans VS Code-regex markers (`<<<<<<<`, `|||||||` diff3 base, `=======`, `>>>>>>>`) into `ConflictBlock`s, and does Accept Current / Incoming / Both resolution by line-splicing.
+
+**Caching that cannot go stale.** The editor caches blocks per `edit_seq`. Every whole-buffer swap bumps the seq, including image, sheet and PDF previews, so the cache can never go stale. The editor tints the regions, and Cmd+. opens the resolve picker. Palette merge commands refuse non-text tabs.
+
+**The guided flow.** Source Control classifies unmerged porcelain codes into a MERGE CONFLICTS section whose entries open the working file parked on the first conflict. F7 and Shift+F7 wrap between blocks. Each header row paints clickable `[Accept …]` actions, with hit spans cleared per render — the frame-truth invariant — and the inline blame annotation is suppressed inside blocks so it cannot overpaint them.
+
+**Bulk accept and completion.** "Accept All Current/Incoming" splices every block back-to-front, one undo step each. "Merge: Complete Merge" refuses while blocks remain, then saves and `git add`s the file so it rejoins the staged flow.
+
+### merge_editor.rs
+
+A three-way merge editor following VS Code's 2022 merge-editor model. `MergeView` diffs base→ours and base→theirs with `build_diff_rows`, clusters transitively overlapping hunks in doubled coordinates so that same-point insertions conflict while adjacent hunks stay independent, auto-resolves one-sided clusters straight into the initial Result, and keeps base text in the conflict regions.
+
+**The Result is the ordinary buffer.** The view only tracks each region's span. Accepts splice through one undo step, and manual edits reconcile per-frame off `merge_edit_row`/`edit_seq` and mark the region manually resolved. Because the Result is the host editor's own buffer, LSP, undo and save need nothing special, and the renderer just carves Current | (Base) | Incoming panes off the top of the editor rect — stacked when narrow, with checkbox gutters clickable per conflict.
+
+**Where the sides come from.** Inputs are `git show :1:/:2:/:3:` via `git::read_file_at_stage`, where missing stages are empty sides (AA/DU/UD), or synthesized from the marker scan for a plain conflicted file. SCM's MERGE CONFLICTS entries open this editor, and "Reopen as Text" reaches the unchanged in-buffer marker flow.
+
+### notebook.rs
+
+The Jupyter rendered view. An `.ipynb` file parses into the same `(lines, images)` state the Markdown preview machinery already renders, so wrap, scroll, the inline-image overlay and Reopen as Text (the raw JSON, sticky via `force_text`) all come for free.
+
+**Cell rendering.** Markdown cells go through the markdown builder, with anchors offset into the merged document. Code cells render as fenced blocks in the kernelspec language under an `In [n]` frame. Stream and error outputs paint dim or red with ANSI stripped, and `image/png` outputs decode into hash-named scratch files that reserve overlay rows the way Markdown pictures do.
+
+**Dispatch.** The preview carries a `notebook` flag so the stale-rebuild and theme-switch paths route to this builder rather than the plain Markdown one.
+
+**No kernels.** The view is read-only truth about the file.
+
+### outline.rs
+
+A collapsible OUTLINE section under the file tree: the active editor's symbol tree, indented and kind-iconed, with follow-cursor highlight and click-to-jump.
+
+**Two sources, one judge.** The tree paints instantly from tree-sitter (see `outline_syntax.rs`) and is refined by the LSP `documentSymbol` reply when it arrives. Each request carries the edit seq, and `drain_lsp_document_symbols` forwards EVERY reply to `apply_outline_symbols`, which is the sole judge: it filters on the active path and on exact edit-seq equality, so a slow server cannot flicker the breadcrumb's symbol crumb while you type.
+
+**No pre-selection in the drain.** Collapsing a tick's replies to whichever arrived last let a late reply for the file just left evict the active file's. Collapsing by highest seq is no better, since seq is a per-`Editor` counter that restarts at zero in a fresh editor group.
+
+**Placement.** It is one of the ⋯-menu Explorer sub-views, alongside Open Editors, Folders, Timeline and Dependencies. `App::render_explorer_sections` stacks the visible ones, with the tree absorbing the leftover rows.
+
+### pair/proactive.rs
+
+The proactive-look detector, pure text-in and row-out. Tree-sitter judges whether the driver COMPLETED a new construct since the navigator's last look.
+
+**Language-specific completion tests.** Code languages multiset-compare outline symbols via `outline_syntax::symbols_for`; half-typed code parses as an `ERROR` node and never fires. Markdown walks its block grammar for a new heading or an ADDED paragraph, keyed on count growth, so prose edits never re-fire.
+
+**Gates live in the App.** `App::tick_proactive_navigator` owns them: seated, idle, a 2s typing pause, the file previously yielded, and one scan per buffer state. It then hands the seat the same comment-only yield turn Cmd+K Y would, anchored at the new construct.
+
+**Opt-out.** The `disable_proactive_navigator` pref and the palette command "Navigator: Toggle Proactive Comments".
+
+### parse.rs
+
+Per-tool output parsers. All node IDs are normalised to `::` separators so one panel tree serves every runner.
+
+**The runners covered.** libtest (`parse_test_line` for run lines, `parse_list_line` for discovery), pytest (`-v` result lines, `--collect-only` node IDs), vitest (`parse_vitest_list_line` for `vitest list`, `parse_vitest_tap_line` for the streaming `--reporter=tap-flat` run lines, whose `file > describe > test` IDs are complete per line), and jest (`parse_jest_json`).
+
+**Why jest is different.** jest prints one `--json` document to stdout at run end, with human output going to stderr, yielding every assertion with its describe chain and treating `pending`/`todo` as the skip family.
+
+### port_detect.rs
+
+Loopback-port detection behind the PORTS panel. A stateful output-stream scraper runs in the terminal reader thread, watching for URL banners and `listening on :PORT` lines and emitting each port once, alongside a low-cadence lsof/ss socket poll scoped to the shell's process subtree. The module also holds the Cmd/Ctrl+click URL resolver.
+
+**The bare-announce regex needs a colon or the word `port`.** An announce verb followed by a plain count is ordinary output — `running 289 tests`, `Started 15 workers` — and fabricating a port from it offers to forward one nothing is listening on.
+
+**Subtree scoping answers only one question.** It says what should be SURFACED, never what is still UP. `poll_all_listening` is the unscoped companion the reconciliation uses, and it returns `None` (no evidence) rather than an empty set when neither tool runs.
+
+### ports.rs
+
+The panel group's PORTS tab: a registry of detected loopback ports (port, address, process, origin) fed by `port_detect.rs`, with an orange `⇄ host` marker for a forwarded remote port. It is a pure widget handling selection and click hit-testing; the App runs the open, forward, copy and stop actions.
+
+**Reconciliation uses the unscoped scan.** `reconcile_live`'s `live` set is EVERY loopback listener on the box, from `port_detect::poll_all_listening`, never the pane-subtree scan that decides what to surface. A container's published port is nobody's descendant, and retiring it for being missing from a snapshot that could never contain it dropped the row and `ssh -O cancel`ed a live tunnel seconds after the scrape found it. A failed probe reconciles nothing at all.
+
+**`x` means two things, and they are not the same.** `stop_forwarding` tears the tunnel down and LEAVES the row; `remove` dismisses the row and suppresses re-detection for the session. Routing the stop through `remove` blacklisted a still-listening port the user could never forward again.
+
+**Scrolling.** The body scrolls to keep the selection visible, since `f` and `x` act on it.
+
+### provenance.rs
+
+Which SEAT wrote each line: a `Seat` (you, navigator, agent-by-pane, or collab peer) plus a per-buffer line map, feeding the gutter overlay and the inline blame annotation. Git blame answers "which commit", which cannot answer "did I write this or did the model?" — a commit records the author of the SAVE, not of the keystrokes.
+
+**A line croft did not watch being written is Unknown, never guessed.** This invariant shapes the whole module. An overlay that is right most of the time gets read as fact, and the one line it attributes wrongly is exactly the line someone is arguing about.
+
+**Splicing drops rather than carries.** `splice` drops the attribution of every line an edit replaced instead of carrying it onto the replacement, and the caller records the new lines against the seat that made the edit. A caller that forgets leaves them unknown, which is the safe direction.
+
+**The seat is a call-site parameter.** It is a parameter on `insert_str_as` rather than editor state, because the same buffer takes text from several seats and which one is making THIS edit is known only at the call site.
+
+### quickfix.rs
+
+Parses the last `grep`, `rg` or `git grep` command line into a pattern, Search toggles, and include/exclude glob lists, so "Terminal: Search & Replace from Last grep/rg" can seed and run the Search sidebar — reusing its multi-file replace-all — from a terminal search.
+
+**Flag handling.** `-g`/`--glob`s accumulate comma-separated. rg's `!`-negated globs and grep's `--exclude`/`--exclude-dir` land in files-to-exclude. rg and ag treat `-s` as forcing case sensitivity, while grep's `-s` stays the no-messages flag.
+
+**The seed replaces wholesale.** `SearchPanel::seed` swaps the panel's query and both filter lists outright, and also resets field selections, because a stale byte range into shorter seeded text panicked. It then refocuses the query.
+
+### registry_index.rs
+
+The remote vetted index at `extensions.croft.software`. It fetches `index.json` and `index.json.sig` over Cloudflare HTTPS, verifies an ed25519 signature against a baked public key (`INDEX_PUBLIC_KEY`) BEFORE caching — verify-at-write, trust-on-read under `~/.cache/croft` — gates entries by `api_version`, and on install fetches the manifest and checks its sha256 against the signed index. It is disarmed (no network, bundled-only) when the key is all-zero.
+
+**Stale-while-revalidate.** Cached entries render synchronously while a background refresh always refetches. `App::drain_ext_index_refresh` signals a panel rebuild only when the verified index changed, so a new extension appears on the next launch with no TTL wait. The panel's ⟳ button (`App::refresh_extension_index`) re-pulls mid-session.
+
+**Where the index lives.** It is git-hosted at `codeberg.org/vitali87/croft-extensions` and published to the VPS by a systemd timer mirroring croft-docs.
+
+### release_notes.rs
+
+Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) shown on the welcome panel. The text is DATA: one file per version in `src/release_notes/<version>.md`, baked in by `build.rs` and parsed once. No git log, no network.
+
+**One file per version.** A single shared const sat on every open pull request's rebase path. A missing file for the current version is a BUILD error, so a binary always describes itself.
+
+**The card is sized before the logo.** `welcome_card_inner_width` is the one wrap width shared by the height measure and the paint pass, and the logo yields down to its 4-row minimum before the card may clip. The logo-first order kept a full-height logo above a note clipped mid-sentence in height-starved windows.
+
+### run_debug.rs
+
+The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output, and a `❯` REPL prompt. The App builds the rows and maps clicks back to frames and variables.
+
+**WATCH is frame-relative.** Session-scoped expressions are re-evaluated on every stop via DAP `evaluate` with context `watch`, against the SELECTED frame. The stop selects the top frame, and clicking a call-stack frame re-evaluates every watch against that frame.
+
+**The changed-value baseline rotates exactly once per stop.** It is armed by `Stopped` and consumed by the first `InspectionUpdated`. Later `InspectionUpdated`s — frame switches, variable expansions — re-evaluate WITHOUT rotating, or the stop's own values would clobber the comparison.
+
+**Row mechanics.** A rejected expression renders `<not available>`, the `success:false` branch of `DapEvent::Evaluated`. Rows carry a right-edge remove `✕` with hit rects cleared per render, and the trailing "+ Add Expression" row and the palette's "Debug: Add Watch Expression" both open the input popup.
+
+### session.rs
+
+One launch session: the initialize -> setBreakpoints -> configurationDone -> stopped state machine, the event classifier, the stackTrace -> scopes -> variables inspection chain, `evaluate` (REPL, hover, watch), breakpoint-verification tracking, pause and reverse-request replies — all over one adapter-agnostic `launch_with`.
+
+**Conditional breakpoints and logpoints.** `SourceBreakpoint` carries `condition` and `log_message`. A logpoint's message is interpolated and printed by the adapter instead of pausing; it is set with Shift+Alt+F9 or the gutter menu and shows as an amber diamond in the gutter.
+
+**No vendored protocol types.** Requests are built from `Value`-based builders, and `AdapterKind` names the launch mechanisms.
+
+### svg.rs
+
+SVG file-preview rasterisation: `usvg` parse plus `resvg` render into a PNG that the standard image-overlay pipeline consumes unchanged.
+
+**Vector render once, bitmap refit after.** The vector render happens once per open at a fixed quality — longest edge `1600px`, with small icons capped at 8× natural so they stay crisp instead of blurring. A pane resize refits that stored PNG through `fit_image_auto` like any image tab: a bitmap rescale, never a fresh vector render.
+
+**The `<text>` fontdb is lazy.** It is built on the FIRST preview, never at startup, because `init_graphics`' icon bake is the critical path and codicons carry no text. Generic families are remapped to a real face when the host lacks the fontdb defaults (Arial, Times) — imperfect typography beats invisible text.
+
+**Fallbacks and overrides.** A parse failure falls through to the XML source in the text editor. The per-tab `force_text` override ("File: Reopen as Text") skips every preview route and sticks across same-path FS-sync reloads, so an SVG edited in one split refreshes the preview in the other.
+
+### tasks.rs
+
+Auto-detected project tasks. It reads the manifests the repo already has — `.vscode/tasks.json` with JSONC tolerated, Makefile, justfile, `package.json` with a lockfile-matched runner, `Cargo.toml`, `pyproject.toml` — into runnable `Task` commands, backing "Tasks: Run Task" and the Cmd+Shift+B default build. A `tasks.json` `isDefault` outranks the first build task.
+
+**Terminal-pane reuse is strict about the directory.** Each task runs in a named terminal pane that is reused only while its shell sits idle at EXACTLY the task's directory; a shell that has cd'd into a subdirectory is not reused. Where the platform cannot report a cwd at all (Android, a remote pane's ssh process), reuse falls back to the pane's name alone. The cwd is kernel-reported, and the write clears a half-typed prompt line first.
+
+### update_check.rs
+
+A release-availability check plus a staged upgrade. Once a day, tracked by the cache file `~/.cache/croft/update-check.json`, a local croft asks GitHub's latest-release endpoint off-thread; a newer, undismissed version raises a click-only popup at bottom-left offering Update or Later.
+
+**Update stages, it does not replace.** Update runs `cargo install croft-software --version X --root ~/.cache/croft/staged` in the background, so the binary on PATH is untouched and a fresh launch stays on the current version. The popup then offers Relaunch, which copies the staged binary over the installed one and re-execs — the same path F9 takes.
+
+**Never automatic.** Later remembers the version so it is not offered again, and `CROFT_NO_UPDATE_CHECK` disables the check entirely.
+
+### voice.rs
+
+Voice input for the Termux OSK mic key. It delegates to `termux-dialog speech` (Android's SpeechRecognizer, the same engine Gboard's mic uses), auto-installs the `termux-api` package via `InstallState`, and sends the transcript over a channel the app injects through `handle_key`.
+
+**`termux-dialog speech`, not `termux-speech-to-text`.** The service closes its output on `onEndOfSpeech` and so discards the final `onResults` transcript.
+
+**Tap, not hold.** A tap opens the system speech dialog and the result is injected when Android finalizes on silence; a second tap cancels, since killing preempts the result. The process runs in its own process group so cancel kills the whole tree. It is a tap rather than a hold because Termux steals finger-holds for text selection.
+
 ### File encoding
 
 How croft decodes a file on open, re-encodes it on save, and what it does when the buffer holds characters the target encoding cannot represent.
