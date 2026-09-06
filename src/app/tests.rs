@@ -13487,7 +13487,6 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
         Some("alpha.rs"),
         "the file part of the query is what gets opened"
     );
-    assert_eq!(app.editor.cursor_row, 235, "the cursor lands on line 236");
     let sel = app
         .editor
         .selection
@@ -13499,6 +13498,27 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
         "the selection starts at the top of line 236"
     );
     assert_eq!(r1, 238, "and reaches line 239");
+    // The cursor sits at the selection's HEAD, as every other
+    // selection-installing path leaves it, so Shift+motion extends the
+    // range rather than collapsing it onto the cursor.
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        sel.head,
+        "the cursor is at the head of the range"
+    );
+    assert!(
+        app.status.ends_with("alpha.rs:236-239"),
+        "the status names the range: {:?}",
+        app.status
+    );
+    app.handle_key(key(KeyCode::Down, KeyModifiers::SHIFT))
+        .unwrap();
+    let ((r0, _), (r1, _)) = app.editor.selection.expect("still selected").normalised();
+    assert_eq!(
+        (r0, r1),
+        (235, 239),
+        "Shift+Down extends the range by a line instead of shrinking it"
+    );
     let page = app.editor.page_size().max(1);
     assert!(
         app.editor.scroll <= 235 && 235 < app.editor.scroll + page,
@@ -13514,6 +13534,17 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
     assert!(
         app.editor.selection.is_none(),
         "a single line is a place to land, not a range to select"
+    );
+    assert!(
+        app.status.ends_with("alpha.rs:12"),
+        "the status names the line: {:?}",
+        app.status
+    );
+
+    type_and_enter(&mut app, "alpha:5000");
+    assert_eq!(
+        app.editor.cursor_row, 299,
+        "a line past the end lands on the last line"
     );
 
     type_and_enter(&mut app, "alpha:236:7");

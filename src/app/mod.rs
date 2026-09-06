@@ -30920,6 +30920,13 @@ impl App {
                             anchor: (start, 0),
                             head: (end_row, end_col),
                         });
+                        // The cursor sits at the selection's head, as every
+                        // other selection-installing path leaves it: Shift+motion
+                        // extends from the cursor, so a cursor at the anchor
+                        // would collapse the range on the first keystroke.
+                        self.editor.cursor_row = end_row;
+                        self.editor.cursor_col = end_col;
+                        self.editor.ensure_cursor_col_visible();
                     }
                     // VS Code's `explorer.autoReveal` analogue:
                     // expand every parent dir of the picked file

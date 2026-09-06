@@ -384,7 +384,7 @@ pub fn split_line_hint(query: &str) -> (&str, Option<LineHint>) {
             return (&q[..i], None);
         }
     }
-    (query, None)
+    (q, None)
 }
 
 /// Digits, at most one `-` or `:` separator, digits: every prefix of a hint
@@ -410,9 +410,12 @@ fn parse_line_hint(s: &str) -> Option<LineHint> {
             .filter(|n| *n > 0)
     };
     if let Some((a, b)) = s.split_once('-') {
+        // `239-236` is the same range as `236-239`; the caller clamps the
+        // selection from `line` to `end`, so the pair is ordered here.
+        let (a, b) = (num(a)?, num(b)?);
         return Some(LineHint {
-            line: num(a)?,
-            end: Some(num(b)?),
+            line: a.min(b),
+            end: Some(a.max(b)),
             col: None,
         });
     }
@@ -1246,6 +1249,19 @@ mod tests {
             );
             assert_eq!(finder.line_hint(), Some(hint), "{query}");
         }
+        // A reversed range is the same range; a zero is no line at all.
+        finder.set_query("alpha:239-236");
+        assert_eq!(
+            finder.line_hint(),
+            Some(LineHint {
+                line: 236,
+                end: Some(239),
+                col: None,
+            }),
+            "a reversed range normalises"
+        );
+        finder.set_query("alpha:0");
+        assert_eq!(finder.line_hint(), None, "line 0 is not a line");
         finder.set_query("alpha");
         assert_eq!(finder.line_hint(), None, "no suffix, no hint");
         // A colon with nothing numeric after it is not a line suffix.
