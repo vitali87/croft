@@ -59,20 +59,20 @@ Only the very first connect (no croft on the box yet) waits for an install. Ever
 
 This is a refusal, not a crash. It happens when you are already attached to the remote croft *and* the fast cross-build path is unavailable. The only route left would be compiling on the box you are typing into, so croft declines rather than spend its cores on an unrequested build. You stay on the running binary; nothing is half-installed.
 
-The reason is logged on the **launching** machine — the one you connected *from*, not the server in the message:
+The reason is logged on the **launching** machine — the one you connected *from*, not the server in the message. Read it **before** reconnecting: each connect truncates the file.
 
 ```bash
 tail ~/.cache/croft/install.log
 ```
 
-Look for the missing piece:
+Look for the missing piece. Every line carries a Unix timestamp:
 
 ```
-Local cross-build skipped: rustup target `x86_64-unknown-linux-musl` missing
-Update NOT installed: cross-build unavailable (...)
+[1788730108] Local cross-build skipped: rustup target `x86_64-unknown-linux-musl` missing (run `rustup target add x86_64-unknown-linux-musl` once to enable the fast path)
+[1788730108] Update NOT installed: cross-build unavailable (rustup target `x86_64-unknown-linux-musl` missing (…)). Run `croft setup-cross` on this machine, then reconnect — updates then ship a prebuilt binary in seconds.
 ```
 
-The prerequisites are `zig`, `cargo-zigbuild`, and the musl rustup targets. Install them on the launching machine:
+The prerequisites are `zig`, `cargo-zigbuild`, and both musl rustup targets (`x86_64-` and `aarch64-unknown-linux-musl`). Install them on the launching machine:
 
 ```bash
 croft setup-cross          # prints a plan, then asks to confirm
@@ -81,7 +81,7 @@ croft setup-cross --yes    # skip the prompt
 
 It is idempotent and reports what it skips. Answering anything but `y` prints `Aborted.` and exits 0, so read the output rather than the exit code. Then **reconnect** — a declined update is not retried on the running session.
 
-Two things that catch people out. Rustup targets are per-toolchain, and this repo pins its channel in `rust-toolchain.toml`, so `rustup target list --installed` only answers for the pinned toolchain when run from a croft checkout; a channel bump orphans every target you added. And connecting with the dialog still up — no session attached — asks whether to compile on the host instead, since there is no live session to disturb.
+Two things catch people out. Rustup targets are per-toolchain, and this repo pins its channel in `rust-toolchain.toml`, so `rustup target list --installed` only answers for the pinned toolchain when run from a croft checkout; a channel bump orphans every target you added. And connecting with the dialog still up — no session attached — asks whether to compile on the host instead, since there is no live session to disturb.
 
 ### Surviving sleep and network drops
 
