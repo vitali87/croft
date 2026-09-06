@@ -1174,6 +1174,33 @@ mod tests {
         );
     }
 
+    /// #466: lines past `MAX_HIGHLIGHT_BYTES` are parsed unhighlighted, and a
+    /// line just under it is coloured, so the cap is pinned on both sides.
+    #[test]
+    fn highlighting_stops_at_the_width_cap() {
+        let under = format!("{} ERROR 42\n", "x ".repeat((MAX_HIGHLIGHT_BYTES - 64) / 2));
+        let over = format!("{} ERROR 42\n", "x ".repeat((MAX_HIGHLIGHT_BYTES + 64) / 2));
+        let (_d, p) = write_tmp(format!("{under}{over}").as_bytes());
+        let mut v = LogView::open(&p).unwrap();
+        v.set_highlight(true);
+        v.ensure(0, 2).unwrap();
+        let lit = v.line(0).unwrap();
+        assert!(
+            lit.spans.iter().any(|s| s.style.fg.is_some()),
+            "just under the cap the line is coloured"
+        );
+        let wide = v.line(1).unwrap();
+        assert!(
+            wide.spans.iter().all(|s| s.style.fg.is_none()),
+            "past the cap the line is parsed as written"
+        );
+        assert_eq!(
+            wide.text.trim_end(),
+            over.trim_end(),
+            "and its visible text is intact"
+        );
+    }
+
     /// #466: the process-wide default steers a view opened after it changed,
     /// and an existing view follows its own toggle, not the default.
     #[test]
