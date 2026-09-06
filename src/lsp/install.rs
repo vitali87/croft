@@ -86,6 +86,11 @@ pub enum Provision {
         /// an unsupported platform to fall back to PATH (clangd's linux-aarch64,
         /// which has no Termux package either).
         termux_pkg: Option<&'static str>,
+        /// Per-platform SHA-256 of the asset, keyed like `targets`; a platform
+        /// with an entry has its download verified before anything is
+        /// unpacked or marked executable. Empty means unverified (the
+        /// pre-existing state for every binary provision).
+        sha256: &'static [(&'static str, &'static str)],
     },
 }
 
@@ -400,9 +405,34 @@ fn extract_zip(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
 /// so when `target` is not there after unpacking the tree is searched for a
 /// file with the binary's name and that file is moved into place.
 fn extract_tar_xz(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
-    let mut tar_bytes = Vec::new();
-    lzma_rs::xz_decompress(&mut std::io::Cursor::new(bytes), &mut tar_bytes)
+    extract_tar_xz_capped(bytes, dir, target, MAX_BINARY_BYTES)
+}
+
+/// [`extract_tar_xz`] with the unpacked-size ceiling as a parameter; the
+/// decompressed stream and the sum of the entries it holds must both stay
+/// under `cap`, or nothing is written.
+fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> std::io::Result<()> {
+    // The download cap covered compressed bytes; a high-ratio archive could
+    // still expand to fill memory and disk. The decoder writes into a sink
+    // that refuses past `cap`, and the entries' declared sizes are summed
+    // against the same cap before anything is unpacked.
+    let mut sink = Capped {
+        buf: Vec::new(),
+        cap,
+    };
+    lzma_rs::xz_decompress(&mut std::io::Cursor::new(bytes), &mut sink)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+    let tar_bytes = sink.buf;
+    let mut total: u64 = 0;
+    for entry in tar::Archive::new(std::io::Cursor::new(&tar_bytes)).entries()? {
+        total = total.saturating_add(entry?.header().size()?);
+        if total > cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("archive expands past the {cap}-byte ceiling"),
+            ));
+        }
+    }
     tar::Archive::new(std::io::Cursor::new(tar_bytes)).unpack(dir)?;
     if !target.is_file()
         && let Some(name) = target.file_name()
@@ -427,6 +457,38 @@ fn extract_tar_xz(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()
     set_executable(target)
 }
 
+/// A `Write` sink that refuses to grow past `cap`, so a decoder cannot be
+/// made to allocate without bound by a small, high-ratio input.
+struct Capped {
+    buf: Vec<u8>,
+    cap: u64,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if (self.buf.len() as u64).saturating_add(data.len() as u64) > self.cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("decompressed data exceeds the {}-byte ceiling", self.cap),
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Whether `bytes` hash to `expected` (hex SHA-256, either case). An empty
+/// or malformed expectation never matches: a gate that passes on a typo is
+/// no gate.
+fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
+    use sha2::Digest;
+    let expected = expected.trim().to_ascii_lowercase();
+    expected.len() == 64 && format!("{:x}", sha2::Sha256::digest(bytes)) == expected
+}
+
 /// First regular file named `name` under `dir`, depth-first.
 fn find_file_named(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
@@ -443,20 +505,31 @@ fn find_file_named(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
     None
 }
 
+/// The pieces of a [`Provision::Binary`] a managed install needs, borrowed
+/// from the provision for the length of the install.
+struct BinarySpec<'a> {
+    targets: &'a [(&'a str, &'a str)],
+    bin: &'a str,
+    archive: ArchiveKind,
+    bin_path: Option<&'a str>,
+    termux_pkg: Option<&'a str>,
+    sha256: &'a [(&'a str, &'a str)],
+}
+
 /// Download + unpack a prebuilt release binary into `~/.croft/servers/<name>/`.
 /// Resolves the platform tokens, builds the URL, fetches, extracts per archive
 /// kind, and marks the language installed on success. A platform the project
 /// ships no asset for is logged + surfaced and left to PATH (e.g. clangd has no
 /// linux-aarch64 build).
-fn run_binary_install(
-    name: &'static str,
-    language: Language,
-    targets: &[(&str, &str)],
-    bin: &str,
-    archive: ArchiveKind,
-    bin_path: Option<&str>,
-    termux_pkg: Option<&str>,
-) {
+fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'_>) {
+    let BinarySpec {
+        targets,
+        bin,
+        archive,
+        bin_path,
+        termux_pkg,
+        sha256,
+    } = spec;
     // Termux/Android: the cross-distro release (linux-gnu) won't run on bionic
     // libc and `android` is absent from `targets`, so reroute to the native
     // package manager exactly as the uv backend does for ty/ruff. `pkg` lands
@@ -508,6 +581,21 @@ fn run_binary_install(
         return;
     };
 
+    // A platform with a pinned digest has its download verified before a
+    // byte of it is unpacked or marked executable: an altered asset or a
+    // tampered delivery path is refused, not installed.
+    if let Some(expected) = target_url(sha256, os, arch)
+        && !sha256_matches(&bytes, expected)
+    {
+        log_file::log(&format!("lsp[{name}] checksum mismatch for {url}"));
+        crate::output::push(
+            crate::output::CHANNEL_PROVISION,
+            crate::output::OutputLevel::Error,
+            &format!("{name}: checksum mismatch for {url}; refusing to install"),
+        );
+        set_status(format!("{name} install refused (checksum mismatch)"));
+        return;
+    }
     let target = dir.join(bin_path.unwrap_or(bin));
     let extracted = match archive {
         ArchiveKind::Gz => extract_gz(&bytes, &target),
@@ -592,14 +680,18 @@ pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
             archive,
             bin_path,
             termux_pkg,
+            sha256,
         } => run_binary_install(
             name,
             language,
-            targets,
-            bin,
-            *archive,
-            *bin_path,
-            *termux_pkg,
+            BinarySpec {
+                targets,
+                bin,
+                archive: *archive,
+                bin_path: *bin_path,
+                termux_pkg: *termux_pkg,
+                sha256,
+            },
         ),
     });
 }
@@ -1305,6 +1397,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(out.status.success(), "the extracted binary is executable");
         assert!(String::from_utf8_lossy(&out.stdout).contains("csvlens-ok"));
+    }
+
+    /// A valid archive that expands past the ceiling must not land: the
+    /// download cap covers compressed bytes only, and a high-ratio archive
+    /// would otherwise fill memory and disk during provisioning.
+    #[test]
+    fn a_tar_xz_that_expands_past_the_cap_is_refused() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let payload = vec![0u8; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "big/csvlens", &payload[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("csvlens");
+        let outcome = extract_tar_xz_capped(&xz, &dir, &target, 1024);
+        let landed = target.is_file();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            outcome.is_err(),
+            "a 4 KiB payload under a 1 KiB cap is refused"
+        );
+        assert!(!landed, "and nothing is left at the target");
+    }
+
+    /// The checksum gate is the only thing between a download and an
+    /// executable; it must reject a mismatch and accept the true digest.
+    #[test]
+    fn sha256_matches_only_the_true_digest() {
+        let bytes = b"csvlens release bytes";
+        // sha256("csvlens release bytes")
+        let good = "8b0fa3ee6b2b3d3b0a0a4f3f6d2d7d5f1a4f0d6b3d5b1f0e3a4b7c2d9e8f1a0b";
+        assert!(!sha256_matches(
+            bytes,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(!sha256_matches(bytes, ""));
+        let real = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(bytes))
+        };
+        assert_ne!(
+            real, good,
+            "the literal above is a decoy, the real digest is computed"
+        );
+        assert!(sha256_matches(bytes, &real), "the true digest is accepted");
+        assert!(
+            sha256_matches(bytes, &real.to_uppercase()),
+            "case does not matter"
+        );
     }
 
     #[test]

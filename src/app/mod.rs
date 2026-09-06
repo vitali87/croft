@@ -1727,7 +1727,7 @@ fn build_tree_context_menu_items(
         target_dir,
         clipboard,
         compare_anchor,
-        |file| crate::mcp::registry::viewer_for_path(file).map(|v| (v.label, v.id)),
+        |file| crate::mcp::registry::viewer_for_path(file).map(|v| (v.label.clone(), v.key())),
     )
 }
 
@@ -31658,13 +31658,25 @@ impl App {
         viewer: &crate::mcp::registry::ContributedViewer,
         path: &Path,
     ) {
+        // The pane spawn takes `String` args, so a name that is not valid
+        // UTF-8 could only be handed over mangled, and the tool would open a
+        // different path. Refuse with the reason rather than open the wrong
+        // file.
+        let Some(file) = path.to_str().map(str::to_owned) else {
+            self.status = format!(
+                "{}: the file's name is not valid UTF-8, so it cannot be passed to the viewer",
+                viewer.label
+            );
+            return;
+        };
+        let install_name = viewer.install_name();
         let program = match viewer.provision.as_ref() {
             None => viewer.command.clone(),
             Some(provision) => {
-                match crate::lsp::install::provisioned_command(&viewer.id, provision) {
+                match crate::lsp::install::provisioned_command(&install_name, provision) {
                     Some((command, _extra_paths)) => command,
                     None => {
-                        let name: &'static str = Box::leak(viewer.id.clone().into_boxed_str());
+                        let name: &'static str = Box::leak(install_name.clone().into_boxed_str());
                         let config = crate::lsp::config::ServerConfig {
                             name,
                             command: viewer.command.clone(),
@@ -31683,7 +31695,6 @@ impl App {
                 }
             }
         };
-        let file = path.to_string_lossy().into_owned();
         let args: Vec<String> = viewer
             .args
             .iter()

@@ -13498,6 +13498,44 @@ fn opening_a_file_in_a_viewer_runs_the_tool_on_it_in_a_new_terminal_pane() {
     );
 }
 
+/// A file name that is not valid UTF-8 must not be handed to the viewer
+/// mangled (#485 review): the tool would open a different path and fail.
+/// Until the pane spawn can carry OS-native arguments, such a file is
+/// refused with a status line rather than opened wrong.
+#[cfg(unix)]
+#[test]
+fn a_viewer_refuses_a_path_it_cannot_pass_faithfully() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    // The file is deliberately not created: APFS refuses such a name, and
+    // the guard fires before the viewer path touches the disk anyway.
+    let odd = tmp
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"d\xffata.csv"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: "csvlens".into(),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30".into(), "sh".into(), "{file}".into()],
+        extensions: vec!["csv".into()],
+        provision: None,
+    };
+    let before = app.terminals.len();
+    app.open_in_viewer(&viewer, &odd);
+    assert_eq!(
+        app.terminals.len(),
+        before,
+        "no pane is spawned for a path that cannot be passed"
+    );
+    assert!(
+        app.status.contains("not valid UTF-8"),
+        "the status says why: {:?}",
+        app.status
+    );
+}
+
 /// #465: the palette row reaches the viewer route (not the MCP command path)
 /// and guards on the active file before anything is spawned.
 #[test]

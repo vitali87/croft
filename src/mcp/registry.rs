@@ -141,7 +141,24 @@ pub struct ContributedViewer {
     pub provision: Option<crate::lsp::install::Provision>,
 }
 
-/// Palette command id for a viewer: `viewer:<id>`.
+impl ContributedViewer {
+    /// The viewer's identity across extensions: `<extension id>/<viewer id>`.
+    /// Two extensions may both declare a viewer called `csvlens`; the palette
+    /// row, the dispatch and the managed install are keyed on this so they
+    /// cannot collide or share state.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.ext_id, self.id)
+    }
+
+    /// The name croft's managed install of this viewer's binary lives under
+    /// (`~/.croft/servers/<name>/`): the key with its `/` folded, so two
+    /// extensions' same-named viewers never share an install dir.
+    pub fn install_name(&self) -> String {
+        format!("{}-{}", self.ext_id, self.id)
+    }
+}
+
+/// Palette command id for a viewer: `viewer:<extension id>/<viewer id>`.
 pub const VIEWER_COMMAND_PREFIX: &str = "viewer:";
 
 /// Pure: every viewer across `sources` whose extension is enabled, in
@@ -159,7 +176,17 @@ fn viewers_in(sources: &[String], disabled: &BTreeSet<String>) -> Vec<Contribute
                 id: v.id,
                 label: v.label,
                 command: v.command,
-                args: v.args,
+                // The tool must always be handed the file: an arg list with
+                // no `{file}` gets it appended, and no args at all means just
+                // the file, so a manifest cannot open a pane and omit the
+                // document the user chose.
+                args: {
+                    let mut args = v.args;
+                    if !args.iter().any(|a| a.contains("{file}")) {
+                        args.push(String::from("{file}"));
+                    }
+                    args
+                },
                 extensions: v.extensions.iter().map(|e| e.to_lowercase()).collect(),
                 provision: v.provision.as_ref().map(|p| p.to_provision()),
             })
@@ -187,7 +214,7 @@ fn viewer_commands_in(sources: &[String], disabled: &BTreeSet<String>) -> Vec<Co
         .into_iter()
         .map(|v| ContributedCommand {
             title: format!("{}: {}", v.ext_id, v.label),
-            id: format!("{VIEWER_COMMAND_PREFIX}{}", v.id),
+            id: format!("{VIEWER_COMMAND_PREFIX}{}", v.key()),
             ext_id: v.ext_id,
         })
         .collect()
@@ -199,12 +226,21 @@ pub fn viewer_for_path(path: &std::path::Path) -> Option<ContributedViewer> {
     viewer_for_path_in(&all_sources(), &disabled, path)
 }
 
-/// The enabled viewer with this id, if any.
-pub fn viewer_by_id(id: &str) -> Option<ContributedViewer> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
-    viewers_in(&all_sources(), &disabled)
+/// Pure: the enabled viewer whose [`ContributedViewer::key`] is `key`.
+fn viewer_by_key_in(
+    sources: &[String],
+    disabled: &BTreeSet<String>,
+    key: &str,
+) -> Option<ContributedViewer> {
+    viewers_in(sources, disabled)
         .into_iter()
-        .find(|v| v.id == id)
+        .find(|v| v.key() == key)
+}
+
+/// The enabled viewer with this key (`<extension id>/<viewer id>`), if any.
+pub fn viewer_by_id(key: &str) -> Option<ContributedViewer> {
+    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    viewer_by_key_in(&all_sources(), &disabled, key)
 }
 
 /// Palette rows for the enabled viewers.
@@ -247,6 +283,60 @@ extensions = ["csv", "tsv"]
 provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { "macos-aarch64" = "https://example.invalid/csvlens-aarch64-apple-darwin.tar.xz" } }
 "#;
 
+    /// Two enabled extensions may both declare a viewer called `csvlens`
+    /// (#485 review): their palette rows, dispatch keys and install names
+    /// must stay distinct, or picking the second runs the first.
+    #[test]
+    fn viewers_from_two_extensions_with_the_same_id_stay_distinct() {
+        let alpha = CSVLENS.replace("id = \"csvlens\"\nname", "id = \"alpha\"\nname");
+        let beta = CSVLENS
+            .replace("id = \"csvlens\"\nname", "id = \"beta\"\nname")
+            .replace("command = \"csvlens\"", "command = \"beta-bin\"");
+        let sources = vec![alpha, beta];
+        let none = BTreeSet::new();
+        let ids: Vec<String> = viewer_commands_in(&sources, &none)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec!["viewer:alpha/csvlens", "viewer:beta/csvlens"]);
+        let picked = viewer_by_key_in(&sources, &none, "beta/csvlens").expect("beta's viewer");
+        assert_eq!(
+            picked.command, "beta-bin",
+            "the second row runs the second extension's tool"
+        );
+        let keys: BTreeSet<String> = viewers_in(&sources, &none)
+            .iter()
+            .map(|v| v.key())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "install and dispatch identities do not collide"
+        );
+    }
+
+    /// A viewer whose args name no `{file}` would open its pane without the
+    /// document (#485 review): the file is appended so the tool always gets
+    /// it, and an empty arg list means just the file.
+    #[test]
+    fn a_viewer_without_a_file_placeholder_gets_the_file_appended() {
+        let none = BTreeSet::new();
+        let bare = CSVLENS.replace("args = [\"{file}\"]\n", "");
+        let v = &viewers_in(&[bare], &none)[0];
+        assert_eq!(
+            v.args,
+            vec!["{file}"],
+            "no args at all means the file alone"
+        );
+        let flagged = CSVLENS.replace("args = [\"{file}\"]", "args = [\"--no-headers\"]");
+        let v = &viewers_in(&[flagged], &none)[0];
+        assert_eq!(
+            v.args,
+            vec!["--no-headers", "{file}"],
+            "the file follows the declared flags"
+        );
+    }
+
     /// #465: a viewer is offered for its file kinds, case-insensitively, and
     /// only while its extension is enabled; it reaches the palette as one row.
     #[test]
@@ -278,7 +368,11 @@ provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { 
                 cmds[0].id.as_str(),
                 cmds[0].title.as_str()
             ),
-            ("csvlens", "viewer:csvlens", "csvlens: Open in csvlens")
+            (
+                "csvlens",
+                "viewer:csvlens/csvlens",
+                "csvlens: Open in csvlens"
+            )
         );
         assert!(viewer_commands_in(&sources, &disabled).is_empty());
     }

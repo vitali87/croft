@@ -406,6 +406,11 @@ pub struct ProvisionDecl {
     /// cross-distro release can't run on Android (absent → PATH fallback).
     #[serde(default)]
     pub termux_pkg: Option<String>,
+    /// `binary`: per-platform SHA-256 of the asset, keyed like `targets`.
+    /// A platform with an entry has its download verified before anything is
+    /// unpacked; a platform without one installs unverified.
+    #[serde(default)]
+    pub sha256: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -511,6 +516,7 @@ impl ProvisionDecl {
                 },
                 bin_path: self.bin_path.as_deref().map(intern),
                 termux_pkg: self.termux_pkg.as_deref().map(intern),
+                sha256: intern_pairs(&self.sha256),
             },
         }
     }
@@ -587,6 +593,36 @@ pub fn read_extension_sources(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binary provision may pin the asset's digest per platform (#485
+    /// review): the parsed form carries it alongside the URL map.
+    #[test]
+    fn a_binary_provision_carries_per_target_checksums() {
+        const DECL: &str = r#"
+id = "x"
+name = "x"
+api_version = 1
+
+[[viewers]]
+id = "x"
+label = "x"
+command = "x"
+provision = { kind = "binary", bin = "x", archive = "tar.xz", targets = { "macos-aarch64" = "https://example.invalid/x.tar.xz" }, sha256 = { "macos-aarch64" = "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3" } }
+"#;
+        let m = parse(DECL).expect("parses");
+        let Provision::Binary { sha256, .. } =
+            m.viewers[0].provision.as_ref().unwrap().to_provision()
+        else {
+            panic!("binary");
+        };
+        assert_eq!(
+            sha256,
+            &[(
+                "macos-aarch64",
+                "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3"
+            )]
+        );
+    }
 
     /// #465: a catalog entry that opens a file kind in an external TUI.
     #[test]
