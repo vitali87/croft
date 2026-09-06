@@ -815,6 +815,43 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             self.assertIn("line=7::", text, f"and so is the nearer one: {text}")
             self.assertEqual(text.count("::error"), 3, f"an ambiguous pairing stands nothing down: {text}")
 
+    def test_cfg_twins_each_captured_stand_both_blocks_down(self):
+        """Two `#[cfg]` definitions under one key, each with its own copy of
+        the doc, each captured by an insertion. The first victim pairs with
+        the first block; the second must still pair with the second, which
+        needs the ambiguity count to skip blocks already stood down. One
+        loss, no stranded-block annotations."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit(
+                "a.rs",
+                "/// Creates a new instance.\n#[cfg(unix)]\nfn new() {}\n\n"
+                "/// Creates a new instance.\n#[cfg(windows)]\nfn new() {}\n",
+            )
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "/// Creates a new instance.\n\n/// Helper.\nfn helper_a() {}\n\n"
+                "#[cfg(unix)]\nfn new() {}\n\n"
+                "/// Creates a new instance.\n\n/// Helper.\nfn helper_b() {}\n\n"
+                "#[cfg(windows)]\nfn new() {}\n",
+            )
+            out = io.StringIO()
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            text = out.getvalue()
+            self.assertIn("`new` had a doc comment", text)
+            self.assertNotIn("line=", text, f"both stranded copies are explained: {text}")
+            self.assertEqual(text.count("::error"), 1, f"one loss, one annotation: {text}")
+
     def test_ordinary_docs_are_not_reported(self):
         """The control. A gate that cries wolf stops being read, so the
         shapes a real file is full of must stay silent: attributes and
