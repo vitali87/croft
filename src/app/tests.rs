@@ -25760,7 +25760,7 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
 }
 
 #[test]
-fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
+fn cmd_k_d_dumps_the_pane_scrollback_into_a_rendered_log_tab() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
@@ -25801,27 +25801,28 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
         label.contains("bldlog") && label.contains("scrollback"),
         "the scratch tab is named after the pane: {label:?}"
     );
+    // A pane's output carries colour (croft's own run header does, and so
+    // does any shell prompt), so the dump lands in the rendered log view
+    // (#257) rather than a plain scratch buffer; the text is read from the
+    // view once its index is complete and its window loaded.
+    let text: Vec<String> = {
+        let log = app
+            .editor
+            .log
+            .as_mut()
+            .expect("the dump opens as a rendered log");
+        log.finish_index();
+        let n = log.len();
+        log.ensure(0, n).unwrap();
+        (0..n)
+            .map(|i| log.visible_text(i).unwrap_or("").to_string())
+            .collect()
+    };
     assert!(
-        app.editor
-            .lines
-            .iter()
-            .any(|l| l.contains("scrollback-payload-7")),
-        "the pane's output is in the buffer"
+        text.iter().any(|l| l.contains("scrollback-payload-7")),
+        "the pane's output is in the buffer: {text:?}"
     );
-    assert!(
-        !app.editor
-            .lines
-            .last()
-            .map(String::as_str)
-            .unwrap_or("x")
-            .trim()
-            .is_empty()
-            || app.editor.lines.len() > 1,
-        "the blank live-screen tail is trimmed"
-    );
-    let blank_tail = app
-        .editor
-        .lines
+    let blank_tail = text
         .iter()
         .rev()
         .take_while(|l| l.trim().is_empty())
@@ -25829,6 +25830,77 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
     assert!(
         blank_tail <= 1,
         "the unused live-screen rows must not pad the buffer: {blank_tail} blank tail lines"
+    );
+}
+
+/// #257: Cmd+K D lands the pane's scrollback in the rendered log view, so
+/// the colours the pane showed survive into the tab, written to a real file
+/// under the scrollback dir because the log view indexes from disk.
+#[test]
+fn cmd_k_d_opens_the_scrollback_as_a_rendered_log_with_its_colours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}GREEN\\033[0m rest\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the pane to print the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQGREEN rest"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    {
+        // The view indexes in the background and parses a window on demand:
+        // read only what it has actually loaded.
+        let log = app
+            .editor
+            .log
+            .as_mut()
+            .expect("the scrollback opens in the rendered log view");
+        log.finish_index();
+        let n = log.len();
+        log.ensure(0, n).unwrap();
+    }
+    let log = app.editor.log.as_ref().unwrap();
+    let row = (0..log.len())
+        .find(|&i| {
+            log.visible_text(i)
+                .is_some_and(|t| t.contains("QQGREEN rest"))
+        })
+        .expect("the coloured row is in the view, escapes stripped");
+    let line = log.line(row).expect("the row is parsed");
+    let green = line
+        .spans
+        .iter()
+        .find(|s| line.text[s.start..s.end].contains("QQGREEN"))
+        .unwrap_or_else(|| panic!("a span colours the green run: {:?}", line.spans));
+    assert_eq!(
+        green.style.fg,
+        Some(crate::ansi_text::AnsiColor::Indexed(2)),
+        "the pane's green reaches the tab as the symbolic green slot"
+    );
+    let path = app.editor.path.clone().expect("the tab has a path");
+    assert!(
+        path.starts_with(&app.scrollback_dir) && path.extension().is_some_and(|e| e == "log"),
+        "the dump is a .log under the scrollback dir: {path:?}"
+    );
+    assert!(
+        path.is_file(),
+        "the dump exists on disk for the view to index"
     );
 }
 

@@ -2853,6 +2853,10 @@ pub struct App {
     /// `terminals` (#313). A pane that is hidden, already collapsed, too
     /// narrow for the glyph, or maximized holds an empty rect.
     terminal_collapse_buttons: Vec<Rect>,
+    /// Where "open scrollback in an editor tab" writes the pane's coloured
+    /// scrollback so the rendered log view can index it from disk (#257).
+    /// `~/.cache/croft/scrollback` normally; a test points it at a temp dir.
+    scrollback_dir: PathBuf,
     /// Hit-test rectangles of the one-column strips collapsed panes leave
     /// behind, in lock-step with `terminals` (#313). Clicking anywhere down a
     /// strip gives that pane its width back; expanded panes hold an empty
@@ -4440,6 +4444,7 @@ impl App {
             terminal_profile_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
             terminal_collapse_buttons: Vec::new(),
+            scrollback_dir: crate::session_state::dirs_cache_croft().join("scrollback"),
             terminal_strip_rects: Vec::new(),
             terminal_max_buttons: Vec::new(),
             terminal_rail_rects: Vec::new(),
@@ -27308,21 +27313,69 @@ impl App {
     /// trimmed so the buffer ends at the last real row.
     fn open_scrollback_in_editor(&mut self) {
         let (lines, _) = self.terminal().grid_lines();
+        let coloured = self.terminal().grid_lines_ansi();
         let last = lines
             .iter()
             .rposition(|l| !l.trim().is_empty())
             .map_or(0, |i| i + 1);
-        // Every redact rule applies here, copy-mode or not: this buffer
-        // leaves the pane as bytes (#360).
-        let text = crate::triggers::mask_text(&lines[..last].join("\n"), &self.triggers, false);
         let pane = self.terminal().label();
         let pane = if pane.is_empty() { "terminal" } else { pane };
         let label = format!("{pane} scrollback");
+        // Every redact rule applies here, copy-mode or not: this buffer
+        // leaves the pane as bytes (#360). Masking works on the plain text;
+        // a row the rules touch keeps its masked plain form and gives up its
+        // colour, since a mask spliced between escapes could break them.
+        let mut rows: Vec<String> = Vec::with_capacity(last);
+        for (plain, ansi) in lines[..last].iter().zip(coloured.iter()) {
+            let masked = crate::triggers::mask_text(plain, &self.triggers, false);
+            rows.push(if masked == *plain {
+                ansi.clone()
+            } else {
+                masked
+            });
+        }
+        // A pane that showed colour lands in the rendered log view (#257),
+        // which indexes from disk, so the rows go to a real file under the
+        // scrollback dir, one per pane, overwritten on each dump. A pane
+        // with no colour keeps the scratch buffer it always had.
+        if rows.iter().any(|r| r.contains('\x1b')) {
+            let file = self.scrollback_dir.join(format!(
+                "{}-scrollback.log",
+                pane.chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    })
+                    .collect::<String>()
+            ));
+            let written = std::fs::create_dir_all(&self.scrollback_dir)
+                .and_then(|()| std::fs::write(&file, rows.join("\n") + "\n"));
+            match written
+                .map_err(anyhow::Error::from)
+                .and_then(|()| self.editor.open_preview(&file))
+            {
+                Ok(()) => {
+                    self.focus_pane(Pane::Editor);
+                    self.sync_open_file_poll_mtime();
+                    self.status = format!("Opened {last} scrollback lines as a rendered log");
+                    return;
+                }
+                Err(e) => {
+                    // Fall through to the plain scratch buffer rather than
+                    // lose the dump: a full disk still leaves the text.
+                    self.status = format!("Rendered scrollback unavailable ({e}); opened as text");
+                }
+            }
+        }
+        let text = crate::triggers::mask_text(&lines[..last].join("\n"), &self.triggers, false);
         match self.editor.open_text_buffer(Path::new(&label), &text) {
             Ok(()) => {
                 self.focus_pane(Pane::Editor);
                 self.sync_open_file_poll_mtime();
-                self.status = format!("Opened {last} scrollback lines in the editor");
+                if !self.status.starts_with("Rendered scrollback unavailable") {
+                    self.status = format!("Opened {last} scrollback lines in the editor");
+                }
             }
             Err(e) => self.status = format!("Open scrollback failed: {e}"),
         }
