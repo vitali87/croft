@@ -13498,6 +13498,118 @@ fn opening_a_file_in_a_viewer_runs_the_tool_on_it_in_a_new_terminal_pane() {
     );
 }
 
+/// #465: the palette row reaches the viewer route (not the MCP command path)
+/// and guards on the active file before anything is spawned.
+#[test]
+fn a_viewer_palette_row_guards_on_the_active_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let notes = tmp.path().join("notes.md");
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&notes, "# hi\n").unwrap();
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The `viewer:` prefix is routed before the MCP lookup: an unknown viewer
+    // is reported as a viewer, not as an extension command.
+    app.run_extension_command("viewer:nope");
+    assert_eq!(app.status, "Viewer 'nope' is unavailable");
+
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: "csvlens".into(),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30".into()],
+        extensions: vec!["csv".into(), "tsv".into()],
+        provision: None,
+    };
+    let before = app.terminals.len();
+    app.editor.path = None;
+    app.open_active_file_in_viewer(&viewer);
+    assert_eq!(app.status, "Open in csvlens: open a file first");
+    app.editor.open(&notes).unwrap();
+    app.open_active_file_in_viewer(&viewer);
+    assert_eq!(
+        app.status,
+        "Open in csvlens: the active file is not one of .csv / .tsv"
+    );
+    assert_eq!(app.terminals.len(), before, "a guard spawns nothing");
+    app.editor.open(&data).unwrap();
+    app.open_active_file_in_viewer(&viewer);
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "a matching file opens in a pane"
+    );
+}
+
+/// #465: the Explorer menu offers the viewer for a single file it handles,
+/// after Rename and before the compare entries, and for nothing else.
+#[test]
+fn the_explorer_menu_offers_a_viewer_for_a_single_matching_file_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("data.csv");
+    let md = tmp.path().join("notes.md");
+    std::fs::write(&csv, "a,b\n").unwrap();
+    std::fs::write(&md, "# hi\n").unwrap();
+    let viewer_for = |file: &Path| {
+        (file.extension().and_then(|e| e.to_str()) == Some("csv"))
+            .then(|| (String::from("Open in csvlens"), String::from("csvlens")))
+    };
+    let target = tmp.path().to_path_buf();
+
+    let n = file_node(&csv);
+    let items = build_tree_context_menu_items_with(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&csv),
+        &target,
+        None,
+        None,
+        viewer_for,
+    );
+    let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+    let at = labels
+        .iter()
+        .position(|l| *l == "Open in csvlens")
+        .expect("a csv gets the viewer entry");
+    assert_eq!(labels[at - 1], "Rename", "it follows Rename");
+    assert!(
+        matches!(&items[at].1, MenuAction::OpenInViewer(id, p) if id == "csvlens" && p == &csv)
+    );
+
+    let n = file_node(&md);
+    let items = build_tree_context_menu_items_with(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&md),
+        &target,
+        None,
+        None,
+        viewer_for,
+    );
+    assert!(
+        !items.iter().any(|(l, _)| l == "Open in csvlens"),
+        "a kind no viewer handles gets no entry"
+    );
+
+    // A multi-selection is not one file, so no viewer entry either.
+    let n = file_node(&csv);
+    let both = vec![csv.clone(), md.clone()];
+    let items = build_tree_context_menu_items_with(
+        Some(&n),
+        tmp.path(),
+        &both,
+        &target,
+        None,
+        None,
+        viewer_for,
+    );
+    assert!(
+        !items.iter().any(|(l, _)| l == "Open in csvlens"),
+        "a multi-selection gets no viewer entry"
+    );
+}
+
 #[test]
 fn down_arrow_moves_selection_in_the_file_finder() {
     let tmp = tempfile::tempdir().unwrap();

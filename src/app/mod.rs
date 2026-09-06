@@ -1720,6 +1720,29 @@ fn build_tree_context_menu_items(
     clipboard: Option<&ExplorerClipboard>,
     compare_anchor: Option<&Path>,
 ) -> Vec<(String, MenuAction)> {
+    build_tree_context_menu_items_with(
+        node,
+        root,
+        selection,
+        target_dir,
+        clipboard,
+        compare_anchor,
+        |file| crate::mcp::registry::viewer_for_path(file).map(|v| (v.label, v.id)),
+    )
+}
+
+/// [`build_tree_context_menu_items`] with the viewer lookup injected (#465):
+/// `viewer_for` answers "which installed viewer handles this file", as
+/// `(label, id)`, so a test can offer one without an extensions dir.
+fn build_tree_context_menu_items_with(
+    node: Option<&crate::widgets::file_tree::Node>,
+    root: &Path,
+    selection: &[PathBuf],
+    target_dir: &Path,
+    clipboard: Option<&ExplorerClipboard>,
+    compare_anchor: Option<&Path>,
+    viewer_for: impl Fn(&Path) -> Option<(String, String)>,
+) -> Vec<(String, MenuAction)> {
     let entry_target = crate::widgets::file_tree::delete_target_for(node, root);
     let mut items: Vec<(String, MenuAction)> = Vec::new();
     if let Some(p) = entry_target {
@@ -1768,11 +1791,8 @@ fn build_tree_context_menu_items(
         if let Some(file) = single_file_target {
             // An installed viewer for this file kind (#465): `Open in csvlens`
             // on a .csv, once the csvlens extension has been added.
-            if let Some(viewer) = crate::mcp::registry::viewer_for_path(file) {
-                items.push((
-                    viewer.label.clone(),
-                    MenuAction::OpenInViewer(viewer.id.clone(), file.clone()),
-                ));
+            if let Some((label, id)) = viewer_for(file) {
+                items.push((label, MenuAction::OpenInViewer(id, file.clone())));
             }
             match compare_anchor {
                 Some(anchor) if anchor != file.as_path() => {
@@ -31698,6 +31718,13 @@ impl App {
             self.status = format!("Viewer '{viewer_id}' is unavailable");
             return;
         };
+        self.open_active_file_in_viewer(&viewer);
+    }
+
+    /// The palette row's work once its viewer is known: the active editor
+    /// file must exist and be a kind the viewer handles, or the status line
+    /// says which it is not.
+    fn open_active_file_in_viewer(&mut self, viewer: &crate::mcp::registry::ContributedViewer) {
         let Some(path) = self.editor.path.clone() else {
             self.status = format!("{}: open a file first", viewer.label);
             return;
@@ -31714,7 +31741,7 @@ impl App {
             );
             return;
         }
-        self.open_in_viewer(&viewer, &path);
+        self.open_in_viewer(viewer, &path);
     }
 
     /// Dispatch a chosen palette row: a built-in command runs inline; an
