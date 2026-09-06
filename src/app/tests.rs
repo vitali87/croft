@@ -2972,12 +2972,11 @@ fn terminal_decoration_dot_click_is_not_hijacked_by_the_sidebar_splitter() {
         tmp.path(),
     )
     .unwrap();
-    let mut waited = 0u32;
-    while app.terminals[0].command_decorations().is_empty() {
-        assert!(waited < 8000, "no decoration mark arrived");
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        waited += 40;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the shell to emit a decoration mark",
+        || !app.terminals[0].command_decorations().is_empty(),
+    );
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
@@ -3643,18 +3642,18 @@ fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
         tmp.path(),
     )
     .unwrap();
-    let mut waited = 0u32;
-    while app.terminals[0].prompt_lines().is_empty()
-        || !app.terminals[0]
-            .grid_lines()
-            .0
-            .iter()
-            .any(|l| l.contains("filler-39"))
-    {
-        assert!(waited < 4000, "mark/filler output never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the prompt mark and filler output",
+        || {
+            !app.terminals[0].prompt_lines().is_empty()
+                && app.terminals[0]
+                    .grid_lines()
+                    .0
+                    .iter()
+                    .any(|l| l.contains("filler-39"))
+        },
+    );
     app.focus_pane(Pane::Terminal);
     assert_eq!(
         app.terminal().viewport_top_line(),
@@ -3697,19 +3696,19 @@ fn ctrl_shift_space_quick_select_labels_matches_and_a_label_commits() {
     // sentinels, so wait until the SHA shows up on its own echoed row too
     // (a second occurrence); otherwise quick-select can open on a
     // header-only viewport and the hint set is timing-dependent.
-    let mut waited = 0u32;
-    while app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .filter(|l| l.contains("de40bdf12ab34"))
-        .count()
-        < 2
-    {
-        assert!(waited < 4000, "output never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "both copies of the pasted hash",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .filter(|l| l.contains("de40bdf12ab34"))
+                .count()
+                >= 2
+        },
+    );
     app.focus_pane(Pane::Terminal);
     assert!(app.terminal_quick_select.is_none(), "starts off");
 
@@ -3786,17 +3785,17 @@ fn shift_pageup_pages_the_scrollback_and_shift_end_snaps_back() {
         tmp.path(),
     )
     .unwrap();
-    let mut waited = 0u32;
-    while !app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("page-79"))
-    {
-        assert!(waited < 4000, "filler output never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the filler output",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("page-79"))
+        },
+    );
     app.focus_pane(Pane::Terminal);
     let at_bottom = app.terminal().viewport_top_line();
 
@@ -3886,18 +3885,18 @@ fn pane_inline_image_overlay_anchors_hides_when_scrolled_off_and_returns() {
         tmp.path(),
     )
     .unwrap();
-    let mut waited = 0u32;
-    while app.terminals[0].pane_images().is_empty()
-        || !app.terminals[0]
-            .grid_lines()
-            .0
-            .iter()
-            .any(|l| l.contains("fill-79"))
-    {
-        assert!(waited < 8000, "image/filler never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the image and its filler",
+        || {
+            !app.terminals[0].pane_images().is_empty()
+                && app.terminals[0]
+                    .grid_lines()
+                    .0
+                    .iter()
+                    .any(|l| l.contains("fill-79"))
+        },
+    );
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -3951,19 +3950,19 @@ fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
         tmp.path(),
     )
     .unwrap();
-    let mut waited = 0u32;
-    while app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .filter(|l| l.contains("example.com/paint"))
-        .count()
-        < 2
-    {
-        assert!(waited < 4000, "output never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "both copies of the pasted URL",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .filter(|l| l.contains("example.com/paint"))
+                .count()
+                >= 2
+        },
+    );
     app.focus_pane(Pane::Terminal);
     // Render once BEFORE opening quick select: the first render resizes the
     // pane to its layout size (reflowing the grid), and hints must be
@@ -4067,16 +4066,15 @@ fn cmd_k_i_broadcasts_input_to_every_pane_with_confirm_and_auto_off() {
         app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
     }
     app.handle_terminal_key(key(KeyCode::Enter, KeyModifiers::NONE));
-    let mut waited = 0u32;
-    while !app
-        .terminals
-        .iter()
-        .all(|t| t.grid_lines().0.iter().any(|l| l.contains("got-hi")))
-    {
-        assert!(waited < 8000, "broadcast input never reached every pane");
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        waited += 40;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the broadcast input to reach every pane",
+        || {
+            app.terminals
+                .iter()
+                .all(|t| t.grid_lines().0.iter().any(|l| l.contains("got-hi")))
+        },
+    );
 
     // Cmd+K Shift+I toggles the active pane out of the broadcast set.
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('I'), KeyModifiers::SHIFT)));
@@ -19000,20 +18998,17 @@ fn bare_f10_reaches_the_shell_when_terminal_is_focused_with_no_debug_session() {
     .unwrap();
     app.focus_pane(Pane::Terminal);
     let _ = app.handle_key(key(KeyCode::F(10), KeyModifiers::NONE));
-    let mut waited = 0u32;
-    while !app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("^[[21~"))
-    {
-        assert!(
-            waited < 4000,
-            "F10 was swallowed instead of being forwarded to the PTY"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "F10 to reach the PTY rather than being swallowed",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("^[[21~"))
+        },
+    );
 }
 
 #[test]
@@ -26160,17 +26155,17 @@ fn copy_mode_navigates_scrollback_with_vi_keys_and_copies_char_line_and_block() 
     )
     .unwrap();
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while !app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("ccc3"))
-    {
-        assert!(waited < 8000, "pane output never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane output \"ccc3\"",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("ccc3"))
+        },
+    );
     let enter_copy_mode = key(
         KeyCode::Char('y'),
         KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -26400,17 +26395,17 @@ fn finished_commands_land_in_durable_history_and_the_popup_types_them() {
         "Enter closes the popup"
     );
     app.terminals[0].write_input(b"\n");
-    let mut waited = 0u32;
-    while !app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("typed-kubectl get pods"))
-    {
-        assert!(waited < 8000, "typed command never reached the shell");
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        waited += 40;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the typed command to reach the shell",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("typed-kubectl get pods"))
+        },
+    );
 }
 
 #[test]
@@ -27349,12 +27344,11 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
         .unwrap(),
     );
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while app.terminals[0].progress() != Some((1, 46)) {
-        assert!(waited < 8000, "progress report never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the 1-of-46 progress report",
+        || app.terminals[0].progress() == Some((1, 46)),
+    );
 
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -27396,12 +27390,11 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
 
     // State 0 clears: the gauge and the pill percent both vanish.
     app.terminals[0].write_input(b"\n");
-    let mut waited = 0u32;
-    while app.terminals[0].progress().is_some() {
-        assert!(waited < 8000, "state 0 never cleared the progress");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "state 0 to clear the progress",
+        || app.terminals[0].progress().is_none(),
+    );
     term.draw(|f| app.render(f)).unwrap();
     let rows = screen_rows(&term);
     let border_row = &rows[(area.y + area.height - 1) as usize];
@@ -27431,17 +27424,17 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_rendered_log_tab() {
     app.terminals[0].set_manual_name(Some(String::from("bldlog")));
     app.scrollback_dir = tmp.path().join("dumps");
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while !app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("scrollback-payload-7"))
-    {
-        assert!(waited < 8000, "pane output never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane output \"scrollback-payload-7\"",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("scrollback-payload-7"))
+        },
+    );
 
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('d'), KeyModifiers::NONE)));
     assert!(
@@ -28248,17 +28241,17 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
     )
     .unwrap();
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while !app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.starts_with("gutter-row-9"))
-    {
-        assert!(waited < 8000, "pane output never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane output \"gutter-row-9\"",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.starts_with("gutter-row-9"))
+        },
+    );
     fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
         let buf = term.backend().buffer();
         (0..buf.area.height)
@@ -28331,12 +28324,11 @@ fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
     )
     .unwrap();
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while app.terminals[0].command_decorations().is_empty() {
-        assert!(waited < 8000, "the command never finished");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the command to finish",
+        || !app.terminals[0].command_decorations().is_empty(),
+    );
     fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
         let buf = term.backend().buffer();
         (0..buf.area.height)
@@ -28492,17 +28484,17 @@ fn a_plain_click_on_the_prompt_row_moves_the_shell_cursor() {
     )
     .unwrap();
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while !app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("hello-world"))
-    {
-        assert!(waited < 8000, "prompt text never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the prompt text",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("hello-world"))
+        },
+    );
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -28561,17 +28553,17 @@ fn arrow_keys_reach_an_app_cursor_mode_child_as_ss3() {
     )
     .unwrap();
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while !app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("READY_MARK"))
-    {
-        assert!(waited < 8000, "the child never turned on app cursor mode");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the child to turn on app cursor mode",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("READY_MARK"))
+        },
+    );
     for code in [
         KeyCode::Up,
         KeyCode::Down,
@@ -28635,16 +28627,15 @@ fn broadcast_arrows_encode_per_pane_cursor_mode() {
     app.active_terminal = 0;
     app.broadcast_input = true;
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while !app
-        .terminals
-        .iter()
-        .all(|t| t.grid_lines().0.iter().any(|l| l.contains("READY_MARK")))
-    {
-        assert!(waited < 8000, "the children never reached their prompts");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the children to reach their prompts",
+        || {
+            app.terminals
+                .iter()
+                .all(|t| t.grid_lines().0.iter().any(|l| l.contains("READY_MARK")))
+        },
+    );
     app.handle_terminal_key(key(KeyCode::Up, KeyModifiers::NONE));
     let mut waited = 0u32;
     loop {
@@ -28675,17 +28666,17 @@ fn cmd_k_n_annotates_the_selection_and_a_click_shows_the_note() {
     )
     .unwrap();
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while !app.terminals[0]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.starts_with("mark-this-output"))
-    {
-        assert!(waited < 8000, "output never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane output \"mark-this-output\"",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.starts_with("mark-this-output"))
+        },
+    );
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -28822,12 +28813,11 @@ fn host_accent_rules_dress_matching_panes() {
         .unwrap(),
     );
     app.focus_pane(Pane::Terminal);
-    let mut waited = 0u32;
-    while app.terminals[0].shell_host().as_deref() != Some("prod-db-1") {
-        assert!(waited < 8000, "the OSC 7 host never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the OSC 7 host",
+        || app.terminals[0].shell_host().as_deref() == Some("prod-db-1"),
+    );
     let backend = ratatui::backend::TestBackend::new(140, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
