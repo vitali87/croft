@@ -22,29 +22,37 @@ fn probe_command(probe: &str) -> String {
     format!("printf '%s%s\\n' '{head}' '{tail}'\r")
 }
 
-/// How long the terminal end-to-end tests wait for their probe to come back
-/// through the PTY. Generous on purpose: a real shell has to start, run the
-/// command, and have the reader thread drain the bytes into the grid, and on
-/// a box running the whole suite in parallel that took longer than the three
-/// seconds this used to allow (issue #226).
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
 /// Run the probe command in the app's embedded terminal and wait until the
 /// probe is on screen. Panics with the actual screen contents if it never
 /// arrives, so a failure says what the terminal was showing instead of
 /// unwrapping `None` several lines later.
+///
+/// The wait is load-scaled (#397): a real shell has to start, run the
+/// command, and have the reader thread drain the bytes into the grid, and
+/// what stretches that is contention from the rest of the suite, not this
+/// test. The fixed 15s this replaced (#226 had raised it from 3s) is what a
+/// quiet machine still gets at the floor; the captured failure had the probe
+/// command echoed on screen and unanswered at 15s, a starved shell rather
+/// than a broken one. `spawn_budget` rather than `await_spawned` so the
+/// panic can keep showing the screen.
 fn await_terminal_probe(app: &mut App, probe: &str) {
     app.terminal_mut()
         .write_input(probe_command(probe).as_bytes());
+    let base = crate::test_budget::tests::TERMINAL_PROBE_BASE;
+    let budget = crate::test_budget::spawn_budget(base);
     let started = std::time::Instant::now();
-    while started.elapsed() < PROBE_TIMEOUT {
+    while started.elapsed() < budget {
         if app.terminal().visible_text().contains(probe) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     panic!(
-        "the shell never printed the probe {probe:?} within {PROBE_TIMEOUT:?}; terminal showed:\n{}",
+        "the shell never printed the probe {probe:?} within {budget:?} ({base:?} base x{} total \
+         for calibration and load); if this is a real failure it would also fail at 1x, so \
+         re-run the full suite on the unmodified merge base under the same load before \
+         suspecting your diff. Terminal showed:\n{}",
+        budget.as_millis() / base.as_millis().max(1),
         app.terminal().visible_text()
     );
 }
@@ -6291,13 +6299,14 @@ fn rerunning_a_task_reuses_its_pane_instead_of_stacking_new_ones() {
     app.handle_key(chord).unwrap();
     // Wait for the pane's shell to come back to its prompt so the rerun
     // path sees an idle pane (a busy pane legitimately gets a new one).
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) {
-        if app.terminals[app.active_terminal].foreground_is_shell() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled and LOUD (#397): the fixed 5000ms loop broke out silently
+    // on timeout, so under suite load the next step met a pane still busy
+    // and the assertion after it misreported the timeout as its own failure.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the task pane's shell to return to its prompt",
+        || app.terminals[app.active_terminal].foreground_is_shell(),
+    );
     let after_first = app.terminals.len();
     app.handle_key(chord).unwrap();
     assert_eq!(
@@ -6328,13 +6337,14 @@ fn a_reused_task_pane_clears_a_half_typed_prompt_line_first() {
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     );
     app.handle_key(chord).unwrap();
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) {
-        if app.terminals[app.active_terminal].foreground_is_shell() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled and LOUD (#397): the fixed 5000ms loop broke out silently
+    // on timeout, so under suite load the next step met a pane still busy
+    // and the assertion after it misreported the timeout as its own failure.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the task pane's shell to return to its prompt",
+        || app.terminals[app.active_terminal].foreground_is_shell(),
+    );
     app.handle_key(chord).unwrap();
     let bytes = app.terminals[app.active_terminal].written_bytes_for_test();
     let needle = b"\x05\x15make build\r";
@@ -6358,13 +6368,16 @@ fn a_task_pane_from_the_old_workspace_is_not_reused_after_a_re_root() {
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     );
     app.handle_key(chord).unwrap();
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) {
-        if app.terminals[app.active_terminal].foreground_is_shell() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled and LOUD (#397). The fixed 5000ms loop broke out silently
+    // on timeout, and here a still-busy pane passes the assertion below for
+    // the wrong reason: a busy pane always gets a sibling, so `after + 1`
+    // held without the cwd guard ever being exercised. Failing loudly makes
+    // the guard the thing under test.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the task pane's shell to return to its prompt",
+        || app.terminals[app.active_terminal].foreground_is_shell(),
+    );
     // Focus another pane so the re-root's active-pane `cd` cannot move the
     // task pane along (the reviewer's scenario: it is NOT cd'd).
     app.active_terminal = 0;
@@ -30469,21 +30482,32 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
 fn quick_select_labels_follow_content_that_streams_below_them() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A SILENT pane (#397). The row slack below was this test's first fix,
+    // and it held until a full-suite run captured the pane holding ONLY the
+    // shell's wrapped prompt and the trailing x1 x2 x3, the URL gone: the
+    // shell's prompt repaint after the maximize's SIGWINCH landed between
+    // the feeds and rewrote the rows the URL sat on. Slack absorbs a prompt
+    // that appends; it cannot absorb one that repaints. A child that prints
+    // nothing removes the writer entirely, and the subject here -- croft's
+    // label overlay following content the pane streams -- needs a grid, not
+    // a shell. The slack assertion stays: the scroll this test drives still
+    // needs the rows.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     // The panel over the editor, so the pane has ROWS. Unmaximized it is a
     // few rows tall here, and this test parks its URL four rows from the
-    // bottom: almost no slack against a prompt that a real shell writes and
-    // that wraps to several rows on a machine with a long hostname and path.
-    // That is this test's entry in #397, measured at 3 failures in 20 runs
-    // under load, with the URL scrolling off the top in the failure. The
-    // measured numbers are in the PR; the literals are not repeated here,
-    // since they are one configuration's and the code derives its own below.
-    //
-    // The maximize also resizes the PTY, so the pane's shell takes a SIGWINCH
-    // and may repaint its prompt. That lands before the newline flood parks
-    // the cursor, and the slack this exists to create absorbs a late one.
+    // bottom. When the pane still ran the workspace shell that was almost
+    // no slack against a wrapped prompt (this test's first entry in #397,
+    // 3 failures in 20 runs under load); with a silent child the rows are
+    // simply what the scroll below needs, and the maximize is how it gets
+    // them.
     app.toggle_terminal_maximize();
     term.draw(|f| app.render(f)).unwrap();
     // Park the cursor at the pane bottom so every further row SCROLLS.
@@ -30493,21 +30517,19 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     // rows, the test would quietly return to flaking instead of failing.
     assert!(
         h >= 16,
-        "the maximized panel must leave slack for the shell's wrapped prompt; got {h} rows"
+        "the maximized panel must leave rows for the scroll this test drives; got {h} rows"
     );
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
-    // One atomic feed, opening with its own newline: the live child
-    // shell's prompt can flush between feed calls under suite load (#62),
-    // and a prompt landing just before the URL used to push it across the
-    // pane edge, wrapping the match. Advancing "\r\n" + URL under one grid
-    // lock keeps the URL at column 0 whether the prompt arrives before
-    // this chunk (its row is above) or after it (it appends to the right).
+    // One atomic feed, opening with its own newline, so "\r\n" + URL lands
+    // under one grid lock with the URL at column 0. #62 saw the match wrap
+    // the pane edge when another writer got between two feeds; the pane is
+    // silent now, and the shape is kept because it is the one that cannot
+    // wrap whatever else is on screen.
     app.terminals[0].feed_bytes_for_test(b"\r\nhttp://drift.io");
     app.open_terminal_quick_select();
-    // The URL by name, not `is_some()`. Quick select stages every match on
-    // screen and the live shell's prompt path is one, so `is_some()` cannot
-    // tell "the URL is hinted" from "only the prompt is", and maximizing the
-    // pane put more prompt text on screen rather than less.
+    // The URL by name, not `is_some()`: quick select stages every match on
+    // screen, and naming the one this test planted keeps the assertion
+    // about it rather than about whatever else happens to match.
     assert!(
         app.terminal_quick_select
             .as_ref()
@@ -30519,10 +30541,9 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     let buf = term.backend().buffer().clone();
     // Join the pane's inner rows into one stream before searching, so pane
     // geometry can't split the needle across a row boundary (#62), and
-    // don't pin WHICH gold label the URL drew: when the live shell's
-    // prompt lands above the URL its path is a match too, and label
-    // assignment is bottom-priority, so the URL's letter depends on that
-    // race. The invariant is that SOME label still covers the URL's first
+    // don't pin WHICH gold label the URL drew: label assignment is
+    // bottom-priority over every match on screen, and the letter is not the
+    // claim. The invariant is that SOME label still covers the URL's first
     // cell after the scroll — the 'h' is overlaid, the rest is intact.
     let inner = app.terminals[0].last_inner;
     let joined: String = (inner.y..inner.y + inner.height)
