@@ -777,13 +777,6 @@ mod tests {
         );
     }
 
-    /// The cap accepts EXACTLY `cap` bytes and refuses one more.
-    ///
-    /// `read_capped`'s `take(cap + 1)` and `>` carry a deliberate off-by-one
-    /// argument that nothing could check while it was inline in `run`: a
-    /// `take(cap)` cannot tell a legal cap-byte payload from a truncated
-    /// larger one, and a `>=` would refuse the legal one. Both mutations are
-    /// invisible in a suite that never drives the boundary.
     /// Serve connections from a NON-blocking listener until told to stop,
     /// answering each with the reply `answer` picks for its index, and hand
     /// back how many arrived.
@@ -893,6 +886,13 @@ mod tests {
         assert_eq!(seen, 2, "exactly two attempts, not {seen}");
     }
 
+    /// The cap accepts EXACTLY `cap` bytes and refuses one more.
+    ///
+    /// `read_capped`'s `take(cap + 1)` and `>` carry a deliberate off-by-one
+    /// argument that nothing could check while it was inline in `run`: a
+    /// `take(cap)` cannot tell a legal cap-byte payload from a truncated
+    /// larger one, and a `>=` would refuse the legal one. Both mutations are
+    /// invisible in a suite that never drives the boundary.
     #[test]
     fn the_stdin_cap_accepts_exactly_the_cap_and_refuses_one_more() {
         assert_eq!(
