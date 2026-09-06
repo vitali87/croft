@@ -377,7 +377,7 @@ def documented(text):
     reported documentation as missing when rustc could see it perfectly well.
     """
     state = {}
-    for name, block in _items(text):
+    for name, block, _line in _items(text):
         state[name] = state.get(name, False) or block is not None
     return state
 
@@ -414,15 +414,44 @@ def _items(text):
             while j >= 0 and kinds[j] == DOC:
                 j -= 1
             block = tuple(l.strip() for l in lines[j + 1 : end])
-        yield name, block
+        yield name, block, i
 
 
 def doc_blocks_of(text, names):
     """The `///` blocks sitting above the items in `names`, as tuples of
-    stripped lines. What a stranded block at HEAD is compared against to
-    tell "the prose this loss already accounts for" from a second defect
-    (#463)."""
-    return {block for name, block in _items(text) if name in names and block}
+    stripped lines, one entry per documented definition. What a stranded
+    block at HEAD is compared against to tell "the prose this loss already
+    accounts for" from a second defect (#463)."""
+    return [block for name, block, _line in _items(text) if name in names and block]
+
+
+def explained_orphans(head_text, candidates, lost, explained):
+    """Line numbers of the stranded blocks in `candidates` that the losses
+    of `lost` already account for (#463).
+
+    An insertion strands the block that sat above its victim, so the
+    explained copy is the nearest matching block ABOVE where the victim now
+    sits at HEAD. Pairing by position rather than by text alone matters when
+    the same prose occurs twice in a file: `/// Creates a new instance.`
+    above two `new`s is ordinary, and a match on text would let one loss
+    silence a stranded copy that never documented it. Each lost definition
+    explains at most one block, and a block with no victim below it is
+    reported as usual.
+    """
+    remaining = list(explained)
+    stood_down = set()
+    victims = sorted(line for name, _block, line in _items(head_text) if name in lost)
+    for victim in victims:
+        above = [
+            o
+            for o in candidates
+            if o[0] - 1 < victim and o[0] not in stood_down and o[3] in remaining
+        ]
+        if above:
+            pick = max(above, key=lambda o: o[0])
+            stood_down.add(pick[0])
+            remaining.remove(pick[3])
+    return stood_down
 
 
 def orphaned_docs(text):
@@ -823,21 +852,25 @@ def main():
         # named it, and the block it left stranded at HEAD is the very block
         # that sat above it at the revision the loss names. Reporting that
         # block again describes the same edit a second time. The match is on
-        # the block's full text, not on the file: a stranded block that
-        # never documented the lost item is a second defect and keeps its
-        # line, and prose the branch also rewrote no longer matches and is
-        # reported, which is the conservative side for a gate.
-        explained = set()
+        # the block's full text AND its position above the victim, not on
+        # the file: a stranded block that never documented the lost item is
+        # a second defect and keeps its line, and prose the branch also
+        # rewrote no longer matches and is reported, which is the
+        # conservative side for a gate.
+        explained = []
         by_rev = {}
         for path, name, at in losses:
             if path == f:
                 by_rev.setdefault(at, set()).add(name)
         for at, names in by_rev.items():
-            explained |= doc_blocks_of(
-                git("show", f"{at}:{f}", allow_missing_path=True), names
+            explained.extend(
+                doc_blocks_of(git("show", f"{at}:{f}", allow_missing_path=True), names)
             )
-        for line_no, first, follower, block in orphaned_docs(head_text):
-            if block in explained:
+        candidates = orphaned_docs(head_text)
+        lost_here = set().union(*by_rev.values()) if by_rev else set()
+        stood_down = explained_orphans(head_text, candidates, lost_here, explained)
+        for line_no, first, follower, _block in candidates:
+            if line_no in stood_down:
                 continue
             orphans.append((f, line_no, first, follower))
         # `--no-merges`, and the omission is not a shortcut. A merge's first

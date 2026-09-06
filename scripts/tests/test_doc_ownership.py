@@ -686,6 +686,41 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             self.assertNotIn("'/// Documents beta.'", text, f"the block the loss explains stands down: {text}")
             self.assertEqual(text.count("::error"), 2, f"two defects, two annotations: {text}")
 
+    def test_duplicated_prose_does_not_silence_a_second_stranded_block(self):
+        """The stand-down pairs a loss with the stranded block ABOVE its
+        victim, not with every block that reads the same. `/// Creates a new
+        instance.` above two `new`s is ordinary Rust; here one copy is the
+        #463 capture of `A::new`, and the other is a #427-shaped capture in
+        a new impl, whose victim has no base doc to lose and so is seen by
+        the head-only pass alone. Matching on text would silence it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "impl A {\n    /// Creates a new instance.\n    pub fn new() {}\n}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "impl A {\n    /// Creates a new instance.\n\n    /// Helper.\n"
+                "    pub fn helper() {}\n\n    pub fn new() {}\n}\n"
+                "impl C {\n    /// Creates a new instance.\n\n    /// Other.\n"
+                "    pub fn other() {}\n\n    pub fn new() {}\n}\n",
+            )
+            out = io.StringIO()
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            text = out.getvalue()
+            self.assertIn("`A::new` had a doc comment", text)
+            self.assertIn("line=10::", text, f"the copy in impl C is its own defect: {text}")
+            self.assertNotIn("line=2::", text, f"the copy above A::new is the loss's: {text}")
+            self.assertEqual(text.count("::error"), 2, f"two captures, two annotations: {text}")
+
     def test_ordinary_docs_are_not_reported(self):
         """The control. A gate that cries wolf stops being read, so the
         shapes a real file is full of must stay silent: attributes and
