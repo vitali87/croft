@@ -29,6 +29,124 @@ use crate::ansi_text::{AnsiLine, AnsiStyle, parse_into, parse_line};
 use crate::widgets::editor_find::{MatchPos, line_matches};
 use crate::widgets::search::{SearchOpts, line_may_match};
 
+/// Whether a NEWLY opened view highlights (#466). The app sets it from the
+/// `disable_log_highlight` preference at startup, on a settings remerge (a
+/// workspace layer may set the key) and on the palette toggle, so a log
+/// opened later comes up the way the user last asked without every opener
+/// having to thread the preference through. Existing views are flipped by
+/// the app through [`LogView::set_highlight`].
+static DEFAULT_HIGHLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Serialises the tests that read or write the process-wide default (#466):
+/// the atomic makes each access sound, not the snapshot / flip / open /
+/// restore sequence a test performs around it, and the suite runs tests on
+/// parallel threads.
+#[cfg(test)]
+pub(crate) static DEFAULT_HIGHLIGHT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Set the highlight default for views opened from now on (#466).
+pub fn set_default_highlight(on: bool) {
+    DEFAULT_HIGHLIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The highlight default new views take (#466).
+pub fn default_highlight() -> bool {
+    DEFAULT_HIGHLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// One tailspin highlighter per thread (#466): building it compiles its
+    /// regex set, which is worth doing once rather than per window refill,
+    /// and a thread-local sidesteps any question of the highlighter being
+    /// shareable across threads. Parsing only ever happens on the thread
+    /// that renders, so in practice this is one instance.
+    static HIGHLIGHTER: tailspin::Highlighter = build_highlighter();
+}
+
+/// The `tspin` CLI's default groups plus its severity keywords (#466). The
+/// library's `Highlighter::default()` deliberately leaves the keywords out;
+/// a log viewer wants them most of all, so they are added here, and FIRST,
+/// because when two matches overlap the group added first wins.
+///
+/// NO KEYWORD STYLE MAY SET A BACKGROUND. tailspin renders a background-
+/// styled keyword as a badge with a literal space on each side, which
+/// changes the visible text -- and `visible_text` promises the text the
+/// reader sees is the text find and copy read from the raw, unhighlighted
+/// line. `coloured` below therefore sets a foreground only.
+fn build_highlighter() -> tailspin::Highlighter {
+    use tailspin::config::*;
+    use tailspin::style::{Color, Style};
+    let words = |list: &[&str]| list.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+    let coloured = |fg: Color, bold: bool| Style {
+        fg: Some(fg),
+        bold,
+        ..Style::default()
+    };
+    tailspin::Highlighter::builder()
+        .with_keyword_highlighters(vec![
+            KeywordConfig {
+                words: words(&[
+                    "ERROR", "FATAL", "PANIC", "CRITICAL", "error", "fatal", "panic",
+                ]),
+                style: coloured(Color::Red, true),
+            },
+            KeywordConfig {
+                words: words(&["WARN", "WARNING", "warn", "warning"]),
+                style: coloured(Color::Yellow, true),
+            },
+            KeywordConfig {
+                words: words(&["INFO", "info", "NOTICE"]),
+                style: coloured(Color::Green, false),
+            },
+            KeywordConfig {
+                words: words(&["DEBUG", "TRACE", "debug", "trace"]),
+                style: coloured(Color::Magenta, false),
+            },
+            KeywordConfig {
+                words: words(&["true", "false", "null", "nil"]),
+                style: coloured(Color::Cyan, false),
+            },
+            KeywordConfig {
+                words: words(&["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]),
+                style: coloured(Color::Blue, false),
+            },
+        ])
+        .with_json_highlighter(JsonConfig::default())
+        .with_date_time_highlighter(DateTimeConfig::default())
+        .with_ip_v4_highlighter(IpV4Config::default())
+        .with_url_highlighter(UrlConfig::default())
+        .with_email_highlighter(EmailConfig::default())
+        .with_unix_path_highlighter(UnixPathConfig::default())
+        .with_key_value_highlighter(KeyValueConfig::default())
+        .with_uuid_highlighter(UuidConfig::default())
+        .with_pointer_highlighter(PointerConfig::default())
+        .with_unix_process_highlighter(UnixProcessConfig::default())
+        .with_duration_highlighter(DurationConfig::default())
+        .with_number_highlighter(NumberConfig::default())
+        .with_quote_highlighter(QuoteConfig::default())
+        .build()
+        .expect("tailspin's default groups plus fixed keywords always build")
+}
+
+/// Lines wider than this are parsed unhighlighted (#466). tailspin's merge
+/// step allocates a style slot per byte of a line that matched anything,
+/// and a line can be as wide as the whole window; a megabyte-wide JSON line
+/// is not one a reader scans for a coloured UUID. Every other sweep in this
+/// file is budgeted (`FIND_SCAN_BYTES`, `MAX_COPY_BYTES`); so is this one.
+const MAX_HIGHLIGHT_BYTES: usize = 16 * 1024;
+
+/// `raw` with tailspin's colours applied (#466), or `raw` untouched when it
+/// already carries an escape sequence: a line that coloured itself (pytest,
+/// cargo, a structured logger) keeps its own colours rather than getting a
+/// second set painted over them. A line tailspin matches nothing on comes
+/// back borrowed, so the common plain line costs no allocation.
+fn highlighted(raw: &str) -> std::borrow::Cow<'_, str> {
+    if raw.is_empty() || raw.len() > MAX_HIGHLIGHT_BYTES || raw.contains('\x1b') {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    HIGHLIGHTER.with(|h| h.apply(raw))
+}
+
 /// One window refill: many screens' worth, still instant to read.
 const WINDOW_BYTES: usize = 256 * 1024;
 
@@ -151,6 +269,10 @@ pub struct LogView {
     cache: std::collections::BTreeMap<usize, AnsiLine>,
     /// Line number the cache starts at, for cheap eviction.
     cache_start: usize,
+    /// Whether plain lines get tailspin's colours when parsed into the
+    /// window (#466). Flipping it drops the window so the next paint
+    /// re-parses; see [`Self::set_highlight`].
+    highlight: bool,
     /// Anchor and head of a mouse selection, as absolute (line, char column).
     ///
     /// Kept here rather than in the editor's own `selection` because those
@@ -250,6 +372,7 @@ impl LogView {
             scanned_to: 0,
             cache: std::collections::BTreeMap::new(),
             cache_start: 0,
+            highlight: default_highlight(),
             selection: None,
             dragging: false,
             last_body: ratatui::layout::Rect::default(),
@@ -471,10 +594,41 @@ impl LogView {
             if idx >= last {
                 break;
             }
-            let parsed = parse_line(raw.strip_suffix('\r').unwrap_or(raw), &mut style);
+            let raw = raw.strip_suffix('\r').unwrap_or(raw);
+            // Only a line that starts from the default style is tailspin's
+            // to colour. One still inside a colour block an earlier line
+            // opened (a red stack trace under one `\e[31m`) has no escape
+            // byte of its own, yet it IS coloured, and tailspin's resets
+            // after each match would cut the block short. Exact within a
+            // window; the window's own first line always starts from the
+            // default style (see the doc on `ensure`), so a block that
+            // opened above the window is not seen there -- the same
+            // boundary that already left such a line uncoloured.
+            let parsed = if self.highlight && style == AnsiStyle::default() {
+                parse_line(&highlighted(raw), &mut style)
+            } else {
+                parse_line(raw, &mut style)
+            };
             self.cache.insert(idx, parsed);
         }
         Ok(())
+    }
+
+    /// Whether this view highlights plain lines with tailspin (#466).
+    pub fn highlight(&self) -> bool {
+        self.highlight
+    }
+
+    /// Turn tailspin highlighting on or off for this view (#466). A change
+    /// drops the parsed window, so the next `ensure` re-parses the visible
+    /// lines under the new setting; the index, selection and find state are
+    /// untouched, since none of them read colours.
+    pub fn set_highlight(&mut self, on: bool) {
+        if self.highlight == on {
+            return;
+        }
+        self.highlight = on;
+        self.cache.clear();
     }
 
     /// The parsed line at `idx`, if the current window covers it.
@@ -921,6 +1075,148 @@ mod tests {
         body.extend_from_slice(tail.as_bytes());
         body.push(b'\n');
         (body, lines + 1)
+    }
+
+    /// #466: a plain line comes out of the window coloured by tailspin, the
+    /// same line with highlighting off is one unstyled span, and the text
+    /// the reader copies or searches is identical either way.
+    #[test]
+    fn plain_lines_are_highlighted_and_the_text_is_unchanged() {
+        let (_d, p) = write_tmp(b"2024-01-02 12:00:00 ERROR request 42 failed\n");
+        let mut v = LogView::open(&p).unwrap();
+        // Set explicitly rather than relying on the process default: a
+        // sibling test flips that default around its own open.
+        v.set_highlight(true);
+        v.ensure(0, 1).unwrap();
+        let lit = v.line(0).unwrap().clone();
+        assert!(
+            lit.spans.iter().any(|s| s.style.fg.is_some()),
+            "tailspin colours something on a plain log line: {lit:?}"
+        );
+        assert!(
+            lit.spans
+                .iter()
+                .any(|s| lit.text[s.start..s.end].contains("ERROR") && s.style.fg.is_some()),
+            "the severity keyword is coloured, which the library default omits: {lit:?}"
+        );
+        let text_lit = lit.text.clone();
+        assert_eq!(text_lit, "2024-01-02 12:00:00 ERROR request 42 failed");
+
+        v.set_highlight(false);
+        v.ensure(0, 1).unwrap();
+        let plain = v.line(0).unwrap().clone();
+        assert!(
+            plain.spans.iter().all(|s| s.style.fg.is_none()),
+            "with highlighting off the line is unstyled: {plain:?}"
+        );
+        let text_plain = plain.text.clone();
+        assert_eq!(
+            text_plain, text_lit,
+            "the visible text is the same either way"
+        );
+    }
+
+    /// #466: a line that already carries colour is parsed as written; a
+    /// second set of colours painted over a logger's own would misreport
+    /// what the program printed.
+    #[test]
+    fn lines_with_their_own_colours_are_left_alone() {
+        let body = b"\x1b[31mERROR\x1b[0m 2024-01-02 code 500\n";
+        let (_d, p) = write_tmp(body);
+        let mut v = LogView::open(&p).unwrap();
+        v.ensure(0, 1).unwrap();
+        let got = v.line(0).unwrap().clone();
+        let mut style = AnsiStyle::default();
+        let expected = parse_line("\x1b[31mERROR\x1b[0m 2024-01-02 code 500", &mut style);
+        assert_eq!(
+            got, expected,
+            "a self-coloured line is exactly its own parse"
+        );
+    }
+
+    /// #466: a plain line inside a colour block an earlier line opened keeps
+    /// that block: it carries no escape byte, but it is not "plain".
+    #[test]
+    fn a_line_inside_an_inherited_colour_block_is_not_rehighlighted() {
+        let (_d, p) = write_tmp(b"\x1b[31mtrace\n  at foo.rs:12\n\x1b[0mdone\n");
+        let mut v = LogView::open(&p).unwrap();
+        v.set_highlight(true);
+        v.ensure(0, 3).unwrap();
+        let inherited = v.line(1).unwrap().clone();
+        assert!(
+            inherited
+                .spans
+                .iter()
+                .all(|s| s.style.fg == Some(crate::ansi_text::AnsiColor::Indexed(1))),
+            "every span of the inherited line stays red: {inherited:?}"
+        );
+    }
+
+    /// #466: a toggle drops the parsed window, so a stale coloured line is
+    /// never served after the flag flips; the next `ensure` re-parses.
+    #[test]
+    fn toggling_highlight_drops_the_parsed_window() {
+        let (_d, p) = write_tmp(b"2024-01-02 plain 42\n");
+        let mut v = LogView::open(&p).unwrap();
+        v.set_highlight(true);
+        v.ensure(0, 1).unwrap();
+        assert!(v.line(0).is_some(), "the window is parsed");
+        v.set_highlight(false);
+        assert!(v.line(0).is_none(), "the flip drops the window");
+        v.set_highlight(false);
+        v.ensure(0, 1).unwrap();
+        assert!(
+            v.line(0)
+                .unwrap()
+                .spans
+                .iter()
+                .all(|s| s.style.fg.is_none())
+        );
+    }
+
+    /// #466: lines past `MAX_HIGHLIGHT_BYTES` are parsed unhighlighted, and a
+    /// line just under it is coloured, so the cap is pinned on both sides.
+    #[test]
+    fn highlighting_stops_at_the_width_cap() {
+        let under = format!("{} ERROR 42\n", "x ".repeat((MAX_HIGHLIGHT_BYTES - 64) / 2));
+        let over = format!("{} ERROR 42\n", "x ".repeat((MAX_HIGHLIGHT_BYTES + 64) / 2));
+        let (_d, p) = write_tmp(format!("{under}{over}").as_bytes());
+        let mut v = LogView::open(&p).unwrap();
+        v.set_highlight(true);
+        v.ensure(0, 2).unwrap();
+        let lit = v.line(0).unwrap();
+        assert!(
+            lit.spans.iter().any(|s| s.style.fg.is_some()),
+            "just under the cap the line is coloured"
+        );
+        let wide = v.line(1).unwrap();
+        assert!(
+            wide.spans.iter().all(|s| s.style.fg.is_none()),
+            "past the cap the line is parsed as written"
+        );
+        assert_eq!(
+            wide.text.trim_end(),
+            over.trim_end(),
+            "and its visible text is intact"
+        );
+    }
+
+    /// #466: the process-wide default steers a view opened after it changed,
+    /// and an existing view follows its own toggle, not the default.
+    #[test]
+    fn the_default_steers_new_views_only() {
+        let _exclusive = DEFAULT_HIGHLIGHT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_d, p) = write_tmp(b"plain 1\n");
+        let before = default_highlight();
+        set_default_highlight(false);
+        let opened_off = LogView::open(&p).unwrap();
+        set_default_highlight(true);
+        let opened_on = LogView::open(&p).unwrap();
+        set_default_highlight(before);
+        assert!(!opened_off.highlight());
+        assert!(opened_on.highlight());
     }
 
     /// #394: a file within the head budget is complete when `open` returns,

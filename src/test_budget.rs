@@ -236,8 +236,47 @@ pub fn await_spawned(base: Duration, what: &str, mut ready: impl FnMut() -> bool
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The base the two restored-shell waits use (#397).
+    ///
+    /// Shared rather than retyped at each call site, because the test that
+    /// pins it has to be about THEM: an assertion over a literal written
+    /// beside it stays green when a call site changes, which is the
+    /// regression it exists to catch.
+    ///
+    /// 2s because `await_spawned` multiplies by
+    /// `BASE_CALIBRATION * load_scale`, which is 4 at the floor: these two
+    /// replaced a fixed 8000ms, and this keeps that as what they still get
+    /// on a quiet machine. Deliberately NOT a repo-wide rule -
+    /// `a_terminal_link_binding_is_not_refused_for_an_editor_side_reason`
+    /// converts an 8s constant with a 1s base, and reconciling the two is a
+    /// question about that test's operation rather than about these.
+    ///
+    /// Inside this module rather than beside it, because the release gate
+    /// waives a `#[cfg(test)] mod` and nothing else: a `#[cfg(test)]` on a
+    /// free item reads as shipped, which is the conservative direction that
+    /// filter deliberately takes.
+    pub(crate) const RESTORED_SHELL_BASE: Duration = Duration::from_secs(2);
+
+    /// The base behind the app tests' `await_terminal_probe` (#397), which
+    /// six end-to-end tests go through. It replaced a fixed 15s (#226 had
+    /// raised that from 3s for the same reason). 3750ms because
+    /// `BASE_CALIBRATION * MIN_SCALE` is 4 at the floor: a quiet machine
+    /// keeps the 15s it had, and a loaded one gets up to twice that. The
+    /// captured failure was a probe that had been ECHOED but not answered
+    /// within the 15s during a full parallel suite, so the shell was alive
+    /// and merely starved -- the case a load-scaled budget exists for.
+    pub(crate) const TERMINAL_PROBE_BASE: Duration = Duration::from_millis(3750);
+
+    /// The base the three task-pane tests wait for the pane's shell to come
+    /// back to its prompt (#397). They had a fixed 5000ms loop that `break`s
+    /// on timeout, so under load the rerun met a pane still busy, opened a
+    /// second one, and the count assertion reported "3 panes, expected 2"
+    /// as if reuse were broken. 1250ms keeps the 5s at the floor, and the
+    /// wait now fails loudly, naming what it waited for.
+    pub(crate) const TASK_PANE_PROMPT_BASE: Duration = Duration::from_millis(1250);
 
     // The floor matters more than it looks: every budget this replaces was
     // observed failing at 1x, so a quiet machine must still get more room
@@ -346,6 +385,43 @@ mod tests {
         assert!(
             spawn_budget(base) <= base * 8,
             "no budget may exceed the 8x ceiling, however it is composed"
+        );
+    }
+
+    /// The two restored-shell waits keep the 8000ms they replaced.
+    ///
+    /// Written against `RESTORED_SHELL_BASE`, which those call sites use, so
+    /// lowering the base fails HERE. The first version asserted over a
+    /// literal `Duration::from_secs(2)` retyped beside it, which left both
+    /// call sites free to change underneath it, and reduced to
+    /// `BASE_CALIBRATION * MIN_SCALE >= 4` - already asserted, more
+    /// strongly, by `the_worst_case_stretch_is_unchanged` above.
+    #[test]
+    fn a_converted_wait_keeps_the_budget_it_replaced() {
+        let floor = RESTORED_SHELL_BASE * BASE_CALIBRATION * MIN_SCALE;
+        assert!(
+            floor >= Duration::from_millis(8000),
+            "the restored-shell base must reproduce the 8000ms it replaced at \
+             the floor, got {floor:?}"
+        );
+    }
+
+    /// Same rule for the two #397 bases added later: each must give back,
+    /// at the floor, the constant it replaced. Against the constants the
+    /// call sites use, so lowering either fails here.
+    #[test]
+    fn the_probe_and_task_pane_bases_keep_their_old_budgets() {
+        let probe = TERMINAL_PROBE_BASE * BASE_CALIBRATION * MIN_SCALE;
+        assert!(
+            probe >= Duration::from_secs(15),
+            "the terminal probe base must reproduce the 15s it replaced at the \
+             floor, got {probe:?}"
+        );
+        let task = TASK_PANE_PROMPT_BASE * BASE_CALIBRATION * MIN_SCALE;
+        assert!(
+            task >= Duration::from_millis(5000),
+            "the task-pane prompt base must reproduce the 5000ms it replaced at \
+             the floor, got {task:?}"
         );
     }
 

@@ -266,6 +266,13 @@ pub struct Prefs {
     /// matching VS Code.
     #[serde(default)]
     pub copy_on_select: bool,
+    /// Opt-out for tailspin highlighting in the rendered log view (#466):
+    /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
+    /// are coloured on lines that carry no colour of their own. Stored as
+    /// the disable flag so the derived `Default` and an older config both
+    /// mean "highlighted".
+    #[serde(default)]
+    pub disable_log_highlight: bool,
     /// Opt-out for the built-in secret redaction rules (#360): AWS keys,
     /// `sk-`/`ghp_`/`xox` tokens, JWTs and bearer tokens are masked in
     /// terminal panes by default. Stored as the disable flag so the
@@ -275,6 +282,18 @@ pub struct Prefs {
     /// Per-host pane accent rules; see [`HostAccentRule`].
     #[serde(default)]
     pub host_accents: Vec<HostAccentRule>,
+    /// Opt-out for the ssh-pane workspace offer (#364): when a pane's
+    /// foreground becomes `ssh <host>` for a host in `~/.ssh/config`, the
+    /// status bar offers to open the workspace on that host. Stored as the
+    /// disable flag so the derived `Default` and an older config both mean
+    /// "offer". User layers only: an offer is a prompt to connect somewhere.
+    #[serde(default)]
+    pub disable_remote_offer: bool,
+    /// Hosts (ssh config aliases, matched case-insensitively) the offer
+    /// never prompts for (#364): the per-host `auto_offer = off`. A jump
+    /// host, a box you only ever tunnel through. User layers only.
+    #[serde(default)]
+    pub remote_offer_excluded_hosts: Vec<String>,
     /// Scrollback lines kept per terminal pane (VS Code's
     /// `terminal.integrated.scrollback`). 0 — the default for older configs —
     /// means the built-in 5000. Applies to panes opened after the change.
@@ -357,19 +376,31 @@ pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
 
 /// Persist the set of disabled extension ids, preserving other settings.
 /// Best-effort: a write failure is swallowed by the caller.
-pub fn save_disabled_extensions(disabled: &BTreeSet<String>) -> Result<()> {
-    let path = config_path();
+pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String>) -> Result<()> {
+    let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disabled_extensions = disabled.clone();
     prefs.save(&path)
 }
 
-/// Record first-run consent to spawn an MCP sidecar extension, preserving other
-/// settings. Best-effort: a write failure is swallowed by the caller.
-pub fn save_mcp_consent(ext_id: &str) -> Result<()> {
-    let path = config_path();
+/// Record a first-run consent for `ext_id` under an explicit config dir: the app carries the
+/// dir it was built with, so a test can point it at a scratch dir instead
+/// of mutating the process-wide environment (which races sibling tests).
+pub fn save_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
+    let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.mcp_consented.insert(ext_id.to_string());
+    prefs.save(&path)
+}
+
+/// Forget a recorded first-run consent under an explicit config dir; see
+/// [`save_mcp_consent_in`] for why the dir is a parameter.
+pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
+    let path = config_dir.join("config.json");
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    if !prefs.mcp_consented.remove(ext_id) {
+        return Ok(());
+    }
     prefs.save(&path)
 }
 
@@ -432,6 +463,15 @@ fn set_disable_secret_redaction(path: &Path, disabled: bool) -> Result<()> {
     let mut prefs = prefs_for_update(path)?;
     prefs.disable_secret_redaction = disabled;
     prefs.save(path)
+}
+
+/// Persist the log-highlight toggle (#466) as its disable flag. Goes through
+/// [`prefs_for_update`] so a malformed config is refused, not replaced.
+pub fn save_disable_log_highlight(disabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = prefs_for_update(&path)?;
+    prefs.disable_log_highlight = disabled;
+    prefs.save(&path)
 }
 
 pub fn save_copy_on_select(enabled: bool) -> Result<()> {

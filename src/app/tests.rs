@@ -22,29 +22,37 @@ fn probe_command(probe: &str) -> String {
     format!("printf '%s%s\\n' '{head}' '{tail}'\r")
 }
 
-/// How long the terminal end-to-end tests wait for their probe to come back
-/// through the PTY. Generous on purpose: a real shell has to start, run the
-/// command, and have the reader thread drain the bytes into the grid, and on
-/// a box running the whole suite in parallel that took longer than the three
-/// seconds this used to allow (issue #226).
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
 /// Run the probe command in the app's embedded terminal and wait until the
 /// probe is on screen. Panics with the actual screen contents if it never
 /// arrives, so a failure says what the terminal was showing instead of
 /// unwrapping `None` several lines later.
+///
+/// The wait is load-scaled (#397): a real shell has to start, run the
+/// command, and have the reader thread drain the bytes into the grid, and
+/// what stretches that is contention from the rest of the suite, not this
+/// test. The fixed 15s this replaced (#226 had raised it from 3s) is what a
+/// quiet machine still gets at the floor; the captured failure had the probe
+/// command echoed on screen and unanswered at 15s, a starved shell rather
+/// than a broken one. `spawn_budget` rather than `await_spawned` so the
+/// panic can keep showing the screen.
 fn await_terminal_probe(app: &mut App, probe: &str) {
     app.terminal_mut()
         .write_input(probe_command(probe).as_bytes());
+    let base = crate::test_budget::tests::TERMINAL_PROBE_BASE;
+    let budget = crate::test_budget::spawn_budget(base);
     let started = std::time::Instant::now();
-    while started.elapsed() < PROBE_TIMEOUT {
+    while started.elapsed() < budget {
         if app.terminal().visible_text().contains(probe) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     panic!(
-        "the shell never printed the probe {probe:?} within {PROBE_TIMEOUT:?}; terminal showed:\n{}",
+        "the shell never printed the probe {probe:?} within {budget:?} ({base:?} base x{} total \
+         for calibration and load); if this is a real failure it would also fail at 1x, so \
+         re-run the full suite on the unmodified merge base under the same load before \
+         suspecting your diff. Terminal showed:\n{}",
+        budget.as_millis() / base.as_millis().max(1),
         app.terminal().visible_text()
     );
 }
@@ -2297,14 +2305,11 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
 
 #[test]
 fn a_mouse_tracking_child_keeps_the_pointer_from_a_bound_wheel() {
-    // A tracking child owns the gestures croft actually FORWARDS, and croft
-    // forwards exactly one kind: `report_mouse`'s three production call sites
-    // all construct WheelUp/WheelDown. So the wheel is the case where "the
-    // child asked for it" is true, and a bound wheel must decline for the
-    // child. Clicks are covered by
-    // `a_bound_click_still_fires_over_a_mouse_tracking_child`, which asserts
-    // the opposite for the opposite reason: there is no click-forwarding path,
-    // so declining a click hands it to nobody.
+    // A tracking child owns the gestures croft actually FORWARDS: the wheel
+    // (both wheel arms) and, since #474, the left button. So a bound wheel
+    // must decline for the child. The left click is covered by
+    // `a_bound_click_defers_to_a_mouse_tracking_child`, which asserts the
+    // same rule for the same reason.
     //
     // SHIFT is the documented override.
     use crossterm::event::MouseEventKind;
@@ -2738,20 +2743,14 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
 }
 
 #[test]
-fn a_bound_click_still_fires_over_a_mouse_tracking_child() {
-    // `child_owns_pointer` suppressed bound CLICKS on the stated ground that a
-    // tracking child owns the pointer. For the WHEEL that is exact -- the
-    // wheel arms genuinely call `report_mouse`. For clicks it is false:
-    // `report_mouse`'s three production call sites all construct
-    // WheelUp/WheelDown, and `MouseButtonKind::Left` is never constructed
-    // outside `encode_mouse_report`'s own tests. There is no click-forwarding
-    // path, so suppressing the binding hands the gesture to nobody -- and the
-    // built-in `Down(Left)` arm does not defer either (it runs
-    // `start_selection_at` and Ctrl+click URL-open with no `mouse_reporting`
-    // check, unlike click-to-move-cursor, which does gate on it).
-    //
-    // So the binding must fire. The observable is the bound command's own
-    // effect, not a status string the built-in could also produce.
+fn a_bound_click_defers_to_a_mouse_tracking_child() {
+    // `child_owns_pointer` covers a bound CLICK the same way it covers the
+    // wheel, because since #474 the left button is a gesture croft actually
+    // forwards: the Down(Left) arm sends the press to a tracking child. So a
+    // `ctrl+click` binding must decline over a tracking child -- the child
+    // asked for the pointer -- and the press must reach it with the Ctrl bit
+    // set, exactly as it would under a bare terminal emulator. SHIFT remains
+    // the bypass (`holding_shift_takes_the_pointer_back_from_a_tracking_child`).
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -2769,28 +2768,34 @@ fn a_bound_click_still_fires_over_a_mouse_tracking_child() {
     );
     let (col, row) = (area.x + 2, area.y + 1);
 
-    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
     assert!(
         app.terminals[0].mouse_reporting(),
         "the child must be tracking, or this test says nothing about the guard"
     );
-    assert!(
-        app.terminals[0].cell_at(col, row).is_some(),
-        "the click must land on a real grid cell, or the guard declines for the \
-         border reason instead of the tracking one and the test is vacuous"
-    );
+    let Some((lr, lc)) = app.terminals[0].cell_at(col, row) else {
+        panic!(
+            "the click must land on a real grid cell, or the guard declines for the \
+             border reason instead of the tracking one and the test is vacuous"
+        );
+    };
 
     let before = app.editor.wrap_enabled();
     let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ctrl.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ctrl);
 
-    assert_ne!(
+    assert_eq!(
         app.editor.wrap_enabled(),
         before,
-        "a bound ctrl+click over a tracking child must RUN: croft has no \
-         click-forwarding path, so declining it gives the gesture to nobody \
-         while the built-in fires anyway"
+        "a bound ctrl+click over a tracking child must NOT run: the child asked \
+         for the pointer and croft forwards the press to it"
+    );
+    let expected = format!("\x1b[<16;{};{}M", lc + 1, lr + 1);
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        expected,
+        "the press reaches the child as an SGR report carrying the Ctrl bit"
     );
 }
 
@@ -2943,11 +2948,12 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     // would disable the built-in Ctrl+click over every full-screen TUI while
     // binding `ctrl+click` leaves it working -- backwards.
     //
-    // Note what this does NOT rest on: croft never forwards clicks to the
-    // child. `report_mouse` has three production call sites and all three
-    // construct WheelUp/WheelDown, so there is no click-forwarding path for a
-    // tracking child to "own". The fall-through is right because the built-in
-    // is the only consumer, not because the child is a better one.
+    // Since #474 the child DOES own a left click here (`child_owns_pointer`
+    // covers Click/DoubleClick), so the swallow steps aside for that reason
+    // too. The fall-through is right for a narrower reason that survives it:
+    // the Cmd/Ctrl link-open runs BEFORE the forward in the Down(Left) arm,
+    // so swallowing this click costs the user the link and buys nobody
+    // anything -- the bound double is already unreachable over a tracker.
     //
     // The observable is deliberately a REFUSED link: `open_detected_url`
     // rejects a non-web scheme and sets a status without spawning anything.
@@ -3011,9 +3017,8 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     assert_eq!(
         app.status, "Refused to open non-web link: mailto:x@example.com",
         "a double-click PREFIX over a mouse-tracking child must fall through to \
-         the built-in: croft has no click-forwarding path, so swallowing it \
-         hands the gesture to nobody -- the swallow branch \
-         is missing the `child_owns_pointer` guard its sibling applies. \
+         the built-in: the Cmd/Ctrl link-open runs BEFORE the press is \
+         forwarded, so swallowing the click would cost the user the link. \
          Expected the refusal from the built-in link handler"
     );
 }
@@ -4769,6 +4774,20 @@ fn drain_fs_events_returns_false_when_nothing_pending() {
     assert!(!app.drain_fs_events(), "no fs events ⇒ no redraw needed");
 }
 
+/// How many drain ticks an external filesystem change may take to reach the
+/// Explorer: the 200 ms fs-sync invariant, expressed in croft's own work
+/// rather than in wall clock (#483). Each tick is one `drain_fs_events` and
+/// a 10 ms pause, so twenty ticks is 200 ms of croft's own opportunities to
+/// notice the change; a suite that starves this thread for 300 ms between
+/// two ticks stretches the clock but not the count. On a quiet machine the
+/// change lands in one or two ticks, and the poll fallback alone would land
+/// it in about five at `FS_POLL_INTERVAL`'s floor (more once `back_off`
+/// widens the interval), so this bound catches a gross regression (a
+/// watcher and a poll that both stopped delivering), not drift; the
+/// wall-clock figure itself is measured by the `#[ignore]`d serial test
+/// below.
+const FS_SYNC_TICKS: usize = 20;
+
 #[test]
 fn drain_fs_events_returns_true_after_workspace_write() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4781,27 +4800,24 @@ fn drain_fs_events_returns_true_after_workspace_write() {
     }
     let new_file = tmp.path().join("new.txt");
     std::fs::write(&new_file, "hi").unwrap();
-    let started = std::time::Instant::now();
     let mut saw = false;
-    let mut saw_tree = false;
-    for _ in 0..150 {
+    let mut landed = false;
+    // Bounded at the invariant itself: every tick past it would give the
+    // same verdict, so the loop stops where the claim does.
+    for _ in 1..=FS_SYNC_TICKS {
         if app.drain_fs_events() {
             saw = true;
         }
         if app.tree.nodes.iter().any(|n| n.path == new_file) {
-            saw_tree = true;
+            landed = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(saw, "workspace write should propagate as a dirty signal");
     assert!(
-        saw_tree,
-        "workspace write should refresh the tree with the created file"
-    );
-    assert!(
-        started.elapsed() <= std::time::Duration::from_millis(200),
-        "created file should appear in Explorer within 200ms"
+        landed,
+        "created file should appear in Explorer within {FS_SYNC_TICKS} drain ticks (never landed)"
     );
 }
 
@@ -4817,20 +4833,73 @@ fn drain_fs_events_removes_deleted_root_file_from_tree() {
     );
 
     std::fs::remove_file(&doomed).unwrap();
-    let started = std::time::Instant::now();
-    let mut saw_tree = false;
-    for _ in 0..150 {
+    let mut gone = false;
+    for _ in 1..=FS_SYNC_TICKS {
         let _ = app.drain_fs_events();
         if !app.tree.nodes.iter().any(|n| n.path == doomed) {
-            saw_tree = true;
+            gone = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(saw_tree, "deleted file should disappear from the tree");
     assert!(
-        started.elapsed() <= std::time::Duration::from_millis(200),
-        "deleted file should disappear from Explorer within 200ms"
+        gone,
+        "deleted file should disappear from Explorer within {FS_SYNC_TICKS} drain ticks (never left)"
+    );
+}
+
+/// The 200 ms invariant as wall clock, for a serial run on a quiet machine
+/// (pass `--ignored` with the filter `fs_sync_reflects`). Ignored by default
+/// because a full parallel suite is itself the load (#483): the scheduler,
+/// not croft, decides whether this thread runs again inside 200 ms while
+/// thousands of neighbours spawn shells, so a failure here in that setting
+/// says nothing about the watcher. The tick-counted pair above carries the
+/// check in the suite; this one measures the invariant itself.
+#[test]
+#[ignore = "wall clock: run serially on a quiet machine"]
+fn fs_sync_reflects_external_changes_within_200ms_wall_clock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let doomed = tmp.path().join("doomed.txt");
+    std::fs::write(&doomed, "bye").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for _ in 0..20 {
+        let _ = app.drain_fs_events();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let budget = std::time::Duration::from_millis(200);
+
+    let new_file = tmp.path().join("new.txt");
+    std::fs::write(&new_file, "hi").unwrap();
+    // The budget is checked after every drain as well as before: a drain
+    // that lands the change past the deadline must still fail, not end the
+    // loop quietly on the next condition check.
+    let started = std::time::Instant::now();
+    while !app.tree.nodes.iter().any(|n| n.path == new_file) {
+        let _ = app.drain_fs_events();
+        assert!(
+            started.elapsed() <= budget,
+            "created file should appear in Explorer within {budget:?} (deadline passed mid-drain)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        started.elapsed() <= budget,
+        "created file should appear in Explorer within {budget:?} (deadline passed at the last check)"
+    );
+
+    std::fs::remove_file(&doomed).unwrap();
+    let started = std::time::Instant::now();
+    while app.tree.nodes.iter().any(|n| n.path == doomed) {
+        let _ = app.drain_fs_events();
+        assert!(
+            started.elapsed() <= budget,
+            "deleted file should disappear from Explorer within {budget:?} (deadline passed mid-drain)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        started.elapsed() <= budget,
+        "deleted file should disappear from Explorer within {budget:?} (deadline passed at the last check)"
     );
 }
 
@@ -6441,13 +6510,14 @@ fn rerunning_a_task_reuses_its_pane_instead_of_stacking_new_ones() {
     app.handle_key(chord).unwrap();
     // Wait for the pane's shell to come back to its prompt so the rerun
     // path sees an idle pane (a busy pane legitimately gets a new one).
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) {
-        if app.terminals[app.active_terminal].foreground_is_shell() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled and LOUD (#397): the fixed 5000ms loop broke out silently
+    // on timeout, so under suite load the next step met a pane still busy
+    // and the assertion after it misreported the timeout as its own failure.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the task pane's shell to return to its prompt",
+        || app.terminals[app.active_terminal].foreground_is_shell(),
+    );
     let after_first = app.terminals.len();
     app.handle_key(chord).unwrap();
     assert_eq!(
@@ -6478,13 +6548,14 @@ fn a_reused_task_pane_clears_a_half_typed_prompt_line_first() {
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     );
     app.handle_key(chord).unwrap();
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) {
-        if app.terminals[app.active_terminal].foreground_is_shell() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled and LOUD (#397): the fixed 5000ms loop broke out silently
+    // on timeout, so under suite load the next step met a pane still busy
+    // and the assertion after it misreported the timeout as its own failure.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the task pane's shell to return to its prompt",
+        || app.terminals[app.active_terminal].foreground_is_shell(),
+    );
     app.handle_key(chord).unwrap();
     let bytes = app.terminals[app.active_terminal].written_bytes_for_test();
     let needle = b"\x05\x15make build\r";
@@ -6508,13 +6579,16 @@ fn a_task_pane_from_the_old_workspace_is_not_reused_after_a_re_root() {
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     );
     app.handle_key(chord).unwrap();
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) {
-        if app.terminals[app.active_terminal].foreground_is_shell() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled and LOUD (#397). The fixed 5000ms loop broke out silently
+    // on timeout, and here a still-busy pane passes the assertion below for
+    // the wrong reason: a busy pane always gets a sibling, so `after + 1`
+    // held without the cwd guard ever being exercised. Failing loudly makes
+    // the guard the thing under test.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the task pane's shell to return to its prompt",
+        || app.terminals[app.active_terminal].foreground_is_shell(),
+    );
     // Focus another pane so the re-root's active-pane `cd` cannot move the
     // task pane along (the reviewer's scenario: it is NOT cd'd).
     app.active_terminal = 0;
@@ -13669,6 +13743,771 @@ fn enter_in_file_finder_opens_the_selected_file_and_closes_the_modal() {
     );
 }
 
+/// #465: a viewer runs the declared program on the file in a pane of its own,
+/// with `{file}` replaced by the file's path, and the pane takes focus. The
+/// program here is `sh`, so nothing has to be installed for the test.
+#[test]
+fn opening_a_file_in_a_viewer_runs_the_tool_on_it_in_a_new_terminal_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n1,2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.consented_extensions.insert("csvlens".into());
+    let before = app.terminals.len();
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: "csvlens".into(),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "echo VIEWING \"$1\"; sleep 30".into(),
+            "sh".into(),
+            "{file}".into(),
+        ],
+        extensions: vec!["csv".into()],
+        provision: None,
+    };
+    app.open_in_viewer(&viewer, &data);
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "the viewer gets a pane of its own"
+    );
+    assert!(app.show_terminal, "the panel is shown");
+    assert!(
+        matches!(app.focus, Pane::Terminal),
+        "and the pane takes focus"
+    );
+    let want = format!("VIEWING {}", data.display());
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the viewer to print the file it was handed",
+        || app.terminal().visible_text().contains(&want),
+    );
+}
+
+/// A file name that is not valid UTF-8 must not be handed to the viewer
+/// mangled (#485 review): the tool would open a different path and fail.
+/// Until the pane spawn can carry OS-native arguments, such a file is
+/// refused with a status line rather than opened wrong.
+#[cfg(unix)]
+#[test]
+fn a_viewer_refuses_a_path_it_cannot_pass_faithfully() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    // The file is deliberately not created: APFS refuses such a name, and
+    // the guard fires before the viewer path touches the disk anyway.
+    let odd = tmp
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"d\xffata.csv"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: "csvlens".into(),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30".into(), "sh".into(), "{file}".into()],
+        extensions: vec!["csv".into()],
+        provision: None,
+    };
+    let before = app.terminals.len();
+    app.open_in_viewer(&viewer, &odd);
+    assert_eq!(
+        app.terminals.len(),
+        before,
+        "no pane is spawned for a path that cannot be passed"
+    );
+    assert!(
+        app.status.contains("not valid UTF-8"),
+        "the status says why: {:?}",
+        app.status
+    );
+}
+
+/// A viewer spawns a program from a manifest, so it passes the same
+/// first-run consent gate a sidecar does (#485 review): the first use of an
+/// extension's viewer shows the exact command line and spawns nothing until
+/// the user allows it; a consented extension runs straight away.
+#[test]
+fn a_viewer_asks_for_consent_before_its_first_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: format!("consent-test-{}", std::process::id()),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30".into(), "sh".into(), "{file}".into()],
+        extensions: vec!["csv".into()],
+        provision: None,
+    };
+    let before = app.terminals.len();
+    app.open_in_viewer(&viewer, &data);
+    assert_eq!(app.terminals.len(), before, "nothing spawns before consent");
+    let prompt = app
+        .input_prompt
+        .as_ref()
+        .expect("the consent prompt is open");
+    assert!(
+        prompt.title.contains(&viewer.ext_id) && prompt.title.contains("/bin/sh"),
+        "the prompt names the extension and the exact command: {:?}",
+        prompt.title
+    );
+}
+
+/// A scratch config dir holding the given user extension manifests
+/// (`<id>` → manifest text). An app pointed at it (`app.config_dir`) reads
+/// its extensions and consent from there and nowhere else; the process
+/// environment is never touched, so the test is safe beside every other.
+fn scratch_config(manifests: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let croft = tmp.path().join("croft");
+    for (id, text) in manifests {
+        let dir = croft.join("extensions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("extension.toml"), text).unwrap();
+    }
+    (tmp, croft)
+}
+
+/// The consent set recorded in a scratch config dir.
+fn consent_on_disk(croft: &Path) -> std::collections::BTreeSet<String> {
+    crate::prefs::Prefs::load(&croft.join("config.json"))
+        .unwrap_or_default()
+        .mcp_consented
+}
+
+/// One consent per extension, read from one place (#485 review): the sidecar
+/// gate consults the same session set the viewer gate does, so allowing an
+/// extension through either gate satisfies the other in the same session,
+/// whatever became of the prefs write. And a prefs write that fails is
+/// reported before the command's own argument prompt takes the screen.
+#[test]
+fn the_sidecar_gate_reads_the_session_consent_set() {
+    use crate::widgets::input_prompt::InputPurpose;
+    const EXT: &str = r#"
+id = "tconsent"
+name = "tconsent"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/false"
+[[commands]]
+id = "tconsent.go"
+title = "tconsent: go"
+server = "srv"
+tool = "go"
+arg = "q"
+prompt = "Query"
+"#;
+    let (_scratch, croft) = scratch_config(&[("tconsent", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
+    // Allowed this session, not (yet) on disk: the gate must not re-prompt,
+    // it must move on to the command's own argument prompt.
+    app.consented_extensions.insert("tconsent".into());
+    app.run_extension_command("tconsent.go");
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(InputPurpose::McpArg { .. })
+        ),
+        "a consented extension goes straight to its argument prompt, not consent: {:?}",
+        app.input_prompt.as_ref().map(|p| p.title.clone())
+    );
+    // Allowing through the sidecar prompt with the prefs file unwritable: the
+    // failure is reported where the user can see it and the grant holds.
+    app.close_input_prompt();
+    app.consented_extensions.remove("tconsent");
+    std::fs::create_dir_all(croft.join("config.json")).unwrap();
+    app.run_extension_command("tconsent.go");
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(InputPurpose::McpConsent { .. })
+        ),
+        "fixture: an unconsented extension is asked first"
+    );
+    app.submit_input_prompt();
+    assert!(
+        app.status.contains("could not be saved"),
+        "a failed prefs write is reported: {:?}",
+        app.status
+    );
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(InputPurpose::McpArg { .. })
+        ),
+        "and the command went on to its argument prompt"
+    );
+    assert!(
+        app.consented_extensions.contains("tconsent"),
+        "the session grant holds"
+    );
+}
+
+/// Allowing a viewer records the consent and resumes the open that asked;
+/// a prefs write that fails is said in the status rather than swallowed.
+#[test]
+fn allowing_a_viewer_records_consent_and_resumes_the_open() {
+    const EXT: &str = r#"
+id = "tviewer"
+name = "tviewer"
+api_version = 1
+[[viewers]]
+id = "sh"
+label = "Open in sh"
+command = "/bin/sh"
+args = ["-c", "sleep 30", "sh", "{file}"]
+extensions = ["csv"]
+"#;
+    let (_scratch, croft) = scratch_config(&[("tviewer", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
+    let viewer = crate::mcp::registry::viewer_by_id_in_dir(&croft, "tviewer/sh")
+        .expect("the scratch viewer");
+    let before = app.terminals.len();
+    app.open_in_viewer(&viewer, &data);
+    assert!(
+        app.input_prompt.is_some(),
+        "fixture: consent is asked first"
+    );
+    app.submit_input_prompt();
+    assert_eq!(app.terminals.len(), before + 1, "allowing resumes the open");
+    assert!(
+        app.consented_extensions.contains("tviewer"),
+        "and records the consent"
+    );
+    let saved = consent_on_disk(&croft);
+    assert!(saved.contains("tviewer"), "on disk too: {saved:?}");
+    assert!(
+        !app.status.contains("could not be saved"),
+        "a successful save is not reported as a failure: {:?}",
+        app.status
+    );
+    // Now with the prefs file made unwritable (a directory in its place):
+    // the consent still holds for the session and the status says the save
+    // failed, instead of the failure vanishing.
+    app.consented_extensions.remove("tviewer");
+    let _ = std::fs::remove_file(croft.join("config.json"));
+    std::fs::create_dir_all(croft.join("config.json")).unwrap();
+    app.open_in_viewer(&viewer, &data);
+    app.submit_input_prompt();
+    assert!(
+        app.status.contains("could not be saved"),
+        "a failed prefs write is reported: {:?}",
+        app.status
+    );
+    assert!(
+        app.consented_extensions.contains("tviewer"),
+        "the session grant still holds"
+    );
+}
+
+/// The Explorer row and the palette row for a viewer are built from the
+/// same config dir the click resolves them through: a viewer installed only
+/// under the app's dir gets its row, and the row opens.
+#[test]
+fn a_viewer_row_is_built_and_resolved_through_the_same_config_dir() {
+    const EXT: &str = r#"
+id = "tviewer"
+name = "tviewer"
+api_version = 1
+[[viewers]]
+id = "sh"
+label = "Open in sh"
+command = "/bin/sh"
+args = ["-c", "sleep 30", "sh", "{file}"]
+extensions = ["csv"]
+"#;
+    let (_scratch, croft) = scratch_config(&[("tviewer", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("data.csv");
+    std::fs::write(&csv, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
+    app.consented_extensions.insert("tviewer".into());
+    let n = file_node(&csv);
+    let items = build_tree_context_menu_items_in_dir(
+        &croft,
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&csv),
+        tmp.path(),
+        None,
+        None,
+    );
+    let row = items
+        .iter()
+        .find_map(|(label, a)| match a {
+            MenuAction::OpenInViewer(id, p) if p == &csv => Some((label.clone(), id.clone())),
+            _ => None,
+        })
+        .expect("the viewer under the app's config dir gets a row");
+    assert_eq!(row, ("Open in sh".to_string(), "tviewer/sh".to_string()));
+    let before = app.terminals.len();
+    app.dispatch_menu_action(
+        MenuAction::OpenInViewer(row.1.clone(), csv.clone()),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "and the row resolves and opens"
+    );
+    let palette_ids: Vec<String> = crate::mcp::registry::contributed_viewer_commands_in_dir(&croft)
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert!(
+        palette_ids.iter().any(|id| id == "viewer:tviewer/sh"),
+        "the palette row comes from the same dir: {palette_ids:?}"
+    );
+}
+
+/// Uninstalling an extension forgets its consent, in the session and on
+/// disk: a later re-add is a fresh install of a program the user has not
+/// approved this time, so the first-run gate asks again. The disabled state
+/// it clears lands in the same config file.
+#[test]
+fn uninstalling_an_extension_forgets_its_consent() {
+    let (_scratch, croft) = scratch_config(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
+    crate::prefs::save_mcp_consent_in(&croft, "csvlens").unwrap();
+    app.consented_extensions.insert("csvlens".into());
+    app.disabled_extensions.insert("csvlens".into());
+    crate::prefs::save_disabled_extensions_in(&croft, &app.disabled_extensions).unwrap();
+    app.perform_extension_uninstall("csvlens");
+    let disabled_on_disk = crate::prefs::Prefs::load(&croft.join("config.json"))
+        .unwrap_or_default()
+        .disabled_extensions;
+    assert!(
+        !disabled_on_disk.contains("csvlens"),
+        "the disabled state is cleared in the app's own config file: {disabled_on_disk:?}"
+    );
+    assert!(
+        app.status.starts_with("Uninstalled"),
+        "fixture: the catalog entry uninstalls cleanly: {:?}",
+        app.status
+    );
+    assert!(
+        !app.consented_extensions.contains("csvlens"),
+        "the session grant is gone"
+    );
+    let saved = consent_on_disk(&croft);
+    assert!(
+        !saved.contains("csvlens"),
+        "and so is the one on disk: {saved:?}"
+    );
+}
+
+/// A viewer that is gone by the time its menu row is clicked, or by the time
+/// its consent prompt is allowed (the extension was removed in between),
+/// must say so rather than do nothing: a silent click reads as a broken
+/// menu. Neither path spawns anything or records consent for a viewer it
+/// could not find.
+#[test]
+fn a_vanished_viewer_is_reported_from_the_menu_and_the_consent_prompt() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let before = app.terminals.len();
+    let key = format!("vanished-ext-{}/csvlens", std::process::id());
+    app.status.clear();
+    app.dispatch_menu_action(
+        MenuAction::OpenInViewer(key.clone(), data.clone()),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(app.terminals.len(), before, "the menu click spawns nothing");
+    assert!(
+        app.status.contains("no longer"),
+        "the click says the viewer is gone: {:?}",
+        app.status
+    );
+    app.status.clear();
+    app.open_input_prompt(
+        InputPrompt::new(
+            InputPurpose::ViewerConsent {
+                key: key.clone(),
+                path: data,
+            },
+            "Allow",
+            "",
+        )
+        .with_value("allow"),
+    );
+    app.submit_input_prompt();
+    assert!(app.input_prompt.is_none(), "the prompt closes");
+    assert_eq!(app.terminals.len(), before, "allowing spawns nothing");
+    assert!(
+        app.status.contains("no longer"),
+        "allowing says the viewer is gone: {:?}",
+        app.status
+    );
+    assert!(
+        !app.consented_extensions
+            .iter()
+            .any(|e| key.starts_with(e.as_str())),
+        "no consent is recorded for a viewer that could not be found"
+    );
+}
+
+/// #465: the palette row reaches the viewer route (not the MCP command path)
+/// and guards on the active file before anything is spawned.
+#[test]
+fn a_viewer_palette_row_guards_on_the_active_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let notes = tmp.path().join("notes.md");
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&notes, "# hi\n").unwrap();
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.consented_extensions.insert("csvlens".into());
+    // The `viewer:` prefix is routed before the MCP lookup: an unknown viewer
+    // is reported as a viewer, not as an extension command.
+    app.run_extension_command("viewer:nope");
+    assert_eq!(app.status, "Viewer 'nope' is unavailable");
+
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: "csvlens".into(),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30".into()],
+        extensions: vec!["csv".into(), "tsv".into()],
+        provision: None,
+    };
+    let before = app.terminals.len();
+    app.editor.path = None;
+    app.open_active_file_in_viewer(&viewer);
+    assert_eq!(app.status, "Open in csvlens: open a file first");
+    app.editor.open(&notes).unwrap();
+    app.open_active_file_in_viewer(&viewer);
+    assert_eq!(
+        app.status,
+        "Open in csvlens: the active file is not one of .csv / .tsv"
+    );
+    assert_eq!(app.terminals.len(), before, "a guard spawns nothing");
+    app.editor.open(&data).unwrap();
+    app.open_active_file_in_viewer(&viewer);
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "a matching file opens in a pane"
+    );
+}
+
+/// #465: the Explorer menu offers the viewer for a single file it handles,
+/// after Rename and before the compare entries, and for nothing else.
+#[test]
+fn the_explorer_menu_offers_a_viewer_for_a_single_matching_file_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("data.csv");
+    let md = tmp.path().join("notes.md");
+    std::fs::write(&csv, "a,b\n").unwrap();
+    std::fs::write(&md, "# hi\n").unwrap();
+    let viewer_for = |file: &Path| {
+        (file.extension().and_then(|e| e.to_str()) == Some("csv"))
+            .then(|| (String::from("Open in csvlens"), String::from("csvlens")))
+    };
+    let target = tmp.path().to_path_buf();
+
+    let n = file_node(&csv);
+    let items = build_tree_context_menu_items_with(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&csv),
+        &target,
+        None,
+        None,
+        viewer_for,
+    );
+    let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+    let at = labels
+        .iter()
+        .position(|l| *l == "Open in csvlens")
+        .expect("a csv gets the viewer entry");
+    assert_eq!(labels[at - 1], "Rename", "it follows Rename");
+    assert!(
+        matches!(&items[at].1, MenuAction::OpenInViewer(id, p) if id == "csvlens" && p == &csv)
+    );
+
+    let n = file_node(&md);
+    let items = build_tree_context_menu_items_with(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&md),
+        &target,
+        None,
+        None,
+        viewer_for,
+    );
+    assert!(
+        !items.iter().any(|(l, _)| l == "Open in csvlens"),
+        "a kind no viewer handles gets no entry"
+    );
+
+    // A multi-selection is not one file, so no viewer entry either.
+    let n = file_node(&csv);
+    let both = vec![csv.clone(), md.clone()];
+    let items = build_tree_context_menu_items_with(
+        Some(&n),
+        tmp.path(),
+        &both,
+        &target,
+        None,
+        None,
+        viewer_for,
+    );
+    assert!(
+        !items.iter().any(|(l, _)| l == "Open in csvlens"),
+        "a multi-selection gets no viewer entry"
+    );
+}
+
+#[test]
+fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
+    // #472: `alpha:236-239` in Cmd+P must still find alpha.rs, and Enter
+    // must land on line 236 with 236-239 selected so the range reads as
+    // highlighted. `alpha:12` lands on the line with nothing selected.
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=300).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(tmp.path().join("alpha.rs"), &body).unwrap();
+    std::fs::write(tmp.path().join("beta.rs"), "fn b() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let type_and_enter = |app: &mut App, text: &str| {
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+    };
+
+    type_and_enter(&mut app, "alpha:236-239");
+    assert!(app.file_finder.is_none(), "Enter closes the modal");
+    assert_eq!(
+        app.editor
+            .path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str()),
+        Some("alpha.rs"),
+        "the file part of the query is what gets opened"
+    );
+    let sel = app
+        .editor
+        .selection
+        .expect("the range is selected so it reads as highlighted");
+    let ((r0, c0), (r1, _)) = sel.normalised();
+    assert_eq!(
+        (r0, c0),
+        (235, 0),
+        "the selection starts at the top of line 236"
+    );
+    assert_eq!(r1, 238, "and reaches line 239");
+    // The cursor sits at the selection's HEAD, as every other
+    // selection-installing path leaves it, and the head is the landing line
+    // (the anchor is the far end), so the line the user asked for is the one
+    // on screen and Shift+motion extends from it.
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        sel.head,
+        "the cursor is at the head of the range"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 235,
+        "and the head is the landing line"
+    );
+    assert!(
+        app.status.ends_with("alpha.rs:236-239"),
+        "the status names the range: {:?}",
+        app.status
+    );
+    app.handle_key(key(KeyCode::Up, KeyModifiers::SHIFT))
+        .unwrap();
+    let ((r0, _), (r1, _)) = app.editor.selection.expect("still selected").normalised();
+    assert_eq!(
+        (r0, r1),
+        (234, 238),
+        "Shift+Up extends the range from the landing line"
+    );
+    let page = app.editor.page_size().max(1);
+    assert!(
+        app.editor.scroll <= 235 && 235 < app.editor.scroll + page,
+        "the landing line is on screen: scroll={} page={page}",
+        app.editor.scroll
+    );
+
+    // A pick with no hint replaces the range a hinted pick left: quick open
+    // never installed a selection before hints existed, so a bare `alpha`
+    // must not re-show one the user did not just ask for.
+    // Extended by hand, the range is the user's now and a re-pick keeps it;
+    // a freshly installed one is cleared by the next pick.
+    let extended = app.editor.selection;
+    type_and_enter(&mut app, "alpha");
+    assert_eq!(
+        app.editor.selection, extended,
+        "a range the user extended survives an unhinted re-pick"
+    );
+    type_and_enter(&mut app, "alpha:236-239");
+    type_and_enter(&mut app, "alpha");
+    assert!(
+        app.editor.selection.is_none(),
+        "an unhinted pick clears the range a hinted pick left"
+    );
+    // A saturated line number goes through the open path like any other
+    // out-of-range line: it lands on the last line and the status reports
+    // the line landed on, never the sentinel.
+    type_and_enter(&mut app, "alpha:99999999999999999999");
+    assert_eq!(
+        app.editor.cursor_row, 299,
+        "a saturated line lands on the last line"
+    );
+    assert!(
+        app.status.ends_with("alpha.rs:300"),
+        "the status names the landed line, not the typed one: {:?}",
+        app.status
+    );
+    // Both ends of a range are clamped the same way.
+    type_and_enter(&mut app, "alpha:280-99999999999999999999");
+    assert!(
+        app.status.ends_with("alpha.rs:280-300"),
+        "both ends of the range are clamped to the file: {:?}",
+        app.status
+    );
+    // A selection the user made by hand is theirs: an unhinted pick of the
+    // file already in front of them does not take it away. Only a range a
+    // hinted pick installed is cleared by the next pick.
+    let mine = crate::widgets::editor::EditorSelection {
+        anchor: (10, 0),
+        head: (11, 3),
+    };
+    app.editor.selection = Some(mine);
+    type_and_enter(&mut app, "alpha");
+    assert_eq!(
+        app.editor.selection,
+        Some(mine),
+        "an unhinted re-pick keeps a selection the user made"
+    );
+    // Stale secondary carets do not survive a pick: the next keystroke
+    // would otherwise edit at every one of them.
+    app.editor.cursor_row = 5;
+    app.editor.add_cursor_below();
+    assert!(
+        app.editor.has_multi_cursor(),
+        "fixture: a second caret exists"
+    );
+    type_and_enter(&mut app, "alpha:236-239");
+    assert!(
+        !app.editor.has_multi_cursor(),
+        "a pick collapses the carets along with the selection"
+    );
+    // A zero column (0-based tool output) keeps the line and drops the
+    // column, as the terminal's path:line:col parser does.
+    type_and_enter(&mut app, "alpha:236:0");
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (235, 0),
+        "`:236:0` lands on line 236 at the start"
+    );
+
+    type_and_enter(&mut app, "alpha:12");
+    assert_eq!(
+        app.editor.cursor_row, 11,
+        "a single line lands on that line"
+    );
+    assert!(
+        app.editor.selection.is_none(),
+        "a single line is a place to land, not a range to select"
+    );
+    assert!(
+        app.status.ends_with("alpha.rs:12"),
+        "the status names the line: {:?}",
+        app.status
+    );
+
+    type_and_enter(&mut app, "alpha:5000");
+    assert_eq!(
+        app.editor.cursor_row, 299,
+        "a line past the end lands on the last line"
+    );
+
+    // A range taller than the viewport still shows the landing line after a
+    // paint: the paint-time clamp follows the cursor, so the cursor must be
+    // on that line. Painted first so the page size is the real one.
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    type_and_enter(&mut app, "alpha:100-200");
+    term.draw(|f| app.render(f)).unwrap();
+    let page = app.editor.page_size().max(1);
+    assert!(
+        app.editor.scroll <= 99 && 99 < app.editor.scroll + page,
+        "line 100 is on screen after the paint: scroll={} page={page}",
+        app.editor.scroll
+    );
+    let ((r0, _), (r1, _)) = app
+        .editor
+        .selection
+        .expect("the tall range is selected")
+        .normalised();
+    assert_eq!((r0, r1), (99, 199));
+
+    type_and_enter(&mut app, "alpha:236:7");
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (235, 6),
+        "`:line:col` lands on the column too"
+    );
+
+    // The click path goes through the same open, so a clicked row honours
+    // the hint as Enter does.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    for c in "alpha:40".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let finder = app.file_finder.as_ref().unwrap();
+    assert_eq!(
+        finder.results.len(),
+        1,
+        "the file part alone matches alpha.rs"
+    );
+    // The list body starts three rows below the popup top (border, prompt,
+    // separator); row 0 is the only result.
+    let (col, row) = (finder.last_rect.x + 4, finder.last_rect.y + 3);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(app.file_finder.is_none(), "the click confirms the pick");
+    assert_eq!(
+        app.editor.cursor_row, 39,
+        "a clicked row lands on the hinted line"
+    );
+}
+
 #[test]
 fn down_arrow_moves_selection_in_the_file_finder() {
     let tmp = tempfile::tempdir().unwrap();
@@ -16851,32 +17690,56 @@ fn assert_pane_pill_clears_its_buttons(name: &str) {
             .to_string()
     };
     let mut checked = 0;
-    for (i, btn) in app.terminal_max_buttons.iter().enumerate() {
-        if btn.width == 0 {
+    // Every button in the strip, not only `⛶`. Since #313 the leftmost is the
+    // `‹` collapse button, and checking the old leftmost alone would leave the
+    // new one free to be overpainted - the same bug this test exists for,
+    // three columns over.
+    let families: [(&str, &Vec<Rect>, char); 2] = [
+        ("collapse", &app.terminal_collapse_buttons, '\u{eab5}'),
+        ("maximize", &app.terminal_max_buttons, '\u{eb4c}'),
+    ];
+    for (i, pill) in app.terminal_label_rects.iter().enumerate() {
+        let painted: Vec<(&str, Rect, char)> = families
+            .iter()
+            .filter(|(_, rects, _)| rects[i].width > 0)
+            .map(|(f, rects, want)| (*f, rects[i], *want))
+            .collect();
+        if painted.is_empty() {
             continue;
         }
-        // The pill must actually be painted and long enough to reach the
-        // button, or a narrower layout would pass this while the bug stands.
-        let pill = app.terminal_label_rects[i];
+        // The pill has to run right up to the button strip, or a layout that
+        // simply left it short would pass this while the bug stands. Measured
+        // against the LEFTMOST button: the pill is clipped at the strip's
+        // edge, so asking it to also reach the rightmost would be asking it to
+        // be in two places at once.
+        //
+        // One cell of slack, and only one: a two-cell grapheme that would
+        // straddle the clip boundary is dropped whole rather than half-painted,
+        // so a `項` name legitimately stops one column short where a `§` name
+        // lands exactly on it. Two cells of slack would start admitting pills
+        // that were never long enough to threaten the buttons at all.
+        let leftmost = painted.iter().map(|(_, r, _)| r.x).min().unwrap();
         assert!(
-            pill.width > 0 && pill.x + pill.width >= btn.x,
-            "pane {i}'s pill must reach the button for this to prove anything, \
-             pill={pill:?} button={btn:?}"
+            pill.width > 0 && pill.x + pill.width + 1 >= leftmost,
+            "pane {i}'s pill must reach the button strip for this to prove \
+             anything, pill={pill:?} strip starts at {leftmost}"
         );
-        let painted: String = (btn.x..btn.x + btn.width).map(|x| cell(x, btn.y)).collect();
-        assert!(
-            !painted.contains(glyph),
-            "pane {i}'s {glyph:?} label painted over its maximize button: {painted:?}"
-        );
-        assert!(
-            painted.contains('\u{eb4c}'),
-            "pane {i}'s maximize glyph must survive a {glyph:?} label, got {painted:?}"
-        );
-        checked += 1;
+        for (family, btn, want) in painted {
+            let cells: String = (btn.x..btn.x + btn.width).map(|x| cell(x, btn.y)).collect();
+            assert!(
+                !cells.contains(glyph),
+                "pane {i}'s {glyph:?} label painted over its {family} button: {cells:?}"
+            );
+            assert!(
+                cells.contains(want),
+                "pane {i}'s {family} glyph must survive a {glyph:?} label, got {cells:?}"
+            );
+            checked += 1;
+        }
     }
     assert!(
-        checked >= 2,
-        "this layout must paint maximize buttons to test"
+        checked >= 4,
+        "this layout must paint both button families to test"
     );
 }
 
@@ -24650,17 +25513,21 @@ fn undo_close_restores_a_closed_terminal_pane_with_its_process_alive() {
     assert_eq!(app.terminals[1].label(), "keepme");
     assert_eq!(app.active_terminal, 1, "the restored pane takes focus");
     app.terminals[1].write_input(b"back\n");
-    let mut waited = 0u32;
-    while !app.terminals[1]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("revived-back"))
-    {
-        assert!(waited < 8000, "restored pane's shell no longer answers");
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        waited += 40;
-    }
+    // The same operation and the same old constant as the wait in
+    // `terminal_session_restores_pane_layout_names_and_focus_across_restarts`:
+    // a shell echoing one line, waited on under whatever load the suite is
+    // running. Same 2s base, so the same 8s floor.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the reopened pane's shell to answer",
+        || {
+            app.terminals[1]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("revived-back"))
+        },
+    );
 
     // Past the grace window the parked pane is dropped for real: the tick
     // reaps it and undo has nothing left to restore.
@@ -24977,17 +25844,29 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
     );
     // The restored pane runs a live shell.
     app2.terminals[1].write_input(b"s=ali; echo ${s}ve-42\n");
-    let mut waited = 0u32;
-    while !app2.terminals[1]
-        .grid_lines()
-        .0
-        .iter()
-        .any(|l| l.contains("alive-42"))
-    {
-        assert!(waited < 8000, "restored pane's shell is not alive");
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        waited += 60;
-    }
+    // Load-scaled, not a fixed 8000ms: what blows a wait on a spawned shell
+    // is contention, which is a property of what else the suite is doing
+    // rather than of this test, and `test_budget` is where that reasoning
+    // already lives (#307/#422).
+    //
+    // `await_spawned` multiplies the base by `BASE_CALIBRATION * load_scale`,
+    // which that module's own test pins at 4 at MIN_SCALE and 8 at the cap.
+    // A 2s base is therefore 8s at the floor and 16s at the cap: the 8000ms
+    // this replaces is what the wait KEEPS on a quiet machine, and load buys
+    // more on top. The floor is the point - `MIN_SCALE`'s own doc says it may
+    // never shrink below the budgets these tests already had, since every one
+    // of them was observed failing at 1x.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the restored pane's shell to answer",
+        || {
+            app2.terminals[1]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("alive-42"))
+        },
+    );
 
     // Closing back down to one default pane prunes the record, so a plain
     // single-shell workspace never grows the file.
@@ -25934,7 +26813,7 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
 }
 
 #[test]
-fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
+fn cmd_k_d_dumps_the_pane_scrollback_into_a_rendered_log_tab() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
@@ -25947,6 +26826,7 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
     )
     .unwrap();
     app.terminals[0].set_manual_name(Some(String::from("bldlog")));
+    app.scrollback_dir = tmp.path().join("dumps");
     app.focus_pane(Pane::Terminal);
     let mut waited = 0u32;
     while !app.terminals[0]
@@ -25975,27 +26855,28 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
         label.contains("bldlog") && label.contains("scrollback"),
         "the scratch tab is named after the pane: {label:?}"
     );
+    // A pane's output carries colour (croft's own run header does, and so
+    // does any shell prompt), so the dump lands in the rendered log view
+    // (#257) rather than a plain scratch buffer; the text is read from the
+    // view once its index is complete and its window loaded.
+    let text: Vec<String> = {
+        let log = app
+            .editor
+            .log
+            .as_mut()
+            .expect("the dump opens as a rendered log");
+        log.finish_index();
+        let n = log.len();
+        log.ensure(0, n).unwrap();
+        (0..n)
+            .map(|i| log.visible_text(i).unwrap_or("").to_string())
+            .collect()
+    };
     assert!(
-        app.editor
-            .lines
-            .iter()
-            .any(|l| l.contains("scrollback-payload-7")),
-        "the pane's output is in the buffer"
+        text.iter().any(|l| l.contains("scrollback-payload-7")),
+        "the pane's output is in the buffer: {text:?}"
     );
-    assert!(
-        !app.editor
-            .lines
-            .last()
-            .map(String::as_str)
-            .unwrap_or("x")
-            .trim()
-            .is_empty()
-            || app.editor.lines.len() > 1,
-        "the blank live-screen tail is trimmed"
-    );
-    let blank_tail = app
-        .editor
-        .lines
+    let blank_tail = text
         .iter()
         .rev()
         .take_while(|l| l.trim().is_empty())
@@ -26003,6 +26884,750 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
     assert!(
         blank_tail <= 1,
         "the unused live-screen rows must not pad the buffer: {blank_tail} blank tail lines"
+    );
+}
+
+/// #257: Cmd+K D lands the pane's scrollback in the rendered log view, so
+/// the colours the pane showed survive into the tab, written to a real file
+/// under the scrollback dir because the log view indexes from disk.
+#[test]
+fn cmd_k_d_opens_the_scrollback_as_a_rendered_log_with_its_colours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}GREEN\\033[0m rest\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the pane to print the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQGREEN rest"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    {
+        // The view indexes in the background and parses a window on demand:
+        // read only what it has actually loaded.
+        let log = app
+            .editor
+            .log
+            .as_mut()
+            .expect("the scrollback opens in the rendered log view");
+        log.finish_index();
+        let n = log.len();
+        log.ensure(0, n).unwrap();
+    }
+    let log = app.editor.log.as_ref().unwrap();
+    let row = (0..log.len())
+        .find(|&i| {
+            log.visible_text(i)
+                .is_some_and(|t| t.contains("QQGREEN rest"))
+        })
+        .expect("the coloured row is in the view, escapes stripped");
+    let line = log.line(row).expect("the row is parsed");
+    let green = line
+        .spans
+        .iter()
+        .find(|s| line.text[s.start..s.end].contains("QQGREEN"))
+        .unwrap_or_else(|| panic!("a span colours the green run: {:?}", line.spans));
+    assert_eq!(
+        green.style.fg,
+        Some(crate::ansi_text::AnsiColor::Indexed(2)),
+        "the pane's green reaches the tab as the symbolic green slot"
+    );
+    let path = app.editor.path.clone().expect("the tab has a path");
+    assert!(
+        path.starts_with(&app.scrollback_dir) && path.extension().is_some_and(|e| e == "log"),
+        "the dump is a .log under the scrollback dir: {path:?}"
+    );
+    assert!(
+        path.is_file(),
+        "the dump exists on disk for the view to index"
+    );
+}
+
+/// The dump file is one per pane and overwritten on each Cmd+K D, so the
+/// second dump must show the pane's NEW output, not the first dump's rows
+/// through a stale index, and must not claim a fresh open it did not make.
+#[test]
+fn a_second_dump_of_the_same_pane_shows_its_new_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from(
+                "s=QQ; printf \"\\033[32m${s}ONE\\033[0m\\n\"; read line; \
+                 printf \"\\033[32m${s}TWO\\033[0m\\n\"; sleep 30",
+            ),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the first coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQONE"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    assert!(app.editor.log.is_some(), "the first dump is a rendered log");
+
+    app.terminals[0].write_input(b"\n");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the second coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQTWO"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let text: Vec<String> = {
+        let log = app
+            .editor
+            .log
+            .as_mut()
+            .expect("the second dump is a rendered log too");
+        log.finish_index();
+        let n = log.len();
+        log.ensure(0, n).unwrap();
+        (0..n)
+            .map(|i| log.visible_text(i).unwrap_or("").to_string())
+            .collect()
+    };
+    assert!(
+        text.iter().any(|l| l.contains("QQTWO")),
+        "the second dump shows the new row, not the stale first dump: {text:?}"
+    );
+}
+
+/// The route gate and the open path's sniff must agree: the sniff reads only
+/// the first 8 KiB, so colour that first appears beyond it must route to the
+/// plain buffer, or the user gets an editable file full of raw escapes.
+#[test]
+fn colour_beyond_the_sniff_prefix_keeps_the_dump_plain() {
+    let plain: Vec<String> = (0..400)
+        .map(|i| format!("plain row {i:04} with padding text"))
+        .collect();
+    let mut late = plain.clone();
+    late.push(String::from("\x1b[32mlate colour\x1b[0m"));
+    assert!(
+        late.iter().map(|r| r.len() + 1).take(400).sum::<usize>() > 8192,
+        "fixture: the colour sits past the 8 KiB sniff prefix"
+    );
+    assert!(
+        !scrollback_opens_as_log(&late),
+        "colour past the prefix is not a log to the sniff"
+    );
+    let mut early = vec![String::from("\x1b[32mearly colour\x1b[0m")];
+    early.extend(plain.iter().cloned());
+    assert!(
+        scrollback_opens_as_log(&early),
+        "colour inside the prefix is"
+    );
+    assert!(!scrollback_opens_as_log(&plain), "no colour at all is not");
+}
+
+/// A dump is a pinned tab of its own, as the scratch buffer was: a later
+/// single-click file peek must not replace it, and two panes' dumps must
+/// not share one preview slot.
+#[test]
+fn a_scrollback_dump_is_a_pinned_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}PIN\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQPIN"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the dump tab has a path");
+    let idx = app
+        .editor
+        .find_tab_with_path(&path)
+        .expect("the dump tab is findable by its path");
+    assert!(
+        !app.editor.is_preview(idx),
+        "the dump is pinned, not a replaceable preview"
+    );
+}
+
+/// Two panes may carry the same label (two unnamed shells both read
+/// `terminal`), so the dump file is keyed on the pane's stable uid too: the
+/// second pane's dump must not overwrite and close the first pane's.
+#[test]
+fn two_panes_with_one_label_dump_to_separate_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    let spawn = |tag: &str| {
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                format!("s=QQ; printf \"\\033[32m${{s}}{tag}\\033[0m\\n\"; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap()
+    };
+    app.terminals = vec![spawn("ONE"), spawn("TWO")];
+    for (i, tag) in ["QQONE", "QQTWO"].iter().enumerate() {
+        app.terminals[i].set_manual_name(Some(String::from("same")));
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the pane to print its row",
+            || {
+                app.terminals[i]
+                    .grid_lines()
+                    .0
+                    .iter()
+                    .any(|l| l.contains(tag))
+            },
+        );
+    }
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let first = app.editor.path.clone().expect("first dump has a path");
+    app.active_terminal = 1;
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let second = app.editor.path.clone().expect("second dump has a path");
+    assert_ne!(first, second, "one file per pane, not per label");
+    assert!(
+        first.is_file() && second.is_file(),
+        "both dumps are still on disk"
+    );
+    assert!(
+        app.editor.find_tab_with_path(&first).is_some(),
+        "the first pane's tab survives the second pane's dump"
+    );
+}
+
+/// A dump holds terminal output, so it is written owner-only: the dir is
+/// 0700 and the file 0600 whatever the umask, so another local account
+/// cannot read it.
+#[cfg(unix)]
+#[test]
+fn a_scrollback_dump_is_owner_only_on_disk() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}SEC\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQSEC"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the dump has a path");
+    let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(&app.scrollback_dir)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600, "the dump is readable by its owner alone");
+    assert_eq!(dir_mode, 0o700, "and so is the dir that holds it");
+}
+
+/// A dump file must not be shared across croft processes: the pane uid is
+/// a per-process counter that restarts at 1, so the file name carries the
+/// pid too, as the session handoff file does.
+#[test]
+fn a_scrollback_dump_file_is_scoped_to_this_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}PID\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQPID"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let name = app
+        .editor
+        .path
+        .clone()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .expect("the dump has a file name");
+    assert!(
+        name.contains(&format!("-{}-", std::process::id())),
+        "the file name carries this process's pid: {name}"
+    );
+}
+
+/// A stale tab from an earlier dump can live in ANY editor group, not only
+/// the focused one, and every copy must go before the file is rewritten:
+/// a tab left in another group would read the new bytes through its old
+/// index and paint garbage, with nothing to heal it.
+#[test]
+fn a_second_dump_closes_the_stale_tab_in_every_editor_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}GRP\\033[0m\\n\"; read line; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQGRP"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the first dump has a path");
+    // Split: the dump tab now sits in the left group; the right is focused.
+    app.split_editor();
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let stale_elsewhere = app
+        .editor_layout
+        .inactive_groups()
+        .iter()
+        .any(|g| g.find_tab_with_path(&path).is_some());
+    assert!(
+        !stale_elsewhere,
+        "no other group keeps a tab over the rewritten dump file"
+    );
+    assert!(
+        app.editor.find_tab_with_path(&path).is_some(),
+        "the focused group holds the rebuilt dump"
+    );
+    // The left group held nothing but the stale dump: closing its only tab
+    // leaves a blank group, which every other close path prunes; a dead
+    // blank pane the user never opened must not survive here either.
+    assert!(
+        app.editor_layout
+            .inactive_groups()
+            .iter()
+            .all(|g| !g.is_blank_initial()),
+        "an inactive group emptied by the close is pruned, not left blank"
+    );
+}
+
+/// The private write must never re-mode something it did not create through
+/// a link: `set_permissions` follows symlinks, so a scrollback dir that is a
+/// link is refused and its target keeps its mode. A real dir left loose by
+/// an older run is tightened, and so is a stale dump file.
+#[cfg(unix)]
+#[test]
+fn write_private_refuses_a_symlinked_dir_and_tightens_a_loose_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let loose = tmp.path().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stale = loose.join("old.log");
+    std::fs::write(&stale, "old").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_private(&loose, &stale, "new").expect("a real dir is written");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode(&loose),
+        0o700,
+        "a loose dir from an older run is tightened"
+    );
+    assert_eq!(mode(&stale), 0o600, "and so is a stale dump file");
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "new");
+
+    let target = tmp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let outcome = write_private(&link, &link.join("x.log"), "x");
+    assert!(
+        outcome.is_err(),
+        "a symlinked dir is refused, not written through"
+    );
+    assert_eq!(mode(&target), 0o755, "the link's target keeps its mode");
+    assert!(!target.join("x.log").exists(), "and gains no file");
+
+    // The same for the dump FILE: a link planted where the dump goes must
+    // not have its target truncated, overwritten and re-moded.
+    let outside = tmp.path().join("outside.txt");
+    std::fs::write(&outside, "secret").unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let planted = loose.join("planted.log");
+    std::os::unix::fs::symlink(&outside, &planted).unwrap();
+    let outcome = write_private(&loose, &planted, "new");
+    assert!(outcome.is_err(), "a symlinked dump file is refused");
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "secret",
+        "its target is untouched"
+    );
+    assert_eq!(mode(&outside), 0o644, "and keeps its mode");
+}
+
+/// The prune after a close is scoped to the group the close emptied: a
+/// group the user left blank on purpose (a split with one side cleared) is
+/// not this command's to fold away.
+#[test]
+fn a_scrollback_dump_leaves_a_blank_group_it_did_not_empty_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}KEEP\\033[0m\\n\"; read line; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQKEEP"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    // Split, blank the new (focused) group, then focus the group that holds
+    // the dump: the blank group is now an inactive leaf with no dump in it.
+    app.split_editor();
+    assert!(app.editor_layout.is_split(), "fixture: the editor is split");
+    app.editor.close_tab(0);
+    assert!(
+        app.editor.is_blank_initial(),
+        "fixture: the focused group is blank"
+    );
+    app.focus_editor_group(true);
+    assert!(
+        app.editor.path.is_some(),
+        "fixture: the dump's group is focused"
+    );
+    assert!(
+        app.editor_layout
+            .inactive_groups()
+            .iter()
+            .any(|g| g.is_blank_initial()),
+        "fixture: the blank group is inactive"
+    );
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    assert!(
+        app.editor_layout.is_split(),
+        "a blank group this dump did not empty survives it"
+    );
+}
+
+/// With two inactive groups, one emptied by the close and one the user
+/// blanked, only the emptied one is pruned: the sweep must be scoped to the
+/// group the close emptied, not to blankness.
+#[test]
+fn a_scrollback_dump_prunes_only_the_group_it_emptied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}THREE\\033[0m\\n\"; read line; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQTHREE"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    // [A(dump) | B(focused)] -> blank B -> focus A -> split A again:
+    // [[A(dump) | C(focused)] | B(blank)], so A and B are both inactive.
+    app.split_editor();
+    app.editor.close_tab(0);
+    app.focus_editor_group(true);
+    assert!(
+        app.editor.path.is_some(),
+        "fixture: the dump's group is focused"
+    );
+    app.split_editor();
+    let inactive = app.editor_layout.inactive_groups();
+    assert_eq!(inactive.len(), 2, "fixture: two inactive groups");
+    assert!(
+        inactive.iter().any(|g| g.is_blank_initial())
+            && inactive.iter().any(|g| g
+                .find_tab_with_path(app.editor.path.as_ref().unwrap())
+                .is_some()),
+        "fixture: one blank, one holding the dump"
+    );
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let inactive = app.editor_layout.inactive_groups();
+    assert!(
+        app.editor_layout.is_split(),
+        "the user's blank group keeps its split"
+    );
+    assert_eq!(
+        inactive.len(),
+        1,
+        "exactly the emptied group is gone: {} left",
+        inactive.len()
+    );
+    assert!(
+        inactive[0].is_blank_initial(),
+        "and the survivor is the user's blank group"
+    );
+}
+
+/// A dump that cannot reach the disk still leaves the user the text: the
+/// plain rows land in the scratch buffer and the status says why.
+#[test]
+fn a_scrollback_dump_that_cannot_be_written_falls_back_to_the_plain_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A file where the dir's parent should be: nothing can be created under it.
+    let blocker = tmp.path().join("blocker");
+    std::fs::write(&blocker, "not a dir").unwrap();
+    app.scrollback_dir = blocker.join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}FALL\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQFALL"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    assert!(app.editor.log.is_none(), "no rendered log view opened");
+    assert!(
+        app.editor.lines.iter().any(|l| l.contains("QQFALL")),
+        "the plain text is in the buffer: {:?}",
+        app.editor.lines
+    );
+    assert!(
+        app.status.starts_with("Rendered scrollback unavailable"),
+        "the status says why: {:?}",
+        app.status
+    );
+}
+
+/// Dumps are named by pid, so a croft that exits leaves its dumps behind
+/// with no process that will ever overwrite them; the next dump reaps the
+/// files of pids that are gone and leaves live processes' files alone.
+#[cfg(unix)]
+#[test]
+fn a_scrollback_dump_reaps_the_dumps_of_dead_processes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    std::fs::create_dir_all(&app.scrollback_dir).unwrap();
+    // A pid that is certainly gone: a child that has already been reaped.
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+    let dead = app
+        .scrollback_dir
+        .join(format!("shell-{}-1-scrollback.log", child.id()));
+    std::fs::write(&dead, "gone").unwrap();
+    let live = app
+        .scrollback_dir
+        .join(format!("shell-{}-99-scrollback.log", std::process::id()));
+    std::fs::write(&live, "mine").unwrap();
+    let other = app.scrollback_dir.join("notes.txt");
+    std::fs::write(&other, "not a dump").unwrap();
+    // A pid no `pid_t` can hold reads as alive: a false "alive" only leaks
+    // a file, a false "dead" would delete one.
+    let huge = app.scrollback_dir.join("shell-4294967295-1-scrollback.log");
+    std::fs::write(&huge, "?").unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}REAP\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQREAP"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    assert!(app.editor.path.is_some(), "the dump itself landed");
+    assert!(!dead.exists(), "a dead process's dump is reaped");
+    assert!(live.exists(), "this process's other dump stays");
+    assert!(other.exists(), "a file that is not a dump is not touched");
+    assert!(huge.exists(), "a pid outside pid_t is left alone");
+}
+
+/// The dump is a new on-disk copy of pane output, so the redact rules must
+/// hold on disk too: the matching row is written masked (and gives up its
+/// colour), while a neighbouring row keeps its colour.
+#[test]
+fn a_scrollback_dump_is_redacted_on_disk_and_only_the_masked_row_loses_colour() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[{ "regex": "token \\S+", "action": "redact" }]"#,
+    ));
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from(
+                "s=QQ; printf \"\\033[32m${s}SAFE\\033[0m\\n\"; \
+                 printf \"\\033[31mtoken ${s}SECRET99\\033[0m\\n\"; sleep 30",
+            ),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "both rows", || {
+        app.terminals[0]
+            .grid_lines()
+            .0
+            .iter()
+            .any(|l| l.contains("QQSECRET99"))
+    });
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the dump has a path");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !on_disk.contains("QQSECRET99"),
+        "the secret never reaches the disk: {on_disk:?}"
+    );
+    let masked_row = on_disk
+        .lines()
+        .find(|l| l.contains(crate::triggers::MASK))
+        .expect("the matching row is written masked");
+    assert!(
+        !masked_row.contains('\x1b'),
+        "the masked row gives up its colour: {masked_row:?}"
+    );
+    let safe_row = on_disk
+        .lines()
+        .find(|l| l.contains("QQSAFE"))
+        .expect("the neighbouring row is there");
+    assert!(
+        safe_row.contains("\x1b[32m"),
+        "and keeps its colour: {safe_row:?}"
     );
 }
 
@@ -26201,15 +27826,43 @@ fn clicking_an_annotated_span_still_clears_the_click_selection() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A SILENT pane (#477). `App::new` spawns the user's interactive shell,
+    // whose prompt lands whenever the machine gets round to it; a prompt
+    // arriving between the anchor below and the click scrolled the
+    // annotation off the row the click was aimed at, and the popup
+    // assertion read as "annotation hover broke" on a merely busy host.
+    // A child that prints nothing cannot move the grid, so the only bytes
+    // on it are the ones this test feeds.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     app.terminals[0].feed_bytes_for_test(b"annotated words here\r\n");
+    // Anchor the note to the grid line the text actually landed on and aim
+    // the click at that same line, rather than assuming both are row 0.
+    let line = app.terminals[0]
+        .find_captured_line("annotated words here")
+        .expect("the fed text is on the grid");
+    assert!(
+        line >= 0,
+        "with no scrollback the text sits on a viewport row, got line {line}"
+    );
     let clock = app.terminals[0].scroll_clock();
-    app.terminals[0].add_annotation(0, clock, 0, 15, String::from("the note"));
+    app.terminals[0].add_annotation(line, clock, 0, 15, String::from("the note"));
     let inner = app.terminals[0].last_inner;
-    let (cx, cy) = (inner.x + 2, inner.y);
+    let (cx, cy) = (inner.x + 2, inner.y + line as u16);
+    assert!(
+        app.terminals[0]
+            .line_text_at(cx, cy)
+            .is_some_and(|(text, idx)| text.starts_with("annotated words here") && idx == 2),
+        "the click must land ON the annotated text, or the popup assertion is vacuous"
+    );
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), cx, cy));
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), cx, cy));
     assert!(app.hover_popup.is_some(), "the click must pop the note");
@@ -26635,8 +28288,12 @@ fn alt_screen_upward_drag_through_the_real_mouse_pipeline_selects_upward() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
 
-    // Few enough rows that nothing scrolls in the pane's alt grid.
-    let mut screen = String::from("\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[H\x1b[2J");
+    // Few enough rows that nothing scrolls in the pane's alt grid. The
+    // modes are Claude Code's own pair: click-only 1000 with SGR 1006. Since
+    // #474 the press is forwarded to such a child, but a drag is croft's
+    // selection because the child never asked for motion -- under 1002 this
+    // same plain drag would be the app's and Shift would be needed.
+    let mut screen = String::from("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[H\x1b[2J");
     for i in 0..6 {
         screen.push_str(&format!("transcript line number {i:02}\r\n"));
     }
@@ -30513,6 +32170,64 @@ fn shift_end_reaches_an_alt_screen_program() {
     );
 }
 
+#[test]
+fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
+    // The deterministic half of #397's quick-select entry. Its sibling below
+    // was measured at 3 failures in 20 runs under load, because a REAL
+    // shell's prompt wraps to several rows and the pane had one row of slack;
+    // a rate is the best evidence a race allows, and it is not a test.
+    //
+    // This one feeds the prompt itself, so the geometry is the whole claim
+    // and the machine has no say. Four rows of it, then the same park,
+    // stream and assert. On the unmaximized pane, which is five rows here,
+    // this fails on every machine on every run.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    app.toggle_terminal_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.terminals[0].last_inner;
+    let h = inner.height as usize;
+    // The same tripwire the sibling carries. This fixture's own band is
+    // wider - it needs eight rows, not sixteen - but a panel that shrank
+    // below the sibling's threshold should fail in both, not silently pass
+    // here while failing there.
+    assert!(
+        h >= 16,
+        "the maximized panel must leave slack for the wrapped prompt; got {h} rows"
+    );
+
+    app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
+    app.terminals[0].feed_bytes_for_test(b"\r\nhttp://drift.io");
+    app.open_terminal_quick_select();
+    // The prompt arrives AFTER the URL is on screen, which is the race: one
+    // that lands before the flood is scrolled away by it and costs nothing.
+    // Four rows of it, the shape a hostname-and-path prompt takes when it
+    // wraps at this width, and then the stream that scrolls the URL.
+    app.terminals[0]
+        .feed_bytes_for_test(format!("\r\n{}", "p".repeat(inner.width as usize * 4)).as_bytes());
+    app.terminals[0].feed_bytes_for_test(b"\r\nx1\r\nx2\r\nx3");
+    term.draw(|f| app.render(f)).unwrap();
+
+    let buf = term.backend().buffer().clone();
+    let joined: String = (inner.y..inner.y + inner.height)
+        .flat_map(|y| {
+            (inner.x..inner.x + inner.width)
+                .map(move |x| (x, y))
+                .map(|(x, y)| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+        })
+        .collect();
+    // The label clause is what makes `open_terminal_quick_select` above
+    // load-bearing: without it the bare URL satisfies this assertion just as
+    // well as a labelled one, and deleting the call left the test green.
+    assert!(
+        joined.contains("ttp://drift.io") && !joined.contains("http://drift.io"),
+        "a four-row prompt must not cost the URL its place on screen, and a \
+         label must still cover its first cell: {joined:?}"
+    );
+}
+
 /// Quick-select labels ride the scroll clock like every other overlay:
 /// output streaming under an open label set used to leave the gold labels
 /// at fixed viewport rows while their matches scrolled away, so the user
@@ -30521,31 +32236,68 @@ fn shift_end_reaches_an_alt_screen_program() {
 fn quick_select_labels_follow_content_that_streams_below_them() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A SILENT pane (#397). The row slack below was this test's first fix,
+    // and it held until a full-suite run captured the pane holding ONLY the
+    // shell's wrapped prompt and the trailing x1 x2 x3, the URL gone: the
+    // shell's prompt repaint after the maximize's SIGWINCH landed between
+    // the feeds and rewrote the rows the URL sat on. Slack absorbs a prompt
+    // that appends; it cannot absorb one that repaints. A child that prints
+    // nothing removes the writer entirely, and the subject here -- croft's
+    // label overlay following content the pane streams -- needs a grid, not
+    // a shell. The slack assertion stays: the scroll this test drives still
+    // needs the rows.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut term = ratatui::Terminal::new(backend).unwrap();
+    // The panel over the editor, so the pane has ROWS. Unmaximized it is a
+    // few rows tall here, and this test parks its URL four rows from the
+    // bottom. When the pane still ran the workspace shell that was almost
+    // no slack against a wrapped prompt (this test's first entry in #397,
+    // 3 failures in 20 runs under load); with a silent child the rows are
+    // simply what the scroll below needs, and the maximize is how it gets
+    // them.
+    app.toggle_terminal_maximize();
     term.draw(|f| app.render(f)).unwrap();
     // Park the cursor at the pane bottom so every further row SCROLLS.
     let h = app.terminals[0].last_inner.height as usize;
+    // The precondition this fix IS, checked in the same run as the claim it
+    // supports: if a future panel change shrank the pane back toward five
+    // rows, the test would quietly return to flaking instead of failing.
+    assert!(
+        h >= 16,
+        "the maximized panel must leave rows for the scroll this test drives; got {h} rows"
+    );
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
-    // One atomic feed, opening with its own newline: the live child
-    // shell's prompt can flush between feed calls under suite load (#62),
-    // and a prompt landing just before the URL used to push it across the
-    // pane edge, wrapping the match. Advancing "\r\n" + URL under one grid
-    // lock keeps the URL at column 0 whether the prompt arrives before
-    // this chunk (its row is above) or after it (it appends to the right).
+    // One atomic feed, opening with its own newline, so "\r\n" + URL lands
+    // under one grid lock with the URL at column 0. #62 saw the match wrap
+    // the pane edge when another writer got between two feeds; the pane is
+    // silent now, and the shape is kept because it is the one that cannot
+    // wrap whatever else is on screen.
     app.terminals[0].feed_bytes_for_test(b"\r\nhttp://drift.io");
     app.open_terminal_quick_select();
-    assert!(app.terminal_quick_select.is_some(), "staging: one hint");
+    // The URL by name, not `is_some()`: quick select stages every match on
+    // screen, and naming the one this test planted keeps the assertion
+    // about it rather than about whatever else happens to match.
+    assert!(
+        app.terminal_quick_select
+            .as_ref()
+            .is_some_and(|s| s.hints.iter().any(|h| h.text.contains("drift.io"))),
+        "staging: the URL is hinted"
+    );
     app.terminals[0].feed_bytes_for_test(b"\r\nx1\r\nx2\r\nx3");
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer().clone();
     // Join the pane's inner rows into one stream before searching, so pane
     // geometry can't split the needle across a row boundary (#62), and
-    // don't pin WHICH gold label the URL drew: when the live shell's
-    // prompt lands above the URL its path is a match too, and label
-    // assignment is bottom-priority, so the URL's letter depends on that
-    // race. The invariant is that SOME label still covers the URL's first
+    // don't pin WHICH gold label the URL drew: label assignment is
+    // bottom-priority over every match on screen, and the letter is not the
+    // claim. The invariant is that SOME label still covers the URL's first
     // cell after the scroll — the 'h' is overlaid, the rest is intact.
     let inner = app.terminals[0].last_inner;
     let joined: String = (inner.y..inner.y + inner.height)
@@ -38736,4 +40488,2774 @@ fn an_unknowable_cwd_still_allows_reuse_but_a_wrong_one_does_not() {
         "Task: nonexistent",
         &real_root
     ));
+}
+
+// ---------------------------------------------------------------------------
+// #313: collapsing terminal panes.
+// ---------------------------------------------------------------------------
+
+/// Split to `n` panes and render once at a size wide enough for every pane to
+/// carry its full header strip.
+fn app_with_terminal_panes(
+    n: usize,
+) -> (
+    tempfile::TempDir,
+    App,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for _ in 1..n {
+        app.split_terminal().unwrap();
+    }
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    (tmp, app, term)
+}
+
+#[test]
+fn collapsed_panes_keep_one_column_and_the_rest_divide_what_is_left() {
+    // The apportioning is the whole of the layout risk, so it is measured
+    // against real solved widths rather than eyeballed off a constraint list.
+    let solve = |flags: &[bool], width: u16| -> Vec<u16> {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(terminal_pane_constraints(flags))
+            .split(Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 10,
+            })
+            .iter()
+            .map(|r| r.width)
+            .collect()
+    };
+
+    // Nothing collapsed: the even split croft had before the feature existed.
+    assert_eq!(solve(&[false; 4], 100), vec![25, 25, 25, 25]);
+
+    // Two collapsed: one column each, and the two still open divide the 98
+    // that leaves. This is the assertion `Ratio(1, k)` fails - it would ask
+    // for 50 columns apiece out of the FULL 100 while the strips also want
+    // theirs, and the solver settles the overflow by shaving the panes.
+    let widths = solve(&[false, true, true, false], 100);
+    assert_eq!(
+        widths,
+        vec![49, 1, 1, 49],
+        "collapsed panes cost one column"
+    );
+    assert_eq!(widths.iter().sum::<u16>(), 100, "the row is fully spent");
+
+    // The gain is the point: 25 columns each becomes 49.
+    assert!(
+        widths[0] > solve(&[false; 4], 100)[0],
+        "collapsing must actually hand width to the panes still open"
+    );
+}
+
+#[test]
+fn the_minus_button_still_closes_and_the_chevron_collapses() {
+    // The ruling on #313: `-` keeps meaning close, and collapse is its own
+    // button. These are one test because the whole risk is the two being
+    // confused - a build where `-` folded instead of closing would pass any
+    // test that only exercised one of them.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+
+    let fold = app.terminal_collapse_buttons[1];
+    assert!(fold.width > 0, "the collapse button must be painted");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        fold.x + 1,
+        fold.y,
+    ));
+    assert_eq!(app.terminals.len(), 3, "collapsing must never close a pane");
+    assert!(app.terminals[1].collapsed, "the clicked pane folded");
+
+    let close = app.terminal_close_buttons[0];
+    assert!(close.width > 0, "the close button must be painted");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        close.x + 1,
+        close.y,
+    ));
+    assert_eq!(
+        app.terminals.len(),
+        2,
+        "`-` still closes the pane - it was NOT repurposed to collapse"
+    );
+}
+
+#[test]
+fn clicking_a_collapsed_strip_gives_the_pane_its_width_back() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    term.draw(|f| app.render(f)).unwrap();
+
+    let strip = app.terminal_strip_rects[2];
+    assert_eq!(strip.width, 1, "a collapsed pane is one column wide");
+    assert!(strip.height > 1, "the strip runs the height of the panel");
+    // Anywhere down the strip, not only the chevron: one column is a small
+    // enough target without also demanding the right row.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        strip.x,
+        strip.y + strip.height / 2,
+    ));
+    assert!(!app.terminals[2].collapsed, "the strip is the way back out");
+}
+
+#[test]
+fn a_strip_on_the_sidebar_seam_still_unfolds_its_pane() {
+    // #468: the default terminal is the LEFTMOST pane, and its strip sits on
+    // the editor column's left edge, which is exactly the column the sidebar
+    // seam claims for a resize drag. That hit-test runs before the strip's,
+    // so a click on the left pane's strip started a drag and the pane could
+    // never be brought back; a pane opened to the right sat clear of the seam
+    // and unfolded fine. Both sidebar positions are covered because the seam
+    // moves with the side bar: on the right it is the column past the editor,
+    // and its two-column grab zone reaches the LAST pane's strip instead.
+    for &pos in &[SideBarPosition::Left, SideBarPosition::Right] {
+        let (_tmp, mut app, mut term) = app_with_terminal_panes(2);
+        app.side_bar_position = pos;
+        let idx = match pos {
+            SideBarPosition::Left => 0,
+            SideBarPosition::Right => 1,
+        };
+        app.toggle_terminal_collapse(idx);
+        term.draw(|f| app.render(f)).unwrap();
+
+        let strip = app.terminal_strip_rects[idx];
+        assert_eq!(strip.width, 1, "{pos:?}: pane {idx} is folded to a strip");
+        let seam = app
+            .sidebar_splitter_x
+            .expect("the side bar is shown, so its seam exists");
+        // The whole point: the strip must lie inside the seam's grab zone
+        // (the seam column and the one left of it), or this proves nothing.
+        assert!(
+            strip.x == seam || strip.x + 1 == seam,
+            "{pos:?}: precondition - strip x={} must meet the seam at x={seam}",
+            strip.x
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            strip.x,
+            strip.y + strip.height / 2,
+        ));
+        assert!(
+            !app.terminals[idx].collapsed,
+            "{pos:?}: the strip on the seam is still the way back out"
+        );
+        assert_eq!(
+            app.splitter_drag, None,
+            "{pos:?}: a click on a strip is not a sidebar resize"
+        );
+    }
+}
+
+#[test]
+fn a_collapsed_pane_is_never_reflowed_into_its_strip() {
+    // `resize` clamps to two columns, so rendering a collapsed pane would not
+    // crash - it would quietly rewrap the running shell to a two-column grid
+    // and destroy everything on its screen. Skipping the render is what keeps
+    // the pane's geometry, and this is the assertion that says so.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    let before = app.terminals[1].grid_cols();
+    assert!(
+        before > 2,
+        "the pane must start at a real width to prove this"
+    );
+
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        app.terminals[1].grid_cols(),
+        before,
+        "a collapsed pane's shell keeps the geometry it had"
+    );
+    assert_eq!(
+        app.terminals[1].last_area,
+        Rect::default(),
+        "and its grid hit rect is cleared, so a strip click cannot land in it"
+    );
+}
+
+#[test]
+fn the_last_expanded_pane_refuses_to_collapse() {
+    let (_tmp, mut app, _term) = app_with_terminal_panes(2);
+    app.toggle_terminal_collapse(0);
+    assert!(app.terminals[0].collapsed);
+
+    app.toggle_terminal_collapse(1);
+    assert!(
+        !app.terminals[1].collapsed,
+        "folding every pane away would leave a row of strips with nothing in it"
+    );
+    assert!(
+        app.status.contains("last expanded"),
+        "and it says so rather than swallowing the click: {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn closing_the_only_expanded_pane_never_leaves_a_row_of_strips() {
+    // The refusal above guards one route into an all-collapsed row; closing
+    // is the other, and it arrives from the opposite direction.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(2);
+    app.toggle_terminal_collapse(0);
+    assert!(app.close_terminal_at(1), "close the pane that was expanded");
+    assert_eq!(app.terminals.len(), 1);
+    assert!(
+        !app.terminals[0].collapsed,
+        "the survivor must be given its width back"
+    );
+}
+
+#[test]
+fn reopening_a_closed_pane_brings_it_back_expanded() {
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    assert!(app.close_terminal_at(2));
+    app.undo_close_terminal();
+    // The count first. Without it a reopen that did nothing at all leaves two
+    // uncollapsed panes and satisfies the flag check while proving the pane
+    // never came back: the predicate is fine, the set it ranges over is wrong.
+    assert_eq!(app.terminals.len(), 3, "the pane must actually be back");
+    assert!(
+        !app.terminals.iter().any(|t| t.collapsed),
+        "a reopen that put a strip on screen would read as having failed"
+    );
+}
+
+#[test]
+fn cmd_k_brackets_fold_the_active_pane_and_restore_every_folded_one() {
+    let (_tmp, mut app, _term) = app_with_terminal_panes(4);
+    app.active_terminal = 3;
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('['), KeyModifiers::NONE)));
+    app.active_terminal = 2;
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('['), KeyModifiers::NONE)));
+    assert_eq!(
+        app.terminals.iter().filter(|t| t.collapsed).count(),
+        2,
+        "each Cmd+K [ folds the pane that is active"
+    );
+
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char(']'), KeyModifiers::NONE)));
+    assert!(
+        !app.terminals.iter().any(|t| t.collapsed),
+        "Cmd+K ] is the issue's one gesture back to equal-sized panes"
+    );
+    assert!(app.status.contains("Restored 2"), "{:?}", app.status);
+}
+
+#[test]
+fn cmd_k_e_still_reveals_in_the_explorer() {
+    // The design proposal had picked Cmd+K E for restore-all. It is croft's
+    // reveal-in-Explorer, and an `e` arm added below the existing one would
+    // never have been reached - a chord that silently does nothing. This
+    // pins the collision so the mistake cannot be made a second time.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(2);
+    app.toggle_terminal_collapse(1);
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('e'), KeyModifiers::NONE)));
+    // BOTH halves, in this test. "Did not collapse" alone passes against a
+    // build where `e` reaches nothing at all, while the test's NAME goes on
+    // claiming it revealed. With no file open the reveal arm says so, and
+    // that is the presence half over the same state.
+    assert_eq!(
+        app.status, "Reveal in Explorer View: no active file",
+        "Cmd+K E must still reach reveal-in-Explorer"
+    );
+    assert!(
+        app.terminals[1].collapsed,
+        "and must not have been quietly taken over by collapse"
+    );
+}
+
+#[test]
+fn folding_the_focused_pane_moves_focus_somewhere_visible() {
+    // A one-column strip shows no cursor, so keystrokes would land where the
+    // user cannot see them arrive.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.active_terminal = 1;
+    app.toggle_terminal_collapse(1);
+    assert!(app.terminals[1].collapsed);
+    // The SPECIFIC pane, not merely "not the folded one": naming it is what
+    // tells a deliberate hand-off from focus landing somewhere by accident.
+    // Pane 1's neighbours are equidistant, so this pins the left tie-break.
+    assert_eq!(app.active_terminal, 0, "ties go to the pane on the left");
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "and that pane is actually on screen"
+    );
+}
+
+#[test]
+fn folding_a_pane_hands_focus_to_its_neighbour_not_to_the_front_of_the_row() {
+    // The case above cannot tell "nearest" from "first": pane 1 of three is
+    // one step from both its neighbours, so the two rules agree there. Four
+    // panes with the LAST one folded separates them - nearest says 2, first
+    // says 0 - which is the whole of the difference between handing focus to
+    // a neighbour and throwing the user back across the panel.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(4);
+    app.active_terminal = 3;
+    app.toggle_terminal_collapse(3);
+    assert!(app.terminals[3].collapsed);
+    assert_eq!(
+        app.active_terminal, 2,
+        "focus goes to the neighbour, not to the first expanded pane"
+    );
+}
+
+#[test]
+fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
+    // The two gestures are orthogonal: entering maximize does not clear the
+    // flags, and leaving it restores whatever folding was in force.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    app.active_terminal = 0;
+    app.toggle_terminal_pane_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminals[2].collapsed,
+        "maximize must not silently clear the folding"
+    );
+    assert_eq!(
+        app.terminal_strip_rects
+            .iter()
+            .filter(|r| r.width > 0)
+            .count(),
+        0,
+        "but no strip is painted while maximize owns the panel"
+    );
+
+    app.toggle_terminal_pane_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        app.terminal_strip_rects[2].width, 1,
+        "leaving maximize brings the strip back"
+    );
+}
+
+#[test]
+fn a_collapsed_strip_carries_the_pane_name_down_its_column() {
+    // The strip is what makes the gesture obviously reversible, so it has to
+    // be identifiable: the chevron out, then the name.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.terminals[1].set_manual_name(Some(String::from("build")));
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+
+    let strip = app.terminal_strip_rects[1];
+    let column: String = (strip.y..strip.y + strip.height)
+        .map(|y| {
+            term.backend()
+                .buffer()
+                .cell(ratatui::layout::Position::new(strip.x, y))
+                .unwrap()
+                .symbol()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        column.starts_with('\u{eab6}'),
+        "the expand chevron heads the strip: {column:?}"
+    );
+    assert!(
+        column.contains("build"),
+        "the pane's name runs down the strip: {column:?}"
+    );
+}
+
+#[test]
+fn a_long_pane_name_never_paints_past_the_end_of_its_strip() {
+    // A PROPERTY, not a case: this never states which row the name should end
+    // on, only that nothing lands outside the strip. A case written to a
+    // boundary already reasoned through would confirm the painting code's
+    // arithmetic rather than probe it, since the same reasoning produced both.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let height = app.terminal_strip_rects[1].height;
+    assert!(
+        height > 2,
+        "the strip must be tall enough for a name to overrun"
+    );
+
+    // Omega is one cell wide and appears nowhere else in the chrome, so any
+    // sighting of it outside the strip is the name having escaped.
+    const MARK: &str = "\u{3a9}";
+    for len in 1..=(height as usize + 2) {
+        app.terminals[1].set_manual_name(Some(MARK.repeat(len)));
+        term.draw(|f| app.render(f)).unwrap();
+        let strip = app.terminal_strip_rects[1];
+        assert_eq!(strip.width, 1, "still one column at name length {len}");
+        // Containment, counted over the WHOLE screen rather than probed at
+        // the row below the strip: that probe reads `None` whenever the panel
+        // reaches the last screen row, and an assertion the buffer's edge can
+        // satisfy is not an assertion. Comparing totals cannot go vacuous, and
+        // it states no arithmetic about which row is last.
+        let buf = term.backend().buffer();
+        let mark_at = |x: u16, y: u16| {
+            buf.cell(ratatui::layout::Position::new(x, y))
+                .is_some_and(|c| c.symbol() == MARK)
+        };
+        let area = buf.area();
+        let on_screen = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| mark_at(x, y))
+            .count();
+        let in_strip = (strip.y..strip.y + strip.height)
+            .filter(|&y| mark_at(strip.x, y))
+            .count();
+        assert!(
+            in_strip > 0,
+            "the name must actually be painted at length {len}, or nothing is being tested"
+        );
+        assert_eq!(
+            on_screen, in_strip,
+            "a {len}-character name painted outside its own strip"
+        );
+    }
+}
+
+// --- #313 fallback-review findings: red-first ------------------------------
+
+#[test]
+fn cycling_terminals_never_lands_on_a_collapsed_pane() {
+    // Cmd+] / Cmd+[ walk `active_terminal` by raw modular arithmetic, which
+    // predates the collapse flag. `toggle_terminal_collapse` documents the
+    // invariant "focus must not sit on a pane the user cannot see" and
+    // defends it on its own path only; cycling is the other way in.
+    //
+    // The FIXTURE has to be able to tell the two apart: four panes with index
+    // 1 folded, cycling from 0. Broken lands on 1 (folded, no cursor painted);
+    // correct skips to 2. A three-pane fixture would not discriminate.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(4);
+    app.toggle_terminal_collapse(1);
+    app.active_terminal = 0;
+    app.cycle_terminal();
+    assert_eq!(
+        app.active_terminal, 2,
+        "forward cycling steps over the strip"
+    );
+    assert!(!app.terminals[app.active_terminal].collapsed);
+
+    app.cycle_terminal_back();
+    assert_eq!(app.active_terminal, 0, "and so does backward cycling");
+    assert!(!app.terminals[app.active_terminal].collapsed);
+
+    // Presence half: with nothing folded the cycle still moves one slot, so
+    // this cannot pass by the cycle being broken outright.
+    app.restore_all_terminal_panes();
+    app.active_terminal = 0;
+    app.cycle_terminal();
+    assert_eq!(app.active_terminal, 1, "an unfolded row still steps by one");
+}
+
+#[test]
+fn collapse_is_inert_while_a_pane_is_maximized() {
+    // The `‹` button is not painted while maximized and the menu entry is
+    // suppressed, but the chord and the palette command called through
+    // unconditionally. `toggle_terminal_collapse` reassigns `active_terminal`,
+    // and the maximize branch hands the panel to whatever that is - so the
+    // pane being watched was silently swapped for a neighbour.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.active_terminal = 1;
+    app.toggle_terminal_pane_maximize();
+    assert!(app.terminal_pane_maximized, "precondition");
+
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('['), KeyModifiers::NONE)));
+    assert_eq!(
+        app.active_terminal, 1,
+        "the maximized pane must not be swapped out from under the user"
+    );
+    assert!(
+        !app.terminals.iter().any(|t| t.collapsed),
+        "and nothing folds while maximize owns the panel"
+    );
+}
+
+#[test]
+fn right_clicking_a_collapsed_strip_offers_to_expand_it() {
+    // `terminal_at_pos` hit-tests `last_area`, which a collapsed pane clears,
+    // so the right-click never resolved to a folded pane: the menu's
+    // "Expand Terminal" branch was unreachable while KEYBINDINGS.md advertised
+    // it, and a strip had exactly one gesture.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("a strip right-click opens the pane menu");
+    let labels: Vec<String> = menu
+        .items
+        .iter()
+        .filter_map(|e| match e {
+            MenuEntry::Item { label, .. } => Some(label.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "Expand Terminal"),
+        "the folded pane offers the way back out: {labels:?}"
+    );
+}
+
+#[test]
+fn a_reorder_never_hands_a_collapsed_pane_a_live_hit_rect() {
+    // `move_terminal` re-seats `last_area` in SLOT order, because the rect is a
+    // slot's geometry living on the terminal object. Before collapse existed
+    // every visible slot had a real rect, so that was self-consistent. Now a
+    // folded pane dragged into an expanded slot inherits a full-size rect it is
+    // not painted in, and clicks over it resolve to a pane that is not there.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.move_terminal(0, 2);
+    let folded = app
+        .terminals
+        .iter()
+        .position(|t| t.collapsed)
+        .expect("the folded pane survived the reorder");
+    assert_eq!(
+        app.terminals[folded].last_area,
+        Rect::default(),
+        "a folded pane must not inherit an expanded slot's hit rect"
+    );
+    // Presence half: the panes that ARE painted keep real rects, so this
+    // cannot pass by the re-seat having been removed altogether.
+    assert!(
+        app.terminals
+            .iter()
+            .filter(|t| !t.collapsed)
+            .any(|t| t.last_area.width > 0),
+        "expanded panes still carry their slot geometry"
+    );
+}
+
+#[test]
+fn closing_the_pane_beside_a_folded_one_never_leaves_focus_on_it() {
+    // Round 1 fixed ONE route onto a folded pane (cycling) at the call site
+    // rather than at `sync_focus_flags`, which documents itself as the single
+    // place every gesture moving `active_terminal` funnels through.
+    //
+    // Here: fold the ACTIVE pane 1, which hands focus left to 0, then close 0.
+    // `close_terminal_at` leaves `active_terminal` at 0, which is now the
+    // folded pane. `ensure_a_terminal_pane_is_expanded` does not catch it - it
+    // enforces "SOME pane is expanded", not "the ACTIVE pane is".
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.active_terminal = 1;
+    app.toggle_terminal_collapse(1);
+    assert_eq!(app.active_terminal, 0, "precondition: focus went left");
+    assert!(app.close_terminal_at(0), "close the pane holding focus");
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "closing a neighbour must not leave focus on a strip"
+    );
+}
+
+#[test]
+fn dismissing_a_strips_menu_never_leaves_focus_on_the_strip() {
+    // This route was OPENED by round 1's own fix: making a strip
+    // right-clickable also made it focusable, because the same line that
+    // resolves the pane also focuses it. A folded pane paints no cursor and no
+    // focus border, so the user then types into a pane they cannot see.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    assert!(
+        app.context_menu.is_some(),
+        "precondition: the strip right-click opened the pane menu"
+    );
+    // Dismiss through the PRODUCTION path. Assigning `context_menu = None`
+    // under a comment saying "the user presses Esc" made this test assert
+    // focus after the RIGHT-CLICK, not after dismissal: the right-click branch
+    // calls `focus_pane`, which runs the invariant, so the assertion below was
+    // already satisfied before the line pretending to dismiss anything ran. It
+    // passed, and it could not have failed for the reason it is named for.
+    app.handle_menu_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        app.context_menu.is_none(),
+        "Esc must actually close the menu, or the dismissal path is not what \
+         this test exercised"
+    );
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "dismissing a strip's menu must not leave focus on the strip"
+    );
+}
+
+#[test]
+fn leaving_maximize_never_lands_focus_on_a_folded_pane() {
+    // The rail lists every pane, folded ones included, and a rail click sets
+    // `active_terminal` with no collapse check. While maximized that is
+    // harmless - the flags are ignored and the pane is painted full width -
+    // but leaving maximize drops focus onto a one-column strip.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    app.active_terminal = 0;
+    app.toggle_terminal_pane_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Hand the maximized pane to the folded terminal the way the rail does.
+    app.active_terminal = 2;
+    app.toggle_terminal_pane_maximize();
+    assert!(
+        !app.terminal_pane_maximized,
+        "precondition: back to the split"
+    );
+    assert!(
+        !app.terminals[app.active_terminal].collapsed,
+        "leaving maximize must not leave focus on a strip"
+    );
+}
+
+#[test]
+fn restore_all_is_inert_while_a_pane_is_maximized() {
+    // The mirror of `collapse_is_inert_while_a_pane_is_maximized`. Collapse
+    // got the maximize guard in round 1 and restore did not, so Cmd+K ]
+    // cleared every flag and announced it, for a change invisible until the
+    // user left maximize - the same silent-state-change shape, reversed.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(2);
+    app.active_terminal = 0;
+    app.toggle_terminal_pane_maximize();
+    assert!(app.terminal_pane_maximized, "precondition");
+
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char(']'), KeyModifiers::NONE)));
+    assert!(
+        app.terminals[2].collapsed,
+        "restore must not silently clear folding the user cannot see"
+    );
+}
+
+#[test]
+fn jumping_to_a_captured_line_reveals_the_folded_pane_that_holds_it() {
+    // Round 2 moved the "focus never rests on a folded pane" invariant into
+    // `sync_focus_flags`. That closed three routes and broke a fourth class:
+    // callers which deliberately TARGET a pane by index and then focus it.
+    // `sync_focus_flags` sees the target folded and walks focus away, so the
+    // caller's chosen pane is silently swapped for a neighbour - here the
+    // capture is applied to a pane the user cannot see while focus lands
+    // somewhere unrelated. `run_project_task` and `run_block_in_pane` have the
+    // same shape and write a COMMAND into the invisible pane.
+    //
+    // The invariant is right; what was missing is that reaching for a pane by
+    // index is a request to SEE it, which is the rationale `undo_close_terminal`
+    // already applies when it force-expands a reopened pane.
+    let (_tmp, mut app, _term) = app_with_terminal_panes(3);
+    let pid = app.terminals[1]
+        .shell_pid()
+        .expect("a real shell to key on");
+    app.terminals[1].feed_bytes_for_test(b"a captured line worth jumping to\r\n");
+    app.toggle_terminal_collapse(1);
+    assert!(
+        app.terminals[1].collapsed,
+        "precondition: the target is folded"
+    );
+    assert_ne!(app.active_terminal, 1, "precondition: focus left it");
+
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: String::from("build"),
+        shell_pid: Some(pid),
+        message: String::from("captured"),
+        line: String::from("a captured line worth jumping to"),
+    });
+    app.captures_open_selected();
+
+    assert_eq!(
+        app.active_terminal, 1,
+        "the jump must land on the pane that HOLDS the captured line"
+    );
+    assert!(
+        !app.terminals[1].collapsed,
+        "and that pane must be visible: applying a selection to a folded pane \
+         shows the user nothing"
+    );
+}
+
+#[test]
+fn the_expand_entry_advertises_no_chord_it_cannot_perform() {
+    // `Cmd+K [` acts on `active_terminal`, which the focus invariant keeps off
+    // folded panes, so the chord can only ever COLLAPSE. The menu label
+    // alternates, so a folded pane's menu read `Expand Terminal   ⌘K [` -
+    // advertising a shortcut that does the opposite of the label beside it.
+    // Contrast `ToggleMaximizeTerminal`, which carries `⌘K M` honestly because
+    // that chord genuinely toggles both ways.
+    assert_eq!(
+        shortcut_for(&MenuAction::ToggleCollapseTerminal(0)),
+        None,
+        "a one-way chord must not be advertised beside a two-way label"
+    );
+    assert_eq!(
+        shortcut_for(&MenuAction::ToggleMaximizeTerminal(0)),
+        Some("⌘K M"),
+        "and the genuinely two-way sibling keeps its hint, so this is not just \
+         the hint lookup being broken"
+    );
+}
+
+#[test]
+fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
+    // A strip right-click sets `active_terminal = idx` and focuses the pane,
+    // and `sync_focus_flags` then walks focus straight off a folded pane to
+    // its nearest expanded neighbour. Every menu entry that carries no index
+    // acts on `active_terminal`, so the menu named one pane and acted on
+    // another: "Open Scrollback in Editor" opened the NEIGHBOUR's scrollback
+    // under the neighbour's label. The broadcast entry was worse — it read
+    // its label from `terminals[idx]` and toggled `active_terminal`, so it
+    // could say "Exclude from Broadcast" and include a different pane.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.broadcast_input = true;
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    assert_ne!(
+        app.active_terminal, 1,
+        "precondition: focus cannot rest on a folded pane, which is what \
+         makes an index-free entry act on the wrong one"
+    );
+    let labels = |app: &App| -> Vec<String> {
+        app.context_menu
+            .as_ref()
+            .expect("a right-click opens the pane menu")
+            .items
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let folded = labels(&app);
+    for entry in [
+        "Quick Select",
+        "Copy Mode",
+        "Command History",
+        "Open Scrollback in Editor",
+        "Exclude from Broadcast",
+        "Include in Broadcast",
+    ] {
+        assert!(
+            !folded.iter().any(|l| l == entry),
+            "{entry:?} acts on the active pane, which is not this one: {folded:?}"
+        );
+    }
+    assert!(
+        folded.iter().any(|l| l == "Rename Terminal")
+            && folded.iter().any(|l| l == "Expand Terminal"),
+        "the entries that carry their own index stay: {folded:?}"
+    );
+
+    // The control, in the same run: an EXPANDED pane still offers all of
+    // them, so this is a rule about folded panes and not a menu that lost
+    // half its entries.
+    app.context_menu = None;
+    let area = app.terminals[0].last_area;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 1,
+        area.y + 1,
+    ));
+    let expanded = labels(&app);
+    for entry in [
+        "Quick Select",
+        "Copy Mode",
+        "Command History",
+        "Open Scrollback in Editor",
+    ] {
+        assert!(
+            expanded.iter().any(|l| l == entry),
+            "{entry:?} belongs on an expanded pane's menu: {expanded:?}"
+        );
+    }
+}
+
+#[test]
+fn a_pane_named_in_wide_characters_still_marks_its_strip() {
+    // Only single-width characters are painted, because a CJK glyph or an
+    // emoji is two cells wide and the pane next door is one column away. But
+    // FILTERING them out left a pane named entirely in them with a blank
+    // strip: a folded pane that is not identifiable is the one thing the
+    // strip exists to prevent.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.terminals[1].set_manual_name(Some(String::from("\u{9805}\u{76ee}")));
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    assert_eq!(strip.width, 1, "precondition: the strip is painted");
+    assert!(strip.height > 2, "precondition: room below the chevron");
+
+    let buf = term.backend().buffer();
+    let at = |x: u16, y: u16| {
+        buf.cell(ratatui::layout::Position::new(x, y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default()
+    };
+    let marked = (strip.y + 1..strip.y + strip.height)
+        .filter(|&y| !at(strip.x, y).trim().is_empty())
+        .count();
+    assert!(
+        marked > 0,
+        "the strip must carry something under the chevron for a wide-character name"
+    );
+    // And the containment property the filter was there for: the stand-in is
+    // one cell, so the pane one column away is untouched.
+    assert_eq!(
+        unicode_width::UnicodeWidthChar::width(TERMINAL_STRIP_WIDE_STANDIN),
+        Some(1),
+        "the stand-in has to fit the one column the strip owns"
+    );
+}
+
+#[test]
+fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
+    // `ToggleMaximizeTerminal` carries its index and assigns `active_terminal`
+    // directly rather than through `focus_pane`, which makes it the one path
+    // that deliberately puts focus ON a folded pane. That is correct here:
+    // maximize ignores the collapse flags by design and paints the active
+    // pane across the panel, so the pane the menu names is the pane that
+    // appears. The strip's right-click made this reachable, and nothing
+    // pinned it.
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[1];
+    let folded_width = app.terminals[1].last_area.width;
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    let action = app
+        .context_menu
+        .as_ref()
+        .expect("a strip right-click opens the pane menu")
+        .items
+        .iter()
+        .find_map(|e| match e {
+            MenuEntry::Item { label, action } if label == "Maximize Terminal" => {
+                Some(action.clone())
+            }
+            _ => None,
+        })
+        .expect("a folded pane still offers maximize: the entry carries its own index");
+    app.context_menu = None;
+    let root = app.workspace_root().to_path_buf();
+    app.dispatch_menu_action(action, root);
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(
+        app.active_terminal, 1,
+        "the maximized pane is the one the menu named"
+    );
+    assert!(
+        app.terminals[1].last_area.width > folded_width,
+        "the folded pane is painted across the panel, not left as a strip: \
+         {folded_width} then {}",
+        app.terminals[1].last_area.width
+    );
+    assert!(
+        app.terminal_strip_rects.iter().all(|r| r.width == 0),
+        "no strip survives maximize, or a click could land on a pane that is not painted"
+    );
+}
+
+/// #474: a rendered app whose only pane is tracking the mouse with SGR
+/// reports, exactly the pair Claude Code sends (`?1000h` + `?1006h`), plus
+/// a cell inside the grid and that cell's local coordinates.
+fn tracking_terminal_app(modes: &[u8]) -> (App, tempfile::TempDir, u16, u16, u16, u16) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(modes);
+    let inner = app.terminals[0].last_inner;
+    assert!(
+        inner.width > 6 && inner.height > 3,
+        "terminal grid must be laid out, got {inner:?}"
+    );
+    let (col, row) = (inner.x + 3, inner.y + 2);
+    let (lr, lc) = app.terminals[0]
+        .cell_at(col, row)
+        .expect("the test cell lies inside the grid");
+    (app, tmp, col, row, lc, lr)
+}
+
+#[test]
+fn a_click_over_a_mouse_tracking_child_is_forwarded_as_press_and_release() {
+    // Claude Code's diff panel closes from a click on its ×; htop, lazygit
+    // and vim's `mouse=a` route clicks the same way. All of them see the
+    // click only if croft sends the press AND the release: a TUI that got a
+    // press with no release believes the button is still down. Before #474
+    // neither was sent -- the click became a one-cell croft selection.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    assert!(app.terminals[0].mouse_reporting());
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!("\x1b[<0;{};{}M", lc + 1, lr + 1),
+        "the press is an SGR button-0 report at the 1-based grid cell"
+    );
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "a forwarded press plants no croft selection: the child owns the click"
+    );
+    let uid = app.terminals[0].uid();
+    assert!(
+        app.terminal_pointer_forwarded
+            .is_some_and(|f| f.pane == uid && f.press == (col, row) && !f.selecting),
+        "the pane (by uid) and cell that got the press are remembered for the release"
+    );
+
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!("\x1b[<0;{c};{r}M\x1b[<0;{c};{r}m", c = lc + 1, r = lr + 1),
+        "the release follows as the lower-case SGR terminator"
+    );
+    assert!(
+        app.terminal_pointer_forwarded.is_none(),
+        "the release ends the forwarded gesture"
+    );
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "nor does the release leave a highlight behind"
+    );
+}
+
+#[test]
+fn a_click_over_a_child_that_is_not_tracking_stays_a_croft_selection() {
+    // The forward is gated on the child having asked (`report_mouse` declines
+    // without a tracking mode), so a shell prompt or a plain pager keeps
+    // croft's click-to-select and nothing reaches the child's stdin.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, _, _) = tracking_terminal_app(b"");
+    assert!(!app.terminals[0].mouse_reporting());
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.terminals[0].written_bytes_for_test().is_empty(),
+        "no report is written to a child that never asked for the mouse"
+    );
+    assert!(
+        app.terminals[0].selection().is_some(),
+        "the click anchors croft's own selection as before"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn shift_click_over_a_tracking_child_keeps_the_click_for_croft() {
+    // Shift is the bypass for the whole forwarded family, the same one the
+    // wheel has and the one xterm, iTerm2 and VS Code use: with it held the
+    // click anchors croft's selection so text can still be copied out of a
+    // full-screen app that otherwise owns the pointer.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+
+    let mut shift = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    shift.modifiers = KeyModifiers::SHIFT;
+    app.handle_mouse(shift);
+    assert!(
+        app.terminals[0].written_bytes_for_test().is_empty(),
+        "Shift+click is croft's: nothing is reported to the child"
+    );
+    assert!(
+        app.terminals[0].selection().is_some(),
+        "Shift+click anchors croft's own selection over a tracking child"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_click_on_the_pane_border_is_not_forwarded_to_a_tracking_child() {
+    // `terminal_at_pos` hit-tests the pane INCLUDING its border, while a
+    // report needs a grid cell. A border click over a tracking child must
+    // fall through to croft (where it is inert) rather than be reported at a
+    // cell the child does not have.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, _, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    let border_row = app.terminals[0].last_area.y;
+    assert!(
+        app.terminals[0].cell_at(col, border_row).is_none(),
+        "the top border is not a grid cell"
+    );
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        col,
+        border_row,
+    ));
+    assert!(
+        app.terminals[0].written_bytes_for_test().is_empty(),
+        "no report for a cell outside the child's grid"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_forwarded_drag_reports_motion_only_when_the_child_asked_for_it() {
+    // DECSET 1000 is click-only: the child wants presses and releases and
+    // nothing in between. 1002 adds button-held motion. The Drag arm hands
+    // the event to `report_mouse`, whose motion guard already encodes that
+    // distinction, so the same drag is silent under 1000 and a `+32` report
+    // under 1002 -- and croft's own drag-selection never starts either way.
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col + 2,
+        row + 1,
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!("\x1b[<0;{};{}M", lc + 1, lr + 1),
+        "under 1000 the drag adds nothing after the press: the child asked for clicks"
+    );
+    // A click-only child cannot use the drag, so croft keeps it: the
+    // selection is anchored at the PRESS cell, not where the first motion
+    // event happened to land, and extends to the pointer.
+    let sel = app.terminals[0]
+        .selection()
+        .expect("under 1000 the drag is croft's text selection");
+    let (sr, sc, er, ec) = sel.normalised();
+    assert_eq!(
+        (sr, sc, er, ec),
+        (lr as i32, lc, lr as i32 + 1, lc + 2),
+        "the selection runs from the press cell to the drag cell"
+    );
+    assert!(
+        app.terminal_pointer_forwarded.is_some_and(|f| f.selecting),
+        "the gesture is still open and marked as croft's selection"
+    );
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        col + 2,
+        row + 1,
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!(
+            "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+            lc + 1,
+            lr + 1,
+            lc + 3,
+            lr + 2
+        ),
+        "the child that got the press still gets the release"
+    );
+    assert!(
+        app.terminals[0].selection().is_some_and(|s| s.has_area()),
+        "and croft's selection survives the release for copying"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1002h\x1b[?1006h");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col + 2,
+        row + 1,
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!(
+            "\x1b[<0;{};{}M\x1b[<32;{};{}M",
+            lc + 1,
+            lr + 1,
+            lc + 3,
+            lr + 2
+        ),
+        "under 1002 the drag is a button-0 motion report at the new cell"
+    );
+    assert!(app.terminals[0].selection().is_none());
+}
+
+#[test]
+fn a_forwarded_release_outside_the_pane_is_clamped_to_its_grid() {
+    // A press the child got must be followed by a release the child gets,
+    // even when the pointer has wandered off the pane by then; otherwise the
+    // child keeps a button held that the user let go. xterm reports such a
+    // release at the nearest cell, and so does croft: the coordinates are
+    // clamped to the pane's grid rather than the report being dropped.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    let inner = app.terminals[0].last_inner;
+    assert!(
+        app.terminals[0].cell_at(0, 0).is_none(),
+        "(0,0) must be outside the pane, or nothing is clamped"
+    );
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 0));
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!("\x1b[<0;{};{}M\x1b[<0;1;1m", lc + 1, lr + 1),
+        "the release lands on the grid's top-left cell, the nearest to (0,0)"
+    );
+    assert_eq!(
+        app.terminals[0].clamp_to_grid(u16::MAX, u16::MAX),
+        (inner.x + inner.width - 1, inner.y + inner.height - 1),
+        "the far corner clamps to the last cell, never one past it"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_forwarded_release_over_a_sibling_pane_goes_to_the_pane_that_got_the_press() {
+    // The point of remembering the pane in `terminal_pointer_forwarded`
+    // rather than re-hit-testing at release: a drag that ends over the
+    // NEIGHBOUR pane still owes its release to the child that got the press,
+    // at that child's nearest edge cell. Re-resolving by pointer would hand
+    // the release to a pane that never saw a press (or drop it, if that pane
+    // is not tracking) and leave the first child with a held button.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.terminals.len(), 2, "two panes are visible");
+    // Only pane 0 tracks the mouse; pane 1 is a plain shell.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    assert!(app.terminals[0].mouse_reporting());
+    assert!(!app.terminals[1].mouse_reporting());
+
+    let inner0 = app.terminals[0].last_inner;
+    let inner1 = app.terminals[1].last_inner;
+    assert!(
+        inner0.width > 4 && inner0.height > 3 && inner1.width > 4 && inner1.height > 3,
+        "both panes need a real grid: {inner0:?} {inner1:?}"
+    );
+    let (col, row) = (inner0.x + 2, inner0.y + 1);
+    let (lr, lc) = app.terminals[0].cell_at(col, row).unwrap();
+    // A cell well inside pane 1, on the same row.
+    let (far_col, far_row) = (inner1.x + 2, row);
+    assert!(
+        app.terminals[1].cell_at(far_col, far_row).is_some()
+            && app.terminals[0].cell_at(far_col, far_row).is_none(),
+        "the release cell must belong to pane 1 only"
+    );
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        far_col,
+        far_row,
+    ));
+
+    let (clamped_col, clamped_row) = app.terminals[0].clamp_to_grid(far_col, far_row);
+    let (er, ec) = app.terminals[0].cell_at(clamped_col, clamped_row).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()),
+        format!(
+            "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+            lc + 1,
+            lr + 1,
+            ec + 1,
+            er + 1
+        ),
+        "pane 0 gets the press and the release, the latter at its nearest edge cell"
+    );
+    assert!(
+        app.terminals[1].written_bytes_for_test().is_empty(),
+        "pane 1 never saw a press, so it gets no release either"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_forwarded_release_finds_its_pane_after_an_earlier_pane_closes() {
+    // `ForwardedPointer` names the pane by uid, not by index. Close the pane
+    // BEFORE the pressed one while the button is held: the pressed pane
+    // slides from index 1 to index 0, and the release must still reach it.
+    // An index would have delivered the release to whatever now sits at
+    // the old slot (nothing, here) and left the pressed child holding a
+    // button.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.terminals.len(), 2);
+    app.terminals[1].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    let pressed_uid = app.terminals[1].uid();
+    let inner = app.terminals[1].last_inner;
+    let (col, row) = (inner.x + 2, inner.y + 1);
+    let (lr, lc) = app.terminals[1].cell_at(col, row).unwrap();
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(
+        app.terminal_pointer_forwarded
+            .is_some_and(|f| f.pane == pressed_uid)
+    );
+
+    assert!(app.close_terminal_at(0), "the EARLIER pane closes");
+    assert_eq!(app.terminals.len(), 1);
+    assert_eq!(
+        app.terminals[0].uid(),
+        pressed_uid,
+        "the pressed pane now sits at index 0"
+    );
+    // The pane was re-laid out by the close; release wherever the pointer
+    // is, the report is clamped to the pane's current grid.
+    term.draw(|f| app.render(f)).unwrap();
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+
+    let written = String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).into_owned();
+    assert!(
+        written.starts_with(&format!("\x1b[<0;{};{}M", lc + 1, lr + 1)),
+        "the press went to the pane before the close: {written:?}"
+    );
+    assert!(
+        written.ends_with('m') && written.matches("\x1b[<0;").count() == 2,
+        "the release still reaches the same pane after it moved to index 0: {written:?}"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_click_only_drag_keeps_extending_the_origin_pane_after_the_active_pane_moves() {
+    // Under click-only 1000 the drag is croft's selection on the pane that
+    // got the press. `Cmd+]` (cycle_terminal) can move the ACTIVE pane while
+    // the button is held; the drag must keep extending the origin's
+    // selection, not the new active pane's, and the release must finalise
+    // it there. Routing through `terminal_mut()` would have left the origin
+    // at its one-cell anchor and started nothing on the other pane either.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    let inner = app.terminals[0].last_inner;
+    assert!(
+        inner.width > 6 && inner.height > 3,
+        "pane 0 needs a grid: {inner:?}"
+    );
+    let (col, row) = (inner.x + 2, inner.y + 1);
+    let (lr, lc) = app.terminals[0].cell_at(col, row).unwrap();
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert_eq!(
+        app.active_terminal, 0,
+        "the press activates the pressed pane"
+    );
+    // The keyboard moves the active pane mid-gesture.
+    app.cycle_terminal();
+    assert_eq!(app.active_terminal, 1, "Cmd+] moved the active pane");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col + 3,
+        row + 1,
+    ));
+    let sel = app.terminals[0]
+        .selection()
+        .expect("the origin pane carries the drag-selection");
+    let (sr, sc, er, ec) = sel.normalised();
+    assert_eq!(
+        (sr, sc, er, ec),
+        (lr as i32, lc, lr as i32 + 1, lc + 3),
+        "the origin's selection runs from the press cell to the drag cell"
+    );
+    assert!(
+        app.terminals[1].selection().is_none(),
+        "the pane that merely became active gets no selection"
+    );
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        col + 3,
+        row + 1,
+    ));
+    assert!(
+        app.terminals[0].selection().is_some_and(|s| s.has_area()),
+        "the release finalises the origin's selection"
+    );
+    assert!(
+        String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).ends_with('m'),
+        "and the origin child gets the release"
+    );
+    assert!(
+        app.terminals[1].written_bytes_for_test().is_empty(),
+        "the active pane's child sees nothing"
+    );
+    assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_double_click_over_a_tracking_child_is_two_forwarded_clicks_not_a_word_select() {
+    // Both clicks of the pair are the child's, and neither arms croft's
+    // double-click tracker, so no word is selected. This is the documented
+    // trade: word-select is unavailable over a tracking app.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    // The token is put ON the click row (the helper's cell is grid row 2),
+    // and the precondition checks it: a word-select on a blank cell selects
+    // nothing, so without this the "no word" assertion could not fail.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[3;1Hhello_world_token\r\n");
+    let (text, idx) = app.terminals[0]
+        .line_text_at(col, row)
+        .expect("the click must resolve to a grid cell");
+    assert!(
+        text.contains("hello_world_token") && idx < text.len(),
+        "the click must land ON the token: {text:?} at {idx}"
+    );
+    for _ in 0..2 {
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+    }
+    let written = String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).into_owned();
+    let pair = format!("\x1b[<0;{c};{r}M\x1b[<0;{c};{r}m", c = lc + 1, r = lr + 1);
+    assert_eq!(
+        written,
+        format!("{pair}{pair}"),
+        "two press/release pairs reach the child"
+    );
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "no word is selected: the pair was never croft's"
+    );
+}
+
+#[test]
+fn shift_drag_over_a_1002_child_selects_with_croft_and_reports_nothing() {
+    // Under 1002 the unshifted drag is the child's; Shift+drag is the way
+    // left to select text in a `mouse=a` vim or lazygit, and it must never
+    // leak a report.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, _, _) = tracking_terminal_app(b"\x1b[?1002h\x1b[?1006h");
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::SHIFT;
+    app.handle_mouse(ev);
+    let mut ev = mouse(MouseEventKind::Drag(MouseButton::Left), col + 3, row + 1);
+    ev.modifiers = KeyModifiers::SHIFT;
+    app.handle_mouse(ev);
+    let mut ev = mouse(MouseEventKind::Up(MouseButton::Left), col + 3, row + 1);
+    ev.modifiers = KeyModifiers::SHIFT;
+    app.handle_mouse(ev);
+    assert!(
+        app.terminals[0].written_bytes_for_test().is_empty(),
+        "Shift keeps every event of the gesture from the child"
+    );
+    assert!(
+        app.terminals[0].selection().is_some_and(|s| s.has_area()),
+        "and croft's selection has the dragged area"
+    );
+}
+
+#[test]
+fn copy_on_select_fires_for_a_click_only_forwarded_drag() {
+    // The forwarded-release tail carries its own copy-on-select, aimed at the
+    // origin pane; it must put the origin's selection on the clipboard the
+    // way the ordinary mouse-up does.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, _, _, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    app.copy_on_select = true;
+    app.terminals[0].feed_bytes_for_test(b"\x1b[H");
+    app.terminals[0].feed_bytes_for_test(b"copy-me-please\r\n");
+    let inner = app.terminals[0].last_inner;
+    let (x0, y0) = (inner.x, inner.y);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x0, y0));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x0 + 13, y0));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x0 + 13, y0));
+    assert_eq!(
+        crate::clipboard::read_string().as_deref(),
+        Some("copy-me-please"),
+        "the origin pane's selection landed on the clipboard"
+    );
+}
+
+#[test]
+fn toggling_log_highlighting_flips_open_views_and_the_default() {
+    // #466: the palette / Settings toggle reaches the view that is already
+    // open AND steers views opened afterwards, so the user sees the change
+    // at once and does not get it undone by the next log they open.
+    let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("build.log");
+    std::fs::write(&log, b"\x1b[32mok\x1b[0m 2024-01-02 step 1\nplain step 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&log).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "a coloured .log opens as a rendered log"
+    );
+    let before = app.log_highlight;
+    let view_before = app.editor.log.as_ref().unwrap().highlight();
+    assert_eq!(
+        view_before, before,
+        "the open view starts at the app's setting"
+    );
+
+    app.toggle_log_highlight();
+    assert_eq!(app.log_highlight, !before);
+    assert_eq!(
+        app.editor.log.as_ref().unwrap().highlight(),
+        !before,
+        "the open view followed the toggle"
+    );
+    assert_eq!(
+        crate::log_view::default_highlight(),
+        !before,
+        "and so will the next log opened"
+    );
+    assert!(app.status.starts_with("Log highlighting (tailspin):"));
+
+    // Back to where it was, so the process-wide default is left as found.
+    app.toggle_log_highlight();
+    assert_eq!(app.log_highlight, before);
+    assert_eq!(crate::log_view::default_highlight(), before);
+}
+
+#[test]
+fn startup_seeds_the_log_view_default_from_the_saved_preference() {
+    // #466: `App::new` seeds the log view's opening default from the saved
+    // preference. Under test that seed is recorded per thread instead of
+    // written (hundreds of apps on parallel threads would race the tests
+    // reading the process-wide default), which keeps the CALL SITE
+    // observable: this asserts what `App::new` decided, pinned by a
+    // workspace layer so it does not move with the developer's own config.
+    let tmp = tempfile::tempdir().unwrap();
+    let layer = crate::config_layers::workspace_config_path(tmp.path());
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    std::fs::write(&layer, r#"{"disable_log_highlight": true}"#).unwrap();
+    STARTUP_LOG_HIGHLIGHT_SEED.with(|c| c.set(None));
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        !app.log_highlight,
+        "the workspace layer's opt-out reached the field"
+    );
+    assert_eq!(
+        STARTUP_LOG_HIGHLIGHT_SEED.with(|c| c.get()),
+        Some(false),
+        "and App::new seeded the log view's opening default with the same value"
+    );
+    std::fs::write(&layer, r#"{"disable_log_highlight": false}"#).unwrap();
+    STARTUP_LOG_HIGHLIGHT_SEED.with(|c| c.set(None));
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.log_highlight);
+    assert_eq!(STARTUP_LOG_HIGHLIGHT_SEED.with(|c| c.get()), Some(true));
+}
+
+#[test]
+fn a_workspace_layer_setting_disable_log_highlight_applies_on_remerge() {
+    // #466: `disable_log_highlight` is a workspace-allowed key, so a repo's
+    // `.croft/config.json` can set it, and a settings remerge (a save of
+    // that file) must apply it live: to the field, to the default for logs
+    // opened later, and to every open log view. Read at startup too.
+    let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let before = crate::log_view::default_highlight();
+    let tmp = tempfile::tempdir().unwrap();
+    let layer = crate::config_layers::workspace_config_path(tmp.path());
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    std::fs::write(&layer, r#"{"disable_log_highlight": true}"#).unwrap();
+    let log = tmp.path().join("build.log");
+    std::fs::write(&log, b"\x1b[32mok\x1b[0m 2024-01-02 step 1\nplain step 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(!app.log_highlight, "the workspace layer is read at startup");
+    app.editor.open_pinned(&log).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "a coloured .log opens as a rendered log"
+    );
+    // Force the open view on, as a stale default would have left it, so the
+    // remerge below has something visible to fix.
+    app.editor.log.as_mut().unwrap().set_highlight(true);
+
+    // A second log parked in another split group, so the fan-out over
+    // inactive groups is exercised, not just the active tab.
+    let other = tmp.path().join("other.log");
+    std::fs::write(&other, b"\x1b[31merr\x1b[0m 2024-01-02 step 9\n").unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&other).unwrap();
+    assert!(app.editor.log.is_some());
+    app.editor.log.as_mut().unwrap().set_highlight(true);
+    fn parked_log_flags(app: &mut App) -> Vec<bool> {
+        app.editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .flat_map(|g| g.editors.iter())
+            .filter_map(|e| e.log.as_ref().map(|l| l.highlight()))
+            .collect()
+    }
+
+    std::fs::write(&layer, r#"{"disable_log_highlight": false}"#).unwrap();
+    app.reload_config_for_path(&layer);
+    assert!(
+        app.log_highlight,
+        "the remerge applied the workspace layer's new value"
+    );
+    assert!(
+        app.editor.log.as_ref().unwrap().highlight(),
+        "and pushed it into the open log view"
+    );
+    let parked = parked_log_flags(&mut app);
+    assert!(
+        !parked.is_empty() && parked.iter().all(|&h| h),
+        "and into the log parked in the other split group: {parked:?}"
+    );
+    assert!(
+        crate::log_view::default_highlight(),
+        "and into the default for later logs"
+    );
+
+    std::fs::write(&layer, r#"{"disable_log_highlight": true}"#).unwrap();
+    app.reload_config_for_path(&layer);
+    assert!(!app.log_highlight);
+    assert!(
+        !app.editor.log.as_ref().unwrap().highlight(),
+        "the opt-out reaches the open view"
+    );
+    assert!(
+        parked_log_flags(&mut app).iter().all(|&h| !h),
+        "and the parked one"
+    );
+    crate::log_view::set_default_highlight(before);
+}
+
+/// #471: no watcher-reported paths, for the poll-shaped refresh calls.
+fn no_paths() -> std::collections::BTreeSet<std::path::PathBuf> {
+    std::collections::BTreeSet::new()
+}
+
+/// #471 fixtures: a repo with one committed file, and the app rooted there.
+fn repo_with_seed(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(&args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+    let f = root.join("seed.txt");
+    std::fs::write(&f, text).unwrap();
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "init", "--quiet"]);
+    (tmp, f)
+}
+
+fn git_ok(root: &std::path::Path, args: &[&str]) {
+    let st = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(st.success(), "git {args:?}");
+}
+
+/// Write `text` to `path` so that its `(mtime, len)` stamp differs from the
+/// one before the write: a stamp-gated refresh must not miss a rewrite that
+/// lands within the filesystem's mtime granularity of the previous one. A
+/// different length differs at once; an equal length waits for the clock.
+fn rewrite_later(path: &std::path::Path, text: &str) {
+    let stamp = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len())))
+    };
+    let before = stamp(path);
+    std::fs::write(path, text).unwrap();
+    let mut spins = 0;
+    while stamp(path) == before && spins < 400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(path, text).unwrap();
+        spins += 1;
+    }
+    assert_ne!(
+        stamp(path),
+        before,
+        "the rewrite must move the file's stamp"
+    );
+}
+
+#[test]
+fn an_open_head_diff_follows_the_working_file_and_head() {
+    // The Source Control diff used to be a snapshot: an agent rewriting the
+    // file, or a save from a sibling tab, left the rows stale until the tab
+    // was reopened (#471). Now the view is rebuilt in place -- from disk on
+    // a filesystem trigger, from HEAD too on a git-status trigger -- with
+    // the reader's viewport kept.
+    let (tmp, f) = repo_with_seed("one\ntwo\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    // Open exactly what open_source_control_entry opens for a Modified row.
+    std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "one\ntwo\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    assert_eq!(app.editor.diff.as_ref().unwrap().right_lines.len(), 3);
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "nothing moved yet: the refresh is a no-op"
+    );
+
+    // The working file grows under the open view.
+    rewrite_later(&f, "one\ntwo\nthree\nfour\nfive\n");
+    app.editor.diff.as_mut().unwrap().scroll = 1;
+    assert!(
+        app.refresh_open_diff_views(false, &[], &no_paths()),
+        "a filesystem trigger rebuilds the view from the changed file"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(d.right_lines, vec!["one", "two", "three", "four", "five"]);
+    assert_eq!(d.left_lines, vec!["one", "two"], "HEAD side untouched");
+    assert_eq!(
+        d.scroll, 1,
+        "the reader's viewport is kept, not reset to the first hunk"
+    );
+    assert!(
+        d.left_is_git_head,
+        "the rebuilt view still gates stage/revert like the original"
+    );
+    assert!(
+        matches!(
+            d.source,
+            crate::widgets::diff::DiffSource::HeadVsWorking { .. }
+        ),
+        "the source survives the rebuild"
+    );
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "the stamps were taken: a second tick does not rebuild again"
+    );
+
+    // A commit moves HEAD: the git-status trigger re-reads the left side.
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "grow", "--quiet"]);
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "a filesystem-only trigger does not re-read HEAD"
+    );
+    assert!(
+        !app.refresh_open_diff_views(true, &[], &no_paths()),
+        "nor does a git-status drain in which THIS root's HEAD did not move"
+    );
+    assert!(
+        app.refresh_open_diff_views(true, std::slice::from_ref(&root), &no_paths()),
+        "the drain that saw this root's HEAD move does"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(
+        d.left_lines, d.right_lines,
+        "after the commit both sides agree"
+    );
+}
+
+#[test]
+fn edge_autoscroll_stands_down_while_the_forwarded_pane_is_not_active_and_resumes() {
+    // The tick scrolls the ACTIVE pane. With a click-only forwarded drag
+    // parked past pane 0's top edge, Cmd+] must not have the tick walk pane
+    // 1's scrollback, and Cmd+[ back must let it resume without a new Drag
+    // event, since a parked pointer sends none.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    // Enough history in pane 1 that a stray tick would visibly move it.
+    app.terminals[1].feed_bytes_for_test("row\r\n".repeat(200).as_bytes());
+    let inner = app.terminals[0].last_inner;
+    let (col, row) = (inner.x + 2, inner.y + 1);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert_eq!(app.active_terminal, 0);
+    // Park the pointer above the top edge: the drag arms auto-scroll.
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col,
+        inner.y.saturating_sub(1),
+    ));
+    assert!(
+        app.terminal_select_autoscroll.is_some(),
+        "precondition: auto-scroll armed"
+    );
+
+    app.cycle_terminal();
+    assert_eq!(app.active_terminal, 1);
+    let pane1_before = app.terminals[1].viewport_top_line();
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    assert!(
+        !app.tick_terminal_autoscroll(),
+        "the tick stands down for a non-origin active pane"
+    );
+    assert_eq!(
+        app.terminals[1].viewport_top_line(),
+        pane1_before,
+        "pane 1's viewport did not move"
+    );
+    assert!(
+        app.terminal_select_autoscroll.is_some(),
+        "the armed state is held, not dropped"
+    );
+
+    app.cycle_terminal_back();
+    assert_eq!(app.active_terminal, 0);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    assert!(
+        app.tick_terminal_autoscroll(),
+        "back on the origin pane the tick resumes without a new Drag"
+    );
+}
+
+#[test]
+fn a_bare_forwarded_click_never_reaches_the_clipboard() {
+    // The forwarded-release tail runs copy-on-select only for a gesture the
+    // Drag arm turned into croft's selection. A plain click that stayed the
+    // child's leaves the clipboard alone even with copy-on-select on.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, _, _, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    app.copy_on_select = true;
+    app.terminals[0].feed_bytes_for_test(b"\x1b[H");
+    app.terminals[0].feed_bytes_for_test(b"not-for-the-clipboard\r\n");
+    let inner = app.terminals[0].last_inner;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        inner.x + 2,
+        inner.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        inner.x + 2,
+        inner.y,
+    ));
+    assert_eq!(
+        crate::clipboard::read_string().as_deref().unwrap_or(""),
+        "",
+        "a click that was the child's copies nothing"
+    );
+    assert!(app.terminals[0].selection().is_none());
+}
+
+#[test]
+fn edge_autoscroll_is_dropped_when_the_forwarded_pane_closes_mid_gesture() {
+    // A parked, armed forwarded drag whose origin pane is then closed has
+    // nothing to resume on: the tick drops the gesture instead of standing
+    // down until a release that may never come.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    let inner = app.terminals[0].last_inner;
+    let (col, row) = (inner.x + 2, inner.y + 1);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col,
+        inner.y.saturating_sub(1),
+    ));
+    assert!(
+        app.terminal_select_autoscroll.is_some(),
+        "precondition: armed"
+    );
+    assert!(
+        app.close_terminal_at(0),
+        "the origin pane closes under the held button"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    assert!(!app.tick_terminal_autoscroll(), "nothing to scroll");
+    assert!(
+        app.terminal_select_autoscroll.is_none() && app.terminal_pointer_forwarded.is_none(),
+        "the gesture is dropped, not held"
+    );
+}
+
+#[test]
+fn a_staged_diff_view_reruns_git_on_a_status_trigger_only() {
+    let (tmp, f) = repo_with_seed("alpha\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    let raw = crate::git::diff_staged(&root).unwrap();
+    app.editor
+        .open_git_diff_side_by_side(std::path::Path::new("git diff --staged"), &raw)
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+        root: root.clone(),
+        kind: crate::widgets::diff::GitDiffKind::Staged,
+    });
+    assert!(
+        app.editor
+            .diff
+            .as_ref()
+            .unwrap()
+            .right_lines
+            .contains(&String::from("(no changes)")),
+        "nothing is staged yet"
+    );
+
+    std::fs::write(&f, "alpha\nbeta\n").unwrap();
+    git_ok(&root, &["add", "seed.txt"]);
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "a git-command view is not re-run on a filesystem tick: the index is not a file it watches"
+    );
+    assert!(
+        app.refresh_open_diff_views(true, &[], &no_paths()),
+        "the git-status drain re-runs it"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        d.right_lines.iter().any(|l| l == "beta"),
+        "the staged line now shows: {:?}",
+        d.right_lines
+    );
+    assert!(
+        !app.refresh_open_diff_views(true, &[], &no_paths()),
+        "identical output changes nothing"
+    );
+}
+
+#[test]
+fn a_snapshot_and_a_two_file_diff_follow_their_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "x\n").unwrap();
+    std::fs::write(&b, "x\ny\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Timeline snapshot: fixed left text against the working file.
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("b.txt (local snapshot)"),
+            "x\n",
+            &b,
+            false,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft {
+        left_text: String::from("x\n"),
+    });
+    rewrite_later(&b, "x\ny\nz\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(d.right_lines, vec!["x", "y", "z"]);
+    assert_eq!(d.left_lines, vec!["x"], "the snapshot side never changes");
+    assert!(!d.left_is_git_head, "a snapshot view still cannot stage");
+
+    // Two real files: either side moving rebuilds.
+    app.editor.open_diff(&a, &b).unwrap();
+    rewrite_later(&a, "x\nw\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(d.left_lines, vec!["x", "w"]);
+    assert!(
+        d.left_is_real_file,
+        "Enter on a Removed row still opens the left file"
+    );
+    assert!(!app.refresh_open_diff_views(false, &[], &no_paths()));
+}
+
+#[test]
+fn a_diff_view_in_an_inactive_split_group_is_refreshed_too() {
+    // Every group is swept, not just the focused one: the diff the user
+    // parked in the other split is exactly the one they are watching while
+    // they type in this one.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "1\n").unwrap();
+    std::fs::write(&b, "1\n2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_diff(&a, &b).unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&a).unwrap();
+    assert!(
+        app.editor.diff.is_none(),
+        "the focused group shows a plain buffer"
+    );
+
+    rewrite_later(&b, "1\n2\n3\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let stale = app
+        .editor_layout
+        .inactive_groups_mut()
+        .into_iter()
+        .flat_map(|g| g.editors.iter())
+        .filter_map(|e| e.diff.as_ref())
+        .any(|d| d.right_lines.len() != 3);
+    assert!(!stale, "the inactive group's diff shows the third line");
+}
+
+#[test]
+fn a_rewrite_that_only_changes_bytes_still_refreshes_the_byte_facts() {
+    // A final newline added to the working file changes no line text, so the
+    // rows come back identical -- but `right_no_final_nl` and the "bytes
+    // differ, lines equal" banner feed the hunk patch and the header. The
+    // same-content skip must see those facts as content, or stage/revert
+    // would build a patch from bytes no longer on disk.
+    let (tmp, f) = repo_with_seed("a\nb\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "a\nb").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "a\nb\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        d.right_no_final_nl && d.bytes_differ_but_lines_equal,
+        "precondition: {d:?}"
+    );
+
+    rewrite_later(&f, "a\nb\n");
+    assert!(
+        app.refresh_open_diff_views(false, &[], &no_paths()),
+        "the byte-only rewrite counts as a change"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        !d.right_no_final_nl,
+        "the working side now ends in a newline"
+    );
+    assert!(
+        !d.bytes_differ_but_lines_equal,
+        "and the banner's fact is cleared"
+    );
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "and it is not rebuilt again"
+    );
+}
+
+#[test]
+fn a_same_length_rewrite_with_a_preserved_mtime_refreshes_on_the_watcher_path() {
+    // `(mtime, len)` cannot see a rewrite that keeps both, and the poll has
+    // nothing else to go on. The watcher does: it names the path, and a
+    // named path bypasses the stamp gate.
+    let (tmp, f) = repo_with_seed("one\ntwo\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "one\ntwo\nAAA\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "one\ntwo\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    let mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+    std::fs::write(&f, "one\ntwo\nBBB\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&f)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&f).unwrap().modified().unwrap(),
+        mtime,
+        "precondition: the rewrite preserved the mtime"
+    );
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "the poll's stamp gate cannot see this rewrite"
+    );
+    let mut written = std::collections::BTreeSet::new();
+    written.insert(f.clone());
+    assert!(
+        app.refresh_open_diff_views(false, &[], &written),
+        "the watcher naming the path rebuilds the view regardless of the stamp"
+    );
+    assert!(
+        app.editor
+            .diff
+            .as_ref()
+            .unwrap()
+            .right_lines
+            .iter()
+            .any(|l| l == "BBB"),
+        "the view shows the rewritten bytes"
+    );
+}
+
+#[test]
+fn a_rebuild_recomputes_the_find_match_against_the_new_rows() {
+    // The active find match names a row of the OLD rows. After a rebuild it
+    // is dropped and, with the find bar open, recomputed: gone when the new
+    // rows no longer hold the needle, back when they do again.
+    let (tmp, f) = repo_with_seed("alpha\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "alpha\nneedle here\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "alpha\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    app.open_editor_find();
+    app.diff_find_set_query(String::from("needle"));
+    assert!(
+        app.editor.diff.as_ref().unwrap().find.active.is_some(),
+        "precondition: the needle is found"
+    );
+
+    rewrite_later(&f, "alpha\nnothing to see\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(d.find.active.is_none(), "no row holds the needle now");
+    assert_eq!(
+        d.find.needle.as_deref(),
+        Some("needle"),
+        "the query itself survives"
+    );
+    assert_eq!(
+        app.editor_find.as_ref().and_then(|s| s.match_index),
+        None,
+        "the find bar agrees: no current match"
+    );
+
+    rewrite_later(&f, "alpha\nthe needle is back\nneedle twice\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        d.find.active.is_some(),
+        "the match is recomputed on the new rows"
+    );
+    assert_eq!(
+        app.editor_find.as_ref().and_then(|s| s.match_index),
+        Some(1),
+        "and the find bar counts from the first"
+    );
+}
+
+#[test]
+fn a_staged_view_reruns_when_a_status_refresh_lands_unchanged() {
+    // Replacing an already-staged file's bytes leaves porcelain status
+    // identical ("M  seed.txt" before and after), so a "status changed"
+    // gate would never re-run the staged view. The completed refresh is the
+    // signal, and it flows through the real worker drain here.
+    let (tmp, f) = repo_with_seed("alpha\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    // Let the worker's first status land so later ones can compare equal.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the git worker's first status",
+        || {
+            app.try_install_pending_init();
+            app.git.status().in_repo
+        },
+    );
+    std::fs::write(&f, "alpha\nbeta\n").unwrap();
+    git_ok(&root, &["add", "seed.txt"]);
+    let raw = crate::git::diff_staged(&root).unwrap();
+    app.editor
+        .open_git_diff_side_by_side(std::path::Path::new("git diff --staged"), &raw)
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+        root: root.clone(),
+        kind: crate::widgets::diff::GitDiffKind::Staged,
+    });
+    assert!(
+        app.editor
+            .diff
+            .as_ref()
+            .unwrap()
+            .right_lines
+            .iter()
+            .any(|l| l == "beta")
+    );
+
+    // Same porcelain status, different index bytes.
+    std::fs::write(&f, "alpha\ngamma\n").unwrap();
+    git_ok(&root, &["add", "seed.txt"]);
+    app.active_git_bypass_debounce();
+    app.refresh_git_status_debounced();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the staged view to show the re-staged bytes",
+        || {
+            app.try_install_pending_init();
+            app.editor
+                .diff
+                .as_ref()
+                .is_some_and(|d| d.right_lines.iter().any(|l| l == "gamma"))
+        },
+    );
+}
+
+#[test]
+fn a_head_diff_tagged_with_the_repo_toplevel_refreshes_from_a_subdirectory_workspace() {
+    // The Source Control opener tags a view with `scm_root()`, the git
+    // TOPLEVEL. From a subdirectory workspace that is not the workspace
+    // root the drain keys its HEAD-oid bookkeeping on, so `heads_moved`
+    // has to record the toplevel (and compare canonically), or a commit
+    // never re-reads the HEAD side. This drives the real drain.
+    let (tmp, f) = repo_with_seed("one\n");
+    let root = tmp.path().to_path_buf();
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut app = App::new(sub.clone()).unwrap();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the git worker's first status",
+        || {
+            app.try_install_pending_init();
+            app.git.status().in_repo
+        },
+    );
+    let scm = app.scm_root();
+    assert_ne!(
+        scm, sub,
+        "precondition: the toplevel is not the workspace root"
+    );
+
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "one\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: scm.clone(),
+        rel: String::from("seed.txt"),
+    });
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "two", "--quiet"]);
+    app.active_git_bypass_debounce();
+    app.refresh_git_status_debounced();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the HEAD side to follow the commit through the status drain",
+        || {
+            app.try_install_pending_init();
+            app.editor
+                .diff
+                .as_ref()
+                .is_some_and(|d| d.left_lines == d.right_lines && d.right_lines.len() == 2)
+        },
+    );
+}
+
+#[test]
+fn a_background_diff_refresh_leaves_the_active_diff_find_and_anchor_alone() {
+    // Only a rebuild of the ACTIVE tab recomputes the find bar; a diff
+    // refreshing in another split must not scroll or re-anchor the view the
+    // reader is on.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    let c = tmp.path().join("c.txt");
+    let d = tmp.path().join("d.txt");
+    std::fs::write(&a, "1\n").unwrap();
+    std::fs::write(&b, "1\n2\n").unwrap();
+    std::fs::write(&c, "x\n").unwrap();
+    std::fs::write(&d, "x\nneedle\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_diff(&a, &b).unwrap();
+    app.split_editor();
+    app.editor.open_diff(&c, &d).unwrap();
+    app.open_editor_find();
+    app.diff_find_set_query(String::from("needle"));
+    // Anchored AFTER the query: `diff_find_apply` scrolls to its match and
+    // clears the hunk anchor, which is exactly why a spurious recompute
+    // from a background refresh would be visible here.
+    app.editor.diff.as_mut().unwrap().nav_anchor = Some(0);
+    let before = app.editor.diff.as_ref().unwrap().clone();
+    assert!(
+        before.find.active.is_some(),
+        "precondition: the active diff has a match"
+    );
+
+    rewrite_later(&b, "1\n2\n3\n");
+    assert!(
+        app.refresh_open_diff_views(false, &[], &no_paths()),
+        "the background split's diff rebuilt"
+    );
+    let after = app.editor.diff.as_ref().unwrap();
+    assert_eq!(
+        after.nav_anchor,
+        Some(0),
+        "the active diff's hunk anchor is untouched"
+    );
+    assert_eq!(after.scroll, before.scroll, "and its viewport");
+    assert_eq!(
+        after.find.active, before.find.active,
+        "and its active match"
+    );
+}
+
+#[test]
+fn a_rebuild_that_changes_the_rows_drops_the_hunk_anchor() {
+    // `nav_anchor` is the one input to `action_row`, which S/U/R read. Over
+    // rebuilt rows the remembered index names whatever now sits there, so
+    // the anchor is dropped and the actions fall back to the viewport, as
+    // after a manual scroll.
+    let (tmp, f) = repo_with_seed("a\nb\nc\nd\ne\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "a\nB\nc\nd\nE\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "a\nb\nc\nd\ne\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    app.jump_diff_change(true);
+    assert!(
+        app.editor.diff.as_ref().unwrap().nav_anchor.is_some(),
+        "precondition: a jump anchored a hunk"
+    );
+    // A new hunk ABOVE the anchored one shifts every row under the index.
+    rewrite_later(&f, "A\nB\nc\nd\nE\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    assert_eq!(
+        app.editor.diff.as_ref().unwrap().nav_anchor,
+        None,
+        "the anchor does not survive rows it no longer describes"
+    );
+}
+
+#[test]
+fn a_background_diff_keeps_its_find_band_across_a_rebuild() {
+    // The active match is recomputed inside `carry_view_from`, so a view
+    // rebuilt in a background split keeps its band without the app's
+    // find-bar recompute, which only runs for the active tab.
+    let tmp = tempfile::tempdir().unwrap();
+    let c = tmp.path().join("c.txt");
+    let d = tmp.path().join("d.txt");
+    std::fs::write(&c, "x\n").unwrap();
+    std::fs::write(&d, "x\nneedle\n").unwrap();
+    let plain = tmp.path().join("plain.txt");
+    std::fs::write(&plain, "hi\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_diff(&c, &d).unwrap();
+    app.open_editor_find();
+    app.diff_find_set_query(String::from("needle"));
+    assert!(app.editor.diff.as_ref().unwrap().find.active.is_some());
+    // The diff moves to the background: a split, and a plain file on top.
+    app.split_editor();
+    app.editor.open_pinned(&plain).unwrap();
+    assert!(
+        app.editor.diff.is_none(),
+        "the active tab is the plain file"
+    );
+
+    rewrite_later(&d, "x\nstill a needle\nmore\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let mut seen = 0;
+    for group in app.editor_layout.inactive_groups_mut() {
+        for ed in &group.editors {
+            if let Some(dd) = ed.diff.as_ref().filter(|dd| dd.right_path == d) {
+                seen += 1;
+                assert_eq!(dd.find.needle.as_deref(), Some("needle"));
+                assert!(
+                    dd.find.active.is_some(),
+                    "the background view's active match was recomputed in place"
+                );
+            }
+        }
+    }
+    assert!(seen >= 1, "the background split still holds the diff");
+}
+
+#[test]
+fn an_ssh_session_raises_the_offer_once_and_drops_it_when_the_session_ends() {
+    // #364: the offer appears when a pane's foreground BECOMES `ssh <host>`
+    // for a known host, not on every sample of the same session, and it
+    // leaves with the session.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The refusal memory is read from the real cache directory at startup;
+    // this machine's must not decide the test.
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer
+            .as_ref()
+            .is_some_and(|o| o.pane == pane && o.host == "db-1"),
+        "a new session offers"
+    );
+    assert!(
+        app.status.starts_with("Connected to db-1"),
+        "{:?}",
+        app.status
+    );
+    app.status = String::from("something else happened");
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert_eq!(
+        app.status, "something else happened",
+        "the same session sampled again does not re-prompt"
+    );
+    app.status = String::from("Connected to db-1 · Open workspace here?");
+    app.consider_ssh_offer(pane, None);
+    assert!(
+        app.ssh_offer.is_none(),
+        "the session ended: the offer is gone"
+    );
+    assert!(app.status.is_empty(), "and its status line with it");
+    // A NEW session to the same host offers again.
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+}
+
+#[test]
+fn the_offer_respects_the_global_switch_the_host_list_and_learned_refusals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.remote_offer_excluded = vec![String::from("DB-1")];
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "per-host opt-out, case-insensitive"
+    );
+    app.remote_offer_excluded.clear();
+    app.remote_offer_refused
+        .insert(String::from("db-1"), std::time::SystemTime::now());
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "a host that refused provisioning is not offered"
+    );
+    app.remote_offer_refused.clear();
+    app.remote_offer_disabled = true;
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_none(), "the global switch");
+    app.remote_offer_disabled = false;
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_some(),
+        "and with every gate open it offers"
+    );
+}
+
+#[test]
+fn accepting_or_dismissing_the_offer_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The refusal memory is read from the real cache directory at startup;
+    // this machine's must not decide the test.
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert_eq!(app.accept_ssh_offer().as_deref(), Some("db-1"));
+    assert!(app.ssh_offer.is_none() && app.status.is_empty());
+    assert_eq!(app.accept_ssh_offer(), None, "nothing to accept twice");
+
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+    // Esc dismisses through the ordinary key path, whatever pane has focus.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.ssh_offer.is_none(), "Esc dismissed the offer");
+    assert!(app.status.is_empty());
+}
+
+#[test]
+fn an_untouched_offer_expires_and_a_closed_pane_takes_its_offer_along() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The refusal memory is read from the real cache directory at startup;
+    // this machine's must not decide the test.
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    app.ssh_offer.as_mut().unwrap().since =
+        std::time::Instant::now() - SSH_OFFER_TTL - std::time::Duration::from_secs(1);
+    app.expire_ssh_offer();
+    assert!(
+        app.ssh_offer.is_none(),
+        "an offer past its TTL clears itself"
+    );
+
+    app.split_terminal().unwrap();
+    let second = app.terminals[1].uid();
+    app.consider_ssh_offer(second, Some(String::from("db-1")));
+    assert!(app.ssh_offer.as_ref().is_some_and(|o| o.pane == second));
+    assert!(app.close_terminal_at(1));
+    app.expire_ssh_offer();
+    assert!(
+        app.ssh_offer.is_none(),
+        "the pane that owned the offer is gone"
+    );
+    assert!(
+        !app.ssh_offer_seen.contains_key(&second),
+        "and its per-pane memory went with it"
+    );
+}
+
+#[test]
+fn a_pane_that_moves_to_another_host_loses_the_old_offer_even_if_the_new_one_is_excluded() {
+    // `ssh a cmd; ssh b cmd` inside one sample gap: the offer for A must not
+    // stay up (and be accepted with Cmd+K G) once the pane is on B, whether
+    // or not B itself is offerable.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.remote_offer_excluded = vec![String::from("b")];
+    app.consider_ssh_offer(pane, Some(String::from("a")));
+    assert!(app.ssh_offer.as_ref().is_some_and(|o| o.host == "a"));
+    app.consider_ssh_offer(pane, Some(String::from("b")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "the offer for A fell when the pane moved to B"
+    );
+    assert!(app.status.is_empty());
+}
+
+#[test]
+fn the_offer_switches_apply_on_a_settings_remerge() {
+    // The two prefs re-apply on a config save like every other boolean pref,
+    // and switching the offer off takes down one already on screen.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The refusal memory is read from the real cache directory at startup;
+    // this machine's must not decide the test.
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+    let mut prefs = crate::prefs::Prefs {
+        disable_remote_offer: true,
+        remote_offer_excluded_hosts: vec![String::from("jump")],
+        ..Default::default()
+    };
+    app.apply_merged_settings(&prefs);
+    assert!(app.remote_offer_disabled && app.remote_offer_excluded == vec![String::from("jump")]);
+    assert!(
+        app.ssh_offer.is_none(),
+        "the live offer went down with the switch"
+    );
+    prefs.disable_remote_offer = false;
+    app.apply_merged_settings(&prefs);
+    assert!(!app.remote_offer_disabled);
+    // An offer on screen for a host that just joined the exclusion list
+    // goes down too, not only on the global switch.
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+    prefs.remote_offer_excluded_hosts = vec![String::from("db-1")];
+    app.apply_merged_settings(&prefs);
+    assert!(
+        app.ssh_offer.is_none(),
+        "the newly excluded host's offer went down"
+    );
+}
+
+#[test]
+fn switching_the_offer_off_and_on_forgets_what_each_pane_was_last_seen_on() {
+    // While the offer is off the label thread ships no samples, so the
+    // per-pane memory stops tracking reality. Session A on db-1, offer off,
+    // session A ends and session B to db-1 starts, offer on: B is a new
+    // session and must be offered, not mistaken for a continuation of A.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+    let mut prefs = crate::prefs::Prefs {
+        disable_remote_offer: true,
+        ..Default::default()
+    };
+    app.apply_merged_settings(&prefs);
+    assert!(app.ssh_offer.is_none(), "the switch took the offer down");
+    // No `None` sample in between: nothing observed the gap.
+    prefs.disable_remote_offer = false;
+    app.apply_merged_settings(&prefs);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.as_ref().is_some_and(|o| o.host == "db-1"),
+        "the first session seen after a re-enable is offered"
+    );
+}
+
+#[test]
+fn taking_a_host_off_the_exclusion_list_offers_the_session_already_on_it() {
+    // A pane sampled on db-1 while db-1 was excluded is remembered as seen
+    // there; the same host on the next sample would read as the same
+    // session and never prompt. Un-excluding the host forgets that, so the
+    // next sample offers it.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    let mut prefs = crate::prefs::Prefs {
+        remote_offer_excluded_hosts: vec![String::from("DB-1")],
+        ..Default::default()
+    };
+    app.apply_merged_settings(&prefs);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_none(), "excluded: no offer");
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "still the same session, still excluded"
+    );
+    prefs.remote_offer_excluded_hosts.clear();
+    app.apply_merged_settings(&prefs);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer
+            .as_ref()
+            .is_some_and(|o| o.pane == pane && o.host == "db-1"),
+        "the live session is offered once its host is allowed again"
+    );
+    // A pane on a host that stayed excluded is untouched by the change.
+    prefs.remote_offer_excluded_hosts = vec![String::from("jump"), String::from("db-1")];
+    app.apply_merged_settings(&prefs);
+    assert!(
+        app.ssh_offer.is_none(),
+        "re-excluding db-1 takes its offer down"
+    );
+    app.consider_ssh_offer(pane, Some(String::from("jump")));
+    prefs.remote_offer_excluded_hosts = vec![String::from("jump")];
+    app.apply_merged_settings(&prefs);
+    app.consider_ssh_offer(pane, Some(String::from("jump")));
+    assert!(
+        app.ssh_offer.is_none(),
+        "jump stayed excluded and stayed quiet"
+    );
+}
+
+#[test]
+fn an_in_memory_refusal_stops_blocking_once_its_window_has_passed() {
+    // The TTL is applied when the policy is asked, not only when the file
+    // is loaded: a croft left open past the window offers the host again.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.remote_offer_refused.insert(
+        String::from("db-1"),
+        std::time::SystemTime::now()
+            - crate::remote::REFUSED_HOST_TTL
+            - std::time::Duration::from_secs(60),
+    );
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.is_some(),
+        "a refusal older than the TTL no longer suppresses the offer"
+    );
+}
+
+#[test]
+fn cmd_k_g_with_no_offer_open_says_so_instead_of_connecting() {
+    // The chord's guidance branch: nothing to accept, nothing launched, a
+    // status that says where the offer comes from. (The accept branch runs
+    // `request_remote_launch`, which spawns a real ssh; `accept_ssh_offer`
+    // is covered directly instead of reaching the network from a test.)
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.ssh_offer.is_none());
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('g'), KeyModifiers::NONE)));
+    assert!(
+        app.status.starts_with("No ssh workspace offer is open"),
+        "status: {}",
+        app.status
+    );
+    assert!(app.connect_dialog.is_none(), "nothing was launched");
+    assert!(app.pending_remote_launch_host.is_none());
+}
+
+#[test]
+fn ssh_samples_from_the_label_thread_drive_the_offer_by_shell_pid() {
+    // The label thread ships `(shell pid, host)`; the app maps the shell pid
+    // to the pane's uid and feeds the same transition logic the direct tests
+    // cover. An unknown shell pid is ignored.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let shell = app.terminals[0]
+        .shell_pid()
+        .expect("the pane has a shell pid");
+    let uid = app.terminals[0].uid();
+    app.apply_ssh_samples(vec![
+        (shell, Some(String::from("db-1"))),
+        (-42, Some(String::from("x"))),
+    ]);
+    assert!(
+        app.ssh_offer
+            .as_ref()
+            .is_some_and(|o| o.pane == uid && o.host == "db-1")
+    );
+    app.apply_ssh_samples(vec![(shell, None)]);
+    assert!(
+        app.ssh_offer.is_none(),
+        "the session ended through the same path"
+    );
+}
+
+#[test]
+fn a_failed_provisioning_is_remembered_and_a_later_success_forgets_it() {
+    // Drives the two notes the install session calls, against the cache-dir
+    // override so nothing touches this machine's real memory.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+        }
+    }
+    let _restore = Restore;
+    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        app.remote_offer_refused.is_empty(),
+        "a fresh cache dir remembers nothing"
+    );
+    let pane = app.terminals[0].uid();
+
+    app.note_provisioning_failed("DB-1");
+    assert!(
+        app.remote_offer_refused.contains_key("db-1"),
+        "remembered in memory, lower-cased"
+    );
+    let refused_path = crate::remote::refused_hosts_path(&tmp.path().join("cache"));
+    let on_disk = crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now());
+    assert!(on_disk.contains_key("db-1"), "and on disk: {on_disk:?}");
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_none(), "a refused host is not offered");
+
+    app.note_provisioning_succeeded("db-1");
+    assert!(
+        !app.remote_offer_refused.contains_key("db-1"),
+        "a success forgets it in memory"
+    );
+    let on_disk = crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now());
+    assert!(!on_disk.contains_key("db-1"), "and on disk");
+    app.consider_ssh_offer(pane, None);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some(), "and the host is offered again");
+}
+
+#[test]
+fn a_success_forgets_a_refusal_another_croft_recorded() {
+    // The refusal file is shared by every croft on the machine. A refusal
+    // this instance never loaded (recorded by another one after this one
+    // started) must still be erased by a success here, or it outlives the
+    // host that demonstrably works for its whole seven-day TTL.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+        }
+    }
+    let _restore = Restore;
+    let cache = tmp.path().join("cache");
+    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(cache.clone());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let refused_path = crate::remote::refused_hosts_path(&cache);
+    // "Another instance" writes the refusal behind this one's back.
+    crate::remote::remember_refused_host(&refused_path, "db-1", std::time::SystemTime::now())
+        .unwrap();
+    assert!(
+        crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now())
+            .contains_key("db-1")
+    );
+    app.note_provisioning_succeeded("DB-1");
+    assert!(
+        !crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now())
+            .contains_key("db-1"),
+        "the disk refusal is gone even though this instance never held it"
+    );
 }

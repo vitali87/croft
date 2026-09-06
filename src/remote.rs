@@ -4343,3 +4343,376 @@ Host !blocked *.internal
         );
     }
 }
+
+/// Hosts croft learned it cannot provision (#364): lower-cased alias to the
+/// time of the failure. The time travels with the entry so the TTL applies
+/// to an entry learned during this run as much as to one loaded at startup;
+/// a process left open for a week must not suppress a host forever.
+pub type RefusedHosts = std::collections::BTreeMap<String, std::time::SystemTime>;
+
+/// Whether a refusal recorded at `at` still counts at `now` (#364): younger
+/// than [`REFUSED_HOST_TTL`]. A timestamp in the FUTURE does not count
+/// either: it means the clock was corrected backward since the refusal was
+/// recorded, and an age that cannot be computed must not read as zero, or
+/// the entry would outlive its window by however far the clock moved.
+pub fn refusal_live(at: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    now.duration_since(at)
+        .is_ok_and(|age| age <= REFUSED_HOST_TTL)
+}
+
+/// Whether the ssh-pane workspace offer may prompt for `host` at `now`
+/// (#364): not globally disabled, not on the user's per-host opt-out list,
+/// and not a host with a live learned refusal. Pure, so the policy is
+/// testable without a pane or a filesystem.
+pub fn offer_allowed(
+    host: &str,
+    disabled: bool,
+    excluded: &[String],
+    refused: &RefusedHosts,
+    now: std::time::SystemTime,
+) -> bool {
+    if disabled {
+        return false;
+    }
+    if excluded.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+        return false;
+    }
+    !refused
+        .get(&host.to_ascii_lowercase())
+        .is_some_and(|at| refusal_live(*at, now))
+}
+
+/// The label thread's ssh verdict for each pane it named (#364). `named` is
+/// `(shell pid, foreground pid, foreground name)` per pane; the result is
+/// `(shell pid, host)` for every pane that has a verdict:
+///
+/// * a foreground that is the shell itself, or any program but ssh, is a
+///   confirmed non-session: `None`, which ends the pane's session;
+/// * an ssh whose argv `cmdline` cannot read is NO verdict, so the pane is
+///   left out rather than reported as ended: a transient read failure must
+///   not tear down an offer and re-raise it on the next sample;
+/// * an ssh with argv resolves through [`ssh_offer_host`]: the config
+///   alias, or `None` for a host the config does not know (a confirmed
+///   non-offerable endpoint).
+///
+/// `targets` (the `~/.ssh/config` parse) is called at most once, and only
+/// when some pane's foreground is ssh.
+pub fn ssh_pane_samples(
+    named: &[(i32, i32, String)],
+    targets: impl FnOnce() -> Vec<RemoteTarget>,
+    cmdline: impl Fn(i32) -> Option<Vec<String>>,
+) -> Vec<(i32, Option<String>)> {
+    let mut targets = Some(targets);
+    let mut config: Vec<RemoteTarget> = Vec::new();
+    let mut out = Vec::with_capacity(named.len());
+    for (shell, fg, name) in named {
+        if shell == fg || !is_ssh_program(name) {
+            out.push((*shell, None));
+            continue;
+        }
+        let Some(argv) = cmdline(*fg) else {
+            continue;
+        };
+        if let Some(parse) = targets.take() {
+            config = parse();
+        }
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        out.push((*shell, ssh_offer_host(&argv, &config)));
+    }
+    out
+}
+
+/// Whether a resolved foreground process name is an ssh program (#364): the
+/// cheap pre-check before the label thread reads that process's argv, which
+/// costs a whole-process-table enumeration through sysinfo. `name` is what
+/// `process_name` returns, a bare basename, but a path is tolerated.
+pub fn is_ssh_program(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    SSH_PROGRAMS.contains(&base)
+}
+
+/// The host a pane's foreground argv earns an offer for (#364): the resolved
+/// `~/.ssh/config` alias, or `None` when the process is not ssh, names no
+/// host yet, or names a host the config does not know.
+pub fn ssh_offer_host(argv: &[&str], targets: &[RemoteTarget]) -> Option<String> {
+    ssh_reroot_decision(argv, targets)
+        .ok()
+        .map(|t| t.alias.clone())
+}
+
+/// How long a learned "cannot provision" verdict silences the offer for a
+/// host (#364). Long enough that a jump host does not nag every session,
+/// short enough that a box whose install failed on a bad day is offered
+/// again without the user finding and deleting a cache file.
+pub const REFUSED_HOST_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// The file under croft's cache directory that remembers hosts whose
+/// provisioning failed (#364): a JSON map of alias (lower-cased) to the unix
+/// time of the failure.
+pub fn refused_hosts_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("remote-offer-refused.json")
+}
+
+/// The hosts remembered as unprovisionable, minus entries whose refusal is
+/// no longer live as of `now` (see [`refusal_live`]). A missing or unreadable
+/// file is an empty map: this memory only ever suppresses a prompt, so
+/// losing it is safe.
+pub fn load_refused_hosts(path: &Path, now: std::time::SystemTime) -> RefusedHosts {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Default::default();
+    };
+    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, u64>>(&raw) else {
+        return Default::default();
+    };
+    map.into_iter()
+        .map(|(h, at)| {
+            (
+                h.to_ascii_lowercase(),
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(at),
+            )
+        })
+        .filter(|(_, at)| refusal_live(*at, now))
+        .collect()
+}
+
+/// Forget a remembered refusal for `host` (#364): a later provisioning that
+/// SUCCEEDED proves the memory stale, and a week is too long to keep not
+/// offering a box that merely failed on a bad day. Best effort like the
+/// remembering side; a missing file or entry is not an error.
+pub fn forget_refused_host(path: &Path, host: &str) -> std::io::Result<()> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut map: std::collections::BTreeMap<String, u64> =
+        serde_json::from_str(&raw).unwrap_or_default();
+    if map.remove(&host.to_ascii_lowercase()).is_none() {
+        return Ok(());
+    }
+    let body = serde_json::to_string_pretty(&map).map_err(std::io::Error::other)?;
+    std::fs::write(path, body)
+}
+
+/// Record that provisioning `host` failed at `now` (#364), keeping the other
+/// entries. Best effort: a write failure costs one repeated offer, not data.
+pub fn remember_refused_host(
+    path: &Path,
+    host: &str,
+    now: std::time::SystemTime,
+) -> std::io::Result<()> {
+    let mut map: std::collections::BTreeMap<String, u64> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let now_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    map.insert(host.to_ascii_lowercase(), now_secs);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body = serde_json::to_string_pretty(&map).map_err(std::io::Error::other)?;
+    std::fs::write(path, body)
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn the_offer_policy_respects_every_opt_out() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let none = RefusedHosts::new();
+        assert!(offer_allowed("db-1", false, &[], &none, now));
+        assert!(
+            !offer_allowed("db-1", true, &[], &none, now),
+            "the global switch"
+        );
+        assert!(
+            !offer_allowed("db-1", false, &[String::from("DB-1")], &none, now),
+            "the per-host list, case-insensitively"
+        );
+        let refused: RefusedHosts = [(String::from("db-1"), now)].into_iter().collect();
+        assert!(
+            !offer_allowed("DB-1", false, &[], &refused, now),
+            "a learned refusal"
+        );
+        assert!(offer_allowed(
+            "web-2",
+            false,
+            &[String::from("db-1")],
+            &refused,
+            now
+        ));
+        // The TTL applies in memory too: a process open for longer than the
+        // window stops honouring a refusal it learned at the start.
+        assert!(
+            offer_allowed(
+                "db-1",
+                false,
+                &[],
+                &refused,
+                now + REFUSED_HOST_TTL + Duration::from_secs(1)
+            ),
+            "an in-memory refusal past the TTL no longer blocks"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_live_inside_its_window_and_never_from_the_future() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert!(refusal_live(now, now));
+        assert!(
+            refusal_live(now - REFUSED_HOST_TTL, now),
+            "the edge is inclusive"
+        );
+        assert!(!refusal_live(
+            now - REFUSED_HOST_TTL - Duration::from_secs(1),
+            now
+        ));
+        assert!(
+            !refusal_live(now + Duration::from_secs(1), now),
+            "a clock corrected backward must not pin the entry"
+        );
+    }
+
+    #[test]
+    fn pane_samples_give_a_verdict_only_where_there_is_one() {
+        // `(shell, fg, name)`: pane 1 at its prompt, pane 2 in vim, pane 3 in
+        // an ssh whose argv cannot be read, pane 4 on a known host, pane 5 on
+        // a host the config does not know.
+        let named = vec![
+            (10, 10, String::from("zsh")),
+            (20, 21, String::from("vim")),
+            (30, 31, String::from("ssh")),
+            (40, 41, String::from("ssh")),
+            (50, 51, String::from("ssh")),
+        ];
+        let parses = std::cell::Cell::new(0);
+        let targets = || {
+            parses.set(parses.get() + 1);
+            vec![RemoteTarget {
+                alias: String::from("db-1"),
+                host_name: Some(String::from("10.0.0.5")),
+                user: None,
+            }]
+        };
+        let cmdline = |pid: i32| match pid {
+            41 => Some(vec![String::from("ssh"), String::from("db-1")]),
+            51 => Some(vec![String::from("ssh"), String::from("elsewhere")]),
+            _ => None,
+        };
+        let samples = ssh_pane_samples(&named, targets, cmdline);
+        assert_eq!(
+            samples,
+            vec![
+                (10, None),
+                (20, None),
+                (40, Some(String::from("db-1"))),
+                (50, None),
+            ],
+            "the unreadable ssh (pane 3) gets no verdict at all"
+        );
+        assert_eq!(parses.get(), 1, "the config is parsed once per pass");
+
+        let parses = std::cell::Cell::new(0);
+        let quiet = vec![(10, 10, String::from("zsh")), (20, 21, String::from("vim"))];
+        let samples = ssh_pane_samples(
+            &quiet,
+            || {
+                parses.set(parses.get() + 1);
+                Vec::new()
+            },
+            |_| None,
+        );
+        assert_eq!(samples, vec![(10, None), (20, None)]);
+        assert_eq!(parses.get(), 0, "and not at all when no pane is ssh");
+    }
+
+    #[test]
+    fn refused_hosts_round_trip_and_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = refused_hosts_path(dir.path());
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert!(
+            load_refused_hosts(&path, now).is_empty(),
+            "no file, no memory"
+        );
+        remember_refused_host(&path, "Jump", now).unwrap();
+        remember_refused_host(
+            &path,
+            "old-box",
+            now - REFUSED_HOST_TTL - Duration::from_secs(1),
+        )
+        .unwrap();
+        remember_refused_host(&path, "ahead", now + Duration::from_secs(60)).unwrap();
+        let loaded = load_refused_hosts(&path, now);
+        assert!(
+            loaded.contains_key("jump"),
+            "stored lower-cased: {loaded:?}"
+        );
+        assert_eq!(loaded["jump"], now, "and its time comes back with it");
+        assert!(
+            !loaded.contains_key("old-box"),
+            "an entry past the TTL is forgotten"
+        );
+        assert!(
+            !loaded.contains_key("ahead"),
+            "an entry from the future (clock moved back) is forgotten too"
+        );
+        std::fs::write(&path, "not json").unwrap();
+        assert!(
+            load_refused_hosts(&path, now).is_empty(),
+            "garbage reads as empty"
+        );
+    }
+
+    #[test]
+    fn only_ssh_itself_is_an_ssh_program() {
+        assert!(is_ssh_program("ssh"));
+        assert!(is_ssh_program("/usr/bin/ssh"), "a path is tolerated");
+        assert!(
+            !is_ssh_program("ssh-agent"),
+            "whole-name match, as SSH_PROGRAMS promises"
+        );
+        assert!(!is_ssh_program("sshfs"));
+        assert!(
+            !is_ssh_program("mosh"),
+            "long-option programs are refused (see #445)"
+        );
+        assert!(!is_ssh_program(""));
+    }
+
+    #[test]
+    fn a_success_forgets_a_remembered_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = refused_hosts_path(dir.path());
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        forget_refused_host(&path, "nobody").unwrap();
+        assert!(!path.exists(), "forgetting with no file creates nothing");
+        remember_refused_host(&path, "db-1", now).unwrap();
+        remember_refused_host(&path, "jump", now).unwrap();
+        forget_refused_host(&path, "DB-1").unwrap();
+        let left = load_refused_hosts(&path, now);
+        assert!(
+            !left.contains_key("db-1") && left.contains_key("jump"),
+            "{left:?}"
+        );
+    }
+
+    #[test]
+    fn the_offer_host_is_the_config_alias_or_nothing() {
+        let targets = vec![RemoteTarget {
+            alias: String::from("db-1"),
+            host_name: Some(String::from("10.0.0.5")),
+            user: None,
+        }];
+        assert_eq!(
+            ssh_offer_host(&["ssh", "-p", "2222", "db-1"], &targets).as_deref(),
+            Some("db-1")
+        );
+        assert_eq!(ssh_offer_host(&["ssh", "unknown-box"], &targets), None);
+        assert_eq!(ssh_offer_host(&["vim", "db-1"], &targets), None);
+    }
+}

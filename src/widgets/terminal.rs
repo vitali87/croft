@@ -523,6 +523,21 @@ pub struct PtyTerminal {
     /// mirrored keystrokes (it still gets its own input when focused).
     /// Toggled per pane with Cmd+K Shift+I; session-scoped.
     pub broadcast_excluded: bool,
+    /// Collapsed to a one-column strip (#313): the pane keeps running and
+    /// keeps its place in the row, but yields its width to the panes still
+    /// expanded.
+    ///
+    /// A flag on the PANE rather than a set of indices held by the app.
+    /// Indices shift when a pane is closed or reordered, so a stored one
+    /// comes to name a different terminal than it was set against - the
+    /// same class of bug as #440, where a positional index named the wrong
+    /// command after an eviction. A flag that travels with the pane cannot
+    /// be pointed at the wrong one.
+    ///
+    /// Session-scoped, and deliberately not written to the terminal session
+    /// store: collapse says "I am not looking at this right now", which is
+    /// not a fact worth restoring a workspace into.
+    pub collapsed: bool,
     /// When focused, draw the orange→green gradient border (Black theme)
     /// instead of the solid blue one. Set by the app's focus/theme sync.
     pub focus_gradient: bool,
@@ -1374,6 +1389,82 @@ impl PtyTerminal {
         (lines, top)
     }
 
+    /// Every readable grid row as `(plain, coloured)`: the plain text
+    /// exactly as [`Self::grid_lines`] gives it, and the same row with the
+    /// cells' colours and attributes written back as SGR, so the text can be
+    /// re-rendered elsewhere with the colours the pane showed (#257: "open
+    /// scrollback in an editor tab" through the rendered log view). Both
+    /// forms come from ONE pass under ONE term lock, so a caller that masks
+    /// the plain row and writes the coloured one can never pair a row with
+    /// its neighbour after output landed between two reads. Wide-char
+    /// spacers are skipped as in `grid_lines`; trailing default-styled
+    /// blanks are trimmed (a row padded with a coloured background keeps
+    /// those cells, which the plain twin drops, so the two forms can differ
+    /// in length there); every row that set a style ends with a reset.
+    pub fn grid_lines_ansi(&self) -> Vec<(String, String)> {
+        let term = self.term.lock();
+        if term.columns() == 0 {
+            return Vec::new();
+        }
+        let top = term.grid().topmost_line().0;
+        let bottom = term.screen_lines() as i32 - 1;
+        let ncols = term.columns();
+        let mut lines = Vec::new();
+        let mut l = top;
+        while l <= bottom {
+            // Cells are collected as (char, style key) - three Copy values,
+            // no allocation per cell - so trailing default-styled blanks can
+            // be trimmed before anything is serialised, and the SGR string
+            // is built once per run of equal style rather than once per
+            // cell. This runs under the term lock the reader thread shares,
+            // and a saturated scrollback is hundreds of thousands of rows.
+            let mut cells: Vec<(char, (AnsiColor, AnsiColor, Flags))> = Vec::with_capacity(ncols);
+            for c in 0..ncols {
+                let cell = &term.grid()[Point::new(Line(l), Column(c))];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                cells.push((ch, (cell.fg, cell.bg, cell.flags)));
+            }
+            let plain: String = cells
+                .iter()
+                .map(|(ch, _)| *ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            while cells.last().is_some_and(|(ch, (fg, bg, flags))| {
+                *ch == ' ' && style_is_default(*fg, *bg, *flags)
+            }) {
+                cells.pop();
+            }
+            let mut out = String::new();
+            let mut current: Option<(AnsiColor, AnsiColor, Flags)> = None;
+            let mut styled = false;
+            for (ch, key) in cells {
+                if current != Some(key) {
+                    if styled {
+                        out.push_str("\x1b[0m");
+                    }
+                    let sgr = cell_sgr(key.0, key.1, key.2);
+                    styled = !sgr.is_empty();
+                    out.push_str(&sgr);
+                    current = Some(key);
+                }
+                out.push(ch);
+            }
+            if styled {
+                out.push_str("\x1b[0m");
+            }
+            lines.push((plain, out));
+            l += 1;
+        }
+        lines
+    }
+
     /// [`Self::grid_lines`] plus the scroll-clock reading, captured under
     /// ONE term lock. Terminal find stamps its match anchor with the clock;
     /// separate reads would let output land between them and mis-pair a
@@ -2097,6 +2188,7 @@ impl PtyTerminal {
             size_shared,
             focused: false,
             broadcast_excluded: false,
+            collapsed: false,
             focus_gradient: false,
             theme: crate::theme::Theme::default(),
             last_area: Rect::default(),
@@ -2718,6 +2810,23 @@ impl PtyTerminal {
         Some((row - inner.y, col - inner.x))
     }
 
+    /// The host-screen cell nearest `(col, row)` that is still inside the
+    /// pane's grid. A forwarded drag or release that leaves the pane is
+    /// delivered at the edge cell it crossed, as xterm does with a grabbed
+    /// pointer, rather than dropped: a child that got the press must also
+    /// get the release, or it keeps a button held that the user let go.
+    /// Returns the input unchanged when the pane has no grid yet.
+    pub fn clamp_to_grid(&self, col: u16, row: u16) -> (u16, u16) {
+        let inner = self.last_inner;
+        if inner.width == 0 || inner.height == 0 {
+            return (col, row);
+        }
+        (
+            col.clamp(inner.x, inner.x + inner.width - 1),
+            row.clamp(inner.y, inner.y + inner.height - 1),
+        )
+    }
+
     /// Current scrollback offset: how many rows the viewport is scrolled
     /// up from the live bottom. Viewport row `r` maps to absolute grid
     /// line `r - display_offset`.
@@ -3011,6 +3120,13 @@ impl PtyTerminal {
         let mut p = Processor::<StdSyncHandler>::new();
         let mut term = self.term.lock();
         p.advance(&mut *term, bytes);
+    }
+
+    /// Test-only: the pane's grid lock, for tests that must observe what
+    /// `resize` does WHILE the grid is held (#473).
+    #[cfg(test)]
+    pub fn grid_lock_for_test(&self) -> Arc<FairMutex<Term<VoidListener>>> {
+        self.term.clone()
     }
 
     /// Test-only: run one reader-thread timestamp pass over the current
@@ -3395,6 +3511,17 @@ impl PtyTerminal {
         self.term.lock().mode().intersects(TermMode::MOUSE_MODE)
     }
 
+    /// True when the child asked for button-held MOTION too (DECSET 1002
+    /// button-drag or 1003 any-motion), not just clicks (1000). Decides who
+    /// a left-button drag belongs to: a child that only asked for clicks
+    /// cannot use the drag, so croft keeps it as a text selection (#474).
+    pub fn mouse_motion_reporting(&self) -> bool {
+        self.term
+            .lock()
+            .mode()
+            .intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+    }
+
     /// Encode a mouse gesture at host-screen cell `(col, row)` as a mouse
     /// report and send it to the child. Returns false without writing when
     /// the cell is outside the pane, the child isn't tracking the mouse, or
@@ -3429,6 +3556,11 @@ impl PtyTerminal {
             r,
             mods,
         );
+        #[cfg(test)]
+        self.written_for_test
+            .lock()
+            .unwrap()
+            .extend_from_slice(&report);
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(&report);
             let _ = w.flush();
@@ -3614,6 +3746,19 @@ impl PtyTerminal {
         self.pty_dirty.store(true, Ordering::Release);
     }
 
+    /// The PTY grid's current column count.
+    ///
+    /// Test-only, and the point of it is #313: a collapsed pane must not be
+    /// reflowed into its one-column strip. `resize` clamps to two columns, so
+    /// a collapsed pane that got rendered would not crash - it would quietly
+    /// rewrap the running shell to a two-column grid and lose everything on
+    /// its screen. Reading the real grid width is what tells that apart from
+    /// a pane that was simply left alone.
+    #[cfg(test)]
+    pub fn grid_cols(&self) -> u16 {
+        self.cols
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) {
         // A degenerate pane (a host window shrunk to a sliver leaves the
         // layout no room) must not reach alacritty: Term::resize panics on
@@ -3626,15 +3771,28 @@ impl PtyTerminal {
         self.cols = cols;
         self.rows = rows;
         *self.size_shared.lock().unwrap() = (cols, rows);
+        // Grid first, pty second, under one hold of the grid lock (#473).
+        // The pty ioctl delivers SIGWINCH, and a full-screen child answers
+        // it with a complete repaint sized to the NEW dimensions. If that
+        // repaint reaches the reader before the grid has been resized, it
+        // is parsed into the old grid: rows land on the wrong lines, wide
+        // lines wrap, and once the grid does grow those cells sit where a
+        // diff-based renderer (Claude Code, and anything else that only
+        // redraws what it believes changed) considers them already blank.
+        // Nothing ever repaints them, and the stale text stays on screen.
+        // Resizing the grid while holding the lock across the ioctl means
+        // every byte the child emits in reply meets a grid of the right
+        // size.
+        let mut term = self.term.lock();
+        let size = TermSize::new(cols as usize, rows as usize);
+        term.resize(size);
         let _ = self.master.resize(PtySize {
             cols,
             rows,
             pixel_width: 0,
             pixel_height: 0,
         });
-        let mut term = self.term.lock();
-        let size = TermSize::new(cols as usize, rows as usize);
-        term.resize(size);
+        drop(term);
         self.pty_dirty.store(true, Ordering::Release);
     }
 }
@@ -4131,6 +4289,119 @@ pub fn osc52_copy_seq(text: &str) -> Vec<u8> {
     out.extend_from_slice(encoded.as_bytes());
     out.push(0x07);
     out
+}
+
+/// The SGR sequence that reproduces a cell's colours and attributes, or an
+/// empty string for a default cell (#257). Named and low-indexed colours go
+/// out as the 16 standard codes so the reader resolves them through ITS
+/// theme palette, the way the pane does; the 256-cube and truecolour pass
+/// through as `38;5;n` / `38;2;r;g;b`.
+fn cell_sgr(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> String {
+    let mut codes: Vec<String> = Vec::new();
+    if flags.contains(Flags::BOLD) {
+        codes.push("1".into());
+    }
+    if flags.contains(Flags::DIM) {
+        codes.push("2".into());
+    }
+    if flags.contains(Flags::ITALIC) {
+        codes.push("3".into());
+    }
+    if flags.intersects(
+        Flags::UNDERLINE
+            | Flags::DOUBLE_UNDERLINE
+            | Flags::UNDERCURL
+            | Flags::DOTTED_UNDERLINE
+            | Flags::DASHED_UNDERLINE,
+    ) {
+        codes.push("4".into());
+    }
+    if flags.contains(Flags::INVERSE) {
+        codes.push("7".into());
+    }
+    if flags.contains(Flags::STRIKEOUT) {
+        codes.push("9".into());
+    }
+    if let Some(code) = color_sgr(fg, false) {
+        codes.push(code);
+    }
+    if let Some(code) = color_sgr(bg, true) {
+        codes.push(code);
+    }
+    if codes.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", codes.join(";"))
+    }
+}
+
+/// Whether a cell carries no colour and no attribute the export would
+/// write: the cheap test the trailing-blank trim uses, with no SGR string
+/// built to find out.
+fn style_is_default(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> bool {
+    let plain = |c: AnsiColor| matches!(c, AnsiColor::Named(n) if named_slot(n).is_none());
+    plain(fg)
+        && plain(bg)
+        && !flags.intersects(
+            Flags::BOLD
+                | Flags::DIM
+                | Flags::ITALIC
+                | Flags::UNDERLINE
+                | Flags::DOUBLE_UNDERLINE
+                | Flags::UNDERCURL
+                | Flags::DOTTED_UNDERLINE
+                | Flags::DASHED_UNDERLINE
+                | Flags::INVERSE
+                | Flags::STRIKEOUT,
+        )
+}
+
+/// One colour as its SGR parameter(s): `30..37`/`90..97` (or the `40..`
+/// / `100..` background forms) for the 16 slots, `38;5;n` beyond them,
+/// `38;2;r;g;b` for truecolour, `None` for the default colour.
+fn color_sgr(c: AnsiColor, background: bool) -> Option<String> {
+    let base = if background { 40 } else { 30 };
+    let bright = if background { 100 } else { 90 };
+    let extended = if background { 48 } else { 38 };
+    let slot = |i: u8| {
+        if i < 8 {
+            (base + i as u16).to_string()
+        } else {
+            (bright + (i - 8) as u16).to_string()
+        }
+    };
+    match c {
+        AnsiColor::Spec(rgb) => Some(format!("{extended};2;{};{};{}", rgb.r, rgb.g, rgb.b)),
+        AnsiColor::Indexed(i) if i < 16 => Some(slot(i)),
+        AnsiColor::Indexed(i) => Some(format!("{extended};5;{i}")),
+        AnsiColor::Named(named) => named_slot(named).map(slot),
+    }
+}
+
+/// The 16-slot index a named colour maps to, mirroring `named_to_ratatui`;
+/// the terminal's own defaults (`Foreground`, `Background`, cursor colours)
+/// have no slot and stay default.
+fn named_slot(n: NamedColor) -> Option<u8> {
+    use NamedColor::*;
+    Some(match n {
+        Foreground | Background | Cursor | DimForeground | BrightForeground => return None,
+        Black | DimBlack => 0,
+        Red | DimRed => 1,
+        Green | DimGreen => 2,
+        Yellow | DimYellow => 3,
+        Blue | DimBlue => 4,
+        Magenta | DimMagenta => 5,
+        Cyan | DimCyan => 6,
+        White | DimWhite => 7,
+        BrightBlack => 8,
+        BrightRed => 9,
+        BrightGreen => 10,
+        BrightYellow => 11,
+        BrightBlue => 12,
+        BrightMagenta => 13,
+        BrightCyan => 14,
+        BrightWhite => 15,
+    })
 }
 
 /// Map an alacritty cell color to ratatui through the theme's 16-color ANSI
@@ -5765,6 +6036,87 @@ mod tests {
         );
     }
 
+    /// #473: the grid must take the new size BEFORE the child hears about it.
+    ///
+    /// `resize` used to send the pty ioctl (which delivers SIGWINCH) first
+    /// and resize alacritty's grid second. A program that repaints on
+    /// WINCH - Claude Code does, with a full frame laid out for the new
+    /// size - can have that frame parsed into the OLD grid whenever the
+    /// render thread loses the CPU between the two steps. A frame laid out
+    /// for one size and parsed into another leaves rows of stale text the
+    /// program believes it erased: its renderer diffs against its own model
+    /// and never repaints what it thinks is already blank. Replaying a
+    /// recorded Claude Code session with the two steps swapped reproduces
+    /// the residue; the correct order replays clean.
+    ///
+    /// The order is observed, not timed: the child records its size the
+    /// moment WINCH arrives, and the test holds the grid lock across the
+    /// whole `resize`. If the ioctl goes out before the grid is resized,
+    /// the child reports the new size WHILE the lock is held, which the
+    /// correct order makes impossible however long the wait.
+    #[test]
+    fn the_grid_takes_the_new_size_before_the_child_hears_the_winch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("winch-size");
+        // The path travels as `$1` rather than being spliced into the
+        // script: a temp dir with a space, a `;` or a quote in it would break
+        // an interpolated redirection, while "$1" is expanded by the shell
+        // itself when WINCH fires.
+        let script =
+            "trap 'stty size > \"$1\"' WINCH; echo trap-armed; while :; do sleep 0.05; done";
+        let mut pane = PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from(script),
+                String::from("sh"),
+                out.display().to_string(),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the child shell to arm its WINCH trap",
+            || pane.visible_text().contains("trap-armed"),
+        );
+        let grid = pane.grid_lock_for_test();
+        let held = grid.lock();
+        // A budget, not a race: the wrong order sends the ioctl before it
+        // ever asks for the lock, so the child's report lands within
+        // milliseconds; the right order cannot produce one while the lock
+        // is held, so waiting longer only makes a true failure slower.
+        let window = crate::test_budget::spawn_budget(std::time::Duration::from_millis(150));
+        std::thread::scope(|s| {
+            s.spawn(|| pane.resize(30, 10));
+            std::thread::sleep(window);
+            let reported = std::fs::read_to_string(&out).ok();
+            // Released BEFORE asserting, or a failure deadlocks the scope
+            // on a resize that is still waiting for the grid.
+            drop(held);
+            assert!(
+                reported.is_none(),
+                "the child saw the new size ({:?}) while the grid lock was still held: \
+                 the pty was resized before the grid",
+                reported.map(|s| s.trim().to_string())
+            );
+        });
+        // Positive control: the trap works and the resize went through.
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the child to report the new size once the grid lock was released",
+            || std::fs::read_to_string(&out).is_ok_and(|s| s.trim() == "10 30"),
+        );
+        // The parser grid itself, not the cached `cols` field: `resize`
+        // writes that field before it touches the grid, so it reads 30 even
+        // when the grid was never resized.
+        assert_eq!(
+            grid.lock().columns(),
+            30,
+            "the grid took the new column count"
+        );
+    }
+
     #[test]
     fn pristine_covers_only_an_untouched_interactive_shell() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7161,6 +7513,62 @@ mod tests {
         assert!(
             !term.take_bell(),
             "take_bell drains the flag — a second read is false"
+        );
+    }
+
+    /// #257: the colour export round-trips through the log parser: the
+    /// text is what the pane showed and the coloured run keeps its colour
+    /// and weight, as the 16 symbolic slots the theme resolves.
+    #[test]
+    fn grid_lines_ansi_carries_the_pane_colours_as_sgr() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The sentinel is assembled at runtime so the pane's run-label header
+        // can never match the scan below.
+        let term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from("s=QQ; printf \"\\033[1;31m${s}RED\\033[0m plain\\n\"; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("QQRED plain")));
+        let exported = term.grid_lines_ansi();
+        let (plain, raw) = exported
+            .iter()
+            .find(|(p, _)| p.contains("QQRED"))
+            .expect("the coloured row is exported");
+        let mut style = crate::ansi_text::AnsiStyle::default();
+        let parsed = crate::ansi_text::parse_line(raw, &mut style);
+        assert_eq!(
+            parsed.text.trim_end(),
+            plain.trim_end(),
+            "the plain twin is the coloured row with its escapes stripped"
+        );
+        assert!(
+            parsed.text.starts_with("QQRED plain"),
+            "escapes never reach the text: {:?}",
+            parsed.text
+        );
+        let red = parsed
+            .spans
+            .iter()
+            .find(|s| s.start == 0 && s.end >= 5)
+            .unwrap_or_else(|| {
+                panic!("a span covers the red run: {:?} from {raw:?}", parsed.spans)
+            });
+        assert_eq!(
+            red.style.fg,
+            Some(crate::ansi_text::AnsiColor::Indexed(1)),
+            "SGR 31 comes back as the symbolic red slot"
+        );
+        assert!(red.style.bold, "SGR 1 comes back as bold");
+        let plain = parsed.spans.iter().find(|s| s.start >= 5);
+        assert!(
+            plain.is_none_or(|s| s.style.fg.is_none() && !s.style.bold),
+            "the reset ends the run: {:?}",
+            parsed.spans
         );
     }
 

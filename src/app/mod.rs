@@ -1084,6 +1084,9 @@ enum MenuAction {
     /// Finder exists, so the menu omits this entry entirely rather than
     /// offering a no-op.
     RevealInFinder(PathBuf),
+    /// Open the file in an extension-contributed viewer (#465): the viewer's
+    /// id and the file.
+    OpenInViewer(String, PathBuf),
     /// Close the editor tab at `idx`. Mirrors clicking the tab's `×`
     /// glyph; surfaces in the tab-strip right-click menu so the four
     /// close actions (Close / Others / Right / All) live in one place.
@@ -1285,6 +1288,9 @@ enum MenuAction {
     /// Terminal pane right-click: maximize the pane at `idx` across the
     /// panel (or restore the even split when already maximized).
     ToggleMaximizeTerminal(usize),
+    /// Terminal pane right-click: collapse the pane at `idx` to a strip, or
+    /// expand it again (#313).
+    ToggleCollapseTerminal(usize),
     /// Terminal pane right-click: enter quick-select hint mode on the pane.
     TerminalQuickSelect,
     /// Terminal pane right-click: enter copy mode (keyboard selection with
@@ -1397,6 +1403,14 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::RenameTerminal(_) => Some("⌘K R"),
         MenuAction::ClearTerminal(_) => Some("⌘K K"),
         MenuAction::ToggleMaximizeTerminal(_) => Some("⌘K M"),
+        // No hint. The label alternates "Collapse Terminal" / "Expand
+        // Terminal", but `Cmd+K [` only ever COLLAPSES: it acts on
+        // `active_terminal`, which the focus invariant guarantees is never a
+        // folded pane, so the expand branch is unreachable from the chord. Its
+        // sibling `ToggleMaximizeTerminal` can carry `⌘K M` honestly because
+        // that chord really does toggle both ways. Advertising a shortcut
+        // beside a label it cannot perform is worse than showing none.
+        MenuAction::ToggleCollapseTerminal(_) => None,
         MenuAction::TerminalQuickSelect => Some("⌃⇧Space"),
         MenuAction::TerminalCopyMode => Some("⌃⇧Y"),
         MenuAction::TerminalCommandHistory => Some("⌃⇧H"),
@@ -1698,6 +1712,11 @@ fn build_tab_context_menu_items(
 ///   Delete to a count and keeps Rename on a single entry only.
 /// * Right-click on empty tree space, or on the workspace root row →
 ///   workspace-scoped actions: New File, New Folder, Paste.
+///
+/// Test-side entry with no viewer lookup, so a viewer installed on the host
+/// can never reach the built-in rows these tests assert; the app itself goes
+/// through [`build_tree_context_menu_items_in_dir`] with the dir it carries.
+#[cfg(test)]
 fn build_tree_context_menu_items(
     node: Option<&crate::widgets::file_tree::Node>,
     root: &Path,
@@ -1705,6 +1724,57 @@ fn build_tree_context_menu_items(
     target_dir: &Path,
     clipboard: Option<&ExplorerClipboard>,
     compare_anchor: Option<&Path>,
+) -> Vec<(String, MenuAction)> {
+    // No viewer lookup at all: these tests assert the built-in rows, so the
+    // lookup must find nothing whatever the host has installed.
+    build_tree_context_menu_items_with(
+        node,
+        root,
+        selection,
+        target_dir,
+        clipboard,
+        compare_anchor,
+        |_| None,
+    )
+}
+
+/// [`build_tree_context_menu_items`] reading the viewers under an explicit
+/// config dir: the app passes the dir it carries, so the row it builds and
+/// the click that resolves the row read the same extensions.
+fn build_tree_context_menu_items_in_dir(
+    config_dir: &Path,
+    node: Option<&crate::widgets::file_tree::Node>,
+    root: &Path,
+    selection: &[PathBuf],
+    target_dir: &Path,
+    clipboard: Option<&ExplorerClipboard>,
+    compare_anchor: Option<&Path>,
+) -> Vec<(String, MenuAction)> {
+    build_tree_context_menu_items_with(
+        node,
+        root,
+        selection,
+        target_dir,
+        clipboard,
+        compare_anchor,
+        |file| {
+            crate::mcp::registry::viewer_for_path_in_dir(config_dir, file)
+                .map(|v| (v.label.clone(), v.key()))
+        },
+    )
+}
+
+/// [`build_tree_context_menu_items`] with the viewer lookup injected (#465):
+/// `viewer_for` answers "which installed viewer handles this file", as
+/// `(label, id)`, so a test can offer one without an extensions dir.
+fn build_tree_context_menu_items_with(
+    node: Option<&crate::widgets::file_tree::Node>,
+    root: &Path,
+    selection: &[PathBuf],
+    target_dir: &Path,
+    clipboard: Option<&ExplorerClipboard>,
+    compare_anchor: Option<&Path>,
+    viewer_for: impl Fn(&Path) -> Option<(String, String)>,
 ) -> Vec<(String, MenuAction)> {
     let entry_target = crate::widgets::file_tree::delete_target_for(node, root);
     let mut items: Vec<(String, MenuAction)> = Vec::new();
@@ -1752,6 +1822,11 @@ fn build_tree_context_menu_items(
             .filter(|_| paths_for_action.len() == 1)
             .filter(|pp| pp.is_file());
         if let Some(file) = single_file_target {
+            // An installed viewer for this file kind (#465): `Open in csvlens`
+            // on a .csv, once the csvlens extension has been added.
+            if let Some((label, id)) = viewer_for(file) {
+                items.push((label, MenuAction::OpenInViewer(id, file.clone())));
+            }
             match compare_anchor {
                 Some(anchor) if anchor != file.as_path() => {
                     items.push((
@@ -2142,6 +2217,33 @@ pub enum BranchPurpose {
     Rebase,
 }
 
+/// The live ssh-pane workspace offer (#364): which pane's foreground became
+/// `ssh <host>`, the resolved config alias, and when the offer appeared (it
+/// expires on its own if neither accepted nor dismissed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SshOffer {
+    pane: u64,
+    host: String,
+    since: std::time::Instant,
+}
+
+/// A left press forwarded to a mouse-tracking child (#474): which pane got
+/// it, the host cell it landed on, and whether the drag since has become
+/// croft's own text selection (a child that asked only for clicks cannot use
+/// a drag, so croft keeps it). See `App::terminal_pointer_forwarded`.
+///
+/// The pane is held by its stable `uid`, NOT its index in `App::terminals`:
+/// a pane closed while the button is held (the close chord, the header
+/// button) shifts every later pane one slot left, and an index would then
+/// deliver the release to the neighbour while the child that got the press
+/// keeps a button it thinks is still down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForwardedPointer {
+    pane: u64,
+    press: (u16, u16),
+    selecting: bool,
+}
+
 /// State for edge auto-scroll during a terminal drag-selection. `dir` is
 /// -1 (pointer above the top edge, scroll into history) or +1 (below the
 /// bottom edge, scroll toward live); `col` is the last drag column so the
@@ -2356,6 +2458,10 @@ pub struct App {
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
     copy_on_select: bool,
+    /// Tailspin highlighting in rendered log views (#466): the inverse of
+    /// the `disable_log_highlight` preference. Pushed into `log_view`'s
+    /// default for views opened later and into every open view on toggle.
+    log_highlight: bool,
     /// Built-in secret redaction rules are in the trigger set (#360).
     /// Settings "Terminal: Redact Secrets"; stored inverted in config.json
     /// as `disable_secret_redaction` so the default is on.
@@ -2712,6 +2818,25 @@ pub struct App {
     remote_launch: Option<RemoteLaunch>,
     pending_remote_launch_host: Option<String>,
     pending_remote_launch_path: Option<String>,
+    /// The ssh-pane offer currently shown in the status bar (#364), if any.
+    /// Accepted with Cmd+K G, dismissed with Esc, dropped when the pane's
+    /// ssh ends or after `SSH_OFFER_TTL`.
+    ssh_offer: Option<SshOffer>,
+    /// What each pane (by uid) was last seen connected to, so an ssh session
+    /// is offered once when it starts rather than on every sample.
+    ssh_offer_seen: std::collections::BTreeMap<u64, Option<String>>,
+    /// The label thread's ssh samples (#364): `(shell pid, resolved host)`
+    /// per pane it looked at, shipped beside the names it already resolves
+    /// so the argv read and the `~/.ssh/config` parse stay off the loop.
+    ssh_rx: std::sync::mpsc::Receiver<Vec<(i32, Option<String>)>>,
+    ssh_tx: std::sync::mpsc::Sender<Vec<(i32, Option<String>)>>,
+    /// `disable_remote_offer` from prefs (#364).
+    remote_offer_disabled: bool,
+    /// `remote_offer_excluded_hosts` from prefs (#364).
+    remote_offer_excluded: Vec<String>,
+    /// Hosts whose provisioning failed recently (#364), loaded from the
+    /// cache file at startup and extended when an install fails.
+    remote_offer_refused: crate::remote::RefusedHosts,
     /// Explorer-scoped Cut/Copy buffer. Independent from the OS clipboard
     /// (which carries text), this stores filesystem paths and the intent
     /// (move vs. copy) until the next Paste consumes it.
@@ -2838,10 +2963,56 @@ pub struct App {
     /// lock-step with `terminals`. A press on one starts a drag-reorder;
     /// hidden or unlabeled panes hold an empty rect. Empty with one terminal.
     terminal_label_rects: Vec<Rect>,
+    /// Hit-test rectangles of the collapse (`‹`) buttons, in lock-step with
+    /// `terminals` (#313). A pane that is hidden, already collapsed, too
+    /// narrow for the glyph, or maximized holds an empty rect.
+    terminal_collapse_buttons: Vec<Rect>,
+    /// Extensions whose programs the user has allowed to run (the MCP
+    /// consent set, loaded once from prefs and kept current when a consent
+    /// is granted here), so a viewer's gate is a set lookup rather than a
+    /// prefs read per click, and a test can seed it without a prefs file.
+    consented_extensions: std::collections::BTreeSet<String>,
+    /// The config dir this app reads extensions and consent from. Carried
+    /// rather than re-derived so a test can point one app at a scratch dir
+    /// instead of mutating the process-wide environment, which this repo
+    /// has twice seen take an unrelated test down.
+    config_dir: PathBuf,
+    /// Where "open scrollback in an editor tab" writes the pane's coloured
+    /// scrollback so the rendered log view can index it from disk (#257).
+    /// `~/.cache/croft/scrollback` normally; a test points it at a temp dir.
+    scrollback_dir: PathBuf,
+    /// Hit-test rectangles of the one-column strips collapsed panes leave
+    /// behind, in lock-step with `terminals` (#313). Clicking anywhere down a
+    /// strip gives that pane its width back; expanded panes hold an empty
+    /// rect. The WHOLE strip is the target, not just the chevron: one column
+    /// is already a small thing to hit without also demanding the right row.
+    terminal_strip_rects: Vec<Rect>,
     /// Index of the terminal being drag-reordered (grabbed by its pane label
     /// or its maximize-rail row). The reorder is live: crossing another pane
     /// or rail row moves the terminal there immediately, and this follows it.
     terminal_drag_from: Option<usize>,
+    /// A left press that was FORWARDED to a pane because its child tracks
+    /// the mouse (#474), live until the release. The release goes to the
+    /// same pane, clamped to its grid if the pointer left it. What the drag
+    /// in between does depends on what the child asked for: motion reports
+    /// under 1002/1003, croft's own text selection anchored at the press
+    /// cell under click-only 1000 (Claude Code's mode), since a child that
+    /// never asked for motion cannot use the drag and the user still needs
+    /// to copy text out of it. The pane is named by `uid`, so a pane closed
+    /// or reordered mid-press is found again (or found gone) rather than
+    /// confused with whichever pane now holds its old index. Every later
+    /// event of the gesture -- motion, selection extension, release,
+    /// copy-on-select -- is aimed at THAT pane, never at the active one:
+    /// the keyboard can move the active pane while the button is held.
+    ///
+    /// Same hole as `terminal_drag_from`: a modal that takes the screen
+    /// while the button is held swallows the mouse-up in `handle_mouse`'s
+    /// overlay gates, so the latch stays set until the next release. Two
+    /// consequences the older latch never had: the child keeps a button it
+    /// believes is down until its next click, and the auto-scroll tick keeps
+    /// standing down for a pane that is not active. Reaching it needs a
+    /// keystroke with the button held.
+    terminal_pointer_forwarded: Option<ForwardedPointer>,
     /// True while one terminal pane fills the panel's width and the others
     /// are listed in the right-side rail (the per-pane `⛶` button / Cmd+K M).
     /// Distinct from `terminal_maximized`, which grows the panel vertically
@@ -3343,6 +3514,11 @@ pub struct App {
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
+    /// The range the last hinted quick-open pick installed, and the file it
+    /// was installed in: the next pick clears it if it is still the
+    /// selection there, and nothing else, so a selection the user made by
+    /// hand (or extended from it) survives a re-pick of the same file.
+    quick_open_range: Option<(PathBuf, crate::widgets::editor::EditorSelection)>,
     /// VS Code-style Cmd+Shift+P / Ctrl+Shift+P command palette. None when
     /// the modal is closed.
     pub command_palette: Option<crate::widgets::command_palette::CommandPalette>,
@@ -4118,6 +4294,15 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
+        // Seed the log view's opening default from the saved preference
+        // BEFORE any log can be opened (#466): the toggle keeps the two in
+        // step afterwards, but a startup that set only `App::log_highlight`
+        // opened the first log highlighted despite a saved opt-out. Test-
+        // inert like the keymap and matcher loads below: the suite builds
+        // hundreds of apps on parallel threads, and an unguarded write to
+        // the process-wide default from each would race the tests that
+        // read it; those call `seed_log_highlight_default` explicitly.
+        seed_log_highlight_default_at_startup(!loaded_prefs.disable_log_highlight);
         // Same treatment for keybindings: a row croft refused (an unknown
         // command id, a gesture that can never fire, a reserved bare click)
         // used to vanish silently, which reads as croft being broken rather
@@ -4181,6 +4366,7 @@ impl App {
         let (port_poll_tx, port_poll_rx) = std::sync::mpsc::channel();
         let (fleet_tx, fleet_rx) = std::sync::mpsc::channel();
         let (label_tx, label_rx) = std::sync::mpsc::channel();
+        let (ssh_tx, ssh_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
         std::thread::spawn(move || {
             crate::widgets::search::search_worker_loop(
@@ -4240,6 +4426,7 @@ impl App {
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
+            log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
             auto_save: loaded_prefs.auto_save,
@@ -4392,6 +4579,16 @@ impl App {
             remote_launch: None,
             pending_remote_launch_host: None,
             pending_remote_launch_path: None,
+            ssh_offer: None,
+            ssh_offer_seen: std::collections::BTreeMap::new(),
+            ssh_rx,
+            ssh_tx,
+            remote_offer_disabled: loaded_prefs.disable_remote_offer,
+            remote_offer_excluded: loaded_prefs.remote_offer_excluded_hosts.clone(),
+            remote_offer_refused: crate::remote::load_refused_hosts(
+                &crate::remote::refused_hosts_path(&croft_cache_dir()),
+                std::time::SystemTime::now(),
+            ),
             tree_clipboard: None,
             tree_typeahead: None,
             compare_anchor: None,
@@ -4418,6 +4615,11 @@ impl App {
             terminal_add_buttons: Vec::new(),
             terminal_profile_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
+            terminal_collapse_buttons: Vec::new(),
+            consented_extensions: crate::prefs::Prefs::load_or_default().mcp_consented,
+            config_dir: crate::prefs::config_dir(),
+            scrollback_dir: crate::session_state::dirs_cache_croft().join("scrollback"),
+            terminal_strip_rects: Vec::new(),
             terminal_max_buttons: Vec::new(),
             terminal_rail_rects: Vec::new(),
             terminal_rail_area: Rect::default(),
@@ -4425,6 +4627,7 @@ impl App {
             terminal_rail_revealed: None,
             terminal_label_rects: Vec::new(),
             terminal_drag_from: None,
+            terminal_pointer_forwarded: None,
             terminal_pane_maximized: false,
             bottom_panel_tab: BottomPanelTab::Terminal,
             problems: crate::widgets::problems::ProblemsPanel::new(),
@@ -4557,6 +4760,7 @@ impl App {
             closed_terminals: Vec::new(),
             closed_tabs: Vec::new(),
             file_finder: None,
+            quick_open_range: None,
             command_palette: None,
             go_to_symbol: None,
             workspace_symbols: None,
@@ -5919,7 +6123,12 @@ impl App {
                 self.kick_file_finder_index_rebuild();
             }
         }
-        poll.open_file_changed || poll.dirs_changed
+        // Stamp-gated, so an idle poll costs a stat per open diff view; on
+        // hosts without a native watcher this is how a diff follows the
+        // file (#471).
+        let diffs_changed =
+            self.refresh_open_diff_views(false, &[], &std::collections::BTreeSet::new());
+        poll.open_file_changed || poll.dirs_changed || diffs_changed
     }
 
     /// Drain any pending filesystem events from the watcher and refresh the
@@ -5988,6 +6197,11 @@ impl App {
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
         let mut changed = false;
+        // Roots whose HEAD oid moved in this drain: the open Source Control
+        // diffs for THESE re-read their HEAD blob (#471); the rest are
+        // stamp-gated like any filesystem tick.
+        let mut heads_moved: Vec<PathBuf> = Vec::new();
+        let mut status_arrived = false;
         let primary_root = self.roots.primary().to_path_buf();
         let mut worker_roots: Vec<PathBuf> = vec![primary_root];
         worker_roots.extend(self.git_extra.iter().map(|(r, _)| r.clone()));
@@ -6002,6 +6216,13 @@ impl App {
             };
             w.flush_pending();
             let this_changed = w.drain_into(is_active.then_some(panel));
+            // A completed refresh whose status came back identical is still
+            // news to an open staged / branch / previous-commit diff (#471):
+            // those read the index or a ref, which porcelain status does
+            // not fully describe.
+            if w.take_status_arrival() {
+                status_arrived = true;
+            }
             if !this_changed {
                 continue;
             }
@@ -6016,6 +6237,11 @@ impl App {
             let oid = status.head_oid.clone();
             if self.git_head_oids.get(&ws_root) != Some(&oid) {
                 self.git_head_oids.insert(ws_root.clone(), oid);
+                // The diff tag stores `scm_root()`, the git TOPLEVEL, which
+                // is not the workspace root for a subdirectory workspace or
+                // for a root reached through a symlink (git canonicalises
+                // `--show-toplevel`). Record what the tag will compare with.
+                heads_moved.push(status.repo_root.clone().unwrap_or_else(|| ws_root.clone()));
                 if is_active {
                     self.refresh_commit_graph();
                 }
@@ -6056,7 +6282,15 @@ impl App {
                 self.tree.ignored = std::sync::Arc::new(union);
             }
         }
-        changed
+        // A completed status refresh means HEAD or the index may have moved:
+        // a Source Control diff re-reads its HEAD blob when its root's HEAD
+        // oid changed, a staged / branch / previous-commit view re-runs its
+        // `git diff` on every arrival (#471). This is the debounced cadence,
+        // so a burst of writes costs one re-run, and a rebuilt view owes a
+        // redraw even when the status itself was unchanged.
+        let diffs_refreshed = (changed || status_arrived)
+            && self.refresh_open_diff_views(true, &heads_moved, &std::collections::BTreeSet::new());
+        changed || diffs_refreshed
     }
 
     /// Point the SCM surfaces at `active`'s repository: seed the panel
@@ -8485,6 +8719,7 @@ impl App {
                 self.status = format!("Could not open snapshot diff: {e}");
                 return;
             }
+            self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
             self.history_restore = Some((path, content));
             self.focus_pane(Pane::Editor);
             self.status = format!("Showing {rel} at a local snapshot");
@@ -11465,6 +11700,10 @@ impl App {
         // no-op and won't clobber selection or reload spuriously.
         if drain.got_any {
             self.reload_open_file_after_external_change();
+            // An open diff view follows the file the same way a buffer does
+            // (#471): an agent rewriting the working file, or a save from a
+            // sibling tab, re-diffs it in place.
+            self.refresh_open_diff_views(false, &[], &drain.changed_files);
         }
         // Attribute the writes to whichever agents were working when they
         // landed (#345). Done after the reload so an agent's write to the
@@ -11872,6 +12111,23 @@ impl App {
                 }
                 row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
+
+            // The ambient wave (#312), painted LAST and only into cells the
+            // notes left blank, so the card's text always wins and a release
+            // with a lot to say simply pushes the field out of view.
+            let wave_area = Rect {
+                x: inner_x,
+                y: inner_y,
+                width: inner_w_actual,
+                height: box_rect.height.saturating_sub(2),
+            };
+            let theme = self.theme;
+            crate::gradient::paint_card_wave(
+                frame.buffer_mut(),
+                wave_area,
+                theme.is_light(),
+                |c| theme.ui(c),
+            );
         }
     }
 
@@ -12754,6 +13010,10 @@ impl App {
         } else if self.active_terminal > idx {
             self.active_terminal -= 1;
         }
+        // Closing the only expanded pane would leave the row nothing but
+        // strips; the collapse gesture refuses that from its own side and
+        // this closes the other route to it.
+        self.ensure_a_terminal_pane_is_expanded();
         // A lone terminal has nothing to maximize against; the rail would be
         // empty, so the split view is the honest state.
         if self.terminals.len() <= 1 {
@@ -12779,6 +13039,11 @@ impl App {
     pub fn toggle_terminal_pane_maximize(&mut self) {
         if self.terminal_pane_maximized {
             self.terminal_pane_maximized = false;
+            // The rail lists folded panes too, so the pane that held the
+            // maximized view may be a strip once the split comes back. The
+            // invariant lives in `sync_focus_flags` and this is the gesture
+            // that re-enters its scope.
+            self.sync_focus_flags();
             self.terminal_status(String::from("Restored terminal split"));
         } else if self.terminals.len() > 1 {
             self.terminal_pane_maximized = true;
@@ -12786,6 +13051,178 @@ impl App {
         } else {
             self.status = String::from("Only one terminal open");
         }
+    }
+
+    /// Paint a collapsed pane's one-column strip (#313) and return its hit
+    /// rect: the expand chevron on the header row, then the pane's name set
+    /// vertically down the column.
+    ///
+    /// A strip rather than hiding the pane outright. A pane that vanishes is
+    /// indistinguishable from one that was closed, and croft already has
+    /// closing, with its own undo window; the strip keeps the pane counted,
+    /// named and clickable, which is what makes folding it obviously
+    /// reversible.
+    fn paint_terminal_collapsed_strip(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        idx: usize,
+    ) -> Rect {
+        if area.width == 0 || area.height == 0 {
+            return Rect::default();
+        }
+        let hovered = self.pointer_cell.is_some_and(|(px, py)| {
+            px >= area.x && px < area.x + area.width && py >= area.y && py < area.y + area.height
+        });
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(Style::default().bg(self.theme.editor_bg())),
+            area,
+        );
+        let chevron = crate::widgets::header_pill::action_style(self.theme, hovered);
+        let name = crate::widgets::header_pill::action_style(self.theme, false);
+        let label = self.terminals[idx].label().to_string();
+        let buf = frame.buffer_mut();
+        buf.set_string(area.x, area.y, TERMINAL_EXPAND_GLYPH.to_string(), chevron);
+        // The name runs down the strip so a folded pane is still identifiable
+        // without unfolding it. Only single-width characters are placed: a CJK
+        // glyph or an emoji is two cells wide and would paint over the pane
+        // next door, which is one column away.
+        for (row, ch) in label
+            .chars()
+            .filter_map(|c| match unicode_width::UnicodeWidthChar::width(c) {
+                Some(1) => Some(c),
+                // Wide: keep the position, lose the glyph.
+                Some(w) if w > 1 => Some(TERMINAL_STRIP_WIDE_STANDIN),
+                // Zero-width — a combining mark or a control character —
+                // has nothing to stand in for and no cell of its own.
+                _ => None,
+            })
+            .take(area.height.saturating_sub(1) as usize)
+            .enumerate()
+        {
+            buf.set_string(area.x, area.y + 1 + row as u16, ch.to_string(), name);
+        }
+        area
+    }
+
+    /// Collapse the pane at `idx` to a strip, or give a collapsed one its
+    /// width back (#313). The `‹` header button, the strip, the right-click
+    /// entry and the palette command all land here.
+    ///
+    /// Collapsing the LAST expanded pane is refused: folding every pane away
+    /// leaves a row of strips with nothing in it, and croft already has
+    /// Ctrl+J for putting the panel away entirely (Ctrl+Shift+J is the
+    /// opposite gesture, growing it over the editor). The refusal says so
+    /// on the status line rather than swallowing the click, so the button
+    /// never reads as broken.
+    pub fn toggle_terminal_collapse(&mut self, idx: usize) {
+        let Some(pane) = self.terminals.get(idx) else {
+            return;
+        };
+        if pane.collapsed {
+            self.terminals[idx].collapsed = false;
+            self.active_terminal = idx;
+            self.focus_pane(Pane::Terminal);
+            let msg = format!("Expanded terminal {}", self.terminals[idx].label());
+            self.terminal_status(msg);
+            return;
+        }
+        if self.terminals.iter().filter(|t| !t.collapsed).count() <= 1 {
+            self.status = String::from("Cannot collapse the last expanded terminal");
+            return;
+        }
+        self.terminals[idx].collapsed = true;
+        // Focus cannot stay on a pane that is now one column wide: it shows no
+        // cursor, so the keystrokes would go somewhere the user cannot see
+        // them arrive. `sync_focus_flags` owns that rule for every path, this
+        // one included - a second copy of the nearest-expanded walk here would
+        // be dead weight AND a tie-break that can drift out of step with the
+        // one that matters.
+        self.sync_focus_flags();
+        let msg = format!("Collapsed terminal {}", self.terminals[idx].label());
+        self.terminal_status(msg);
+    }
+
+    /// Fold the active pane, unless maximize owns the panel (#313).
+    ///
+    /// The `‹` button is not painted while maximized and the right-click entry
+    /// is suppressed there, but the chord and the palette command reached
+    /// `toggle_terminal_collapse` directly and so had no such guard. Because
+    /// collapsing reassigns `active_terminal` and the maximize branch hands
+    /// the panel to whatever that is, the effect was to swap the maximized
+    /// pane for a neighbour while the status line announced a collapse that
+    /// was invisible until you left maximize.
+    pub fn collapse_active_terminal_pane(&mut self) {
+        if self.terminal_pane_maximized {
+            self.status = String::from("Collapse is unavailable while a pane is maximized");
+            return;
+        }
+        self.toggle_terminal_collapse(self.active_terminal);
+    }
+
+    /// Make the pane at `idx` the active one AND visible (#313).
+    ///
+    /// For callers that deliberately TARGET a pane by index - jump to a
+    /// captured line, run a task in its own pane, run a fenced block, focus an
+    /// agent's pane - rather than for a gesture that merely moves focus.
+    ///
+    /// The distinction is load-bearing. `sync_focus_flags` walks focus OFF a
+    /// folded pane, which is right for a drifting gesture and wrong here: it
+    /// silently redirected these callers to a neighbour, so a task command was
+    /// written into a pane that is never rendered while the status line
+    /// reported it running. Reaching for a pane by index is a request to see
+    /// it, which is the rationale `undo_close_terminal` already applies when
+    /// it force-expands a reopened pane.
+    fn reveal_terminal_pane(&mut self, idx: usize) {
+        if let Some(t) = self.terminals.get_mut(idx) {
+            t.collapsed = false;
+        }
+        self.active_terminal = idx;
+    }
+
+    /// Give every collapsed pane its width back (Cmd+K `]`): the issue's
+    /// "maximise the terminals back to the same equal-sized terminal
+    /// windows", which has to be one gesture rather than one per pane.
+    pub fn restore_all_terminal_panes(&mut self) {
+        // The mirror of the guard on `collapse_active_terminal_pane`. Without
+        // it, Cmd+K ] while maximized cleared every flag and announced it, for
+        // a change the user cannot see until they leave maximize: the same
+        // silent-state-change this pair already refuses in the other
+        // direction.
+        if self.terminal_pane_maximized {
+            self.terminal_status(String::from(
+                "Restore is unavailable while a pane is maximized",
+            ));
+            return;
+        }
+        let folded = self.terminals.iter().filter(|t| t.collapsed).count();
+        if folded == 0 {
+            self.terminal_status(String::from("No collapsed terminal panes"));
+            return;
+        }
+        for t in self.terminals.iter_mut() {
+            t.collapsed = false;
+        }
+        self.terminal_status(format!(
+            "Restored {folded} terminal pane{}",
+            if folded == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Keep at least one pane expanded after a pane leaves the row (#313).
+    ///
+    /// [`Self::toggle_terminal_collapse`] refuses to fold the last expanded
+    /// pane, but CLOSING reaches the same state from the other side: two
+    /// panes with one collapsed, close the expanded one, and the panel is a
+    /// single strip with nothing behind it. Expanding the pane that is now
+    /// active, rather than all of them, keeps the rest of the user's
+    /// folding intact.
+    fn ensure_a_terminal_pane_is_expanded(&mut self) {
+        if self.terminals.is_empty() || self.terminals.iter().any(|t| !t.collapsed) {
+            return;
+        }
+        let idx = self.active_terminal.min(self.terminals.len() - 1);
+        self.terminals[idx].collapsed = false;
     }
 
     /// Drop the rail's hit rects and its column. Both must go together: a
@@ -12920,7 +13357,16 @@ impl App {
             }
         } else {
             for (term, rect) in self.terminals.iter_mut().zip(slot_rects) {
-                term.last_area = rect;
+                // A folded pane is not painted in whatever slot the drag left
+                // it in, so it must not inherit that slot's geometry (#313):
+                // the rest of the drained mouse burst hit-tests these rects,
+                // and a live rect over an unpainted pane resolves clicks to a
+                // pane that is not there.
+                term.last_area = if term.collapsed {
+                    Rect::default()
+                } else {
+                    rect
+                };
             }
         }
         self.terminal_session_dirty = true;
@@ -12951,6 +13397,10 @@ impl App {
         };
         let idx = parked.idx.min(self.terminals.len());
         self.terminals.insert(idx, parked.term);
+        // Reopening is a request to see the pane, so it comes back expanded
+        // whatever it was when it was closed: a restore that put a strip on
+        // screen would read as the reopen having failed.
+        self.terminals[idx].collapsed = false;
         self.active_terminal = idx;
         if !self.show_terminal {
             self.show_terminal = true;
@@ -13103,6 +13553,14 @@ impl App {
         self.terminals.iter().map(|t| t.redacted_on_screen).sum()
     }
 
+    /// The current index of the pane a forwarded left press went to (#474),
+    /// or `None` once that pane has been closed. Looked up by uid on every
+    /// event of the gesture because a close or reorder while the button is
+    /// held renumbers the vector under a stored index.
+    fn forwarded_pane_index(&self, fp: ForwardedPointer) -> Option<usize> {
+        self.terminals.iter().position(|t| t.uid() == fp.pane)
+    }
+
     /// The clipboard's view of terminal text: rules marked `copy: masked`
     /// keep their mask, everything else copies as typed (#360).
     fn terminal_text_for_copy(&self, text: String) -> String {
@@ -13191,23 +13649,49 @@ impl App {
         }
     }
 
-    /// Cycle the active terminal forward by one slot, wrapping at the end.
+    /// Cycle the active terminal forward to the next pane the user can
+    /// actually see, wrapping at the end.
+    ///
+    /// Collapsed panes are stepped over (#313). A folded pane is one column
+    /// wide and is never rendered, so it paints no cursor and no focus
+    /// border: cycling onto one would send every keystroke into a pane the
+    /// user cannot see receiving them. `toggle_terminal_collapse` defends
+    /// that same invariant on its own path; this is the other way in, and it
+    /// predated the flag.
     pub fn cycle_terminal(&mut self) {
-        if self.terminals.len() <= 1 {
-            return;
-        }
-        self.active_terminal = (self.active_terminal + 1) % self.terminals.len();
-        self.sync_focus_flags();
+        self.step_active_terminal(true);
     }
 
-    /// Cycle the active terminal backward by one slot, wrapping at the
-    /// front. Mirror of `cycle_terminal` for the Cmd+[ binding.
+    /// Cycle the active terminal backward, wrapping at the front. Mirror of
+    /// `cycle_terminal` for the Cmd+[ binding, folded panes skipped alike.
     pub fn cycle_terminal_back(&mut self) {
+        self.step_active_terminal(false);
+    }
+
+    /// Walk `active_terminal` one visible pane in either direction.
+    ///
+    /// The loop is bounded by the pane count and at least one pane is always
+    /// expanded (`toggle_terminal_collapse` refuses to fold the last one and
+    /// `ensure_a_terminal_pane_is_expanded` closes the other route), so it
+    /// always terminates on a pane that is painted. If that invariant were
+    /// ever broken the walk falls through without moving, which is inert
+    /// rather than a hang.
+    fn step_active_terminal(&mut self, forward: bool) {
         let n = self.terminals.len();
         if n <= 1 {
             return;
         }
-        self.active_terminal = (self.active_terminal + n - 1) % n;
+        for step in 1..=n {
+            let cand = if forward {
+                (self.active_terminal + step) % n
+            } else {
+                (self.active_terminal + n - (step % n)) % n
+            };
+            if !self.terminals[cand].collapsed {
+                self.active_terminal = cand;
+                break;
+            }
+        }
         self.sync_focus_flags();
     }
 
@@ -13644,6 +14128,53 @@ impl App {
     }
 
     fn sync_focus_flags(&mut self) {
+        // Focus must never rest on a COLLAPSED pane (#313). A folded pane is
+        // one column wide and is never rendered, so it paints no cursor and no
+        // focus border: the user would be typing into a pane they cannot see
+        // receiving it.
+        //
+        // Enforced HERE rather than at each gesture. The first attempt guarded
+        // `cycle_terminal` alone, which left closing the pane beside a folded
+        // one, the maximize rail, and a right-click on a strip - the last of
+        // which that same round OPENED, since making a strip right-clickable
+        // also made it focusable. A fix at the call site closes the path you
+        // were looking at; a fix at the invariant closes the ones you were not.
+        //
+        // Two things this function does NOT do, contrary to an earlier
+        // version of this comment. It is not called per frame - there are
+        // eleven call sites, none in a render path - and it is not on every
+        // path that moves `active_terminal`: `activate_terminal_pane` and
+        // `move_terminal` both assign without calling it. Those two are safe
+        // for reasons of their own (the first takes its index from
+        // `terminal_at_pos`, which cannot name a folded pane because its
+        // `last_area` is cleared; the second keeps the active pane pointed at
+        // its own terminal), so the invariant's totality rests on those
+        // reasons rather than on this being a universal funnel. A change to
+        // what feeds `terminal_at_pos` would break it silently.
+        //
+        // And this is the rule for focus that DRIFTS. A caller deliberately
+        // choosing a pane by index wants it made visible instead, which is
+        // `reveal_terminal_pane`.
+        //
+        // Skipped while a pane is maximized: the flags are deliberately
+        // ignored there and the active pane is painted full width whatever it
+        // holds, so moving focus would fight the user's own selection. Leaving
+        // maximize calls back through here, which is where it is repaired.
+        if !self.terminal_pane_maximized
+            && self
+                .terminals
+                .get(self.active_terminal)
+                .is_some_and(|t| t.collapsed)
+            && let Some(next) = self
+                .terminals
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.collapsed)
+                .min_by_key(|(candidate, _)| candidate.abs_diff(self.active_terminal))
+                .map(|(candidate, _)| candidate)
+        {
+            self.active_terminal = next;
+        }
         // Quick-select is bound to the pane it opened on; this per-frame
         // invariant covers every gesture that can move `active_terminal`
         // (clicks, chords, pane closes shifting indices) in one place, so
@@ -14223,6 +14754,7 @@ impl App {
             *rect = Rect::default();
         }
         self.dress_host_accents();
+        self.expire_ssh_offer();
         // Theme background, whole frame. croft's chrome (the sidebar panels,
         // explorer sections, activity bar, gaps) mostly paints `Color::Reset`
         // and leans on the iTerm2 `SetColors` session bg to color it. Ghostty /
@@ -14802,11 +15334,17 @@ impl App {
                             })
                             .collect()
                     } else {
-                        let constraints: Vec<Constraint> =
-                            (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
+                        // Collapsed panes (#313) keep a one-column strip and
+                        // the rest divide what is left. Read off the panes
+                        // rather than a list held here, so a reorder or a
+                        // close can never leave the flags naming the wrong
+                        // terminal.
+                        let collapsed: Vec<bool> = (0..n)
+                            .map(|i| self.terminals.get(i).is_some_and(|t| t.collapsed))
+                            .collect();
                         Layout::default()
                             .direction(Direction::Horizontal)
-                            .constraints(constraints)
+                            .constraints(terminal_pane_constraints(&collapsed))
                             .split(content)
                             .to_vec()
                     };
@@ -14819,7 +15357,16 @@ impl App {
                     // theme at all instead of showing the host's own bg.
                     let term_bg = self.theme.editor_bg();
                     for (i, t) in self.terminals.iter_mut().enumerate() {
-                        if cols[i].width == 0 {
+                        // A collapsed pane is not rendered, and that is what
+                        // keeps its shell intact: rendering is what resizes
+                        // the PTY, and reflowing a running shell into one
+                        // column would mangle everything already on its
+                        // screen. It keeps the geometry it had, so expanding
+                        // brings the pane back as it was rather than as a
+                        // column of broken wrapping. Its `last_area` is
+                        // cleared so a click on the strip cannot land in a
+                        // grid that is no longer painted there.
+                        if cols[i].width == 0 || (t.collapsed && !maximized) {
                             t.last_area = Rect::default();
                             t.redacted_on_screen = 0;
                         } else {
@@ -14837,6 +15384,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     for (i, col) in cols.iter().enumerate().take(self.terminals.len()) {
                         // Hidden panes still push placeholders so a button's
                         // position in each vec names its terminal index.
@@ -14846,8 +15395,25 @@ impl App {
                             self.terminal_close_buttons.push(Rect::default());
                             self.terminal_max_buttons.push(Rect::default());
                             self.terminal_label_rects.push(Rect::default());
+                            self.terminal_collapse_buttons.push(Rect::default());
+                            self.terminal_strip_rects.push(Rect::default());
                             continue;
                         }
+                        // A collapsed pane's whole chrome is its strip: no
+                        // header buttons fit in one column, and the only
+                        // gesture it offers is the way back out.
+                        if self.terminals[i].collapsed && !maximized {
+                            let strip = self.paint_terminal_collapsed_strip(frame, *col, i);
+                            self.terminal_add_buttons.push(Rect::default());
+                            self.terminal_profile_buttons.push(Rect::default());
+                            self.terminal_close_buttons.push(Rect::default());
+                            self.terminal_max_buttons.push(Rect::default());
+                            self.terminal_label_rects.push(Rect::default());
+                            self.terminal_collapse_buttons.push(Rect::default());
+                            self.terminal_strip_rects.push(strip);
+                            continue;
+                        }
+                        self.terminal_strip_rects.push(Rect::default());
                         let buttons = paint_terminal_pane_buttons(
                             frame,
                             *col,
@@ -14864,6 +15430,8 @@ impl App {
                             .push(buttons.close.unwrap_or_default());
                         self.terminal_max_buttons
                             .push(buttons.max.unwrap_or_default());
+                        self.terminal_collapse_buttons
+                            .push(buttons.collapse.unwrap_or_default());
                         // Auto/manual pane label at top-left, only with 2+ panes
                         // (a lone pane needs no name). Kept clear of the buttons.
                         // The painted pill doubles as the drag-reorder handle,
@@ -14971,6 +15539,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -14986,6 +15556,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -15001,6 +15573,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -15015,6 +15589,8 @@ impl App {
                     self.terminal_close_buttons.clear();
                     self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
+                    self.terminal_collapse_buttons.clear();
+                    self.terminal_strip_rects.clear();
                     self.clear_terminal_rail();
                     for t in self.terminals.iter_mut() {
                         t.last_area = Rect::default();
@@ -15029,6 +15605,8 @@ impl App {
             self.terminal_close_buttons.clear();
             self.terminal_max_buttons.clear();
             self.terminal_label_rects.clear();
+            self.terminal_collapse_buttons.clear();
+            self.terminal_strip_rects.clear();
             self.clear_terminal_rail();
             self.problems_tab_rect = Rect::default();
             self.output_tab_rect = Rect::default();
@@ -17065,6 +17643,20 @@ impl App {
                 self.request_call_hierarchy_at_cursor(false);
                 true
             }
+            // Cmd+K G: accept the ssh-pane workspace offer (#364) — "go to
+            // the host". The same remote flow the palette command runs; the
+            // offer only saves the reaching.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'g') => {
+                match self.accept_ssh_offer() {
+                    Some(host) => self.request_remote_launch(host, None),
+                    None => {
+                        self.status = String::from(
+                            "No ssh workspace offer is open (it appears when a pane connects to a host in ~/.ssh/config)",
+                        );
+                    }
+                }
+                true
+            }
             // Cmd+K H: incoming calls — who calls the symbol at the caret
             // (VS Code's call Hierarchy, peek replaced by croft's picker).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'h') => {
@@ -17153,6 +17745,32 @@ impl App {
                     self.show_terminal = true;
                 }
                 self.toggle_terminal_pane_maximize();
+                true
+            }
+            // Cmd+K [ / Cmd+K ]: fold the active terminal pane to a strip,
+            // and give every folded pane its width back (#313). VS Code binds
+            // its own fold / unfold pair to ⌘K ⌘[ and ⌘K ⌘], so the gesture
+            // keeps the keys it already has elsewhere.
+            //
+            // NOT ⌘K E, which the design proposal had picked as "even": that
+            // is croft's reveal-in-Explorer and the arm would never have been
+            // reached, since an earlier `e` arm in this same match wins.
+            // NOT ⌘K -, either: `-` is close, on the button and here.
+            //
+            // Cmd+K M (pane-maximize) is untouched: maximize and collapse are
+            // orthogonal and compose.
+            KeyCode::Char('[') if plain => {
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.collapse_active_terminal_pane();
+                true
+            }
+            KeyCode::Char(']') if plain => {
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.restore_all_terminal_panes();
                 true
             }
             // Cmd+K D: dump the active terminal's scrollback into a scratch
@@ -17253,6 +17871,14 @@ impl App {
     /// built-in defaults call their app methods directly, so a command-level
     /// recorder would miss most of what a user does.
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Esc dismisses an open ssh-pane offer (#364) without being consumed:
+        // the offer is a status-bar hint, not a modal, so whatever Esc meant
+        // to the focused pane still happens.
+        if key.code == KeyCode::Esc
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            self.dismiss_ssh_offer();
+        }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
         let result = self.handle_key_inner(key);
@@ -18267,7 +18893,8 @@ impl App {
         } else {
             self.disabled_extensions.insert(id.clone());
         }
-        let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
+        let _ =
+            crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
         self.refresh_extensions();
         self.status = format!(
             "{} extension '{id}'",
@@ -18310,18 +18937,41 @@ impl App {
     /// Perform the confirmed uninstall (the popup's Enter path). Removes the
     /// catalog/index-installed manifest and refreshes the panel.
     fn perform_extension_uninstall(&mut self, id: &str) {
-        match crate::mcp::catalog::uninstall(id) {
+        match crate::mcp::catalog::uninstall_in(&self.config_dir.join("extensions"), id) {
             Ok(()) => {
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
                 if self.disabled_extensions.remove(id) {
-                    let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
+                    let _ = crate::prefs::save_disabled_extensions_in(
+                        &self.config_dir,
+                        &self.disabled_extensions,
+                    );
                 }
+                // And its consent: a re-add is a program the user has not
+                // approved this time, so the first-run gate asks again.
+                self.forget_extension_consent(id);
                 self.refresh_extensions();
                 self.status = format!("Uninstalled '{id}' — it's back under AVAILABLE to re-add");
             }
             Err(e) => self.status = format!("Could not uninstall '{id}': {e}"),
         }
+    }
+
+    /// Write a first-run consent for `ext_id` to prefs, after the caller has
+    /// put it in the session set both gates read. The session grant holds
+    /// either way; a prefs write that fails is said in the status rather
+    /// than swallowed, since the user would otherwise be asked again next
+    /// launch with no idea why.
+    fn persist_extension_consent(&mut self, ext_id: &str) {
+        if let Err(e) = crate::prefs::save_mcp_consent_in(&self.config_dir, ext_id) {
+            self.status = format!("Allowed {ext_id}, but the consent could not be saved: {e}");
+        }
+    }
+
+    /// Forget `id`'s first-run consent in the session set and in prefs.
+    fn forget_extension_consent(&mut self, id: &str) {
+        self.consented_extensions.remove(id);
+        let _ = crate::prefs::forget_mcp_consent_in(&self.config_dir, id);
     }
 
     /// Whether the extension `id` is currently enabled (not in the disabled set).
@@ -20370,7 +21020,15 @@ impl App {
                             .editor
                             .open_head_diff_with_text(label, &head_text, &abs, true)
                         {
-                            Ok(()) => true,
+                            Ok(()) => {
+                                self.tag_open_diff(
+                                    crate::widgets::diff::DiffSource::HeadVsWorking {
+                                        root: scm_root.to_path_buf(),
+                                        rel: entry.path.clone(),
+                                    },
+                                );
+                                true
+                            }
                             Err(e) => {
                                 self.status = format!("Diff failed: {e}");
                                 false
@@ -21199,19 +21857,49 @@ impl App {
                 let r = crate::git::create_tag(&self.scm_root(), &value);
                 self.run_scm_op("tag", r, "Created tag");
             }
+            InputPurpose::ViewerConsent { key, path } => {
+                // The user allowed the viewer's extension; record it and
+                // resume the open that asked. The viewer is looked up first:
+                // one removed while the prompt was up gets a status line and
+                // no consent, since what was allowed no longer exists.
+                self.close_input_prompt();
+                let Some(viewer) =
+                    crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, &key)
+                else {
+                    self.status = format!("{key} is no longer available");
+                    return;
+                };
+                // The session grant first, so the open passes the gate; the
+                // prefs write after, so a failure it reports is the status
+                // the user is left with rather than one the open overwrote.
+                self.consented_extensions.insert(viewer.ext_id.clone());
+                self.open_in_viewer(&viewer, &path);
+                self.persist_extension_consent(&viewer.ext_id);
+            }
             InputPurpose::McpConsent { command_id } => {
                 // The user confirmed; record consent for this command's
                 // extension and resume the command (which now passes the gate
                 // and proceeds to its argument prompt or runs).
                 self.close_input_prompt();
-                if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
-                    let _ = crate::prefs::save_mcp_consent(&resolved.ext_id);
+                // The session grant first, so the run passes the gate, and
+                // the prefs write before the run here: a sidecar command's
+                // run ends on its own argument prompt with no status of its
+                // own, so a failure reported after it would sit under that
+                // prompt and be cleared with it.
+                let ext_id =
+                    crate::mcp::registry::resolve_command_in_dir(&self.config_dir, &command_id)
+                        .map(|r| r.ext_id);
+                if let Some(ext_id) = &ext_id {
+                    self.consented_extensions.insert(ext_id.clone());
+                    self.persist_extension_consent(ext_id);
                 }
                 self.run_extension_command(&command_id);
             }
             InputPurpose::McpArg { command_id } => {
                 self.close_input_prompt();
-                if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
+                if let Some(resolved) =
+                    crate::mcp::registry::resolve_command_in_dir(&self.config_dir, &command_id)
+                {
                     self.spawn_mcp_command(resolved, Some(value));
                 }
             }
@@ -22997,6 +23685,7 @@ impl App {
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
+                    "toggle:log_highlight" => self.toggle_log_highlight(),
                     "toggle:secret_redaction" => self.toggle_secret_redaction(),
                     "toggle:format_on_type" => self.toggle_format_on_type(),
                     "cmd:color_theme" => {
@@ -23159,6 +23848,14 @@ impl App {
                 ),
             },
             ListRow {
+                id: String::from("toggle:log_highlight"),
+                label: format!(
+                    "Log: Highlighting (tailspin): {}{}",
+                    on_off(self.log_highlight),
+                    prov("disable_log_highlight")
+                ),
+            },
+            ListRow {
                 id: String::from("toggle:secret_redaction"),
                 label: format!(
                     "Terminal: Redact Secrets (keys, tokens): {}{}",
@@ -23277,7 +23974,11 @@ impl App {
             .iter()
             .position(|t| pane_is_idle_at(t, &pane_name, &root))
         {
-            self.active_terminal = idx;
+            // Reused panes may be folded (#313): the release notes name the
+            // build pane as the thing you would fold, and a task written into
+            // a pane that is never rendered runs invisibly under a status line
+            // saying it started.
+            self.reveal_terminal_pane(idx);
             self.terminals[idx].write_input(command.as_bytes());
             self.show_terminal = true;
             self.focus_pane(Pane::Terminal);
@@ -23426,6 +24127,10 @@ impl App {
             self.status = format!("Could not open staged diff: {err}");
             return;
         }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+            root: self.scm_root(),
+            kind: crate::widgets::diff::GitDiffKind::Staged,
+        });
         self.source_control.commit_feedback = None;
         self.status = String::from("Showing git diff --staged");
         self.focus_pane(Pane::Editor);
@@ -23462,6 +24167,10 @@ impl App {
             self.status = format!("Could not open diff vs {branch}: {err}");
             return;
         }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+            root: self.scm_root(),
+            kind: crate::widgets::diff::GitDiffKind::AgainstBranch(branch.clone()),
+        });
         self.default_branch_label = Some(branch.clone());
         self.source_control.commit_feedback = None;
         self.status = format!("Showing git diff {branch}");
@@ -23491,6 +24200,10 @@ impl App {
             self.status = format!("Could not open diff vs previous: {err}");
             return;
         }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+            root: self.scm_root(),
+            kind: crate::widgets::diff::GitDiffKind::PreviousCommit,
+        });
         self.source_control.commit_feedback = None;
         self.status = String::from("Showing git diff HEAD~1");
         self.focus_pane(Pane::Editor);
@@ -23694,7 +24407,27 @@ impl App {
             Ok(_) => {
                 self.status = format!("Reverted hunk in {}", pr.rel_path);
                 self.refresh_after_hunk_op();
-                self.rebuild_open_scm_diff(&pr.rel_path);
+                // The revert rewrote the working file; force the HEAD-side rebuild
+                // of the open view so it refreshes even if the rewrite landed
+                // within the stamp's granularity. Forced by the root the VIEW is
+                // tagged with, not `scm_root()` re-read now: the tag may predate the
+                // worker's first status reply and hold the workspace root.
+                let force_root = self
+                    .editor
+                    .diff
+                    .as_ref()
+                    .and_then(|d| match &d.source {
+                        crate::widgets::diff::DiffSource::HeadVsWorking { root, .. } => {
+                            Some(root.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| self.scm_root());
+                self.refresh_open_diff_views(
+                    true,
+                    std::slice::from_ref(&force_root),
+                    &std::collections::BTreeSet::new(),
+                );
             }
             Err(err) => self.status = format!("Revert hunk failed: {err}"),
         }
@@ -23710,31 +24443,97 @@ impl App {
         self.refresh_source_control();
     }
 
-    /// Re-diff HEAD against the working tree after a revert so the open
-    /// diff pane shows the surviving hunks instead of stale rows. Stage /
-    /// unstage don't touch either side of the displayed diff, so only the
-    /// revert path needs this.
-    fn rebuild_open_scm_diff(&mut self, rel: &str) {
-        let root = self.scm_root();
-        let (label, path, scroll) = {
-            let Some(diff) = self.editor.diff.as_ref() else {
-                return;
-            };
-            (diff.left_path.clone(), diff.right_path.clone(), diff.scroll)
-        };
-        let Ok(head) = crate::git::read_file_at_head(&root, rel) else {
-            return;
-        };
-        if self
-            .editor
-            .open_head_diff_with_text(label, &head, &path, true)
-            .is_ok()
-            && let Some(diff) = self.editor.diff.as_mut()
-        {
-            // Keep the viewport where the user was working instead of
-            // snapping back to the first hunk.
-            diff.scroll = scroll.min(diff.rows.len().saturating_sub(1));
+    /// Record on the diff view the opener just made active how it is to be
+    /// rebuilt when a side moves (#471), and take its first disk stamps.
+    fn tag_open_diff(&mut self, source: crate::widgets::diff::DiffSource) {
+        if let Some(diff) = self.editor.diff.as_mut() {
+            diff.source = source;
+            diff.stamp_sides();
         }
+    }
+
+    /// Rebuild every open diff view, in every split group, whose sides may
+    /// have moved (#471), keeping each reader's viewport. Returns true when
+    /// any view's content actually changed, so the caller owes a redraw.
+    ///
+    /// Two triggers, two costs. A filesystem event or poll (`git_too` false)
+    /// re-reads only file-backed sides, and only those whose stat stamp
+    /// moved, so an idle tick is a stat per open diff and nothing more. A
+    /// git-status drain (`git_too` true; the worker debounces it) also
+    /// re-runs the `git diff` behind a staged / branch / previous-commit
+    /// view, whose input is the index or a ref rather than a file, and
+    /// re-reads the HEAD blob behind a Source Control view for the roots in
+    /// `heads_moved` -- the drain already knows whose HEAD oid changed, and
+    /// a `git show` per open diff per status refresh would otherwise run
+    /// during every write burst for a HEAD that had not moved.
+    /// A view whose content came back identical is left untouched: no reset
+    /// of selection or find, no redraw.
+    pub fn refresh_open_diff_views(
+        &mut self,
+        git_too: bool,
+        heads_moved: &[PathBuf],
+        changed_files: &std::collections::BTreeSet<PathBuf>,
+    ) -> bool {
+        // The watcher's own list of written paths bypasses the stamp gate: a
+        // same-length rewrite that lands within the filesystem's mtime
+        // granularity (or restores the mtime) shows the same `(mtime, len)`
+        // as before, and the event is the only evidence it happened.
+        // Canonicalised once, so a path the watcher reports through a
+        // symlinked root (macOS's /tmp -> /private/tmp) still matches the
+        // path the view was opened with.
+        let touched: Vec<PathBuf> = changed_files
+            .iter()
+            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .collect();
+        let mut changed = false;
+        // The active group's active tab, by address: a rebuild there is the
+        // one that owes the find bar a recompute. A diff refreshing in a
+        // background tab or split must not touch the view the reader is on.
+        let active_ptr: *const crate::widgets::editor::Editor = &*self.editor;
+        let mut active_changed = false;
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                let Some(old) = ed.diff.as_ref() else {
+                    continue;
+                };
+                let Some(mut fresh) = rebuild_diff_view(old, git_too, heads_moved, &touched) else {
+                    continue;
+                };
+                if fresh.same_content_as(old) {
+                    // Same rows: keep the reader's selection and find
+                    // state, but take the new stamps so the next tick does
+                    // not re-read the file again for a no-op write.
+                    if let Some(cur) = ed.diff.as_mut() {
+                        cur.left_stamp = fresh.left_stamp;
+                        cur.right_stamp = fresh.right_stamp;
+                    }
+                    continue;
+                }
+                fresh.carry_view_from(old);
+                ed.diff = Some(fresh);
+                changed = true;
+                if std::ptr::eq(&*ed, active_ptr) {
+                    active_changed = true;
+                }
+            }
+        }
+        // A rebuilt ACTIVE diff with a find bar open gets its match set and
+        // active match recomputed against the new rows, the same way a
+        // typed query would; `carry_view_from` deliberately dropped the old
+        // active match because it named rows that may be gone.
+        if active_changed
+            && self.editor.diff.is_some()
+            && self
+                .editor_find
+                .as_ref()
+                .is_some_and(|s| !s.query.is_empty())
+        {
+            let pos = self.diff_find_current_pos();
+            self.diff_find_apply(pos);
+        }
+        changed
     }
 
     pub fn request_discard_source_control_entry(&mut self, entry_idx: usize) {
@@ -23820,6 +24619,136 @@ impl App {
         }
     }
 
+    /// Housekeeping for the ssh-pane offer (#364), from the top of `render`
+    /// like `dress_host_accents`: an offer nobody took or dismissed clears
+    /// itself after [`SSH_OFFER_TTL`], and a pane that closed takes its offer
+    /// and its per-pane memory along. No system calls: the sampling itself
+    /// rides the label thread (see `refresh_terminal_labels`).
+    fn expire_ssh_offer(&mut self) {
+        let now = std::time::Instant::now();
+        if self
+            .ssh_offer
+            .as_ref()
+            .is_some_and(|o| now.duration_since(o.since) > SSH_OFFER_TTL)
+        {
+            self.dismiss_ssh_offer();
+        }
+        let live: std::collections::BTreeSet<u64> =
+            self.terminals.iter().map(|t| t.uid()).collect();
+        self.ssh_offer_seen.retain(|uid, _| live.contains(uid));
+        if self
+            .ssh_offer
+            .as_ref()
+            .is_some_and(|o| !live.contains(&o.pane))
+        {
+            self.dismiss_ssh_offer();
+        }
+    }
+
+    /// Fold the label thread's ssh samples into the offer state (#364):
+    /// each `(shell pid, host)` names the pane by its shell and goes through
+    /// `consider_ssh_offer` keyed on the pane's uid.
+    fn apply_ssh_samples(&mut self, samples: Vec<(i32, Option<String>)>) {
+        for (shell_pid, host) in samples {
+            let Some(uid) = self
+                .terminals
+                .iter()
+                .find(|t| t.shell_pid() == Some(shell_pid))
+                .map(|t| t.uid())
+            else {
+                continue;
+            };
+            self.consider_ssh_offer(uid, host);
+        }
+    }
+
+    /// One pane's sampled ssh host, against what it was last seen connected
+    /// to (#364). A session is offered when it STARTS: the same host on the
+    /// next sample is the same session, not a new reason to prompt. `None`
+    /// ends the session; an offer for that pane goes with it.
+    fn consider_ssh_offer(&mut self, pane: u64, host: Option<String>) {
+        let previous = self.ssh_offer_seen.insert(pane, host.clone()).flatten();
+        match host {
+            None => {
+                if self.ssh_offer.as_ref().is_some_and(|o| o.pane == pane) {
+                    self.dismiss_ssh_offer();
+                }
+            }
+            Some(host) => {
+                if previous.as_deref() == Some(host.as_str()) {
+                    return;
+                }
+                // The pane moved to another host: whatever it was offered
+                // for is no longer where it is, offerable or not.
+                if self.ssh_offer.as_ref().is_some_and(|o| o.pane == pane) {
+                    self.dismiss_ssh_offer();
+                }
+                if !crate::remote::offer_allowed(
+                    &host,
+                    self.remote_offer_disabled,
+                    &self.remote_offer_excluded,
+                    &self.remote_offer_refused,
+                    std::time::SystemTime::now(),
+                ) {
+                    return;
+                }
+                self.status =
+                    format!("Connected to {host} · Open workspace here? (Cmd+K G, Esc dismisses)");
+                self.ssh_offer = Some(SshOffer {
+                    pane,
+                    host,
+                    since: std::time::Instant::now(),
+                });
+            }
+        }
+    }
+
+    /// Take the open offer's host for launching (#364), clearing the offer.
+    fn accept_ssh_offer(&mut self) -> Option<String> {
+        let offer = self.ssh_offer.take()?;
+        if self.status.starts_with("Connected to ") {
+            self.status.clear();
+        }
+        Some(offer.host)
+    }
+
+    /// Remember that provisioning `host` failed (#364): the ssh-pane offer
+    /// stops prompting for it for `REFUSED_HOST_TTL`. Recorded for any
+    /// install that fails, offer-launched or not, because the fact learned
+    /// is about the host; and undone by the next success (below), so a box
+    /// that merely failed on a bad day is offered again once it works.
+    fn note_provisioning_failed(&mut self, host: &str) {
+        let key = host.to_ascii_lowercase();
+        let now = std::time::SystemTime::now();
+        self.remote_offer_refused.insert(key.clone(), now);
+        let _ = crate::remote::remember_refused_host(
+            &crate::remote::refused_hosts_path(&croft_cache_dir()),
+            &key,
+            now,
+        );
+    }
+
+    /// A provisioning of `host` succeeded (#364): any remembered refusal is
+    /// stale, in memory and on disk. The disk side runs unconditionally:
+    /// the file is shared by every croft on the machine, so another
+    /// instance may have recorded a refusal this one never loaded, and
+    /// `forget_refused_host` is a no-op when there is nothing to forget.
+    fn note_provisioning_succeeded(&mut self, host: &str) {
+        let key = host.to_ascii_lowercase();
+        self.remote_offer_refused.remove(&key);
+        let _ = crate::remote::forget_refused_host(
+            &crate::remote::refused_hosts_path(&croft_cache_dir()),
+            &key,
+        );
+    }
+
+    /// Drop the open offer and its status line, if any (#364).
+    fn dismiss_ssh_offer(&mut self) {
+        if self.ssh_offer.take().is_some() && self.status.starts_with("Connected to ") {
+            self.status.clear();
+        }
+    }
+
     fn request_remote_launch(&mut self, host: String, path: Option<String>) {
         self.status = format!("Connecting to {host}");
         match crate::remote_connect::SshAuth::start(&host) {
@@ -23857,12 +24786,12 @@ impl App {
     /// under the pane and offering to re-root onto a host the user piped
     /// output from rather than one they are working on.
     ///
-    /// Explicit rather than automatic, deliberately. The issue proposes a
-    /// status-bar prompt offering this on detection, which needs a per-host
-    /// opt-out, a memory of hosts that refused provisioning, and a decision
-    /// about how often to nag — none of which should be invented alongside
-    /// the detection itself. A command the user reaches for does the same
-    /// work and cannot interrupt anyone.
+    /// Explicit in the first slice, deliberately: the automatic status-bar
+    /// offer needed a per-host opt-out, a memory of hosts that refused
+    /// provisioning and a decision about how often to prompt, none of which
+    /// belonged alongside the detection itself. Those exist now (the second
+    /// slice: `consider_ssh_offer` and its gates), and the offer accepts
+    /// through the same `request_remote_launch` this command reaches for.
     fn open_workspace_on_ssh_host(&mut self) {
         let Some(term) = self.terminals.get(self.active_terminal) else {
             self.status = String::from("No terminal pane is open");
@@ -24511,6 +25440,7 @@ impl App {
             {
                 let host = session.host.clone();
                 let path = session.path.clone();
+                self.note_provisioning_succeeded(&host);
                 self.remote_launch = Some(RemoteLaunch {
                     host: host.clone(),
                     path,
@@ -24523,6 +25453,13 @@ impl App {
             return true;
         }
         if let Some(detail) = failure {
+            // Remember the host as one croft could not provision (#364), so
+            // the ssh-pane offer stops prompting for it for a while. Kept
+            // beside the failure it learns from, and best-effort: a write
+            // that fails costs one repeated offer.
+            if let Some(host) = self.install_session.as_ref().map(|s| s.host.clone()) {
+                self.note_provisioning_failed(&host);
+            }
             if let Some(dialog) = self.connect_dialog.as_mut() {
                 dialog.set_failed(detail.clone());
             }
@@ -24535,6 +25472,7 @@ impl App {
             {
                 let host = session.host.clone();
                 let path = session.path.clone();
+                self.note_provisioning_succeeded(&host);
                 self.remote_launch = Some(RemoteLaunch {
                     host: host.clone(),
                     path,
@@ -26919,29 +27857,172 @@ impl App {
         }
     }
 
-    /// Cmd+K D: snapshot the active pane's scrollback + screen into a
-    /// scratch editor tab named after the pane. Read from the same
-    /// `grid_lines` the find bar searches; the blank live-screen tail is
-    /// trimmed so the buffer ends at the last real row.
+    /// Cmd+K D: snapshot the active pane's scrollback + screen. A pane that
+    /// showed colour is written, colours as SGR, to a private file under the
+    /// scrollback dir and opened as a pinned rendered-log tab (#257); a pane
+    /// with no colour goes into the scratch editor tab it always had. Read
+    /// from one grid pass (`grid_lines_ansi`, the plain twin of which is the
+    /// text the find bar searches); the blank live-screen tail is trimmed so
+    /// the buffer ends at the last real row.
     fn open_scrollback_in_editor(&mut self) {
-        let (lines, _) = self.terminal().grid_lines();
-        let last = lines
+        // Plain and coloured rows come from ONE grid read, so a redact rule
+        // is applied to the row it matches and never to a neighbour that
+        // shifted in while a second read was taken.
+        let rows_both = self.terminal().grid_lines_ansi();
+        let last = rows_both
             .iter()
-            .rposition(|l| !l.trim().is_empty())
+            .rposition(|(plain, _)| !plain.trim().is_empty())
             .map_or(0, |i| i + 1);
-        // Every redact rule applies here, copy-mode or not: this buffer
-        // leaves the pane as bytes (#360).
-        let text = crate::triggers::mask_text(&lines[..last].join("\n"), &self.triggers, false);
         let pane = self.terminal().label();
         let pane = if pane.is_empty() { "terminal" } else { pane };
         let label = format!("{pane} scrollback");
+        // Every redact rule applies here, copy-mode or not: this buffer
+        // leaves the pane as bytes (#360). Masking works on the plain text;
+        // a row the rules touch keeps its masked plain form and gives up its
+        // colour, since a mask spliced between escapes could break them.
+        let mut plain_rows: Vec<String> = Vec::with_capacity(last);
+        let mut rows: Vec<String> = Vec::with_capacity(last);
+        let mut fallback_reason: Option<String> = None;
+        for (plain, ansi) in &rows_both[..last] {
+            let masked = crate::triggers::mask_text(plain, &self.triggers, false);
+            rows.push(if masked == *plain {
+                ansi.clone()
+            } else {
+                masked.clone()
+            });
+            plain_rows.push(masked);
+        }
+        // A pane that showed colour lands in the rendered log view (#257),
+        // which indexes from disk, so the rows go to a real file under the
+        // scrollback dir, one per pane, overwritten on each dump. The gate
+        // uses the open path's own sniff, so the file can never open as an
+        // editable buffer of raw escapes. A pane with no colour keeps the
+        // scratch buffer it always had.
+        if scrollback_opens_as_log(&rows) {
+            // Keyed on the pane's stable uid as well as its label: two
+            // unnamed shells both read `terminal`, and two labels can
+            // sanitise to one name, and neither may overwrite the other's
+            // dump or close its tab.
+            // The uid is a per-process counter that restarts at 1, so two
+            // croft processes would share a name without the pid, as the
+            // session handoff file learned before this one.
+            let file = self.scrollback_dir.join(format!(
+                "{}-{}-{}-scrollback.log",
+                pane.chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    })
+                    .collect::<String>(),
+                std::process::id(),
+                self.terminal().uid()
+            ));
+            // A tab from an earlier dump holds a byte index over the OLD
+            // file; it is closed so the open below rebuilds the view over the
+            // new bytes rather than reading them through the stale index.
+            self.close_tabs_with_path_everywhere(&file);
+            // Terminal output is written owner-only whatever the umask: the
+            // redaction rules are finite, and another local account has no
+            // business reading a shell's history.
+            let written = write_private(&self.scrollback_dir, &file, &(rows.join("\n") + "\n"));
+            // Dumps left by croft processes that have exited are reaped on
+            // the way past: nothing will ever overwrite them. Here rather
+            // than at startup because this is the one place the dir grows,
+            // so its size is bounded at the moment it would grow; the cost
+            // is one `read_dir` and one `kill(0)` per stale file, paid by a
+            // command that just wrote a scrollback to disk.
+            if written.is_ok() {
+                reap_dead_scrollback_dumps(&self.scrollback_dir);
+            }
+            // Pinned, as the scratch buffer was: a later file peek must not
+            // replace the dump, and two panes' dumps must not share a slot.
+            let opened = written
+                .map_err(anyhow::Error::from)
+                .and_then(|()| self.editor.open_pinned(&file));
+            match opened {
+                Ok(()) if self.editor.log.is_some() => {
+                    self.focus_pane(Pane::Editor);
+                    self.sync_open_file_poll_mtime();
+                    self.status = format!("Opened {last} scrollback lines as a rendered log");
+                    return;
+                }
+                Ok(()) => {
+                    // The open path decided this was not a log after all:
+                    // never leave the user an editable file of raw escapes,
+                    // nor the file itself, which nothing will read now.
+                    self.close_tabs_with_path_everywhere(&file);
+                    let _ = std::fs::remove_file(&file);
+                    fallback_reason = Some(String::from(
+                        "Rendered scrollback unavailable; opened as text",
+                    ));
+                }
+                Err(e) => {
+                    // Fall through to the plain scratch buffer rather than
+                    // lose the dump: a full disk still leaves the text. A
+                    // partial file, if one was written, serves nobody.
+                    let _ = std::fs::remove_file(&file);
+                    fallback_reason = Some(format!(
+                        "Rendered scrollback unavailable ({e}); opened as text"
+                    ));
+                }
+            }
+        }
+        let text = plain_rows.join("\n");
         match self.editor.open_text_buffer(Path::new(&label), &text) {
             Ok(()) => {
                 self.focus_pane(Pane::Editor);
                 self.sync_open_file_poll_mtime();
-                self.status = format!("Opened {last} scrollback lines in the editor");
+                // The reason travels in a local, not in `status`: a message
+                // left by an earlier action must not be mistaken for one
+                // this dump produced.
+                self.status = fallback_reason
+                    .unwrap_or_else(|| format!("Opened {last} scrollback lines in the editor"));
             }
             Err(e) => self.status = format!("Open scrollback failed: {e}"),
+        }
+    }
+
+    /// Close every tab holding `path`, in the focused group and in every
+    /// other one: a tab in an unfocused group would otherwise keep reading a
+    /// rewritten file through its old index, and nothing heals it. Every
+    /// match goes, not the first: `push_editor` can open one path twice. A
+    /// group emptied by this is pruned as every other close path prunes it;
+    /// the focused group is left blank for the caller to refill.
+    fn close_tabs_with_path_everywhere(&mut self, path: &Path) {
+        // `close_tab` on a group's last tab leaves a blank editor with no
+        // path, so the search finds nothing more and the loop ends.
+        while let Some(idx) = self.editor.find_tab_with_path(path) {
+            self.editor.close_tab(idx);
+        }
+        // The prune names the groups THIS close emptied, by position: a
+        // group the user left blank on purpose (a split with one side
+        // cleared) is not this command's to fold away, and a blankness
+        // sweep would take it along with the emptied one.
+        let pre_blank: Vec<bool> = self
+            .editor_layout
+            .inactive_groups()
+            .iter()
+            .map(|g| g.is_blank_initial())
+            .collect();
+        let mut doomed = Vec::new();
+        for (i, group) in self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .enumerate()
+        {
+            let mut closed_here = false;
+            while let Some(idx) = group.find_tab_with_path(path) {
+                group.close_tab(idx);
+                closed_here = true;
+            }
+            if closed_here && group.is_blank_initial() && !pre_blank[i] {
+                doomed.push(i);
+            }
+        }
+        if !doomed.is_empty() {
+            self.editor_layout.prune_inactive_at(&doomed);
         }
     }
 
@@ -27249,7 +28330,7 @@ impl App {
                     .position(|t| t.shell_pid() == Some(pid))
             })
             .unwrap_or(self.active_terminal);
-        self.active_terminal = idx;
+        self.reveal_terminal_pane(idx);
         self.set_bottom_panel_tab(BottomPanelTab::Terminal);
         self.focus_pane(Pane::Terminal);
         let needle: String = entry.line.trim_end().chars().take(60).collect();
@@ -27711,7 +28792,7 @@ impl App {
             .position(|t| pane_is_idle_at(t, &block.pane_name, &root))
         {
             self.arm_block_capture(&block, idx);
-            self.active_terminal = idx;
+            self.reveal_terminal_pane(idx);
             self.terminals[idx].write_input(bytes.as_bytes());
             self.show_terminal = true;
             self.focus_pane(Pane::Terminal);
@@ -28391,6 +29472,27 @@ impl App {
         };
         if state.last.elapsed() < std::time::Duration::from_millis(30) {
             return false;
+        }
+        // A forwarded click-only drag (#474) may be on a pane other than the
+        // active one: Cmd+] moves the active pane mid-drag, and no further
+        // Drag event arrives while the pointer rests past the edge to
+        // re-check. This tick scrolls the ACTIVE pane, so it stands down
+        // rather than walk the wrong pane's scrollback -- HELD, not dropped:
+        // the parked pointer sends nothing to re-arm, so cycling back to the
+        // origin pane must resume the scroll on its own (and the untouched
+        // `last` stamp makes that first tick fire at once).
+        if let Some(fp) = self.terminal_pointer_forwarded {
+            let Some(idx) = self.forwarded_pane_index(fp) else {
+                // The origin pane is gone (closed by its button while the
+                // pointer was parked): nothing can ever resume this, so
+                // drop the gesture rather than hold it to the release.
+                self.terminal_pointer_forwarded = None;
+                self.terminal_select_autoscroll = None;
+                return false;
+            };
+            if idx != self.active_terminal {
+                return false;
+            }
         }
         self.terminal_mut().autoscroll_select(state.dir, state.col);
         self.terminal_select_autoscroll = Some(TerminalSelectAutoScroll {
@@ -29484,7 +30586,7 @@ impl App {
             .or_else(|| self.terminals.iter().position(|t| t.agent().is_some()));
         match pick {
             Some(idx) => {
-                self.active_terminal = idx;
+                self.reveal_terminal_pane(idx);
                 self.set_bottom_panel_tab(BottomPanelTab::Terminal);
             }
             // The chip is showing a review queue whose agents have all gone:
@@ -29511,6 +30613,9 @@ impl App {
     fn refresh_terminal_labels(&mut self) -> bool {
         let mut changed = false;
         // Apply whatever the last background lookup resolved.
+        if let Some(samples) = self.ssh_rx.try_iter().last() {
+            self.apply_ssh_samples(samples);
+        }
         if let Some(labels) = self.label_rx.try_iter().last() {
             for (shell_pid, name) in &labels {
                 if let Some(t) = self
@@ -29547,15 +30652,32 @@ impl App {
             }
             if !targets.is_empty() {
                 let tx = self.label_tx.clone();
+                let ssh_tx = self.ssh_tx.clone();
+                let sample_ssh = !self.remote_offer_disabled;
                 let inflight = self.label_inflight.clone();
                 inflight.store(true, std::sync::atomic::Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    let resolved: Vec<(i32, String)> = targets
+                    let named: Vec<(i32, i32, String)> = targets
                         .into_iter()
                         .filter_map(|(sp, fg)| {
-                            crate::widgets::terminal::process_name(fg).map(|n| (sp, n))
+                            crate::widgets::terminal::process_name(fg).map(|n| (sp, fg, n))
                         })
                         .collect();
+                    // The ssh-pane offer (#364) rides this thread: only a
+                    // pane whose foreground IS ssh pays the argv read (a
+                    // whole-process-table enumeration), and the config
+                    // parse runs once per pass and only when one does. The
+                    // verdicts themselves are `remote::ssh_pane_samples`,
+                    // kept pure so the gate is testable without a pane.
+                    if sample_ssh {
+                        let _ = ssh_tx.send(crate::remote::ssh_pane_samples(
+                            &named,
+                            crate::remote::discover_ssh_targets,
+                            crate::widgets::terminal::process_cmdline,
+                        ));
+                    }
+                    let resolved: Vec<(i32, String)> =
+                        named.into_iter().map(|(sp, _, n)| (sp, n)).collect();
                     let _ = tx.send(resolved);
                     inflight.store(false, std::sync::atomic::Ordering::Relaxed);
                 });
@@ -30501,18 +31623,91 @@ impl App {
             return;
         };
         let path = finder.selected_entry().map(|e| e.path.clone());
+        let hint = finder.line_hint();
         if let Some(path) = path {
             self.close_file_finder();
-            match self.editor.open_preview(&path) {
+            // `alpha:236-239` (#472): land on the line, centred, and select
+            // the range so it reads as highlighted; `alpha:236` lands with
+            // nothing selected, since one line is a place, not a span.
+            let opened = match hint {
+                Some(hint) => {
+                    let row = hint.line.saturating_sub(1);
+                    let col = hint.col.map_or(0, |c| c.saturating_sub(1));
+                    self.open_at(&path, row, col)
+                }
+                None => self.editor.open_preview(&path),
+            };
+            match opened {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
+                    // A range an earlier hinted pick installed is cleared if
+                    // it is still the selection in its tab, so neither
+                    // `alpha:12` nor a bare `alpha` keeps showing it; a
+                    // selection the user made or extended since is theirs
+                    // and stays. Stale secondary carets never survive a
+                    // pick, as they never survive a click: the next
+                    // keystroke would edit at every one of them.
+                    if let Some((prev, sel)) = self.quick_open_range.take()
+                        && let Some(idx) = self.editor.find_tab_with_path(&prev)
+                        && self.editor.editors[idx].selection == Some(sel)
+                    {
+                        self.editor.editors[idx].selection = None;
+                    }
+                    if hint.is_some() {
+                        self.editor.clear_selection();
+                    }
+                    self.editor.collapse_carets();
+                    if let Some(end) = hint.and_then(|h| h.end) {
+                        let start = self.editor.cursor_row;
+                        let last = self.editor.lines.len().saturating_sub(1);
+                        let end_row = end.saturating_sub(1).clamp(start, last);
+                        let end_col = self
+                            .editor
+                            .lines
+                            .get(end_row)
+                            .map_or(0, |l| l.chars().count());
+                        let sel = crate::widgets::editor::EditorSelection {
+                            anchor: (end_row, end_col),
+                            head: (start, 0),
+                        };
+                        self.editor.selection = Some(sel);
+                        self.quick_open_range = Some((path.to_path_buf(), sel));
+                        // The landing line is the head, and the cursor sits at
+                        // the head as every other selection-installing path
+                        // leaves it: Shift+motion extends from the cursor, and
+                        // the paint-time clamp keeps the cursor on screen, so
+                        // a range taller than the viewport still shows the
+                        // line the user asked for, centred by `open_at`, with
+                        // the selection running down from it.
+                        self.editor.cursor_row = start;
+                        self.editor.cursor_col = 0;
+                    }
                     // VS Code's `explorer.autoReveal` analogue:
                     // expand every parent dir of the picked file
                     // and park the cursor on its row so the user
                     // sees where in the workspace the file lives.
                     self.tree.reveal_path(&path);
                     self.focus_pane(Pane::Editor);
-                    self.status = format!("Opened {}", self.status_path(&path));
+                    // The status names the lines landed on: a number past the
+                    // file (or one that saturated in the parser) was clamped
+                    // above, and the clamped truth is the useful signal.
+                    let last_line = self.editor.lines.len().max(1);
+                    self.status = match hint {
+                        Some(hint) => match hint.end {
+                            Some(end) => format!(
+                                "Opened {}:{}-{}",
+                                self.status_path(&path),
+                                hint.line.min(last_line),
+                                end.min(last_line)
+                            ),
+                            None => format!(
+                                "Opened {}:{}",
+                                self.status_path(&path),
+                                hint.line.min(last_line)
+                            ),
+                        },
+                        None => format!("Opened {}", self.status_path(&path)),
+                    };
                 }
                 Err(e) => {
                     self.status = format!("Open failed: {e}");
@@ -30587,6 +31782,9 @@ impl App {
         let ext_commands: Vec<crate::widgets::command_palette::ExtensionCommand> =
             crate::mcp::registry::contributed_commands()
                 .into_iter()
+                .chain(crate::mcp::registry::contributed_viewer_commands_in_dir(
+                    &self.config_dir,
+                ))
                 .map(|c| crate::widgets::command_palette::ExtensionCommand {
                     ext_id: c.ext_id,
                     id: c.id,
@@ -31233,6 +32431,136 @@ impl App {
         }
     }
 
+    /// Open `path` in an extension-contributed viewer (#465): a new terminal
+    /// pane running the tool on the file, focused. `{file}` in the declared
+    /// args is the file's path. A provisioned tool that is not installed yet
+    /// has its managed install kicked off and the user is told to run the
+    /// command again once it lands, the way a sidecar's first run behaves.
+    pub fn open_in_viewer(
+        &mut self,
+        viewer: &crate::mcp::registry::ContributedViewer,
+        path: &Path,
+    ) {
+        // The pane spawn takes `String` args, so a name that is not valid
+        // UTF-8 could only be handed over mangled, and the tool would open a
+        // different path. Refuse with the reason rather than open the wrong
+        // file.
+        let Some(file) = path.to_str().map(str::to_owned) else {
+            self.status = format!(
+                "{}: the file's name is not valid UTF-8, so it cannot be passed to the viewer",
+                viewer.label
+            );
+            return;
+        };
+        // A viewer spawns a program named by a manifest, exactly what the
+        // sidecar consent gate exists for, and manifests can arrive from the
+        // signed remote index, not only the bundled catalog. The first run of
+        // an extension's viewer shows the exact command line and spawns
+        // nothing until the user allows it; allowing resumes this open.
+        if !self.consented_extensions.contains(&viewer.ext_id) {
+            use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+            let spawn_line = std::iter::once(viewer.command.clone())
+                .chain(viewer.args.iter().map(|a| a.replace("{file}", &file)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.open_input_prompt(
+                InputPrompt::new(
+                    InputPurpose::ViewerConsent {
+                        key: viewer.key(),
+                        path: path.to_path_buf(),
+                    },
+                    format!("Allow {} to run:  {}", viewer.ext_id, spawn_line),
+                    "Enter to allow · Esc to cancel",
+                )
+                .with_value("allow"),
+            );
+            return;
+        }
+        let install_name = viewer.install_name();
+        let program = match viewer.provision.as_ref() {
+            None => viewer.command.clone(),
+            Some(provision) => {
+                match crate::lsp::install::provisioned_command(&install_name, provision) {
+                    Some((command, _extra_paths)) => command,
+                    None => {
+                        let name: &'static str = crate::lsp::install::static_name(&install_name);
+                        let config = crate::lsp::config::ServerConfig {
+                            name,
+                            command: viewer.command.clone(),
+                            args: viewer.args.clone(),
+                            language: crate::lsp::config::Language("viewer"),
+                            initialization_options: None,
+                            provision: Some(provision.clone()),
+                        };
+                        crate::lsp::install::resolve_managed(&config, provision, true);
+                        self.status =
+                            format!("Installing {}; run it again once it lands", viewer.label);
+                        return;
+                    }
+                }
+            }
+        };
+        let args: Vec<String> = viewer
+            .args
+            .iter()
+            .map(|a| a.replace("{file}", &file))
+            .collect();
+        let cwd = path
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.workspace_root().to_path_buf());
+        match PtyTerminal::new_running(&program, &args, &cwd) {
+            Ok(term) => {
+                let slot = (self.active_terminal + 1).min(self.terminals.len());
+                self.terminals.insert(slot, term);
+                self.active_terminal = slot;
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.focus_pane(Pane::Terminal);
+                self.status = format!("{}: {}", viewer.label, self.status_path(path));
+            }
+            Err(e) => {
+                self.status = format!("{} failed to start: {e}", viewer.label);
+            }
+        }
+    }
+
+    /// A palette `viewer:<extension id>/<viewer id>` row: open the active
+    /// editor file in that viewer, if the file is a kind it handles.
+    fn run_viewer_command(&mut self, viewer_id: &str) {
+        let Some(viewer) = crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, viewer_id)
+        else {
+            self.status = format!("Viewer '{viewer_id}' is unavailable");
+            return;
+        };
+        self.open_active_file_in_viewer(&viewer);
+    }
+
+    /// The palette row's work once its viewer is known: the active editor
+    /// file must exist and be a kind the viewer handles, or the status line
+    /// says which it is not.
+    fn open_active_file_in_viewer(&mut self, viewer: &crate::mcp::registry::ContributedViewer) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = format!("{}: open a file first", viewer.label);
+            return;
+        };
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !viewer.extensions.contains(&ext) {
+            self.status = format!(
+                "{}: the active file is not one of .{}",
+                viewer.label,
+                viewer.extensions.join(" / .")
+            );
+            return;
+        }
+        self.open_in_viewer(viewer, &path);
+    }
+
     /// Dispatch a chosen palette row: a built-in command runs inline; an
     /// extension-contributed command routes through the MCP sidecar path.
     fn run_palette_item(&mut self, item: crate::widgets::command_palette::PaletteItem) {
@@ -31248,16 +32576,26 @@ impl App {
     /// argument (if any) via an input popup, then spawns the server off-thread.
     fn run_extension_command(&mut self, command_id: &str) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-        let Some(resolved) = crate::mcp::registry::resolve_command(command_id) else {
+        // Viewer rows (#465) run a terminal program on the active file; no
+        // sidecar, so none of the MCP consent or argument flow below applies.
+        if let Some(viewer_id) =
+            command_id.strip_prefix(crate::mcp::registry::VIEWER_COMMAND_PREFIX)
+        {
+            self.run_viewer_command(viewer_id);
+            return;
+        }
+        let Some(resolved) =
+            crate::mcp::registry::resolve_command_in_dir(&self.config_dir, command_id)
+        else {
             self.status = format!("Extension command '{command_id}' is unavailable");
             return;
         };
         // First-run consent gate: never spawn a sidecar until the user has
         // approved this extension, shown the exact command line croft will run.
-        let consented = crate::prefs::Prefs::load_or_default()
-            .mcp_consented
-            .contains(&resolved.ext_id);
-        if !consented {
+        // One set answers this gate and the viewer gate alike: it is loaded
+        // from prefs at startup and fed by every grant since, so the two
+        // cannot disagree, whatever became of a prefs write.
+        if !self.consented_extensions.contains(&resolved.ext_id) {
             let spawn_line = std::iter::once(resolved.server.command.clone())
                 .chain(resolved.server.args.iter().cloned())
                 .collect::<Vec<_>>()
@@ -31599,6 +32937,9 @@ impl App {
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
+            Cmd::ToggleLogHighlight => self.toggle_log_highlight(),
+            Cmd::CollapseTerminalPane => self.collapse_active_terminal_pane(),
+            Cmd::RestoreTerminalPanes => self.restore_all_terminal_panes(),
             Cmd::ToggleSecretRedaction => self.toggle_secret_redaction(),
             Cmd::RevealRedactedSecrets => self.reveal_redacted_secrets(),
             Cmd::SearchFromTerminal => self.search_from_last_terminal_command(),
@@ -34751,17 +36092,20 @@ impl App {
         // one the user had aimed at the TUI in the terminal. Same predicate as
         // the dispatch below, indexed by the pane that was CLICKED.
         let child_owns_pointer = bound_mouse.is_some_and(|(ctx, gesture, _)| {
-            // ONLY THE WHEEL. A tracking child can only "own" a gesture croft
-            // actually forwards, and croft forwards exactly one kind:
-            // `report_mouse` has three production call sites and all three
-            // construct WheelUp/WheelDown. No path constructs
-            // MouseButtonKind::Left/Middle/Right outside `encode_mouse_report`'s
-            // own tests, so declining a bound CLICK hands it to nobody -- and
-            // the built-in Down(Left) arm then runs anyway, since unlike
-            // click-to-move-cursor it never consults `mouse_reporting()`.
+            // Only the gestures croft actually FORWARDS: a tracking child can
+            // own nothing else. That is the wheel (both wheel arms below) and
+            // the LEFT button -- press in the Down(Left) arm, motion in Drag,
+            // release in Up -- since #474, when clicking a TUI's own controls
+            // (Claude Code's diff-panel ×) started working. `Click` and
+            // `DoubleClick` are both Down(Left), so both are the child's.
+            // Middle and right clicks are still croft's (paste, the context
+            // menu), so a binding on them fires over a tracking child too.
             matches!(
                 gesture.kind,
-                crate::keymap::GestureKind::WheelUp | crate::keymap::GestureKind::WheelDown
+                crate::keymap::GestureKind::WheelUp
+                    | crate::keymap::GestureKind::WheelDown
+                    | crate::keymap::GestureKind::Click
+                    | crate::keymap::GestureKind::DoubleClick
             ) && matches!(ctx, crate::keymap::MouseContext::Terminal)
                 && terminal_hit.is_some_and(|idx| {
                     // Tracking is not enough: `terminal_at_pos` hit-tests
@@ -34815,12 +36159,16 @@ impl App {
         // that state anyway: swallowing would cost the built-in and buy
         // nothing. Omitting it here disabled the built-in Ctrl+click over
         // every full-screen TUI for anyone who bound only `ctrl+double_click`.
-        // `child_owns_pointer` used to carry this branch's deferral too, but it
-        // is wheel-only now (croft forwards no clicks), so it is always false
-        // here and cannot decide anything. The question the swallow actually
-        // needs answered is narrower: would declining this click COST the user
-        // a built-in that was going to act? For Ctrl/Cmd the built-in opens a
-        // URL or a file reference, so defer when either is under the cursor.
+        // Over a tracking child the click is forwarded to it (#474), so
+        // `child_owns_pointer` is true for a left click there and the swallow
+        // steps aside: the recording above already declined, the bound double
+        // is unreachable, and swallowing would only cost the child its press.
+        // Where the child does not own it, the question is narrower: would
+        // declining this click COST the user a built-in that was going to act?
+        // For Ctrl/Cmd the built-in opens a URL or a file reference, so defer
+        // when either is under the cursor -- that link-open runs BEFORE the
+        // forward in the Down(Left) arm, so it applies over a tracking child
+        // as well.
         let builtin_would_act = matches!(bound_mouse, Some((ctx, _, _)) if
             matches!(ctx, crate::keymap::MouseContext::Terminal))
             && (m.modifiers.contains(KeyModifiers::CONTROL)
@@ -34830,6 +36178,7 @@ impl App {
         if let Some((ctx, gesture, None)) = bound_mouse
             && !gesture.mods.is_empty()
             && !builtin_would_act
+            && !child_owns_pointer
             && self.keymap.is_double_click_prefix(gesture, ctx)
         {
             // Focus still moves, as a click in a pane always does — otherwise
@@ -35149,11 +36498,33 @@ impl App {
                 // Terminal pane right-click: the `…`-overflow equivalent. Rename
                 // and Clear (the gaps vs VS Code's toolbar); split/close already
                 // have buttons and chords.
+                // A folded pane clears its `last_area`, so `terminal_at_pos`
+                // can never name one and the menu's "Expand Terminal" branch
+                // was unreachable while KEYBINDINGS.md advertised it (#313).
+                // Fall back to the strips so a folded pane has a second
+                // gesture rather than left-click alone.
+                let terminal_hit = terminal_hit.or_else(|| {
+                    self.terminal_strip_rects
+                        .iter()
+                        .position(|r| rect_contains(*r, m.column, m.row))
+                });
                 if self.bottom_panel_tab == BottomPanelTab::Terminal
                     && let Some(idx) = terminal_hit
                 {
                     self.active_terminal = idx;
                     self.focus_pane(Pane::Terminal);
+                    // A folded pane cannot BE the active one: `focus_pane`
+                    // runs `sync_focus_flags`, whose invariant walks focus to
+                    // the nearest expanded neighbour rather than leave it on
+                    // a pane with nothing painted. Entries carrying `idx` are
+                    // unaffected, but the ones that read `active_terminal`
+                    // would act on that neighbour while this menu names THIS
+                    // pane - and the broadcast entry read its label from
+                    // `idx` while toggling the neighbour, so it could say
+                    // "Exclude from Broadcast" and include a different pane.
+                    // Each of them is also a gesture on a grid the user
+                    // cannot see while the pane is a strip.
+                    let folded = self.terminals.get(idx).is_some_and(|t| t.collapsed);
                     let mut items = vec![
                         MenuEntry::Item {
                             label: String::from("Rename Terminal"),
@@ -35163,23 +36534,27 @@ impl App {
                             label: String::from("Clear"),
                             action: MenuAction::ClearTerminal(idx),
                         },
-                        MenuEntry::Item {
-                            label: String::from("Quick Select"),
-                            action: MenuAction::TerminalQuickSelect,
-                        },
-                        MenuEntry::Item {
-                            label: String::from("Copy Mode"),
-                            action: MenuAction::TerminalCopyMode,
-                        },
-                        MenuEntry::Item {
-                            label: String::from("Command History"),
-                            action: MenuAction::TerminalCommandHistory,
-                        },
-                        MenuEntry::Item {
-                            label: String::from("Open Scrollback in Editor"),
-                            action: MenuAction::OpenScrollbackInEditor,
-                        },
                     ];
+                    if !folded {
+                        items.extend([
+                            MenuEntry::Item {
+                                label: String::from("Quick Select"),
+                                action: MenuAction::TerminalQuickSelect,
+                            },
+                            MenuEntry::Item {
+                                label: String::from("Copy Mode"),
+                                action: MenuAction::TerminalCopyMode,
+                            },
+                            MenuEntry::Item {
+                                label: String::from("Command History"),
+                                action: MenuAction::TerminalCommandHistory,
+                            },
+                            MenuEntry::Item {
+                                label: String::from("Open Scrollback in Editor"),
+                                action: MenuAction::OpenScrollbackInEditor,
+                            },
+                        ]);
+                    }
                     // Undo close only appears while a parked pane is alive
                     // to restore (the grace window).
                     if !self.closed_terminals.is_empty() {
@@ -35199,6 +36574,19 @@ impl App {
                             }),
                             action: MenuAction::ToggleMaximizeTerminal(idx),
                         });
+                        // Collapse is meaningless while maximize owns the
+                        // whole panel and the flags are ignored, so the entry
+                        // is not offered there.
+                        if !self.terminal_pane_maximized {
+                            items.push(MenuEntry::Item {
+                                label: String::from(if self.terminals[idx].collapsed {
+                                    "Expand Terminal"
+                                } else {
+                                    "Collapse Terminal"
+                                }),
+                                action: MenuAction::ToggleCollapseTerminal(idx),
+                            });
+                        }
                         items.push(MenuEntry::Item {
                             label: String::from(if self.broadcast_input {
                                 "Stop Broadcast Input"
@@ -35207,7 +36595,7 @@ impl App {
                             }),
                             action: MenuAction::ToggleBroadcastInput,
                         });
-                        if self.broadcast_input {
+                        if self.broadcast_input && !folded {
                             items.push(MenuEntry::Item {
                                 label: String::from(if self.terminals[idx].broadcast_excluded {
                                     "Include in Broadcast"
@@ -35251,7 +36639,8 @@ impl App {
                     let target_dir =
                         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root);
                     let selection = self.tree.action_paths();
-                    let mut items = build_tree_context_menu_items(
+                    let mut items = build_tree_context_menu_items_in_dir(
+                        &self.config_dir,
                         node,
                         &self.tree.root,
                         &selection,
@@ -35566,7 +36955,21 @@ impl App {
                         && rect_contains(self.outline.last_scrollbar, m.column, m.row);
                     let graph_bar = self.sidebar_view == SidebarView::SourceControl
                         && rect_contains(self.commit_graph.last_scrollbar, m.column, m.row);
+                    // A collapsed terminal pane's one-column strip shares this
+                    // zone too (#468): the leftmost pane starts on the seam
+                    // itself, and with the side bar on the right the last
+                    // pane ends one column short of it. The strip's only
+                    // gesture is the click that unfolds it, so the seam must
+                    // not take that click as a resize, or a folded pane on
+                    // that edge can never be brought back. The rects are
+                    // cleared whenever the panel is not painted, so a stale
+                    // strip cannot deaden the seam later.
+                    let on_strip = self
+                        .terminal_strip_rects
+                        .iter()
+                        .any(|r| rect_contains(*r, m.column, m.row));
                     if (m.column == x || m.column == x.saturating_sub(1))
+                        && !on_strip
                         && !outline_bar
                         && !graph_bar
                         && self.decoration_dot_at(m.column, m.row).is_none()
@@ -35773,6 +37176,25 @@ impl App {
                     .position(|r| rect_contains(*r, m.column, m.row))
                 {
                     self.open_terminal_profile_picker(idx);
+                    return;
+                }
+                if let Some(idx) = self
+                    .terminal_collapse_buttons
+                    .iter()
+                    .position(|r| rect_contains(*r, m.column, m.row))
+                {
+                    self.toggle_terminal_collapse(idx);
+                    return;
+                }
+                // A strip is one column wide, so it is tested before the
+                // splitter and the pane body below: anything that claims the
+                // click first makes a folded pane impossible to unfold.
+                if let Some(idx) = self
+                    .terminal_strip_rects
+                    .iter()
+                    .position(|r| rect_contains(*r, m.column, m.row))
+                {
+                    self.toggle_terminal_collapse(idx);
                     return;
                 }
                 if let Some(idx) = self
@@ -36653,6 +38075,42 @@ impl App {
                     {
                         return;
                     }
+                    // A child tracking the mouse (Claude Code's diff panel,
+                    // htop, lazygit, vim with `mouse=a`) gets the click
+                    // itself (#474): an SGR/X10 press now, motion under
+                    // 1002/1003 as the drag goes, and the release on
+                    // mouse-up, all aimed at THIS pane via
+                    // `terminal_pointer_forwarded`. Shift is the bypass,
+                    // the same one the wheel has: croft's own selection when
+                    // held. `report_mouse` is the whole gate -- it declines
+                    // when the child is not tracking or the cell is on the
+                    // border, and either way the click falls through to the
+                    // selection below. The Cmd/Ctrl link-open above still
+                    // wins, as in VS Code and iTerm2: the modifier is
+                    // croft's, and Cmd has no mouse-report encoding anyway.
+                    // A stale croft highlight goes, as it does for a plain
+                    // click anywhere else -- the user is aiming at the TUI,
+                    // not at the text under it -- and the double-click
+                    // tracker is not armed: the pair, if any, is the child's.
+                    if !m.modifiers.contains(KeyModifiers::SHIFT)
+                        && self.terminal_mut().report_mouse(
+                            MouseButtonKind::Left,
+                            MouseAction::Press,
+                            m.column,
+                            m.row,
+                            mouse_mods(&m),
+                        )
+                    {
+                        self.terminal_mut().clear_selection();
+                        self.editor.clear_selection();
+                        self.terminal_pointer_forwarded = Some(ForwardedPointer {
+                            pane: self.terminals[idx].uid(),
+                            press: (m.column, m.row),
+                            selecting: false,
+                        });
+                        self.terminal_click.clear();
+                        return;
+                    }
                     // Shift+click extends the existing selection to the
                     // clicked cell (VS Code / iTerm2) instead of starting a
                     // fresh one.
@@ -36784,6 +38242,61 @@ impl App {
                 // the one tracker not on this list behaved differently from
                 // every other one for no reason a user could discover.
                 self.modified_click.clear_if_moved(m.column, m.row);
+                // A drag after a press that went to a mouse-tracking child
+                // (#474) belongs to whoever can use it. A child that asked
+                // for motion (1002/1003) gets it, at the pane that got the
+                // press, clamped to that pane's grid so a pointer that
+                // wanders out reports the edge cell instead of vanishing. A
+                // child that asked only for clicks (1000: Claude Code) has
+                // no use for a drag, so the drag is croft's text selection,
+                // anchored at the PRESS cell on its first motion so nothing
+                // is lost by the press having been forwarded, then extended
+                // here -- on the ORIGIN pane, found by uid, not through
+                // `terminal_mut()`: Cmd+] can move the active pane while the
+                // button is held, and the generic drag path below would then
+                // extend the wrong pane's selection and leave this one at its
+                // one-cell anchor. Edge auto-scroll is armed only while the
+                // origin is still the active pane, because the tick that
+                // services it scrolls the active one. The child still gets
+                // the release either way. A gesture whose pane is gone ends
+                // here with nothing to deliver.
+                if let Some(fp) = self.terminal_pointer_forwarded {
+                    let Some(idx) = self.forwarded_pane_index(fp) else {
+                        self.terminal_pointer_forwarded = None;
+                        self.terminal_select_autoscroll = None;
+                        return;
+                    };
+                    if self.terminals[idx].mouse_motion_reporting() {
+                        let (col, row) = self.terminals[idx].clamp_to_grid(m.column, m.row);
+                        // Motion reporting was just checked, so the verdict
+                        // is known; `let _` says "already decided", not
+                        // "ignored". The encoder re-checks the same modes
+                        // as its own guard; the two are intentional.
+                        let _ = self.terminals[idx].report_mouse(
+                            MouseButtonKind::Left,
+                            MouseAction::Motion,
+                            col,
+                            row,
+                            mouse_mods(&m),
+                        );
+                        return;
+                    }
+                    if !fp.selecting {
+                        self.terminals[idx].start_selection_at(fp.press.0, fp.press.1);
+                        self.terminal_pointer_forwarded = Some(ForwardedPointer {
+                            selecting: true,
+                            ..fp
+                        });
+                    }
+                    let dir = self.terminals[idx].drag_select_to(m.column, m.row);
+                    self.terminal_select_autoscroll = (dir != 0 && idx == self.active_terminal)
+                        .then_some(TerminalSelectAutoScroll {
+                            dir,
+                            col: m.column,
+                            last: std::time::Instant::now(),
+                        });
+                    return;
+                }
                 // Terminal drag-selection is handled before the per-pane
                 // branches so it keeps extending even when the pointer
                 // leaves the pane: dragging past the bottom edge is how the
@@ -36882,6 +38395,48 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // The release of a press that was forwarded to a tracking
+                // child goes to the same pane (#474), clamped to its grid
+                // like the drag. `report_mouse` may decline if the child
+                // dropped tracking mid-press, which is the child's own
+                // choice; there is nothing croft should do with the release
+                // instead. The pane is found by uid, so one closed under
+                // the held button is simply gone rather than mistaken for
+                // its neighbour. The whole gesture ends here, aimed at the
+                // ORIGIN pane and never the active one: a click, or a drag
+                // the child asked for, gets no copy-on-select, click-to-move,
+                // annotation or secret popup; a drag the Drag arm turned into
+                // croft's selection is finalised on that pane (`end_drag`,
+                // then copy-on-select), the same tail the ordinary mouse-up
+                // below runs for the active pane.
+                if let Some(fp) = self.terminal_pointer_forwarded.take() {
+                    if let Some(idx) = self.forwarded_pane_index(fp) {
+                        let (col, row) = self.terminals[idx].clamp_to_grid(m.column, m.row);
+                        self.terminals[idx].report_mouse(
+                            MouseButtonKind::Left,
+                            MouseAction::Release,
+                            col,
+                            row,
+                            mouse_mods(&m),
+                        );
+                        if fp.selecting {
+                            self.terminals[idx].end_drag();
+                            if self.copy_on_select
+                                && self.terminals[idx]
+                                    .selection()
+                                    .is_some_and(|s| s.has_area())
+                            {
+                                let text = self
+                                    .terminal_text_for_copy(self.terminals[idx].selection_text());
+                                if !text.is_empty() {
+                                    copy_to_clipboard(&text);
+                                }
+                            }
+                        }
+                    }
+                    self.terminal_select_autoscroll = None;
+                    return;
+                }
                 // Releasing the button ends any terminal edge auto-scroll
                 // and finalizes a drag-selection (the alt-screen content
                 // anchor is captured at release).
@@ -37609,6 +39164,40 @@ impl App {
         }
     }
 
+    /// Palette "Log: Toggle Highlighting (tailspin)" and the Settings row
+    /// (#466): flip tailspin colouring for every open rendered log, steer
+    /// the default for logs opened later, and persist the preference.
+    pub fn toggle_log_highlight(&mut self) {
+        self.set_log_highlight(!self.log_highlight);
+        self.status = if self.log_highlight {
+            String::from("Log highlighting (tailspin): on")
+        } else {
+            String::from("Log highlighting (tailspin): off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_disable_log_highlight(!self.log_highlight);
+        }
+    }
+
+    /// Apply a log-highlight setting everywhere it lives (#466): the app's
+    /// field, the log view's opening default for logs opened later, and
+    /// every log view already open in any split group. Shared by the
+    /// palette / Settings toggle and by a settings remerge (a workspace
+    /// layer setting `disable_log_highlight`), so the two cannot drift.
+    fn set_log_highlight(&mut self, on: bool) {
+        self.log_highlight = on;
+        seed_log_highlight_default(on);
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                if let Some(log) = ed.log.as_mut() {
+                    log.set_highlight(on);
+                }
+            }
+        }
+    }
+
     fn toggle_copy_on_select(&mut self) {
         self.copy_on_select = !self.copy_on_select;
         self.status = if self.copy_on_select {
@@ -37868,6 +39457,60 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        // The ssh-pane offer's switches apply live like every other pref
+        // here (#364); turning it off also takes down an offer on screen.
+        self.remote_offer_disabled = p.disable_remote_offer;
+        let was_excluded = std::mem::replace(
+            &mut self.remote_offer_excluded,
+            p.remote_offer_excluded_hosts.clone(),
+        );
+        // Sampling stops while the offer is off, so the per-pane memory stops
+        // tracking reality; kept, it would make the first session seen after
+        // a re-enable look like a continuation of the last one seen before
+        // it, and that pane would never be offered that host again (#364).
+        if self.remote_offer_disabled {
+            self.ssh_offer_seen.clear();
+        }
+        // A host taken OFF the exclusion list: a pane already on it was seen
+        // while excluded and would otherwise never be offered for the
+        // session it is in. Forgetting what those panes were seen on makes
+        // the next sample read as a session start, which is the moment the
+        // user asked to be offered at.
+        let freed: Vec<&String> = was_excluded
+            .iter()
+            .filter(|h| {
+                !self
+                    .remote_offer_excluded
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(h))
+            })
+            .collect();
+        if !freed.is_empty() {
+            self.ssh_offer_seen.retain(|_, seen| {
+                !seen
+                    .as_deref()
+                    .is_some_and(|h| freed.iter().any(|f| f.eq_ignore_ascii_case(h)))
+            });
+        }
+        if let Some(o) = self.ssh_offer.as_ref()
+            && !crate::remote::offer_allowed(
+                &o.host,
+                self.remote_offer_disabled,
+                &self.remote_offer_excluded,
+                &self.remote_offer_refused,
+                std::time::SystemTime::now(),
+            )
+        {
+            self.dismiss_ssh_offer();
+        }
+        // Only on a real change: the startup remerge runs before any log is
+        // open and the field already holds the preference, and writing the
+        // process-wide default from here under test would race the tests
+        // that read it (see `seed_log_highlight_default`).
+        let want_highlight = !p.disable_log_highlight;
+        if want_highlight != self.log_highlight {
+            self.set_log_highlight(want_highlight);
+        }
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
         if !p.disable_inline_blame && !self.inline_blame_enabled {
@@ -38777,6 +40420,14 @@ impl App {
                 self.change_workspace_root(folder);
             }
             MenuAction::RevealInFinder(path) => self.reveal_in_finder(path),
+            MenuAction::OpenInViewer(id, path) => {
+                // The row was built when the menu opened; an extension
+                // removed since then must not make the click a silent no-op.
+                match crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, &id) {
+                    Some(viewer) => self.open_in_viewer(&viewer, &path),
+                    None => self.status = format!("{id} is no longer available"),
+                }
+            }
             MenuAction::CopyTabPath(path) => self.copy_path_to_clipboard(path),
             MenuAction::CopyTabRelativePath(path) => self.copy_relative_path_to_clipboard(path),
             MenuAction::RevealInExplorer(path) => self.reveal_in_explorer(path),
@@ -39043,6 +40694,7 @@ impl App {
                 }
                 self.toggle_terminal_pane_maximize();
             }
+            MenuAction::ToggleCollapseTerminal(idx) => self.toggle_terminal_collapse(idx),
             MenuAction::NewTerminalWithProfile(shell) => {
                 let label = std::path::Path::new(&shell)
                     .file_name()
@@ -44124,13 +45776,280 @@ fn log_cell_at(
     (line, column)
 }
 
+/// Create `dir` (0700) if needed and write `contents` to `file` (0600). On
+/// non-unix hosts the modes do not exist and the plain write is used.
+fn write_private(dir: &Path, file: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        // `recursive` also creates any missing parent (`~/.cache/croft`
+        // itself on a first run) at 0700. Its other tenants are `sessions/`
+        // (session.rs), `tmp/` (pdf.rs) and the MCP registry cache
+        // (registry_index.rs), every one of them private per-user state
+        // that gains nothing from a wider parent.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        // A pre-existing dir is tightened, a link is refused: `create` adopts
+        // an existing symlink to a dir, `symlink_metadata` reports the link's
+        // own mode (always loose), and `set_permissions` follows the link, so
+        // without this check a scrollback dir pointed at any dir the user
+        // owns would silently re-mode that dir on the first dump.
+        let meta = std::fs::symlink_metadata(dir)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symlink; refusing to write through it",
+                    dir.display()
+                ),
+            ));
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        // The same for the file: `create(true).truncate(true)` follows a link
+        // planted where the dump goes, and the chmod below would re-mode its
+        // target after the truncate had emptied it. The dir is 0700, so the
+        // planter is this user's own tooling or a restored backup, and the
+        // answer is still a refusal rather than a destroyed file.
+        if let Ok(fmeta) = std::fs::symlink_metadata(file)
+            && fmeta.file_type().is_symlink()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symlink; refusing to write through it",
+                    file.display()
+                ),
+            ));
+        }
+        // `O_NOFOLLOW` makes the open itself refuse a link, so a link swapped
+        // in between the check above and this open cannot be followed either
+        // (the same pair config_layers.rs uses); the check above only buys
+        // the clearer error. `mode` applies on creation alone, hence the
+        // chmod below for a file left by an earlier dump.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
+        let mut f = opts.open(file)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(file, contents)
+    }
+}
+
+/// Remove the dumps under `dir` whose croft process is gone. A dump is named
+/// `<pane>-<pid>-<uid>-scrollback.log` and is overwritten only by the process
+/// that wrote it, so every exited croft would otherwise leave its dumps
+/// behind for good, each the size of a pane's scrollback; the other cache
+/// dirs here all bound themselves the same way. Anything not shaped like a
+/// dump is left alone, and so is every live process's file.
+fn reap_dead_scrollback_dumps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix("-scrollback.log"))
+        else {
+            continue;
+        };
+        // `<pane>-<pid>-<uid>`, read from the right since a pane label may
+        // itself contain dashes.
+        let mut parts = stem.rsplitn(3, '-');
+        let (Some(_uid), Some(pid), Some(_pane)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid != me && !process_is_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether a process with `pid` exists. Signal 0 delivers nothing and only
+/// checks; a process this user may not signal still exists, so `EPERM`
+/// reads as alive. Off unix nothing is reaped, on the conservative side.
+/// Existence, not liveness, is enough here (unlike `session::is_alive`,
+/// which probes by connecting): a pid that was reused reads as alive and
+/// only leaks a file, and every wrong answer this can give errs that way.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: `kill` with signal 0 only checks for the process; no signal is
+    // delivered and no memory is touched.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Whether a scrollback dump goes to the rendered log view or to the plain
+/// scratch buffer (#257). Must agree with the open path's own sniff, which
+/// reads only the first 8 KiB of the file: a dump this says is a log but the
+/// sniff says is text would open as an editable file full of raw escapes.
+fn scrollback_opens_as_log(rows: &[String]) -> bool {
+    // The same 8 KiB the file sniff reads, over the same bytes it will read.
+    let mut prefix = String::new();
+    for row in rows {
+        if prefix.len() >= 8192 {
+            break;
+        }
+        prefix.push_str(row);
+        prefix.push('\n');
+    }
+    let cut = prefix.floor_char_boundary(prefix.len().min(8192));
+    crate::ansi_text::looks_like_ansi(&prefix[..cut])
+}
+
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
+/// Push a log-highlight setting into the log view's process-wide opening
+/// default (#466), from the toggle and from a settings remerge.
+pub(crate) fn seed_log_highlight_default(on: bool) {
+    crate::log_view::set_default_highlight(on);
+}
+
+/// The startup seed of that default from the saved preference (#466). In
+/// the shipped binary it is the same write; under test it RECORDS the value
+/// per thread instead, because the suite builds hundreds of apps on
+/// parallel threads and each write would race the tests that read the
+/// process-wide default. The record keeps the call site observable: a test
+/// asserts what `App::new` decided to seed, not merely that a setter sets.
+#[cfg(not(test))]
+fn seed_log_highlight_default_at_startup(on: bool) {
+    crate::log_view::set_default_highlight(on);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What the most recent `App::new` on this thread would have seeded.
+    pub(crate) static STARTUP_LOG_HIGHLIGHT_SEED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn seed_log_highlight_default_at_startup(on: bool) {
+    STARTUP_LOG_HIGHLIGHT_SEED.with(|cell| cell.set(Some(on)));
+}
+
+/// Build the up-to-date version of an open diff view from its recorded
+/// source (#471), or `None` when there is nothing new to build: a `Static`
+/// view, a file-backed view whose sides have not moved on disk, a git-command
+/// view on a filesystem-only trigger, or a side that can no longer be read
+/// (the reader keeps the last good view). The result carries fresh disk
+/// stamps but none of the reader's view state; `DiffData::carry_view_from`
+/// adds that.
+fn rebuild_diff_view(
+    old: &crate::widgets::diff::DiffData,
+    git_too: bool,
+    heads_moved: &[PathBuf],
+    touched: &[PathBuf],
+) -> Option<crate::widgets::diff::DiffData> {
+    use crate::widgets::diff::{DiffData, DiffSource, GitDiffKind};
+    // A side the watcher just reported written, matched on the canonical
+    // path so a symlinked root cannot hide it. Bypasses the stamp gate.
+    let written = |side: &Path| {
+        if touched.is_empty() {
+            return false;
+        }
+        let canon = std::fs::canonicalize(side).unwrap_or_else(|_| side.to_path_buf());
+        touched.iter().any(|t| *t == canon || t == side)
+    };
+    let lines = |t: &str| -> Vec<String> { t.lines().map(str::to_string).collect() };
+    let two_sided = |left_text: &str, right_text: &str| {
+        DiffData::build_with_byte_check(
+            old.left_path.clone(),
+            old.right_path.clone(),
+            lines(left_text),
+            lines(right_text),
+            Some(left_text),
+            Some(right_text),
+        )
+    };
+    let mut fresh = match &old.source {
+        DiffSource::Static => return None,
+        DiffSource::HeadVsWorking { root, rel } => {
+            // Canonical on both sides: git canonicalises `--show-toplevel`
+            // (macOS's /tmp -> /private/tmp), while a root the app carries
+            // as typed may not be, so the same repository can be spelled two
+            // ways between the tag and the drain's record.
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let head_moved = git_too
+                && heads_moved
+                    .iter()
+                    .any(|r| r == root || canon(r) == canon(root));
+            if !head_moved && !written(&old.right_path) && !old.sides_moved_on_disk() {
+                return None;
+            }
+            let head = crate::git::read_file_at_head(root, rel).ok()?;
+            let right = std::fs::read_to_string(&old.right_path).ok()?;
+            two_sided(&head, &right)
+        }
+        DiffSource::FixedLeft { left_text } => {
+            if !written(&old.right_path) && !old.sides_moved_on_disk() {
+                return None;
+            }
+            let right = std::fs::read_to_string(&old.right_path).ok()?;
+            two_sided(left_text, &right)
+        }
+        DiffSource::TwoFiles => {
+            if !written(&old.left_path) && !written(&old.right_path) && !old.sides_moved_on_disk() {
+                return None;
+            }
+            let left = std::fs::read_to_string(&old.left_path).ok()?;
+            let right = std::fs::read_to_string(&old.right_path).ok()?;
+            DiffData::build(
+                old.left_path.clone(),
+                old.right_path.clone(),
+                lines(&left),
+                lines(&right),
+            )
+        }
+        DiffSource::GitCommand { root, kind } => {
+            if !git_too {
+                return None;
+            }
+            let raw = match kind {
+                GitDiffKind::Staged => crate::git::diff_staged(root),
+                GitDiffKind::AgainstBranch(branch) => crate::git::diff_against_branch(root, branch),
+                GitDiffKind::PreviousCommit => crate::git::diff_previous_commit(root),
+            }
+            .ok()?;
+            DiffData::build_side_by_side_from_git_text(old.left_path.clone(), &raw)
+        }
+    };
+    fresh.source = old.source.clone();
+    fresh.left_is_real_file = old.left_is_real_file;
+    fresh.stamp_sides();
+    Some(fresh)
+}
+
 /// Fold a mouse event's Shift/Alt/Ctrl state into the form `report_mouse`
-/// wants, so a forwarded wheel event carries the same modifiers the child
-/// would have seen natively.
+/// wants, so a forwarded wheel notch or left-button event carries the same
+/// modifiers the child would have seen natively.
 fn mouse_mods(m: &MouseEvent) -> MouseMods {
     MouseMods {
         shift: m.modifiers.contains(KeyModifiers::SHIFT),
@@ -44219,15 +46138,72 @@ const TERMINAL_MAX_LABEL: &str = " \u{eb4c} ";
 /// Codicon screen-normal (Nerd Fonts `cod-screen_normal` = U+EB4D): restore
 /// the even split. Swapped in for the `⛶` while a pane is maximized.
 const TERMINAL_RESTORE_LABEL: &str = " \u{eb4d} ";
+/// Codicon chevron-left (Nerd Fonts `cod-chevron_left` = U+EAB5): fold this
+/// pane to a strip and hand its width to the panes still expanded (#313).
+///
+/// Its own button rather than a new meaning for `-`: `-` closes, and it goes
+/// on closing. A control that destroys on one build and folds on the next is
+/// the kind of change muscle memory finds out the hard way.
+const TERMINAL_COLLAPSE_LABEL: &str = " \u{eab5} ";
+/// Codicon chevron-right (U+EAB6), on the header row of a collapsed pane's
+/// strip: the way back out. It points the opposite way to the button that put
+/// the pane there, which is the whole of the affordance in one column.
+const TERMINAL_EXPAND_GLYPH: char = '\u{eab6}';
+/// Stands in for a character too wide for the one column a strip owns. A
+/// CJK glyph or an emoji is two cells and would paint over the pane next
+/// door; dropping it outright left a pane named entirely in them with a
+/// blank strip, which is the one thing the strip exists to prevent.
+const TERMINAL_STRIP_WIDE_STANDIN: char = '\u{b7}';
+/// A collapsed pane's entire width: one column, carrying the expand chevron
+/// and the pane's name set vertically.
+const TERMINAL_STRIP_W: u16 = 1;
 /// Codicon terminal (Nerd Fonts `cod-terminal` = U+EA85), leading each
 /// maximize-rail row the way VS Code's terminal tabs list does.
 /// Cells the pane's header buttons occupy, measured in from its right edge:
-/// `⛶`, `-`, `∨` and `+` at three each, plus the one blank column right of
-/// `+`. The name pill paints after the buttons and would win the shared cells,
-/// so it is clipped to the width left of this strip.
+/// `‹`, `⛶`, `-`, `∨` and `+` at three each, plus the one blank column right
+/// of `+`. The name pill paints after the buttons and would win the shared
+/// cells, so it is clipped to the width left of this strip.
 /// `a_long_pane_label_never_overpaints_the_maximize_button` pins it, so adding
-/// a fifth button fails a test rather than quietly erasing a glyph again.
-const TERMINAL_BUTTON_STRIP_W: u16 = 13;
+/// a SIXTH button fails a test rather than quietly erasing a glyph again -
+/// which is how the collapse button (#313) was caught needing this widened
+/// from 13 instead of silently sharing the pill's cells.
+const TERMINAL_BUTTON_STRIP_W: u16 = 16;
+/// Width constraints for the terminal row, given which panes are collapsed
+/// (#313).
+///
+/// A collapsed pane keeps a one-column strip; the panes still expanded divide
+/// everything left over. Split out as a pure function of the flags because
+/// the apportioning is the whole of the layout risk here, and this way it is
+/// asserted directly - a constraint vector measured against expected widths -
+/// rather than only through a rendered frame.
+///
+/// `Fill` rather than `Ratio` for the expanded panes: `Ratio(1, k)` is a
+/// share of the WHOLE row, so mixing it with the strips' `Length(1)` asks the
+/// solver for more columns than exist and it settles that overflow by shaving
+/// the panes. `Fill` divides what the strips leave, which is the arithmetic
+/// actually wanted.
+///
+/// With nothing collapsed every pane is `Fill(1)`, which apportions the row
+/// evenly - the same split as before the feature existed, so the common case
+/// pays nothing for it.
+///
+/// Every pane collapsed is unreachable through the UI ([`App::toggle_terminal_collapse`]
+/// and [`App::close_terminal_at`] both keep one expanded), but it is answered
+/// here rather than left to divide by zero.
+fn terminal_pane_constraints(collapsed: &[bool]) -> Vec<Constraint> {
+    let any_expanded = collapsed.iter().any(|c| !c);
+    collapsed
+        .iter()
+        .map(|&c| {
+            if c && any_expanded {
+                Constraint::Length(TERMINAL_STRIP_W)
+            } else {
+                Constraint::Fill(1)
+            }
+        })
+        .collect()
+}
+
 const TERMINAL_RAIL_ICON: char = '\u{ea85}';
 /// How many label characters a rail row shows. Fixed and deliberately tiny:
 /// the rail is a switcher, not a directory, so four letters identify a pane.
@@ -44287,6 +46263,11 @@ struct HttpRunOutcome {
     raw_line: String,
     result: Result<crate::http_file::HttpResponse, String>,
 }
+
+/// How long an ssh-pane offer stays up untouched (#364) before it clears
+/// itself: long enough to read and act on, short enough not to be stale
+/// when the user next looks at the status bar.
+const SSH_OFFER_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
 fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
@@ -44517,11 +46498,16 @@ fn run_mcp_command_blocking(
     crate::mcp::McpOutcome { title, body }
 }
 
-/// Paint the `[+]` and (when more than one terminal is open) `[-]` buttons
-/// on the top border of the terminal pane and return their hit-test
-/// rectangles `(add, close)`. Either side is None when the pane is too
-/// narrow / short for the label, or — for close — when only one terminal
-/// is open and there's nothing to drop.
+/// Paint the terminal pane's header buttons on its top border and return
+/// their hit-test rectangles. Any of them is `None` when the pane is too
+/// narrow or short for the label to fit, and the three that act on ONE pane
+/// among several (`-`, `⛶`, `‹`) are absent when a lone terminal is open and
+/// there is nothing to drop, maximize against, or fold away from.
+///
+/// Right to left: `+`, `∨`, `-`, `⛶`, `‹`. The collapse button (#313) went on
+/// the far LEFT deliberately: every button already there keeps the exact
+/// column it had, so a user reaching for `-` by position still lands on `-`
+/// and not on a gesture that merely looks similar.
 fn paint_terminal_pane_buttons(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -44534,6 +46520,7 @@ fn paint_terminal_pane_buttons(
     let caret_w = TERMINAL_PROFILE_LABEL.chars().count() as u16;
     let close_w = TERMINAL_CLOSE_LABEL.chars().count() as u16;
     let max_w = TERMINAL_MAX_LABEL.chars().count() as u16;
+    let fold_w = TERMINAL_COLLAPSE_LABEL.chars().count() as u16;
     let mut out = TerminalPaneButtons::default();
     if area.height == 0 {
         return out;
@@ -44604,6 +46591,25 @@ fn paint_terminal_pane_buttons(
             height: 1,
         });
     }
+    // Collapse sits left of `⛶`, putting the two layout gestures beside each
+    // other and leaving the destructive `-` where it was. Maximize already
+    // owns the whole panel and ignores the collapse flags, so while it is on
+    // the button would be a control that does nothing: it is not painted.
+    if show_close_button
+        && !pane_maximized
+        && area.width >= add_w + caret_w + close_w + max_w + fold_w + 2
+    {
+        let x = area.x + area.width - add_w - caret_w - close_w - max_w - fold_w - 1;
+        frame
+            .buffer_mut()
+            .set_string(x, y, TERMINAL_COLLAPSE_LABEL, style_at(x, fold_w));
+        out.collapse = Some(Rect {
+            x,
+            y,
+            width: fold_w,
+            height: 1,
+        });
+    }
     out
 }
 
@@ -44615,6 +46621,7 @@ struct TerminalPaneButtons {
     profile: Option<Rect>,
     close: Option<Rect>,
     max: Option<Rect>,
+    collapse: Option<Rect>,
 }
 
 /// `app_cursor` is the pane's DECCKM state: cursor keys switch from the
