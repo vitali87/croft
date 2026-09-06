@@ -33,8 +33,9 @@ pub struct AgentKind {
     /// typed into the lane's fresh shell. The built-ins launch as their own
     /// name; a row may set its own (`claude --model opus`). A NEW row
     /// without one opens a plain shell, while a row that replaces a
-    /// built-in without one keeps the built-in's command (such rows
-    /// usually exist to fix a prompt pattern, not to unteach the launch).
+    /// built-in and OMITS it keeps the built-in's command (such rows
+    /// usually exist to fix a prompt pattern, not to unteach the launch);
+    /// a blank `launch` on such a row is the explicit way to unteach it.
     pub launch: Option<String>,
 }
 
@@ -101,8 +102,8 @@ pub const TEMPLATE: &str = r##"// croft agent lanes: which foreground processes 
 //   launch:  the command a new worktree lane (Cmd+K Shift+L) starts the agent
 //            with, when `lane_agent` in settings.json names this row (#348);
 //            the built-ins launch as their own name; a NEW row without one
-//            opens a plain shell, while a row replacing a built-in without
-//            one keeps the built-in's command
+//            opens a plain shell, while a row replacing a built-in keeps the
+//            built-in's command unless it sets its own or a blank one
 [
   // { "name": "goose", "process": ["goose"], "prompt": ["^\\s*>\\s*$", "\\(y/n\\)"], "launch": "goose" }
 ]
@@ -214,6 +215,10 @@ impl AgentTable {
                     Err(_) => table.dropped_patterns += 1,
                 }
             }
+            // Omitted and blank are different answers: a row that says
+            // nothing about launching has no opinion, a row that says
+            // `"launch": ""` is asking for no command.
+            let launch_omitted = row.launch.is_none();
             let launch = row
                 .launch
                 .as_deref()
@@ -225,8 +230,13 @@ impl AgentTable {
                     // A row that replaces a built-in but says nothing about
                     // launching keeps the built-in's command: the row is
                     // usually there to fix a prompt pattern, not to unteach
-                    // croft how to start the agent.
-                    let launch = launch.or_else(|| existing.launch.clone());
+                    // croft how to start the agent. A blank one is the
+                    // explicit way to unteach it.
+                    let launch = if launch_omitted {
+                        existing.launch.clone()
+                    } else {
+                        launch
+                    };
                     *existing = AgentKind {
                         name: name.clone(),
                         process,
@@ -471,6 +481,14 @@ mod tests {
         assert_eq!(t.launch_line("quiet"), None, "a blank launch is none");
         let t = AgentTable::from_json(r#"[{ "name": "claude", "launch": "claude --model opus" }]"#);
         assert_eq!(t.launch_line("claude"), Some("claude --model opus"));
+        // Omitted inherits; blank is an explicit "no command", even on a
+        // row that replaces a built-in.
+        let t = AgentTable::from_json(r#"[{ "name": "claude", "launch": "  " }]"#);
+        assert_eq!(
+            t.launch_line("claude"),
+            None,
+            "a blank launch on a replacing row unteaches the built-in's"
+        );
     }
 
     #[test]
