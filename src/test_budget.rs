@@ -457,14 +457,26 @@ pub(crate) mod tests {
     fn the_view_socket_bases_reproduce_the_constants_they_replaced() {
         let floor = |base: Duration| base * BASE_CALIBRATION * MIN_SCALE;
         for (got, want, what) in [
-            (floor(VIEW_ACCEPT_BASE), Duration::from_secs(5), "the accept wait"),
+            (
+                floor(VIEW_ACCEPT_BASE),
+                Duration::from_secs(5),
+                "the accept wait",
+            ),
             (
                 floor(VIEW_SERVER_DEADLINE_BASE),
                 Duration::from_millis(500),
                 "the server deadline",
             ),
-            (floor(VIEW_DRAIN_BASE), Duration::from_millis(2000), "the drain poll"),
-            (floor(VIEW_FIFO_RECV_BASE), Duration::from_secs(20), "the FIFO recv"),
+            (
+                floor(VIEW_DRAIN_BASE),
+                Duration::from_millis(2000),
+                "the drain poll",
+            ),
+            (
+                floor(VIEW_FIFO_RECV_BASE),
+                Duration::from_secs(20),
+                "the FIFO recv",
+            ),
         ] {
             assert_eq!(
                 got, want,

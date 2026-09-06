@@ -328,11 +328,7 @@ pub fn read_request(
     stream: &std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
 ) -> std::io::Result<ViewRequest> {
-    let text = read_line_by_deadline(
-        stream,
-        deadline,
-        FRAME_BUDGET_REFUSAL,
-    )?;
+    let text = read_line_by_deadline(stream, deadline, FRAME_BUDGET_REFUSAL)?;
     serde_json::from_str(text.trim())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -532,7 +528,6 @@ pub(crate) fn stage_at(dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<P
     }
 }
 
-/// `croft view <path>` / `croft view -`.
 /// Read at most `cap` bytes, refusing anything longer rather than truncating.
 ///
 /// An uncapped `read_to_end` let a runaway producer buffer the whole stream in
@@ -548,11 +543,14 @@ fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> anyhow::Result<Vec<u8>>
     let mut buf = Vec::new();
     let read = reader.take(cap + 1).read_to_end(&mut buf)? as u64;
     if read > cap {
-        anyhow::bail!("more than {cap} bytes arrived on stdin; write it to a file and view that instead");
+        anyhow::bail!(
+            "more than {cap} bytes arrived on stdin; write it to a file and view that instead"
+        );
     }
     Ok(buf)
 }
 
+/// `croft view <path>` / `croft view -`.
 pub fn run(
     target: &std::ffi::OsStr,
     as_hint: Option<&str>,
