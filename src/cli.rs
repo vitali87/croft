@@ -274,8 +274,10 @@ pub enum CliCommand {
         /// the entry point, one call before the encoding that preserves them.
         path: std::ffi::OsString,
         /// Extension to stage piped bytes under, for content that has no
-        /// magic bytes to sniff (`--as csv`, `--as json`). Ignored unless
-        /// the path is `-`.
+        /// magic bytes to sniff (`--as csv`, `--as json`). Only valid with
+        /// `-`: on a named file it is REFUSED rather than ignored, since that
+        /// file is routed by its own extension and a silently dropped flag
+        /// shows up only as the wrong viewer opening.
         #[arg(long = "as")]
         as_ext: Option<String>,
     },

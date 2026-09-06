@@ -43450,9 +43450,20 @@ fn one_drain_answers_every_client_already_waiting() {
     let mut clients = Vec::new();
     for target in [&first, &second] {
         let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
-        let req = crate::view_ipc::ViewRequest {
-            path: target.as_os_str().as_encoded_bytes().to_vec(),
-        };
+        // A read timeout, so losing FAILS rather than hangs. Whether both are
+        // served in one drain rests on production's 20ms budget, which no
+        // test scale can stretch: if the first open costs most of it, the
+        // drain returns having served client 0, the assert below still passes
+        // because something opened, and an untimed `read_line` on client 1
+        // blocks forever. That is a CI timeout with no message, which two
+        // other tests in this file go out of their way to avoid.
+        c.set_read_timeout(Some(crate::test_budget::spawn_budget(
+            crate::test_budget::tests::VIEW_DRAIN_BASE,
+        )))
+        .unwrap();
+        // Through `ViewRequest::new`, so a change to the byte encoding is
+        // exercised here rather than bypassed by hand-rolling the field.
+        let req = crate::view_ipc::ViewRequest::new(target);
         let mut line = serde_json::to_string(&req).unwrap();
         line.push('\n');
         c.write_all(line.as_bytes()).unwrap();
@@ -43467,7 +43478,14 @@ fn one_drain_answers_every_client_already_waiting() {
 
     for (i, c) in clients.iter().enumerate() {
         let mut reply = String::new();
-        std::io::BufReader::new(c).read_line(&mut reply).unwrap();
+        std::io::BufReader::new(c)
+            .read_line(&mut reply)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "client {i} was never answered ({e}): one drain must serve \
+                     every client already waiting, not just the first"
+                )
+            });
         let reply: crate::view_ipc::ViewReply = serde_json::from_str(reply.trim())
             .unwrap_or_else(|e| panic!("client {i} got no parseable reply: {e}"));
         assert_eq!(
@@ -43745,9 +43763,9 @@ fn a_non_blocking_accepted_stream_is_still_answered() {
         // the mode to matter, which is exactly the case a real `croft view`
         // hits whenever the shell is a little slower than the frame loop.
         std::thread::sleep(std::time::Duration::from_millis(120));
-        let req = crate::view_ipc::ViewRequest {
-            path: target2.as_os_str().as_encoded_bytes().to_vec(),
-        };
+        // `ViewRequest::new` rather than the field by hand, so the byte
+        // encoding is exercised rather than reimplemented beside it.
+        let req = crate::view_ipc::ViewRequest::new(&target2);
         let mut line = serde_json::to_string(&req).unwrap();
         line.push('\n');
         let _ = std::io::Write::write_all(&mut c, line.as_bytes());

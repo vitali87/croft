@@ -177,7 +177,16 @@ pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
     // Nothing was opened in that case (the request was never read), so a
     // second attempt cannot double-open, and a croft that is genuinely wedged
     // fails the same way one frame later.
-    if matches!(&first, ViewReply::Err { message } if message.ends_with(FRAME_BUDGET_REFUSAL)) {
+    // Compared EXACTLY, not by suffix. The server wraps this one refusal as
+    // `unreadable request: {e}`, so the whole string is knowable here; a
+    // suffix test also matches any future reply that happens to END with the
+    // same words, and one of them already can, since the absolute-path
+    // refusal ends with a client-supplied path. Today that is harmless
+    // (the retry re-sends and is refused again, opening nothing), but the
+    // retry's entire safety argument is "nothing was opened", and a reply
+    // that named a path after a side effect would become double-executed
+    // with no test noticing.
+    if first == retryable_refusal() {
         return send_once(socket, req);
     }
     Ok(first)
@@ -187,6 +196,18 @@ pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
 /// than spelled twice: a reworded refusal would otherwise turn the retry off
 /// silently, which is the failure this constant exists to make impossible.
 pub const FRAME_BUDGET_REFUSAL: &str = "the request did not arrive within the frame budget";
+
+/// The one reply [`send`] retries, spelled exactly as the server sends it.
+///
+/// Built from the same pieces the server uses (`answer_view_client` wraps a
+/// read error as `unreadable request: {e}`), so a reworded refusal fails to
+/// match here and the retry turns itself off rather than firing on the wrong
+/// reply.
+fn retryable_refusal() -> ViewReply {
+    ViewReply::Err {
+        message: format!("unreadable request: {FRAME_BUDGET_REFUSAL}"),
+    }
+}
 
 fn send_once(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
     use std::os::unix::net::UnixStream;
@@ -763,6 +784,115 @@ mod tests {
     /// `take(cap)` cannot tell a legal cap-byte payload from a truncated
     /// larger one, and a `>=` would refuse the legal one. Both mutations are
     /// invisible in a suite that never drives the boundary.
+    /// Serve connections from a NON-blocking listener until told to stop,
+    /// answering each with the reply `answer` picks for its index, and hand
+    /// back how many arrived.
+    ///
+    /// Non-blocking so the thread can be told to stop without a connection
+    /// arriving to unblock it: a test that must prove NO third connection
+    /// happened cannot wait on a blocking `accept` for one.
+    fn serve_counting(
+        listener: std::os::unix::net::UnixListener,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        answer: impl Fn(usize) -> ViewReply + Send + 'static,
+    ) -> std::thread::JoinHandle<usize> {
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut seen = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // Production clears this on every accepted stream, and
+                        // for the same reason: macOS inherits the listener's
+                        // flags across accept, so the read below would return
+                        // before the client has written.
+                        stream.set_nonblocking(false).unwrap();
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        if read_line_by_deadline(&stream, deadline, "no request").is_err() {
+                            continue;
+                        }
+                        let reply = answer(seen);
+                        seen += 1;
+                        let _ = write_reply(&mut stream, &reply);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+            seen
+        })
+    }
+
+    /// The one refusal `send` retries is retried, and the retry is what
+    /// produces the success (#362).
+    ///
+    /// The connection COUNT is the assertion that matters. Asserting only the
+    /// reply would pass if the server had answered `Ok` first time, which is
+    /// the same green a deleted retry produces.
+    #[test]
+    fn a_frame_budget_refusal_is_retried_once_and_then_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("v.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = serve_counting(listener, std::sync::Arc::clone(&stop), |i| {
+            if i == 0 {
+                retryable_refusal()
+            } else {
+                ViewReply::Ok
+            }
+        });
+
+        let reply = send(&sock, &ViewRequest::new(Path::new("/tmp/x"))).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let seen = server.join().unwrap();
+
+        assert_eq!(
+            reply,
+            ViewReply::Ok,
+            "the refusal names croft's own frame budget, which the client had \
+             no part in, so a second attempt is owed"
+        );
+        assert_eq!(
+            seen, 2,
+            "and the success must come from a SECOND connection: delete the \
+             retry and this is 1 with the refusal returned"
+        );
+    }
+
+    /// One retry, not a loop (#362).
+    ///
+    /// Nothing else in the suite would catch the `if` becoming a `while`, and
+    /// a croft wedged for a whole frame would then hold the user's shell for
+    /// as long as it stayed wedged.
+    #[test]
+    fn the_frame_budget_retry_is_one_attempt_not_a_loop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("v.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = serve_counting(listener, std::sync::Arc::clone(&stop), |_| {
+            retryable_refusal()
+        });
+
+        let reply = send(&sock, &ViewRequest::new(Path::new("/tmp/x"))).unwrap();
+        // Long enough that a looping client would have made more attempts by
+        // now, so the count below is a real bound rather than a race.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let seen = server.join().unwrap();
+
+        assert_eq!(
+            reply,
+            retryable_refusal(),
+            "a croft refusing twice is reported, not retried forever"
+        );
+        assert_eq!(seen, 2, "exactly two attempts, not {seen}");
+    }
+
     #[test]
     fn the_stdin_cap_accepts_exactly_the_cap_and_refuses_one_more() {
         assert_eq!(
@@ -783,8 +913,9 @@ mod tests {
              a truncated payload stages a corrupt file and reports success"
         );
         assert!(
-            over.unwrap_err().to_string().contains("8"),
-            "and the message must name the cap the user hit"
+            over.unwrap_err().to_string().contains("more than 8 bytes"),
+            "and the message must name the cap the user hit: `contains(\"8\")` \
+             passed on any stray 8 in any wording"
         );
     }
 
@@ -819,6 +950,22 @@ mod tests {
             looks_delimited(early.as_bytes()),
             None,
             "a row that disagrees INSIDE the window rejects the whole sniff"
+        );
+        // The FLOOR, which the three fixtures above do not reach: every one of
+        // them stays green for any `take(n)` from 2 through 7, because the
+        // first needs only two agreeing rows and the others disagree at rows 9
+        // and 2. Seven agreeing rows and a disagreeing EIGHTH is red for every
+        // window narrower than 8 and green at 8, so the number is now bounded
+        // from both sides rather than only from above.
+        let mut seven = String::new();
+        for i in 0..7 {
+            seven.push_str(&format!("a{i},b{i}\n"));
+        }
+        seven.push_str("the eighth row has no delimiter\n");
+        assert_eq!(
+            looks_delimited(seven.as_bytes()),
+            None,
+            "the eighth row is INSIDE the window, so it must reject the sniff"
         );
     }
 

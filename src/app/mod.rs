@@ -30041,6 +30041,20 @@ impl App {
     /// whether the file can be shown, not about where it is.
     fn apply_view_request(&mut self, path: &Path) -> crate::view_ipc::ViewReply {
         use crate::view_ipc::ViewReply;
+        // The invariant `view_ipc`'s header states, actually enforced. The
+        // client resolves against ITS cwd before sending, so a relative path
+        // here came from something that is not `croft view`; resolving it
+        // against croft's own cwd would silently open a different file than
+        // the sender named. Same-uid, so this is not a trust boundary, but
+        // an invariant no code checks is a comment rather than an invariant.
+        if !path.is_absolute() {
+            return ViewReply::Err {
+                message: format!(
+                    "the request must carry an absolute path, got {}",
+                    path.display()
+                ),
+            };
+        }
         // A REGULAR file, not merely something that exists and is not a
         // directory. `File::open` on a FIFO blocks until a writer appears, so
         // `mkfifo /tmp/f && croft view /tmp/f` from any pane froze the whole
@@ -30071,24 +30085,12 @@ impl App {
         // build script running `croft view out.pdf` on a large document parks
         // the editor for the render. Filed rather than fixed here: moving the
         // open off the frame loop changes how every viewer reports failure,
-        // which is a bigger change than the channel that exposed it. There is also a TOCTOU window between this and the open,
+        // which is a bigger change than the channel that exposed it.
+        //
+        // There is also a TOCTOU window between this and the open,
         // which is same-uid and so inside the trust boundary the module
         // already argues from - noted so a later reader does not mistake the
         // check for airtight.
-        // The invariant `view_ipc`'s header states, actually enforced. The
-        // client resolves against ITS cwd before sending, so a relative path
-        // here came from something that is not `croft view`; resolving it
-        // against croft's own cwd would silently open a different file than
-        // the sender named. Same-uid, so this is not a trust boundary, but
-        // an invariant no code checks is a comment rather than an invariant.
-        if !path.is_absolute() {
-            return ViewReply::Err {
-                message: format!(
-                    "the request must carry an absolute path, got {}",
-                    path.display()
-                ),
-            };
-        }
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
@@ -46850,16 +46852,20 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    // Listed once. `sweep_dead_bind_stages` runs per dead socket and used to
+    // re-read the directory each time.
+    let names: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| Some((e.file_name().to_str()?.to_string(), e.path())))
+        .collect();
     let me = std::process::id();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+    for (name, entry_path) in &names {
         // A croft that died between `bind_socket_0600`'s lock creation and its
         // rename leaves a `.bind.lock` with no socket beside it. The
         // socket-keyed pass below can never reach one, because
         // `pid_of_socket` requires the `.sock` suffix, so those leaked
         // permanently. Judging the lock by the pid in its own name closes it.
-        let sock_name = match name.strip_suffix(".bind.lock") {
+        let sock_name = match name.as_str().strip_suffix(".bind.lock") {
             Some(stem) => std::borrow::Cow::Owned(format!("{stem}.sock")),
             None => std::borrow::Cow::Borrowed(name),
         };
@@ -46872,12 +46878,12 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
             && unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
         if gone {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(entry_path);
             // `bind_socket_0600` binds inside a `.s<pid>-<n>` dir and removes
             // it on both paths, but a croft killed inside that window strands
             // one, and nothing else ever looks at it again. Same argument as
             // the orphan lock below: it is litter only this sweep can reach.
-            sweep_dead_bind_stages(dir, pid);
+            sweep_dead_bind_stages(&names, pid);
             // Derived from the SOCKET's name rather than from this entry's,
             // so sweeping a lock entry does not compose a second suffix onto
             // itself. Removing both from either entry is idempotent.
@@ -46898,17 +46904,18 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
 ///
 /// Keyed on the same pid the socket sweep just judged dead, so a LIVE croft's
 /// staging directory is never touched: removing one mid-bind would take the
-/// socket it is about to rename out with it.
-fn sweep_dead_bind_stages(dir: &Path, pid: u32) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+/// socket it is about to rename out with it. "Never" modulo the pid-recycling
+/// window the socket unlink above already accepts, which needs the pid space
+/// to wrap between the `kill` and the removal.
+///
+/// Takes the directory listing rather than reading it: this is called once per
+/// dead socket, and a cache dir holding N stale sockets was costing N full
+/// listings at launch.
+fn sweep_dead_bind_stages(names: &[(String, PathBuf)], pid: u32) {
     let prefix = format!(".s{pid}-");
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+    for (name, path) in names {
         if name.starts_with(&prefix) && name[prefix.len()..].parse::<u64>().is_ok() {
-            let _ = std::fs::remove_dir_all(entry.path());
+            let _ = std::fs::remove_dir_all(path);
         }
     }
 }
