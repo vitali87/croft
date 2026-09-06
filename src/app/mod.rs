@@ -2499,6 +2499,12 @@ pub struct App {
     blame_fetched: Option<PathBuf>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
+    /// The provenance lens (#349): who typed each line, in the gutter and
+    /// the blame annotation. Session-only for now; the persisted half of
+    /// #349 (the map beside local history) is a later slice. Pushed onto
+    /// every editor in every group by `sync_focus_flags`, since the gutter
+    /// bar paints in every pane, not only the focused one.
+    provenance_overlay: bool,
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
     /// default, pushed to every editor by the per-frame focus sync.
     indent_guides_enabled: bool,
@@ -4459,6 +4465,7 @@ impl App {
             blame_tx,
             blame_fetched: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
+            provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
             bracket_colors_enabled: !loaded_prefs.disable_bracket_colors,
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
@@ -6966,6 +6973,7 @@ impl App {
     /// Gated on the pref so a subprocess never runs when blame is off.
     fn sync_blame(&mut self) {
         self.editor.blame_enabled = self.inline_blame_enabled;
+        self.editor.provenance_overlay = self.provenance_overlay;
         self.editor.auto_close_pairs = self.auto_close_pairs;
         if !self.inline_blame_enabled {
             return;
@@ -14270,6 +14278,7 @@ impl App {
             ed.csv_viewer_enabled = csv_on;
             ed.show_indent_guides = self.indent_guides_enabled;
             ed.show_bracket_colors = self.bracket_colors_enabled;
+            ed.provenance_overlay = self.provenance_overlay;
             ed.whitespace_mode = self.whitespace_mode;
             ed.diff_ws_default = self.diff_ws_default;
         }
@@ -14281,6 +14290,7 @@ impl App {
                 ed.csv_viewer_enabled = csv_on;
                 ed.show_indent_guides = self.indent_guides_enabled;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
+                ed.provenance_overlay = self.provenance_overlay;
                 ed.whitespace_mode = self.whitespace_mode;
                 ed.diff_ws_default = self.diff_ws_default;
                 ed.diff_ws_default = self.diff_ws_default;
@@ -33119,6 +33129,7 @@ impl App {
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
+            Cmd::ToggleProvenance => self.toggle_provenance(),
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
             Cmd::ToggleRenderWhitespace => self.toggle_render_whitespace(),
@@ -39183,6 +39194,19 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_auto_save_on_focus_change(self.auto_save_on_focus_change);
         }
+    }
+
+    /// `Editor: Toggle Provenance` (#349): flip the lens for the session and
+    /// push it onto the active editor now (the per-tick sync covers the
+    /// next tab focused).
+    fn toggle_provenance(&mut self) {
+        self.provenance_overlay = !self.provenance_overlay;
+        self.editor.provenance_overlay = self.provenance_overlay;
+        self.status = if self.provenance_overlay {
+            String::from("Provenance: on")
+        } else {
+            String::from("Provenance: off")
+        };
     }
 
     fn toggle_inline_blame(&mut self) {

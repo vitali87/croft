@@ -12459,6 +12459,61 @@ fn inline_blame_annotation_paints_on_the_cursor_line() {
     );
 }
 
+/// `Editor: Toggle Provenance` (#349) flips the lens on the active editor
+/// and keeps it across the per-tick sync; off again on a second toggle.
+#[test]
+fn toggle_provenance_command_flips_the_editor_lens() {
+    let mut app = editor_app_with_lines(&["one", "two"]);
+    assert!(!app.editor.provenance_overlay, "the lens is off by default");
+    app.run_command(crate::widgets::command_palette::Command::ToggleProvenance);
+    assert!(app.editor.provenance_overlay, "the command turns it on");
+    assert_eq!(app.status, "Provenance: on");
+    app.sync_blame();
+    assert!(
+        app.editor.provenance_overlay,
+        "and the tick sync keeps it on"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleProvenance);
+    app.sync_blame();
+    assert!(
+        !app.editor.provenance_overlay,
+        "toggling again turns it off"
+    );
+}
+
+/// The lens reaches every tab of every group, not only the focused editor
+/// (#349 review): the gutter bar paints in every pane, so `sync_focus_flags`
+/// carries it the way it carries indent guides.
+#[test]
+fn the_provenance_lens_reaches_every_editor_after_the_flag_sync() {
+    let mut app = editor_app_with_lines(&["one", "two"]);
+    app.editor
+        .push_editor(crate::widgets::editor::Editor::new());
+    assert!(app.editor.editors.len() >= 2, "fixture: two tabs");
+    // A split puts the first group out of focus; the lens must reach it too.
+    app.editor.path = Some(std::path::PathBuf::from("split-anchor.txt"));
+    app.split_editor();
+    app.run_command(crate::widgets::command_palette::Command::ToggleProvenance);
+    app.sync_focus_flags();
+    let every_editor_on = app.editor.editors.iter().all(|e| e.provenance_overlay)
+        && app
+            .editor_layout
+            .inactive_groups()
+            .iter()
+            .flat_map(|g| g.editors.iter())
+            .all(|e| e.provenance_overlay);
+    assert!(
+        every_editor_on,
+        "every tab in every group carries the lens after the sync"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleProvenance);
+    app.sync_focus_flags();
+    assert!(
+        app.editor.editors.iter().all(|e| !e.provenance_overlay),
+        "and every tab drops it"
+    );
+}
+
 #[test]
 fn toggle_inline_blame_command_flips_the_editor_flag_and_pref() {
     let mut app = editor_app_with_lines(&["one", "two"]);
