@@ -15,21 +15,25 @@ this-way is gone. That check cannot fail in the case it is needed for. This one
 compares each module's description LENGTH against the base revision and asks
 for a prose section whenever it shrank substantially.
 
-Both ways of being wrong are cheap here, so the threshold is deliberately
-generous: a module trimmed by less than 400 characters was edited, not gutted,
-and asking for a section it does not need costs one heading.
-
 Usage: check_arch_content.py [base-revision]   (default: origin/main)
 Exit 0 when every shortened module has a home, 1 when one does not.
 """
 
+import collections
 import re
 import subprocess
 import sys
 
 PATH = "docs/ARCHITECTURE.md"
-# Below this, a shrunken line is an edit rather than a gutting.
-SHRINK_THRESHOLD = 400
+# A line that lost this many characters lost a sentence, not a comma.
+#
+# Set from the corpus, not from a round number. The first pass used 400 on
+# the reasoning that both ways of being wrong are cheap, and 400 turned out
+# to sit just above a cluster of real losses - the largest unguarded shrink
+# was 353 characters, so the gate was tuned to pass. Measure before picking:
+# a threshold chosen without looking at the distribution it guards can admit
+# every case it exists to catch and still report success.
+SHRINK_THRESHOLD = 120
 
 
 def tree_descriptions(text):
@@ -43,9 +47,16 @@ def tree_descriptions(text):
     script exists to catch.
     """
     lines = text.split("\n")
+    # Anchor on the heading, not on a line number. Keying the search off a
+    # bare `i > 12` meant the parse depended on how much prose happened to
+    # sit above the tree: adding a fenced example to an earlier section
+    # would silently retarget it at that fence and compare unrelated text.
     try:
+        heading = next(
+            i for i, l in enumerate(lines) if l.strip() == "## Project layout"
+        )
         opening = next(
-            i for i, l in enumerate(lines) if l.strip() == "```" and i > 12
+            i for i in range(heading + 1, len(lines)) if lines[i].strip() == "```"
         )
         closing = next(
             i for i in range(opening + 1, len(lines)) if lines[i].strip() == "```"
@@ -75,32 +86,54 @@ def tree_descriptions(text):
     return out
 
 
-def main():
-    base = sys.argv[1] if len(sys.argv) > 1 else "origin/main"
-    old = subprocess.check_output(["git", "show", f"{base}:{PATH}"], text=True)
-    new = open(PATH).read()
+def section_keys(name, ambiguous=frozenset()):
+    """The names a `### ` heading may use for this module.
 
+    The full path always counts. The bare filename counts only when it names
+    exactly one row: `session.rs` and `dap/session.rs` both live in this tree,
+    and a single `### session.rs` heading was accepted as covering both, so one
+    of them kept a lost fact while the gate reported success.
+    """
+    bare = name.rstrip("/")
+    parts = bare.split("/")
+    keys = set()
+    # Every trailing slice of the path - `src/lsp/install.rs`, `lsp/install.rs`,
+    # `install.rs` - except a bare filename two rows share.
+    for i in range(len(parts)):
+        suffix = "/".join(parts[i:])
+        if "/" not in suffix and suffix in ambiguous:
+            continue
+        keys |= {suffix, suffix + "/"}
+    return keys
+
+
+def compare(old, new):
+    """(shrunk-with-no-section, dropped-rows) between two versions of the doc."""
     before, after = tree_descriptions(old), tree_descriptions(new)
-    # A section may be headed by the full tree path, by the bare filename, or
-    # by a directory with its trailing slash. Normalise all three to compare.
-    def keys(name):
-        bare = name.rstrip("/")
-        return {bare, bare + "/", bare.split("/")[-1], bare.split("/")[-1] + "/"}
+    # A basename carried by more than one row cannot stand in for a path.
+    seen = collections.Counter(p.rstrip("/").split("/")[-1] for p in before)
+    ambiguous = frozenset(leaf for leaf, n in seen.items() if n > 1)
 
     documented = set()
-    for h in re.findall(r"^### (\S+)", new, re.M):
-        documented |= keys(h)
+    for heading in re.findall(r"^### (\S+)", new, re.M):
+        documented |= section_keys(heading, ambiguous)
 
-    gutted = [
+    shrunk = [
         (name, len(desc), len(after[name]))
         for name, desc in before.items()
         if name in after
         and len(desc) - len(after[name]) > SHRINK_THRESHOLD
-        and not (keys(name) & documented)
+        and not (section_keys(name, ambiguous) & documented)
     ]
-    dropped = sorted(set(before) - set(after))
+    return sorted(shrunk, key=lambda r: r[2] - r[1]), sorted(set(before) - set(after))
 
-    for name, was, now in sorted(gutted, key=lambda r: r[2] - r[1]):
+
+def main():
+    base = sys.argv[1] if len(sys.argv) > 1 else "origin/main"
+    old = subprocess.check_output(["git", "show", f"{base}:{PATH}"], text=True)
+    gutted, dropped = compare(old, open(PATH).read())
+
+    for name, was, now in gutted:
         print(f"{name}: {was} -> {now} chars, with no `### {name}` section")
     for name in dropped:
         print(f"{name}: row gone from the tree entirely")

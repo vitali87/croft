@@ -49,7 +49,7 @@ This is the decisive one. croft's visual identity is painted with the **iTerm2 O
 
 The stock Windows console stack (`conhost`, and the Windows Terminal that fronts PowerShell) implements **none** of them. So even with every syscall above ported and the binary running cleanly under PowerShell, the result would be the image-less fallback: Nerd Font glyphs for icons and a metadata-header line for previews — exactly the degraded mode croft already warns about at startup, on any OS.
 
-The only way to get the real UI on Windows is a terminal emulator implementing the protocols, which in practice means **WezTerm**. And once you run WezTerm on Windows, the natural way to give it a POSIX environment is WSL — which puts you back at the supported Linux build. That is why the recommendation is "WSL2 + WezTerm" rather than a native port: the port's best case still requires WezTerm, and WSL gets you there without rewriting the syscall and clipboard layers.
+The only way to get the real UI on Windows is a terminal emulator implementing the protocols, which in practice means **WezTerm** (cross-platform, speaks both). And once you run WezTerm on Windows, the natural way to give it a POSIX environment is WSL — which puts you back at the supported Linux build. That is why the recommendation is "WSL2 + WezTerm" rather than a native port: the port's best case still requires WezTerm, and WSL gets you there without rewriting the syscall and clipboard layers.
 
 ## Summary
 
