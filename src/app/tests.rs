@@ -39012,11 +39012,12 @@ fn a_fold_mid_recording_narrows_the_frame_and_announces_nothing() {
         .find(|p| p.extension().is_some_and(|x| x == "cast"))
         .expect("a .cast file was written");
     let text = std::fs::read_to_string(&path).unwrap();
-    let header: serde_json::Value =
-        serde_json::from_str(text.lines().next().expect("a header")).expect("the header is JSON");
-    let declared = header["width"]
-        .as_u64()
-        .expect("the header declares a width");
+    // No header parse here: the "frames fit the header" claim belongs to
+    // `a_recorded_frames_rows_wrap_at_the_width_its_header_declares`, which
+    // pins it with a 100-character payload. Asserting it HERE was arithmetic,
+    // since `after` is pinned to 2 two lines below and no row can exceed the
+    // grid, so it survived the fold being deleted. That is the same defect
+    // this test was rewritten to remove, kept one assertion further down.
     let events: Vec<(String, String)> = text
         .lines()
         .skip(1)
@@ -39043,8 +39044,10 @@ fn a_fold_mid_recording_narrows_the_frame_and_announces_nothing() {
         .collect();
     assert_eq!(widths.len(), 2, "one frame each side of the fold");
 
-    // The claim the fold moves. Remove the fold and `after` is 15 like
-    // `before`, so this is the assertion the previous version was missing.
+    // The claim the fold moves. Remove the fold and `after` EQUALS `before`
+    // (whatever that is: the pane's real shell may print a prompt wider than
+    // the payload), so this is the assertion the previous version was
+    // missing. No literal here, because the fixture does not control it.
     let (before, after) = (widths[0], widths[1]);
     assert!(
         after < before,
@@ -39052,13 +39055,9 @@ fn a_fold_mid_recording_narrows_the_frame_and_announces_nothing() {
     );
     assert_eq!(
         after, 2,
-        "and the folded frame carries the GRID's two-column floor rather \
-         than a snapshot taken before the resize landed"
-    );
-    assert!(
-        (before as u64) <= declared && (after as u64) <= declared,
-        "neither frame may exceed the {declared}-column window the header \
-         asks for, since a player has nowhere to put the overflow"
+        "and the folded frame carries the GRID's two-column floor (`cols.max(2)` \
+         in src/widgets/terminal.rs) rather than a snapshot taken before the \
+         resize landed"
     );
     // And the suppression is part of the claim rather than a side effect the
     // filter above discarded: `last_inner.width` of 0 fails the guard's
@@ -39099,6 +39098,12 @@ fn a_widened_pane_announces_its_new_geometry_before_the_wider_frame() {
     let wide: String = std::iter::repeat_n('w', 60).collect();
     app.terminals[0].feed_bytes_for_test(format!("\r\n{wide}\r\n").as_bytes());
     app.record_active_screen();
+    // A third frame with NOTHING moved, which pins the recorder REMEMBERING
+    // the widening. Delete `self.recorded_size = size` from
+    // `record_active_screen` and this reads ["o","r","o","r","o"]: the stale
+    // size makes every later frame re-announce a geometry the player has.
+    // Nothing in the suite caught that assignment's removal.
+    app.record_active_screen();
     app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
 
     let path = std::fs::read_dir(app.workspace_root())
@@ -39120,16 +39125,11 @@ fn a_widened_pane_announces_its_new_geometry_before_the_wider_frame() {
     let kinds: Vec<&str> = events.iter().filter_map(|ev| ev[1].as_str()).collect();
     assert_eq!(
         kinds,
-        vec!["o", "r", "o"],
+        vec!["o", "r", "o", "o"],
         "the widened geometry must reach the player BEFORE the frame wrapped \
-         for it, got {kinds:?}"
+         for it, and exactly once, got {kinds:?}"
     );
 
-    let announced = events[1][3].as_u64().or_else(|| {
-        events[1][2]
-            .as_str()
-            .and_then(|s| s.split('x').next()?.parse().ok())
-    });
     let widest = events[2][2]
         .as_str()
         .expect("the second frame is text")
@@ -39144,13 +39144,19 @@ fn a_widened_pane_announces_its_new_geometry_before_the_wider_frame() {
         "the fixture must produce a frame the HEADER cannot hold, or the \
          resize event is not load-bearing: widest {widest}, header {declared}"
     );
-    if let Some(announced) = announced {
-        assert!(
-            widest as u64 <= announced,
-            "and the frame must fit the geometry the `r` announced: widest \
-             {widest}, announced {announced}"
-        );
-    }
+    // Unconditional, and on BOTH dimensions. The first version read
+    // `events[1][3]`, which an asciicast resize never has (it is
+    // `[time, "r", "COLSxROWS"]`, three elements), so the primary extraction
+    // always yielded None and an `or_else` did the work behind an `if let`.
+    // The day that fallback was tidied away the assertion would have stopped
+    // running with nothing failing, and the rows dimension was read by
+    // nothing at all: `record_resize(size.1, size.0)` survived the suite.
+    assert_eq!(
+        events[1][2].as_str(),
+        Some("80x20"),
+        "the `r` must name the pane's new geometry, got {:?}",
+        events[1]
+    );
 }
 
 /// #366: review boxes survive a render, which rebuilds the navigator's.
