@@ -26104,15 +26104,43 @@ fn clicking_an_annotated_span_still_clears_the_click_selection() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A SILENT pane (#477). `App::new` spawns the user's interactive shell,
+    // whose prompt lands whenever the machine gets round to it; a prompt
+    // arriving between the anchor below and the click scrolled the
+    // annotation off the row the click was aimed at, and the popup
+    // assertion read as "annotation hover broke" on a merely busy host.
+    // A child that prints nothing cannot move the grid, so the only bytes
+    // on it are the ones this test feeds.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     app.terminals[0].feed_bytes_for_test(b"annotated words here\r\n");
+    // Anchor the note to the grid line the text actually landed on and aim
+    // the click at that same line, rather than assuming both are row 0.
+    let line = app.terminals[0]
+        .find_captured_line("annotated words here")
+        .expect("the fed text is on the grid");
+    assert!(
+        line >= 0,
+        "with no scrollback the text sits on a viewport row, got line {line}"
+    );
     let clock = app.terminals[0].scroll_clock();
-    app.terminals[0].add_annotation(0, clock, 0, 15, String::from("the note"));
+    app.terminals[0].add_annotation(line, clock, 0, 15, String::from("the note"));
     let inner = app.terminals[0].last_inner;
-    let (cx, cy) = (inner.x + 2, inner.y);
+    let (cx, cy) = (inner.x + 2, inner.y + line as u16);
+    assert!(
+        app.terminals[0]
+            .line_text_at(cx, cy)
+            .is_some_and(|(text, idx)| text.starts_with("annotated words here") && idx == 2),
+        "the click must land ON the annotated text, or the popup assertion is vacuous"
+    );
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), cx, cy));
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), cx, cy));
     assert!(app.hover_popup.is_some(), "the click must pop the note");
