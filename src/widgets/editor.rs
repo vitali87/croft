@@ -10515,7 +10515,7 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 /// position past that `\r` (semantic tokens, diagnostics, hover, definition)
 /// would then resolve one row off. Normalizing first keeps the two in lockstep
 /// and is a no-op for clean `\n`-only files.
-fn split_into_lines(text: &str) -> Vec<String> {
+pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
     normalize_newlines(text)
         .lines()
         .map(|s| s.to_string())

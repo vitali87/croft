@@ -24443,7 +24443,8 @@ impl App {
         // before that describes text this diff no longer shows.
         diff.seats = crate::provenance::Provenance::new();
         let path = diff.right_path.clone();
-        let seats = Self::seats_for_working_file(&history_root, &path);
+        let right_lines = diff.right_lines.clone();
+        let seats = Self::seats_for_working_file(&history_root, &path, &right_lines);
         let Some(diff) = self.editor.diff.as_mut() else {
             return;
         };
@@ -24453,21 +24454,65 @@ impl App {
         self.status = format!("Diff: group by seat \u{2022} {}", diff.seat_summary());
     }
 
-    /// The persisted provenance map for a working-tree file, but only when
-    /// the newest snapshot still holds exactly the bytes on disk (#349) -
-    /// the same rule `sync_provenance_for` applies before putting a map on a
-    /// buffer. A file saved since its last snapshot reads as no map at all,
-    /// never as a map of the text it used to hold.
+    /// Reload the group-by-seat map of a rebuilt view against its new rows
+    /// (#349). `carry_view_from` keeps the lens ON but deliberately drops
+    /// its map, which named line indices the rebuilt rows have renumbered;
+    /// this puts back a map that describes the rows now on screen, or none.
+    /// A no-op for a view whose lens is off.
+    fn reload_seats_for(history_root: &Path, diff: &mut crate::widgets::diff::DiffData) {
+        if !diff.group_by_seat {
+            return;
+        }
+        let right_lines = diff.right_lines.clone();
+        diff.seats = Self::seats_for_working_file(history_root, &diff.right_path, &right_lines)
+            .unwrap_or_default();
+    }
+
+    /// [`Self::reload_seats_for`] on the active tab's diff, the step the
+    /// refresh performs for a carried lens. Test-only: production reaches
+    /// the same helper inside the rebuild loop, where the fresh view is in
+    /// hand before it is installed.
+    #[cfg(test)]
+    pub fn reload_group_by_seat_map(&mut self) {
+        let history_root = self.history_root.clone();
+        if let Some(diff) = self.editor.diff.as_mut() {
+            Self::reload_seats_for(&history_root, diff);
+        }
+    }
+
+    /// The persisted provenance map for a working-tree file, for the rows a
+    /// diff view is actually showing (#349). Both halves of the rule
+    /// `sync_provenance_for` applies: the newest snapshot must still hold the
+    /// bytes on disk, AND those bytes must be the lines this view shows.
+    ///
+    /// The second half is not redundant. A diff's `right_lines` were read
+    /// when the view was built, and a same-length rewrite inside one
+    /// filesystem timestamp tick moves the file without moving the
+    /// `(mtime, len)` stamp that triggers a rebuild - so the view can be
+    /// showing older lines than the snapshot describes. Joining a newer map
+    /// onto them would credit lines it never saw, which is the one outcome
+    /// the module forbids. Either half failing reads as no map at all.
     fn seats_for_working_file(
         history_root: &Path,
         path: &Path,
+        right_lines: &[String],
     ) -> Option<crate::provenance::Provenance> {
         let newest = crate::history::entries_in(history_root, path)
             .into_iter()
             .next()?;
-        let seats = crate::history::seats_for(history_root, path, newest.millis)?;
+        let mut seats = crate::history::seats_for(history_root, path, newest.millis)?;
         let (on_disk, snapshot) = (std::fs::read(path).ok()?, std::fs::read(&newest.file).ok()?);
-        (on_disk == snapshot).then_some(seats)
+        if on_disk != snapshot {
+            return None;
+        }
+        // Split the way `Editor::open` splits, so the comparison is against
+        // the same lines the view was built from.
+        let text = String::from_utf8(snapshot).ok()?;
+        if crate::widgets::editor::split_into_lines(&text) != right_lines {
+            return None;
+        }
+        seats.truncate(right_lines.len());
+        Some(seats)
     }
 
     /// Stage only the hunk under the diff caret (`git apply --cached`).
@@ -24607,6 +24652,9 @@ impl App {
         heads_moved: &[PathBuf],
         changed_files: &std::collections::BTreeSet<PathBuf>,
     ) -> bool {
+        // Bound before the borrow of `self.editor` below, for the seat map a
+        // carried group-by-seat lens needs against its rebuilt rows (#349).
+        let self_history_root = self.history_root.clone();
         // The watcher's own list of written paths bypasses the stamp gate: a
         // same-length rewrite that lands within the filesystem's mtime
         // granularity (or restores the mtime) shows the same `(mtime, len)`
@@ -24645,6 +24693,10 @@ impl App {
                     continue;
                 }
                 fresh.carry_view_from(old);
+                // The carried lens needs a map for the REBUILT rows:
+                // `carry_view_from` deliberately drops the old one, which
+                // named lines these rows have renumbered (#349).
+                Self::reload_seats_for(&self_history_root, &mut fresh);
                 ed.diff = Some(fresh);
                 changed = true;
                 if std::ptr::eq(&*ed, active_ptr) {

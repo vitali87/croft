@@ -1122,6 +1122,12 @@ impl DiffData {
         };
         self.left_is_git_head = old.left_is_git_head;
         self.left_is_real_file = old.left_is_real_file;
+        // The lens survives, its MAP does not (#349): the map is keyed on
+        // line indices the rebuilt rows have renumbered, so carrying it
+        // would credit whatever now sits at those lines. The app reloads it
+        // against the new right side; until it does, the lens is on with
+        // nothing claimed, which reads as unrecorded rather than as wrong.
+        self.group_by_seat = old.group_by_seat;
         // `source` is not carried here: the rebuild set it before stamping
         // the sides, since which sides are files depends on it.
     }
@@ -1705,6 +1711,10 @@ mod seat_group_tests {
         use ratatui::widgets::Widget as _;
         let mut e = crate::widgets::editor::Editor::new();
         let mut d = head_diff(&["kept"], &["kept", "mine", "nobody's"]);
+        // Line 0 is unchanged AND has a seat: without it, dropping the
+        // added-rows-only guard would leave the count unchanged and this
+        // test would pass on a renderer that marks unchanged lines too.
+        d.seats.record(0..1, Seat::Navigator);
         d.seats.record(1..2, Seat::Me);
         e.diff = Some(d);
         let area = Rect {
