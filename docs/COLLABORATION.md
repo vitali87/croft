@@ -15,8 +15,8 @@ croft ls                         # list running persistent sessions
 `croft attach` runs the session under croft's built-in session host, so its terminals,
 language servers, debugger, and open files keep running after you close the window (or lose
 the SSH connection). Close the window to detach; run `croft attach` again in the same folder
-to reattach exactly where you left off. This is the same persistence `croft remote` gives you
-over SSH, now available locally, with no external dependency.
+to reattach where you left off. This is the persistence `croft remote` gives you over SSH,
+available locally with no external dependency.
 
 Sessions started by an older croft under dtach keep reattaching through dtach until they end.
 
@@ -26,7 +26,7 @@ Several people (or several of your own windows) can `croft attach` the same fold
 the session live. The first attacher holds write control and later attachers join as read-only
 observers, enforced by the host, with everyone's window sized to the smallest participant.
 
-Inside croft, the status bar shows an "N attached" badge whenever someone else is on, and
+The status bar shows an "N attached" badge whenever someone else is on, and
 **Session: Participants** (`Cmd+K A`) lists everyone so you can grant or revoke write control
 or disconnect a participant. When several people hold control and take turns typing, each keeps
 their own caret: croft parks the previous typist's cursor, restores the new typist's, and shows
@@ -72,18 +72,18 @@ croft pair --workspace /abs/path/to/project --model claude-haiku-4-5-20251001 --
 The command records the activation and exits; the running croft (or the next one you start
 there) seats the pilot within a second and wears a `◆ navigator seated` badge. While seated it
 keeps its own orange caret in the file — parked wherever you last engaged it, at every comment
-it leaves, and riding its edits as they stream. Then, inside the editor:
+it leaves, and riding its edits as they stream. Inside the editor:
 
 - **Ask it** about a line or a selection — right-click the gutter ("Ask Navigator"), right-click
   a selection ("Ask Navigator About Selection"), or press `Cmd+K Q`. From the CAPTURES panel, `n` on a
-  captured line asks about that line with the pane rows around it (#372). From the PROBLEMS panel,
+  captured line asks about that line with the pane rows around it. From the PROBLEMS panel,
   right-click a diagnostic → **Fix with Navigator** (also the last row of the `Cmd+.` Quick Fix
   picker) sends it the diagnostic with the server's quick fixes as hints; the row wears a spinner
-  until the turn ends, and `Cmd+K X` cancels and reverts (#374). Its edits stream into the
+  until the turn ends, and `Cmd+K X` cancels and reverts. Its edits stream into the
   buffer **token by token**, the way a human types, with a named caret riding the stream.
 - **Yield it the turn** with `Cmd+K Y`: it reviews the active file *comment-only* — everything
-  it says appears as **comment boxes** right in the file, unnumbered blocks between the lines
-  they belong to (never part of the buffer, never saved). Each box carries a reply field and an
+  it says appears as **comment boxes** in the file, unnumbered blocks between the lines they
+  belong to (never part of the buffer, never saved). Each box carries a reply field and an
   **Ignore** button: type back and press `Enter` to continue the conversation in place, or
   dismiss it and keep working. `F4` hops to the next box, `Shift+F4` ignores one. Any edit it
   attempts on a yielded turn is discarded by the host, not just discouraged.
@@ -91,9 +91,8 @@ it leaves, and riding its edits as they stream. Then, inside the editor:
   `Cmd+K X` — the streamed text is reverted and the conversation stays alive for your next
   instruction.
 - **It re-engages on its own**: once it has seen a file, finishing a new function, struct, or
-  markdown section and pausing for a moment hands it another comment-only look — a real pair
-  partner glancing over, never able to edit uninvited. Turn it off with "Navigator: Toggle
-  Proactive Comments".
+  markdown section and pausing hands it another comment-only look — a pair partner glancing
+  over, never able to edit uninvited. Turn it off with "Navigator: Toggle Proactive Comments".
 
 The model's toolbox is read-only (`Read`/`Grep`/`Glob` plus a read-only collab seat); the only
 way it can change a buffer is the visible, cancellable stream. `croft pair --off` (or the
@@ -102,8 +101,8 @@ way it can change a buffer is the visible, cancellable stream. `croft pair --off
 ### Local models
 
 The navigator is not claude-only. Point it at any local Anthropic-compatible endpoint — Ollama,
-LM Studio, llama.cpp, vLLM — and your own open-weight model takes the seat, same fences, same
-streaming, same cancel:
+LM Studio, llama.cpp, vLLM — and your own open-weight model takes the seat: same fences, same
+streaming, same cancel.
 
 ```sh
 croft pair --provider ollama --model qwen3-coder:30b          # Ollama on localhost:11434
