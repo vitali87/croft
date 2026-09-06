@@ -31706,7 +31706,7 @@ impl App {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        if !viewer.extensions.iter().any(|e| *e == ext) {
+        if !viewer.extensions.contains(&ext) {
             self.status = format!(
                 "{}: the active file is not one of .{}",
                 viewer.label,

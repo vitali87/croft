@@ -177,7 +177,7 @@ fn viewer_for_path_in(
     let ext = path.extension()?.to_string_lossy().to_lowercase();
     viewers_in(sources, disabled)
         .into_iter()
-        .find(|v| v.extensions.iter().any(|e| *e == ext))
+        .find(|v| v.extensions.contains(&ext))
 }
 
 /// Pure: the palette rows for every enabled viewer, titled
