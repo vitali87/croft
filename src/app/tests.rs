@@ -12248,6 +12248,19 @@ fn editor_app_with_lines(lines: &[&str]) -> App {
     app
 }
 
+/// Wait for the provenance sidecar the save records after its snapshot
+/// (#349); it lands on the same thread, strictly after the snapshot.
+fn wait_for_seats(root: &std::path::Path, f: &std::path::Path, millis: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while crate::history::seats_for(root, f, millis).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sidecar never landed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// History recording runs off-thread; poll until the store has entries (or a
 /// deadline passes and the caller's assert reports the miss).
 fn wait_for_snapshots(
@@ -12478,6 +12491,127 @@ fn toggle_provenance_command_flips_the_editor_lens() {
     assert!(
         !app.editor.provenance_overlay,
         "toggling again turns it off"
+    );
+}
+
+/// Provenance survives a restart (#349, criterion 2): a save records who
+/// typed each line beside the history snapshot, and a fresh app that opens
+/// the unchanged file gets the map back. Distinguishable seats per line, or
+/// a seat on the wrong line would be invisible.
+#[test]
+fn provenance_survives_a_restart_when_the_file_is_unchanged() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+    {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.history_root = hist.path().to_path_buf();
+        app.editor.open(&f).unwrap();
+        app.focus_pane(Pane::Editor);
+        // Recorded directly rather than typed: a typed newline splits the
+        // line below and credits it to the typist (the shipped rule), and
+        // this test needs one line nobody touched.
+        app.editor.provenance.record(0..1, Seat::Navigator);
+        app.editor
+            .provenance
+            .record(1..2, Seat::Agent(String::from("pane 2")));
+        app.editor.dirty = true;
+        app.save();
+        let snaps = wait_for_snapshots(&app.history_root, &f);
+        assert_eq!(snaps.len(), 1, "staging: the save recorded a snapshot");
+        assert_eq!(
+            std::fs::read(&snaps[0].file).unwrap(),
+            std::fs::read(&f).unwrap(),
+            "staging: the snapshot holds the saved bytes"
+        );
+        // The sidecar lands after the snapshot, on the same thread; wait for
+        // it rather than for the snapshot it follows.
+        wait_for_seats(&app.history_root, &f, snaps[0].millis);
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "staging: a fresh open knows nothing yet"
+    );
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance.seat(0),
+        Some(&Seat::Navigator),
+        "the navigator's line comes back: {:?}",
+        app.editor.provenance
+    );
+    assert_eq!(
+        app.editor.provenance.seat(1),
+        Some(&Seat::Agent(String::from("pane 2"))),
+        "and the agent's: {:?}",
+        app.editor.provenance
+    );
+    assert_eq!(
+        app.editor.provenance.seat(2),
+        None,
+        "the untouched line stays unknown"
+    );
+    // A revert swaps the buffer for the snapshot's bytes and clears the map;
+    // the restore fires again for the same path rather than staying burnt.
+    let _ = app.editor.revert_to_disk();
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "staging: the revert cleared the map"
+    );
+    app.provenance_synced_for = None;
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance.seat(0),
+        Some(&Seat::Navigator),
+        "the map comes back after a revert of the same path: {:?}",
+        app.editor.provenance
+    );
+}
+
+/// A persisted map is restored only onto the text it described: a file
+/// changed since the snapshot (by anything, croft or not) opens with every
+/// line unknown rather than credited from a stale map.
+#[test]
+fn provenance_is_not_restored_onto_text_the_snapshot_never_saw() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "v1\n").unwrap();
+    {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.history_root = hist.path().to_path_buf();
+        app.editor.open(&f).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 0;
+        app.editor.insert_str_as("nav\n", Seat::Navigator);
+        app.save();
+        let snaps = wait_for_snapshots(&app.history_root, &f);
+        assert_eq!(snaps.len(), 1, "staging: the save recorded a snapshot");
+        // Positive control: there IS a map that a careless restore would apply.
+        wait_for_seats(&app.history_root, &f, snaps[0].millis);
+    }
+    // Edited outside croft after the save: the snapshot's map describes text
+    // that is no longer what is on disk.
+    let mut on_disk = std::fs::read_to_string(&f).unwrap();
+    on_disk.insert_str(0, "someone else\n");
+    std::fs::write(&f, on_disk).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "a changed file is not credited from a stale map: {:?}",
+        app.editor.provenance
     );
 }
 

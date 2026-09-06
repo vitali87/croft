@@ -2529,6 +2529,9 @@ pub struct App {
     /// Local-history root (`~/.config/croft/history`), cached so tests can
     /// redirect snapshots to a tempdir.
     history_root: PathBuf,
+    /// The file `sync_provenance` last considered, so the history read
+    /// happens once per file the active editor lands on rather than per tick.
+    provenance_synced_for: Option<PathBuf>,
     /// The snapshot currently shown in a local-history diff, `(live file,
     /// snapshot contents)`, so "Local History: Restore Snapshot" can write it
     /// back. Cleared when a non-snapshot diff opens.
@@ -4477,6 +4480,7 @@ impl App {
             } else {
                 crate::history::history_dir()
             },
+            provenance_synced_for: None,
             history_restore: None,
             deps_rx,
             deps_tx,
@@ -6039,6 +6043,9 @@ impl App {
         if report.is_empty() {
             return false;
         }
+        // A reload replaced the buffer and cleared its map (#349); let
+        // `sync_provenance` reconsider this path instead of staying burnt.
+        self.provenance_synced_for = None;
         self.refresh_git_status_debounced();
         match (
             report.reloaded.len(),
@@ -8773,6 +8780,9 @@ impl App {
         // so the editor shows the restored contents and the disk stamp resyncs.
         if self.editor.path.as_deref() == Some(file.as_path()) {
             let _ = self.editor.revert_to_disk();
+            // The revert swapped the buffer for a stored snapshot's bytes and
+            // cleared its map (#349); the restore is worth a second look.
+            self.provenance_synced_for = None;
         }
         // The restore is itself a new version worth keeping.
         self.record_history_snapshot(&file);
@@ -39581,6 +39591,64 @@ impl App {
         }
     }
 
+    /// Restore a persisted provenance map onto the active editor (#349),
+    /// once per file it lands on: when the editor is clean, knows nothing
+    /// yet, and the newest history snapshot holds exactly the bytes on disk,
+    /// the seats recorded beside that snapshot describe this very text and
+    /// come back. Any difference (an edit since, a save croft never saw, a
+    /// file with no history) leaves every line unknown: a map is never
+    /// applied to text it did not describe.
+    fn sync_provenance(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.provenance_synced_for = None;
+            return;
+        };
+        if self.provenance_synced_for.as_deref() == Some(path.as_path()) {
+            return;
+        }
+        self.provenance_synced_for = Some(path.clone());
+        if self.editor.dirty || self.editor.provenance.attributed() > 0 {
+            return;
+        }
+        let Some(newest) = crate::history::entries_in(&self.history_root, &path)
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        // The sidecar first: most files have a snapshot and no record, and
+        // the two whole-file reads below are only worth paying on the UI
+        // thread when there is a map to apply.
+        let Some(mut seats) = crate::history::seats_for(&self.history_root, &path, newest.millis)
+        else {
+            return;
+        };
+        let (Ok(on_disk), Ok(snapshot)) = (std::fs::read(&path), std::fs::read(&newest.file))
+        else {
+            return;
+        };
+        if on_disk != snapshot {
+            return;
+        }
+        seats.truncate(self.editor.lines.len());
+        self.editor.provenance = seats;
+    }
+
+    /// Who typed each line of the open tab for `path`, wherever the tab
+    /// lives, for the history snapshot that save is about to record; an
+    /// unopened path (a deferred write after the tab closed) has no map.
+    fn provenance_of_tab(&self, path: &Path) -> crate::provenance::Provenance {
+        if let Some(idx) = self.editor.find_tab_with_path(path) {
+            return self.editor.editors[idx].provenance.clone();
+        }
+        for group in self.editor_layout.inactive_groups() {
+            if let Some(idx) = group.find_tab_with_path(path) {
+                return group.editors[idx].provenance.clone();
+            }
+        }
+        crate::provenance::Provenance::new()
+    }
+
     /// Record a local-history snapshot of a file that just hit the disk, and
     /// refresh the TIMELINE when it's the active file so the new version shows.
     /// Reads back what was written so the snapshot matches the on-disk bytes
@@ -39592,9 +39660,13 @@ impl App {
         let path = path.to_path_buf();
         let tx = self.history_done_tx.clone();
         let millis = now_millis();
+        // Captured now, on the UI thread, from the tab that was just saved:
+        // the map describes the buffer at this save, and the thread below
+        // records it beside the snapshot of the same bytes (#349).
+        let seats = self.provenance_of_tab(&path);
         std::thread::spawn(move || {
             if let Ok(bytes) = std::fs::read(&path) {
-                let _ = crate::history::record_in(&root, &path, &bytes, millis);
+                let _ = crate::history::record_with_seats_in(&root, &path, &bytes, millis, &seats);
             }
             let _ = tx.send(path);
         });
@@ -47490,6 +47562,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_lsp();
         app.sync_git_gutters();
         app.sync_blame();
+        app.sync_provenance();
         let blame_changed = app.drain_blame();
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.

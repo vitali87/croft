@@ -147,6 +147,7 @@ pub fn record_in(
             write_snapshot(&dir, millis, content)?;
             if latest.millis != millis {
                 let _ = std::fs::remove_file(&latest.file);
+                let _ = std::fs::remove_file(seats_path(&dir, latest.millis));
             }
             return Ok(());
         }
@@ -174,8 +175,15 @@ pub fn record_in(
 /// that died: age alone must not decide it, or a writer paused past the
 /// window would come back to find its bytes swept and its rename failing.
 fn write_snapshot(dir: &Path, millis: u64, content: &[u8]) -> std::io::Result<()> {
+    write_staged(dir, millis, SNAP_EXT, content)
+}
+
+/// The staged write behind [`write_snapshot`], for any of a snapshot's files
+/// (`ext` names which): bytes to the staging name, then a rename over
+/// `<millis>.<ext>`.
+fn write_staged(dir: &Path, millis: u64, ext: &str, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let final_path = dir.join(format!("{millis}.{SNAP_EXT}"));
+    let final_path = dir.join(format!("{millis}.{ext}"));
     let tmp = staging_path(dir, millis);
     let written = (|| {
         let mut file = std::fs::File::create(&tmp)?;
@@ -207,7 +215,9 @@ const STAGING_EXT: &str = "tmp";
 /// a writer that is merely slow.
 const STAGING_ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A staging name unique to this writer: `<millis>.snap.<pid>-<seq>.tmp`.
+/// A staging name unique to this writer: `<millis>.snap.<pid>-<seq>.tmp`
+/// (the `snap` is fixed whatever the final extension: a `.seats` sidecar
+/// stages under the same shape, and the sweep keys on `.tmp` alone).
 /// Two saves of one file in the same millisecond (two croft instances, or
 /// an explicit save racing the auto save) must not share a staging file, or
 /// each would report success while the final snapshot held only one's
@@ -256,6 +266,74 @@ fn sweep_abandoned_staging(dir: &Path, now: std::time::SystemTime) {
     }
 }
 
+/// The extension of the sidecar that records who typed each line of a
+/// snapshot (#349): `<millis>.seats` beside `<millis>.snap`, JSON, written
+/// through the same staging-and-rename as the snapshot so it is never
+/// listed half-written, and removed whenever its snapshot is.
+const SEATS_EXT: &str = "seats";
+
+/// Record who typed each line beside the snapshot taken at `millis` (#349).
+/// A map with nothing attributed writes nothing: an absent sidecar and an
+/// empty one read the same, and the common case (a file nobody's seat has
+/// touched) should not grow the history dir.
+pub(crate) fn record_seats_in(
+    root_dir: &Path,
+    abs_path: &Path,
+    millis: u64,
+    seats: &crate::provenance::Provenance,
+) -> std::io::Result<()> {
+    let dir = dir_for(root_dir, abs_path);
+    if seats.attributed() == 0 {
+        return Ok(());
+    }
+    let json = serde_json::to_vec(seats).map_err(std::io::Error::other)?;
+    std::fs::create_dir_all(&dir)?;
+    write_staged(&dir, millis, SEATS_EXT, &json)
+}
+
+/// Record `content` as [`record_in`] does, then the seats beside whichever
+/// snapshot now holds that content: the one just written, or the newest
+/// existing one when the save changed nothing (`record_in` skips those).
+pub fn record_with_seats_in(
+    root_dir: &Path,
+    abs_path: &Path,
+    content: &[u8],
+    millis: u64,
+    seats: &crate::provenance::Provenance,
+) -> std::io::Result<()> {
+    record_in(root_dir, abs_path, content, millis)?;
+    // Nothing attributed writes nothing (see `record_seats_in`), so skip the
+    // listing and the snapshot read that would find its holder.
+    if seats.attributed() == 0 {
+        return Ok(());
+    }
+    let Some(holder) = entries_in(root_dir, abs_path)
+        .into_iter()
+        .find(|snap| std::fs::read(&snap.file).is_ok_and(|bytes| bytes == content))
+    else {
+        return Ok(());
+    };
+    record_seats_in(root_dir, abs_path, holder.millis, seats)
+}
+
+/// The seats recorded beside the snapshot taken at `millis`, if any (#349).
+/// A sidecar that does not parse reads as nothing: a line is unknown, never
+/// guessed from a record that cannot be trusted.
+pub fn seats_for(
+    root_dir: &Path,
+    abs_path: &Path,
+    millis: u64,
+) -> Option<crate::provenance::Provenance> {
+    let path = dir_for(root_dir, abs_path).join(format!("{millis}.{SEATS_EXT}"));
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The sidecar path for the snapshot taken at `millis`, for removal with it.
+fn seats_path(dir: &Path, millis: u64) -> PathBuf {
+    dir.join(format!("{millis}.{SEATS_EXT}"))
+}
+
 /// Snapshots of `abs_path` under `root_dir`, newest first.
 pub fn entries_in(root_dir: &Path, abs_path: &Path) -> Vec<Snapshot> {
     let dir = dir_for(root_dir, abs_path);
@@ -283,6 +361,9 @@ fn prune_in(root_dir: &Path, abs_path: &Path) {
     let all = entries_in(root_dir, abs_path);
     for old in all.into_iter().skip(MAX_SNAPSHOTS_PER_FILE) {
         let _ = std::fs::remove_file(&old.file);
+        if let Some(dir) = old.file.parent() {
+            let _ = std::fs::remove_file(seats_path(dir, old.millis));
+        }
     }
     sweep_abandoned_staging(&dir_for(root_dir, abs_path), std::time::SystemTime::now());
 }
@@ -608,5 +689,112 @@ mod tests {
         let merged = merged_timeline(commits, &snaps, 10_000);
         let hashes: Vec<&str> = merged.iter().map(|e| e.short_hash.as_str()).collect();
         assert_eq!(hashes, vec!["c1", "local:5000", "c2"], "sorted by age");
+    }
+
+    /// Who typed each line is recorded beside the snapshot it describes and
+    /// read back by the snapshot's timestamp (#349); a snapshot with no
+    /// record reads as nothing, never as a guess.
+    #[test]
+    fn seats_are_recorded_beside_their_snapshot_and_read_back() {
+        use crate::provenance::{Provenance, Seat};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = tmp.path().join("a.txt");
+        record_in(root, &f, b"one\ntwo\n", 1_000).unwrap();
+        let mut seats = Provenance::new();
+        seats.record(0..1, Seat::Navigator);
+        seats.record(1..2, Seat::Peer(String::from("ada")));
+        record_seats_in(root, &f, 1_000, &seats).unwrap();
+        let back = seats_for(root, &f, 1_000).expect("the record is read back");
+        assert_eq!(back.seat(0), Some(&Seat::Navigator));
+        assert_eq!(back.seat(1), Some(&Seat::Peer(String::from("ada"))));
+        assert_eq!(back.seat(2), None);
+        assert!(
+            seats_for(root, &f, 2_000).is_none(),
+            "a timestamp with no record reads as nothing"
+        );
+    }
+
+    /// A snapshot superseded inside the merge window takes its sidecar with
+    /// it (#349): the seats described bytes that no longer have a snapshot.
+    #[test]
+    fn a_superseded_snapshot_takes_its_seats_with_it() {
+        use crate::provenance::{Provenance, Seat};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = tmp.path().join("a.txt");
+        let mut seats = Provenance::new();
+        seats.record(0..1, Seat::Navigator);
+        record_in(root, &f, b"v1\n", 1_000).unwrap();
+        record_seats_in(root, &f, 1_000, &seats).unwrap();
+        assert!(
+            seats_for(root, &f, 1_000).is_some(),
+            "control: the sidecar was written"
+        );
+        record_in(root, &f, b"v2\n", 5_000).unwrap();
+        assert!(
+            seats_for(root, &f, 1_000).is_none(),
+            "the superseded snapshot's seats are gone"
+        );
+    }
+
+    /// Pruning past the cap removes the evicted snapshot's sidecar and keeps
+    /// a survivor's (#349).
+    #[test]
+    fn a_pruned_snapshot_takes_its_seats_with_it() {
+        use crate::provenance::{Provenance, Seat};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = tmp.path().join("a.txt");
+        let mut seats = Provenance::new();
+        seats.record(0..1, Seat::Me);
+        // A minute apart, so none merge; each with a sidecar.
+        for n in 0..=MAX_SNAPSHOTS_PER_FILE as u64 {
+            let millis = 60_000 * (n + 1);
+            record_in(root, &f, format!("v{n}\n").as_bytes(), millis).unwrap();
+            record_seats_in(root, &f, millis, &seats).unwrap();
+        }
+        assert!(
+            seats_for(root, &f, 60_000).is_none(),
+            "the evicted first snapshot's seats are gone"
+        );
+        let newest = 60_000 * (MAX_SNAPSHOTS_PER_FILE as u64 + 1);
+        assert!(
+            seats_for(root, &f, newest).is_some(),
+            "the newest keeps its seats"
+        );
+    }
+
+    /// A save that changes nothing still attaches its seats to the snapshot
+    /// that holds those bytes, and an unattributed map writes no sidecar.
+    #[test]
+    fn seats_attach_to_the_snapshot_holding_the_bytes_and_an_empty_map_writes_nothing() {
+        use crate::provenance::{Provenance, Seat};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = tmp.path().join("a.txt");
+        record_in(root, &f, b"v1\n", 1_000).unwrap();
+        let mut seats = Provenance::new();
+        seats.record(0..1, Seat::Generated);
+        // Identical content much later: `record_in` skips, the seats attach
+        // to the existing holder, and no snapshot appears at the new time.
+        record_with_seats_in(root, &f, b"v1\n", 60_000, &seats).unwrap();
+        assert!(
+            seats_for(root, &f, 1_000).is_some(),
+            "attached to the holder"
+        );
+        assert!(
+            seats_for(root, &f, 60_000).is_none(),
+            "nothing at the skipped time"
+        );
+        let g = tmp.path().join("b.txt");
+        record_with_seats_in(root, &g, b"plain\n", 1_000, &Provenance::new()).unwrap();
+        let dir = dir_for(root, &g);
+        let sidecars = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(SEATS_EXT))
+            .count();
+        assert_eq!(sidecars, 0, "an unattributed map writes no sidecar");
     }
 }
