@@ -13499,25 +13499,30 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
     );
     assert_eq!(r1, 238, "and reaches line 239");
     // The cursor sits at the selection's HEAD, as every other
-    // selection-installing path leaves it, so Shift+motion extends the
-    // range rather than collapsing it onto the cursor.
+    // selection-installing path leaves it, and the head is the landing line
+    // (the anchor is the far end), so the line the user asked for is the one
+    // on screen and Shift+motion extends from it.
     assert_eq!(
         (app.editor.cursor_row, app.editor.cursor_col),
         sel.head,
         "the cursor is at the head of the range"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 235,
+        "and the head is the landing line"
     );
     assert!(
         app.status.ends_with("alpha.rs:236-239"),
         "the status names the range: {:?}",
         app.status
     );
-    app.handle_key(key(KeyCode::Down, KeyModifiers::SHIFT))
+    app.handle_key(key(KeyCode::Up, KeyModifiers::SHIFT))
         .unwrap();
     let ((r0, _), (r1, _)) = app.editor.selection.expect("still selected").normalised();
     assert_eq!(
         (r0, r1),
-        (235, 239),
-        "Shift+Down extends the range by a line instead of shrinking it"
+        (234, 238),
+        "Shift+Up extends the range from the landing line"
     );
     let page = app.editor.page_size().max(1);
     assert!(
@@ -13546,6 +13551,27 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
         app.editor.cursor_row, 299,
         "a line past the end lands on the last line"
     );
+
+    // A range taller than the viewport still shows the landing line after a
+    // paint: the paint-time clamp follows the cursor, so the cursor must be
+    // on that line. Painted first so the page size is the real one.
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    type_and_enter(&mut app, "alpha:100-200");
+    term.draw(|f| app.render(f)).unwrap();
+    let page = app.editor.page_size().max(1);
+    assert!(
+        app.editor.scroll <= 99 && 99 < app.editor.scroll + page,
+        "line 100 is on screen after the paint: scroll={} page={page}",
+        app.editor.scroll
+    );
+    let ((r0, _), (r1, _)) = app
+        .editor
+        .selection
+        .expect("the tall range is selected")
+        .normalised();
+    assert_eq!((r0, r1), (99, 199));
 
     type_and_enter(&mut app, "alpha:236:7");
     assert_eq!(

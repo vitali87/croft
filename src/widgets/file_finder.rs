@@ -237,8 +237,12 @@ impl FileFinder {
         }
         // A hint with no file (`:236`) names a line in nothing: listing every
         // file and opening the first at that line would be a surprise, so it
-        // matches nothing, as it did before hints existed.
-        if needle.is_empty() && hint.is_some() {
+        // matches nothing, as it did before hints existed. The cut, not a
+        // finished hint, is the test: `:236-` and a bare `:` have no file
+        // part either, and listing every file for them would flip the list
+        // from empty to everything between two keystrokes.
+        let cut = file_part.len() != self.query.trim_end().len();
+        if needle.is_empty() && (hint.is_some() || cut) {
             self.results = Vec::new();
             return;
         }
@@ -403,10 +407,12 @@ fn is_partial_line_hint(s: &str) -> bool {
 
 fn parse_line_hint(s: &str) -> Option<LineHint> {
     // One-based as typed; a `0` is not a line anyone can land on.
+    // A number too large for usize saturates rather than vanishing: the open
+    // path clamps out-of-range lines to the file, and a hint that silently
+    // disappeared would open the file at the top with no signal.
     let num = |t: &str| {
         (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| t.parse::<usize>().ok())
-            .flatten()
+            .then(|| t.parse::<usize>().unwrap_or(usize::MAX))
             .filter(|n| *n > 0)
     };
     if let Some((a, b)) = s.split_once('-') {
@@ -1286,12 +1292,18 @@ mod tests {
                 "{partial}: no hint until it parses"
             );
         }
-        // A hint with no file part names a line in nothing.
-        finder.set_query(":236");
-        assert!(
-            finder.visible_results().is_empty(),
-            "`:236` alone matches nothing"
-        );
+        // A hint with no file part names a line in nothing, whether or not
+        // it has finished parsing.
+        for q in [":236", ":", "::", ":236-", ":0"] {
+            finder.set_query(q);
+            assert!(
+                finder.visible_results().is_empty(),
+                "{q:?} alone matches nothing"
+            );
+        }
+        // A number past usize saturates instead of vanishing.
+        finder.set_query("alpha:99999999999999999999");
+        assert_eq!(finder.line_hint().map(|h| h.line), Some(usize::MAX));
     }
 
     #[test]

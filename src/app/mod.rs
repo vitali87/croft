@@ -30917,16 +30917,18 @@ impl App {
                             .get(end_row)
                             .map_or(0, |l| l.chars().count());
                         self.editor.selection = Some(crate::widgets::editor::EditorSelection {
-                            anchor: (start, 0),
-                            head: (end_row, end_col),
+                            anchor: (end_row, end_col),
+                            head: (start, 0),
                         });
-                        // The cursor sits at the selection's head, as every
-                        // other selection-installing path leaves it: Shift+motion
-                        // extends from the cursor, so a cursor at the anchor
-                        // would collapse the range on the first keystroke.
-                        self.editor.cursor_row = end_row;
-                        self.editor.cursor_col = end_col;
-                        self.editor.ensure_cursor_col_visible();
+                        // The landing line is the head, and the cursor sits at
+                        // the head as every other selection-installing path
+                        // leaves it: Shift+motion extends from the cursor, and
+                        // the paint-time clamp keeps the cursor on screen, so
+                        // a range taller than the viewport still shows the
+                        // line the user asked for, centred by `open_at`, with
+                        // the selection running down from it.
+                        self.editor.cursor_row = start;
+                        self.editor.cursor_col = 0;
                     }
                     // VS Code's `explorer.autoReveal` analogue:
                     // expand every parent dir of the picked file
