@@ -1518,6 +1518,113 @@ fn app_with_open_file_and_editor_cell() -> (App, tempfile::TempDir, u16, u16) {
     (app, tmp, col, row)
 }
 
+/// Every cell of `pane`'s own `last_area`, row-major.
+///
+/// ONE walk. The column derivation in it was wrong once, and a second copy is
+/// a second place to fix it. `hyperlink_at_screen` and `line_text_at` both
+/// hit-test `last_inner`, which this rect contains, and answer `None` outside
+/// it, so nothing yielded here is a cell a click could not reach.
+fn cells_of(pane: &crate::widgets::terminal::PtyTerminal) -> impl Iterator<Item = (u16, u16)> {
+    let area = pane.last_area;
+    (area.y..area.y + area.height)
+        .flat_map(move |r| (area.x..area.x + area.width).map(move |c| (c, r)))
+}
+
+/// The first grid cell of `pane` that falls INSIDE the first occurrence of
+/// `needle` on its row, searched row-major over the pane's own `last_area`
+/// (#397).
+///
+/// A test that prints something into a pane and then clicks it must not assume
+/// which row it landed on: the pane runs a REAL shell whose prompt races the
+/// feed, so the row is a property of machine load rather than of the test.
+/// Callers anchor on the exact text they printed, so unrelated output cannot
+/// satisfy the search.
+fn cell_carrying(pane: &crate::widgets::terminal::PtyTerminal, needle: &str) -> Option<(u16, u16)> {
+    cells_of(pane).find(|&(c, r)| {
+        // The cell must be ON the needle, not merely on a ROW containing
+        // it. `line_text_at` hands back the whole row plus the char index
+        // under the cell, and every column maps to an index (blanks
+        // included), so a `text.contains` test succeeds at the row's FIRST
+        // inner column whatever the needle's position. These fixtures print
+        // at column 0, which hid it; a row like `bash-5.2$ some_token`
+        // would have matched and clicked the `b`.
+        //
+        // A click lands on a cell, not a row, so the span is the claim.
+        pane.line_text_at(c, r).is_some_and(|(text, idx)| {
+            text.find(needle).is_some_and(|byte_start| {
+                let start = text[..byte_start].chars().count();
+                (start..start + needle.chars().count()).contains(&idx)
+            })
+        })
+    })
+}
+
+/// The first grid cell of `pane` carrying an OSC 8 link to exactly `uri`,
+/// searched row-major over the pane's own `last_area` (#397).
+///
+/// The URI is the anchor rather than "any link", so a decoy printed beside the
+/// payload cannot satisfy the search. Below [`cell_carrying`] rather than
+/// above it: inserting an item over a `///` block hands that block to the
+/// newcomer, which is what happened here once already.
+fn cell_with_link(pane: &crate::widgets::terminal::PtyTerminal, uri: &str) -> Option<(u16, u16)> {
+    cells_of(pane).find(|&(c, r)| pane.hyperlink_at_screen(c, r).as_deref() == Some(uri))
+}
+
+/// `cell_carrying` returns a cell INSIDE the needle, not the row's first cell.
+///
+/// The refinement has exactly one red state in the suite, and it is a
+/// downstream word-selection assertion in another test, so it does not
+/// depend on that one test surviving: the helper's own doc records that the
+/// column derivation in it was wrong once.
+///
+/// Placed beside the two helpers rather than in the block it was first
+/// written in, which was some 35,000 lines away and made "beside the
+/// helper" a claim the file did not support. Below `cell_with_link`
+/// rather than between the two: inserting above a `///` block hands that
+/// block to the newcomer, which this file has been bitten by twice.
+#[test]
+fn cell_carrying_lands_inside_the_needle_not_at_the_start_of_its_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "the terminal must be laid out, or the search finds nothing and the \
+         failure below blames a missing token rather than a missing pane"
+    );
+
+    // The needle is NOT at column 0: a shell-shaped prefix in front of it is
+    // what separates a span predicate from a row-level `contains`, which
+    // would resolve the `b` of `bash-5.2$` instead.
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\nbash-5.2$ tok_here\r\n");
+    term.draw(|f| app.render(f)).unwrap();
+
+    let (col, row) =
+        cell_carrying(&app.terminals[0], "tok_here").expect("the pane must show this test's token");
+    let (text, idx) = app.terminals[0]
+        .line_text_at(col, row)
+        .expect("the returned cell must map to a row and a char index");
+    let start = text
+        .find("tok_here")
+        .map(|b| text[..b].chars().count())
+        .expect("the row the search returned must carry the needle");
+    assert!(
+        (start..start + "tok_here".chars().count()).contains(&idx),
+        "the cell must fall inside the needle: row {text:?} put the cell at \
+         char {idx} and the needle spans {start}..{}",
+        start + "tok_here".chars().count()
+    );
+    assert!(
+        idx > 0,
+        "and this fixture must keep the needle off column 0, or a row \
+         predicate and a span predicate pick the same cell and the assertion \
+         above cannot fail"
+    );
+}
+
 fn mouse(
     kind: crossterm::event::MouseEventKind,
     col: u16,
@@ -1761,15 +1868,31 @@ fn a_terminal_link_binding_is_not_refused_for_an_editor_side_reason() {
     // A non-web OSC 8 link in the terminal: resolves via `hyperlink_at_screen`,
     // then `open_detected_url` refuses the scheme INERTLY. A web URL would
     // reach `open_url` and launch a real browser.
-    app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:t@example.com\x1b\\link\x1b]8;;\x1b\\");
+    // The prompt of the real shell in this pane races the fed bytes, so the
+    // line it lands on is not fixed (#397). This puts a line in front of the
+    // link deliberately, making the order that used to break this test the
+    // one it always runs, and the cell is then searched for rather than
+    // assumed.
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
+    // A DECOY link on an earlier row, which is what gives `cell_with_link`'s
+    // exact-URI predicate a red state here: weaken it to `.is_some()` and the
+    // row-major search stops on the decoy, so the click resolves the wrong
+    // link and the status assertion below rejects it by name. Without this
+    // the predicate could be reverted and the test would still pass, since
+    // nothing else in this pane emits OSC 8.
+    //
+    // `mailto:` rather than `file://` deliberately: `file://` is intercepted
+    // by `editor_file_uri` and would exercise a different arm.
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:decoy@example.com\x1b\\decoy\x1b]8;;\x1b\\\r\n");
+    // Trailing newline parks the cursor on the NEXT row: without it any late
+    // shell output writes onto the link's own row.
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:t@example.com\x1b\\link\x1b]8;;\x1b\\\r\n");
     term.draw(|f| app.render(f)).unwrap();
-    let area = app.terminals[0].last_area;
-    let (col, row) = (area.x + 2, area.y + 1);
-    assert_eq!(
-        app.terminals[0].hyperlink_at_screen(col, row).as_deref(),
-        Some("mailto:t@example.com"),
+    let (col, row) = cell_with_link(&app.terminals[0], "mailto:t@example.com").expect(
         "precondition: the click must land on the terminal link, or a refusal \
-         proves nothing about which branch refused it"
+             proves nothing about which branch refused it",
     );
 
     app.focus_pane(Pane::Terminal);
@@ -2133,22 +2256,36 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
     // inertly. A printed https URL would reach `open_url`, which is
     // `Command::new("open")` with no test guard — the suite would launch a
     // real browser on every run (#307's spawning class).
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
+    // A DECOY link on an earlier row. It pins the exact-URI predicate the
+    // same way it is pinned in the split-feed siblings: under `.is_some()`
+    // the row-major search hits the decoy, the click resolves it, and the
+    // `zero@` status assertion below fails by name. The decoy goes into pane
+    // 0 alongside the payload, so it cannot weaken the "WHICH pane resolved"
+    // claim: pane 1 still carries no link at all.
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:decoy@example.com\x1b\\decoy\x1b]8;;\x1b\\\r\n");
     app.terminals[0]
         .feed_bytes_for_test(b"\x1b]8;;mailto:zero@example.com\x1b\\zero-link\x1b]8;;\x1b\\\r\n");
     app.active_terminal = 1;
     term.draw(|f| app.render(f)).unwrap();
 
-    // Click directly on the URL — in pane 0, the pane that is NOT active.
-    // The pane's first row is its border, so the printed line lands on the
-    // next one. Assert the cell really holds the URL first: clicking an
-    // empty cell also yields "No link there", which would pass this test
-    // for entirely the wrong reason.
-    let area = app.terminals[0].last_area;
-    let (col, row) = (area.x + 2, area.y + 1);
-    assert_eq!(
-        app.terminals[0].hyperlink_at_screen(col, row).as_deref(),
-        Some("mailto:zero@example.com"),
-        "the click must land on the OSC 8 link, or a refusal proves nothing"
+    // Click directly on the URL, in pane 0, the pane that is NOT active.
+    //
+    // The cell is SEARCHED FOR rather than computed as "first row after the
+    // border". Pane 0 runs a real shell, so its prompt races the fed bytes:
+    // when the prompt lands first the printed line is pushed down a row and
+    // the assumed cell holds nothing, which is a flake under full-suite load
+    // and passes every time in isolation (#397). The `a prompt got here
+    // first` line above makes that order permanent instead of occasional, so
+    // this test now exercises the case that used to break it.
+    //
+    // Searching costs nothing here: the claim is "clicking the link in pane 0
+    // resolves against pane 0", and any cell carrying that link is a fair
+    // place to click. The precondition survives, because a pane with no such
+    // cell fails below rather than clicking somewhere arbitrary.
+    let (col, row) = cell_with_link(&app.terminals[0], "mailto:zero@example.com").expect(
+        "pane 0 must carry the OSC 8 link somewhere in its area, or a refusal proves nothing",
     );
     let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ev.modifiers = KeyModifiers::CONTROL;
@@ -2427,8 +2564,36 @@ fn an_unmatched_modified_click_does_not_arm_the_tracker() {
         area.width > 4 && area.height > 2,
         "terminal must be laid out"
     );
-    let (col, row) = (area.x + 2, area.y + 1);
-    app.terminals[0].feed_bytes_for_test(b"hello_world_token some other text\r\n");
+    // A line of output IN FRONT of the token, so the ordering that used to
+    // break these tests is the one this test always runs (#397), and the cell
+    // is SEARCHED rather than assumed.
+    //
+    // Assuming it made this test conditionally vacuous, which is worse than
+    // plainly vacuous: measured both ways, with `ClickTracker::record`'s
+    // modifier guard deliberately broken, it FAILED with the token on the
+    // assumed row and PASSED with the token one row down. So it discriminated
+    // whenever it was checked by hand and went blind precisely under load,
+    // which is the only condition it exists to cover. The negative assertion
+    // at the end is satisfied by a click that lands on blank and selects
+    // nothing, whether or not the tracker armed.
+    // One call rather than two, which is fewer moving parts and nothing more:
+    // `cell_carrying` searches every cell of every row, so a prompt landing
+    // between two feeds and prefixing the payload row is tolerated either way.
+    // The sibling tests still feed their decoy and payload separately.
+    //
+    // The payload row OPENS with a shell-shaped prefix on purpose. It is what
+    // gives the span predicate a red state: under a row-level `contains` the
+    // search resolves the `b` of `bash-5.2$`, `select_word_at` takes the word
+    // there instead of the token, and the positive control below fails by
+    // name. Every other fixture in this file prints its needle at column 0,
+    // where a row test and a span test pick the same cell and the refinement
+    // cannot go red.
+    app.terminals[0].feed_bytes_for_test(
+        b"a prompt got here first\r\nbash-5.2$ hello_world_token some other text\r\n",
+    );
+    term.draw(|f| app.render(f)).unwrap();
+    let (col, row) = cell_carrying(&app.terminals[0], "hello_world_token")
+        .expect("the pane must show THIS test's token, or there is no word to mis-select");
 
     // Precondition: the CTRL click must match nothing, or it returns early
     // from the matched dispatch and never reaches the built-in.
@@ -2462,6 +2627,32 @@ fn an_unmatched_modified_click_does_not_arm_the_tracker() {
         "a plain click after an unmatched ctrl+click must not select a WORD: \
          the ctrl+click must not have armed the double-click tracker, but \
          selection was {selected:?}"
+    );
+
+    // The POSITIVE half, over the same cell. Without it, "the tracker stayed
+    // unarmed" and "word selection could never have happened here" are the
+    // same green: a click landing somewhere unselectable satisfies the
+    // negative whatever the tracker did.
+    //
+    // ONE more click, not two. The plain click above DID arm the tracker -
+    // that is the behaviour being contrasted with the ctrl+click, which must
+    // not - so this one pairs with it (`is_double` allows a one-column drift)
+    // and selects the word. A second click would then start a FRESH
+    // single-cell selection and wipe it, which is what the first draft of this
+    // control did and why it failed.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    // The WORD, exactly. `select_word_at` brackets the alphanumeric run
+    // around the pivot and `selection_text` extracts that span, so a correct
+    // select yields the token and nothing else; `contains` would also accept
+    // a selection wider than the word, which is the shape a scroll-clock
+    // rebase can produce. This PR tightened two status assertions for the
+    // same reason, so its own new control should not be looser.
+    assert_eq!(
+        app.terminal().selection_text(),
+        "hello_world_token",
+        "a PLAIN click pairing with the plain click above must select the \
+         word: the tracker arms on plain clicks and refuses only modified \
+         ones, and without this the negative above proves nothing"
     );
 }
 
@@ -2504,29 +2695,27 @@ fn a_modified_click_binding_does_not_arm_the_plain_double_click_in_the_terminal(
     // cell — so clicking an empty terminal makes this test pass vacuously
     // whether the tracker armed or not. Print text first, and assert it
     // arrived, so the click has a real word to wrongly select.
-    app.terminals[0].feed_bytes_for_test(b"hello_world_token\r\n");
+    // A line of output IN FRONT of the token, so the ordering that used to
+    // break these tests is the one this test always runs (#397).
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\nhello_world_token\r\n");
     term.draw(|f| app.render(f)).unwrap();
-    // `area.y` is the pane's BORDER row, not its first text row: `cell_at`
-    // hit-tests against `last_inner` and returns None outside it, so a click
-    // there resolves to no grid cell and selects nothing whatever the tracker
-    // holds. `+ 1` is what the working ctrl+double_click test above uses.
-    let (col, row) = (area.x + 2, area.y + 1);
-    assert!(
-        app.terminals[0]
-            .visible_text()
-            .contains("hello_world_token"),
-        "the terminal must actually show the token, or there is no word for a \
-         wrongly-armed tracker to select and this test cannot fail"
-    );
-    // The click must land on a real grid cell holding the token. Without this
-    // the test passes vacuously off-grid — which it did, three times.
-    let (text, idx) = app.terminals[0]
-        .line_text_at(col, row)
-        .expect("the click must resolve to a terminal grid cell, not the border");
-    assert!(
-        text.contains("hello_world_token") && idx < text.len(),
-        "the click must land ON the token: got {text:?} at {idx}"
-    );
+    // SEARCHED, not assumed. This test already carried a positive control, so
+    // a displaced token failed it outright rather than passing vacuously - the
+    // flaking half of the same defect its sibling had the vacuous half of.
+    let (col, row) = cell_carrying(&app.terminals[0], "hello_world_token")
+        .expect("the pane must show THIS test's token, or there is no word to mis-select");
+    // No re-derivation of `cell_carrying`'s own predicate here. It ran that
+    // exact span test on this pane and this cell to produce `(col, row)`, so
+    // repeating it can only fail if the live shell scrolled the grid between
+    // the search and the re-read - a different fault from the one such an
+    // assertion would name.
+    //
+    // The span property is not pinned HERE. This test's payload prints at
+    // column 0, where a row predicate and a span predicate select the same
+    // cell, and both assertions below are negatives. Its red state lives in
+    // `an_unmatched_modified_click_does_not_arm_the_tracker`, whose payload
+    // row opens with a shell prefix and whose positive control fails by name
+    // under a row predicate.
 
     let mut ctrl = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
     ctrl.modifiers = KeyModifiers::CONTROL;
@@ -2644,6 +2833,17 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     // Link in pane 0; pane 1 is ACTIVE. The two panes must differ, or the
     // bug is unreachable and this test proves nothing.
     app.terminals[0]
+        // A DECOY link on an earlier row. Under the `.is_some()` this branch
+        // replaced, the row-major search hits the decoy first and the click
+        // resolves the wrong link, so the exact-status assertion fails with
+        // `decoy@` in the message. That is the red state the tightening
+        // shipped without: nothing else in these panes emits OSC 8, so
+        // reverting it left the suite green.
+        //
+        // `mailto:` rather than `file://` deliberately: `file://` is
+        // intercepted by `editor_file_uri` and would exercise a different arm.
+        .feed_bytes_for_test(b"\x1b]8;;mailto:decoy@example.com\x1b\\decoy\x1b]8;;\x1b\\\r\n");
+    app.terminals[0]
         .feed_bytes_for_test(b"\x1b]8;;mailto:split@example.com\x1b\\split-link\x1b]8;;\x1b\\\r\n");
     app.active_terminal = 1;
     term.draw(|f| app.render(f)).unwrap();
@@ -2656,16 +2856,13 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     // `area.y + 1` made the test a race against shell startup rather than a
     // check of the swallow guard it is named for.
     //
-    // Searching trades a false negative for a weaker claim, which is the
-    // right trade HERE and not everywhere: this assertion only proves the
-    // built-in has something to act on, and the click coordinates are
-    // computed separately below. If it ever grows into a position-sensitive
-    // check, the search has to narrow with it - "the link is somewhere in
-    // the pane" would then pass for a row no click could reach.
-    let area = app.terminals[0].last_area;
-    let (col, row) = (area.y..area.y + area.height)
-        .flat_map(|r| (area.x..area.x + area.width).map(move |c| (c, r)))
-        .find(|&(c, r)| app.terminals[0].hyperlink_at_screen(c, r).is_some())
+    // The search IS the click coordinate here, not a separate check ahead of
+    // one, and it is anchored on this test's own URI rather than on "a link":
+    // the decoy above is what makes that distinction fail loudly. Every cell
+    // `cells_of` yields is inside `last_area`, which `hyperlink_at_screen`
+    // hit-tests, so a cell found is a cell a click reaches - the claim is not
+    // weakened by not naming the row.
+    let (col, row) = cell_with_link(&app.terminals[0], "mailto:split@example.com")
         .expect("pane 0 must carry the link somewhere, or the built-in has nothing to act on");
     assert_eq!(
         app.active_terminal, 1,
@@ -2677,12 +2874,11 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     ctrl.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ctrl);
 
-    assert!(
-        app.status.contains("Refused to open non-web link"),
+    assert_eq!(
+        app.status, "Refused to open non-web link: mailto:split@example.com",
         "the prefix click must defer to the built-in, which opens the link in \
          the CLICKED pane. Reading the ACTIVE pane finds nothing there, \
-         swallows the click, and the link never opens. status was {:?}",
-        app.status
+         swallows the click, and the link never opens"
     );
 }
 
@@ -2708,10 +2904,15 @@ fn a_prefix_click_defers_to_the_builtin_for_a_file_reference_too() {
         area.width > 12 && area.height > 2,
         "terminal must be laid out"
     );
-    app.terminals[0].feed_bytes_for_test(b"target_file.rs:1:1\r\n");
+    // The same class as the OSC 8 tests, reached through `terminal_file_click`
+    // rather than `terminal_url_click`. The audit that found the others was
+    // scoped to "tests that feed an OSC 8 link", which excludes a bare file
+    // reference BY CONSTRUCTION - so the scope, not the code, is what hid it.
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\ntarget_file.rs:1:1\r\n");
     term.draw(|f| app.render(f)).unwrap();
 
-    let (col, row) = (area.x + 2, area.y + 1);
+    let (col, row) = cell_carrying(&app.terminals[0], "target_file.rs:1:1")
+        .expect("the pane must carry THIS test's file reference");
     // Precondition: a file REFERENCE must be under the cursor, or the guard
     // declines for "nothing there" and the test says nothing about the file
     // half specifically.
@@ -2775,17 +2976,36 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
         area.width > 4 && area.height > 2,
         "terminal must be laid out"
     );
-    // `area.y` is the BORDER row: `cell_at` hit-tests `last_inner`, so a click
-    // there resolves to no grid cell and the whole test would be vacuous.
-    let (col, row) = (area.x + 2, area.y + 1);
-
     // A real OSC 8 hyperlink with a non-web scheme: the built-in finds it via
     // `hyperlink_at_screen`, and `open_detected_url` then refuses it inertly.
-    app.terminals[0].feed_bytes_for_test(b"\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\");
-    assert!(
-        app.terminals[0].hyperlink_at_screen(col, row).is_some(),
-        "the cell must carry an OSC 8 link, or the built-in has nothing to act \
-         on and this test cannot distinguish the two branches"
+    // The leading line forces the shell-prompt race (#397) to resolve the way
+    // that used to break this test, so the cell is searched for instead of
+    // computed from the border row.
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
+    // Two links in one feed, in the order the bytes carry them: the DECOY
+    // first, then the payload. The `a prompt got here first` line above is a
+    // SEPARATE feed, and that is fine here for a reason worth stating, since
+    // a sibling test was just rewritten to avoid exactly that: this search is
+    // anchored on a URI, not on a column, so a prompt arriving between the
+    // two feeds moves the link's row and changes nothing the test asserts.
+    // The wrap test cannot say that, because a column is precisely its
+    // claim.
+    //
+    // The decoy is what gives the exact-URI SEARCH a
+    // red state: revert the predicate to `.is_some()` and the row-major scan
+    // stops on the decoy, so the status assertion rejects it by name. It does
+    // NOT pin the assertion's FORM - with the search intact, `contains`
+    // accepts the same correct answer, and an earlier version of this comment
+    // claimed otherwise.
+    //
+    // The trailing newline after the payload parks the cursor on the NEXT
+    // row, so late shell output cannot write onto the link's own row.
+    app.terminals[0].feed_bytes_for_test(
+        b"\x1b]8;;mailto:decoy@example.com\x1b\\decoy\x1b]8;;\x1b\\\r\n\x1b]8;;mailto:x@example.com\x1b\\link\x1b]8;;\x1b\\\r\n",
+    );
+    let (col, row) = cell_with_link(&app.terminals[0], "mailto:x@example.com").expect(
+        "the cell must carry THIS test's OSC 8 link, or the built-in has nothing \
+             to act on and this test cannot distinguish the two branches",
     );
 
     app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h");
@@ -2799,13 +3019,12 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     ctrl.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ctrl);
 
-    assert!(
-        app.status.contains("Refused to open non-web link"),
+    assert_eq!(
+        app.status, "Refused to open non-web link: mailto:x@example.com",
         "a double-click PREFIX over a mouse-tracking child must fall through to \
          the built-in: the Cmd/Ctrl link-open runs BEFORE the press is \
          forwarded, so swallowing the click would cost the user the link. \
-         Expected the refusal from the built-in link handler, got {:?}",
-        app.status
+         Expected the refusal from the built-in link handler"
     );
 }
 
@@ -39428,9 +39647,39 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
         x: 1,
         y: 1,
         width: 40,
-        height: 6,
+        height: 20,
     };
-    app.terminals[0].feed_bytes_for_test(b"\x1b[8;6;40t");
+    // `resize`, not a `CSI 8 ; rows ; cols t` feed: the emulator leaves that
+    // sequence unhandled, so the grid kept the 80x24 it was spawned with while
+    // `last_inner` said 40x6, and the recorded frame carried 24 rows under a
+    // header announcing 6. Every assertion below still passed, because they
+    // read the same `grid_lines` the recorder does: a fixture can be wrong
+    // about itself while everything asserted on it holds.
+    //
+    // 20 rows, and the number answers two failures at once rather than
+    // trading one for the other.
+    //
+    // `line-199` sits one row above the bottom at EVERY height, because the
+    // flood ends on a newline. What the height sets is the eviction budget:
+    // how many rows the pane's live shell may print before the frame is
+    // recorded. `resize` writes through to the pty master, so that shell
+    // takes a SIGWINCH the old escape-sequence feed never sent, and it is a
+    // login shell running the developer's own rc - a wrapped prompt and a
+    // banner are ordinary. At 6 the budget was five rows, which is inside
+    // that range; at 12 it was eleven, which is nearer than it needs to be.
+    //
+    // The other constraint is only that the height DIFFER from the 24 a pane
+    // is spawned at, or the header assertion below cannot fail: restore the
+    // unhandled escape sequence at 24 and every assertion here passes. 20
+    // satisfies both - 19 rows of budget, and the control still fires.
+    //
+    // A third way the height matters, worth writing down because it is not
+    // obvious: the scrollback guard rejects a last-N-rows recorder by
+    // arithmetic on this number, not structurally. At `resize(40, 64)` a
+    // recorder writing the last 64 rows would satisfy every assertion here,
+    // because 64 would then BE the screen. The row-order assertion below is
+    // the one check that does not depend on the height.
+    app.terminals[0].resize(40, 20);
 
     // Far more output than the screen holds, so most of it is scrollback.
     let mut flood = String::new();
@@ -39458,20 +39707,521 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
         .and_then(|ev| ev[2].as_str().map(String::from))
         .expect("an output event");
 
+    // The geometry a player is handed, taken from the FILE rather than from
+    // `grid_lines`. The recorder takes the header from the pane's rect and
+    // the frame body from the grid, and nothing tied the two together: a
+    // fixture whose rect and grid disagreed wrote a 24-row frame under a
+    // header announcing 6, and every assertion here still passed because they
+    // all read the grid. A player sizes its window from this header, so the
+    // frame that follows has to fit it.
+    let header: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("a header")).expect("the header is JSON");
+
     let rows = frame.split("\r\n").count();
+    // The claim is the VISIBLE screen, so the bound is the screen's own
+    // height, taken from the pane rather than guessed: `grid_lines` returns
+    // the scrollback first, and the visible rows are what remains after its
+    // negative `top`. The bound of 64 this replaces admitted the regression
+    // it existed to reject - a recorder that wrote the last 64 rows carries
+    // 40 rows of history AND `line-199`, so every assertion here passed on
+    // it (verified by making `record_active_screen` do exactly that).
+    let (all, top) = app.terminals[0].grid_lines();
+    let visible = all.len() - (-top).max(0) as usize;
+    assert_eq!(
+        rows, visible,
+        "the frame must be the {visible}-row screen, not {rows} rows of history"
+    );
+    assert_eq!(
+        (header["width"].as_u64(), header["height"].as_u64()),
+        (Some(40), Some(rows as u64)),
+        "the geometry a player reads must describe the frame that follows it"
+    );
+    // And a check that does not go through `grid_lines` at all, so a wrong
+    // slice cannot agree with a wrong expectation: any frame wider than the
+    // screen reaches back into the flood, and `line-100` is far outside a
+    // screen-sized window at the recent end of 200 lines.
     assert!(
-        rows <= 64,
-        "the frame carries {rows} rows — that is scrollback, not a screen"
+        !frame.contains("line-100"),
+        "the frame reaches back into scrollback: {frame:?}"
+    );
+    // Order and adjacency, in one literal that does not go through
+    // `grid_lines`. Everything above constrains the frame's ENDS and its row
+    // count, so a recorder that emitted the visible rows reversed, or
+    // shuffled, satisfies all of it.
+    assert!(
+        frame.contains("line-198\r\nline-199"),
+        "the frame must carry the screen's rows in order: {frame:?}"
     );
     // And it is the RECENT end of the output, not the oldest.
+    // `line-199` alone. The `|| contains("line-19")` this replaces was both
+    // redundant and weakening: "line-199" already contains "line-19", so the
+    // disjunct could only ever ADD acceptance - of a frame showing an old
+    // scrollback slice around line-19 through line-24, which is precisely the
+    // regression the assertion exists to reject. An OR whose second arm is a
+    // substring of its first can only make a check weaker.
     assert!(
-        frame.contains("line-199") || frame.contains("line-19"),
+        frame.contains("line-199"),
         "the frame must show what was last on screen: {:?}",
         &frame[..frame.len().min(120)]
     );
     assert!(
         !frame.contains("line-0\r\n"),
         "the frame reaches back to the first line ever printed"
+    );
+}
+
+/// The recorded frame's rows wrap at the width the header declares (#397).
+///
+/// The header takes its geometry from the pane's `last_inner` and the body
+/// comes from the grid, and the sibling test above ties them together in one
+/// dimension only: it compares `header["height"]` against a row count derived
+/// from the frame, but `header["width"]` against the literal 40 the fixture
+/// itself set. A grid wrapped at any other column satisfies that. It is not a
+/// hypothetical shape either: that fixture shipped an 80-column grid under a
+/// 40-column header and every assertion in it passed.
+///
+/// A line longer than the screen is the discriminator. It can only wrap at
+/// the grid's REAL width, so a frame whose rows run past the header's width
+/// fails here, and the digits make the wrap column readable from the text
+/// rather than inferred from a length.
+#[test]
+fn a_recorded_frames_rows_wrap_at_the_width_its_header_declares() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 20,
+    };
+    // `resize`, so the GRID is 40 columns too. Setting `last_inner` alone
+    // leaves the grid at the 80 it was spawned with, which is exactly the
+    // disagreement this test exists to reject.
+    app.terminals[0].resize(40, 20);
+
+    // Digits repeating every SEVEN columns, so the wrap point is READ off the
+    // text. The period matters twice over. A uniform fill would look
+    // correctly wrapped at every width; and a period of ten, which this
+    // replaces, divides 40, so `long[..40]` and `long[40..80]` were the SAME
+    // string and the adjacency needle below was also satisfied at grid widths
+    // 50 and 60. Seven is coprime with 40, so the two halves differ and
+    // adjacency pins the column by itself.
+    let long: String = (0..100u8).map(|i| char::from(b'0' + (i % 7))).collect();
+    // A LEADING CRLF, in the SAME feed as the payload. The pane runs a real
+    // shell whose prompt races these bytes (#397), and a prompt landing first
+    // would push the payload off column 0, at which point the line wraps
+    // somewhere else and this test reports "the long line must wrap at column
+    // 40" against a grid that really is 40 - the same misdiagnosis its own
+    // first draft produced for a different reason. `feed_bytes_for_test`
+    // holds the term lock for the whole buffer, so the reader thread cannot
+    // interleave INSIDE this call; a separate leading feed would leave the
+    // window between the two calls open.
+    app.terminals[0].feed_bytes_for_test(format!("\r\n{long}\r\n").as_bytes());
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let header: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("a header")).expect("the header is JSON");
+    let frame = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|ev| ev[1] == "o")
+        .and_then(|ev| ev[2].as_str().map(String::from))
+        .expect("an output event");
+
+    // The recorder writes a clear-and-home BEFORE the rows, so the first
+    // segment of a naive split carries seven escape characters on top of its
+    // row. Measuring that as a row's width is how the first version of this
+    // test read 47 columns off a grid that really was 40.
+    let body = frame
+        .strip_prefix("\u{1b}[H\u{1b}[2J")
+        .expect("a recorded frame opens with clear-and-home, then the rows");
+    let declared = header["width"]
+        .as_u64()
+        .expect("the header declares a width");
+    assert_eq!(
+        declared, 40,
+        "the fixture's own premise: the header must declare the 40 columns the pane was sized to"
+    );
+    // The wrap, pinned as two WHOLE rows rather than as a substring. The
+    // substring form this replaces did not deliver the uniqueness its comment
+    // claimed: `contains` only needs the first half to END some row and the
+    // second to BEGIN the next, so with a period-P fill it matches at every
+    // width w in 40..=60 with w congruent to 40 mod P. At the period of 10
+    // this started with that was widths 50 and 60; at 7 it is 47 and 54, and
+    // 47 is the very number this test's own first draft misread off a
+    // 40-column grid. Changing the period could never fix it.
+    //
+    // Row EQUALITY can only hold at width 40: at 47 the row is `long[..47]`,
+    // which is not `long[..40]`. So adjacency now rejects every other width on
+    // its own, and the bound below is a genuinely independent second check
+    // rather than the only one doing the work.
+    let rows: Vec<&str> = body.split("\r\n").collect();
+    // Precondition, so a missing payload cannot be reported as a bad wrap.
+    // `record_active_screen` splits scrollback off, so shell startup output
+    // pushing the payload above `topmost_line()` would fail the adjacency
+    // check below while naming the column, which is the exact misdiagnosis
+    // this test's first draft produced for a different reason.
+    assert!(
+        rows.iter().any(|r| r.starts_with(&long[..8])),
+        "the payload must still be on the visible screen: {body:?}"
+    );
+    assert!(
+        rows.windows(2)
+            .any(|w| w[0] == &long[..40] && w[1] == &long[40..80]),
+        "the long line must wrap at column {declared}, the width the header promises: {body:?}"
+    );
+    // And no row may exceed it. This is the half that catches the 80-column
+    // grid: there the line wraps at 80, so the widest row is twice what a
+    // player sizes its window to.
+    let widest = body
+        .split("\r\n")
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        widest as u64 <= declared,
+        "the widest row is {widest} columns and the header promises {declared}: \
+         a player sizes its window from the header, so the frame has to fit it"
+    );
+}
+
+/// A geometry change reaches the cast BEFORE the frame drawn at it (#397).
+///
+/// `record_active_screen` emits the resize first so a player has the new
+/// geometry before the frame that was wrapped for it; the other order renders
+/// one frame at the old width. Nothing pinned that order. In every other
+/// fixture `recorded_size` already equals the pane's size at record time, so
+/// the branch never runs at all, and the one other test that produces an `r`
+/// event calls `record_resize` directly, which bypasses the ordering logic
+/// rather than exercising it.
+///
+/// `last_inner` alone moves here, without a `resize`: it is what the branch
+/// reads, and the claim under test is the ORDER of two events, not the
+/// content of the frame between them.
+#[test]
+fn a_recorded_resize_precedes_the_frame_it_was_drawn_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 20,
+    };
+    app.terminals[0].resize(40, 20);
+
+    // Toggling on seeds `recorded_size` from the pane, so this first frame
+    // must NOT carry a resize: a test that saw one here would be reading the
+    // seeding, not the ordering.
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 60,
+        height: 10,
+    };
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let kinds: Vec<String> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|ev| ev[1].as_str().map(String::from))
+        .collect();
+
+    // Swap the two statements in `record_active_screen` and this reads
+    // `["o", "o", "r"]`; drop the branch and it reads `["o", "o"]`. The
+    // sequence is asserted whole rather than as "an r exists somewhere",
+    // which both of those would satisfy under a looser check.
+    assert_eq!(
+        kinds,
+        vec!["o", "r", "o"],
+        "the cast must carry the new geometry before the frame drawn at it, got {kinds:?}"
+    );
+}
+
+/// A collapsed pane records no geometry, and does not poison the next one.
+///
+/// `record_active_screen`'s guard is `size != self.recorded_size && size.0 > 0
+/// && size.1 > 0`, and the two size conjuncts had never run: every fixture in
+/// the suite holds a non-zero rect. They carry two claims. A pane whose
+/// `last_inner` has collapsed must not write a degenerate `r` announcing a
+/// zero-column window, and it must not overwrite `recorded_size` with that
+/// zero, which would make the NEXT record emit a resize back to a geometry
+/// the player already had.
+///
+/// Drop EITHER size conjunct and the sequence gains two `r` events instead
+/// of none: `size.0 > 0` from the width fold, `size.1 > 0` from the height
+/// fold. The first version of this doc named only the width half, which is
+/// the shape an earlier round was pulled up for: the doc is what the next
+/// editor reads before the assert message.
+#[test]
+fn a_collapsed_pane_records_no_resize_and_leaves_the_last_one_standing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 20,
+    };
+    app.terminals[0].resize(40, 20);
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    // Collapsed: the rect a pane gets when its split is folded to nothing.
+    // `last_inner` only, deliberately: production also calls `resize`, which
+    // floors the GRID at two columns, and the guard under test reads
+    // `last_inner` rather than the grid.
+    app.terminals[0].last_inner.width = 0;
+    app.record_active_screen();
+    // And back to the geometry the recording was opened at. If the collapsed
+    // record had written its zero into `recorded_size`, THIS record would
+    // announce a resize to 40x20, which the player already has.
+    app.terminals[0].last_inner.width = 40;
+    app.record_active_screen();
+    // The HEIGHT conjunct, which the first version of this test left as dead
+    // as it found it: with only `size.0 > 0` deleted the collapsed record
+    // still has a zero width and the sequence does not move, so that mutation
+    // was invisible. A zero-height fold exercises the other half.
+    app.terminals[0].last_inner.height = 0;
+    app.record_active_screen();
+    app.terminals[0].last_inner.height = 20;
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let kinds: Vec<String> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|ev| ev[1].as_str().map(String::from))
+        .collect();
+
+    assert_eq!(
+        kinds,
+        vec!["o", "o", "o", "o", "o"],
+        "five frames and NO resize: a collapsed pane has no geometry worth \
+         announcing, and must not make the pane after it look like a change. \
+         Dropping either conjunct of the guard adds two `r` events, the width \
+         half from the first fold and the height half from the second, \
+         got {kinds:?}"
+    );
+}
+
+/// A fold mid-recording narrows the frame, and says nothing about it (#397).
+///
+/// The sibling above moves `last_inner` alone, because the guard it tests
+/// reads `last_inner`. Production folds differently: `render` assigns
+/// `last_inner = inner` and then calls `resize(inner.width, inner.height)`,
+/// so a real fold leaves `last_inner.width` at 0 while the GRID floors at two
+/// columns. The zero then suppresses the resize event, and the cast carries a
+/// 2-column frame under a 40-column header with nothing announcing it.
+///
+/// The first version of this test asserted `widest <= declared` and could not
+/// fail. Both numbers are arithmetic: no row can exceed the grid, and the
+/// grid is only ever 40 or the floor of 2, so 2 <= 40 held whatever the fold
+/// did. Deleting both fold lines left every assertion green, which is a test
+/// named for a gesture it never exercised. It now asserts what the fold
+/// actually moves.
+#[test]
+fn a_fold_mid_recording_narrows_the_frame_and_announces_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 20,
+    };
+    app.terminals[0].resize(40, 20);
+    app.terminals[0].feed_bytes_for_test(b"\r\nbefore the fold\r\n");
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    // Exactly what `render` does on a fold: `last_inner` takes the zero, and
+    // `resize` floors the grid at two columns. Setting `last_inner.width = 2`
+    // instead, as the first version did, is a pairing production never
+    // produces, and it makes the recorder emit an `r` the real gesture
+    // suppresses, so the fixture avoided the case it was written for.
+    app.terminals[0].last_inner.width = 0;
+    app.terminals[0].resize(0, 20);
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    // No header parse here: the "frames fit the header" claim belongs to
+    // `a_recorded_frames_rows_wrap_at_the_width_its_header_declares`, which
+    // pins it with a 100-character payload. Asserting it HERE was arithmetic,
+    // since `after` is pinned to 2 two lines below and no row can exceed the
+    // grid, so it survived the fold being deleted. That is the same defect
+    // this test was rewritten to remove, kept one assertion further down.
+    let events: Vec<(String, String)> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|ev| {
+            Some((
+                ev[1].as_str()?.to_string(),
+                ev[2].as_str().unwrap_or_default().to_string(),
+            ))
+        })
+        .collect();
+    let widths: Vec<usize> = events
+        .iter()
+        .filter(|(kind, _)| kind == "o")
+        .map(|(_, frame)| {
+            frame
+                .strip_prefix("\u{1b}[H\u{1b}[2J")
+                .expect("a recorded frame opens with clear-and-home")
+                .split("\r\n")
+                .map(|row| row.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    assert_eq!(widths.len(), 2, "one frame each side of the fold");
+
+    // The claim the fold moves. Remove the fold and `after` EQUALS `before`
+    // (whatever that is: the pane's real shell may print a prompt wider than
+    // the payload), so this is the assertion the previous version was
+    // missing. No literal here, because the fixture does not control it.
+    let (before, after) = (widths[0], widths[1]);
+    assert!(
+        after < before,
+        "the fold must narrow the recorded rows, got {before} then {after}"
+    );
+    assert_eq!(
+        after, 2,
+        "and the folded frame carries the GRID's two-column floor (`cols.max(2)` \
+         in src/widgets/terminal.rs) rather than a snapshot taken before the \
+         resize landed"
+    );
+    // And the suppression is part of the claim rather than a side effect the
+    // filter above discarded: `last_inner.width` of 0 fails the guard's
+    // `size.0 > 0`, so the narrowing reaches the player with no `r` in front
+    // of it. Set `last_inner.width = 2` and an `r` appears here.
+    assert!(
+        events.iter().all(|(kind, _)| kind == "o"),
+        "a fold announces no geometry, got {:?}",
+        events.iter().map(|(k, _)| k).collect::<Vec<_>>()
+    );
+}
+
+/// A pane that GROWS mid-recording announces the new width first (#397).
+///
+/// The fold above narrows, which a player renders as a small image in a large
+/// window and cannot corrupt anything. Widening is the direction that can:
+/// the frame really is wider than the header the recording opened at, and
+/// correctness rests entirely on the `r` event arriving before the frame
+/// drawn at it. Nothing in the suite recorded a pane that grows.
+#[test]
+fn a_widened_pane_announces_its_new_geometry_before_the_wider_frame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 20,
+    };
+    app.terminals[0].resize(40, 20);
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.terminals[0].last_inner.width = 80;
+    app.terminals[0].resize(80, 20);
+    // Longer than the header's 40 and shorter than the new 80, so the row
+    // that lands is one the OLD geometry could not have held.
+    let wide: String = std::iter::repeat_n('w', 60).collect();
+    app.terminals[0].feed_bytes_for_test(format!("\r\n{wide}\r\n").as_bytes());
+    app.record_active_screen();
+    // A third frame with NOTHING moved, which pins the recorder REMEMBERING
+    // the widening. Delete `self.recorded_size = size` from
+    // `record_active_screen` and this reads ["o","r","o","r","o"]: the stale
+    // size makes every later frame re-announce a geometry the player has.
+    // Nothing in the suite caught that assignment's removal.
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let header: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("a header")).expect("the header is JSON");
+    let declared = header["width"]
+        .as_u64()
+        .expect("the header declares a width");
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect();
+    let kinds: Vec<&str> = events.iter().filter_map(|ev| ev[1].as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["o", "r", "o", "o"],
+        "the widened geometry must reach the player BEFORE the frame wrapped \
+         for it, and exactly once, got {kinds:?}"
+    );
+
+    let widest = events[2][2]
+        .as_str()
+        .expect("the second frame is text")
+        .strip_prefix("\u{1b}[H\u{1b}[2J")
+        .expect("a recorded frame opens with clear-and-home")
+        .split("\r\n")
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        widest as u64 > declared,
+        "the fixture must produce a frame the HEADER cannot hold, or the \
+         resize event is not load-bearing: widest {widest}, header {declared}"
+    );
+    // Unconditional, and on BOTH dimensions. The first version read
+    // `events[1][3]`, which an asciicast resize never has (it is
+    // `[time, "r", "COLSxROWS"]`, three elements), so the primary extraction
+    // always yielded None and an `or_else` did the work behind an `if let`.
+    // The day that fallback was tidied away the assertion would have stopped
+    // running with nothing failing, and the rows dimension was read by
+    // nothing at all: `record_resize(size.1, size.0)` survived the suite.
+    assert_eq!(
+        events[1][2].as_str(),
+        Some("80x20"),
+        "the `r` must name the pane's new geometry, got {:?}",
+        events[1]
     );
 }
 
