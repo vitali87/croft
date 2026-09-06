@@ -9420,14 +9420,17 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
         crate::test_budget::tests::SHELL_PAINT_BASE,
         "the kernel to report a foreign foreground group (the sleep)",
         || {
-            foreground = app.terminal_mut().foreground_resolved_for_test();
+            foreground = app.terminal().foreground_resolved_for_test();
             foreground == Some(false)
         },
     );
+    // `await_spawned` panics rather than returning on timeout, so this can
+    // only be `Some(false)`; it pins the sample the wait observed rather
+    // than guarding the wait. Same shape as `wait_for_conflicted_entry`.
     assert_eq!(
         foreground,
         Some(false),
-        "precondition: the terminal must be running a foreground command"
+        "await_spawned returns only once the kernel reports the foreign group"
     );
 
     app.change_workspace_root(target_dir.clone());

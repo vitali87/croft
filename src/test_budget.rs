@@ -279,6 +279,12 @@ pub(crate) mod tests {
     /// that each base reproduces its own at the floor, which one number
     /// cannot do for both. The operation they wait on is the same.
     ///
+    /// Two of the three call sites reproduce their old 8000ms exactly. The
+    /// third, the re-root test's foreground poll, is a deliberate RAISE from
+    /// 4000ms: that loop never asserted on timeout, so its number was never
+    /// a deadline the test could fail on, and matching it would have left
+    /// the shorter of two waits on one shell inside the same test.
+    ///
     /// 2s because `BASE_CALIBRATION * MIN_SCALE` is 4 at the floor, so the
     /// call sites keep the 8000ms they had on a quiet machine and get up to
     /// twice that under load. The hyperlink wait had already been raised
@@ -455,8 +461,10 @@ pub(crate) mod tests {
         let paint = SHELL_PAINT_BASE * BASE_CALIBRATION * MIN_SCALE;
         assert!(
             paint >= Duration::from_millis(8000),
-            "the shell-paint base must reproduce the 8000ms its call sites \
-             replaced at the floor, got {paint:?}"
+            "the shell-paint base must reproduce at the floor the largest \
+             constant its call sites replaced - 8000ms, at two of the three; \
+             the re-root test's second wait was a 4000ms loop that never \
+             asserted on timeout, so it is deliberately raised - got {paint:?}"
         );
     }
 
