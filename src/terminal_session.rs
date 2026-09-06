@@ -14,12 +14,34 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// The worktree lane a pane was opened for (#348), so a relaunch brings the
+/// lane back as a lane: same worktree, same branch, and the agent seated
+/// again, rather than an anonymous shell that happens to sit in that
+/// directory. `agent` is the `agents.json` row name, resolved to a launch
+/// line at restore time so an edited row applies.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaneRecord {
+    /// Lenient on read: a truncated lane object must not make the whole
+    /// store unparsable for every workspace; an empty path is simply not a
+    /// directory, so the pane comes back as an ordinary one.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
 /// One pane to bring back.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaneRecord {
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Set when the pane is a worktree lane's (#348); omitted otherwise, so
+    /// an older store still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<LaneRecord>,
     /// The pane's visible output at save time, replayed above the fresh
     /// prompt so a restored pane is not blank (#249).
     ///
@@ -137,6 +159,7 @@ mod tests {
                 cwd: String::from("/w/a/sub"),
                 name: Some(String::from("srv")),
                 transcript: Vec::new(),
+                lane: None,
             }],
             active: 0,
         };
@@ -156,6 +179,49 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_pane_round_trips_its_lane_and_an_older_record_has_none() {
+        // #348: the lane travels with the pane, and a store written before
+        // lanes existed still parses with none.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("s.json");
+        let lane = LaneRecord {
+            path: String::from("/work/repo-fix-login"),
+            branch: String::from("agent/fix-login"),
+            agent: Some(String::from("claude")),
+        };
+        let rec = SessionRecord {
+            panes: vec![
+                PaneRecord {
+                    cwd: String::from("/work/repo"),
+                    name: None,
+                    transcript: Vec::new(),
+                    lane: None,
+                },
+                PaneRecord {
+                    cwd: String::from("/work/repo-fix-login"),
+                    name: Some(String::from("Lane: fix-login")),
+                    transcript: Vec::new(),
+                    lane: Some(lane.clone()),
+                },
+            ],
+            active: 1,
+        };
+        save_for_root(&p, "/work/repo", rec).unwrap();
+        let back = load(&p);
+        assert_eq!(back["/work/repo"].panes[1].lane.as_ref(), Some(&lane));
+        assert_eq!(back["/work/repo"].panes[0].lane, None);
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            raw.matches("\"lane\"").count(),
+            1,
+            "omitted where there is none: {raw}"
+        );
+        let older = r#"{"/w": {"panes": [{"cwd": "/w", "name": "srv"}], "active": 0}}"#;
+        std::fs::write(&p, older).unwrap();
+        assert_eq!(load(&p)["/w"].panes[0].lane, None, "an older store parses");
+    }
+
+    #[test]
     fn save_round_trips_and_trivial_records_prune() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("s.json");
@@ -165,11 +231,13 @@ mod tests {
                     cwd: String::from("/repo"),
                     name: None,
                     transcript: Vec::new(),
+                    lane: None,
                 },
                 PaneRecord {
                     cwd: String::from("/repo/sub"),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
+                    lane: None,
                 },
             ],
             active: 1,
@@ -187,6 +255,7 @@ mod tests {
                     cwd: String::from("/repo"),
                     name: None,
                     transcript: Vec::new(),
+                    lane: None,
                 }],
                 active: 0,
             },
