@@ -31,8 +31,10 @@ pub struct AgentKind {
     pub prompt: Vec<Regex>,
     /// The command line a new worktree lane starts this agent with (#348):
     /// typed into the lane's fresh shell. The built-ins launch as their own
-    /// name; a row may set its own (`claude --model opus`) or none, in
-    /// which case a lane for it opens a plain shell.
+    /// name; a row may set its own (`claude --model opus`). A NEW row
+    /// without one opens a plain shell, while a row that replaces a
+    /// built-in without one keeps the built-in's command (such rows
+    /// usually exist to fix a prompt pattern, not to unteach the launch).
     pub launch: Option<String>,
 }
 
@@ -98,8 +100,9 @@ pub const TEMPLATE: &str = r##"// croft agent lanes: which foreground processes 
 //   prompt:  regexes a recent screen row matches when it is waiting on you
 //   launch:  the command a new worktree lane (Cmd+K Shift+L) starts the agent
 //            with, when `lane_agent` in settings.json names this row (#348);
-//            the built-ins launch as their own name, a row without one opens
-//            a plain shell
+//            the built-ins launch as their own name; a NEW row without one
+//            opens a plain shell, while a row replacing a built-in without
+//            one keeps the built-in's command
 [
   // { "name": "goose", "process": ["goose"], "prompt": ["^\\s*>\\s*$", "\\(y/n\\)"], "launch": "goose" }
 ]
@@ -223,7 +226,7 @@ impl AgentTable {
                     // launching keeps the built-in's command: the row is
                     // usually there to fix a prompt pattern, not to unteach
                     // croft how to start the agent.
-                    let launch = launch.or_else(|| existing.launch.take());
+                    let launch = launch.or_else(|| existing.launch.clone());
                     *existing = AgentKind {
                         name: name.clone(),
                         process,

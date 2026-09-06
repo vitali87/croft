@@ -42863,6 +42863,150 @@ fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
 }
 
 #[test]
+fn a_restored_lane_pane_spawns_in_its_worktree_not_where_the_shell_had_wandered() {
+    // The launch line is typed into the restored shell, so that shell must
+    // be in the lane: not in the directory the old shell had cd'd to at save
+    // time, and not, when that directory is gone, in the PRIMARY repo the
+    // cwd fallback names. The "agent" prints its cwd so the test can read
+    // where it was seated.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let session = tmp.path().join("sessions.json");
+    let lane_dir = tmp.path().join("repo-fix-login");
+    std::fs::create_dir_all(&lane_dir).unwrap();
+    let elsewhere = tmp.path().join("notes");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let vanished = lane_dir.join("scratch");
+    let root_key = repo.display().to_string();
+    let lane = |agent: &str| crate::terminal_session::LaneRecord {
+        path: lane_dir.display().to_string(),
+        branch: String::from("agent/fix-login"),
+        agent: Some(String::from(agent)),
+    };
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![
+            crate::terminal_session::PaneRecord {
+                cwd: elsewhere.display().to_string(),
+                name: Some(String::from("Lane: fix-login")),
+                transcript: Vec::new(),
+                lane: Some(lane("probe-a")),
+            },
+            crate::terminal_session::PaneRecord {
+                cwd: vanished.display().to_string(),
+                name: Some(String::from("Lane: fix-login")),
+                transcript: Vec::new(),
+                lane: Some(lane("probe-b")),
+            },
+        ],
+        active: 0,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = session;
+    app.agents = crate::agents::AgentTable::from_json(
+        r#"[
+          { "name": "probe-a", "launch": "printf '%s%s\\n' 'croft-seat' \"-a:$(pwd)\"" },
+          { "name": "probe-b", "launch": "printf '%s%s\\n' 'croft-seat' \"-b:$(pwd)\"" }
+        ]"#,
+    );
+    app.restore_terminal_session();
+    assert_eq!(app.terminals.len(), 2);
+    let lane_canon = lane_dir.canonicalize().unwrap().display().to_string();
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
+    let started = std::time::Instant::now();
+    let seated = |app: &App, tag: &str| {
+        app.terminals
+            .iter()
+            .any(|t| t.visible_text().contains(&format!("croft-seat-{tag}:")))
+    };
+    while started.elapsed() < budget && !(seated(&app, "a") && seated(&app, "b")) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for tag in ["a", "b"] {
+        let screen = app
+            .terminals
+            .iter()
+            .map(|t| t.visible_text())
+            .find(|s| s.contains(&format!("croft-seat-{tag}:")))
+            .unwrap_or_else(|| panic!("probe {tag} never printed its cwd"));
+        let line = screen
+            .lines()
+            .find(|l| l.contains(&format!("croft-seat-{tag}:")))
+            .unwrap();
+        assert!(
+            line.trim_end().ends_with(&lane_canon)
+                || line.trim_end().ends_with(&lane_dir.display().to_string()),
+            "agent {tag} was seated in the lane, got: {line:?}"
+        );
+    }
+    for t in &app.terminals {
+        assert!(
+            app.lane_panes.contains_key(&t.uid()),
+            "both restored panes are the lane's"
+        );
+    }
+}
+
+#[test]
+fn a_lane_pane_closed_by_any_route_is_no_longer_the_lanes_even_when_reopened() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let uid = app.terminals[app.active_terminal].uid();
+    assert!(app.lane_panes.contains_key(&uid));
+    assert!(app.close_active_terminal(), "the ordinary close");
+    assert!(
+        app.lane_panes.is_empty(),
+        "the map does not keep dead panes"
+    );
+    app.undo_close_terminal();
+    assert!(
+        app.terminals.iter().any(|t| t.uid() == uid),
+        "the pane came back"
+    );
+    assert!(
+        app.lane_panes.is_empty(),
+        "but not as the lane's: nobody asked for an agent to be re-seated"
+    );
+}
+
+#[test]
+fn closing_a_lane_whose_pane_is_the_last_one_keeps_the_pane_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("solo");
+    // Drop the original pane so the lane's is the only one left.
+    assert!(app.close_terminal_at(0));
+    assert_eq!(app.terminals.len(), 1);
+    assert_eq!(app.terminals[0].manual_name(), Some("Lane: solo"));
+    let lane = tmp.path().join("repo-solo").canonicalize().unwrap();
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    assert!(!lane.exists(), "{}", app.status);
+    assert_eq!(app.terminals.len(), 1, "the last pane is never closed");
+    assert_eq!(
+        app.terminals[0].manual_name(),
+        None,
+        "but it stops wearing the lane's name"
+    );
+    assert!(app.lane_panes.is_empty());
+    assert!(
+        app.status.contains("stays as the last one"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
 fn closing_a_lane_closes_its_pane_through_the_undoable_path() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

@@ -12775,22 +12775,34 @@ impl App {
         let mut terms = Vec::new();
         let mut lanes = std::collections::BTreeMap::new();
         for p in &rec.panes {
-            let dir = PathBuf::from(&p.cwd);
-            let dir = if dir.is_dir() {
-                dir
-            } else {
-                self.workspace_root().to_path_buf()
+            // A lane pane belongs in its worktree, whatever cwd its shell
+            // had drifted to at save time (#348): the launch line below is
+            // typed into THIS shell, so the directory and the lane are
+            // decided together. Deciding them apart seated the agent where
+            // the shell had wandered, or, when that cwd was gone, in the
+            // PRIMARY repo the fallback names, which is the one directory a
+            // lane exists to keep the agent out of. A lane whose worktree
+            // is gone is an ordinary pane now.
+            let lane = p.lane.as_ref().filter(|l| Path::new(&l.path).is_dir());
+            let dir = match lane {
+                Some(l) => PathBuf::from(&l.path),
+                None => {
+                    let dir = PathBuf::from(&p.cwd);
+                    if dir.is_dir() {
+                        dir
+                    } else {
+                        self.workspace_root().to_path_buf()
+                    }
+                }
             };
             // The transcript is painted during the spawn, not after it: a
             // replay that follows the constructor races the new shell's
             // first prompt for the same grid (#249).
             if let Ok(mut t) = PtyTerminal::new_with_transcript(&dir, &p.transcript) {
                 t.set_manual_name(p.name.clone());
-                // A lane pane comes back as a lane (#348): the agent is
-                // seated again, from the row's CURRENT launch line. A lane
-                // whose worktree is gone is an ordinary pane now; carrying
-                // the record on would seat an agent in the wrong directory.
-                if let Some(lane) = p.lane.as_ref().filter(|l| Path::new(&l.path).is_dir()) {
+                // The agent is seated again, from the row's CURRENT launch
+                // line, so an edited row applies.
+                if let Some(lane) = lane {
                     if let Some(cmd) = lane
                         .agent
                         .as_deref()
@@ -13024,6 +13036,10 @@ impl App {
             return false;
         }
         let term = self.terminals.remove(idx);
+        // A lane pane closed by any route stops being the lane's (#348): the
+        // map is keyed by uid, and an undo-close brings the pane back as an
+        // ordinary one rather than re-seating an agent nobody asked for.
+        self.lane_panes.remove(&term.uid());
         self.closed_terminals.push(ClosedTerminal {
             term,
             idx,
@@ -25315,7 +25331,7 @@ impl App {
             .as_deref()
             .map(str::trim)
             .filter(|a| !a.is_empty())
-            .map(str::to_lowercase);
+            .map(str::to_ascii_lowercase);
         let launch = agent
             .as_deref()
             .and_then(|a| self.agents.launch_line(a))
@@ -25373,8 +25389,10 @@ impl App {
 
     /// Close the panes that belong to the lane at `lane` (#348), through the
     /// undoable close so a mistaken lane removal does not also lose the
-    /// pane's scrollback. Returns how many closed.
-    fn close_lane_panes(&mut self, lane: &Path) -> usize {
+    /// pane's scrollback. Returns how many closed and how many stayed: the
+    /// close refuses the last pane, and that pane then sits in a directory
+    /// git just removed, so it drops its lane name and the caller says so.
+    fn close_lane_panes(&mut self, lane: &Path) -> (usize, usize) {
         let doomed: Vec<usize> = self
             .terminals
             .iter()
@@ -25386,18 +25404,21 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
-        let mut closed = 0;
+        let (mut closed, mut kept) = (0, 0);
         // Highest index first so the earlier indices stay valid.
         for idx in doomed.into_iter().rev() {
             let uid = self.terminals[idx].uid();
             if self.close_terminal_at(idx) {
                 closed += 1;
+            } else {
+                // The last pane stays; it is no longer a lane's (its
+                // worktree is gone), so it stops wearing the lane's name.
+                kept += 1;
+                self.terminals[idx].set_manual_name(None);
+                self.lane_panes.remove(&uid);
             }
-            // Whether it closed or was the last pane (which `close_terminal_at`
-            // keeps), it is no longer a lane's: its worktree is gone.
-            self.lane_panes.remove(&uid);
         }
-        closed
+        (closed, kept)
     }
 
     /// Remove the active root's worktree lane, refusing when it is dirty
@@ -25439,13 +25460,18 @@ impl App {
                 // in the status; only claim success when the folder really
                 // left, or a refusal there would be overwritten by a message
                 // saying the whole thing worked.
-                let panes = self.close_lane_panes(&lane);
+                let (closed, kept) = self.close_lane_panes(&lane);
                 if self.roots.iter().any(|r| r == lane) {
                     self.status = format!(
                         "Removed {} on disk, but it is still in this workspace",
                         lane.display()
                     );
-                } else if panes > 0 {
+                } else if kept > 0 {
+                    self.status = format!(
+                        "Removed lane {} — its pane stays as the last one, in a directory that is now gone",
+                        lane.display()
+                    );
+                } else if closed > 0 {
                     self.status = format!(
                         "Removed lane {} and closed its pane (Cmd+K Shift+T reopens it)",
                         lane.display()

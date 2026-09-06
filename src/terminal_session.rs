@@ -21,7 +21,12 @@ use std::path::{Path, PathBuf};
 /// line at restore time so an edited row applies.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaneRecord {
+    /// Lenient on read: a truncated lane object must not make the whole
+    /// store unparsable for every workspace; an empty path is simply not a
+    /// directory, so the pane comes back as an ordinary one.
+    #[serde(default)]
     pub path: String,
+    #[serde(default)]
     pub branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
