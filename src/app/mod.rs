@@ -2761,11 +2761,11 @@ pub struct App {
     /// What each pane (by uid) was last seen connected to, so an ssh session
     /// is offered once when it starts rather than on every sample.
     ssh_offer_seen: std::collections::BTreeMap<u64, Option<String>>,
-    /// When the ssh sampler last ran; it reads a process's argv per pane, so
-    /// it runs at most once a second rather than per frame.
-    ssh_offer_sampled_at: Option<std::time::Instant>,
-    /// `~/.ssh/config` targets, re-read at most every 30 s for the sampler.
-    ssh_targets_cache: Option<(std::time::Instant, Vec<crate::remote::RemoteTarget>)>,
+    /// The label thread's ssh samples (#364): `(shell pid, resolved host)`
+    /// per pane it looked at, shipped beside the names it already resolves
+    /// so the argv read and the `~/.ssh/config` parse stay off the loop.
+    ssh_rx: std::sync::mpsc::Receiver<Vec<(i32, Option<String>)>>,
+    ssh_tx: std::sync::mpsc::Sender<Vec<(i32, Option<String>)>>,
     /// `disable_remote_offer` from prefs (#364).
     remote_offer_disabled: bool,
     /// `remote_offer_excluded_hosts` from prefs (#364).
@@ -4292,6 +4292,7 @@ impl App {
         let (port_poll_tx, port_poll_rx) = std::sync::mpsc::channel();
         let (fleet_tx, fleet_rx) = std::sync::mpsc::channel();
         let (label_tx, label_rx) = std::sync::mpsc::channel();
+        let (ssh_tx, ssh_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
         std::thread::spawn(move || {
             crate::widgets::search::search_worker_loop(
@@ -4506,8 +4507,8 @@ impl App {
             pending_remote_launch_path: None,
             ssh_offer: None,
             ssh_offer_seen: std::collections::BTreeMap::new(),
-            ssh_offer_sampled_at: None,
-            ssh_targets_cache: None,
+            ssh_rx,
+            ssh_tx,
             remote_offer_disabled: loaded_prefs.disable_remote_offer,
             remote_offer_excluded: loaded_prefs.remote_offer_excluded_hosts.clone(),
             remote_offer_refused: crate::remote::load_refused_hosts(
@@ -14677,7 +14678,7 @@ impl App {
             *rect = Rect::default();
         }
         self.dress_host_accents();
-        self.poll_ssh_offers();
+        self.expire_ssh_offer();
         // Theme background, whole frame. croft's chrome (the sidebar panels,
         // explorer sections, activity bar, gaps) mostly paints `Color::Reset`
         // and leans on the iTerm2 `SetColors` session bg to color it. Ghostty /
@@ -17797,7 +17798,9 @@ impl App {
         // Esc dismisses an open ssh-pane offer (#364) without being consumed:
         // the offer is a status-bar hint, not a modal, so whatever Esc meant
         // to the focused pane still happens.
-        if key.code == KeyCode::Esc {
+        if key.code == KeyCode::Esc
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
             self.dismiss_ssh_offer();
         }
         let capture =
@@ -24486,21 +24489,13 @@ impl App {
         }
     }
 
-    /// Sample every pane for an ssh session and raise or drop the offer
-    /// (#364). Runs from the top of `render` like `dress_host_accents`, but
-    /// at most once per [`SSH_OFFER_SAMPLE_GAP`]: each sample reads a
-    /// process's argv, which is a system call per pane, and a foreground
-    /// change is visible within a second either way.
-    fn poll_ssh_offers(&mut self) {
+    /// Housekeeping for the ssh-pane offer (#364), from the top of `render`
+    /// like `dress_host_accents`: an offer nobody took or dismissed clears
+    /// itself after [`SSH_OFFER_TTL`], and a pane that closed takes its offer
+    /// and its per-pane memory along. No system calls: the sampling itself
+    /// rides the label thread (see `refresh_terminal_labels`).
+    fn expire_ssh_offer(&mut self) {
         let now = std::time::Instant::now();
-        if self
-            .ssh_offer_sampled_at
-            .is_some_and(|at| now.duration_since(at) < SSH_OFFER_SAMPLE_GAP)
-        {
-            return;
-        }
-        self.ssh_offer_sampled_at = Some(now);
-        // An offer nobody took or dismissed goes away on its own.
         if self
             .ssh_offer
             .as_ref()
@@ -24508,42 +24503,6 @@ impl App {
         {
             self.dismiss_ssh_offer();
         }
-        if self.remote_offer_disabled {
-            return;
-        }
-        let targets = self.ssh_targets(now);
-        let samples: Vec<(u64, Option<String>)> = self
-            .terminals
-            .iter()
-            .map(|t| {
-                // Foreground and shell pids compared directly, not through
-                // `foreground_is_shell`: that probe retries an unresolvable
-                // sample after a 5 ms sleep, which has no place on the
-                // render thread once a second per pane. Here an
-                // unresolvable sample simply offers nothing, and the next
-                // second's sample tries again.
-                // And only for a pane whose CACHED foreground name is ssh:
-                // reading argv enumerates the whole process table through
-                // sysinfo, which a pane running vim or a build must not pay
-                // every second for nothing.
-                let host = match (t.foreground_pid(), t.shell_pid()) {
-                    (Some(fg), Some(shell))
-                        if fg != shell && crate::remote::is_ssh_program(t.foreground_program()) =>
-                    {
-                        crate::widgets::terminal::process_cmdline(fg).and_then(|cmd| {
-                            let argv: Vec<&str> = cmd.iter().map(String::as_str).collect();
-                            crate::remote::ssh_offer_host(&argv, &targets)
-                        })
-                    }
-                    _ => None,
-                };
-                (t.uid(), host)
-            })
-            .collect();
-        for (pane, host) in samples {
-            self.consider_ssh_offer(pane, host);
-        }
-        // Panes that closed take their memory with them.
         let live: std::collections::BTreeSet<u64> =
             self.terminals.iter().map(|t| t.uid()).collect();
         self.ssh_offer_seen.retain(|uid, _| live.contains(uid));
@@ -24556,16 +24515,21 @@ impl App {
         }
     }
 
-    /// `~/.ssh/config` targets for the sampler, re-read at most every 30 s.
-    fn ssh_targets(&mut self, now: std::time::Instant) -> Vec<crate::remote::RemoteTarget> {
-        if let Some((at, targets)) = self.ssh_targets_cache.as_ref()
-            && now.duration_since(*at) < std::time::Duration::from_secs(30)
-        {
-            return targets.clone();
+    /// Fold the label thread's ssh samples into the offer state (#364):
+    /// each `(shell pid, host)` names the pane by its shell and goes through
+    /// `consider_ssh_offer` keyed on the pane's uid.
+    fn apply_ssh_samples(&mut self, samples: Vec<(i32, Option<String>)>) {
+        for (shell_pid, host) in samples {
+            let Some(uid) = self
+                .terminals
+                .iter()
+                .find(|t| t.shell_pid() == Some(shell_pid))
+                .map(|t| t.uid())
+            else {
+                continue;
+            };
+            self.consider_ssh_offer(uid, host);
         }
-        let targets = crate::remote::discover_ssh_targets();
-        self.ssh_targets_cache = Some((now, targets.clone()));
-        targets
     }
 
     /// One pane's sampled ssh host, against what it was last seen connected
@@ -24617,6 +24581,33 @@ impl App {
         Some(offer.host)
     }
 
+    /// Remember that provisioning `host` failed (#364): the ssh-pane offer
+    /// stops prompting for it for `REFUSED_HOST_TTL`. Recorded for any
+    /// install that fails, offer-launched or not, because the fact learned
+    /// is about the host; and undone by the next success (below), so a box
+    /// that merely failed on a bad day is offered again once it works.
+    fn note_provisioning_failed(&mut self, host: &str) {
+        let key = host.to_ascii_lowercase();
+        self.remote_offer_refused.insert(key.clone());
+        let _ = crate::remote::remember_refused_host(
+            &crate::remote::refused_hosts_path(&croft_cache_dir()),
+            &key,
+            std::time::SystemTime::now(),
+        );
+    }
+
+    /// A provisioning of `host` succeeded (#364): any remembered refusal is
+    /// stale, in memory and on disk.
+    fn note_provisioning_succeeded(&mut self, host: &str) {
+        let key = host.to_ascii_lowercase();
+        if self.remote_offer_refused.remove(&key) {
+            let _ = crate::remote::forget_refused_host(
+                &crate::remote::refused_hosts_path(&croft_cache_dir()),
+                &key,
+            );
+        }
+    }
+
     /// Drop the open offer and its status line, if any (#364).
     fn dismiss_ssh_offer(&mut self) {
         if self.ssh_offer.take().is_some() && self.status.starts_with("Connected to ") {
@@ -24661,12 +24652,12 @@ impl App {
     /// under the pane and offering to re-root onto a host the user piped
     /// output from rather than one they are working on.
     ///
-    /// Explicit rather than automatic, deliberately. The issue proposes a
-    /// status-bar prompt offering this on detection, which needs a per-host
-    /// opt-out, a memory of hosts that refused provisioning, and a decision
-    /// about how often to nag — none of which should be invented alongside
-    /// the detection itself. A command the user reaches for does the same
-    /// work and cannot interrupt anyone.
+    /// Explicit in the first slice, deliberately: the automatic status-bar
+    /// offer needed a per-host opt-out, a memory of hosts that refused
+    /// provisioning and a decision about how often to prompt, none of which
+    /// belonged alongside the detection itself. Those exist now (the second
+    /// slice: `consider_ssh_offer` and its gates), and the offer accepts
+    /// through the same `request_remote_launch` this command reaches for.
     fn open_workspace_on_ssh_host(&mut self) {
         let Some(term) = self.terminals.get(self.active_terminal) else {
             self.status = String::from("No terminal pane is open");
@@ -25315,6 +25306,7 @@ impl App {
             {
                 let host = session.host.clone();
                 let path = session.path.clone();
+                self.note_provisioning_succeeded(&host);
                 self.remote_launch = Some(RemoteLaunch {
                     host: host.clone(),
                     path,
@@ -25331,14 +25323,8 @@ impl App {
             // the ssh-pane offer stops prompting for it for a while. Kept
             // beside the failure it learns from, and best-effort: a write
             // that fails costs one repeated offer.
-            if let Some(session) = self.install_session.as_ref() {
-                let host = session.host.to_ascii_lowercase();
-                self.remote_offer_refused.insert(host.clone());
-                let _ = crate::remote::remember_refused_host(
-                    &crate::remote::refused_hosts_path(&croft_cache_dir()),
-                    &host,
-                    std::time::SystemTime::now(),
-                );
+            if let Some(host) = self.install_session.as_ref().map(|s| s.host.clone()) {
+                self.note_provisioning_failed(&host);
             }
             if let Some(dialog) = self.connect_dialog.as_mut() {
                 dialog.set_failed(detail.clone());
@@ -25352,6 +25338,7 @@ impl App {
             {
                 let host = session.host.clone();
                 let path = session.path.clone();
+                self.note_provisioning_succeeded(&host);
                 self.remote_launch = Some(RemoteLaunch {
                     host: host.clone(),
                     path,
@@ -30492,6 +30479,9 @@ impl App {
     fn refresh_terminal_labels(&mut self) -> bool {
         let mut changed = false;
         // Apply whatever the last background lookup resolved.
+        if let Some(samples) = self.ssh_rx.try_iter().last() {
+            self.apply_ssh_samples(samples);
+        }
         if let Some(labels) = self.label_rx.try_iter().last() {
             for (shell_pid, name) in &labels {
                 if let Some(t) = self
@@ -30528,15 +30518,50 @@ impl App {
             }
             if !targets.is_empty() {
                 let tx = self.label_tx.clone();
+                let ssh_tx = self.ssh_tx.clone();
+                let sample_ssh = !self.remote_offer_disabled;
                 let inflight = self.label_inflight.clone();
                 inflight.store(true, std::sync::atomic::Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    let resolved: Vec<(i32, String)> = targets
+                    let named: Vec<(i32, i32, String)> = targets
                         .into_iter()
                         .filter_map(|(sp, fg)| {
-                            crate::widgets::terminal::process_name(fg).map(|n| (sp, n))
+                            crate::widgets::terminal::process_name(fg).map(|n| (sp, fg, n))
                         })
                         .collect();
+                    // The ssh-pane offer (#364) rides this thread: only a
+                    // pane whose foreground IS ssh pays the argv read (a
+                    // whole-process-table enumeration), and the config
+                    // parse runs once per pass and only when one does. A
+                    // pane at its prompt samples as `None`, which is what
+                    // ends its session for the offer.
+                    if sample_ssh {
+                        let is_ssh = |sp: &i32, fg: &i32, n: &str| {
+                            sp != fg && crate::remote::is_ssh_program(n)
+                        };
+                        let config = if named.iter().any(|(sp, fg, n)| is_ssh(sp, fg, n)) {
+                            crate::remote::discover_ssh_targets()
+                        } else {
+                            Vec::new()
+                        };
+                        let samples: Vec<(i32, Option<String>)> = named
+                            .iter()
+                            .map(|(sp, fg, n)| {
+                                let host = is_ssh(sp, fg, n)
+                                    .then(|| crate::widgets::terminal::process_cmdline(*fg))
+                                    .flatten()
+                                    .and_then(|cmd| {
+                                        let argv: Vec<&str> =
+                                            cmd.iter().map(String::as_str).collect();
+                                        crate::remote::ssh_offer_host(&argv, &config)
+                                    });
+                                (*sp, host)
+                            })
+                            .collect();
+                        let _ = ssh_tx.send(samples);
+                    }
+                    let resolved: Vec<(i32, String)> =
+                        named.into_iter().map(|(sp, _, n)| (sp, n)).collect();
                     let _ = tx.send(resolved);
                     inflight.store(false, std::sync::atomic::Ordering::Relaxed);
                 });
@@ -39176,7 +39201,14 @@ impl App {
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
         self.remote_offer_excluded = p.remote_offer_excluded_hosts.clone();
-        if self.remote_offer_disabled {
+        if let Some(o) = self.ssh_offer.as_ref()
+            && !crate::remote::offer_allowed(
+                &o.host,
+                self.remote_offer_disabled,
+                &self.remote_offer_excluded,
+                &self.remote_offer_refused,
+            )
+        {
             self.dismiss_ssh_offer();
         }
         // Only on a real change: the startup remerge runs before any log is
@@ -45931,9 +45963,6 @@ struct HttpRunOutcome {
     raw_line: String,
     result: Result<crate::http_file::HttpResponse, String>,
 }
-
-/// How often the ssh-pane sampler runs (#364); see `App::poll_ssh_offers`.
-const SSH_OFFER_SAMPLE_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long an ssh-pane offer stays up untouched (#364) before it clears
 /// itself: long enough to read and act on, short enough not to be stale

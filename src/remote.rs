@@ -4364,13 +4364,12 @@ pub fn offer_allowed(
     !refused.contains(&lower)
 }
 
-/// Whether a pane's cached foreground label names an ssh program (#364): the
-/// cheap pre-check before the sampler reads a process's argv, which costs a
-/// whole-process-table enumeration through sysinfo. The label is the
-/// process's basename as the pane's own label lookup stored it.
-pub fn is_ssh_program(label: &str) -> bool {
-    let first = label.split_whitespace().next().unwrap_or("");
-    let base = first.rsplit('/').next().unwrap_or(first);
+/// Whether a resolved foreground process name is an ssh program (#364): the
+/// cheap pre-check before the label thread reads that process's argv, which
+/// costs a whole-process-table enumeration through sysinfo. `name` is what
+/// `process_name` returns, a bare basename, but a path is tolerated.
+pub fn is_ssh_program(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
     SSH_PROGRAMS.contains(&base)
 }
 
@@ -4418,6 +4417,23 @@ pub fn load_refused_hosts(
         .filter(|(_, at)| now_secs.saturating_sub(*at) <= ttl)
         .map(|(h, _)| h.to_ascii_lowercase())
         .collect()
+}
+
+/// Forget a remembered refusal for `host` (#364): a later provisioning that
+/// SUCCEEDED proves the memory stale, and a week is too long to keep not
+/// offering a box that merely failed on a bad day. Best effort like the
+/// remembering side; a missing file or entry is not an error.
+pub fn forget_refused_host(path: &Path, host: &str) -> std::io::Result<()> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut map: std::collections::BTreeMap<String, u64> =
+        serde_json::from_str(&raw).unwrap_or_default();
+    if map.remove(&host.to_ascii_lowercase()).is_none() {
+        return Ok(());
+    }
+    let body = serde_json::to_string_pretty(&map).map_err(std::io::Error::other)?;
+    std::fs::write(path, body)
 }
 
 /// Record that provisioning `host` failed at `now` (#364), keeping the other
@@ -4501,6 +4517,36 @@ mod offer_tests {
             load_refused_hosts(&path, now).is_empty(),
             "garbage reads as empty"
         );
+    }
+
+    #[test]
+    fn only_ssh_itself_is_an_ssh_program() {
+        assert!(is_ssh_program("ssh"));
+        assert!(is_ssh_program("/usr/bin/ssh"), "a path is tolerated");
+        assert!(
+            !is_ssh_program("ssh-agent"),
+            "whole-name match, as SSH_PROGRAMS promises"
+        );
+        assert!(!is_ssh_program("sshfs"));
+        assert!(
+            !is_ssh_program("mosh"),
+            "long-option programs are refused (see #445)"
+        );
+        assert!(!is_ssh_program(""));
+    }
+
+    #[test]
+    fn a_success_forgets_a_remembered_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = refused_hosts_path(dir.path());
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        forget_refused_host(&path, "nobody").unwrap();
+        assert!(!path.exists(), "forgetting with no file creates nothing");
+        remember_refused_host(&path, "db-1", now).unwrap();
+        remember_refused_host(&path, "jump", now).unwrap();
+        forget_refused_host(&path, "DB-1").unwrap();
+        let left = load_refused_hosts(&path, now);
+        assert!(!left.contains("db-1") && left.contains("jump"), "{left:?}");
     }
 
     #[test]
