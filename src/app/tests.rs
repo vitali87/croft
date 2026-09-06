@@ -12645,9 +12645,10 @@ fn the_group_by_seat_lens_refuses_a_map_for_lines_the_view_does_not_show() {
             true,
         )
         .unwrap();
-    // Same LENGTH, different content: the stamp gate cannot see this, so the
-    // view still shows the old lines while disk and its snapshot have moved.
-    std::fs::write(&f, "kept\nOTHER\n").unwrap();
+    // Same LENGTH, different content ("else" for "mine"), so the (mtime,
+    // len) stamp gate genuinely cannot see this rewrite: the view still
+    // shows the old lines while disk and its snapshot have moved.
+    std::fs::write(&f, "kept\nelse\n").unwrap();
     let mut seats = crate::provenance::Provenance::new();
     seats.record(1..2, Seat::Me);
     crate::history::record_with_seats_in(
