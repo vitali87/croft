@@ -373,6 +373,18 @@ pub fn save_mcp_consent(ext_id: &str) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Forget a recorded first-run consent, preserving other settings: an
+/// uninstalled extension is a fresh install when it is re-added, and the
+/// gate must ask again. Best-effort like [`save_mcp_consent`].
+pub fn forget_mcp_consent(ext_id: &str) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    if !prefs.mcp_consented.remove(ext_id) {
+        return Ok(());
+    }
+    prefs.save(&path)
+}
+
 /// Record (trust-on-first-use) the fingerprint of the tool a command calls,
 /// preserving other settings. Best-effort: a write failure is swallowed.
 pub fn save_mcp_tool_fingerprint(command_id: &str, fingerprint: &str) -> Result<()> {

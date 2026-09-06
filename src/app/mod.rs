@@ -18768,11 +18768,31 @@ impl App {
                 if self.disabled_extensions.remove(id) {
                     let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
                 }
+                // And its consent: a re-add is a program the user has not
+                // approved this time, so the first-run gate asks again.
+                self.forget_extension_consent(id);
                 self.refresh_extensions();
                 self.status = format!("Uninstalled '{id}' — it's back under AVAILABLE to re-add");
             }
             Err(e) => self.status = format!("Could not uninstall '{id}': {e}"),
         }
+    }
+
+    /// Write a first-run consent for `ext_id` to prefs, after the caller has
+    /// put it in the session set both gates read. The session grant holds
+    /// either way; a prefs write that fails is said in the status rather
+    /// than swallowed, since the user would otherwise be asked again next
+    /// launch with no idea why.
+    fn persist_extension_consent(&mut self, ext_id: &str) {
+        if let Err(e) = crate::prefs::save_mcp_consent(ext_id) {
+            self.status = format!("Allowed {ext_id}, but the consent could not be saved: {e}");
+        }
+    }
+
+    /// Forget `id`'s first-run consent in the session set and in prefs.
+    fn forget_extension_consent(&mut self, id: &str) {
+        self.consented_extensions.remove(id);
+        let _ = crate::prefs::forget_mcp_consent(id);
     }
 
     /// Whether the extension `id` is currently enabled (not in the disabled set).
@@ -21668,24 +21688,26 @@ impl App {
                     self.status = format!("{key} is no longer available");
                     return;
                 };
-                let _ = crate::prefs::save_mcp_consent(&viewer.ext_id);
+                // The session grant first, so the open passes the gate; the
+                // prefs write after, so a failure it reports is the status
+                // the user is left with rather than one the open overwrote.
                 self.consented_extensions.insert(viewer.ext_id.clone());
                 self.open_in_viewer(&viewer, &path);
+                self.persist_extension_consent(&viewer.ext_id);
             }
             InputPurpose::McpConsent { command_id } => {
                 // The user confirmed; record consent for this command's
                 // extension and resume the command (which now passes the gate
                 // and proceeds to its argument prompt or runs).
                 self.close_input_prompt();
-                if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
-                    let _ = crate::prefs::save_mcp_consent(&resolved.ext_id);
-                    // The viewer gate reads this set rather than prefs, and
-                    // both gates are one consent per extension: allowing a
-                    // sidecar must not re-prompt for the same extension's
-                    // viewer in the same session.
-                    self.consented_extensions.insert(resolved.ext_id.clone());
+                let ext_id = crate::mcp::registry::resolve_command(&command_id).map(|r| r.ext_id);
+                if let Some(ext_id) = &ext_id {
+                    self.consented_extensions.insert(ext_id.clone());
                 }
                 self.run_extension_command(&command_id);
+                if let Some(ext_id) = &ext_id {
+                    self.persist_extension_consent(ext_id);
+                }
             }
             InputPurpose::McpArg { command_id } => {
                 self.close_input_prompt();
@@ -31974,10 +31996,10 @@ impl App {
         };
         // First-run consent gate: never spawn a sidecar until the user has
         // approved this extension, shown the exact command line croft will run.
-        let consented = crate::prefs::Prefs::load_or_default()
-            .mcp_consented
-            .contains(&resolved.ext_id);
-        if !consented {
+        // One set answers this gate and the viewer gate alike: it is loaded
+        // from prefs at startup and fed by every grant since, so the two
+        // cannot disagree, whatever became of a prefs write.
+        if !self.consented_extensions.contains(&resolved.ext_id) {
             let spawn_line = std::iter::once(resolved.server.command.clone())
                 .chain(resolved.server.args.iter().cloned())
                 .collect::<Vec<_>>()
