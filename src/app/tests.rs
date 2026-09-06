@@ -26227,6 +26227,106 @@ fn a_second_dump_closes_the_stale_tab_in_every_editor_group() {
         app.editor.find_tab_with_path(&path).is_some(),
         "the focused group holds the rebuilt dump"
     );
+    // The left group held nothing but the stale dump: closing its only tab
+    // leaves a blank group, which every other close path prunes; a dead
+    // blank pane the user never opened must not survive here either.
+    assert!(
+        app.editor_layout
+            .inactive_groups()
+            .iter()
+            .all(|g| !g.is_blank_initial()),
+        "an inactive group emptied by the close is pruned, not left blank"
+    );
+}
+
+/// The private write must never re-mode something it did not create through
+/// a link: `set_permissions` follows symlinks, so a scrollback dir that is a
+/// link is refused and its target keeps its mode. A real dir left loose by
+/// an older run is tightened, and so is a stale dump file.
+#[cfg(unix)]
+#[test]
+fn write_private_refuses_a_symlinked_dir_and_tightens_a_loose_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let loose = tmp.path().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stale = loose.join("old.log");
+    std::fs::write(&stale, "old").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_private(&loose, &stale, "new").expect("a real dir is written");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode(&loose),
+        0o700,
+        "a loose dir from an older run is tightened"
+    );
+    assert_eq!(mode(&stale), 0o600, "and so is a stale dump file");
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "new");
+
+    let target = tmp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let outcome = write_private(&link, &link.join("x.log"), "x");
+    assert!(
+        outcome.is_err(),
+        "a symlinked dir is refused, not written through"
+    );
+    assert_eq!(mode(&target), 0o755, "the link's target keeps its mode");
+    assert!(!target.join("x.log").exists(), "and gains no file");
+}
+
+/// Dumps are named by pid, so a croft that exits leaves its dumps behind
+/// with no process that will ever overwrite them; the next dump reaps the
+/// files of pids that are gone and leaves live processes' files alone.
+#[cfg(unix)]
+#[test]
+fn a_scrollback_dump_reaps_the_dumps_of_dead_processes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    std::fs::create_dir_all(&app.scrollback_dir).unwrap();
+    // A pid that is certainly gone: a child that has already been reaped.
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+    let dead = app
+        .scrollback_dir
+        .join(format!("shell-{}-1-scrollback.log", child.id()));
+    std::fs::write(&dead, "gone").unwrap();
+    let live = app
+        .scrollback_dir
+        .join(format!("shell-{}-99-scrollback.log", std::process::id()));
+    std::fs::write(&live, "mine").unwrap();
+    let other = app.scrollback_dir.join("notes.txt");
+    std::fs::write(&other, "not a dump").unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}REAP\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQREAP"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    assert!(app.editor.path.is_some(), "the dump itself landed");
+    assert!(!dead.exists(), "a dead process's dump is reaped");
+    assert!(live.exists(), "this process's other dump stays");
+    assert!(other.exists(), "a file that is not a dump is not touched");
 }
 
 /// The dump is a new on-disk copy of pane output, so the redact rules must

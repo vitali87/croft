@@ -27307,10 +27307,13 @@ impl App {
         }
     }
 
-    /// Cmd+K D: snapshot the active pane's scrollback + screen into a
-    /// scratch editor tab named after the pane. Read from the same
-    /// `grid_lines` the find bar searches; the blank live-screen tail is
-    /// trimmed so the buffer ends at the last real row.
+    /// Cmd+K D: snapshot the active pane's scrollback + screen. A pane that
+    /// showed colour is written, colours as SGR, to a private file under the
+    /// scrollback dir and opened as a pinned rendered-log tab (#257); a pane
+    /// with no colour goes into the scratch editor tab it always had. Read
+    /// from one grid pass (`grid_lines_ansi`, the plain twin of which is the
+    /// text the find bar searches); the blank live-screen tail is trimmed so
+    /// the buffer ends at the last real row.
     fn open_scrollback_in_editor(&mut self) {
         // Plain and coloured rows come from ONE grid read, so a redact rule
         // is applied to the row it matches and never to a neighbour that
@@ -27372,7 +27375,12 @@ impl App {
             // Terminal output is written owner-only whatever the umask: the
             // redaction rules are finite, and another local account has no
             // business reading a shell's history.
-            let written = write_private(&self.scrollback_dir, &file, rows.join("\n") + "\n");
+            let written = write_private(&self.scrollback_dir, &file, &(rows.join("\n") + "\n"));
+            // Dumps left by croft processes that have exited are reaped on
+            // the way past: nothing will ever overwrite them.
+            if written.is_ok() {
+                reap_dead_scrollback_dumps(&self.scrollback_dir);
+            }
             // Pinned, as the scratch buffer was: a later file peek must not
             // replace the dump, and two panes' dumps must not share a slot.
             let opened = written
@@ -27419,16 +27427,23 @@ impl App {
 
     /// Close every tab holding `path`, in the focused group and in every
     /// other one: a tab in an unfocused group would otherwise keep reading a
-    /// rewritten file through its old index, and nothing heals it.
+    /// rewritten file through its old index, and nothing heals it. Every
+    /// match goes, not the first: `push_editor` can open one path twice. A
+    /// group emptied by this is pruned as every other close path prunes it;
+    /// the focused group is left blank for the caller to refill.
     fn close_tabs_with_path_everywhere(&mut self, path: &Path) {
-        if let Some(idx) = self.editor.find_tab_with_path(path) {
+        // `close_tab` on a group's last tab leaves a blank editor with no
+        // path, so the search finds nothing more and the loop ends.
+        while let Some(idx) = self.editor.find_tab_with_path(path) {
             self.editor.close_tab(idx);
         }
         for group in self.editor_layout.inactive_groups_mut() {
-            if let Some(idx) = group.find_tab_with_path(path) {
+            while let Some(idx) = group.find_tab_with_path(path) {
                 group.close_tab(idx);
             }
         }
+        self.editor_layout
+            .prune_blank_inactive(|t| t.is_blank_initial());
     }
 
     /// `.http`/`.rest` (#370): send the request under the caret. The env
@@ -44687,19 +44702,34 @@ fn log_cell_at(
 
 /// Create `dir` (0700) if needed and write `contents` to `file` (0600). On
 /// non-unix hosts the modes do not exist and the plain write is used.
-fn write_private(dir: &Path, file: &Path, contents: String) -> std::io::Result<()> {
+fn write_private(dir: &Path, file: &Path, contents: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        // `recursive` also creates any missing parent (`~/.cache/croft`
+        // itself on a first run) at 0700, which is the mode its other
+        // tenants want too.
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        // Only a dir this call created gets its mode set: `set_permissions`
-        // follows links, and an existing entry here is not this code's to
-        // re-mode blindly.
-        if std::fs::symlink_metadata(dir)?.permissions().mode() & 0o077 != 0 {
+        // A pre-existing dir is tightened, a link is refused: `create` adopts
+        // an existing symlink to a dir, `symlink_metadata` reports the link's
+        // own mode (always loose), and `set_permissions` follows the link, so
+        // without this check a scrollback dir pointed at any dir the user
+        // owns would silently re-mode that dir on the first dump.
+        let meta = std::fs::symlink_metadata(dir)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symlink; refusing to write through it",
+                    dir.display()
+                ),
+            ));
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
         let mut f = std::fs::OpenOptions::new()
@@ -44717,6 +44747,62 @@ fn write_private(dir: &Path, file: &Path, contents: String) -> std::io::Result<(
         std::fs::create_dir_all(dir)?;
         std::fs::write(file, contents)
     }
+}
+
+/// Remove the dumps under `dir` whose croft process is gone. A dump is named
+/// `<pane>-<pid>-<uid>-scrollback.log` and is overwritten only by the process
+/// that wrote it, so every exited croft would otherwise leave its dumps
+/// behind for good, each the size of a pane's scrollback; the other cache
+/// dirs here all bound themselves the same way. Anything not shaped like a
+/// dump is left alone, and so is every live process's file.
+fn reap_dead_scrollback_dumps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix("-scrollback.log"))
+        else {
+            continue;
+        };
+        // `<pane>-<pid>-<uid>`, read from the right since a pane label may
+        // itself contain dashes.
+        let mut parts = stem.rsplitn(3, '-');
+        let (Some(_uid), Some(pid), Some(_pane)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid != me && !process_is_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether a process with `pid` exists. Signal 0 delivers nothing and only
+/// checks; a process this user may not signal still exists, so `EPERM`
+/// reads as alive. Off unix nothing is reaped, on the conservative side.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: `kill` with signal 0 only checks for the process; no signal is
+    // delivered and no memory is touched.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Whether a scrollback dump goes to the rendered log view or to the plain
