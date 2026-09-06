@@ -46,6 +46,16 @@ pub struct ScoredResult {
 }
 
 #[derive(Default)]
+/// Where in the picked file to land, parsed off the end of the query
+/// (#472): `name:236`, `name:236:7` or `name:236-239`. Lines and columns
+/// are one-based as typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineHint {
+    pub line: usize,
+    pub end: Option<usize>,
+    pub col: Option<usize>,
+}
+
 pub struct FileFinder {
     pub query: String,
     pub cursor: usize,
@@ -176,6 +186,11 @@ impl FileFinder {
         }
     }
 
+    /// The line suffix typed after the file part of the query, if any.
+    pub fn line_hint(&self) -> Option<LineHint> {
+        split_line_hint(&self.query).1
+    }
+
     pub fn selected_entry(&self) -> Option<&FileEntry> {
         self.results.get(self.selected).map(|r| &r.entry)
     }
@@ -205,7 +220,11 @@ impl FileFinder {
     }
 
     fn refresh_results(&mut self) {
-        let needle: String = self.query.trim().to_lowercase();
+        // Only the file part takes part in matching: `alpha:236-239` names
+        // alpha.rs and a place in it, and a needle carrying the suffix would
+        // match nothing at all (#472).
+        let (file_part, _hint) = split_line_hint(&self.query);
+        let needle: String = file_part.trim().to_lowercase();
         if needle.is_empty() {
             let mut scored: Vec<ScoredResult> = Vec::with_capacity(MAX_RESULTS);
             for entry in self.entries.iter().take(MAX_RESULTS) {
@@ -324,6 +343,51 @@ fn push_topk(heap: &mut BinaryHeap<RankedSlot>, slot: RankedSlot, k: usize) {
         heap.pop();
         heap.push(slot);
     }
+}
+
+/// Split a trailing line hint off a quick-open query (#472): the file part
+/// and, when the query ends in `:line`, `:line:col` or `:line-line`, the
+/// parsed hint. The first `:` whose remainder parses as a hint is the cut,
+/// so a name that itself contains a colon keeps it. Anything that does not
+/// parse stays part of the file name, which is the conservative reading: a
+/// half-typed `alpha:` still searches for `alpha:` rather than guessing.
+pub fn split_line_hint(query: &str) -> (&str, Option<LineHint>) {
+    let q = query.trim_end();
+    for (i, _) in q.match_indices(':') {
+        if let Some(hint) = parse_line_hint(&q[i + 1..]) {
+            return (&q[..i], Some(hint));
+        }
+    }
+    (query, None)
+}
+
+fn parse_line_hint(s: &str) -> Option<LineHint> {
+    // One-based as typed; a `0` is not a line anyone can land on.
+    let num = |t: &str| {
+        (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| t.parse::<usize>().ok())
+            .flatten()
+            .filter(|n| *n > 0)
+    };
+    if let Some((a, b)) = s.split_once('-') {
+        return Some(LineHint {
+            line: num(a)?,
+            end: Some(num(b)?),
+            col: None,
+        });
+    }
+    if let Some((a, b)) = s.split_once(':') {
+        return Some(LineHint {
+            line: num(a)?,
+            end: None,
+            col: Some(num(b)?),
+        });
+    }
+    Some(LineHint {
+        line: num(s)?,
+        end: None,
+        col: None,
+    })
 }
 
 pub fn score_entry(
@@ -1087,6 +1151,59 @@ mod tests {
             Some("md2pdf/core.py"),
             "a query containing '/' must match against the relative path; got {names:?}"
         );
+    }
+
+    #[test]
+    fn a_line_suffix_is_split_off_the_query_and_the_file_part_still_matches() {
+        // #472: `fileA:236-239` names a file AND where to land in it. The
+        // suffix is not part of the file name, so it must not take part in
+        // matching, and it has to come back parsed for the open to use.
+        let entries = Arc::new(vec![entry("src/alpha.rs"), entry("src/beta.rs")]);
+        let mut finder = FileFinder::new(entries);
+        for (query, hint) in [
+            (
+                "alpha:236-239",
+                LineHint {
+                    line: 236,
+                    end: Some(239),
+                    col: None,
+                },
+            ),
+            (
+                "alpha:236",
+                LineHint {
+                    line: 236,
+                    end: None,
+                    col: None,
+                },
+            ),
+            (
+                "alpha:236:7",
+                LineHint {
+                    line: 236,
+                    end: None,
+                    col: Some(7),
+                },
+            ),
+        ] {
+            finder.set_query(query);
+            let names: Vec<&str> = finder
+                .visible_results()
+                .iter()
+                .map(|r| r.entry.rel.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["src/alpha.rs"],
+                "{query}: the file part alone selects the file; got {names:?}"
+            );
+            assert_eq!(finder.line_hint(), Some(hint), "{query}");
+        }
+        finder.set_query("alpha");
+        assert_eq!(finder.line_hint(), None, "no suffix, no hint");
+        // A colon with nothing numeric after it is not a line suffix.
+        finder.set_query("alpha:");
+        assert_eq!(finder.line_hint(), None, "a bare colon is not a hint");
     }
 
     #[test]

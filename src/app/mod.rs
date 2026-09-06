@@ -30884,18 +30884,58 @@ impl App {
             return;
         };
         let path = finder.selected_entry().map(|e| e.path.clone());
+        let hint = finder.line_hint();
         if let Some(path) = path {
             self.close_file_finder();
-            match self.editor.open_preview(&path) {
+            // `alpha:236-239` (#472): land on the line, centred, and select
+            // the range so it reads as highlighted; `alpha:236` lands with
+            // nothing selected, since one line is a place, not a span.
+            let opened = match hint {
+                Some(hint) => {
+                    let row = hint.line.saturating_sub(1);
+                    let col = hint.col.map_or(0, |c| c.saturating_sub(1));
+                    self.open_at(&path, row, col)
+                }
+                None => self.editor.open_preview(&path),
+            };
+            match opened {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
+                    // A hinted landing replaces whatever was selected: the
+                    // file may already be open with a range from an earlier
+                    // pick, and `alpha:12` must not keep showing it.
+                    if hint.is_some() {
+                        self.editor.clear_selection();
+                    }
+                    if let Some(end) = hint.and_then(|h| h.end) {
+                        let start = self.editor.cursor_row;
+                        let last = self.editor.lines.len().saturating_sub(1);
+                        let end_row = end.saturating_sub(1).clamp(start, last);
+                        let end_col = self
+                            .editor
+                            .lines
+                            .get(end_row)
+                            .map_or(0, |l| l.chars().count());
+                        self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+                            anchor: (start, 0),
+                            head: (end_row, end_col),
+                        });
+                    }
                     // VS Code's `explorer.autoReveal` analogue:
                     // expand every parent dir of the picked file
                     // and park the cursor on its row so the user
                     // sees where in the workspace the file lives.
                     self.tree.reveal_path(&path);
                     self.focus_pane(Pane::Editor);
-                    self.status = format!("Opened {}", self.status_path(&path));
+                    self.status = match hint {
+                        Some(hint) => match hint.end {
+                            Some(end) => {
+                                format!("Opened {}:{}-{}", self.status_path(&path), hint.line, end)
+                            }
+                            None => format!("Opened {}:{}", self.status_path(&path), hint.line),
+                        },
+                        None => format!("Opened {}", self.status_path(&path)),
+                    };
                 }
                 Err(e) => {
                     self.status = format!("Open failed: {e}");

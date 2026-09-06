@@ -13456,6 +13456,68 @@ fn enter_in_file_finder_opens_the_selected_file_and_closes_the_modal() {
 }
 
 #[test]
+fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
+    // #472: `alpha:236-239` in Cmd+P must still find alpha.rs, and Enter
+    // must land on line 236 with 236-239 selected so the range reads as
+    // highlighted. `alpha:12` lands on the line with nothing selected.
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=300).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(tmp.path().join("alpha.rs"), &body).unwrap();
+    std::fs::write(tmp.path().join("beta.rs"), "fn b() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let type_and_enter = |app: &mut App, text: &str| {
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+    };
+
+    type_and_enter(&mut app, "alpha:236-239");
+    assert!(app.file_finder.is_none(), "Enter closes the modal");
+    assert_eq!(
+        app.editor
+            .path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str()),
+        Some("alpha.rs"),
+        "the file part of the query is what gets opened"
+    );
+    assert_eq!(app.editor.cursor_row, 235, "the cursor lands on line 236");
+    let sel = app
+        .editor
+        .selection
+        .expect("the range is selected so it reads as highlighted");
+    let ((r0, c0), (r1, _)) = sel.normalised();
+    assert_eq!(
+        (r0, c0),
+        (235, 0),
+        "the selection starts at the top of line 236"
+    );
+    assert_eq!(r1, 238, "and reaches line 239");
+    let page = app.editor.page_size().max(1);
+    assert!(
+        app.editor.scroll <= 235 && 235 < app.editor.scroll + page,
+        "the landing line is on screen: scroll={} page={page}",
+        app.editor.scroll
+    );
+
+    type_and_enter(&mut app, "alpha:12");
+    assert_eq!(
+        app.editor.cursor_row, 11,
+        "a single line lands on that line"
+    );
+    assert!(
+        app.editor.selection.is_none(),
+        "a single line is a place to land, not a range to select"
+    );
+}
+
+#[test]
 fn down_arrow_moves_selection_in_the_file_finder() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("a1.rs"), "").unwrap();
