@@ -144,12 +144,15 @@ pub fn record_in(
         // Inside the merge window: this save supersedes the newest snapshot
         // rather than appending, so a 1s auto save can't churn out history.
         if millis.saturating_sub(latest.millis) < MERGE_WINDOW_MILLIS {
-            write_snapshot(&dir, millis, content)?;
-            // The sidecar described the bytes just replaced, at either
+            // The sidecar described the bytes about to be replaced, at either
             // timestamp: two saves in one millisecond overwrite `<millis>.snap`
             // in place, and a sidecar left beside it would describe the
-            // previous content.
+            // previous content. Removed BEFORE the replacement is published,
+            // so an interruption in between leaves a snapshot with no seats
+            // (every line unknown) rather than a snapshot wearing the seats
+            // of text it does not hold.
             let _ = std::fs::remove_file(seats_path(&dir, millis));
+            write_snapshot(&dir, millis, content)?;
             if latest.millis != millis {
                 let _ = std::fs::remove_file(&latest.file);
                 let _ = std::fs::remove_file(seats_path(&dir, latest.millis));

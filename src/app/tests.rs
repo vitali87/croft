@@ -12974,6 +12974,58 @@ two
     );
 }
 
+/// The recorded map is bound to the bytes it describes (#349 review): the
+/// worker re-reads the file, so a save of the same path landing in between
+/// must not get the earlier buffer's map attached to its bytes. The snapshot
+/// is still recorded; only the attribution is withheld.
+#[test]
+fn the_map_is_not_recorded_against_another_save_s_bytes() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(0..1, Seat::Navigator);
+    // The map describes "one", but something else reaches the disk first:
+    // exactly the race the worker's re-read opens.
+    std::fs::write(&f, "someone else\n").unwrap();
+    app.record_history_snapshot_of(&f, seats, Some(b"one\n".to_vec()));
+    let snaps = wait_for_snapshots(&app.history_root, &f);
+    assert_eq!(snaps.len(), 1, "the snapshot is still recorded");
+    assert_eq!(
+        std::fs::read(&snaps[0].file).unwrap(),
+        b"someone else\n",
+        "and holds the bytes that were actually on disk"
+    );
+    assert_eq!(
+        crate::history::seats_for(&app.history_root, &f, snaps[0].millis),
+        None,
+        "but wears no map, rather than one describing text it does not hold"
+    );
+    // Positive control: the same call with matching bytes DOES record a map,
+    // so the assertion above is about the binding and not about the plumbing.
+    let mut seats2 = crate::provenance::Provenance::new();
+    seats2.record(0..1, Seat::Peer(String::from("ana")));
+    let on_disk = std::fs::read(&f).unwrap();
+    app.record_history_snapshot_of(&f, seats2, Some(on_disk));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the control's sidecar",
+        || {
+            crate::history::entries_in(&app.history_root, &f)
+                .first()
+                .is_some_and(|s| {
+                    crate::history::seats_for(&app.history_root, &f, s.millis).is_some()
+                })
+        },
+    );
+}
+
 /// A restore of a snapshot with no sidecar restores every line unknown
 /// (#349 review): the buffer's previous map described the text the restore
 /// replaced, and keeping it would credit lines nobody observed.

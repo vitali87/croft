@@ -4637,6 +4637,15 @@ impl Editor {
         want == self.lines
     }
 
+    /// The bytes this buffer would write to disk, for binding a recorded
+    /// provenance map to the text it describes (#349). `None` when the
+    /// encoding cannot represent the text, since a save would refuse it too.
+    pub fn bytes_for_disk(&self) -> Option<Vec<u8>> {
+        let content = self.lines.join(self.eol.sequence());
+        let (encoded, had_errors) = self.encode_for_disk(&content);
+        (!had_errors).then_some(encoded)
+    }
+
     /// The map a save of this tab records beside its history snapshot
     /// (#349): the buffer's own for text, empty for a viewer, whose
     /// placeholder line no seat wrote. Read off the tab that was saved, never

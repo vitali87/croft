@@ -39116,7 +39116,8 @@ impl App {
         // Each saved tab's own map rides along (#349): the recorder must not
         // look it up by path afterwards, since a split can hold the same file
         // in a second buffer with a different map.
-        let mut saved_paths: Vec<(PathBuf, crate::provenance::Provenance)> = Vec::new();
+        let mut saved_paths: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> =
+            Vec::new();
         // The tab that still holds focus is not saved by the focus-change
         // mode: only buffers that LOST focus are written.
         let keep_focused =
@@ -39165,7 +39166,10 @@ impl App {
                 match e.save_to_disk() {
                     Ok(crate::widgets::editor::SaveOutcome::Saved) => {
                         if let Some(p) = e.path.clone() {
-                            saved_paths.push((p, e.provenance_to_record()));
+                            // The bytes this editor just wrote, so the
+                            // recorder can tell whether they are still the
+                            // ones on disk when its worker reads (#349).
+                            saved_paths.push((p, e.provenance_to_record(), e.bytes_for_disk()));
                         }
                     }
                     // The latch also removes the tab from `due`, so this is
@@ -39219,16 +39223,16 @@ impl App {
         // Mirror the explicit-save path: a config file written by auto save
         // must take effect exactly like one written by Cmd+S — including one
         // saved in a background tab or an inactive split.
-        for (path, _) in &saved_paths {
+        for (path, ..) in &saved_paths {
             self.reload_config_for_path(path);
         }
         if let Some(lsp) = self.lsp.as_ref() {
-            for (path, _) in &saved_paths {
+            for (path, ..) in &saved_paths {
                 lsp.save_doc(path.clone());
             }
         }
-        for (path, seats) in saved_paths {
-            self.record_history_snapshot(&path, seats);
+        for (path, seats, described) in saved_paths {
+            self.record_history_snapshot_of(&path, seats, described);
         }
         true
     }
@@ -39495,7 +39499,8 @@ impl App {
                     // other successful save path (#191 review).
                     if let Some(path) = self.editor.path.clone() {
                         let seats = self.editor.provenance_to_record();
-                        self.record_history_snapshot(&path, seats);
+                        let described = self.editor.bytes_for_disk();
+                        self.record_history_snapshot_of(&path, seats, described);
                     }
                 }
                 Ok(SaveOutcome::DiskConflict) => {
@@ -39529,7 +39534,8 @@ impl App {
                     self.status = self.editor.status.clone();
                     if let Some(path) = self.editor.path.clone() {
                         let seats = self.editor.provenance_to_record();
-                        self.record_history_snapshot(&path, seats);
+                        let described = self.editor.bytes_for_disk();
+                        self.record_history_snapshot_of(&path, seats, described);
                     }
                     // Formula cells held back (#178): the NEXT Cmd+S is
                     // the explicit consent, same double-press contract
@@ -39597,7 +39603,8 @@ impl App {
                     self.status = self.editor.status.clone();
                     if let Some(path) = self.editor.path.clone() {
                         let seats = self.editor.provenance_to_record();
-                        self.record_history_snapshot(&path, seats);
+                        let described = self.editor.bytes_for_disk();
+                        self.record_history_snapshot_of(&path, seats, described);
                     }
                     self.lsp_notify_saved();
                     self.reload_config_if_needed();
@@ -39868,16 +39875,19 @@ impl App {
         if ed.dirty || ed.provenance.attributed() > 0 || ed.has_non_text_view() {
             return;
         }
-        ed.provenance_synced_seq = Some(seq);
         let Some(newest) = crate::history::entries_in(root, &path).into_iter().next() else {
             return;
         };
         // The sidecar first: most files have a snapshot and no record, and
         // the reads below are only worth paying on the UI thread when there
-        // is a map to apply.
+        // is a map to apply. Nothing above this point burns the marker: a
+        // save records its snapshot and then its sidecar from a worker
+        // thread, so a tick landing in that window must be free to look
+        // again rather than deciding this buffer has no map.
         let Some(mut seats) = crate::history::seats_for(root, &path, newest.millis) else {
             return;
         };
+        ed.provenance_synced_seq = Some(seq);
         // Then sizes: this runs on the render thread, and two whole-file
         // reads of a large file on the frame a tab is switched to would be a
         // visible stall for what is usually a mismatch.
@@ -39923,12 +39933,39 @@ impl App {
     /// second buffer with a different map, and a snapshot restore records
     /// the restored snapshot's own seats, which no tab holds at that moment.
     fn record_history_snapshot(&mut self, path: &Path, seats: crate::provenance::Provenance) {
+        self.record_history_snapshot_of(path, seats, None);
+    }
+
+    /// [`Self::record_history_snapshot`] with the bytes the map describes.
+    /// The worker re-reads the file, which is what makes the snapshot
+    /// byte-exact, and between the save and that read another tab's save of
+    /// the same path can land - so the map is recorded only while the bytes
+    /// on disk are still the ones it describes.
+    ///
+    /// `described` comes from the caller because only the caller knows WHICH
+    /// buffer the map came from: a search by path finds the focused tab,
+    /// which need not be the tab that saved. `None` records the map
+    /// unconditionally, for a caller whose map has no live buffer - a
+    /// snapshot restore, whose seats come from the restored snapshot and
+    /// describe the bytes it has just written itself.
+    fn record_history_snapshot_of(
+        &mut self,
+        path: &Path,
+        seats: crate::provenance::Provenance,
+        described: Option<Vec<u8>>,
+    ) {
         let root = self.history_root.clone();
         let path = path.to_path_buf();
         let tx = self.history_done_tx.clone();
         let millis = now_millis();
         std::thread::spawn(move || {
             if let Ok(bytes) = std::fs::read(&path) {
+                // Someone else's bytes are on disk now: record the snapshot
+                // alone, every line unknown, which is the safe direction.
+                let seats = match described {
+                    Some(want) if want != bytes => crate::provenance::Provenance::new(),
+                    _ => seats,
+                };
                 let _ = crate::history::record_with_seats_in(&root, &path, &bytes, millis, &seats);
             }
             let _ = tx.send(path);
@@ -39960,8 +39997,9 @@ impl App {
         match editor.save_to_disk() {
             Ok(SaveOutcome::Saved) => {
                 let seats = editor.provenance_to_record();
+                let described = editor.bytes_for_disk();
                 self.status = editor.status.clone();
-                self.record_history_snapshot(path, seats);
+                self.record_history_snapshot_of(path, seats, described);
                 if let Some(lsp) = self.lsp.as_ref() {
                     lsp.save_doc(path.to_path_buf());
                 }
@@ -39996,7 +40034,8 @@ impl App {
                 self.status = self.editor.status.clone();
                 if let Some(path) = self.editor.path.clone() {
                     let seats = self.editor.provenance_to_record();
-                    self.record_history_snapshot(&path, seats);
+                    let described = self.editor.bytes_for_disk();
+                    self.record_history_snapshot_of(&path, seats, described);
                 }
                 self.lsp_notify_saved();
                 self.reload_config_if_needed();
