@@ -224,7 +224,17 @@ impl FileFinder {
         // alpha.rs and a place in it, and a needle carrying the suffix would
         // match nothing at all (#472).
         let (file_part, hint) = split_line_hint(&self.query);
-        let needle: String = file_part.trim().to_lowercase();
+        let mut needle: String = file_part.trim().to_lowercase();
+        // A trailing `:` (or a half-typed hint) is also how a real file name
+        // can end on Linux. When a file is named exactly what was typed, the
+        // query is that name and is matched literally; otherwise the file
+        // part goes on matching while the user types the rest of the hint.
+        if hint.is_none() {
+            let raw = self.query.trim().to_lowercase();
+            if raw != needle && entries_have_filename(&self.entries, &raw) {
+                needle = raw;
+            }
+        }
         // A hint with no file (`:236`) names a line in nothing: listing every
         // file and opening the first at that line would be a surprise, so it
         // matches nothing, as it did before hints existed.
@@ -355,9 +365,11 @@ fn push_topk(heap: &mut BinaryHeap<RankedSlot>, slot: RankedSlot, k: usize) {
 /// Split a trailing line hint off a quick-open query (#472): the file part
 /// and, when the query ends in `:line`, `:line:col` or `:line-line`, the
 /// parsed hint. The first `:` whose remainder parses as a hint is the cut,
-/// so a name that itself contains a colon keeps it. Anything that does not
-/// parse stays part of the file name, which is the conservative reading: a
-/// half-typed `alpha:` still searches for `alpha:` rather than guessing.
+/// so a name that itself contains a colon keeps it. A `:` followed by a hint
+/// still being typed (`alpha:`, `alpha:236-`) is cut with no hint, so the
+/// file part keeps matching between keystrokes; `refresh_results` restores
+/// the literal query when a file is named exactly that. Any other unparsed
+/// suffix (`foo:bar`) stays part of the file name.
 pub fn split_line_hint(query: &str) -> (&str, Option<LineHint>) {
     let q = query.trim_end();
     for (i, _) in q.match_indices(':') {
@@ -416,6 +428,13 @@ fn parse_line_hint(s: &str) -> Option<LineHint> {
         end: None,
         col: None,
     })
+}
+
+/// Whether some entry's file name is exactly `name` (already lower-cased).
+fn entries_have_filename(entries: &[FileEntry], name: &str) -> bool {
+    entries
+        .par_iter()
+        .any(|e| &e.rel_lower[e.filename_start_lower..] == name)
 }
 
 pub fn score_entry(
@@ -1257,6 +1276,29 @@ mod tests {
             finder.visible_results().is_empty(),
             "`:236` alone matches nothing"
         );
+    }
+
+    #[test]
+    fn a_filename_that_ends_in_a_colon_still_wins_an_exact_match() {
+        // A trailing colon is also how a hint starts, so `alpha:` keeps the
+        // list matching on `alpha` while the user types; but on Linux a file
+        // can be named `alpha:` and that exact name must still rank first,
+        // even beside a file named `alpha`, which the file part alone would
+        // rank as the exact match instead.
+        let entries = Arc::new(vec![entry("src/alpha"), entry("src/alpha:")]);
+        let mut finder = FileFinder::new(entries);
+        finder.set_query("alpha:");
+        let names: Vec<&str> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("src/alpha:"),
+            "the file whose name IS the query ranks first; got {names:?}"
+        );
+        assert_eq!(finder.line_hint(), None);
     }
 
     #[test]
