@@ -45,6 +45,16 @@ pub struct ScoredResult {
     pub entry: FileEntry,
 }
 
+/// Where in the picked file to land, parsed off the end of the query
+/// (#472): `name:236`, `name:236:7` or `name:236-239`. Lines and columns
+/// are one-based as typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineHint {
+    pub line: usize,
+    pub end: Option<usize>,
+    pub col: Option<usize>,
+}
+
 #[derive(Default)]
 pub struct FileFinder {
     pub query: String,
@@ -176,6 +186,11 @@ impl FileFinder {
         }
     }
 
+    /// The line suffix typed after the file part of the query, if any.
+    pub fn line_hint(&self) -> Option<LineHint> {
+        split_line_hint(&self.query).1
+    }
+
     pub fn selected_entry(&self) -> Option<&FileEntry> {
         self.results.get(self.selected).map(|r| &r.entry)
     }
@@ -205,7 +220,36 @@ impl FileFinder {
     }
 
     fn refresh_results(&mut self) {
-        let needle: String = self.query.trim().to_lowercase();
+        // Only the file part takes part in matching: `alpha:236-239` names
+        // alpha.rs and a place in it, and a needle carrying the suffix would
+        // match nothing at all (#472).
+        let (file_part, hint) = split_line_hint(&self.query);
+        let mut needle: String = file_part.trim().to_lowercase();
+        // A hint with no file (`:236`) names a line in nothing: listing every
+        // file and opening the first at that line would be a surprise, so it
+        // matches nothing, as it did before hints existed. The cut, not a
+        // finished hint, is the test: `:236-` and a bare `:` have no file
+        // part either, and listing every file for them would flip the list
+        // from empty to everything between two keystrokes. Decided before
+        // the exact-name pass below, which these queries can never need.
+        let cut = file_part.len() != self.query.trim_end().len();
+        if needle.is_empty() && (hint.is_some() || cut) {
+            self.results = Vec::new();
+            return;
+        }
+        // A trailing `:` (or a half-typed hint) is also how a real file name
+        // can end on Linux. When a file is named exactly what was typed, the
+        // query is that name and is matched literally; otherwise the file
+        // part goes on matching while the user types the rest of the hint.
+        // The exact-name check is a second pass over the corpus, taken only
+        // on the keystrokes where the query was cut (`alpha:`, `alpha:23-`);
+        // it short-circuits on a hit and costs one traversal on a miss.
+        if hint.is_none() {
+            let raw = self.query.trim().to_lowercase();
+            if raw != needle && entries_have_filename(&self.entries, &raw) {
+                needle = raw;
+            }
+        }
         if needle.is_empty() {
             let mut scored: Vec<ScoredResult> = Vec::with_capacity(MAX_RESULTS);
             for entry in self.entries.iter().take(MAX_RESULTS) {
@@ -324,6 +368,92 @@ fn push_topk(heap: &mut BinaryHeap<RankedSlot>, slot: RankedSlot, k: usize) {
         heap.pop();
         heap.push(slot);
     }
+}
+
+/// Split a trailing line hint off a quick-open query (#472): the file part
+/// and, when the query ends in `:line`, `:line:col` or `:line-line`, the
+/// parsed hint. The first `:` whose remainder parses as a hint is the cut,
+/// so a name that itself contains a colon keeps it. A `:` followed by a hint
+/// still being typed (`alpha:`, `alpha:236-`) is cut with no hint, so the
+/// file part keeps matching between keystrokes; `refresh_results` restores
+/// the literal query when a file is named exactly that. Any other unparsed
+/// suffix (`foo:bar`) stays part of the file name.
+fn split_line_hint(query: &str) -> (&str, Option<LineHint>) {
+    let q = query.trim_end();
+    for (i, _) in q.match_indices(':') {
+        let rest = &q[i + 1..];
+        if let Some(hint) = parse_line_hint(rest) {
+            return (&q[..i], Some(hint));
+        }
+        // A hint still being typed (`alpha:`, `alpha:236-`): keep matching
+        // on the file part so the list does not empty between keystrokes,
+        // with no hint until it parses.
+        if is_partial_line_hint(rest) {
+            return (&q[..i], None);
+        }
+    }
+    (q, None)
+}
+
+/// Digits, at most one `-` or `:` separator, digits: every prefix of a hint
+/// a user types on the way to a complete one, the empty string included.
+fn is_partial_line_hint(s: &str) -> bool {
+    let mut seen_sep = false;
+    for b in s.bytes() {
+        match b {
+            b'0'..=b'9' => {}
+            b'-' | b':' if !seen_sep => seen_sep = true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn parse_line_hint(s: &str) -> Option<LineHint> {
+    // One-based as typed; a `0` is not a line anyone can land on.
+    // A number too large for usize saturates rather than vanishing: the open
+    // path clamps out-of-range lines to the file, and a hint that silently
+    // disappeared would open the file at the top with no signal.
+    let num = |t: &str| {
+        (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| t.parse::<usize>().unwrap_or(usize::MAX))
+            .filter(|n| *n > 0)
+    };
+    if let Some((a, b)) = s.split_once('-') {
+        // `239-236` is the same range as `236-239`; the caller clamps the
+        // selection from `line` to `end`, so the pair is ordered here.
+        let (a, b) = (num(a)?, num(b)?);
+        return Some(LineHint {
+            line: a.min(b),
+            end: Some(a.max(b)),
+            col: None,
+        });
+    }
+    if let Some((a, b)) = s.split_once(':') {
+        if b.is_empty() || !b.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        // A zero column is common 0-based tool output: the line is kept and
+        // the column dropped, as the terminal's path:line:col parser does,
+        // rather than the whole hint vanishing.
+        return Some(LineHint {
+            line: num(a)?,
+            end: None,
+            col: num(b),
+        });
+    }
+    Some(LineHint {
+        line: num(s)?,
+        end: None,
+        col: None,
+    })
+}
+
+/// Whether some entry's file name is exactly `name` (already lower-cased).
+fn entries_have_filename(entries: &[FileEntry], name: &str) -> bool {
+    entries
+        .par_iter()
+        .any(|e| &e.rel_lower[e.filename_start_lower..] == name)
 }
 
 pub fn score_entry(
@@ -1087,6 +1217,133 @@ mod tests {
             Some("md2pdf/core.py"),
             "a query containing '/' must match against the relative path; got {names:?}"
         );
+    }
+
+    #[test]
+    fn a_line_suffix_is_split_off_the_query_and_the_file_part_still_matches() {
+        // #472: `fileA:236-239` names a file AND where to land in it. The
+        // suffix is not part of the file name, so it must not take part in
+        // matching, and it has to come back parsed for the open to use.
+        let entries = Arc::new(vec![entry("src/alpha.rs"), entry("src/beta.rs")]);
+        let mut finder = FileFinder::new(entries);
+        for (query, hint) in [
+            (
+                "alpha:236-239",
+                LineHint {
+                    line: 236,
+                    end: Some(239),
+                    col: None,
+                },
+            ),
+            (
+                "alpha:236",
+                LineHint {
+                    line: 236,
+                    end: None,
+                    col: None,
+                },
+            ),
+            (
+                "alpha:236:7",
+                LineHint {
+                    line: 236,
+                    end: None,
+                    col: Some(7),
+                },
+            ),
+        ] {
+            finder.set_query(query);
+            let names: Vec<&str> = finder
+                .visible_results()
+                .iter()
+                .map(|r| r.entry.rel.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["src/alpha.rs"],
+                "{query}: the file part alone selects the file; got {names:?}"
+            );
+            assert_eq!(finder.line_hint(), Some(hint), "{query}");
+        }
+        // A reversed range is the same range; a zero is no line at all.
+        finder.set_query("alpha:239-236");
+        assert_eq!(
+            finder.line_hint(),
+            Some(LineHint {
+                line: 236,
+                end: Some(239),
+                col: None,
+            }),
+            "a reversed range normalises"
+        );
+        finder.set_query("alpha:0");
+        assert_eq!(finder.line_hint(), None, "line 0 is not a line");
+        finder.set_query("alpha");
+        assert_eq!(finder.line_hint(), None, "no suffix, no hint");
+        // A colon with nothing numeric after it is not a line suffix.
+        finder.set_query("alpha:");
+        assert_eq!(finder.line_hint(), None, "a bare colon is not a hint");
+        // The keystrokes on the way to a complete hint keep the file matched.
+        for partial in ["alpha:", "alpha:236-", "alpha:236:"] {
+            finder.set_query(partial);
+            let names: Vec<&str> = finder
+                .visible_results()
+                .iter()
+                .map(|r| r.entry.rel.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["src/alpha.rs"],
+                "{partial}: still matching on the file part"
+            );
+            assert_eq!(
+                finder.line_hint(),
+                None,
+                "{partial}: no hint until it parses"
+            );
+        }
+        // A hint with no file part names a line in nothing, whether or not
+        // it has finished parsing.
+        for q in [":236", ":", "::", ":236-", ":0"] {
+            finder.set_query(q);
+            assert!(
+                finder.visible_results().is_empty(),
+                "{q:?} alone matches nothing"
+            );
+        }
+        // A zero column keeps the line: the hint is `236`, not nothing.
+        finder.set_query("alpha:236:0");
+        assert_eq!(
+            finder.line_hint().map(|h| (h.line, h.col)),
+            Some((236, None)),
+            "`:236:0` is line 236 with no column"
+        );
+        // A number past usize saturates instead of vanishing.
+        finder.set_query("alpha:99999999999999999999");
+        assert_eq!(finder.line_hint().map(|h| h.line), Some(usize::MAX));
+    }
+
+    #[test]
+    fn a_filename_that_ends_in_a_colon_still_wins_an_exact_match() {
+        // A trailing colon is also how a hint starts, so `alpha:` keeps the
+        // list matching on `alpha` while the user types; but on Linux a file
+        // can be named `alpha:` and that exact name must still rank first,
+        // even beside a file named `alpha`, which the file part alone would
+        // rank as the exact match instead.
+        let entries = Arc::new(vec![entry("src/alpha"), entry("src/alpha:")]);
+        let mut finder = FileFinder::new(entries);
+        finder.set_query("alpha:");
+        let names: Vec<&str> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("src/alpha:"),
+            "the file whose name IS the query ranks first; got {names:?}"
+        );
+        assert_eq!(finder.line_hint(), None);
     }
 
     #[test]

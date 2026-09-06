@@ -2742,6 +2742,23 @@ impl PtyTerminal {
         Some((row - inner.y, col - inner.x))
     }
 
+    /// The host-screen cell nearest `(col, row)` that is still inside the
+    /// pane's grid. A forwarded drag or release that leaves the pane is
+    /// delivered at the edge cell it crossed, as xterm does with a grabbed
+    /// pointer, rather than dropped: a child that got the press must also
+    /// get the release, or it keeps a button held that the user let go.
+    /// Returns the input unchanged when the pane has no grid yet.
+    pub fn clamp_to_grid(&self, col: u16, row: u16) -> (u16, u16) {
+        let inner = self.last_inner;
+        if inner.width == 0 || inner.height == 0 {
+            return (col, row);
+        }
+        (
+            col.clamp(inner.x, inner.x + inner.width - 1),
+            row.clamp(inner.y, inner.y + inner.height - 1),
+        )
+    }
+
     /// Current scrollback offset: how many rows the viewport is scrolled
     /// up from the live bottom. Viewport row `r` maps to absolute grid
     /// line `r - display_offset`.
@@ -3426,6 +3443,17 @@ impl PtyTerminal {
         self.term.lock().mode().intersects(TermMode::MOUSE_MODE)
     }
 
+    /// True when the child asked for button-held MOTION too (DECSET 1002
+    /// button-drag or 1003 any-motion), not just clicks (1000). Decides who
+    /// a left-button drag belongs to: a child that only asked for clicks
+    /// cannot use the drag, so croft keeps it as a text selection (#474).
+    pub fn mouse_motion_reporting(&self) -> bool {
+        self.term
+            .lock()
+            .mode()
+            .intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+    }
+
     /// Encode a mouse gesture at host-screen cell `(col, row)` as a mouse
     /// report and send it to the child. Returns false without writing when
     /// the cell is outside the pane, the child isn't tracking the mouse, or
@@ -3460,6 +3488,11 @@ impl PtyTerminal {
             r,
             mods,
         );
+        #[cfg(test)]
+        self.written_for_test
+            .lock()
+            .unwrap()
+            .extend_from_slice(&report);
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(&report);
             let _ = w.flush();
