@@ -3407,6 +3407,11 @@ pub struct App {
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
+    /// The range the last hinted quick-open pick installed, and the file it
+    /// was installed in: the next pick clears it if it is still the
+    /// selection there, and nothing else, so a selection the user made by
+    /// hand (or extended from it) survives a re-pick of the same file.
+    quick_open_range: Option<(PathBuf, crate::widgets::editor::EditorSelection)>,
     /// VS Code-style Cmd+Shift+P / Ctrl+Shift+P command palette. None when
     /// the modal is closed.
     pub command_palette: Option<crate::widgets::command_palette::CommandPalette>,
@@ -4634,6 +4639,7 @@ impl App {
             closed_terminals: Vec::new(),
             closed_tabs: Vec::new(),
             file_finder: None,
+            quick_open_range: None,
             command_palette: None,
             go_to_symbol: None,
             workspace_symbols: None,
@@ -31117,18 +31123,91 @@ impl App {
             return;
         };
         let path = finder.selected_entry().map(|e| e.path.clone());
+        let hint = finder.line_hint();
         if let Some(path) = path {
             self.close_file_finder();
-            match self.editor.open_preview(&path) {
+            // `alpha:236-239` (#472): land on the line, centred, and select
+            // the range so it reads as highlighted; `alpha:236` lands with
+            // nothing selected, since one line is a place, not a span.
+            let opened = match hint {
+                Some(hint) => {
+                    let row = hint.line.saturating_sub(1);
+                    let col = hint.col.map_or(0, |c| c.saturating_sub(1));
+                    self.open_at(&path, row, col)
+                }
+                None => self.editor.open_preview(&path),
+            };
+            match opened {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
+                    // A range an earlier hinted pick installed is cleared if
+                    // it is still the selection in its tab, so neither
+                    // `alpha:12` nor a bare `alpha` keeps showing it; a
+                    // selection the user made or extended since is theirs
+                    // and stays. Stale secondary carets never survive a
+                    // pick, as they never survive a click: the next
+                    // keystroke would edit at every one of them.
+                    if let Some((prev, sel)) = self.quick_open_range.take()
+                        && let Some(idx) = self.editor.find_tab_with_path(&prev)
+                        && self.editor.editors[idx].selection == Some(sel)
+                    {
+                        self.editor.editors[idx].selection = None;
+                    }
+                    if hint.is_some() {
+                        self.editor.clear_selection();
+                    }
+                    self.editor.collapse_carets();
+                    if let Some(end) = hint.and_then(|h| h.end) {
+                        let start = self.editor.cursor_row;
+                        let last = self.editor.lines.len().saturating_sub(1);
+                        let end_row = end.saturating_sub(1).clamp(start, last);
+                        let end_col = self
+                            .editor
+                            .lines
+                            .get(end_row)
+                            .map_or(0, |l| l.chars().count());
+                        let sel = crate::widgets::editor::EditorSelection {
+                            anchor: (end_row, end_col),
+                            head: (start, 0),
+                        };
+                        self.editor.selection = Some(sel);
+                        self.quick_open_range = Some((path.to_path_buf(), sel));
+                        // The landing line is the head, and the cursor sits at
+                        // the head as every other selection-installing path
+                        // leaves it: Shift+motion extends from the cursor, and
+                        // the paint-time clamp keeps the cursor on screen, so
+                        // a range taller than the viewport still shows the
+                        // line the user asked for, centred by `open_at`, with
+                        // the selection running down from it.
+                        self.editor.cursor_row = start;
+                        self.editor.cursor_col = 0;
+                    }
                     // VS Code's `explorer.autoReveal` analogue:
                     // expand every parent dir of the picked file
                     // and park the cursor on its row so the user
                     // sees where in the workspace the file lives.
                     self.tree.reveal_path(&path);
                     self.focus_pane(Pane::Editor);
-                    self.status = format!("Opened {}", self.status_path(&path));
+                    // The status names the lines landed on: a number past the
+                    // file (or one that saturated in the parser) was clamped
+                    // above, and the clamped truth is the useful signal.
+                    let last_line = self.editor.lines.len().max(1);
+                    self.status = match hint {
+                        Some(hint) => match hint.end {
+                            Some(end) => format!(
+                                "Opened {}:{}-{}",
+                                self.status_path(&path),
+                                hint.line.min(last_line),
+                                end.min(last_line)
+                            ),
+                            None => format!(
+                                "Opened {}:{}",
+                                self.status_path(&path),
+                                hint.line.min(last_line)
+                            ),
+                        },
+                        None => format!("Opened {}", self.status_path(&path)),
+                    };
                 }
                 Err(e) => {
                     self.status = format!("Open failed: {e}");
