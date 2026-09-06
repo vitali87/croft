@@ -270,20 +270,30 @@ pub(crate) mod tests {
     /// and merely starved -- the case a load-scaled budget exists for.
     pub(crate) const TERMINAL_PROBE_BASE: Duration = Duration::from_millis(3750);
 
-    /// The base for waiting on a real shell to PAINT something into the grid
-    /// (#397): the linked cell of an OSC 8 hyperlink, a marker line from the
-    /// shell's main loop.
+    /// The base for waiting on a real shell to PAINT something into a pane
+    /// (#397): a grid line, a decoration or prompt mark, an inline image, an
+    /// OSC-reported host or progress state.
     ///
     /// Separate from `TERMINAL_PROBE_BASE` because the two replaced
     /// different constants — 15s there, 8000ms here — and the house rule is
     /// that each base reproduces its own at the floor, which one number
     /// cannot do for both. The operation they wait on is the same.
     ///
-    /// Two of the three call sites reproduce their old 8000ms exactly. The
-    /// third, the re-root test's foreground poll, is a deliberate RAISE from
-    /// 4000ms: that loop never asserted on timeout, so its number was never
-    /// a deadline the test could fail on, and matching it would have left
-    /// the shorter of two waits on one shell inside the same test.
+    /// The rule, rather than a list that goes stale with every batch of
+    /// conversions: every call site reproduces the 8000ms it replaced, and
+    /// the rest are deliberate RAISES from a 4000ms bound. Each of those sat
+    /// on a shell that other waits in the same suite already gave 8000ms, so
+    /// the short bound was an accident of where it was written rather than a
+    /// measured deadline — and one of them, the re-root test's foreground
+    /// poll, never asserted on timeout at all, so its number could not fail
+    /// a test in the first place.
+    ///
+    /// Nothing here is ever CUT: a raise cannot introduce a flake, and the
+    /// floor assertion below guards the direction that can. That assertion
+    /// checks the constant, not its call sites, so converting a wait whose
+    /// old bound EXCEEDED 8000ms would need its own base rather than this
+    /// one — no such call site exists among these, and this is the note
+    /// that says why.
     ///
     /// 2s because `BASE_CALIBRATION * MIN_SCALE` is 4 at the floor, so the
     /// call sites keep the 8000ms they had on a quiet machine and get up to
@@ -461,10 +471,9 @@ pub(crate) mod tests {
         let paint = SHELL_PAINT_BASE * BASE_CALIBRATION * MIN_SCALE;
         assert!(
             paint >= Duration::from_millis(8000),
-            "the shell-paint base must reproduce at the floor the largest \
-             constant its call sites replaced - 8000ms, at two of the three; \
-             the re-root test's second wait was a 4000ms loop that never \
-             asserted on timeout, so it is deliberately raised - got {paint:?}"
+            "the shell-paint base must reproduce 8000ms at the floor, the \
+             constant its call sites replaced; the few that replaced 4000ms \
+             are deliberate raises, named in the doc above - got {paint:?}"
         );
     }
 
