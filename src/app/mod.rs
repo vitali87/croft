@@ -13369,8 +13369,6 @@ impl App {
         self.terminals.iter().map(|t| t.redacted_on_screen).sum()
     }
 
-    /// The clipboard's view of terminal text: rules marked `copy: masked`
-    /// keep their mask, everything else copies as typed (#360).
     /// The current index of the pane a forwarded left press went to (#474),
     /// or `None` once that pane has been closed. Looked up by uid on every
     /// event of the gesture because a close or reorder while the button is
@@ -13379,6 +13377,8 @@ impl App {
         self.terminals.iter().position(|t| t.uid() == fp.pane)
     }
 
+    /// The clipboard's view of terminal text: rules marked `copy: masked`
+    /// keep their mask, everything else copies as typed (#360).
     fn terminal_text_for_copy(&self, text: String) -> String {
         crate::triggers::mask_text(&text, &self.triggers, true)
     }
@@ -36038,7 +36038,21 @@ impl App {
                         && rect_contains(self.outline.last_scrollbar, m.column, m.row);
                     let graph_bar = self.sidebar_view == SidebarView::SourceControl
                         && rect_contains(self.commit_graph.last_scrollbar, m.column, m.row);
+                    // A collapsed terminal pane's one-column strip shares this
+                    // zone too (#468): the leftmost pane starts on the seam
+                    // itself, and with the side bar on the right the last
+                    // pane ends one column short of it. The strip's only
+                    // gesture is the click that unfolds it, so the seam must
+                    // not take that click as a resize, or a folded pane on
+                    // that edge can never be brought back. The rects are
+                    // cleared whenever the panel is not painted, so a stale
+                    // strip cannot deaden the seam later.
+                    let on_strip = self
+                        .terminal_strip_rects
+                        .iter()
+                        .any(|r| rect_contains(*r, m.column, m.row));
                     if (m.column == x || m.column == x.saturating_sub(1))
+                        && !on_strip
                         && !outline_bar
                         && !graph_bar
                         && self.decoration_dot_at(m.column, m.row).is_none()
