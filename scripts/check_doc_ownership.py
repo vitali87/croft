@@ -376,9 +376,20 @@ def documented(text):
     attributes, blanks and `//` comments alike; stopping at the first blank
     reported documentation as missing when rustc could see it perfectly well.
     """
+    state = {}
+    for name, block, _line in _items(text):
+        state[name] = state.get(name, False) or block is not None
+    return state
+
+
+def _items(text):
+    """Every item `ITEM` models, keyed as `documented` keys it, with the
+    `///` block that reaches it: a tuple of the block's stripped lines, or
+    None when nothing documents it. One scan serves both the "is it
+    documented" question and the "which prose documented it" one, so the
+    two can never disagree about where a block's reach ends."""
     lines = text.splitlines()
     kinds = classify(lines)
-    state = {}
     tracker = BlockTracker()
     for i, line in enumerate(lines):
         # The scope an item belongs to is the one in force BEFORE its own
@@ -397,9 +408,61 @@ def documented(text):
         j = i - 1
         while j >= 0 and kinds[j] in (ATTR, SKIP):
             j -= 1
-        has_doc = j >= 0 and kinds[j] == DOC
-        state[name] = state.get(name, False) or has_doc
-    return state
+        block = None
+        if j >= 0 and kinds[j] == DOC:
+            end = j + 1
+            while j >= 0 and kinds[j] == DOC:
+                j -= 1
+            block = tuple(doc_line.strip() for doc_line in lines[j + 1 : end])
+        yield name, block, i
+
+
+def doc_blocks_of(text, names):
+    """The `///` blocks sitting above the items in `names`, as tuples of
+    stripped lines, one entry per documented definition. What a stranded
+    block at HEAD is compared against to tell "the prose this loss already
+    accounts for" from a second defect (#463)."""
+    return [block for name, block, _line in _items(text) if name in names and block]
+
+
+def explained_orphans(head_text, candidates, lost, explained):
+    """Line numbers of the stranded blocks in `candidates` that the losses
+    of `lost` already account for (#463).
+
+    An insertion strands the block that sat above its victim, so the
+    explained copy is the NEAREST stranded block above where the victim now
+    sits at HEAD, and it stands down only when its text is one a loss
+    explains. Pairing by position rather than by text alone matters when
+    the same prose occurs twice in a file: `/// Creates a new instance.`
+    above two `new`s is ordinary, and a match on text would let one loss
+    silence a stranded copy that never documented it. Taking the nearest
+    block regardless of text, rather than the nearest MATCHING one, is what
+    stops a loss whose own prose the branch also rewrote from reaching past
+    that rewritten block to an identical one further up, and when two blocks
+    above the victim carry that text the pairing is ambiguous and stands
+    nothing down. Each lost definition explains at most one block, and a
+    block with no victim below it is reported as usual.
+    """
+    remaining = list(explained)
+    stood_down = set()
+    victims = sorted(line for name, _block, line in _items(head_text) if name in lost)
+    for victim in victims:
+        above = [o for o in candidates if o[0] - 1 < victim and o[0] not in stood_down]
+        if not above:
+            continue
+        nearest = max(above, key=lambda o: o[0])
+        if nearest[3] not in remaining:
+            continue
+        # Two blocks with the victim's prose above it: nothing says which one
+        # it lost, and the nearer may be an independent capture that reads
+        # the same. Standing it down would hide that defect and leave the
+        # report pointing at the other block, so an ambiguous pairing stands
+        # nothing down and every block prints.
+        if sum(1 for o in above if o[3] == nearest[3]) > 1:
+            continue
+        stood_down.add(nearest[0])
+        remaining.remove(nearest[3])
+    return stood_down
 
 
 def orphaned_docs(text):
@@ -446,19 +509,23 @@ def orphaned_docs(text):
         start = i
         while i < len(lines) and kinds[i] == DOC:
             i += 1
+        # Each entry is `(line, first line, what follows, block)`; the block
+        # is the stripped text of the whole `///` run, which is how the
+        # caller recognises the block a reported loss already explains.
+        block = tuple(line.strip() for line in lines[start:i])
         # Attributes and blank lines sit legally between a doc and its item.
         j = i
         while j < len(lines) and kinds[j] in (ATTR, SKIP):
             j += 1
         if j >= len(lines):
             # A doc block at end of file documents nothing.
-            orphans.append((start + 1, lines[start].strip(), "end of file"))
+            orphans.append((start + 1, lines[start].strip(), "end of file", block))
             continue
         if kinds[j] == DOC:
             # Two doc blocks with no item between them: the first cannot
             # reach an item, because the second one gets there first. This
             # is what an insertion above a documented item leaves behind.
-            orphans.append((start + 1, lines[start].strip(), "another doc block"))
+            orphans.append((start + 1, lines[start].strip(), "another doc block", block))
             continue
         if NEVER_DOCUMENTED.match(lines[j]):
             # A line that syntactically cannot carry a doc comment. `use`
@@ -466,7 +533,7 @@ def orphaned_docs(text):
             # dropped between a doc and its function takes prose that
             # rustdoc then renders against the import, and neither the
             # diff check nor `unused_doc_comments` says a word.
-            orphans.append((start + 1, lines[start].strip(), lines[j].strip()))
+            orphans.append((start + 1, lines[start].strip(), lines[j].strip(), block))
     return orphans
 
 
@@ -791,7 +858,31 @@ def main():
         head_text = git("show", f"{head}:{f}", allow_missing_path=True)
         if not head_text:
             continue
-        for line_no, first, follower in orphaned_docs(head_text):
+        # One insertion, one annotation (#463). When the victim is an item
+        # `ITEM` models and was documented before, the loss pass has already
+        # named it, and the block it left stranded at HEAD is the very block
+        # that sat above it at the revision the loss names. Reporting that
+        # block again describes the same edit a second time. The match is on
+        # the block's full text AND its position above the victim, not on
+        # the file: a stranded block that never documented the lost item is
+        # a second defect and keeps its line, and prose the branch also
+        # rewrote no longer matches and is reported, which is the
+        # conservative side for a gate.
+        explained = []
+        by_rev = {}
+        for path, name, at in losses:
+            if path == f:
+                by_rev.setdefault(at, set()).add(name)
+        for at, names in by_rev.items():
+            explained.extend(
+                doc_blocks_of(git("show", f"{at}:{f}", allow_missing_path=True), names)
+            )
+        candidates = orphaned_docs(head_text)
+        lost_here = set().union(*by_rev.values()) if by_rev else set()
+        stood_down = explained_orphans(head_text, candidates, lost_here, explained)
+        for line_no, first, follower, _block in candidates:
+            if line_no in stood_down:
+                continue
             orphans.append((f, line_no, first, follower))
         # `--no-merges`, and the omission is not a shortcut. A merge's first
         # parent is the branch tip, so the pair `(M^, M)` is everything the
