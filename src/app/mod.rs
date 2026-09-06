@@ -25398,6 +25398,118 @@ impl App {
         );
     }
 
+    /// The review-queue summary, one row per agent, grouped by the workspace
+    /// root each file lives under (#348).
+    ///
+    /// Grouping is what makes the queue usable once worktree lanes exist:
+    /// with an agent working in a lane and you working in the main checkout,
+    /// a flat list of basenames cannot say which `mod.rs` it means. Each
+    /// group is named by its lane's BRANCH where the root is a lane, and by
+    /// the root's display label otherwise.
+    ///
+    /// A row whose files all sit under ONE root keeps the pre-grouping flat
+    /// shape, `agent: n to review (a.rs, b.rs)`: with one group the label
+    /// names the only place the files could be and the group count merely
+    /// repeats `n`. So the common single-root session is untouched, and
+    /// grouping appears exactly when there is something to tell apart.
+    ///
+    /// A grouped row carries labels and counts but no file names, because
+    /// the status bar is one row that elides its MIDDLE: a row long enough
+    /// to be cut loses the group labels, which is precisely what grouping
+    /// exists to show. The flat row keeps its sample, being short already.
+    fn agent_lane_rows(&self) -> Vec<String> {
+        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        let labels = crate::workspace::root_display_labels(&roots);
+        // A lane's branch names it better than its directory does: the
+        // directory is `repo-fix-login`, the branch is what the agent is on.
+        let branch_of = |root: &Path| -> Option<String> {
+            self.lane_panes
+                .values()
+                .find(|l| Path::new(&l.path) == root)
+                .map(|l| l.branch.clone())
+        };
+        // Up to three names per group, with an ellipsis when there are more:
+        // a count next to a truncated list otherwise reads as an
+        // enumeration that lost two entries.
+        let sample = |files: &[&crate::agent_lane::LaneFile]| -> String {
+            let names: Vec<String> = files
+                .iter()
+                .take(3)
+                .map(|f| {
+                    let name = f
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if f.shared {
+                        format!("{name} (shared)")
+                    } else {
+                        name
+                    }
+                })
+                .collect();
+            let mut out = names.join(", ");
+            if files.len() > names.len() {
+                out.push_str(", \u{2026}");
+            }
+            out
+        };
+        self.agent_ledger
+            .agents()
+            .into_iter()
+            .map(|agent| {
+                let n = self.agent_ledger.unreviewed_count(agent);
+                let groups = self.agent_ledger.lane_by_root(agent, &roots);
+                // One group is the single-root session this feature does not
+                // change: the root label would name the only place the files
+                // could be, and the group count would repeat `n`.
+                if groups.len() <= 1 {
+                    let files = groups.first().map(|(_, f)| sample(f)).unwrap_or_default();
+                    return format!("{agent}: {n} to review ({files})");
+                }
+                // A lane's branch is derived from its slug alone, so two
+                // lanes cut from different repos can share one; fall back to
+                // the disambiguated root label when that happens, since a
+                // row naming two groups identically is worse than a row
+                // naming them by folder.
+                let branches: Vec<Option<String>> = groups
+                    .iter()
+                    .map(|(root, _)| root.and_then(&branch_of))
+                    .collect();
+                let named: Vec<String> = groups
+                    .iter()
+                    .zip(&branches)
+                    .map(|((root, files), branch)| {
+                        let root_label = |r: &Path| {
+                            roots
+                                .iter()
+                                .position(|candidate| candidate == r)
+                                .and_then(|i| labels.get(i).cloned())
+                                .unwrap_or_else(|| r.display().to_string())
+                        };
+                        let label = match (root, branch) {
+                            (Some(_), Some(b))
+                                if branches.iter().flatten().filter(|o| *o == b).count() == 1 =>
+                            {
+                                b.clone()
+                            }
+                            (Some(r), _) => root_label(r),
+                            (None, _) => String::from("outside the workspace"),
+                        };
+                        // Labels and counts only. The status bar is ONE row
+                        // and elides the MIDDLE of anything too long
+                        // (`elide_middle`), so a row carrying samples for
+                        // every group loses the group labels first — the
+                        // one thing grouping adds. Which files they are is
+                        // a question the Explorer's dots already answer.
+                        format!("{label} {}", files.len())
+                    })
+                    .collect();
+                format!("{agent}: {n} to review \u{2014} {}", named.join("; "))
+            })
+            .collect()
+    }
+
     /// Give each lane's root row in the Explorer its branch and its agent
     /// (#348), from the lane panes: `agent/fix-login · ◆ claude ●` while the
     /// agent is seated, the configured agent's name before it is, the branch
@@ -33744,34 +33856,7 @@ impl App {
                 }
             }
             Cmd::ShowAgentLane => {
-                let rows: Vec<String> = self
-                    .agent_ledger
-                    .agents()
-                    .into_iter()
-                    .map(|agent| {
-                        let n = self.agent_ledger.unreviewed_count(agent);
-                        let files: Vec<String> = self
-                            .agent_ledger
-                            .lane(agent)
-                            .into_iter()
-                            .filter(|f| f.unreviewed())
-                            .take(3)
-                            .map(|f| {
-                                let name = f
-                                    .path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                if f.shared {
-                                    format!("{name} (shared)")
-                                } else {
-                                    name
-                                }
-                            })
-                            .collect();
-                        format!("{agent}: {n} to review ({})", files.join(", "))
-                    })
-                    .collect();
+                let rows = self.agent_lane_rows();
                 self.status = if rows.is_empty() {
                     String::from("No agent has changed anything yet")
                 } else if self.agent_ledger.may_be_incomplete() {

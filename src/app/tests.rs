@@ -43269,3 +43269,201 @@ fn a_lanes_badge_follows_the_seat_and_a_seated_pane_outranks_a_plain_one() {
         "back to the configured name once nobody is seated"
     );
 }
+
+#[test]
+fn the_review_queue_names_the_lane_each_agents_files_are_in() {
+    // #348: with a worktree lane in the workspace the queue groups by root,
+    // naming a lane by its BRANCH and any other root by its display label,
+    // so two files of the same basename are told apart.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let repo = app.roots.primary().to_path_buf();
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+
+    let working = vec![String::from("claude")];
+    app.agent_ledger
+        .record_write(&repo.join("src/mod.rs"), 1, &working);
+    app.agent_ledger
+        .record_write(&lane.join("src/mod.rs"), 2, &working);
+    app.agent_ledger
+        .record_write(&lane.join("src/other.rs"), 3, &working);
+
+    let rows = app.agent_lane_rows();
+    assert_eq!(rows.len(), 1, "one row per agent: {rows:?}");
+    let row = &rows[0];
+    assert!(row.starts_with("claude: 3 to review \u{2014} "), "{row}");
+    let repo_label = repo
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap();
+    assert!(
+        row.contains(&format!("{repo_label} 1")),
+        "the primary root is named by its folder: {row}"
+    );
+    assert!(
+        row.contains("agent/fix-login 2"),
+        "the lane is named by its branch: {row}"
+    );
+    assert!(
+        !row.contains("mod.rs"),
+        "a grouped row carries labels and counts, not file names, so the \
+         status bar cannot elide the labels away: {row}"
+    );
+    assert!(
+        row.find(&repo_label) < row.find("agent/fix-login"),
+        "root order, primary first: {row}"
+    );
+
+    // A file outside every root still appears, under its own heading. Only
+    // reachable defensively: the ledger's one production feeder drops paths
+    // under no root before recording them.
+    app.agent_ledger
+        .record_write(&tmp.path().join("stray.rs"), 4, &working);
+    let row = app.agent_lane_rows().remove(0);
+    assert!(
+        row.contains("outside the workspace 1"),
+        "an unowned file is counted, not dropped: {row}"
+    );
+}
+
+#[test]
+fn two_lanes_sharing_a_branch_are_named_by_their_folders_instead() {
+    // A lane's branch comes from its slug alone, so lanes cut from two
+    // different repos can carry the same one. Naming both groups
+    // `agent/fix` would be worse than naming neither: the fallback is the
+    // disambiguated root label the workspace already computes.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    let one = tmp.path().join("one-fix");
+    let two = tmp.path().join("two-fix");
+    for dir in [&one, &two] {
+        std::fs::create_dir_all(dir).unwrap();
+        app.add_workspace_folder(dir.clone());
+    }
+    let (one, two) = (one.canonicalize().unwrap(), two.canonicalize().unwrap());
+    // Two panes, two lanes, one branch name between them.
+    for (i, dir) in [(0u64, &one), (1, &two)] {
+        app.lane_panes.insert(
+            1000 + i,
+            crate::terminal_session::LaneRecord {
+                path: dir.display().to_string(),
+                branch: String::from("agent/fix"),
+                agent: None,
+            },
+        );
+    }
+    let working = vec![String::from("claude")];
+    app.agent_ledger
+        .record_write(&one.join("a.rs"), 1, &working);
+    app.agent_ledger
+        .record_write(&two.join("b.rs"), 2, &working);
+    let row = app.agent_lane_rows().remove(0);
+    assert!(
+        !row.contains("agent/fix"),
+        "a branch shared by two groups names neither: {row}"
+    );
+    assert!(
+        row.contains("one-fix 1") && row.contains("two-fix 1"),
+        "both groups fall back to their folder labels: {row}"
+    );
+    // One lane alone: the branch is unique again, so it names its group.
+    app.lane_panes.remove(&1001);
+    let row = app.agent_lane_rows().remove(0);
+    assert!(
+        row.contains("agent/fix 1"),
+        "a unique branch still names its lane: {row}"
+    );
+}
+
+#[test]
+fn a_grouped_review_queue_row_survives_the_status_bar() {
+    // The bar is one row and elides the MIDDLE (`elide_middle`), so a row
+    // long enough to be cut loses its group labels — the one thing grouping
+    // adds. Labels and counts keep it short enough to land whole. Same
+    // shape as `status_transient_keeps_its_tail_when_longer_than_the_bar`.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let repo = app.roots.primary().to_path_buf();
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let working = vec![String::from("claude")];
+    for i in 0..4 {
+        app.agent_ledger
+            .record_write(&repo.join(format!("src/r{i}.rs")), i as u64, &working);
+        app.agent_ledger
+            .record_write(&lane.join(format!("src/l{i}.rs")), 100 + i as u64, &working);
+    }
+    app.run_command(crate::widgets::command_palette::Command::ShowAgentLane);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let last_row: String = (a.x..a.x + a.width)
+        .map(|x| buf[(x, a.y + a.height - 1)].symbol().to_string())
+        .collect();
+    assert!(
+        last_row.contains("agent/fix-login 4"),
+        "the lane's group must reach the bar unelided: {last_row:?}"
+    );
+    assert!(
+        last_row.contains("Ln 1, Col 1"),
+        "the right cluster must still paint: {last_row:?}"
+    );
+}
+
+#[test]
+fn a_single_root_review_queue_reads_as_it_always_did() {
+    // Grouping is for workspaces with more than one root: with one, the
+    // label would name the only place the files could be and the group
+    // count would repeat the total, so the row keeps its old flat shape.
+    // A truncated sample says so, and an empty queue has no dangling tail.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let working = vec![String::from("claude")];
+    app.agent_ledger
+        .record_write(&tmp.path().join("a.rs"), 1, &working);
+    app.agent_ledger
+        .record_write(&tmp.path().join("b.rs"), 2, &working);
+    assert_eq!(
+        app.agent_lane_rows(),
+        vec![String::from("claude: 2 to review (b.rs, a.rs)")],
+        "the pre-grouping shape, unchanged"
+    );
+    for i in 0..3 {
+        app.agent_ledger.record_write(
+            &tmp.path().join(format!("f{i}.rs")),
+            10 + i as u64,
+            &working,
+        );
+    }
+    let row = app.agent_lane_rows().remove(0);
+    assert_eq!(
+        row, "claude: 5 to review (f2.rs, f1.rs, f0.rs, \u{2026})",
+        "a sample of three says it is a sample"
+    );
+    // Nothing unreviewed: no trailing separator, no empty group.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f = tmp.path().join("z.rs");
+    std::fs::write(&f, "x").unwrap();
+    app.agent_ledger.record_write(&f, 1, &working);
+    let hash = app.agent_ledger.lane("claude")[0].current_hash;
+    app.agent_ledger.mark_reviewed("claude", &f, hash);
+    assert_eq!(
+        app.agent_lane_rows(),
+        vec![String::from("claude: 0 to review ()")],
+        "an emptied lane keeps the old shape too"
+    );
+}
