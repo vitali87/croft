@@ -167,10 +167,29 @@ pub fn record_in(
 /// renamed over the final name afterwards; a rename is atomic on the same
 /// filesystem. On failure the staging file is removed rather than left to
 /// look like history.
+///
+/// The writer holds an exclusive advisory lock on its staging file from the
+/// write through the rename, so the sweep of abandoned staging files (see
+/// `sweep_abandoned_staging`) can tell a writer that is merely slow from one
+/// that died: age alone must not decide it, or a writer paused past the
+/// window would come back to find its bytes swept and its rename failing.
 fn write_snapshot(dir: &Path, millis: u64, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
     let final_path = dir.join(format!("{millis}.{SNAP_EXT}"));
     let tmp = staging_path(dir, millis);
-    let written = std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, &final_path));
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.lock()?;
+        file.write_all(content)?;
+        // Windows cannot rename a file that is open; the lock is released
+        // with the handle there, and the sweep falls back to age alone.
+        #[cfg(windows)]
+        drop(file);
+        std::fs::rename(&tmp, &final_path)?;
+        #[cfg(not(windows))]
+        drop(file);
+        Ok(())
+    })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -181,10 +200,11 @@ fn write_snapshot(dir: &Path, millis: u64, content: &[u8]) -> std::io::Result<()
 /// cleanup in `prune_in` recognise one without parsing the rest of its name.
 const STAGING_EXT: &str = "tmp";
 
-/// Staging files older than this are abandoned (a crash between the write
-/// and the rename) and swept by `prune_in`. A live writer holds its staging
-/// file for the length of one `fs::write`, milliseconds; a minute leaves no
-/// room to sweep a file another writer is still filling.
+/// Staging files older than this, and not locked by a live writer, are
+/// abandoned (a crash between the write and the rename) and swept by
+/// `prune_in`. The age keeps the sweep away from the instant between a
+/// writer creating its file and taking the lock; the lock is what protects
+/// a writer that is merely slow.
 const STAGING_ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A staging name unique to this writer: `<millis>.snap.<pid>-<seq>.tmp`.
@@ -203,8 +223,10 @@ fn staging_path(dir: &Path, millis: u64) -> PathBuf {
 /// Remove staging files left behind by a writer that died between its write
 /// and its rename. Listing and retention both ignore them, so without this
 /// sweep every interrupted save would leave a hidden snapshot-sized file
-/// forever. Only files older than [`STAGING_ABANDONED_AFTER`] go, so a
-/// writer still filling its file in another thread or process is left alone.
+/// forever. A file goes only when it is older than
+/// [`STAGING_ABANDONED_AFTER`] AND its writer's lock can be taken: a writer
+/// still alive holds that lock (see `write_snapshot`), however long it has
+/// been paused, so it is never swept out from under a rename.
 fn sweep_abandoned_staging(dir: &Path, now: std::time::SystemTime) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
@@ -214,13 +236,21 @@ fn sweep_abandoned_staging(dir: &Path, now: std::time::SystemTime) {
         if path.extension().and_then(|x| x.to_str()) != Some(STAGING_EXT) {
             continue;
         }
-        let abandoned = entry
+        let old_enough = entry
             .metadata()
             .and_then(|m| m.modified())
             .ok()
             .and_then(|at| now.duration_since(at).ok())
             .is_some_and(|age| age > STAGING_ABANDONED_AFTER);
-        if abandoned {
+        if !old_enough {
+            continue;
+        }
+        // Taking the lock proves no writer holds it; it is released with
+        // the handle once the file is gone.
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if file.try_lock().is_ok() {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -332,6 +362,36 @@ mod tests {
         assert!(!stale.exists(), "the abandoned staging file was swept");
         assert!(fresh.exists(), "the live one was left alone");
         assert_eq!(entries_in(root, f).len(), 2, "and the snapshots are intact");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_slow_writer_keeps_its_staging_file_however_old_it_looks() {
+        // Age alone must not decide a sweep: a writer paused between its
+        // write and its rename still holds the lock on its staging file, and
+        // the sweep skips it. Once the writer lets go, the same file goes.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        record_in(root, f, b"v1", 1000).unwrap();
+        let dir = dir_for(root, f);
+        let paused = staging_path(&dir, 900);
+        let holder = std::fs::File::create(&paused).unwrap();
+        holder.lock().unwrap();
+        holder
+            .set_modified(std::time::SystemTime::now() - STAGING_ABANDONED_AFTER * 10)
+            .unwrap();
+        record_in(root, f, b"v2", 120_000).unwrap();
+        assert!(
+            paused.exists(),
+            "a locked staging file is not swept, whatever its age"
+        );
+        drop(holder);
+        record_in(root, f, b"v3", 240_000).unwrap();
+        assert!(
+            !paused.exists(),
+            "released, it is swept like any abandoned one"
+        );
     }
 
     #[test]
