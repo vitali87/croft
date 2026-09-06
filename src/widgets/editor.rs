@@ -2335,6 +2335,21 @@ pub struct Editor {
     /// time gets read as fact and the line it gets wrong is the one someone
     /// is arguing about.
     pub provenance: crate::provenance::Provenance,
+    /// Why the viewer the file's kind called for was declined, when it was
+    /// declined by a deliberate cap rather than by failing to parse (#493).
+    /// Consumed by the fallback viewer's status line: a browser silently
+    /// replaced by a hex dump reads as a bug rather than as a policy.
+    /// Keyed on the path it describes and never cleared on entry: an open
+    /// can set it and then fail before reaching any viewer, and `open_hex`
+    /// is also reached directly by "Reopen as Hex" without passing through
+    /// `open`. Keying makes a surviving note explain only its own file,
+    /// which the
+    /// clear-after-open the sibling `pdf_restore_page` uses cannot do on
+    /// its own. It is not sufficient alone, though: a note can outlive its
+    /// open and go stale against the SAME path, so the two places that
+    /// reach no fresh status line clear it too - `open_hex`'s same-path
+    /// refresh, and a listing that succeeds and thereby disproves it.
+    route_note: Option<(std::path::PathBuf, String)>,
     /// The `edit_seq` at which `App::sync_provenance` last considered THIS
     /// buffer for a persisted map (#349), so the history read happens once
     /// per buffer generation rather than per tick. Per tab, because
@@ -2853,6 +2868,7 @@ impl Editor {
             path: None,
             lines: Vec::new(),
             provenance: crate::provenance::Provenance::new(),
+            route_note: None,
             provenance_synced_seq: None,
             breakpoints: std::collections::HashMap::new(),
             stop_line: None,
@@ -3907,10 +3923,18 @@ impl Editor {
             }
             // A corrupt archive falls through to content routing and,
             // ultimately, the hex fallback.
-            if let Some(kind) = crate::archive::kind_from_ext(path)
-                && self.open_archive(path, kind).is_ok()
-            {
-                return Ok(());
+            if let Some(kind) = crate::archive::kind_from_ext(path) {
+                match self.open_archive(path, kind) {
+                    Ok(()) => return Ok(()),
+                    // A SIZE refusal is a deliberate cap, not a parse
+                    // failure (#493): the file still opens as hex, but the
+                    // reason rides along so the viewer can say why the
+                    // browser it expected was declined.
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
             }
             if extension_is_image(ext) {
                 // A DECODE failure means the extension lied (#174): fall
@@ -4007,30 +4031,38 @@ impl Editor {
                     return Ok(());
                 }
                 // Not a workbook: browse it as the archive it is (#179).
-                if self
-                    .open_archive(path, crate::archive::ArchiveKind::Zip)
-                    .is_ok()
-                {
-                    return Ok(());
+                match self.open_archive(path, crate::archive::ArchiveKind::Zip) {
+                    Ok(()) => return Ok(()),
+                    // The same deliberate cap as the extension route (#493).
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
                 }
             }
             // The remaining container kinds browse too when they parse.
-            Some(crate::magic::Magic::Gzip)
-                if self
-                    .open_archive(path, crate::archive::ArchiveKind::TarGz)
-                    .is_ok() =>
-            {
-                return Ok(());
+            // Same shape as the zip arm above: a SIZE refusal is policy,
+            // so its reason rides to the hex fallback rather than vanishing.
+            Some(crate::magic::Magic::Gzip) => {
+                match self.open_archive(path, crate::archive::ArchiveKind::TarGz) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
             }
             Some(crate::magic::Magic::Sqlite) => {
                 return self.open_sqlite(path);
             }
-            Some(crate::magic::Magic::Tar)
-                if self
-                    .open_archive(path, crate::archive::ArchiveKind::Tar)
-                    .is_ok() =>
-            {
-                return Ok(());
+            Some(crate::magic::Magic::Tar) => {
+                match self.open_archive(path, crate::archive::ArchiveKind::Tar) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
             }
             _ => {}
         }
@@ -4399,6 +4431,9 @@ impl Editor {
     fn open_archive(&mut self, path: &Path, kind: crate::archive::ArchiveKind) -> Result<()> {
         let view = crate::archive::list(path, kind)
             .map_err(|e| anyhow::anyhow!("Archive open failed: {e}"))?;
+        // A listing that succeeds positively disproves any refusal armed
+        // for this path, so it cannot be left to explain a later view.
+        self.route_note = None;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
@@ -4769,6 +4804,10 @@ impl Editor {
         if self.path.as_deref() == Some(path)
             && let Some(view) = self.hex.as_mut()
         {
+            // A refresh writes no status line, so a note armed by the open
+            // that called us would outlive its open and go stale against a
+            // file that may since have come under the cap.
+            self.route_note = None;
             // Pending overwrites survive a same-path re-open (a tree
             // re-click must not silently drop them); the FS sweep never
             // reloads a dirty tab, and an explicit Revert discards via
@@ -4827,7 +4866,16 @@ impl Editor {
         // keep painting after "Reopen as Hex" reported success.
         self.log = None;
         self.hex = Some(view);
-        self.status = format!("Opened {} in the hex viewer", path.display());
+        // Only for the file it was set for: an open can set the note and
+        // then fail before reaching a viewer, and this is also reached
+        // directly by "Reopen as Hex", so a note that outlived its open
+        // would explain the wrong file.
+        self.status = match self.route_note.take() {
+            Some((noted, why)) if noted == path => {
+                format!("Opened {} in the hex viewer: {why}", path.display())
+            }
+            _ => format!("Opened {} in the hex viewer", path.display()),
+        };
         Ok(())
     }
 
