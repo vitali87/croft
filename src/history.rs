@@ -144,7 +144,7 @@ pub fn record_in(
         // Inside the merge window: this save supersedes the newest snapshot
         // rather than appending, so a 1s auto save can't churn out history.
         if millis.saturating_sub(latest.millis) < MERGE_WINDOW_MILLIS {
-            std::fs::write(dir.join(format!("{millis}.{SNAP_EXT}")), content)?;
+            write_snapshot(&dir, millis, content)?;
             if latest.millis != millis {
                 let _ = std::fs::remove_file(&latest.file);
             }
@@ -152,9 +152,28 @@ pub fn record_in(
         }
     }
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(format!("{millis}.{SNAP_EXT}")), content)?;
+    write_snapshot(&dir, millis, content)?;
     prune_in(root_dir, abs_path);
     Ok(())
+}
+
+/// Put `content` at `<millis>.snap` under `dir` so that the entry is never
+/// listed before its bytes are all there. The save path records off the UI
+/// thread while readers (`entries_in` from the history picker, or a test's
+/// byte-exact check) list the same directory, and a plain `fs::write`
+/// creates the file empty first: a reader in that window saw a listed
+/// snapshot with no bytes (#492). The bytes go to a sibling `.snap.tmp`
+/// name, which `entries_in` skips on extension, and are renamed over the
+/// final name afterwards; a rename is atomic on the same filesystem. On
+/// failure the temp file is removed rather than left to look like history.
+fn write_snapshot(dir: &Path, millis: u64, content: &[u8]) -> std::io::Result<()> {
+    let final_path = dir.join(format!("{millis}.{SNAP_EXT}"));
+    let tmp = dir.join(format!("{millis}.{SNAP_EXT}.tmp"));
+    let written = std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, &final_path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Snapshots of `abs_path` under `root_dir`, newest first.
@@ -189,6 +208,55 @@ fn prune_in(root_dir: &Path, abs_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_is_staged_under_a_name_the_listing_ignores() {
+        // The race in #492: `record_in` must never expose an entry whose
+        // bytes are not all on disk. The staging name is what makes that
+        // hold, so pin both halves: a leftover staging file (a crash between
+        // write and rename) is not a snapshot, and a completed record leaves
+        // only the final name behind.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        record_in(root, f, b"v1", 1000).unwrap();
+        let dir = dir_for(root, f);
+        std::fs::write(dir.join("2000.snap.tmp"), b"half").unwrap();
+        let snaps = entries_in(root, f);
+        assert_eq!(snaps.len(), 1, "the staging file is not listed: {snaps:?}");
+        assert_eq!(snaps[0].millis, 1000);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&String::from("1000.snap")), "{names:?}");
+        assert!(
+            !names.contains(&String::from("1000.snap.tmp")),
+            "a completed record leaves no staging file: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_that_cannot_land_leaves_no_staging_file_behind() {
+        // The cleanup branch of the staged write: a rename that fails (the
+        // final name is taken by a directory, which `rename` refuses on
+        // every platform) surfaces as the error `record_in` returns, and
+        // the staging file is removed rather than left to look like history
+        // to anyone listing the directory by hand.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        let dir = dir_for(root, f);
+        std::fs::create_dir_all(dir.join("1000.snap")).unwrap();
+        assert!(
+            record_in(root, f, b"v1", 1000).is_err(),
+            "a snapshot that cannot land is reported"
+        );
+        assert!(
+            !dir.join("1000.snap.tmp").exists(),
+            "and its staging file is gone"
+        );
+    }
 
     #[test]
     fn records_and_lists_snapshots_newest_first() {
