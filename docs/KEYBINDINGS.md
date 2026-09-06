@@ -324,6 +324,12 @@ When vim mode is on it supersedes the always-on `Cmd`+`d` `d` / `Cmd`+`g` `g` ch
 
 Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; every keystroke is swallowed.
 
+**Rendered log (`.log` / `.ansi` / `.out` / `.txt` / extension-less files whose first 8 KiB carry ANSI colour)**
+
+| Keys | Action |
+|------|--------|
+| Highlighting (palette toggle) | Plain lines in the rendered log are coloured by [tailspin](https://github.com/bensadeh/tailspin): dates, durations, numbers, UUIDs, IPs, URLs, paths, quotes, severity keywords (ERROR/WARN/INFO/DEBUG), booleans and null, and HTTP methods. Lines that already carry their own colours are left as printed. The rendered view itself still opens only for a file that carries ANSI colour in its first 8 KiB (an uncoloured `.log` stays an ordinary editable file), so this colours the plain lines of a log that is coloured elsewhere: a build log, pytest output, a structured logger's file. "Log: Toggle Highlighting (tailspin)" switches it for every open log and for logs opened later, persisted as `disable_log_highlight` in `config.json` (also a row in Settings) |
+
 **PDF (`.pdf`)**
 
 | Keys | Action |
