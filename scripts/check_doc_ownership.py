@@ -430,27 +430,29 @@ def explained_orphans(head_text, candidates, lost, explained):
     of `lost` already account for (#463).
 
     An insertion strands the block that sat above its victim, so the
-    explained copy is the nearest matching block ABOVE where the victim now
-    sits at HEAD. Pairing by position rather than by text alone matters when
+    explained copy is the NEAREST stranded block above where the victim now
+    sits at HEAD, and it stands down only when its text is one a loss
+    explains. Pairing by position rather than by text alone matters when
     the same prose occurs twice in a file: `/// Creates a new instance.`
     above two `new`s is ordinary, and a match on text would let one loss
-    silence a stranded copy that never documented it. Each lost definition
-    explains at most one block, and a block with no victim below it is
-    reported as usual.
+    silence a stranded copy that never documented it. Taking the nearest
+    block regardless of text, rather than the nearest MATCHING one, is what
+    stops a loss whose own prose the branch also rewrote from reaching past
+    that rewritten block to an identical one further up. Each lost
+    definition explains at most one block, and a block with no victim below
+    it is reported as usual.
     """
     remaining = list(explained)
     stood_down = set()
     victims = sorted(line for name, _block, line in _items(head_text) if name in lost)
     for victim in victims:
-        above = [
-            o
-            for o in candidates
-            if o[0] - 1 < victim and o[0] not in stood_down and o[3] in remaining
-        ]
-        if above:
-            pick = max(above, key=lambda o: o[0])
-            stood_down.add(pick[0])
-            remaining.remove(pick[3])
+        above = [o for o in candidates if o[0] - 1 < victim and o[0] not in stood_down]
+        if not above:
+            continue
+        nearest = max(above, key=lambda o: o[0])
+        if nearest[3] in remaining:
+            stood_down.add(nearest[0])
+            remaining.remove(nearest[3])
     return stood_down
 
 

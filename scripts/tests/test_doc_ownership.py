@@ -721,6 +721,67 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             self.assertNotIn("line=2::", text, f"the copy above A::new is the loss's: {text}")
             self.assertEqual(text.count("::error"), 2, f"two captures, two annotations: {text}")
 
+    def test_a_rewritten_victim_block_does_not_lend_its_loss_to_a_farther_block(self):
+        """The pairing takes the nearest stranded block ABOVE the victim and
+        stands it down only when its text is one a loss explains. When the
+        branch both rewrote `A::new`'s prose and captured it, the block
+        directly above `A::new` no longer matches the base, and the loss
+        must not reach past it to silence an identically-worded stranded
+        block in another impl. Three defects, three annotations."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "impl A {\n    /// Creates a new instance.\n    pub fn new() {}\n}\n")
+            repo.branch("feat")
+            repo.commit(
+                "a.rs",
+                "impl C {\n    /// Creates a new instance.\n\n    /// Other.\n"
+                "    pub fn other() {}\n\n    pub fn new() {}\n}\n"
+                "impl A {\n    /// Creates a new instance, better.\n\n    /// Helper.\n"
+                "    pub fn helper() {}\n\n    pub fn new() {}\n}\n",
+            )
+            out = io.StringIO()
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            text = out.getvalue()
+            self.assertIn("`A::new` had a doc comment", text)
+            self.assertIn("line=2::", text, f"impl C's stranded copy is its own defect: {text}")
+            self.assertIn("line=10::", text, f"the rewritten block is stranded too: {text}")
+            self.assertEqual(text.count("::error"), 3, f"three defects, three annotations: {text}")
+
+    def test_a_victim_moved_above_its_old_block_leaves_the_block_reported(self):
+        """The stand-down needs a victim BELOW the block. Moving `beta` above
+        its own doc strands the block at end of file with no victim under
+        it, so the loss explains nothing here and both annotations print;
+        matching on text alone used to fold them into one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "/// Documents beta.\nfn beta() {}\n")
+            repo.branch("feat")
+            repo.commit("a.rs", "fn beta() {}\n/// Documents beta.\n")
+            out = io.StringIO()
+            cwd, argv = os.getcwd(), sys.argv
+            os.chdir(repo.path)
+            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = gate.main()
+            finally:
+                sys.argv = argv
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            text = out.getvalue()
+            self.assertIn("`beta` had a doc comment", text)
+            self.assertIn("line=2::", text, f"the block at end of file is reported: {text}")
+            self.assertEqual(text.count("::error"), 2, f"loss and stranded block both print: {text}")
+
     def test_ordinary_docs_are_not_reported(self):
         """The control. A gate that cries wolf stops being read, so the
         shapes a real file is full of must stay silent: attributes and
