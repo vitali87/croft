@@ -1169,6 +1169,13 @@ fn render_diff(
         crate::widgets::diff::DiffWhitespace::Off => header,
         mode => format!("{header}\u{2022} ignoring whitespace: {} ", mode.label()),
     };
+    // Same reason as the whitespace lens: a reader seeing coloured bars must
+    // be told what they mean and who is in them (#349).
+    let header = if diff.group_by_seat {
+        format!("{header}\u{2022} by seat: {} ", diff.seat_summary())
+    } else {
+        header
+    };
     let head_bg = if diff.bytes_differ_but_lines_equal {
         theme.ui(Color::Rgb(0x8a, 0x4a, 0x10))
     } else {
@@ -1352,6 +1359,30 @@ fn render_diff(
             &r_label,
             Style::default().fg(gutter_fg).bg(r_cell_bg),
         );
+        // The group-by-seat lens (#349): a bar in this row's own hue, in the
+        // gutter's last cell, on the lines this change ADDS. An unchanged
+        // line's seat describes work the change did not do, and a line with
+        // no record paints nothing rather than being guessed.
+        // The REAL row, the basis `added_lines_by_seat` counts on: the
+        // whitespace lens reclassifies a re-indented line as Equal, and a
+        // line this change wrote must not lose its bar while the header
+        // still counts it. `display_rows` is index-for-index with `rows`.
+        let seat_row = diff.rows.get(row_idx).copied().unwrap_or(row);
+        if diff.group_by_seat
+            && matches!(seat_row, DiffRow::Added { .. } | DiffRow::Replaced { .. })
+            && let Some(i) = r_right_idx
+            && let Some(seat) = diff.seats.seat(i)
+        {
+            let (sr, sg, sb) = seat.hue();
+            buf.set_string(
+                r_x + r_gutter - 1,
+                y,
+                "\u{258e}",
+                Style::default()
+                    .fg(theme.ui(Color::Rgb(sr, sg, sb)))
+                    .bg(r_cell_bg),
+            );
+        }
         buf.set_string(
             r_sign_x,
             y,

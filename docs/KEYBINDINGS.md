@@ -194,6 +194,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | `F7` / `Shift`+`F7` in a diff tab | Jump to the next / previous change hunk |
 | Command Palette: `Git: Toggle Inline Blame` | Show/hide the GitLens-style current-line blame annotation (author, age, summary trailing the cursor's line; on by default, persisted) |
 | Command Palette: `Editor: Toggle Provenance` | Show/hide who typed each line: a bar in the gutter lane coloured per seat (you, navigator, agent, peer, generated) and the seat's name on the inline-blame annotation (which needs `Git: Toggle Inline Blame` on); lines with no record show nothing, and conflict blocks keep their [Accept …] actions. Off by default, session-only |
+| Command Palette: `Diff: Toggle Group by Seat` | In a Source Control diff of the working tree, mark who wrote each line the change ADDS: a bar in the right gutter in that seat's colour, and a per-seat tally in the diff header, so a change reads as "the agent's part" and "my part". Lines with no record are counted as `unrecorded` and painted nothing. Unchanged lines are not marked: their seat describes earlier work. Off by default, per-view |
 | `Cmd`+`A` / `Ctrl`+`A`, then `Cmd`+`S` / `Ctrl`+`S` | Select every change, then stage the selection |
 | Click `+` on a selected unstaged row | Stage that file |
 | Click `↶` on a selected unstaged row | Discard that file (confirms first; deletes untracked files) |

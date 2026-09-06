@@ -12506,6 +12506,265 @@ fn toggle_provenance_command_flips_the_editor_lens() {
     );
 }
 
+/// The group-by-seat lens on a Source Control diff (#349, slice four): the
+/// command loads the file's persisted map and reports who wrote the lines
+/// the change adds, so a review can be read as "the agent's part" and "my
+/// part". Driven through the real command, not by setting the flag.
+#[test]
+fn the_group_by_seat_lens_reports_who_wrote_the_added_lines() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    // The working tree: one line HEAD already had, two the change adds.
+    std::fs::write(&f, "kept\nmine\nnobody's\n").unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(1..2, Seat::Me);
+    crate::history::record_with_seats_in(
+        hist.path(),
+        &f,
+        &std::fs::read(&f).unwrap(),
+        1_000,
+        &seats,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.focus_pane(Pane::Editor);
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("note.txt (HEAD)"),
+            "kept\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    assert!(app.editor.diff.is_some(), "staging: a diff view is open");
+    assert!(
+        !app.editor.diff.as_ref().unwrap().group_by_seat,
+        "staging: the lens is off by default"
+    );
+
+    app.run_command(crate::widgets::command_palette::Command::DiffToggleGroupBySeat);
+    let diff = app.editor.diff.as_ref().unwrap();
+    assert!(diff.group_by_seat, "the command turns the lens on");
+    assert_eq!(
+        diff.seat_summary(),
+        "you 1 \u{2022} unrecorded 1",
+        "the added lines are reported per seat, the unwatched one as unrecorded"
+    );
+    assert_eq!(
+        app.status, "Diff: group by seat \u{2022} you 1 \u{2022} unrecorded 1",
+        "and the status line says the same"
+    );
+
+    app.run_command(crate::widgets::command_palette::Command::DiffToggleGroupBySeat);
+    assert!(
+        !app.editor.diff.as_ref().unwrap().group_by_seat,
+        "toggling again turns it off"
+    );
+}
+
+/// The lens survives a rebuild of the view under it (#349 review): the
+/// real refresh re-reads a Source Control diff whose file moved, and the
+/// lens must stay on with a map reloaded against the NEW rows, rather than
+/// going dark or keeping a map that named lines these rows renumbered.
+#[test]
+fn the_group_by_seat_lens_survives_a_rebuild_of_the_view() {
+    use crate::provenance::Seat;
+    let (tmp, f) = repo_with_seed("kept\n");
+    let hist = tempfile::tempdir().unwrap();
+    std::fs::write(&f, "kept\nmine\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.focus_pane(Pane::Editor);
+    let record = |millis: u64, seats: &crate::provenance::Provenance| {
+        crate::history::record_with_seats_in(
+            hist.path(),
+            &f,
+            &std::fs::read(&f).unwrap(),
+            millis,
+            seats,
+        )
+        .unwrap();
+    };
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(1..2, Seat::Me);
+    record(1_000, &seats);
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "kept\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: tmp.path().to_path_buf(),
+        rel: String::from("seed.txt"),
+    });
+    app.run_command(crate::widgets::command_palette::Command::DiffToggleGroupBySeat);
+    assert_eq!(
+        app.editor.diff.as_ref().unwrap().seat_summary(),
+        "you 1",
+        "staging: the lens is on and reports the one added line"
+    );
+
+    // An agent appends a line; the real refresh re-reads the moved file.
+    rewrite_later(&f, "kept\nmine\ntheirs\n");
+    let mut seats2 = crate::provenance::Provenance::new();
+    seats2.record(1..2, Seat::Me);
+    seats2.record(2..3, Seat::Agent(String::from("pane 2")));
+    record(500_000, &seats2);
+    let no_paths = std::collections::BTreeSet::new();
+    assert!(
+        app.refresh_open_diff_views(false, &[], &no_paths),
+        "staging: the refresh rebuilt the view"
+    );
+    let diff = app.editor.diff.as_ref().unwrap();
+    assert_eq!(
+        diff.right_lines.len(),
+        3,
+        "staging: the rebuilt view shows the new line"
+    );
+    assert!(
+        diff.group_by_seat,
+        "the lens stays on across the rebuild rather than going dark"
+    );
+    assert_eq!(
+        diff.seat_summary(),
+        "you 1 \u{2022} agent (pane 2) 1",
+        "and its map is reloaded against the rebuilt rows: {}",
+        diff.seat_summary()
+    );
+}
+
+/// A map is never joined onto rows it does not describe (#349 review): if
+/// the file moved on disk since the view was built, the lens reports
+/// nothing rather than crediting the view's stale lines from a newer map.
+#[test]
+fn the_group_by_seat_lens_refuses_a_map_for_lines_the_view_does_not_show() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "kept\nmine\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.focus_pane(Pane::Editor);
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("note.txt (HEAD)"),
+            "kept\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    // Same LENGTH, different content ("else" for "mine"), so the (mtime,
+    // len) stamp gate genuinely cannot see this rewrite: the view still
+    // shows the old lines while disk and its snapshot have moved.
+    std::fs::write(&f, "kept\nelse\n").unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(1..2, Seat::Me);
+    crate::history::record_with_seats_in(
+        hist.path(),
+        &f,
+        &std::fs::read(&f).unwrap(),
+        1_000,
+        &seats,
+    )
+    .unwrap();
+    app.run_command(crate::widgets::command_palette::Command::DiffToggleGroupBySeat);
+    let diff = app.editor.diff.as_ref().unwrap();
+    assert_eq!(
+        diff.right_lines,
+        vec![String::from("kept"), String::from("mine")],
+        "staging: the view still shows the pre-rewrite lines"
+    );
+    assert_eq!(
+        diff.seat_summary(),
+        "unrecorded 1",
+        "the newer map is refused rather than joined onto lines it never described"
+    );
+}
+
+/// A lone carriage return is one line to the diff opener (#349 review):
+/// the comparison that binds a map to the view's rows has to split the same
+/// way, or the lens reports every line unrecorded on such a file.
+#[test]
+fn the_group_by_seat_lens_handles_a_lone_carriage_return() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    // "a\rb" is ONE line to `str::lines`, which is how the view is built.
+    std::fs::write(&f, "kept\na\rb\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.focus_pane(Pane::Editor);
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(1..2, Seat::Me);
+    crate::history::record_with_seats_in(
+        hist.path(),
+        &f,
+        &std::fs::read(&f).unwrap(),
+        1_000,
+        &seats,
+    )
+    .unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("note.txt (HEAD)"),
+            "kept\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        app.editor.diff.as_ref().unwrap().right_lines.len(),
+        2,
+        "staging: the opener made two lines, the lone CR inside the second"
+    );
+    app.run_command(crate::widgets::command_palette::Command::DiffToggleGroupBySeat);
+    assert_eq!(
+        app.editor.diff.as_ref().unwrap().seat_summary(),
+        "you 1",
+        "the map is applied rather than refused over a splitting difference"
+    );
+}
+
+/// The lens refuses a diff whose right side is not the working tree (#349):
+/// a diff parsed from raw git output numbers its rows by position in that
+/// text, so joining a line-keyed seat map onto it would credit lines at
+/// random. Refusing is the only safe answer.
+#[test]
+fn the_group_by_seat_lens_refuses_a_diff_that_is_not_the_working_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    // A Timeline snapshot diff: same opener, left_is_git_head false.
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("note.txt (snapshot)"),
+            "old\n",
+            &f,
+            false,
+        )
+        .unwrap();
+    app.run_command(crate::widgets::command_palette::Command::DiffToggleGroupBySeat);
+    assert!(
+        !app.editor.diff.as_ref().unwrap().group_by_seat,
+        "the lens stays off on a diff it cannot key"
+    );
+    assert!(
+        app.status.contains("working tree"),
+        "and says why: {}",
+        app.status
+    );
+}
+
 /// Provenance survives a restart (#349, criterion 2): a save records who
 /// typed each line beside the history snapshot, and a fresh app that opens
 /// the unchanged file gets the map back. Distinguishable seats per line, or

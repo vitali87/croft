@@ -24414,6 +24414,106 @@ impl App {
         self.status = format!("Diff: ignore whitespace {}", mode.label());
     }
 
+    /// Turn the group-by-seat lens on or off for the diff in view (#349),
+    /// so a change can be read as "the agent's part" and "my part".
+    ///
+    /// Offered only on the Source Control HEAD-vs-working view, the one diff
+    /// whose right side IS the working tree: there the row's `right` index
+    /// is a real file line and the seat map is keyed on the same index. A
+    /// diff parsed out of raw `git diff` text numbers its rows by position
+    /// in that text, so the same join would paint confident wrong seats.
+    pub fn diff_toggle_group_by_seat(&mut self) {
+        let history_root = self.history_root.clone();
+        let Some(diff) = self.editor.diff.as_mut() else {
+            self.status = String::from("Group by seat applies to a diff view");
+            return;
+        };
+        if !diff.left_is_git_head {
+            self.status =
+                String::from("Group by seat applies to a Source Control diff of the working tree");
+            return;
+        }
+        diff.group_by_seat = !diff.group_by_seat;
+        if !diff.group_by_seat {
+            self.status = String::from("Diff: group by seat off");
+            return;
+        }
+        // Read the map fresh each time the lens comes on: the working file
+        // may have been saved since the view was built, and a map from
+        // before that describes text this diff no longer shows.
+        diff.seats = crate::provenance::Provenance::new();
+        let path = diff.right_path.clone();
+        let right_lines = diff.right_lines.clone();
+        let seats = Self::seats_for_working_file(&history_root, &path, &right_lines);
+        let Some(diff) = self.editor.diff.as_mut() else {
+            return;
+        };
+        if let Some(seats) = seats {
+            diff.seats = seats;
+        }
+        self.status = format!("Diff: group by seat \u{2022} {}", diff.seat_summary());
+    }
+
+    /// Reload the group-by-seat map of a rebuilt view against its new rows
+    /// (#349). `carry_view_from` keeps the lens ON but deliberately drops
+    /// its map, which named line indices the rebuilt rows have renumbered;
+    /// this puts back a map that describes the rows now on screen, or none.
+    /// A no-op for a view whose lens is off.
+    fn reload_seats_for(history_root: &Path, diff: &mut crate::widgets::diff::DiffData) {
+        // The same gate the toggle applies, restated rather than assumed:
+        // the map is keyed on working-file line indices, so it may only be
+        // joined onto a view whose right side IS the working tree.
+        if !diff.group_by_seat || !diff.left_is_git_head {
+            return;
+        }
+        let right_lines = diff.right_lines.clone();
+        diff.seats = Self::seats_for_working_file(history_root, &diff.right_path, &right_lines)
+            .unwrap_or_default();
+    }
+
+    /// The persisted provenance map for a working-tree file, for the rows a
+    /// diff view is actually showing (#349). Both halves of the rule
+    /// `sync_provenance_for` applies: the newest snapshot must still hold the
+    /// bytes on disk, AND those bytes must be the lines this view shows.
+    ///
+    /// The second half is not redundant. A diff's `right_lines` were read
+    /// when the view was built, and a same-length rewrite inside one
+    /// filesystem timestamp tick moves the file without moving the
+    /// `(mtime, len)` stamp that triggers a rebuild - so the view can be
+    /// showing older lines than the snapshot describes. Joining a newer map
+    /// onto them would credit lines it never saw, which is the one outcome
+    /// the module forbids. Either half failing reads as no map at all.
+    fn seats_for_working_file(
+        history_root: &Path,
+        path: &Path,
+        right_lines: &[String],
+    ) -> Option<crate::provenance::Provenance> {
+        let newest = crate::history::entries_in(history_root, path)
+            .into_iter()
+            .next()?;
+        let mut seats = crate::history::seats_for(history_root, path, newest.millis)?;
+        let (on_disk, snapshot) = (std::fs::read(path).ok()?, std::fs::read(&newest.file).ok()?);
+        if on_disk != snapshot {
+            return None;
+        }
+        // Split the way the DIFF OPENER splits (`str::lines`), NOT the way
+        // `Editor::open` does: a lone `\r` is one line to the opener and two
+        // to the editor's splitter, and the comparison has to be against the
+        // lines this view was actually built from. The bare UTF-8 decode
+        // matches the opener too, which reads the right side with
+        // `read_to_string` and so never builds a view for a file this
+        // cannot decode.
+        let text = String::from_utf8(snapshot).ok()?;
+        if !text.lines().eq(right_lines.iter().map(String::as_str)) {
+            return None;
+        }
+        // Defensive: the comparison above already forces equal lengths, so
+        // this drops nothing today. It keeps the map bounded by the rows if
+        // that gate is ever loosened.
+        seats.truncate(right_lines.len());
+        Some(seats)
+    }
+
     /// Stage only the hunk under the diff caret (`git apply --cached`).
     pub fn stage_hunk_at_caret(&mut self) {
         // A selection spanning changed rows narrows the action to those
@@ -24551,6 +24651,9 @@ impl App {
         heads_moved: &[PathBuf],
         changed_files: &std::collections::BTreeSet<PathBuf>,
     ) -> bool {
+        // Bound before the borrow of `self.editor` below, for the seat map a
+        // carried group-by-seat lens needs against its rebuilt rows (#349).
+        let self_history_root = self.history_root.clone();
         // The watcher's own list of written paths bypasses the stamp gate: a
         // same-length rewrite that lands within the filesystem's mtime
         // granularity (or restores the mtime) shows the same `(mtime, len)`
@@ -24589,6 +24692,10 @@ impl App {
                     continue;
                 }
                 fresh.carry_view_from(old);
+                // The carried lens needs a map for the REBUILT rows:
+                // `carry_view_from` deliberately drops the old one, which
+                // named lines these rows have renumbered (#349).
+                Self::reload_seats_for(&self_history_root, &mut fresh);
                 ed.diff = Some(fresh);
                 changed = true;
                 if std::ptr::eq(&*ed, active_ptr) {
@@ -33300,6 +33407,7 @@ impl App {
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
             Cmd::ToggleProvenance => self.toggle_provenance(),
+            Cmd::DiffToggleGroupBySeat => self.diff_toggle_group_by_seat(),
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
             Cmd::ToggleRenderWhitespace => self.toggle_render_whitespace(),
