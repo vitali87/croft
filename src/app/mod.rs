@@ -25412,6 +25412,11 @@ impl App {
     /// names the only place the files could be and the group count merely
     /// repeats `n`. So the common single-root session is untouched, and
     /// grouping appears exactly when there is something to tell apart.
+    ///
+    /// A grouped row carries labels and counts but no file names, because
+    /// the status bar is one row that elides its MIDDLE: a row long enough
+    /// to be cut loses the group labels, which is precisely what grouping
+    /// exists to show. The flat row keeps its sample, being short already.
     fn agent_lane_rows(&self) -> Vec<String> {
         let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
         let labels = crate::workspace::root_display_labels(&roots);
@@ -25462,20 +25467,43 @@ impl App {
                     let files = groups.first().map(|(_, f)| sample(f)).unwrap_or_default();
                     return format!("{agent}: {n} to review ({files})");
                 }
+                // A lane's branch is derived from its slug alone, so two
+                // lanes cut from different repos can share one; fall back to
+                // the disambiguated root label when that happens, since a
+                // row naming two groups identically is worse than a row
+                // naming them by folder.
+                let branches: Vec<Option<String>> = groups
+                    .iter()
+                    .map(|(root, _)| root.and_then(&branch_of))
+                    .collect();
                 let named: Vec<String> = groups
                     .iter()
-                    .map(|(root, files)| {
-                        let label = match root {
-                            Some(r) => branch_of(r).unwrap_or_else(|| {
-                                roots
-                                    .iter()
-                                    .position(|candidate| candidate == r)
-                                    .and_then(|i| labels.get(i).cloned())
-                                    .unwrap_or_else(|| r.display().to_string())
-                            }),
-                            None => String::from("outside the workspace"),
+                    .zip(&branches)
+                    .map(|((root, files), branch)| {
+                        let root_label = |r: &Path| {
+                            roots
+                                .iter()
+                                .position(|candidate| candidate == r)
+                                .and_then(|i| labels.get(i).cloned())
+                                .unwrap_or_else(|| r.display().to_string())
                         };
-                        format!("{label} {}: {}", files.len(), sample(files))
+                        let label = match (root, branch) {
+                            (Some(r), Some(b))
+                                if branches.iter().flatten().filter(|o| *o == b).count() == 1 =>
+                            {
+                                let _ = r;
+                                b.clone()
+                            }
+                            (Some(r), _) => root_label(r),
+                            (None, _) => String::from("outside the workspace"),
+                        };
+                        // Labels and counts only. The status bar is ONE row
+                        // and elides the MIDDLE of anything too long
+                        // (`elide_middle`), so a row carrying samples for
+                        // every group loses the group labels first — the
+                        // one thing grouping adds. Which files they are is
+                        // a question the Explorer's dots already answer.
+                        format!("{label} {}", files.len())
                     })
                     .collect();
                 format!("{agent}: {n} to review \u{2014} {}", named.join("; "))

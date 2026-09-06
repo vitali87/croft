@@ -684,6 +684,23 @@ mod tests {
             led.lane_by_root("nobody", &roots).is_empty(),
             "an agent with no lane has no groups"
         );
+
+        // Nested roots: the DEEPER root owns the file, the same rule
+        // `WorkspaceRoots::owning_root` applies, which this re-implements to
+        // stay pure. The two must not drift.
+        let mut led = AgentLedger::new();
+        let inner = repo.join("crates/foo");
+        let nested = vec![repo.clone(), inner.clone()];
+        led.record_write(&inner.join("src/lib.rs"), 1, &working);
+        led.record_write(&repo.join("README.md"), 2, &working);
+        assert_eq!(
+            led.lane_by_root("claude", &nested)
+                .iter()
+                .map(|(r, f)| (*r, f.len()))
+                .collect::<Vec<_>>(),
+            vec![(Some(repo.as_path()), 1), (Some(inner.as_path()), 1)],
+            "the deeper root owns its file, roots still in order"
+        );
     }
 
     /// A dropped-events window makes every count a LOWER BOUND, and says

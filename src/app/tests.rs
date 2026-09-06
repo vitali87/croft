@@ -43302,29 +43302,73 @@ fn the_review_queue_names_the_lane_each_agents_files_are_in() {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap();
     assert!(
-        row.contains(&format!("{repo_label} 1: mod.rs")),
+        row.contains(&format!("{repo_label} 1")),
         "the primary root is named by its folder: {row}"
     );
     assert!(
-        row.contains("agent/fix-login 2: other.rs, mod.rs"),
-        "the lane is named by its branch, most recent first: {row}"
+        row.contains("agent/fix-login 2"),
+        "the lane is named by its branch: {row}"
     );
     assert!(
-        !row.contains('\u{2026}'),
-        "no ellipsis: every file in each group is listed: {row}"
+        !row.contains("mod.rs"),
+        "a grouped row carries labels and counts, not file names, so the \
+         status bar cannot elide the labels away: {row}"
     );
     assert!(
         row.find(&repo_label) < row.find("agent/fix-login"),
         "root order, primary first: {row}"
     );
 
-    // A file outside every root still appears, under its own heading.
+    // A file outside every root still appears, under its own heading. Only
+    // reachable defensively: the ledger's one production feeder drops paths
+    // under no root before recording them.
     app.agent_ledger
         .record_write(&tmp.path().join("stray.rs"), 4, &working);
     let row = app.agent_lane_rows().remove(0);
     assert!(
-        row.contains("outside the workspace 1: stray.rs"),
-        "an unowned file is named, not dropped: {row}"
+        row.contains("outside the workspace 1"),
+        "an unowned file is counted, not dropped: {row}"
+    );
+}
+
+#[test]
+fn a_grouped_review_queue_row_survives_the_status_bar() {
+    // The bar is one row and elides the MIDDLE (`elide_middle`), so a row
+    // long enough to be cut loses its group labels — the one thing grouping
+    // adds. Labels and counts keep it short enough to land whole. Same
+    // shape as `status_transient_keeps_its_tail_when_longer_than_the_bar`.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let repo = app.roots.primary().to_path_buf();
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let working = vec![String::from("claude")];
+    for i in 0..4 {
+        app.agent_ledger
+            .record_write(&repo.join(format!("src/r{i}.rs")), i as u64, &working);
+        app.agent_ledger
+            .record_write(&lane.join(format!("src/l{i}.rs")), 100 + i as u64, &working);
+    }
+    app.run_command(crate::widgets::command_palette::Command::ShowAgentLane);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let last_row: String = (a.x..a.x + a.width)
+        .map(|x| buf[(x, a.y + a.height - 1)].symbol().to_string())
+        .collect();
+    assert!(
+        last_row.contains("agent/fix-login 4"),
+        "the lane's group must reach the bar unelided: {last_row:?}"
+    );
+    assert!(
+        last_row.contains("Ln 1, Col 1"),
+        "the right cluster must still paint: {last_row:?}"
     );
 }
 
