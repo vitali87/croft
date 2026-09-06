@@ -41108,9 +41108,11 @@ fn the_offer_switches_apply_on_a_settings_remerge() {
     let pane = app.terminals[0].uid();
     app.consider_ssh_offer(pane, Some(String::from("db-1")));
     assert!(app.ssh_offer.is_some());
-    let mut prefs = crate::prefs::Prefs::default();
-    prefs.disable_remote_offer = true;
-    prefs.remote_offer_excluded_hosts = vec![String::from("jump")];
+    let mut prefs = crate::prefs::Prefs {
+        disable_remote_offer: true,
+        remote_offer_excluded_hosts: vec![String::from("jump")],
+        ..Default::default()
+    };
     app.apply_merged_settings(&prefs);
     assert!(app.remote_offer_disabled && app.remote_offer_excluded == vec![String::from("jump")]);
     assert!(
