@@ -1522,8 +1522,9 @@ fn cells_of(pane: &crate::widgets::terminal::PtyTerminal) -> impl Iterator<Item 
         .flat_map(move |r| (area.x..area.x + area.width).map(move |c| (c, r)))
 }
 
-/// The first grid cell of `pane` that falls INSIDE an occurrence of `needle`,
-/// searched row-major over the pane's own `last_area` (#397).
+/// The first grid cell of `pane` that falls INSIDE the first occurrence of
+/// `needle` on its row, searched row-major over the pane's own `last_area`
+/// (#397).
 ///
 /// A test that prints something into a pane and then clicks it must not assume
 /// which row it landed on: the pane runs a REAL shell whose prompt races the
@@ -1810,6 +1811,17 @@ fn a_terminal_link_binding_is_not_refused_for_an_editor_side_reason() {
     // one it always runs, and the cell is then searched for rather than
     // assumed.
     app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
+    // A DECOY link on an earlier row, which is what gives `cell_with_link`'s
+    // exact-URI predicate a red state here: weaken it to `.is_some()` and the
+    // row-major search stops on the decoy, so the click resolves the wrong
+    // link and the status assertion below rejects it by name. Without this
+    // the predicate could be reverted and the test would still pass, since
+    // nothing else in this pane emits OSC 8.
+    //
+    // `mailto:` rather than `file://` deliberately: `file://` is intercepted
+    // by `editor_file_uri` and would exercise a different arm.
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:decoy@example.com\x1b\\decoy\x1b]8;;\x1b\\\r\n");
     // Trailing newline parks the cursor on the NEXT row: without it any late
     // shell output writes onto the link's own row.
     app.terminals[0]
@@ -2182,6 +2194,14 @@ fn a_bound_gesture_resolves_the_link_in_the_pane_it_clicked_not_the_active_one()
     // `Command::new("open")` with no test guard — the suite would launch a
     // real browser on every run (#307's spawning class).
     app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
+    // A DECOY link on an earlier row. It pins the exact-URI predicate the
+    // same way it is pinned in the split-feed siblings: under `.is_some()`
+    // the row-major search hits the decoy, the click resolves it, and the
+    // `zero@` status assertion below fails by name. The decoy goes into pane
+    // 0 alongside the payload, so it cannot weaken the "WHICH pane resolved"
+    // claim: pane 1 still carries no link at all.
+    app.terminals[0]
+        .feed_bytes_for_test(b"\x1b]8;;mailto:decoy@example.com\x1b\\decoy\x1b]8;;\x1b\\\r\n");
     app.terminals[0]
         .feed_bytes_for_test(b"\x1b]8;;mailto:zero@example.com\x1b\\zero-link\x1b]8;;\x1b\\\r\n");
     app.active_terminal = 1;
@@ -2499,7 +2519,7 @@ fn an_unmatched_modified_click_does_not_arm_the_tracker() {
     // One call rather than two, which is fewer moving parts and nothing more:
     // `cell_carrying` searches every cell of every row, so a prompt landing
     // between two feeds and prefixing the payload row is tolerated either way.
-    // Three sibling tests still feed their decoy and payload separately.
+    // The sibling tests still feed their decoy and payload separately.
     //
     // The payload row OPENS with a shell-shaped prefix on purpose. It is what
     // gives the span predicate a red state: under a row-level `contains` the
@@ -2794,12 +2814,11 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     ctrl.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ctrl);
 
-    assert!(
-        app.status == "Refused to open non-web link: mailto:split@example.com",
+    assert_eq!(
+        app.status, "Refused to open non-web link: mailto:split@example.com",
         "the prefix click must defer to the built-in, which opens the link in \
          the CLICKED pane. Reading the ACTIVE pane finds nothing there, \
-         swallows the click, and the link never opens. status was {:?}",
-        app.status
+         swallows the click, and the link never opens"
     );
 }
 
@@ -2929,14 +2948,13 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     ctrl.modifiers = KeyModifiers::CONTROL;
     app.handle_mouse(ctrl);
 
-    assert!(
-        app.status == "Refused to open non-web link: mailto:x@example.com",
+    assert_eq!(
+        app.status, "Refused to open non-web link: mailto:x@example.com",
         "a double-click PREFIX over a mouse-tracking child must fall through to \
          the built-in: croft has no click-forwarding path, so swallowing it \
          hands the gesture to nobody -- the swallow branch \
          is missing the `child_owns_pointer` guard its sibling applies. \
-         Expected the refusal from the built-in link handler, got {:?}",
-        app.status
+         Expected the refusal from the built-in link handler"
     );
 }
 
@@ -36866,6 +36884,158 @@ fn a_recorded_frame_is_the_visible_screen_not_the_scrollback() {
     assert!(
         !frame.contains("line-0\r\n"),
         "the frame reaches back to the first line ever printed"
+    );
+}
+
+/// The recorded frame's rows wrap at the width the header declares (#397).
+///
+/// The header takes its geometry from the pane's `last_inner` and the body
+/// comes from the grid, and the sibling test above ties them together in one
+/// dimension only: it compares `header["height"]` against a row count derived
+/// from the frame, but `header["width"]` against the literal 40 the fixture
+/// itself set. A grid wrapped at any other column satisfies that. It is not a
+/// hypothetical shape either: that fixture shipped an 80-column grid under a
+/// 40-column header and every assertion in it passed.
+///
+/// A line longer than the screen is the discriminator. It can only wrap at
+/// the grid's REAL width, so a frame whose rows run past the header's width
+/// fails here, and the digits make the wrap column readable from the text
+/// rather than inferred from a length.
+#[test]
+fn a_recorded_frames_rows_wrap_at_the_width_its_header_declares() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 20,
+    };
+    // `resize`, so the GRID is 40 columns too. Setting `last_inner` alone
+    // leaves the grid at the 80 it was spawned with, which is exactly the
+    // disagreement this test exists to reject.
+    app.terminals[0].resize(40, 20);
+
+    // Digits repeating every ten columns, so the wrap point is READ off the
+    // text: the first screen row ends at index 39 and the next begins at 40.
+    // A uniform fill would look correctly wrapped at every width.
+    let long: String = (0..100u8).map(|i| char::from(b'0' + (i % 10))).collect();
+    app.terminals[0].feed_bytes_for_test(format!("{long}\r\n").as_bytes());
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let header: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("a header")).expect("the header is JSON");
+    let frame = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|ev| ev[1] == "o")
+        .and_then(|ev| ev[2].as_str().map(String::from))
+        .expect("an output event");
+
+    // The recorder writes a clear-and-home BEFORE the rows, so the first
+    // segment of a naive split carries seven escape characters on top of its
+    // row. Measuring that as a row's width is how the first version of this
+    // test read 47 columns off a grid that really was 40.
+    let body = frame
+        .strip_prefix("\u{1b}[H\u{1b}[2J")
+        .expect("a recorded frame opens with clear-and-home, then the rows");
+    let declared = header["width"]
+        .as_u64()
+        .expect("the header declares a width");
+    assert_eq!(
+        declared, 40,
+        "the fixture's own premise: the header must declare the 40 columns the pane was sized to"
+    );
+    // The wrap itself, pinned as adjacency rather than as a length: at any
+    // other grid width these two 40-column halves are not consecutive rows.
+    assert!(
+        body.contains(&format!("{}\r\n{}", &long[..40], &long[40..80])),
+        "the long line must wrap at column {declared}, the width the header promises: {body:?}"
+    );
+    // And no row may exceed it. This is the half that catches the 80-column
+    // grid: there the line wraps at 80, so the widest row is twice what a
+    // player sizes its window to.
+    let widest = body
+        .split("\r\n")
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        widest as u64 <= declared,
+        "a row {widest} columns wide does not fit the {declared}-column window the header asks for"
+    );
+}
+
+/// A geometry change reaches the cast BEFORE the frame drawn at it (#397).
+///
+/// `record_active_screen` emits the resize first so a player has the new
+/// geometry before the frame that was wrapped for it; the other order renders
+/// one frame at the old width. Nothing pinned that order. In every other
+/// fixture `recorded_size` already equals the pane's size at record time, so
+/// the branch never runs at all, and the one other test that produces an `r`
+/// event calls `record_resize` directly, which bypasses the ordering logic
+/// rather than exercising it.
+///
+/// `last_inner` alone moves here, without a `resize`: it is what the branch
+/// reads, and the claim under test is the ORDER of two events, not the
+/// content of the frame between them.
+#[test]
+fn a_recorded_resize_precedes_the_frame_it_was_drawn_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 20,
+    };
+    app.terminals[0].resize(40, 20);
+
+    // Toggling on seeds `recorded_size` from the pane, so this first frame
+    // must NOT carry a resize: a test that saw one here would be reading the
+    // seeding, not the ordering.
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 60,
+        height: 10,
+    };
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let kinds: Vec<String> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|ev| ev[1].as_str().map(String::from))
+        .collect();
+
+    // Swap the two statements in `record_active_screen` and this reads
+    // `["o", "o", "r"]`; drop the branch and it reads `["o", "o"]`. The
+    // sequence is asserted whole rather than as "an r exists somewhere",
+    // which both of those would satisfy under a looser check.
+    assert_eq!(
+        kinds,
+        vec!["o", "r", "o"],
+        "the cast must carry the new geometry before the frame drawn at it, got {kinds:?}"
     );
 }
 
