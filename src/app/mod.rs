@@ -28815,6 +28815,17 @@ impl App {
         if state.last.elapsed() < std::time::Duration::from_millis(30) {
             return false;
         }
+        // A forwarded click-only drag (#474) may be on a pane other than the
+        // active one: Cmd+] moves the active pane mid-drag, and no further
+        // Drag event arrives while the pointer rests past the edge to
+        // re-check. This tick scrolls the ACTIVE pane, so it stands down
+        // rather than walk the wrong pane's scrollback.
+        if let Some(fp) = self.terminal_pointer_forwarded
+            && self.forwarded_pane_index(fp) != Some(self.active_terminal)
+        {
+            self.terminal_select_autoscroll = None;
+            return false;
+        }
         self.terminal_mut().autoscroll_select(state.dir, state.col);
         self.terminal_select_autoscroll = Some(TerminalSelectAutoScroll {
             last: std::time::Instant::now(),
@@ -37514,7 +37525,6 @@ impl App {
                         }
                     }
                     self.terminal_select_autoscroll = None;
-                    self.terminal_drag_from = None;
                     return;
                 }
                 // Releasing the button ends any terminal edge auto-scroll

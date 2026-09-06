@@ -2603,6 +2603,7 @@ fn a_bound_click_defers_to_a_mouse_tracking_child() {
         "the press reaches the child as an SGR report carrying the Ctrl bit"
     );
 }
+
 #[test]
 fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     // `terminal_would_open_something_at` decides whether swallowing a
@@ -39584,4 +39585,78 @@ fn a_click_only_drag_keeps_extending_the_origin_pane_after_the_active_pane_moves
         "the active pane's child sees nothing"
     );
     assert!(app.terminal_pointer_forwarded.is_none());
+}
+
+#[test]
+fn a_double_click_over_a_tracking_child_is_two_forwarded_clicks_not_a_word_select() {
+    // Both clicks of the pair are the child's, and neither arms croft's
+    // double-click tracker, so no word is selected. This is the documented
+    // trade: word-select is unavailable over a tracking app.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    app.terminals[0].feed_bytes_for_test(b"hello_world_token\r\n");
+    for _ in 0..2 {
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+    }
+    let written = String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).into_owned();
+    let pair = format!("\x1b[<0;{c};{r}M\x1b[<0;{c};{r}m", c = lc + 1, r = lr + 1);
+    assert_eq!(
+        written,
+        format!("{pair}{pair}"),
+        "two press/release pairs reach the child"
+    );
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "no word is selected: the pair was never croft's"
+    );
+}
+
+#[test]
+fn shift_drag_over_a_1002_child_selects_with_croft_and_reports_nothing() {
+    // Under 1002 the unshifted drag is the child's; Shift+drag is the way
+    // left to select text in a `mouse=a` vim or lazygit, and it must never
+    // leak a report.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, _, _) = tracking_terminal_app(b"\x1b[?1002h\x1b[?1006h");
+    let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    ev.modifiers = KeyModifiers::SHIFT;
+    app.handle_mouse(ev);
+    let mut ev = mouse(MouseEventKind::Drag(MouseButton::Left), col + 3, row + 1);
+    ev.modifiers = KeyModifiers::SHIFT;
+    app.handle_mouse(ev);
+    let mut ev = mouse(MouseEventKind::Up(MouseButton::Left), col + 3, row + 1);
+    ev.modifiers = KeyModifiers::SHIFT;
+    app.handle_mouse(ev);
+    assert!(
+        app.terminals[0].written_bytes_for_test().is_empty(),
+        "Shift keeps every event of the gesture from the child"
+    );
+    assert!(
+        app.terminals[0].selection().is_some_and(|s| s.has_area()),
+        "and croft's selection has the dragged area"
+    );
+}
+
+#[test]
+fn copy_on_select_fires_for_a_click_only_forwarded_drag() {
+    // The forwarded-release tail carries its own copy-on-select, aimed at the
+    // origin pane; it must put the origin's selection on the clipboard the
+    // way the ordinary mouse-up does.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, col, row, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    app.copy_on_select = true;
+    app.terminals[0].feed_bytes_for_test(b"\x1b[H");
+    app.terminals[0].feed_bytes_for_test(b"copy-me-please\r\n");
+    let inner = app.terminals[0].last_inner;
+    let (x0, y0) = (inner.x, inner.y);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x0, y0));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x0 + 13, y0));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x0 + 13, y0));
+    let _ = (col, row);
+    assert_eq!(
+        crate::clipboard::read_string().as_deref(),
+        Some("copy-me-please"),
+        "the origin pane's selection landed on the clipboard"
+    );
 }
