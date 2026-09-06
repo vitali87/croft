@@ -9409,13 +9409,21 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     // Retain the loop's own sample for the assert: re-sampling could see
     // a transient `None` (a failed tcgetpgrp) after the loop already
     // observed the confirmed reading.
-    let mut waited = 0u32;
-    let mut foreground = app.terminal_mut().foreground_resolved_for_test();
-    while waited < 4000 && foreground != Some(false) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-        foreground = app.terminal_mut().foreground_resolved_for_test();
-    }
+    // Load-scaled like the marker wait above (#397): a shell that wins the
+    // marker race inside a stretched budget could still lose a fixed 4000ms
+    // here, and this one does not assert on timeout — it falls through to
+    // the precondition assert below, which then reads as a broken
+    // foreground-group check rather than a starved box. Captured from
+    // inside the closure so the assert keeps the sample the wait observed.
+    let mut foreground = None;
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the kernel to report a foreign foreground group (the sleep)",
+        || {
+            foreground = app.terminal_mut().foreground_resolved_for_test();
+            foreground == Some(false)
+        },
+    );
     assert_eq!(
         foreground,
         Some(false),

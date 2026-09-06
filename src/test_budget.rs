@@ -272,8 +272,12 @@ pub(crate) mod tests {
 
     /// The base for waiting on a real shell to PAINT something into the grid
     /// (#397): the linked cell of an OSC 8 hyperlink, a marker line from the
-    /// shell's main loop. Distinct from `TERMINAL_PROBE_BASE` only in what
-    /// it replaced, not in what it waits for.
+    /// shell's main loop.
+    ///
+    /// Separate from `TERMINAL_PROBE_BASE` because the two replaced
+    /// different constants — 15s there, 8000ms here — and the house rule is
+    /// that each base reproduces its own at the floor, which one number
+    /// cannot do for both. The operation they wait on is the same.
     ///
     /// 2s because `BASE_CALIBRATION * MIN_SCALE` is 4 at the floor, so the
     /// call sites keep the 8000ms they had on a quiet machine and get up to
@@ -284,14 +288,15 @@ pub(crate) mod tests {
     /// the shape of a wait that needs to scale rather than to be guessed
     /// higher again.
     ///
-    /// `RESTORED_SHELL_BASE`'s doc deferred exactly this reconciliation as
-    /// "a question about that test's operation rather than about these".
-    /// The answer is that painting a cell IS the same operation those waits
-    /// perform, so it takes the same value rather than a guessed fourth
-    /// number. It stays a SEPARATE constant, equal in value, because the
-    /// name is what each call site's failure message and floor assertion
-    /// read as: should either operation's cost move, the other must not
-    /// follow it silently.
+    /// Equal in value to `RESTORED_SHELL_BASE` because both replaced the
+    /// same 8000ms, not because either doc settled it: that doc defers a
+    /// reconciliation, but the counterexample it names,
+    /// `a_terminal_link_binding_is_not_refused_for_an_editor_side_reason`,
+    /// no longer waits on anything — it feeds the grid bytes directly — so
+    /// the deferral is stale rather than answered here. Still a SEPARATE
+    /// constant: the name is what a call site's failure message and floor
+    /// assertion read as, and should either operation's cost move, the
+    /// other must not follow it silently.
     pub(crate) const SHELL_PAINT_BASE: Duration = Duration::from_secs(2);
 
     /// The base the three task-pane tests wait for the pane's shell to come
