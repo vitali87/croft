@@ -68,6 +68,19 @@ class Repo:
             sys.argv = argv
             os.chdir(cwd)
 
+    def run_gate(self, base="main", head="HEAD"):
+        """The gate's exit status and everything it printed to stdout."""
+        out = io.StringIO()
+        cwd, argv = os.getcwd(), sys.argv
+        os.chdir(self.path)
+        sys.argv = ["check_doc_ownership.py", base, head]
+        try:
+            with contextlib.redirect_stdout(out):
+                return gate.main(), out.getvalue()
+        finally:
+            sys.argv = argv
+            os.chdir(cwd)
+
 
 DOCUMENTED_CONST = '''/// The scopes each role uses.
 const SYNTAX_SCOPES: &[&str] = &["a"];
@@ -391,19 +404,10 @@ class ItemKinds(unittest.TestCase):
             ).stdout.strip()
             repo.commit("new.rs", CAPTURED_CONST)
 
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            out = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
 
             self.assertEqual(code, 1)
-            printed = out.getvalue()
+            printed = text
             self.assertIn(
                 documented_at[:12],
                 printed,
@@ -477,21 +481,12 @@ class GitShapes(unittest.TestCase):
             repo.branch("work")
             repo.commit("a.rs", DOCUMENTED_CONST + "\n/// Extra.\nconst EXTRA: u8 = 1;\n")
             repo.commit("a.rs", CAPTURED_CONST + "\n/// Extra.\nconst EXTRA: u8 = 1;\n")
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            out = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
             self.assertEqual(
-                out.getvalue().count("::error"),
+                text.count("::error"),
                 1,
-                f"one loss, one annotation: {out.getvalue()}",
+                f"one loss, one annotation: {text}",
             )
 
     def test_a_capture_inside_a_file_the_branch_added_is_reported(self):
@@ -632,26 +627,17 @@ class HeadOnlyOrphanTests(unittest.TestCase):
                 "a.rs",
                 "/// Documents beta.\n\n/// Documents gamma.\nfn gamma() {}\n\nfn beta() {}\n",
             )
-            out = io.StringIO()
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
             self.assertIn(
                 "`beta` had a doc comment",
-                out.getvalue(),
-                f"the loss pass keeps the report: {out.getvalue()}",
+                text,
+                f"the loss pass keeps the report: {text}",
             )
             self.assertEqual(
-                out.getvalue().count("::error"),
+                text.count("::error"),
                 1,
-                f"one insertion, one annotation: {out.getvalue()}",
+                f"one insertion, one annotation: {text}",
             )
 
     def test_a_stranded_block_unrelated_to_a_loss_is_still_reported(self):
@@ -669,18 +655,8 @@ class HeadOnlyOrphanTests(unittest.TestCase):
                 "/// Documents beta.\n\n/// Documents gamma.\nfn gamma() {}\n\nfn beta() {}\n"
                 "\n/// Lonely.\n\n/// Documents delta.\nfn delta() {}\n",
             )
-            out = io.StringIO()
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
-            text = out.getvalue()
             self.assertIn("`beta` had a doc comment", text)
             self.assertIn("'/// Lonely.'", text, f"the unrelated block is still stranded: {text}")
             self.assertNotIn("'/// Documents beta.'", text, f"the block the loss explains stands down: {text}")
@@ -704,18 +680,8 @@ class HeadOnlyOrphanTests(unittest.TestCase):
                 "impl C {\n    /// Creates a new instance.\n\n    /// Other.\n"
                 "    pub fn other() {}\n\n    pub fn new() {}\n}\n",
             )
-            out = io.StringIO()
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
-            text = out.getvalue()
             self.assertIn("`A::new` had a doc comment", text)
             self.assertIn("line=10::", text, f"the copy in impl C is its own defect: {text}")
             self.assertNotIn("line=2::", text, f"the copy above A::new is the loss's: {text}")
@@ -739,18 +705,8 @@ class HeadOnlyOrphanTests(unittest.TestCase):
                 "impl A {\n    /// Creates a new instance, better.\n\n    /// Helper.\n"
                 "    pub fn helper() {}\n\n    pub fn new() {}\n}\n",
             )
-            out = io.StringIO()
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
-            text = out.getvalue()
             self.assertIn("`A::new` had a doc comment", text)
             self.assertIn("line=2::", text, f"impl C's stranded copy is its own defect: {text}")
             self.assertIn("line=10::", text, f"the rewritten block is stranded too: {text}")
@@ -766,18 +722,8 @@ class HeadOnlyOrphanTests(unittest.TestCase):
             repo.commit("a.rs", "/// Documents beta.\nfn beta() {}\n")
             repo.branch("feat")
             repo.commit("a.rs", "fn beta() {}\n/// Documents beta.\n")
-            out = io.StringIO()
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
-            text = out.getvalue()
             self.assertIn("`beta` had a doc comment", text)
             self.assertIn("line=2::", text, f"the block at end of file is reported: {text}")
             self.assertEqual(text.count("::error"), 2, f"loss and stranded block both print: {text}")
@@ -798,18 +744,8 @@ class HeadOnlyOrphanTests(unittest.TestCase):
                 "    pub fn helper() {}\n\n    /// Creates a new instance.\n\n    /// Other.\n"
                 "    pub fn other() {}\n\n    pub fn new() {}\n}\n",
             )
-            out = io.StringIO()
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
-            text = out.getvalue()
             self.assertIn("`A::new` had a doc comment", text)
             self.assertIn("line=2::", text, f"the farther copy is reported: {text}")
             self.assertIn("line=7::", text, f"and so is the nearer one: {text}")
@@ -836,18 +772,8 @@ class HeadOnlyOrphanTests(unittest.TestCase):
                 "/// Creates a new instance.\n\n/// Helper.\nfn helper_b() {}\n\n"
                 "#[cfg(windows)]\nfn new() {}\n",
             )
-            out = io.StringIO()
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
-            text = out.getvalue()
             self.assertIn("`new` had a doc comment", text)
             self.assertNotIn("line=", text, f"both stranded copies are explained: {text}")
             self.assertEqual(text.count("::error"), 1, f"one loss, one annotation: {text}")
@@ -1066,21 +992,12 @@ class ReassignedDocTests(unittest.TestCase):
                 "enum E {\n    /// Doc for A.\n    /// Doc for B.\n"
                 "    /// Doc for C.\n    C,\n    B,\n    A,\n}\n",
             )
-            out = io.StringIO()
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
             self.assertIn(
                 "described 'A,'",
-                out.getvalue(),
-                f"the victim is the item that had the doc at the base: {out.getvalue()}",
+                text,
+                f"the victim is the item that had the doc at the base: {text}",
             )
 
     def test_a_capture_made_between_two_branch_commits_is_caught(self):
@@ -1154,26 +1071,17 @@ class ReassignedDocTests(unittest.TestCase):
                 "a.rs",
                 "enum E {\n    /// Doc for A.\n\n    /// Doc for B.\n    B,\n    A,\n}\n",
             )
-            out = io.StringIO()
-            cwd, argv = os.getcwd(), sys.argv
-            os.chdir(repo.path)
-            sys.argv = ["check_doc_ownership.py", "main", "HEAD"]
-            try:
-                with contextlib.redirect_stdout(out):
-                    code = gate.main()
-            finally:
-                sys.argv = argv
-                os.chdir(cwd)
+            code, text = repo.run_gate()
             self.assertEqual(code, 1)
             self.assertNotIn(
                 "#455",
-                out.getvalue(),
-                f"the diff pass has nothing to say about a stranded block: {out.getvalue()}",
+                text,
+                f"the diff pass has nothing to say about a stranded block: {text}",
             )
             self.assertEqual(
-                out.getvalue().count("::error"),
+                text.count("::error"),
                 1,
-                f"the head-only pass alone: {out.getvalue()}",
+                f"the head-only pass alone: {text}",
             )
 
     def test_a_raw_identifier_is_one_name(self):

@@ -413,7 +413,7 @@ def _items(text):
             end = j + 1
             while j >= 0 and kinds[j] == DOC:
                 j -= 1
-            block = tuple(l.strip() for l in lines[j + 1 : end])
+            block = tuple(doc_line.strip() for doc_line in lines[j + 1 : end])
         yield name, block, i
 
 
@@ -512,7 +512,7 @@ def orphaned_docs(text):
         # Each entry is `(line, first line, what follows, block)`; the block
         # is the stripped text of the whole `///` run, which is how the
         # caller recognises the block a reported loss already explains.
-        block = tuple(l.strip() for l in lines[start:i])
+        block = tuple(line.strip() for line in lines[start:i])
         # Attributes and blank lines sit legally between a doc and its item.
         j = i
         while j < len(lines) and kinds[j] in (ATTR, SKIP):
