@@ -154,6 +154,19 @@ pub fn take_just_installed() -> Vec<Language> {
 /// matter how many times the manager re-probes a missing client.
 static INSTALL_STARTED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
 
+/// Holds a name in [`INSTALL_STARTED`] for the life of one install attempt
+/// and removes it on drop, panic included, so a gate is never left held by
+/// an attempt that is over.
+struct InstallGate(&'static str);
+
+impl Drop for InstallGate {
+    fn drop(&mut self) {
+        if let Ok(mut started) = INSTALL_STARTED.lock() {
+            started.remove(self.0);
+        }
+    }
+}
+
 /// The names handed out by [`static_name`], so each distinct name is leaked
 /// once however often it is asked for.
 static STATIC_NAMES: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
@@ -339,12 +352,23 @@ const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 /// the specific `"<os>-<arch>"` key first (e.g. `linux-x86_64`), then a bare
 /// `"<os>"` key (e.g. `macos` for a universal build). Pure and testable.
 fn target_url<'a>(targets: &'a [(&'a str, &'a str)], os: &str, arch: &str) -> Option<&'a str> {
+    target_entry(targets, os, arch).map(|(_, url)| url)
+}
+
+/// The key and value the platform resolves to in a per-target map, so a
+/// caller that needs two maps to agree (the URL and its digest) can look
+/// both up under the one key the URL came from.
+fn target_entry<'a>(
+    targets: &'a [(&'a str, &'a str)],
+    os: &str,
+    arch: &str,
+) -> Option<(&'a str, &'a str)> {
     let specific = format!("{os}-{arch}");
     targets
         .iter()
         .find(|(k, _)| *k == specific)
         .or_else(|| targets.iter().find(|(k, _)| *k == os))
-        .map(|(_, url)| *url)
+        .map(|(k, v)| (*k, *v))
 }
 
 /// The executable inside a managed binary install. `bin_path` locates a binary
@@ -593,18 +617,18 @@ impl std::io::Write for Capped {
 /// the reason otherwise. A manifest that pins SOME platforms but not this
 /// one is refused rather than installed unverified: a partial map is a
 /// mistake in the manifest, not a licence to skip the gate here.
-fn digest_verdict(
-    sha256: &[(&str, &str)],
-    os: &str,
-    arch: &str,
-    bytes: &[u8],
-) -> Result<(), &'static str> {
+fn digest_verdict(sha256: &[(&str, &str)], key: &str, bytes: &[u8]) -> Result<(), &'static str> {
     if sha256.is_empty() {
         return Ok(());
     }
-    match target_url(sha256, os, arch) {
-        None => Err("no pinned digest for this platform"),
-        Some(expected) if sha256_matches(bytes, expected) => Ok(()),
+    // Looked up under the exact key the URL resolved to, never by a second
+    // independent resolution: a manifest whose two maps are keyed at
+    // different granularities (a universal `macos` asset, per-arch digests)
+    // would otherwise pair a digest with bytes it was never the digest of.
+    // Such a manifest is a mistake and is refused, as a partial map is.
+    match sha256.iter().find(|(k, _)| *k == key) {
+        None => Err("no pinned digest under the platform's target key"),
+        Some((_, expected)) if sha256_matches(bytes, expected) => Ok(()),
         Some(_) => Err("checksum mismatch"),
     }
 }
@@ -624,7 +648,12 @@ fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
 fn find_file_named(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d).ok()?.flatten() {
+        // One unreadable directory is skipped, not the whole walk: the
+        // binary may sit in a sibling still on the stack.
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
             let p = entry.path();
             let Ok(meta) = std::fs::symlink_metadata(&p) else {
                 continue;
@@ -676,7 +705,7 @@ fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'
         return;
     }
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    let Some(url) = target_url(targets, os, arch) else {
+    let Some((key, url)) = target_entry(targets, os, arch) else {
         log_file::log(&format!("lsp[{name}] no prebuilt binary for {os}-{arch}"));
         set_status(format!(
             "{name} unavailable: no prebuilt binary for this platform (install {bin} manually)"
@@ -719,7 +748,7 @@ fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'
     // of it is unpacked or marked executable: an altered asset, a tampered
     // delivery path, or a platform the manifest forgot to pin is refused,
     // not installed. A manifest that pins nothing stays unverified.
-    if let Err(why) = digest_verdict(sha256, os, arch, &bytes) {
+    if let Err(why) = digest_verdict(sha256, key, &bytes) {
         log_file::log(&format!("lsp[{name}] {why} for {url}"));
         crate::output::push(
             crate::output::CHANNEL_PROVISION,
@@ -800,32 +829,40 @@ pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
     let name = config.name;
     let language = config.language;
     let provision = provision.clone();
-    std::thread::spawn(move || match &provision {
-        Provision::Npm {
-            package, version, ..
-        } => run_npm_install(name, language, package, *version),
-        Provision::Uv {
-            package, version, ..
-        } => run_uv_install(name, language, package, *version),
-        Provision::Binary {
-            targets,
-            bin,
-            archive,
-            bin_path,
-            termux_pkg,
-            sha256,
-        } => run_binary_install(
-            name,
-            language,
-            BinarySpec {
+    std::thread::spawn(move || {
+        // Released when this attempt ends, however it ends: a download that
+        // failed or a digest that was refused must leave the next request
+        // free to try again rather than told "installing" for the rest of
+        // the session. An attempt that succeeded no longer needs the gate,
+        // since the binary is on disk for `provisioned_command` to find.
+        let _release = InstallGate(name);
+        match &provision {
+            Provision::Npm {
+                package, version, ..
+            } => run_npm_install(name, language, package, *version),
+            Provision::Uv {
+                package, version, ..
+            } => run_uv_install(name, language, package, *version),
+            Provision::Binary {
                 targets,
                 bin,
-                archive: *archive,
-                bin_path: *bin_path,
-                termux_pkg: *termux_pkg,
+                archive,
+                bin_path,
+                termux_pkg,
                 sha256,
-            },
-        ),
+            } => run_binary_install(
+                name,
+                language,
+                BinarySpec {
+                    targets,
+                    bin,
+                    archive: *archive,
+                    bin_path: *bin_path,
+                    termux_pkg: *termux_pkg,
+                    sha256,
+                },
+            ),
+        }
     });
 }
 
@@ -1603,6 +1640,54 @@ mod tests {
 
     /// A manifest that pins digests for some platforms but not this one
     /// refuses to install here rather than silently skipping the gate; no
+    /// A background install that ends without producing the binary releases
+    /// the one-shot gate (#485 review): the next request is a real retry,
+    /// not a "still installing" that never lands. The download here fails
+    /// at once (nothing listens on that port), which is the failure shape a
+    /// refused digest or a dead mirror also takes.
+    #[test]
+    fn a_failed_install_releases_the_gate_for_a_retry() {
+        let config = ServerConfig {
+            name: "gate-test-viewer",
+            command: String::new(),
+            args: vec![],
+            language: Language::GO,
+            initialization_options: None,
+            provision: None,
+        };
+        let targets: &'static [(&'static str, &'static str)] = Box::leak(
+            vec![(
+                static_name(std::env::consts::OS),
+                "http://127.0.0.1:1/never.tar.gz",
+            )]
+            .into_boxed_slice(),
+        );
+        let provision = Provision::Binary {
+            targets,
+            bin: "never",
+            archive: ArchiveKind::Gz,
+            bin_path: None,
+            termux_pkg: None,
+            sha256: &[],
+        };
+        ensure_in_background(&config, &provision);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let held = INSTALL_STARTED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains("gate-test-viewer");
+            if !held {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the gate is still held long after the download failed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     /// pins at all stays unverified, as every older binary provision is.
     #[test]
     fn a_partial_digest_map_refuses_an_unlisted_platform() {
@@ -1612,33 +1697,54 @@ mod tests {
             format!("{:x}", sha2::Sha256::digest(bytes))
         };
         assert_eq!(
-            digest_verdict(&[], "linux", "x86_64", bytes),
+            digest_verdict(&[], "linux-x86_64", bytes),
             Ok(()),
             "no pins: unverified"
         );
         assert_eq!(
-            digest_verdict(
-                &[("macos-aarch64", real.as_str())],
-                "macos",
-                "aarch64",
-                bytes
-            ),
+            digest_verdict(&[("macos-aarch64", real.as_str())], "macos-aarch64", bytes),
             Ok(()),
             "the platform's pin matches"
         );
         assert!(
-            digest_verdict(&[("macos-aarch64", "00")], "macos", "aarch64", bytes).is_err(),
+            digest_verdict(&[("macos-aarch64", "00")], "macos-aarch64", bytes).is_err(),
             "a wrong pin refuses"
         );
         assert!(
-            digest_verdict(
-                &[("macos-aarch64", real.as_str())],
-                "linux",
-                "x86_64",
-                bytes
-            )
-            .is_err(),
+            digest_verdict(&[("macos-aarch64", real.as_str())], "linux-x86_64", bytes).is_err(),
             "a map that pins other platforms but not this one refuses"
+        );
+    }
+
+    /// The digest is looked up under the key the URL resolved to, so the
+    /// two maps must agree on granularity: a universal `macos` asset pinned
+    /// under `macos` verifies on any Mac, and a per-arch digest map beside a
+    /// universal asset (or the reverse) is refused as the manifest mistake it
+    /// is, rather than checking bytes against a digest of other bytes.
+    #[test]
+    fn a_digest_is_pinned_to_the_key_the_url_resolved_to() {
+        use sha2::Digest;
+        let universal = b"one asset for every mac";
+        let digest = format!("{:x}", sha2::Sha256::digest(universal));
+        let targets = [("macos", "https://example.invalid/mac.tar.xz")];
+        let (key, _) = target_entry(&targets, "macos", "aarch64").unwrap();
+        assert_eq!(key, "macos");
+        assert_eq!(
+            digest_verdict(&[("macos", digest.as_str())], key, universal),
+            Ok(())
+        );
+        assert_eq!(
+            digest_verdict(&[("macos-aarch64", digest.as_str())], key, universal),
+            Err("no pinned digest under the platform's target key"),
+            "per-arch digests beside a universal asset are a manifest mistake"
+        );
+        let per_arch = [("macos-aarch64", "https://example.invalid/arm.tar.xz")];
+        let (key, _) = target_entry(&per_arch, "macos", "aarch64").unwrap();
+        assert_eq!(key, "macos-aarch64");
+        assert_eq!(
+            digest_verdict(&[("macos", digest.as_str())], key, universal),
+            Err("no pinned digest under the platform's target key"),
+            "a universal digest beside per-arch assets is refused, not checked against the wrong bytes"
         );
     }
 

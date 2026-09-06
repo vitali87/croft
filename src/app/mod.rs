@@ -1713,9 +1713,9 @@ fn build_tab_context_menu_items(
 /// * Right-click on empty tree space, or on the workspace root row →
 ///   workspace-scoped actions: New File, New Folder, Paste.
 ///
-/// Test-side entry: reads the real config dir, which the tests that use it
-/// never populate with viewers; the app itself goes through
-/// [`build_tree_context_menu_items_in_dir`] with the dir it carries.
+/// Test-side entry with no viewer lookup, so a viewer installed on the host
+/// can never reach the built-in rows these tests assert; the app itself goes
+/// through [`build_tree_context_menu_items_in_dir`] with the dir it carries.
 #[cfg(test)]
 fn build_tree_context_menu_items(
     node: Option<&crate::widgets::file_tree::Node>,
@@ -1725,14 +1725,16 @@ fn build_tree_context_menu_items(
     clipboard: Option<&ExplorerClipboard>,
     compare_anchor: Option<&Path>,
 ) -> Vec<(String, MenuAction)> {
-    build_tree_context_menu_items_in_dir(
-        &crate::prefs::config_dir(),
+    // No viewer lookup at all: these tests assert the built-in rows, so the
+    // lookup must find nothing whatever the host has installed.
+    build_tree_context_menu_items_with(
         node,
         root,
         selection,
         target_dir,
         clipboard,
         compare_anchor,
+        |_| None,
     )
 }
 
@@ -32269,10 +32271,8 @@ impl App {
                             provision: Some(provision.clone()),
                         };
                         crate::lsp::install::resolve_managed(&config, provision, true);
-                        self.status = format!(
-                            "Installing {}; run {} again once it lands",
-                            viewer.id, viewer.label
-                        );
+                        self.status =
+                            format!("Installing {}; run it again once it lands", viewer.label);
                         return;
                     }
                 }

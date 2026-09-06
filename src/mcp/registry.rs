@@ -322,7 +322,8 @@ provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { 
         let alpha = CSVLENS.replace("id = \"csvlens\"\nname", "id = \"alpha\"\nname");
         let beta = CSVLENS
             .replace("id = \"csvlens\"\nname", "id = \"beta\"\nname")
-            .replace("command = \"csvlens\"", "command = \"beta-bin\"");
+            .replace("command = \"csvlens\"", "command = \"beta-bin\"")
+            .replace("bin = \"csvlens\"", "bin = \"beta-bin\"");
         let sources = vec![alpha, beta];
         let none = BTreeSet::new();
         let ids: Vec<String> = viewer_commands_in(&sources, &none)

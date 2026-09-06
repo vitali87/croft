@@ -458,7 +458,27 @@ pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
             )));
         }
     }
+    // The consent prompt shows a viewer's `command`; when the viewer is
+    // provisioned, what runs is the provision's `bin`. A manifest in which
+    // the two name different programs would have the user allow one and
+    // croft run another, so it is refused here rather than at spawn time.
+    for v in &m.viewers {
+        if let Some(p) = &v.provision
+            && command_file_name(&v.command) != p.bin
+        {
+            return Err(serde::de::Error::custom(format!(
+                "viewer {:?} runs {:?} but provisions {:?}: the command and the provisioned binary must name one program",
+                v.id, v.command, p.bin
+            )));
+        }
+    }
     Ok(m)
+}
+
+/// The program a spawn line names, without any directory: `/opt/t/csvlens`
+/// and `csvlens` are the same program for the purpose of the consent check.
+fn command_file_name(command: &str) -> &str {
+    command.rsplit(['/', '\\']).next().unwrap_or(command)
 }
 
 /// Whether an id can safely name a directory and a key segment.
@@ -707,7 +727,7 @@ api_version = 1
 [[viewers]]
 id = "y"
 label = "y"
-command = "y"
+command = "ybin"
 provision = { kind = "binary", bin = "ybin", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/y.tar.xz" }, sha256 = { "linux-x86_64" = "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3" } }
 "#;
         let m = parse(DECL).expect("parses");
@@ -732,6 +752,47 @@ provision = { kind = "binary", bin = "ybin", archive = "tar.xz", targets = { "li
         assert!(std::ptr::eq(t1, t2), "the target map is interned once");
         assert!(std::ptr::eq(s1, s2), "and so is the digest map");
         assert!(std::ptr::eq(b1, b2), "and every string");
+    }
+
+    /// The consent prompt shows the viewer's `command`; when the viewer is
+    /// provisioned, what runs is the provision's `bin`. A manifest in which
+    /// the two disagree would have the user allow one program and croft run
+    /// another, so it is refused at parse time (#485 review).
+    #[test]
+    fn a_viewer_whose_provisioned_binary_differs_from_its_command_is_refused() {
+        const MISMATCH: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "csvlens"
+provision = { kind = "binary", bin = "something-else", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        let err = parse(MISMATCH)
+            .expect_err("a viewer that would run a program other than the one it names is refused");
+        assert!(
+            err.to_string().contains("something-else") && err.to_string().contains("csvlens"),
+            "the refusal names both programs: {err}"
+        );
+        // A command given as a path agrees with a bare `bin` by its file name.
+        const AGREES: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "/opt/tools/csvlens"
+provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        assert!(
+            parse(AGREES).is_ok(),
+            "a path whose file name is the bin agrees"
+        );
     }
 
     /// #465: a catalog entry that opens a file kind in an external TUI.
