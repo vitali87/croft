@@ -455,7 +455,7 @@ fn run_pdftoppm(
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
             Ok(None) => {
-                kill_group(&mut child);
+                kill_group(child);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
@@ -466,7 +466,7 @@ fn run_pdftoppm(
                 ));
             }
             Err(e) => {
-                kill_group(&mut child);
+                kill_group(child);
                 return Err(e);
             }
         }
@@ -521,11 +521,15 @@ fn settle_stderr(
     }
 }
 
-/// Kill the renderer's whole process group and reap the renderer, on the
-/// budget's overrun (and on a wait error): a renderer that exited on its
-/// own is not chased, whatever it forked. Off unix only the child itself
-/// can be killed.
-fn kill_group(child: &mut std::process::Child) {
+/// Kill the renderer's whole process group on the budget's overrun (and on
+/// a wait error); a renderer that exited on its own is not chased, whatever
+/// it forked. The reap happens on its own thread: a renderer stalled in
+/// uninterruptible I/O (a stuck filesystem is one of the hangs this bound
+/// exists for) keeps SIGKILL pending until the kernel lets it go, and a
+/// synchronous `wait` here would hold the frame loop for exactly as long
+/// as the budget was meant to stop it being held. Off unix only the child
+/// itself can be killed.
+fn kill_group(mut child: std::process::Child) {
     #[cfg(unix)]
     {
         // SAFETY: a negative pid addresses the process group the child was
@@ -536,9 +540,11 @@ fn kill_group(child: &mut std::process::Child) {
             }
         }
     }
-    // The non-unix path, and a no-op on unix after the group signal.
-    let _ = child.kill();
-    let _ = child.wait();
+    std::thread::spawn(move || {
+        // The non-unix path, and a no-op on unix after the group signal.
+        let _ = child.kill();
+        let _ = child.wait();
+    });
 }
 
 // Unbounded (#493): the follow-up that moves the open off the frame loop
