@@ -57,31 +57,31 @@ Only the very first connect (no croft on the box yet) waits for an install. Ever
 
 ### "Background croft update failed; staying on current version"
 
-A background update declines itself, rather than failing, when you are already attached to the remote croft and the fast cross-build path is not available. Both halves have to be true, and the outcome is deliberate: the only route left is a from-source compile on the box itself, and starting an unrequested build on the machine you are actively typing into would spend its cores and disk on work nobody asked for. So croft declines, clears the `updating` marker, and leaves you on the running binary. Nothing is broken and nothing is half-installed; the update simply did not happen.
+This is a refusal, not a crash. It happens when you are already attached to the remote croft *and* the fast cross-build path is unavailable. The only route left would be compiling on the box you are typing into, so croft declines rather than spend its cores on an unrequested build. You stay on the running binary; nothing is half-installed.
 
-The status line is deliberately short, and the reason is written to the install log on the **launching** machine — the Mac or laptop you connected *from*, not the server named in the message:
+The reason is logged on the **launching** machine — the one you connected *from*, not the server in the message:
 
 ```bash
 tail ~/.cache/croft/install.log
 ```
 
-The line to look for names the missing piece:
+Look for the missing piece:
 
 ```
 Local cross-build skipped: rustup target `x86_64-unknown-linux-musl` missing
 Update NOT installed: cross-build unavailable (...)
 ```
 
-The cause is a missing prerequisite for the cross-build: `zig`, `cargo-zigbuild`, or one of the musl rustup targets. Note that rustup targets are per-toolchain and this repo pins its channel in `rust-toolchain.toml`, so `rustup target list --installed` only answers for the pinned toolchain when run from a croft checkout, and a channel bump orphans every target you had added. Install all three prerequisites on the launching machine with:
+The prerequisites are `zig`, `cargo-zigbuild`, and the musl rustup targets. Install them on the launching machine:
 
 ```bash
 croft setup-cross          # prints a plan, then asks to confirm
-croft setup-cross --yes    # skip the prompt (scripts, unattended runs)
+croft setup-cross --yes    # skip the prompt
 ```
 
-It is idempotent (each already-present piece is reported and skipped), and it runs its rustup queries from the checkout so the pinned toolchain is the one it inspects. Answering anything but `y` prints `Aborted.` and exits 0 without changing anything, so check the output rather than the exit code. Then **reconnect** — the declined update is not retried on the existing session, so a fixed toolchain only takes effect on the next connect.
+It is idempotent and reports what it skips. Answering anything but `y` prints `Aborted.` and exits 0, so read the output rather than the exit code. Then **reconnect** — a declined update is not retried on the running session.
 
-Connecting with the dialog still up (no session attached yet) instead asks whether to fall back to compiling on the host, since at that point there is no live session to disturb.
+Two things that catch people out. Rustup targets are per-toolchain, and this repo pins its channel in `rust-toolchain.toml`, so `rustup target list --installed` only answers for the pinned toolchain when run from a croft checkout; a channel bump orphans every target you added. And connecting with the dialog still up — no session attached — asks whether to compile on the host instead, since there is no live session to disturb.
 
 ### Surviving sleep and network drops
 
