@@ -13515,6 +13515,41 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
         app.editor.selection.is_none(),
         "a single line is a place to land, not a range to select"
     );
+
+    type_and_enter(&mut app, "alpha:236:7");
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (235, 6),
+        "`:line:col` lands on the column too"
+    );
+
+    // The click path goes through the same open, so a clicked row honours
+    // the hint as Enter does.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    for c in "alpha:40".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let finder = app.file_finder.as_ref().unwrap();
+    assert_eq!(
+        finder.results.len(),
+        1,
+        "the file part alone matches alpha.rs"
+    );
+    // The list body starts three rows below the popup top (border, prompt,
+    // separator); row 0 is the only result.
+    let (col, row) = (finder.last_rect.x + 4, finder.last_rect.y + 3);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(app.file_finder.is_none(), "the click confirms the pick");
+    assert_eq!(
+        app.editor.cursor_row, 39,
+        "a clicked row lands on the hinted line"
+    );
 }
 
 #[test]

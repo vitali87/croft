@@ -45,7 +45,6 @@ pub struct ScoredResult {
     pub entry: FileEntry,
 }
 
-#[derive(Default)]
 /// Where in the picked file to land, parsed off the end of the query
 /// (#472): `name:236`, `name:236:7` or `name:236-239`. Lines and columns
 /// are one-based as typed.
@@ -56,6 +55,7 @@ pub struct LineHint {
     pub col: Option<usize>,
 }
 
+#[derive(Default)]
 pub struct FileFinder {
     pub query: String,
     pub cursor: usize,
@@ -223,8 +223,15 @@ impl FileFinder {
         // Only the file part takes part in matching: `alpha:236-239` names
         // alpha.rs and a place in it, and a needle carrying the suffix would
         // match nothing at all (#472).
-        let (file_part, _hint) = split_line_hint(&self.query);
+        let (file_part, hint) = split_line_hint(&self.query);
         let needle: String = file_part.trim().to_lowercase();
+        // A hint with no file (`:236`) names a line in nothing: listing every
+        // file and opening the first at that line would be a surprise, so it
+        // matches nothing, as it did before hints existed.
+        if needle.is_empty() && hint.is_some() {
+            self.results = Vec::new();
+            return;
+        }
         if needle.is_empty() {
             let mut scored: Vec<ScoredResult> = Vec::with_capacity(MAX_RESULTS);
             for entry in self.entries.iter().take(MAX_RESULTS) {
@@ -354,11 +361,32 @@ fn push_topk(heap: &mut BinaryHeap<RankedSlot>, slot: RankedSlot, k: usize) {
 pub fn split_line_hint(query: &str) -> (&str, Option<LineHint>) {
     let q = query.trim_end();
     for (i, _) in q.match_indices(':') {
-        if let Some(hint) = parse_line_hint(&q[i + 1..]) {
+        let rest = &q[i + 1..];
+        if let Some(hint) = parse_line_hint(rest) {
             return (&q[..i], Some(hint));
+        }
+        // A hint still being typed (`alpha:`, `alpha:236-`): keep matching
+        // on the file part so the list does not empty between keystrokes,
+        // with no hint until it parses.
+        if is_partial_line_hint(rest) {
+            return (&q[..i], None);
         }
     }
     (query, None)
+}
+
+/// Digits, at most one `-` or `:` separator, digits: every prefix of a hint
+/// a user types on the way to a complete one, the empty string included.
+fn is_partial_line_hint(s: &str) -> bool {
+    let mut seen_sep = false;
+    for b in s.bytes() {
+        match b {
+            b'0'..=b'9' => {}
+            b'-' | b':' if !seen_sep => seen_sep = true,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn parse_line_hint(s: &str) -> Option<LineHint> {
@@ -1204,6 +1232,31 @@ mod tests {
         // A colon with nothing numeric after it is not a line suffix.
         finder.set_query("alpha:");
         assert_eq!(finder.line_hint(), None, "a bare colon is not a hint");
+        // The keystrokes on the way to a complete hint keep the file matched.
+        for partial in ["alpha:", "alpha:236-", "alpha:236:"] {
+            finder.set_query(partial);
+            let names: Vec<&str> = finder
+                .visible_results()
+                .iter()
+                .map(|r| r.entry.rel.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["src/alpha.rs"],
+                "{partial}: still matching on the file part"
+            );
+            assert_eq!(
+                finder.line_hint(),
+                None,
+                "{partial}: no hint until it parses"
+            );
+        }
+        // A hint with no file part names a line in nothing.
+        finder.set_query(":236");
+        assert!(
+            finder.visible_results().is_empty(),
+            "`:236` alone matches nothing"
+        );
     }
 
     #[test]
