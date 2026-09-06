@@ -59,6 +59,20 @@ impl Seat {
             Seat::Generated => String::from("generated"),
         }
     }
+
+    /// The gutter overlay's colour for this seat, one distinct hue per kind
+    /// so a glance tells the seats apart: blue for you, purple for the
+    /// navigator, orange for an agent, green for a peer, grey for text that
+    /// came from a completion or a snippet rather than a person.
+    pub fn hue(&self) -> (u8, u8, u8) {
+        match self {
+            Seat::Me => (0x4e, 0x9a, 0xff),
+            Seat::Navigator => (0xc0, 0x7c, 0xff),
+            Seat::Agent(_) => (0xff, 0x9f, 0x40),
+            Seat::Peer(_) => (0x66, 0xcc, 0x66),
+            Seat::Generated => (0x8a, 0x8a, 0x8a),
+        }
+    }
 }
 
 /// Per-buffer line provenance.
@@ -277,5 +291,20 @@ mod tests {
         );
         assert_eq!(Seat::Peer(String::from("ada")).label(), "ada");
         assert_eq!(Seat::Generated.label(), "generated");
+    }
+
+    /// The hues are the gutter's interface, like the labels: five kinds,
+    /// five colours, so a glance tells the seats apart.
+    #[test]
+    fn every_seat_kind_has_its_own_hue() {
+        let seats = [
+            Seat::Me,
+            Seat::Navigator,
+            Seat::Agent(String::from("p")),
+            Seat::Peer(String::from("ada")),
+            Seat::Generated,
+        ];
+        let hues: std::collections::BTreeSet<_> = seats.iter().map(Seat::hue).collect();
+        assert_eq!(hues.len(), seats.len(), "two kinds share a hue: {hues:?}");
     }
 }

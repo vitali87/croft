@@ -2011,6 +2011,11 @@ struct Snapshot {
     /// crosses a save point re-dirties the buffer: its content no longer
     /// matches disk even though the snapshot predates the edit.
     save_seq: u64,
+    /// Who typed each line at the time of the snapshot (#349): an undo
+    /// brings back text, and the map that described that text comes back
+    /// with it, so a cycle never credits lines to whoever wrote a different
+    /// buffer.
+    provenance: crate::provenance::Provenance,
 }
 
 const UNDO_STACK_LIMIT: usize = 500;
@@ -2384,6 +2389,11 @@ pub struct Editor {
     /// Whether to paint the current-line blame annotation (user pref, default
     /// on). The blame data is still fetched so toggling is instant.
     pub blame_enabled: bool,
+    /// Paint who typed each line in the gutter and name the seat in the
+    /// inline-blame annotation (#349). Off by default: it is a review lens,
+    /// not a resting state, and `Editor: Toggle Provenance` flips it for the
+    /// session.
+    pub provenance_overlay: bool,
     pub scroll: usize,
     /// In soft-wrap mode, the index of the first visible visual segment within
     /// the top logical line (`self.scroll`). Lets the viewport start partway
@@ -2824,6 +2834,7 @@ impl Editor {
             blame_lines: None,
             blame_for: None,
             blame_enabled: true,
+            provenance_overlay: false,
             scroll: 0,
             scroll_sub: 0,
             wrap_total_cache: Vec::new(),
@@ -3178,6 +3189,30 @@ impl Editor {
     /// range. Committed lines read `author, age • summary`; a line git blames
     /// against the zero hash (a working-tree edit) reads `Uncommitted changes`.
     pub fn current_line_blame_annotation(&self) -> Option<String> {
+        let note = self.committed_blame_annotation();
+        if !self.provenance_overlay {
+            return note;
+        }
+        // With the lens on, the seat that typed the cursor's line joins the
+        // annotation (`Vitali, 1 minute ago • fix • you`), or stands alone
+        // on a line git has nothing to say about. A line with no record
+        // adds nothing: it is unknown, not "you".
+        // A `None` from the git half can mean "suppressed here" (a conflict
+        // block, whose [Accept …] actions own this cell) as well as "nothing
+        // to say", so the seat never stands alone on those rows.
+        let in_conflict =
+            crate::merge::conflict_containing(&self.conflicts, self.cursor_row).is_some();
+        match (note, self.provenance.seat(self.cursor_row)) {
+            (Some(n), Some(seat)) => Some(format!("{n} • {}", seat.label())),
+            (Some(n), None) => Some(n),
+            (None, Some(seat)) if self.blame_enabled && !in_conflict => Some(seat.label()),
+            (None, _) => None,
+        }
+    }
+
+    /// The git half of the annotation: author, age and summary of the
+    /// cursor's line, or the uncommitted marker.
+    fn committed_blame_annotation(&self) -> Option<String> {
         if !self.blame_enabled {
             return None;
         }
@@ -7413,6 +7448,7 @@ impl Editor {
             carets: self.carets.clone(),
             dirty: self.dirty,
             save_seq: self.save_seq,
+            provenance: self.provenance.clone(),
         }
     }
 
@@ -7468,17 +7504,15 @@ impl Editor {
     /// the caret into the restored buffer and refreshing highlights.
     fn restore_snapshot(&mut self, snap: Snapshot) {
         self.lines = snap.lines;
-        // Undo/redo swaps the whole buffer, and `Snapshot` does not carry the
-        // map, so the attributions describe text that is no longer here.
-        // Cleared rather than kept: #349 lists surviving an undo cycle as a
-        // criterion, and carrying a stale map would falsify it silently
-        // instead of leaving the lines honestly unknown. Restoring it
-        // properly means putting `provenance` in `Snapshot`, which is the
-        // later layer of that issue.
-        self.provenance = crate::provenance::Provenance::new();
+        // The map that described this text comes back with it (#349): an
+        // undo re-credits the lines it restores to the seats that wrote
+        // them, a redo re-credits the edit to its seat. Truncated below to
+        // the restored line count, as every other whole-buffer path does.
+        self.provenance = snap.provenance;
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
+        self.provenance.truncate(self.lines.len());
         self.cursor_row = snap.cursor_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = snap.cursor_col.min(self.line_char_len(self.cursor_row));
         self.selection = snap.selection;
@@ -11048,6 +11082,23 @@ impl Widget for &mut Editor {
                     Style::default().fg(color),
                 );
             }
+            // Provenance overlay (#349): the same lane, a thinner bar in the
+            // seat's hue, painted over the git bar while the lens is on
+            // because the user asked who typed the line, not whether it
+            // differs from HEAD. A line with no record paints nothing: an
+            // unknown line is never guessed at.
+            if self.provenance_overlay
+                && (!wrap || row_start == 0)
+                && let Some(seat) = self.provenance.seat(line_idx)
+            {
+                let (r, g, b) = seat.hue();
+                buf.set_string(
+                    inner.x + gutter_width,
+                    y,
+                    "\u{258e}", // ▎ left one-quarter block
+                    Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
+                );
+            }
 
             // Per-row window: the segment [row_start, row_end). For non-wrap
             // this is exactly the horizontally-scrolled view; for wrap it is
@@ -14133,12 +14184,14 @@ mod tests {
         );
     }
 
-    /// A whole-buffer swap leaves no attribution behind (#349).
+    /// A whole-buffer swap leaves no stale attribution behind (#349).
     ///
-    /// Undo/redo and a reload both replace `lines` outright, and the map
-    /// described the text that was replaced. Keeping it would credit lines to
-    /// whoever wrote the buffer's PREVIOUS contents — the invariant's worst
-    /// form, because nothing about the resulting overlay looks wrong.
+    /// A reload replaces `lines` outright, and the map described the text
+    /// that was replaced; keeping it would credit lines to whoever wrote the
+    /// buffer's PREVIOUS contents, the invariant's worst form, because
+    /// nothing about the resulting overlay looks wrong. An undo swaps the
+    /// buffer too, but brings back the map of the text it brings back:
+    /// here that text had no attribution, so none is left behind.
     #[test]
     fn a_whole_buffer_swap_forgets_the_old_attributions() {
         let mut ed = Editor::new();
@@ -14176,6 +14229,65 @@ mod tests {
             0,
             "a reload kept attributions for text it replaced: {:?}",
             re.provenance
+        );
+    }
+
+    /// An undo/redo cycle restores the provenance the buffer had at each
+    /// step (#349, criterion 2): the snapshot carries the map, so undoing an
+    /// edit brings back the attributions of the text it brings back, and
+    /// redoing brings back the edit's own. Distinguishable seats per line,
+    /// or a seat landing on the wrong line would be invisible.
+    #[test]
+    fn an_undo_cycle_restores_the_provenance_of_each_step() {
+        use crate::provenance::Seat;
+        let mut ed = Editor::new();
+        ed.lines = vec![String::from("a"), String::from("b")];
+        ed.provenance.record(0..1, Seat::Peer(String::from("ada")));
+        ed.provenance.record(1..2, Seat::Generated);
+        ed.cursor_row = 1;
+        ed.cursor_col = 0;
+        ed.insert_str_as("x\n", Seat::Navigator);
+        assert_eq!(ed.lines, vec!["a", "x", "b"], "staging: the edit landed");
+        // Inserting at column 0 splits `b`, and a split credits both halves
+        // to the splitting seat (the shipped rule), so `b` reads Navigator
+        // now; the undo below must bring back the Generated it had.
+        assert_eq!(
+            ed.provenance.seat(1),
+            Some(&Seat::Navigator),
+            "staging: attributed"
+        );
+        assert_eq!(
+            ed.provenance.seat(2),
+            Some(&Seat::Navigator),
+            "staging: the split half too"
+        );
+
+        assert!(ed.undo(), "the edit undoes");
+        assert_eq!(ed.lines, vec!["a", "b"]);
+        assert_eq!(
+            ed.provenance.seat(0),
+            Some(&Seat::Peer(String::from("ada"))),
+            "undo restores the first line's seat: {:?}",
+            ed.provenance
+        );
+        assert_eq!(
+            ed.provenance.seat(1),
+            Some(&Seat::Generated),
+            "and the second line's, which the edit had moved: {:?}",
+            ed.provenance
+        );
+
+        assert!(ed.redo(), "the edit redoes");
+        assert_eq!(ed.lines, vec!["a", "x", "b"]);
+        assert_eq!(
+            ed.provenance.seat(1),
+            Some(&Seat::Navigator),
+            "redo restores the edit's seat"
+        );
+        assert_eq!(
+            ed.provenance.seat(2),
+            Some(&Seat::Navigator),
+            "and the split half's, exactly as the edit left it"
         );
     }
 
@@ -14630,6 +14742,107 @@ mod tests {
         e.insert_char('X');
         e.refresh_git_marks();
         assert_eq!(e.git_mark_at(1), Some(GitMark::Modified));
+    }
+
+    /// The provenance lens paints a bar in the seat's hue in the gutter's
+    /// spacer cell (#349): two seats, two colours, and a line with no record
+    /// paints nothing there. Off, the lane is the git gutter's alone.
+    #[test]
+    fn provenance_overlay_paints_a_seat_coloured_bar_per_line() {
+        use crate::provenance::Seat;
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("a\nb\nc");
+        e.provenance.record(0..1, Seat::Me);
+        e.provenance
+            .record(1..2, Seat::Agent(String::from("pane 2")));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 5,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let bar_x = e.last_inner.x + e.last_gutter_width;
+        assert_ne!(
+            buf[(bar_x, e.last_inner.y)].symbol(),
+            "\u{258e}",
+            "off, the lens paints nothing"
+        );
+        e.provenance_overlay = true;
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let me = &buf[(bar_x, e.last_inner.y)];
+        let agent = &buf[(bar_x, e.last_inner.y + 1)];
+        let unknown = &buf[(bar_x, e.last_inner.y + 2)];
+        assert_eq!(me.symbol(), "\u{258e}", "a line you typed gets a bar");
+        assert_eq!(
+            agent.symbol(),
+            "\u{258e}",
+            "a line an agent typed gets a bar"
+        );
+        assert_ne!(me.style().fg, agent.style().fg, "in distinct hues");
+        assert_ne!(
+            unknown.symbol(),
+            "\u{258e}",
+            "a line with no record is never guessed"
+        );
+    }
+
+    /// Inside a conflict block the annotation stays off with the lens on
+    /// (#349): the [Accept …] actions own the header row's cells, and a seat
+    /// standing alone there would paint over the affordance that resolves
+    /// the conflict.
+    #[test]
+    fn provenance_overlay_stays_silent_on_a_conflict_header() {
+        use crate::provenance::Seat;
+        let mut e = editor_with("<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x");
+        let _ = e.conflicts();
+        e.provenance.record(0..1, Seat::Me);
+        e.provenance_overlay = true;
+        e.blame_enabled = true;
+        e.cursor_row = 0;
+        assert!(
+            e.current_line_blame_annotation().is_none(),
+            "the accept affordance still owns the header row"
+        );
+    }
+
+    /// With the lens on, the inline-blame annotation names the seat that
+    /// typed the cursor's line (#349), and says nothing extra for a line
+    /// with no record.
+    #[test]
+    fn provenance_overlay_names_the_seat_in_the_blame_annotation() {
+        use crate::provenance::Seat;
+        let mut e = editor_with("one\ntwo\n");
+        e.path = Some(PathBuf::from("f.rs"));
+        e.set_blame(
+            PathBuf::from("f.rs"),
+            Some(vec![
+                blame_line("Vitali", "fix: the thing", 90, false),
+                blame_line("Alice", "feat: two", 7200, false),
+            ]),
+        );
+        e.provenance
+            .record(0..1, Seat::Agent(String::from("pane 2")));
+        e.cursor_row = 0;
+        assert_eq!(
+            e.current_line_blame_annotation().as_deref(),
+            Some("Vitali, 1 minute ago • fix: the thing"),
+            "off, the annotation is git's alone"
+        );
+        e.provenance_overlay = true;
+        assert_eq!(
+            e.current_line_blame_annotation().as_deref(),
+            Some("Vitali, 1 minute ago • fix: the thing • agent (pane 2)"),
+            "on, the seat joins it"
+        );
+        e.cursor_row = 1;
+        assert_eq!(
+            e.current_line_blame_annotation().as_deref(),
+            Some("Alice, 2 hours ago • feat: two"),
+            "a line with no record adds nothing"
+        );
     }
 
     #[test]
