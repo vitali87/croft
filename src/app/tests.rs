@@ -13531,6 +13531,28 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
         app.editor.scroll
     );
 
+    // A pick with no hint replaces the range a hinted pick left: quick open
+    // never installed a selection before hints existed, so a bare `alpha`
+    // must not re-show one the user did not just ask for.
+    type_and_enter(&mut app, "alpha");
+    assert!(
+        app.editor.selection.is_none(),
+        "an unhinted pick clears the range a hinted pick left"
+    );
+    // A saturated line number goes through the open path like any other
+    // out-of-range line: it lands on the last line and the status reports
+    // the line landed on, never the sentinel.
+    type_and_enter(&mut app, "alpha:99999999999999999999");
+    assert_eq!(
+        app.editor.cursor_row, 299,
+        "a saturated line lands on the last line"
+    );
+    assert!(
+        app.status.ends_with("alpha.rs:300"),
+        "the status names the landed line, not the typed one: {:?}",
+        app.status
+    );
+
     type_and_enter(&mut app, "alpha:12");
     assert_eq!(
         app.editor.cursor_row, 11,

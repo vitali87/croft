@@ -30901,12 +30901,11 @@ impl App {
             match opened {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
-                    // A hinted landing replaces whatever was selected: the
+                    // A quick-open pick replaces whatever was selected: the
                     // file may already be open with a range from an earlier
-                    // pick, and `alpha:12` must not keep showing it.
-                    if hint.is_some() {
-                        self.editor.clear_selection();
-                    }
+                    // hinted pick, and neither `alpha:12` nor a bare `alpha`
+                    // must keep showing it.
+                    self.editor.clear_selection();
                     if let Some(end) = hint.and_then(|h| h.end) {
                         let start = self.editor.cursor_row;
                         let last = self.editor.lines.len().saturating_sub(1);
@@ -30936,12 +30935,23 @@ impl App {
                     // sees where in the workspace the file lives.
                     self.tree.reveal_path(&path);
                     self.focus_pane(Pane::Editor);
+                    // The status names the lines landed on: a number past the
+                    // file (or one that saturated in the parser) was clamped
+                    // above, and the clamped truth is the useful signal.
+                    let last_line = self.editor.lines.len().max(1);
                     self.status = match hint {
                         Some(hint) => match hint.end {
-                            Some(end) => {
-                                format!("Opened {}:{}-{}", self.status_path(&path), hint.line, end)
-                            }
-                            None => format!("Opened {}:{}", self.status_path(&path), hint.line),
+                            Some(end) => format!(
+                                "Opened {}:{}-{}",
+                                self.status_path(&path),
+                                hint.line.min(last_line),
+                                end.min(last_line)
+                            ),
+                            None => format!(
+                                "Opened {}:{}",
+                                self.status_path(&path),
+                                hint.line.min(last_line)
+                            ),
                         },
                         None => format!("Opened {}", self.status_path(&path)),
                     };

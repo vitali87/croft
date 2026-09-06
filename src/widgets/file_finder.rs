@@ -229,6 +229,9 @@ impl FileFinder {
         // can end on Linux. When a file is named exactly what was typed, the
         // query is that name and is matched literally; otherwise the file
         // part goes on matching while the user types the rest of the hint.
+        // The exact-name check is a second pass over the corpus, taken only
+        // on the keystrokes where the query was cut (`alpha:`, `alpha:23-`);
+        // it short-circuits on a hit and costs one traversal on a miss.
         if hint.is_none() {
             let raw = self.query.trim().to_lowercase();
             if raw != needle && entries_have_filename(&self.entries, &raw) {
