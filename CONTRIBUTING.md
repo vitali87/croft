@@ -3,14 +3,13 @@
 Thanks for hacking on croft. Build, run, and platform setup live in the
 [README](README.md) and the [platform guides](docs/). Project internals are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This guide covers the day to day
-developer workflow concerns that do not belong in any of those.
+developer workflow that does not belong in any of those.
 
-Everything in this guide applies to AI agents too, including the three
-sections below on coordinating work, on verifying that a review happened, and
-on verifying that the checks actually ran. Agents often
-also keep a `CLAUDE.md` at the root for their own preferences, but it is
-deliberately untracked and clone-local: a fresh checkout will not have one, and
-nothing here depends on it.
+Everything here applies to AI agents too, including the three sections below on
+coordinating work, on verifying that a review happened, and on verifying that
+the checks actually ran. Agents often also keep a `CLAUDE.md` at the root for
+their own preferences, but it is deliberately untracked and clone-local: a
+fresh checkout will not have one, and nothing here depends on it.
 
 ## Coordinating work, so concurrent sessions do not collide
 
@@ -29,9 +28,9 @@ it is not a reservation:
    message is cheap; discovering ownership after merging is not.
 3. Silence plus a stale commit date means it is free to take.
 
-When you do take something over, say so on the PR with your reasons, and leave
-the branch untouched and reopenable — no force-push, no rewriting someone
-else's history.
+When you take something over, say so on the PR with your reasons, and leave the
+branch untouched and reopenable — no force-push, no rewriting someone else's
+history.
 
 ## Verifying a review actually happened
 
@@ -60,12 +59,11 @@ Where this section and an untracked `/CLAUDE.md` disagree, **this file wins**:
 `/CLAUDE.md` is gitignored, so a fresh clone never sees it and it drifts
 per-machine.
 
-**An all-green check list can mean CI never started.** As CI
-gets faster this gets more dangerous, not less: a check-settled test that polls
-until nothing is pending passes instantly against an empty list, because the
-run has not been created yet. Count the jobs and require all of them for the
-SHA you are about to merge. "Nothing is failing" and "nothing has run" are the
-same reading.
+**An all-green check list can mean CI never started.** Faster CI makes this
+more dangerous, not less: a check-settled test that polls until nothing is
+pending passes instantly against an empty list, because the run has not been
+created yet. Count the jobs and require all of them for the SHA you are about
+to merge. "Nothing is failing" and "nothing has run" are the same reading.
 
 ```bash
 head=$(gh pr view <n> --json headRefOid --jq .headRefOid)
@@ -73,10 +71,10 @@ gh run list --commit "$head" --json databaseId --jq 'length'   # 0 = nothing ran
 ```
 
 Count **runs**, not checks. A check is not a run: a rate-limited review bot
-posts a status context without any workflow behind it, so on this repo PR #335
-returns `1` from `gh pr checks --json name --jq 'length'` while having zero
-runs for its head. The reader who most needs this item — the one whose CI never
-started — is exactly the one that count misleads.
+posts a status context with no workflow behind it, so a PR here returned `1`
+from `gh pr checks --json name --jq 'length'` while having zero runs for its
+head. The reader who most needs this item — the one whose CI never started — is
+exactly the one that count misleads.
 
 **A `CONFLICTING` pull request gets no workflow runs at all.** GitHub cannot
 compute the merge commit, so it never creates them. Four pushes over an hour
@@ -100,20 +98,20 @@ empty list would not.
 **A job that never got a runner reports `pending`, exactly like one that is
 running.** `gh run view <id> --json jobs` is the right command, but read
 `status`, not `completedAt`. That field is Go's zero `time.Time`
-(`0001-01-01T00:00:00Z`) for every job that has not finished, `in_progress` and
-`queued` alike, so it separates finished from unfinished — which is not the
-question. `startedAt` is populated on queued jobs too. What distinguishes them
-is a job still `queued` while its siblings in the same run have moved to
-`in_progress` or `completed`.
+(`0001-01-01T00:00:00Z`) for every unfinished job, `in_progress` and `queued`
+alike, so it separates finished from unfinished — which is not the question.
+`startedAt` is populated on queued jobs too. What distinguishes them is a job
+still `queued` while its siblings in the same run have moved to `in_progress`
+or `completed`.
 
 **Threads can appear after everything is green, and an earlier read of them
-expires.** The rule above about a bot whose check says pass while no review ran
-has a second direction, and it nearly landed a major on #392: a bot that has
-been genuinely silent can start producing findings at any moment, and its check
-row looks identical before and after. That PR was eight-of-eight green — where
-one of the eight was the review bot's own `pass`, annotated "Review rate
-limited" — when a pre-merge re-fetch turned up five inline threads, one of them
-a command running in a directory other than the one its confirm popup named.
+expires.** The trap above — a bot whose check says pass while no review ran —
+has a second direction, and it nearly landed a major bug: a bot that has been
+genuinely silent can start producing findings at any moment, and its check row
+looks identical before and after. One PR was eight-of-eight green — one of the
+eight being the review bot's own `pass`, annotated "Review rate limited" — when
+a pre-merge re-fetch turned up five inline threads, one of them a command
+running in a directory other than the one its confirm popup named.
 
 Read them with the GraphQL `reviewThreads` query rather than
 `pulls/<n>/comments`: the REST payload carries no resolution state at all, and
@@ -147,10 +145,10 @@ somewhere else entirely:
 gh api repos/<repo>/rules/branches/main
 ```
 
-On this repo that is where `required_review_thread_resolution` lives, which is
+That is where this repo's `required_review_thread_resolution` lives, which is
 why a PR with every check green and every finding fixed in code still refuses
-to merge until the threads themselves are resolved. Fixing the code does not resolve a thread: reply saying where the point was
-addressed, then resolve it.
+to merge until the threads themselves are resolved. Fixing the code does not
+resolve a thread: reply saying where the point was addressed, then resolve it.
 
 **A merge commit can have the right tree and the wrong parents.** If a merge
 is committed before it is completed, the tree carries main's *changes* while
@@ -162,11 +160,10 @@ merge that looks done, and the branch reads as inexplicably `DIRTY`.
 **The trigger is "DIRTY at a tree I have just verified is right"**, not "I
 suspect my merge failed" — because you will not suspect that. The natural
 response to an unexplained `DIRTY` is to resolve the conflict again, which
-produces another single-parent commit and the identical result. And the
-evidence does not survive: redoing the merge on top makes the broken commit
-two-parent, so `git log -1 --format=%p` on it prints two afterwards and
-nothing in the tree records that anything was wrong. It is diagnosable only
-in the moment.
+produces another single-parent commit and the identical result. The evidence
+does not survive either: redoing the merge on top makes the broken commit
+two-parent, so `git log -1 --format=%p` prints two afterwards and nothing in
+the tree records that anything was wrong. It is diagnosable only in the moment.
 
 Only the parent list tells you, so ask about the parents:
 
@@ -212,9 +209,9 @@ panel, so a binary always describes itself.
 Notes live in one file per version rather than one shared file because two
 versions' notes never conflict in content, only in the file they shared: with
 several PRs open, every merge forced a rebase through it, and the version
-number had to be reserved by hand between contributors (#399). Only the
-current version's file may change in a PR: an older one describes a release
-that has already shipped.
+number had to be reserved by hand between contributors. Only the current
+version's file may change in a PR: an older one describes a release that has
+already shipped.
 
 CI enforces all of it (the `version bump + release notes` job). Docs, CI, and
 test-only PRs are exempt: `src/app/tests.rs` and `tests/` by path, and a `.rs`
@@ -233,9 +230,9 @@ stays green and the rendered rustdoc is *confidently wrong* rather than
 absent, which is worse - absent docs send a reader to the code, wrong docs
 stop them looking.
 
-The habit that avoids it entirely is positional: add a new item after a
-complete item, not directly above a `///` block. Where that is not possible,
-confirm the doc block above the **next** item still describes that next item.
+The habit that avoids it is positional: add a new item after a complete item,
+not directly above a `///` block. Where that is not possible, confirm the doc
+block above the **next** item still describes that next item.
 
 This is not only about functions. A `const` inserted above another `const`'s
 doc captures it exactly the same way, and did so twice in one day before the
@@ -248,22 +245,22 @@ head is the fingerprint this insertion leaves. It covers `fn`, `const`,
 for a file your branch ADDS it compares your commits pairwise, since a file
 with no base version has no merge-base history to lose documentation against.
 
-Two further passes cover captures that fingerprint does not leave. One reads
-your head on its own and reports a `///` block with nothing under it that a
-doc can attach to, which is what an insertion strands when the newcomer has no
-doc of its own. The other compares what each doc line sat above earlier with
-what it sits above now, at the merge base and at every non-merge commit on
-your branch that touched the file, so a capture made and left in place
-mid-branch is seen even though the merge base predates both items. Merges are
-skipped because a merge's first parent is your branch tip, so comparing across
-one replays whatever you merged IN as your own work; the cost is that a
-capture made by a merge resolution, where the thief is a line the other side
-already had, is not reported. An item inserted directly
-above a documented enum variant takes its prose while stranding nothing at
-all, and that shape shipped once with the gate green. It reports only when the
-old item is still there and now has no documentation, and when the line the
-prose landed on is new, so moving a doc back onto its rightful item stays
-green.
+Two further passes cover captures that fingerprint does not leave:
+
+* **Head-only.** Reports a `///` block with nothing under it for a doc to
+  attach to — what an insertion strands when the newcomer has no doc of its own.
+* **Doc-changed-owner.** Compares what each doc line sat above earlier with what
+  it sits above now, at the merge base and at every non-merge commit on your
+  branch that touched the file, so a capture made and left in place mid-branch
+  is seen even though the merge base predates both items. It exists because an
+  item inserted directly above a documented enum variant takes its prose while
+  stranding nothing at all, and that shape shipped once with the gate green. It
+  reports only when the old item is still there and now has no documentation,
+  and when the line the prose landed on is new, so moving a doc back onto its
+  rightful item stays green. Merges are skipped because a merge's first parent
+  is your branch tip, so comparing across one replays whatever you merged IN as
+  your own work; the cost is that a capture made by a merge resolution, where
+  the thief is a line the other side already had, is not reported.
 
 If a removal is deliberate, say so in a commit message on the branch:
 
@@ -272,13 +269,13 @@ doc-removal: src/path/to/file.rs::some_function_name
 doc-removal: src/path/to/file.rs::SomeType::method_name
 ```
 
-The key after the path is the one the gate's own error names: a bare name
-for a free item, or the enclosing `impl` header for a method (`Foo::new`,
-`Display for Foo::fmt`), so a declared removal of one `new` cannot excuse
-another. It covers the two passes that name an item: the merge-base loss check
-and the doc-changed-owner check. For a victim the gate does not model as an
-item, an enum variant being the common case, the key is the leading name on the
-line itself (`E::A` is declared as `a.rs::A`), and the error prints the exact
+The key after the path is the one the gate's own error names: a bare name for a
+free item, or the enclosing `impl` header for a method (`Foo::new`, `Display for
+Foo::fmt`), so a declared removal of one `new` cannot excuse another. It covers
+the two passes that name an item: the merge-base loss check and the
+doc-changed-owner check. For a victim the gate does not model as an item, an
+enum variant being the common case, the key is the leading name on the line
+itself (`E::A` is declared as `a.rs::A`), and the error prints the exact
 declaration to write.
 
 The head-only pass has no declaration, because what it reports is prose with
@@ -293,39 +290,33 @@ Run it yourself with `python3 scripts/check_doc_ownership.py origin/main HEAD`.
 
 ## Managing the `target/` directory
 
-croft is a large workspace with a deep dependency tree, and active development
-means frequent rebuilds. Cargo optimises for build speed by keeping the
-incremental compilation cache (`target/debug/incremental/`) plus a compiled copy
-of every crate in the tree. The catch is that Cargo **does not garbage collect
-the per project `target/` directory**: old incremental snapshots from previous
-branches and toolchains accumulate and are never reclaimed. On a busy croft
-checkout this directory can grow into the hundreds of gigabytes, the bulk of it
-stale incremental cache.
+croft is a large workspace with a deep dependency tree, so rebuilds are
+frequent. Cargo trades disk for build speed, keeping the incremental
+compilation cache (`target/debug/incremental/`) plus a compiled copy of every
+crate in the tree. The catch is that Cargo **does not garbage collect the per
+project `target/` directory**: old incremental snapshots from previous branches
+and toolchains accumulate and are never reclaimed. On a busy croft checkout the
+directory can reach hundreds of gigabytes, mostly stale incremental cache.
 
-Two things worth knowing:
+Neither obvious answer works:
 
-* Cargo's built in automatic cache cleanup (stable since 1.88) only prunes the
-  **global** cache under `~/.cargo` (downloaded registry and git sources). It
-  never touches a project's `target/`, so it does nothing for the directory that
-  actually grows.
-* A one off `cargo clean` wipes `target/` entirely, which reclaims everything
-  but forces a full cold rebuild next time. Fine in an emergency, painful as a
-  routine.
+* Cargo's automatic cache cleanup (stable since 1.88) only prunes the **global**
+  cache under `~/.cargo` (downloaded registry and git sources). It never touches
+  a project's `target/`, so it does nothing for the directory that grows.
+* `cargo clean` wipes `target/` entirely, reclaiming everything but forcing a
+  full cold rebuild next time. Fine in an emergency, painful as a routine.
 
 ### The recommended fix: scheduled `cargo-sweep`
 
 [`cargo-sweep`](https://github.com/holmgr/cargo-sweep) deletes only the build
-artifacts that have not been used for N days. Your active branch stays warm and
-rebuilds fast while stale snapshots get reclaimed. Run it on a timer and you
-never have to think about disk space again.
-
-Install it:
+artifacts unused for N days, so your active branch stays warm and rebuilds fast
+while stale snapshots get reclaimed.
 
 ```bash
 cargo install cargo-sweep
 ```
 
-Run it by hand whenever you want, recursively across all your Rust projects:
+Run it by hand, recursively across all your Rust projects:
 
 ```bash
 # Preview first (no deletions)
@@ -343,8 +334,7 @@ branches a lot and the cache still grows faster than you would like.
 Run the sweep weekly so it stays hands off.
 
 **macOS (launchd).** Save as
-`~/Library/LaunchAgents/com.user.cargo-sweep.plist`, adjusting the path to where
-you keep your projects:
+`~/Library/LaunchAgents/com.user.cargo-sweep.plist`, adjusting the project path:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -396,8 +386,8 @@ Or, if you prefer systemd, a user `cargo-sweep.timer` paired with a
 ### Why not turn off incremental compilation?
 
 Setting `incremental = false` would stop the cache from growing, but it slows
-the edit, build, run loop that you rely on while developing croft. Keep
-incremental on and let `cargo-sweep` reclaim the stale parts instead.
+the edit, build, run loop you rely on while developing croft. Keep incremental
+on and let `cargo-sweep` reclaim the stale parts instead.
 
 ### macOS: keep the build directory out of Spotlight
 
@@ -415,7 +405,7 @@ The suite spawns PTYs and real shells, so a slice of it is timing-sensitive and
 starves under contention. Run it flat out on a many-core machine and you get
 failures that have nothing to do with your change — terminal, clipboard and
 pairing tests that pass fine on an idle box. CI pins `RUST_TEST_THREADS: 4` for
-exactly this reason.
+this reason.
 
 Half your cores is a reasonable default:
 
@@ -426,8 +416,8 @@ RUST_TEST_THREADS=$(( ($(getconf _NPROCESSORS_ONLN) + 1) / 2 )) cargo test
 One test is `#[ignore]`d for the same reason and runs separately: the 200 ms
 fs-sync invariant (an external file change reaches the Explorer within 200 ms)
 is a wall-clock claim, and a parallel suite is itself the load, so the suite
-carries it as a count of drain ticks and the wall-clock version runs alone
-(#483). CI runs it serially after the suite; locally:
+carries it as a count of drain ticks and the wall-clock version runs alone. CI
+runs it serially after the suite; locally:
 
 ```bash
 cargo test --bin croft fs_sync_reflects -- --ignored --test-threads=1
@@ -446,9 +436,9 @@ baselining is faster than bisecting.
 
 A test that spawns a real process and waits a **fixed** wall-clock budget will
 flake on a loaded machine, and the budget looks generous right up until it
-isn't. The number is not knowable from inside the test: what blows it is not
-the operation, it is contention from every other test spawning at the same
-moment, plus whatever else owns the machine.
+isn't. The number is not knowable from inside the test: what blows it is not the
+operation but contention from every other test spawning at the same moment, plus
+whatever else owns the machine.
 
 So do not pick a fresh constant. Use the shared helper, which scales a quiet
 machine baseline by the load actually present:
@@ -482,7 +472,7 @@ cross target, which silently turns `croft <host>` from "ship a prebuilt static
 binary" into "compile the whole crate graph on the user's box". A 1.95.0 to
 1.97.1 bump did exactly that for four days.
 
-So a toolchain bump is not finished until this passes, run **from inside the
+A toolchain bump is not finished until this passes, run **from inside the
 checkout** so the pin applies:
 
 ```bash

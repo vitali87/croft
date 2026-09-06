@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 /// Cloned rather than interned: a buffer has a handful of distinct seats and
 /// the map is per-buffer, so the sharing an interner would buy is not worth
 /// the indirection at the point where the gutter paints.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Seat {
     /// The person at this croft.
     Me,
@@ -79,7 +79,7 @@ impl Seat {
 ///
 /// Keyed on 0-based line index. A line with no entry is `Unknown` and stays
 /// that way: see the module invariant.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Provenance {
     lines: BTreeMap<usize, Seat>,
 }

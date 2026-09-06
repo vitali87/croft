@@ -270,6 +270,51 @@ pub(crate) mod tests {
     /// and merely starved -- the case a load-scaled budget exists for.
     pub(crate) const TERMINAL_PROBE_BASE: Duration = Duration::from_millis(3750);
 
+    /// The base for waiting on a real shell to PAINT something into a pane
+    /// (#397): a grid line, a decoration or prompt mark, an inline image, an
+    /// OSC-reported host or progress state.
+    ///
+    /// Separate from `TERMINAL_PROBE_BASE` because the two replaced
+    /// different constants — 15s there, 8000ms here — and the house rule is
+    /// that each base reproduces its own at the floor, which one number
+    /// cannot do for both. The operation they wait on is the same.
+    ///
+    /// The rule, rather than a list that goes stale with every batch of
+    /// conversions: every call site reproduces the 8000ms it replaced, and
+    /// the rest are deliberate RAISES from a 4000ms bound. Each of those sat
+    /// on a shell that other waits in the same suite already gave 8000ms, so
+    /// the short bound was an accident of where it was written rather than a
+    /// measured deadline — and one of them, the re-root test's foreground
+    /// poll, never asserted on timeout at all, so its number could not fail
+    /// a test in the first place.
+    ///
+    /// Nothing here is ever CUT: a raise cannot introduce a flake, and the
+    /// floor assertion below guards the direction that can. That assertion
+    /// checks the constant, not its call sites, so converting a wait whose
+    /// old bound EXCEEDED 8000ms would need its own base rather than this
+    /// one — no such call site exists among these, and this is the note
+    /// that says why.
+    ///
+    /// 2s because `BASE_CALIBRATION * MIN_SCALE` is 4 at the floor, so the
+    /// call sites keep the 8000ms they had on a quiet machine and get up to
+    /// twice that under load. The hyperlink wait had already been raised
+    /// once, 5s to 8s, and then re-expressed as a 1000ms base that gave it
+    /// only 4s back; the marker loop was 8000ms from the day it was written
+    /// and never scaled at all. Both still lost on a loaded box, which is
+    /// the shape of a wait that needs to scale rather than to be guessed
+    /// higher again.
+    ///
+    /// Equal in value to `RESTORED_SHELL_BASE` because both replaced the
+    /// same 8000ms, not because either doc settled it: that doc defers a
+    /// reconciliation, but the counterexample it names,
+    /// `a_terminal_link_binding_is_not_refused_for_an_editor_side_reason`,
+    /// no longer waits on anything — it feeds the grid bytes directly — so
+    /// the deferral is stale rather than answered here. Still a SEPARATE
+    /// constant: the name is what a call site's failure message and floor
+    /// assertion read as, and should either operation's cost move, the
+    /// other must not follow it silently.
+    pub(crate) const SHELL_PAINT_BASE: Duration = Duration::from_secs(2);
+
     /// The base the three task-pane tests wait for the pane's shell to come
     /// back to its prompt (#397). They had a fixed 5000ms loop that `break`s
     /// on timeout, so under load the rerun met a pane still busy, opened a
@@ -444,6 +489,13 @@ pub(crate) mod tests {
             task >= Duration::from_millis(5000),
             "the task-pane prompt base must reproduce the 5000ms it replaced at \
              the floor, got {task:?}"
+        );
+        let paint = SHELL_PAINT_BASE * BASE_CALIBRATION * MIN_SCALE;
+        assert!(
+            paint >= Duration::from_millis(8000),
+            "the shell-paint base must reproduce 8000ms at the floor, the \
+             constant its call sites replaced; the few that replaced 4000ms \
+             are deliberate raises, named in the doc above - got {paint:?}"
         );
     }
 

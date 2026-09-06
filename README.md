@@ -4,7 +4,7 @@
 
 # croft
 
-A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust and shipped as a single static binary.
+A VS Code style three pane workspace that runs entirely inside your terminal. Written in Rust, shipped as a single static binary.
 
 ## Tenets
 
@@ -20,11 +20,11 @@ The non-negotiables behind every decision in croft:
 
 ## Layout
 
-Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **panel** bottom right with PROBLEMS, OUTPUT, TERMINAL, CAPTURES, and PORTS tabs. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, Remote (SSH), Run and Debug, Extensions, and Testing, and holds the theme picker. Every seam drags to resize, and a **Customize Layout** popup mirrors VS Code's title-bar layout controls.
+Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **panel** bottom right with PROBLEMS, OUTPUT, TERMINAL, CAPTURES, and PORTS tabs. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, Remote (SSH), Run and Debug, Extensions, and Testing, and holds the theme picker. Every seam drags to resize, and a **Customize Layout** popup mirrors VS Code's title-bar controls.
 
-The essentials are all in: full LSP editing (completion, hover, go-to-definition, rename, quick fixes, inlay hints) with tree-sitter highlighting, multi-cursor, minimap, git gutter, inline blame, and an optional vim mode; a real terminal with shell integration, splits, triggers, copy mode, and durable command history; Source Control with hunk staging and a commit graph; a Test Explorer; a zero-config task runner; and debugging for Python, JavaScript/TypeScript, Rust, C, and C++ over DAP.
+The essentials are all there: full LSP editing (completion, hover, go-to-definition, rename, quick fixes, inlay hints) with tree-sitter highlighting, multi-cursor, minimap, git gutter, inline blame, and an optional vim mode; a real terminal with shell integration, splits, triggers, copy mode, and durable command history; Source Control with hunk staging and a commit graph; a Test Explorer; a zero-config task runner; and debugging for Python, JavaScript/TypeScript, Rust, C, and C++ over DAP.
 
-See **[LAYOUT.md](docs/LAYOUT.md)** for the full pane-by-pane reference: every editor, terminal, Source Control, Testing, and status-bar feature, the debugging workflow, and language-server setup.
+See **[LAYOUT.md](docs/LAYOUT.md)** for the pane-by-pane reference: every editor, terminal, Source Control, Testing, and status-bar feature, the debugging workflow, and language-server setup.
 
 ## Requirements
 
@@ -32,13 +32,13 @@ See **[LAYOUT.md](docs/LAYOUT.md)** for the full pane-by-pane reference: every e
 |-------------|-----|
 | macOS, Linux, or Android (Termux) | The PTY layer is POSIX. On Windows, run the Linux build inside WSL2; see [WINDOWS.md](docs/WINDOWS.md). |
 | Rust 1.85+ stable | To compile the binary (edition 2024). |
-| A Nerd Font as your terminal font | File and activity-bar icons are Nerd Font glyphs. Without one they render as `[?]` boxes. |
-| A 256 color or truecolor terminal | Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Ghostty all qualify. |
-| iTerm2, WezTerm, Ghostty, kitty, or a sixel terminal (optional) | Inline image / PDF / spreadsheet previews. Elsewhere croft shows a metadata header line instead. |
+| A Nerd Font as your terminal font | File and activity-bar icons are Nerd Font glyphs; without one they render as `[?]` boxes. |
+| A 256 color or truecolor terminal | Terminal.app, iTerm2, Alacritty, kitty, WezTerm, and Ghostty all qualify. |
+| iTerm2, WezTerm, Ghostty, kitty, or a sixel terminal (optional) | Inline image / PDF / spreadsheet previews. Elsewhere croft shows a metadata header line. |
 | `pdftoppm` from poppler-utils (optional) | Multi-page PDF preview with clickable links. Without it, page 1 only on macOS via `sips`. |
 | Node.js + npm (optional) | TypeScript / JavaScript LSP; croft auto-installs the `vtsls` server on first use. |
 
-Per-platform setup (Nerd Font, terminal keybindings, optional dependencies) lives in the platform guides linked under [Platform setup](#platform-setup).
+Per-platform setup (Nerd Font, terminal keybindings, optional dependencies) lives in the [platform guides](#platform-setup).
 
 ### Install Rust
 
@@ -54,7 +54,7 @@ Then open a new terminal — or run `. "$HOME/.cargo/env"` in the current one �
 cargo install croft-software --locked
 ```
 
-This compiles the latest [crates.io](https://crates.io/crates/croft-software) release into `~/.cargo/bin/croft`. Re-run to upgrade. To track the latest `main` instead:
+This compiles the latest [crates.io](https://crates.io/crates/croft-software) release into `~/.cargo/bin/croft`. Re-run to upgrade. To track `main` instead:
 
 ```bash
 cargo install --git https://github.com/vitali87/croft.git --locked
@@ -89,20 +89,20 @@ croft theme-import dracula-theme.theme-dracula   # ...or fetch one from the mark
 croft --help
 ```
 
-`croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works out of the box. See [LINUX.md](docs/LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
+`croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works as-is. See [LINUX.md](docs/LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
 
 ## Collaboration
 
 `croft attach` keeps a session alive after you close the window, and lets other people join it.
-Add `--solo` and each participant gets an independent viewport on the same files, live. An AI
-can take a seat too, either as an MCP guest or as a resident pair-programming navigator that
-croft itself hosts (`croft pair`), including local open-weight models.
+Add `--solo` and each participant gets an independent viewport on the same files, live. An AI can
+take a seat too, either as an MCP guest or as a resident pair-programming navigator croft hosts
+itself (`croft pair`), local open-weight models included.
 
 See **[COLLABORATION.md](docs/COLLABORATION.md)** for the full guide.
 
 ## Platform setup
 
-croft runs on macOS, Linux, Android, and Windows (via WSL2). Cross-platform basics are above; each platform has a short guide for its Nerd Font, terminal keybindings, and optional dependencies:
+croft runs on macOS, Linux, Android, and Windows (via WSL2). The cross-platform basics are above; each platform has a short guide for its Nerd Font, terminal keybindings, and optional dependencies:
 
 * **[macOS](docs/MACOS.md)** — Nerd Font for Terminal.app, and `croft setup-iterm2` / `croft setup-ghostty` to deliver the `Cmd` chords that macOS otherwise reserves for menus.
 * **[Linux](docs/LINUX.md)** — `Ctrl` as the command modifier, Nerd Font and poppler-utils, language servers, and the `croft remote <host>` cross-compile / provisioning flow.
@@ -111,13 +111,13 @@ croft runs on macOS, Linux, Android, and Windows (via WSL2). Cross-platform basi
 
 ## Keybindings
 
-Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](docs/KEYBINDINGS.md)**. The command modifier is `Cmd` on macOS and `Ctrl` on Linux / Android; getting `Cmd` chords through your terminal is covered in the [platform guides](#platform-setup).
+Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](docs/KEYBINDINGS.md)**. The command modifier is `Cmd` on macOS and `Ctrl` on Linux / Android; the [platform guides](#platform-setup) cover getting `Cmd` chords through your terminal.
 
 ## Goal
 
 A complete VS Code replacement in the terminal: the full IDE experience as a single fast Rust binary. Everything VS Code does, croft will do, without leaving the TUI.
 
-Maintainers and developers: see [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the project layout and internals, and [CONTRIBUTING.md](CONTRIBUTING.md) for the developer workflow (including keeping the `target/` build directory from filling your disk).
+Maintainers and developers: see [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the project layout and internals, and [CONTRIBUTING.md](CONTRIBUTING.md) for the developer workflow (including keeping `target/` from filling your disk).
 
 ## License
 

@@ -2530,9 +2530,10 @@ pub struct App {
     /// redirect snapshots to a tempdir.
     history_root: PathBuf,
     /// The snapshot currently shown in a local-history diff, `(live file,
-    /// snapshot contents)`, so "Local History: Restore Snapshot" can write it
-    /// back. Cleared when a non-snapshot diff opens.
-    history_restore: Option<(PathBuf, Vec<u8>)>,
+    /// snapshot millis, snapshot contents)`, so "Local History: Restore
+    /// Snapshot" can write it back and carry its seats (#349). Cleared when a
+    /// non-snapshot diff opens.
+    history_restore: Option<(PathBuf, u64, Vec<u8>)>,
     /// Completed off-thread history recordings, drained to refresh the
     /// TIMELINE once the snapshot actually exists on disk.
     history_done_rx: std::sync::mpsc::Receiver<PathBuf>,
@@ -8759,7 +8760,7 @@ impl App {
                 return;
             }
             self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
-            self.history_restore = Some((path, content));
+            self.history_restore = Some((path, millis, content));
             self.focus_pane(Pane::Editor);
             self.status = format!("Showing {rel} at a local snapshot");
             return;
@@ -8792,7 +8793,7 @@ impl App {
     /// contents back to the file and reload the buffer. Reachable from the
     /// Command Palette once a snapshot diff is open (which records the target).
     fn restore_history_snapshot(&mut self) {
-        let Some((file, content)) = self.history_restore.clone() else {
+        let Some((file, millis, content)) = self.history_restore.clone() else {
             self.status = String::from("Open a local snapshot from the TIMELINE first");
             return;
         };
@@ -8800,13 +8801,29 @@ impl App {
             self.status = format!("Restore failed: {e}");
             return;
         }
+        // The snapshot's seats describe exactly the bytes just written (#349),
+        // so they come along: onto the buffer, and onto the snapshot this
+        // restore records below. No open tab's map can serve instead: a
+        // reverted tab has just had its map cleared, and an unreverted one
+        // still describes the text the restore replaced. A snapshot with no
+        // sidecar restores every line unknown, which is what it knows.
+        let seats =
+            crate::history::seats_for(&self.history_root, &file, millis).unwrap_or_default();
         // If that file is the active tab (the snapshot diff opened it), reload
         // so the editor shows the restored contents and the disk stamp resyncs.
-        if self.editor.path.as_deref() == Some(file.as_path()) {
-            let _ = self.editor.revert_to_disk();
+        // `holds_exactly` re-checks rather than assuming the reload landed the
+        // restored bytes: another process can rewrite the file between the
+        // write above and the read inside the revert.
+        if self.editor.path.as_deref() == Some(file.as_path())
+            && self.editor.revert_to_disk().is_ok()
+            && self.editor.holds_exactly(&content)
+        {
+            let mut onto_buffer = seats.clone();
+            onto_buffer.truncate(self.editor.lines.len());
+            self.editor.provenance = onto_buffer;
         }
         // The restore is itself a new version worth keeping.
-        self.record_history_snapshot(&file);
+        self.record_history_snapshot(&file, seats);
         self.status = format!("Restored {}", self.status_path(&file));
     }
 
@@ -24478,6 +24495,106 @@ impl App {
         self.status = format!("Diff: ignore whitespace {}", mode.label());
     }
 
+    /// Turn the group-by-seat lens on or off for the diff in view (#349),
+    /// so a change can be read as "the agent's part" and "my part".
+    ///
+    /// Offered only on the Source Control HEAD-vs-working view, the one diff
+    /// whose right side IS the working tree: there the row's `right` index
+    /// is a real file line and the seat map is keyed on the same index. A
+    /// diff parsed out of raw `git diff` text numbers its rows by position
+    /// in that text, so the same join would paint confident wrong seats.
+    pub fn diff_toggle_group_by_seat(&mut self) {
+        let history_root = self.history_root.clone();
+        let Some(diff) = self.editor.diff.as_mut() else {
+            self.status = String::from("Group by seat applies to a diff view");
+            return;
+        };
+        if !diff.left_is_git_head {
+            self.status =
+                String::from("Group by seat applies to a Source Control diff of the working tree");
+            return;
+        }
+        diff.group_by_seat = !diff.group_by_seat;
+        if !diff.group_by_seat {
+            self.status = String::from("Diff: group by seat off");
+            return;
+        }
+        // Read the map fresh each time the lens comes on: the working file
+        // may have been saved since the view was built, and a map from
+        // before that describes text this diff no longer shows.
+        diff.seats = crate::provenance::Provenance::new();
+        let path = diff.right_path.clone();
+        let right_lines = diff.right_lines.clone();
+        let seats = Self::seats_for_working_file(&history_root, &path, &right_lines);
+        let Some(diff) = self.editor.diff.as_mut() else {
+            return;
+        };
+        if let Some(seats) = seats {
+            diff.seats = seats;
+        }
+        self.status = format!("Diff: group by seat \u{2022} {}", diff.seat_summary());
+    }
+
+    /// Reload the group-by-seat map of a rebuilt view against its new rows
+    /// (#349). `carry_view_from` keeps the lens ON but deliberately drops
+    /// its map, which named line indices the rebuilt rows have renumbered;
+    /// this puts back a map that describes the rows now on screen, or none.
+    /// A no-op for a view whose lens is off.
+    fn reload_seats_for(history_root: &Path, diff: &mut crate::widgets::diff::DiffData) {
+        // The same gate the toggle applies, restated rather than assumed:
+        // the map is keyed on working-file line indices, so it may only be
+        // joined onto a view whose right side IS the working tree.
+        if !diff.group_by_seat || !diff.left_is_git_head {
+            return;
+        }
+        let right_lines = diff.right_lines.clone();
+        diff.seats = Self::seats_for_working_file(history_root, &diff.right_path, &right_lines)
+            .unwrap_or_default();
+    }
+
+    /// The persisted provenance map for a working-tree file, for the rows a
+    /// diff view is actually showing (#349). Both halves of the rule
+    /// `sync_provenance_for` applies: the newest snapshot must still hold the
+    /// bytes on disk, AND those bytes must be the lines this view shows.
+    ///
+    /// The second half is not redundant. A diff's `right_lines` were read
+    /// when the view was built, and a same-length rewrite inside one
+    /// filesystem timestamp tick moves the file without moving the
+    /// `(mtime, len)` stamp that triggers a rebuild - so the view can be
+    /// showing older lines than the snapshot describes. Joining a newer map
+    /// onto them would credit lines it never saw, which is the one outcome
+    /// the module forbids. Either half failing reads as no map at all.
+    fn seats_for_working_file(
+        history_root: &Path,
+        path: &Path,
+        right_lines: &[String],
+    ) -> Option<crate::provenance::Provenance> {
+        let newest = crate::history::entries_in(history_root, path)
+            .into_iter()
+            .next()?;
+        let mut seats = crate::history::seats_for(history_root, path, newest.millis)?;
+        let (on_disk, snapshot) = (std::fs::read(path).ok()?, std::fs::read(&newest.file).ok()?);
+        if on_disk != snapshot {
+            return None;
+        }
+        // Split the way the DIFF OPENER splits (`str::lines`), NOT the way
+        // `Editor::open` does: a lone `\r` is one line to the opener and two
+        // to the editor's splitter, and the comparison has to be against the
+        // lines this view was actually built from. The bare UTF-8 decode
+        // matches the opener too, which reads the right side with
+        // `read_to_string` and so never builds a view for a file this
+        // cannot decode.
+        let text = String::from_utf8(snapshot).ok()?;
+        if !text.lines().eq(right_lines.iter().map(String::as_str)) {
+            return None;
+        }
+        // Defensive: the comparison above already forces equal lengths, so
+        // this drops nothing today. It keeps the map bounded by the rows if
+        // that gate is ever loosened.
+        seats.truncate(right_lines.len());
+        Some(seats)
+    }
+
     /// Stage only the hunk under the diff caret (`git apply --cached`).
     pub fn stage_hunk_at_caret(&mut self) {
         // A selection spanning changed rows narrows the action to those
@@ -24615,6 +24732,9 @@ impl App {
         heads_moved: &[PathBuf],
         changed_files: &std::collections::BTreeSet<PathBuf>,
     ) -> bool {
+        // Bound before the borrow of `self.editor` below, for the seat map a
+        // carried group-by-seat lens needs against its rebuilt rows (#349).
+        let self_history_root = self.history_root.clone();
         // The watcher's own list of written paths bypasses the stamp gate: a
         // same-length rewrite that lands within the filesystem's mtime
         // granularity (or restores the mtime) shows the same `(mtime, len)`
@@ -24653,6 +24773,10 @@ impl App {
                     continue;
                 }
                 fresh.carry_view_from(old);
+                // The carried lens needs a map for the REBUILT rows:
+                // `carry_view_from` deliberately drops the old one, which
+                // named lines these rows have renumbered (#349).
+                Self::reload_seats_for(&self_history_root, &mut fresh);
                 ed.diff = Some(fresh);
                 changed = true;
                 if std::ptr::eq(&*ed, active_ptr) {
@@ -33600,6 +33724,7 @@ impl App {
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
             Cmd::ToggleProvenance => self.toggle_provenance(),
+            Cmd::DiffToggleGroupBySeat => self.diff_toggle_group_by_seat(),
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
             Cmd::ToggleRenderWhitespace => self.toggle_render_whitespace(),
@@ -39498,7 +39623,11 @@ impl App {
     /// immediately but skips the editor that currently HAS focus (it has
     /// not lost it yet). Returns true when anything changed on screen.
     fn sweep_auto_save(&mut self, require_delay: bool) -> bool {
-        let mut saved_paths: Vec<PathBuf> = Vec::new();
+        // Each saved tab's own map rides along (#349): the recorder must not
+        // look it up by path afterwards, since a split can hold the same file
+        // in a second buffer with a different map.
+        let mut saved_paths: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> =
+            Vec::new();
         // The tab that still holds focus is not saved by the focus-change
         // mode: only buffers that LOST focus are written.
         let keep_focused =
@@ -39546,7 +39675,12 @@ impl App {
                 // arm the force-overwrite path an explicit Cmd+S offers.
                 match e.save_to_disk() {
                     Ok(crate::widgets::editor::SaveOutcome::Saved) => {
-                        saved_paths.extend(e.path.clone());
+                        if let Some(p) = e.path.clone() {
+                            // The bytes this editor just wrote, so the
+                            // recorder can tell whether they are still the
+                            // ones on disk when its worker reads (#349).
+                            saved_paths.push((p, e.provenance_to_record(), e.bytes_for_disk()));
+                        }
                     }
                     // The latch also removes the tab from `due`, so this is
                     // the ONLY chance to tell the user: the FS sweep's
@@ -39599,16 +39733,16 @@ impl App {
         // Mirror the explicit-save path: a config file written by auto save
         // must take effect exactly like one written by Cmd+S — including one
         // saved in a background tab or an inactive split.
-        for path in &saved_paths {
+        for (path, ..) in &saved_paths {
             self.reload_config_for_path(path);
         }
         if let Some(lsp) = self.lsp.as_ref() {
-            for path in &saved_paths {
+            for (path, ..) in &saved_paths {
                 lsp.save_doc(path.clone());
             }
         }
-        for path in saved_paths.clone() {
-            self.record_history_snapshot(&path);
+        for (path, seats, described) in saved_paths {
+            self.record_history_snapshot_of(&path, seats, described);
         }
         true
     }
@@ -39874,7 +40008,9 @@ impl App {
                     // Local history captures the new bytes like every
                     // other successful save path (#191 review).
                     if let Some(path) = self.editor.path.clone() {
-                        self.record_history_snapshot(&path);
+                        let seats = self.editor.provenance_to_record();
+                        let described = self.editor.bytes_for_disk();
+                        self.record_history_snapshot_of(&path, seats, described);
                     }
                 }
                 Ok(SaveOutcome::DiskConflict) => {
@@ -39907,7 +40043,9 @@ impl App {
                 Ok(SaveOutcome::Saved) => {
                     self.status = self.editor.status.clone();
                     if let Some(path) = self.editor.path.clone() {
-                        self.record_history_snapshot(&path);
+                        let seats = self.editor.provenance_to_record();
+                        let described = self.editor.bytes_for_disk();
+                        self.record_history_snapshot_of(&path, seats, described);
                     }
                     // Formula cells held back (#178): the NEXT Cmd+S is
                     // the explicit consent, same double-press contract
@@ -39974,7 +40112,9 @@ impl App {
                 Ok(SaveOutcome::Saved) => {
                     self.status = self.editor.status.clone();
                     if let Some(path) = self.editor.path.clone() {
-                        self.record_history_snapshot(&path);
+                        let seats = self.editor.provenance_to_record();
+                        let described = self.editor.bytes_for_disk();
+                        self.record_history_snapshot_of(&path, seats, described);
                     }
                     self.lsp_notify_saved();
                     self.reload_config_if_needed();
@@ -40208,20 +40348,135 @@ impl App {
         }
     }
 
+    /// Restore persisted provenance maps onto the open buffers (#349), each
+    /// once per buffer generation: when a tab is a clean text buffer that
+    /// knows nothing yet, and the newest history snapshot holds exactly the
+    /// bytes on disk, the seats recorded beside that snapshot describe this
+    /// very text and come back. Any difference (an edit since, a save croft
+    /// never saw, a file with no history) leaves every line unknown: a map is
+    /// never applied to text it did not describe. Every tab of every group,
+    /// not only the focused one: the lens paints in every pane
+    /// (`sync_focus_flags` carries the flag there), so a map restored onto
+    /// the focused tab alone would leave a split showing blanks beside it.
+    fn sync_provenance(&mut self) {
+        let root = self.history_root.clone();
+        let groups =
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        for ed in groups.flat_map(|g| g.editors.iter_mut()) {
+            Self::sync_provenance_for(&root, ed);
+        }
+    }
+
+    /// The per-buffer body of [`Self::sync_provenance`].
+    fn sync_provenance_for(root: &Path, ed: &mut crate::widgets::editor::Editor) {
+        let Some(path) = ed.path.clone() else {
+            return;
+        };
+        let seq = ed.edit_seq;
+        if ed.provenance_synced_seq == Some(seq) {
+            return;
+        }
+        // Not eligible yet is not the same as considered: a dirty buffer, one
+        // that already knows its seats, or a viewer tab (the file shown
+        // through its own path, `lines` a placeholder no map should credit;
+        // a markdown preview is NOT one, its `lines` are the file's own text)
+        // leaves the marker unset, so a later tick, after a save or a swap
+        // back to text, reconsiders instead of staying burnt for the session.
+        if ed.dirty || ed.provenance.attributed() > 0 || ed.has_non_text_view() {
+            return;
+        }
+        let Some(newest) = crate::history::entries_in(root, &path).into_iter().next() else {
+            return;
+        };
+        // The sidecar first: most files have a snapshot and no record, and
+        // the reads below are only worth paying on the UI thread when there
+        // is a map to apply. Nothing above this point burns the marker: a
+        // save records its snapshot and then its sidecar from a worker
+        // thread, so a tick landing in that window must be free to look
+        // again rather than deciding this buffer has no map.
+        let Some(mut seats) = crate::history::seats_for(root, &path, newest.millis) else {
+            return;
+        };
+        ed.provenance_synced_seq = Some(seq);
+        // Then sizes: this runs on the render thread, and two whole-file
+        // reads of a large file on the frame a tab is switched to would be a
+        // visible stall for what is usually a mismatch.
+        let (Ok(disk_meta), Ok(snap_meta)) =
+            (std::fs::metadata(&path), std::fs::metadata(&newest.file))
+        else {
+            return;
+        };
+        if disk_meta.len() != snap_meta.len() {
+            return;
+        }
+        let (Ok(on_disk), Ok(snapshot)) = (std::fs::read(&path), std::fs::read(&newest.file))
+        else {
+            return;
+        };
+        if on_disk != snapshot {
+            return;
+        }
+        // And this buffer holds that very text. A clean buffer can still be
+        // stale: when one tab of a split saves, the other keeps the pre-save
+        // lines, and the snapshot then matches DISK while describing text
+        // that tab never held. The disk stamp cannot tell the two apart when
+        // both writes land inside one filesystem timestamp tick, so the
+        // comparison is against the buffer's own bytes.
+        if !ed.holds_exactly(&snapshot) {
+            return;
+        }
+        seats.truncate(ed.lines.len());
+        ed.provenance = seats;
+    }
+
     /// Record a local-history snapshot of a file that just hit the disk, and
     /// refresh the TIMELINE when it's the active file so the new version shows.
     /// Reads back what was written so the snapshot matches the on-disk bytes
     /// exactly (encoding / EOL included). The IO runs off-thread — with auto
     /// save this fires every second, and a large file's read+write on the
     /// render thread is a visible stall.
-    fn record_history_snapshot(&mut self, path: &Path) {
+    ///
+    /// `seats` is who typed each line of the buffer that was saved, recorded
+    /// beside the snapshot (#349). The caller reads it off that tab
+    /// (`Editor::provenance_to_record`) at the save, on the UI thread: never
+    /// looked up by path here, since a split can hold the same file in a
+    /// second buffer with a different map, and a snapshot restore records
+    /// the restored snapshot's own seats, which no tab holds at that moment.
+    fn record_history_snapshot(&mut self, path: &Path, seats: crate::provenance::Provenance) {
+        self.record_history_snapshot_of(path, seats, None);
+    }
+
+    /// [`Self::record_history_snapshot`] with the bytes the map describes.
+    /// The worker re-reads the file, which is what makes the snapshot
+    /// byte-exact, and between the save and that read another tab's save of
+    /// the same path can land - so the map is recorded only while the bytes
+    /// on disk are still the ones it describes.
+    ///
+    /// `described` comes from the caller because only the caller knows WHICH
+    /// buffer the map came from: a search by path finds the focused tab,
+    /// which need not be the tab that saved. `None` records the map
+    /// unconditionally, for a caller whose map has no live buffer - a
+    /// snapshot restore, whose seats come from the restored snapshot and
+    /// describe the bytes it has just written itself.
+    fn record_history_snapshot_of(
+        &mut self,
+        path: &Path,
+        seats: crate::provenance::Provenance,
+        described: Option<Vec<u8>>,
+    ) {
         let root = self.history_root.clone();
         let path = path.to_path_buf();
         let tx = self.history_done_tx.clone();
         let millis = now_millis();
         std::thread::spawn(move || {
             if let Ok(bytes) = std::fs::read(&path) {
-                let _ = crate::history::record_in(&root, &path, &bytes, millis);
+                // Someone else's bytes are on disk now: record the snapshot
+                // alone, every line unknown, which is the safe direction.
+                let seats = match described {
+                    Some(want) if want != bytes => crate::provenance::Provenance::new(),
+                    _ => seats,
+                };
+                let _ = crate::history::record_with_seats_in(&root, &path, &bytes, millis, &seats);
             }
             let _ = tx.send(path);
         });
@@ -40251,8 +40506,10 @@ impl App {
         };
         match editor.save_to_disk() {
             Ok(SaveOutcome::Saved) => {
+                let seats = editor.provenance_to_record();
+                let described = editor.bytes_for_disk();
                 self.status = editor.status.clone();
-                self.record_history_snapshot(path);
+                self.record_history_snapshot_of(path, seats, described);
                 if let Some(lsp) = self.lsp.as_ref() {
                     lsp.save_doc(path.to_path_buf());
                 }
@@ -40286,7 +40543,9 @@ impl App {
             Ok(SaveOutcome::Saved) => {
                 self.status = self.editor.status.clone();
                 if let Some(path) = self.editor.path.clone() {
-                    self.record_history_snapshot(&path);
+                    let seats = self.editor.provenance_to_record();
+                    let described = self.editor.bytes_for_disk();
+                    self.record_history_snapshot_of(&path, seats, described);
                 }
                 self.lsp_notify_saved();
                 self.reload_config_if_needed();
@@ -48344,6 +48603,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_lsp();
         app.sync_git_gutters();
         app.sync_blame();
+        app.sync_provenance();
         let blame_changed = app.drain_blame();
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.

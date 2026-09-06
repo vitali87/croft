@@ -1169,6 +1169,13 @@ fn render_diff(
         crate::widgets::diff::DiffWhitespace::Off => header,
         mode => format!("{header}\u{2022} ignoring whitespace: {} ", mode.label()),
     };
+    // Same reason as the whitespace lens: a reader seeing coloured bars must
+    // be told what they mean and who is in them (#349).
+    let header = if diff.group_by_seat {
+        format!("{header}\u{2022} by seat: {} ", diff.seat_summary())
+    } else {
+        header
+    };
     let head_bg = if diff.bytes_differ_but_lines_equal {
         theme.ui(Color::Rgb(0x8a, 0x4a, 0x10))
     } else {
@@ -1352,6 +1359,30 @@ fn render_diff(
             &r_label,
             Style::default().fg(gutter_fg).bg(r_cell_bg),
         );
+        // The group-by-seat lens (#349): a bar in this row's own hue, in the
+        // gutter's last cell, on the lines this change ADDS. An unchanged
+        // line's seat describes work the change did not do, and a line with
+        // no record paints nothing rather than being guessed.
+        // The REAL row, the basis `added_lines_by_seat` counts on: the
+        // whitespace lens reclassifies a re-indented line as Equal, and a
+        // line this change wrote must not lose its bar while the header
+        // still counts it. `display_rows` is index-for-index with `rows`.
+        let seat_row = diff.rows.get(row_idx).copied().unwrap_or(row);
+        if diff.group_by_seat
+            && matches!(seat_row, DiffRow::Added { .. } | DiffRow::Replaced { .. })
+            && let Some(i) = r_right_idx
+            && let Some(seat) = diff.seats.seat(i)
+        {
+            let (sr, sg, sb) = seat.hue();
+            buf.set_string(
+                r_x + r_gutter - 1,
+                y,
+                "\u{258e}",
+                Style::default()
+                    .fg(theme.ui(Color::Rgb(sr, sg, sb)))
+                    .bg(r_cell_bg),
+            );
+        }
         buf.set_string(
             r_sign_x,
             y,
@@ -2304,6 +2335,29 @@ pub struct Editor {
     /// time gets read as fact and the line it gets wrong is the one someone
     /// is arguing about.
     pub provenance: crate::provenance::Provenance,
+    /// Why the viewer the file's kind called for was declined, when it was
+    /// declined by a deliberate cap rather than by failing to parse (#493).
+    /// Consumed by the fallback viewer's status line: a browser silently
+    /// replaced by a hex dump reads as a bug rather than as a policy.
+    /// Keyed on the path it describes and never cleared on entry: an open
+    /// can set it and then fail before reaching any viewer, and `open_hex`
+    /// is also reached directly by "Reopen as Hex" without passing through
+    /// `open`. Keying makes a surviving note explain only its own file,
+    /// which the
+    /// clear-after-open the sibling `pdf_restore_page` uses cannot do on
+    /// its own. It is not sufficient alone, though: a note can outlive its
+    /// open and go stale against the SAME path, so the two places that
+    /// reach no fresh status line clear it too - `open_hex`'s same-path
+    /// refresh, and a listing that succeeds and thereby disproves it.
+    route_note: Option<(std::path::PathBuf, String)>,
+    /// The `edit_seq` at which `App::sync_provenance` last considered THIS
+    /// buffer for a persisted map (#349), so the history read happens once
+    /// per buffer generation rather than per tick. Per tab, because
+    /// `edit_seq` is: two tabs on one file both sit at seq 1 after their
+    /// opens, and one marker shared across them would skip the second for
+    /// the session. Every opener bumps the seq, so every whole-buffer swap
+    /// is reconsidered by construction.
+    pub provenance_synced_seq: Option<u64>,
     /// Debugger breakpoints, keyed by file path, as 1-based line numbers.
     /// Rendered as red dots in the gutter and pushed to the DAP adapter on
     /// launch. Keyed by path (not just the active file) so switching the buffer
@@ -2814,6 +2868,8 @@ impl Editor {
             path: None,
             lines: Vec::new(),
             provenance: crate::provenance::Provenance::new(),
+            route_note: None,
+            provenance_synced_seq: None,
             breakpoints: std::collections::HashMap::new(),
             stop_line: None,
             unverified_breakpoints: std::collections::HashMap::new(),
@@ -3867,10 +3923,18 @@ impl Editor {
             }
             // A corrupt archive falls through to content routing and,
             // ultimately, the hex fallback.
-            if let Some(kind) = crate::archive::kind_from_ext(path)
-                && self.open_archive(path, kind).is_ok()
-            {
-                return Ok(());
+            if let Some(kind) = crate::archive::kind_from_ext(path) {
+                match self.open_archive(path, kind) {
+                    Ok(()) => return Ok(()),
+                    // A SIZE refusal is a deliberate cap, not a parse
+                    // failure (#493): the file still opens as hex, but the
+                    // reason rides along so the viewer can say why the
+                    // browser it expected was declined.
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
             }
             if extension_is_image(ext) {
                 // A DECODE failure means the extension lied (#174): fall
@@ -3967,30 +4031,38 @@ impl Editor {
                     return Ok(());
                 }
                 // Not a workbook: browse it as the archive it is (#179).
-                if self
-                    .open_archive(path, crate::archive::ArchiveKind::Zip)
-                    .is_ok()
-                {
-                    return Ok(());
+                match self.open_archive(path, crate::archive::ArchiveKind::Zip) {
+                    Ok(()) => return Ok(()),
+                    // The same deliberate cap as the extension route (#493).
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
                 }
             }
             // The remaining container kinds browse too when they parse.
-            Some(crate::magic::Magic::Gzip)
-                if self
-                    .open_archive(path, crate::archive::ArchiveKind::TarGz)
-                    .is_ok() =>
-            {
-                return Ok(());
+            // Same shape as the zip arm above: a SIZE refusal is policy,
+            // so its reason rides to the hex fallback rather than vanishing.
+            Some(crate::magic::Magic::Gzip) => {
+                match self.open_archive(path, crate::archive::ArchiveKind::TarGz) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
             }
             Some(crate::magic::Magic::Sqlite) => {
                 return self.open_sqlite(path);
             }
-            Some(crate::magic::Magic::Tar)
-                if self
-                    .open_archive(path, crate::archive::ArchiveKind::Tar)
-                    .is_ok() =>
-            {
-                return Ok(());
+            Some(crate::magic::Magic::Tar) => {
+                match self.open_archive(path, crate::archive::ArchiveKind::Tar) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
             }
             _ => {}
         }
@@ -4166,6 +4238,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -4232,6 +4308,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
@@ -4301,6 +4381,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
@@ -4347,12 +4431,19 @@ impl Editor {
     fn open_archive(&mut self, path: &Path, kind: crate::archive::ArchiveKind) -> Result<()> {
         let view = crate::archive::list(path, kind)
             .map_err(|e| anyhow::anyhow!("Archive open failed: {e}"))?;
+        // A listing that succeeds positively disproves any refusal armed
+        // for this path, so it cannot be left to explain a later view.
+        self.route_note = None;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
@@ -4397,6 +4488,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -4450,6 +4545,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -4508,6 +4607,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -4578,6 +4681,48 @@ impl Editor {
                 .is_some_and(|md| md.doc_path.is_some())
     }
 
+    /// Whether this buffer's text is exactly what `bytes` decode to (#349),
+    /// for checking a stored snapshot against the buffer the map would land
+    /// on. Compared as LINES, the way `open` builds them: a file's trailing
+    /// newline is not a line of its own, so comparing raw bytes would call
+    /// every ordinary text file a mismatch.
+    pub fn holds_exactly(&self, bytes: &[u8]) -> bool {
+        let enc = encoding_rs::Encoding::for_bom(bytes)
+            .map(|(e, _)| e)
+            .unwrap_or(self.encoding);
+        // Built exactly as `open` builds `lines` from the same bytes: the
+        // replacement-character text of an undecodable byte on both sides
+        // (`open` discards `had_errors` too), and the empty file's one
+        // sentinel line. Any divergence here reads as "not this text" and
+        // silently withholds a map that should have come back.
+        let (text, _, _) = enc.decode(bytes);
+        let mut want = split_into_lines(&text);
+        if want.is_empty() {
+            want.push(String::new());
+        }
+        want == self.lines
+    }
+
+    /// The bytes this buffer would write to disk, for binding a recorded
+    /// provenance map to the text it describes (#349). `None` when the
+    /// encoding cannot represent the text, since a save would refuse it too.
+    pub fn bytes_for_disk(&self) -> Option<Vec<u8>> {
+        let content = self.lines.join(self.eol.sequence());
+        let (encoded, had_errors) = self.encode_for_disk(&content);
+        (!had_errors).then_some(encoded)
+    }
+
+    /// The map a save of this tab records beside its history snapshot
+    /// (#349): the buffer's own for text, empty for a viewer, whose
+    /// placeholder line no seat wrote. Read off the tab that was saved, never
+    /// looked up by path: two tabs on one file are two buffers with two maps.
+    pub fn provenance_to_record(&self) -> crate::provenance::Provenance {
+        if self.has_non_text_view() {
+            return crate::provenance::Provenance::new();
+        }
+        self.provenance.clone()
+    }
+
     /// Open `path` as a rendered ANSI log (#257): colours paint through the
     /// theme's palette and escapes never reach the text. Windowed, so the
     /// file is not read whole. Fails (and the caller falls through to the
@@ -4591,6 +4736,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
@@ -4655,6 +4804,10 @@ impl Editor {
         if self.path.as_deref() == Some(path)
             && let Some(view) = self.hex.as_mut()
         {
+            // A refresh writes no status line, so a note armed by the open
+            // that called us would outlive its open and go stale against a
+            // file that may since have come under the cap.
+            self.route_note = None;
             // Pending overwrites survive a same-path re-open (a tree
             // re-click must not silently drop them); the FS sweep never
             // reloads a dirty tab, and an explicit Revert discards via
@@ -4678,6 +4831,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -4709,7 +4866,16 @@ impl Editor {
         // keep painting after "Reopen as Hex" reported success.
         self.log = None;
         self.hex = Some(view);
-        self.status = format!("Opened {} in the hex viewer", path.display());
+        // Only for the file it was set for: an open can set the note and
+        // then fail before reaching a viewer, and this is also reached
+        // directly by "Reopen as Hex", so a note that outlived its open
+        // would explain the wrong file.
+        self.status = match self.route_note.take() {
+            Some((noted, why)) if noted == path => {
+                format!("Opened {} in the hex viewer: {why}", path.display())
+            }
+            _ => format!("Opened {} in the hex viewer", path.display()),
+        };
         Ok(())
     }
 
