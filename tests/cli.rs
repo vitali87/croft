@@ -397,9 +397,12 @@ fn view_refuses_an_as_flag_that_cannot_be_a_file_extension() {
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("v.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
     let out = Command::cargo_bin("croft")
         .unwrap()
         .env("CROFT_VIEW_SOCK", &sock)
+        .env("HOME", &home)
         .current_dir(tmp.path())
         .write_stdin("a,b\n1,2\n")
         .args(["view", "-", "--as", "../x"])
@@ -409,5 +412,115 @@ fn view_refuses_an_as_flag_that_cannot_be_a_file_extension() {
     assert!(
         stderr.contains("--as"),
         "the message must name the flag, was: {stderr}"
+    );
+    // And it refuses without leaving anything behind. `stage_stdin` used to
+    // create `view-stdin/` before it validated the hint, so this refusal
+    // built a directory in the user's real cache dir on its way out. HOME is
+    // redirected here precisely so that is observable rather than invisible.
+    assert!(
+        !home.join(".cache/croft/view-stdin").exists(),
+        "a refused --as must not create the staging directory"
+    );
+}
+
+/// `croft view -` end to end against the shipped binary (#362).
+///
+/// The rejection test above never reaches the staging write, so nothing
+/// covered the success path at the binary level: the file appearing on disk
+/// under a sniffed extension the editor routes on, at 0600, with THAT path
+/// being what the server is told to open. HOME is redirected so the staging
+/// lands in a tempdir rather than the developer's own cache.
+#[test]
+fn view_from_a_pipe_stages_an_owner_only_file_and_sends_its_path() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream.write_all(b"{\"status\":\"ok\"}\n").unwrap();
+        line
+    });
+
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .env("HOME", &home)
+        .current_dir(tmp.path())
+        .write_stdin("a,b\n1,2\n")
+        .args(["view", "-"])
+        .assert()
+        .success();
+
+    // Same byte-array decode as the on-disk case: the wire carries a filename
+    // as bytes, and a substring match would only work for UTF-8 paths.
+    let request = server.join().unwrap();
+    let bytes: Vec<u8> = request
+        .trim()
+        .trim_start_matches("{\"path\":[")
+        .trim_end_matches("]}")
+        .split(',')
+        .map(|n| n.trim().parse::<u8>().expect("the wire is a byte array"))
+        .collect();
+    let staged = std::path::PathBuf::from(String::from_utf8(bytes).unwrap());
+
+    assert_eq!(
+        staged.extension().and_then(|e| e.to_str()),
+        Some("csv"),
+        "delimited text must be staged under the extension the sheet viewer \
+         routes on, or it arrives as plain text: {staged:?}"
+    );
+    assert!(
+        staged.starts_with(home.join(".cache").join("croft")),
+        "the staged file belongs under the cache dir, not beside the user's \
+         own files: {staged:?}"
+    );
+    let meta = std::fs::metadata(&staged)
+        .expect("the staged file must exist by the time the server is told about it");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o600,
+        "piped content is owner-only: `vault read ... | croft view -` is the \
+         case this command invites"
+    );
+    assert_eq!(
+        std::fs::read(&staged).unwrap(),
+        b"a,b\n1,2\n",
+        "and it is the bytes that came down the pipe, unaltered"
+    );
+}
+
+/// An empty pipe is refused by name, and stages nothing (#362).
+#[test]
+fn view_from_an_empty_pipe_says_nothing_arrived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let sock = tmp.path().join("v.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .env("HOME", &home)
+        .current_dir(tmp.path())
+        .write_stdin("")
+        .args(["view", "-"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("nothing arrived on stdin"),
+        "an empty pipe must say so rather than staging a zero-byte file and \
+         reporting success, was: {stderr}"
+    );
+    assert!(
+        !home.join(".cache/croft/view-stdin").exists(),
+        "and it must not create the staging directory either"
     );
 }

@@ -4368,13 +4368,7 @@ impl App {
             sidebar_dwell: SidebarDwell::default(),
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
-            status: match &view_bind_error {
-                // The one startup failure that would otherwise be invisible
-                // until a user ran `croft view` and got told to do what they
-                // were doing.
-                Some(e) => format!("croft view is unavailable: {e}"),
-                None => String::from("Ready"),
-            },
+            status: view_status(view_bind_error.as_deref()),
             persistence_warning: remote_persistence_status(
                 is_remote_session(),
                 std::env::var_os("CROFT_SESSION_PERSISTENT").is_some(),
@@ -28996,7 +28990,15 @@ impl App {
             return None;
         }
         let dir = croft_cache_dir();
-        std::fs::create_dir_all(&dir).ok()?;
+        // Latched, not swallowed. "A full or read-only `$HOME`" is one of the
+        // causes VIEW_BIND_ERROR's own doc names, and it fails HERE, one line
+        // above the `map_err` that would have reported it. Returning `None`
+        // quietly left `status` on "Ready" and told the user to run from a
+        // pane inside croft, which is what they were already doing.
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            *VIEW_BIND_ERROR.lock().unwrap() = Some(format!("{e}"));
+            return None;
+        }
         // ABSOLUTE, always. `croft_cache_dir` falls back to `.` when `HOME`
         // is unset, and the client resolves what it is handed against the
         // PANE's cwd - so a relative socket path published here reports "the
@@ -29068,12 +29070,17 @@ impl App {
         // fix that either - 50 bytes trickled over a second is under any cap
         // and still costs the second. Only a deadline the client cannot push
         // forward does.
+        // A croft whose bind failed has no listener and never gets one, so it
+        // must not pay two clock reads and a loop entry every frame forever.
+        // The per-iteration binding below stays: it cannot be hoisted, since
+        // holding that borrow across `answer_view_client`'s `&mut self` does
+        // not compile.
+        if self.view_listener.is_none() {
+            return false;
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
         let mut changed = false;
         loop {
-            if std::time::Instant::now() >= deadline {
-                return changed;
-            }
             // Do not accept what we cannot serve. `read_line_by_deadline`
             // checks its budget BEFORE the first read, so a well-behaved
             // client accepted at deadline-minus-epsilon is refused without a
@@ -29090,9 +29097,10 @@ impl App {
             };
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let (reply, opened) = self.answer_view_client(stream, deadline);
+                    // The reply is returned so a TEST can assert on it; the
+                    // drain only needs to know whether a file was opened.
+                    let (_, opened) = self.answer_view_client(stream, deadline);
                     changed |= opened;
-                    let _ = reply;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return changed,
                 Err(_) => return changed,
@@ -45078,6 +45086,21 @@ fn prepare_view_listener(path: &Path) -> std::io::Result<std::os::unix::net::Uni
 /// status line.
 static VIEW_BIND_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// The status line a fresh `App` opens on, given whatever `bind_view_socket`
+/// latched (#362).
+///
+/// Split out so it can be tested at all: `bind_view_socket` returns early
+/// under `cfg(test)`, so nothing in the suite reaches the latch, and the arm
+/// that reports a bind failure was the half that had never once run.
+fn view_status(view_bind_error: Option<&str>) -> String {
+    match view_bind_error {
+        // The one startup failure that would otherwise be invisible until a
+        // user ran `croft view` and got told to do what they were doing.
+        Some(e) => format!("croft view is unavailable: {e}"),
+        None => String::from("Ready"),
+    }
+}
+
 /// Remove `view-<pid>-<nonce>.sock` files whose croft is gone (#362).
 ///
 /// A Unix socket is not auto-unlinked, so every croft that dies leaves its
@@ -45101,7 +45124,16 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(pid) = crate::view_ipc::pid_of_socket(name) else {
+        // A croft that died between `bind_socket_0600`'s lock creation and its
+        // rename leaves a `.bind.lock` with no socket beside it. The
+        // socket-keyed pass below can never reach one, because
+        // `pid_of_socket` requires the `.sock` suffix, so those leaked
+        // permanently. Judging the lock by the pid in its own name closes it.
+        let sock_name = match name.strip_suffix(".bind.lock") {
+            Some(stem) => std::borrow::Cow::Owned(format!("{stem}.sock")),
+            None => std::borrow::Cow::Borrowed(name),
+        };
+        let Some(pid) = crate::view_ipc::pid_of_socket(&sock_name) else {
             continue;
         };
         // Signal 0 checks existence and permission without delivering
@@ -45110,9 +45142,11 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
             && unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
         if gone {
-            let path = entry.path();
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(path.with_extension("bind.lock"));
+            let _ = std::fs::remove_file(entry.path());
+            // Derived from the SOCKET's name rather than from this entry's,
+            // so sweeping a lock entry does not compose a second suffix onto
+            // itself. Removing both from either entry is idempotent.
+            let _ = std::fs::remove_file(dir.join(sock_name.as_ref()).with_extension("bind.lock"));
         }
     }
     sweep_staged_stdin(dir);

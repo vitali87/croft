@@ -188,9 +188,20 @@ pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
 ///
 /// Uncapped, `some_command | croft view -` with a runaway producer buffered
 /// the whole stream in RAM and then wrote a 0600 copy of it into the cache
-/// dir - and the editor refuses anything past its own `MAX_FILE_BYTES`
-/// afterwards, so those bytes were pure cost. The request is capped for
-/// exactly this reasoning; the payload was not.
+/// dir. The request is capped for exactly this reasoning; the payload was
+/// not.
+///
+/// It is NOT the editor's `MAX_FILE_BYTES` (50 MiB), and an earlier version
+/// of this doc claiming it should be was wrong in a way worth recording:
+/// that constant is the TEXT branch's cap, taken after `open` has already
+/// dispatched images, SVG, PDF and sheets to their own limits, and
+/// `Editor::open_pdf` applies no size limit at all. A 60 MiB PDF down a pipe
+/// therefore opens today; lowering this to 50 MiB would refuse it at the
+/// staging step for a bound that never applied to it.
+///
+/// What this number bounds is the RAM the client buffers and the bytes it
+/// writes to disk on a stranger's say-so, so it is deliberately above every
+/// per-format cap rather than equal to any one of them.
 pub const MAX_STAGED_STDIN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The most a single request may be. A path plus JSON framing; anything past
@@ -416,6 +427,11 @@ pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow
     // dir. Possession of the account is already the trust boundary for
     // every other croft socket and staging path, and this joins them.
     use std::os::unix::fs::DirBuilderExt;
+    // Validate the hint BEFORE creating anything. `croft view - --as ../x` is
+    // a refusal, and a refusal must not leave a `view-stdin/` behind in the
+    // user's real cache dir on its way out: the integration test for that
+    // rejection runs against `~/.cache/croft`, so it was doing exactly this.
+    let ext = stdin_extension(bytes, hint)?;
     let dir = cache_dir.join("view-stdin");
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -429,7 +445,7 @@ pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow
     let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let stem = format!("stdin-{}-{n}", std::process::id());
-    let name = match stdin_extension(bytes, hint)? {
+    let name = match ext {
         Some(ext) => format!("{stem}.{ext}"),
         None => stem,
     };
@@ -626,10 +642,20 @@ mod tests {
         // path, and the pid stays readable, which is what the sweep needs to
         // tell a dead croft's socket from a live one's.
         let dir = Path::new("/c");
-        assert_ne!(socket_path(dir, 10), socket_path(dir, 11));
+        // NOT `assert_ne!(socket_path(dir, 10), socket_path(dir, 11))`: the
+        // nonce alone makes any two calls differ, so that assertion holds
+        // even if the pid were dropped from the name entirely. It reads as
+        // evidence for a property it cannot see. Both pids being READABLE
+        // back out is the property the sweep actually depends on, and it
+        // implies the paths differ.
         let ten = socket_path(dir, 10);
+        let eleven = socket_path(dir, 11);
         let name = ten.file_name().unwrap().to_str().unwrap();
         assert_eq!(pid_of_socket(name), Some(10));
+        assert_eq!(
+            pid_of_socket(eleven.file_name().unwrap().to_str().unwrap()),
+            Some(11)
+        );
         assert!(
             ten.starts_with("/c"),
             "and it stays in the cache dir: {ten:?}"
