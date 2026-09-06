@@ -2741,11 +2741,12 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     // would disable the built-in Ctrl+click over every full-screen TUI while
     // binding `ctrl+click` leaves it working -- backwards.
     //
-    // Note what this does NOT rest on: croft never forwards clicks to the
-    // child. `report_mouse` has three production call sites and all three
-    // construct WheelUp/WheelDown, so there is no click-forwarding path for a
-    // tracking child to "own". The fall-through is right because the built-in
-    // is the only consumer, not because the child is a better one.
+    // Since #474 the child DOES own a left click here (`child_owns_pointer`
+    // covers Click/DoubleClick), so the swallow steps aside for that reason
+    // too. The fall-through is right for a narrower reason that survives it:
+    // the Cmd/Ctrl link-open runs BEFORE the forward in the Down(Left) arm,
+    // so swallowing this click costs the user the link and buys nobody
+    // anything -- the bound double is already unreachable over a tracker.
     //
     // The observable is deliberately a REFUSED link: `open_detected_url`
     // rejects a non-web scheme and sets a status without spawning anything.
@@ -39594,7 +39595,17 @@ fn a_double_click_over_a_tracking_child_is_two_forwarded_clicks_not_a_word_selec
     // trade: word-select is unavailable over a tracking app.
     use crossterm::event::{MouseButton, MouseEventKind};
     let (mut app, _tmp, col, row, lc, lr) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
-    app.terminals[0].feed_bytes_for_test(b"hello_world_token\r\n");
+    // The token is put ON the click row (the helper's cell is grid row 2),
+    // and the precondition checks it: a word-select on a blank cell selects
+    // nothing, so without this the "no word" assertion could not fail.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[3;1Hhello_world_token\r\n");
+    let (text, idx) = app.terminals[0]
+        .line_text_at(col, row)
+        .expect("the click must resolve to a grid cell");
+    assert!(
+        text.contains("hello_world_token") && idx < text.len(),
+        "the click must land ON the token: {text:?} at {idx}"
+    );
     for _ in 0..2 {
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
@@ -39644,7 +39655,7 @@ fn copy_on_select_fires_for_a_click_only_forwarded_drag() {
     // origin pane; it must put the origin's selection on the clipboard the
     // way the ordinary mouse-up does.
     use crossterm::event::{MouseButton, MouseEventKind};
-    let (mut app, _tmp, col, row, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    let (mut app, _tmp, _, _, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
     app.copy_on_select = true;
     app.terminals[0].feed_bytes_for_test(b"\x1b[H");
     app.terminals[0].feed_bytes_for_test(b"copy-me-please\r\n");
@@ -39653,7 +39664,6 @@ fn copy_on_select_fires_for_a_click_only_forwarded_drag() {
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x0, y0));
     app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x0 + 13, y0));
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x0 + 13, y0));
-    let _ = (col, row);
     assert_eq!(
         crate::clipboard::read_string().as_deref(),
         Some("copy-me-please"),
