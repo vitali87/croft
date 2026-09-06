@@ -270,6 +270,30 @@ pub(crate) mod tests {
     /// and merely starved -- the case a load-scaled budget exists for.
     pub(crate) const TERMINAL_PROBE_BASE: Duration = Duration::from_millis(3750);
 
+    /// The base for waiting on a real shell to PAINT something into the grid
+    /// (#397): the linked cell of an OSC 8 hyperlink, a marker line from the
+    /// shell's main loop. Distinct from `TERMINAL_PROBE_BASE` only in what
+    /// it replaced, not in what it waits for.
+    ///
+    /// 2s because `BASE_CALIBRATION * MIN_SCALE` is 4 at the floor, so the
+    /// call sites keep the 8000ms they had on a quiet machine and get up to
+    /// twice that under load. The hyperlink wait had already been raised
+    /// once, 5s to 8s, and then re-expressed as a 1000ms base that gave it
+    /// only 4s back; the marker loop was 8000ms from the day it was written
+    /// and never scaled at all. Both still lost on a loaded box, which is
+    /// the shape of a wait that needs to scale rather than to be guessed
+    /// higher again.
+    ///
+    /// `RESTORED_SHELL_BASE`'s doc deferred exactly this reconciliation as
+    /// "a question about that test's operation rather than about these".
+    /// The answer is that painting a cell IS the same operation those waits
+    /// perform, so it takes the same value rather than a guessed fourth
+    /// number. It stays a SEPARATE constant, equal in value, because the
+    /// name is what each call site's failure message and floor assertion
+    /// read as: should either operation's cost move, the other must not
+    /// follow it silently.
+    pub(crate) const SHELL_PAINT_BASE: Duration = Duration::from_secs(2);
+
     /// The base the three task-pane tests wait for the pane's shell to come
     /// back to its prompt (#397). They had a fixed 5000ms loop that `break`s
     /// on timeout, so under load the rerun met a pane still busy, opened a
@@ -422,6 +446,12 @@ pub(crate) mod tests {
             task >= Duration::from_millis(5000),
             "the task-pane prompt base must reproduce the 5000ms it replaced at \
              the floor, got {task:?}"
+        );
+        let paint = SHELL_PAINT_BASE * BASE_CALIBRATION * MIN_SCALE;
+        assert!(
+            paint >= Duration::from_millis(8000),
+            "the shell-paint base must reproduce the 8000ms its call sites \
+             replaced at the floor, got {paint:?}"
         );
     }
 
