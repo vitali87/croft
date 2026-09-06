@@ -1070,23 +1070,38 @@ impl DiffData {
 
     /// Take over the reader's view state from the version of this diff being
     /// replaced (#471): the whitespace mode, the viewport (clamped to the new
-    /// row count), the horizontal pan, the hunk-navigation anchor, the find
-    /// needle and the source. A rebuild must read as "the rows updated under
+    /// row count), the horizontal pan, the hunk-navigation anchor (only while
+    /// the rows are unchanged) and the find needle. A rebuild must read as "the rows updated under
     /// me", never as "the tab reopened at the first hunk".
     pub fn carry_view_from(&mut self, old: &DiffData) {
         self.set_whitespace_mode(old.ws_mode);
         self.scroll = old.scroll.min(self.rows.len().saturating_sub(1));
         self.scroll_x = old.scroll_x;
-        self.nav_anchor = old.nav_anchor.filter(|&row| row < self.rows.len());
-        // The needle and its options survive; the ACTIVE match does not. It
-        // names a row and a span of the old rows, and the new rows may not
-        // hold it (or hold it elsewhere). The app recomputes it against the
-        // fresh rows when a find bar is open; a stale one here would paint a
-        // band on whatever now sits at that row.
+        // The hunk-navigation anchor survives only while the rows are the
+        // same rows: it is the sole input to `action_row`, which `S`, `U`
+        // and `R` read, and a row index over REBUILT rows names whatever now
+        // sits there -- `hunk_range_at` would even walk forward from a row
+        // that became Equal to the next change, so `R` could destroy a hunk
+        // the reader never selected. Dropping it falls back to `scroll`,
+        // which is what a manual scroll already does.
+        self.nav_anchor = old
+            .nav_anchor
+            .filter(|&row| row < self.rows.len() && self.rows == old.rows);
+        // The needle and its options survive; the active match is recomputed
+        // against the new rows rather than carried, since it names a row and
+        // a span of the old ones. Done here, not only by the app, so a view
+        // rebuilt in a background tab or split keeps its band; the app's own
+        // `diff_find_apply` still runs for the active tab, which additionally
+        // owes the find bar a count, an index and a scroll.
+        let active = old
+            .find
+            .needle
+            .as_deref()
+            .and_then(|needle| self.find_matches(needle, old.find.opts).first().copied());
         self.find = DiffFindState {
             needle: old.find.needle.clone(),
             opts: old.find.opts,
-            active: None,
+            active,
         };
         self.left_is_git_head = old.left_is_git_head;
         self.left_is_real_file = old.left_is_real_file;

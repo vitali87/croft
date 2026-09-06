@@ -39738,3 +39738,83 @@ fn a_background_diff_refresh_leaves_the_active_diff_find_and_anchor_alone() {
         "and its active match"
     );
 }
+
+#[test]
+fn a_rebuild_that_changes_the_rows_drops_the_hunk_anchor() {
+    // `nav_anchor` is the one input to `action_row`, which S/U/R read. Over
+    // rebuilt rows the remembered index names whatever now sits there, so
+    // the anchor is dropped and the actions fall back to the viewport, as
+    // after a manual scroll.
+    let (tmp, f) = repo_with_seed("a\nb\nc\nd\ne\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "a\nB\nc\nd\nE\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "a\nb\nc\nd\ne\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    app.jump_diff_change(true);
+    assert!(
+        app.editor.diff.as_ref().unwrap().nav_anchor.is_some(),
+        "precondition: a jump anchored a hunk"
+    );
+    // A new hunk ABOVE the anchored one shifts every row under the index.
+    rewrite_later(&f, "A\nB\nc\nd\nE\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    assert_eq!(
+        app.editor.diff.as_ref().unwrap().nav_anchor,
+        None,
+        "the anchor does not survive rows it no longer describes"
+    );
+}
+
+#[test]
+fn a_background_diff_keeps_its_find_band_across_a_rebuild() {
+    // The active match is recomputed inside `carry_view_from`, so a view
+    // rebuilt in a background split keeps its band without the app's
+    // find-bar recompute, which only runs for the active tab.
+    let tmp = tempfile::tempdir().unwrap();
+    let c = tmp.path().join("c.txt");
+    let d = tmp.path().join("d.txt");
+    std::fs::write(&c, "x\n").unwrap();
+    std::fs::write(&d, "x\nneedle\n").unwrap();
+    let plain = tmp.path().join("plain.txt");
+    std::fs::write(&plain, "hi\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_diff(&c, &d).unwrap();
+    app.open_editor_find();
+    app.diff_find_set_query(String::from("needle"));
+    assert!(app.editor.diff.as_ref().unwrap().find.active.is_some());
+    // The diff moves to the background: a split, and a plain file on top.
+    app.split_editor();
+    app.editor.open_pinned(&plain).unwrap();
+    assert!(
+        app.editor.diff.is_none(),
+        "the active tab is the plain file"
+    );
+
+    rewrite_later(&d, "x\nstill a needle\nmore\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let mut seen = 0;
+    for group in app.editor_layout.inactive_groups_mut() {
+        for ed in &group.editors {
+            if let Some(dd) = ed.diff.as_ref().filter(|dd| dd.right_path == d) {
+                seen += 1;
+                assert_eq!(dd.find.needle.as_deref(), Some("needle"));
+                assert!(
+                    dd.find.active.is_some(),
+                    "the background view's active match was recomputed in place"
+                );
+            }
+        }
+    }
+    assert!(seen >= 1, "the background split still holds the diff");
+}

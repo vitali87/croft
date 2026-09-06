@@ -44764,9 +44764,10 @@ fn rebuild_diff_view(
     let mut fresh = match &old.source {
         DiffSource::Static => return None,
         DiffSource::HeadVsWorking { root, rel } => {
-            // Canonical on both sides: a tag taken before the worker's first
-            // status reply holds the workspace root (`scm_root()`'s
-            // fallback), while the drain records the toplevel.
+            // Canonical on both sides: git canonicalises `--show-toplevel`
+            // (macOS's /tmp -> /private/tmp), while a root the app carries
+            // as typed may not be, so the same repository can be spelled two
+            // ways between the tag and the drain's record.
             let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             let head_moved = git_too
                 && heads_moved
