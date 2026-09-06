@@ -2346,6 +2346,14 @@ impl PtyTerminal {
     }
 
     /// Set the foreground-process label (from the off-loop refresh).
+    /// The foreground program name the label lookup last resolved for this
+    /// pane (empty until the first lookup lands). A cached answer, so a
+    /// caller can decide whether a process is worth a costlier question
+    /// (#364 asks only ssh for its argv).
+    pub fn foreground_program(&self) -> &str {
+        &self.auto_label
+    }
+
     pub fn set_auto_label(&mut self, label: String) {
         self.auto_label = label;
     }
