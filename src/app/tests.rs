@@ -12550,38 +12550,44 @@ fn the_group_by_seat_lens_reports_who_wrote_the_added_lines() {
     );
 }
 
-/// The lens survives a rebuild of the view under it (#349 review): a diff
-/// re-read because the file moved on disk keeps the lens on, and its map is
-/// reloaded against the NEW rows rather than carried (the old map named
-/// lines the rebuilt rows have renumbered) or dropped silently.
+/// The lens survives a rebuild of the view under it (#349 review): the
+/// real refresh re-reads a Source Control diff whose file moved, and the
+/// lens must stay on with a map reloaded against the NEW rows, rather than
+/// going dark or keeping a map that named lines these rows renumbered.
 #[test]
 fn the_group_by_seat_lens_survives_a_rebuild_of_the_view() {
     use crate::provenance::Seat;
-    let tmp = tempfile::tempdir().unwrap();
+    let (tmp, f) = repo_with_seed("kept\n");
     let hist = tempfile::tempdir().unwrap();
-    let f = tmp.path().join("note.txt");
     std::fs::write(&f, "kept\nmine\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.history_root = hist.path().to_path_buf();
     app.focus_pane(Pane::Editor);
+    let record = |millis: u64, seats: &crate::provenance::Provenance| {
+        crate::history::record_with_seats_in(
+            hist.path(),
+            &f,
+            &std::fs::read(&f).unwrap(),
+            millis,
+            seats,
+        )
+        .unwrap();
+    };
     let mut seats = crate::provenance::Provenance::new();
     seats.record(1..2, Seat::Me);
-    crate::history::record_with_seats_in(
-        hist.path(),
-        &f,
-        &std::fs::read(&f).unwrap(),
-        1_000,
-        &seats,
-    )
-    .unwrap();
+    record(1_000, &seats);
     app.editor
         .open_head_diff_with_text(
-            std::path::PathBuf::from("note.txt (HEAD)"),
+            std::path::PathBuf::from("seed.txt (HEAD)"),
             "kept\n",
             &f,
             true,
         )
         .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: tmp.path().to_path_buf(),
+        rel: String::from("seed.txt"),
+    });
     app.run_command(crate::widgets::command_palette::Command::DiffToggleGroupBySeat);
     assert_eq!(
         app.editor.diff.as_ref().unwrap().seat_summary(),
@@ -12589,50 +12595,31 @@ fn the_group_by_seat_lens_survives_a_rebuild_of_the_view() {
         "staging: the lens is on and reports the one added line"
     );
 
-    // The rebuild, as `refresh_open_diff_views` performs it: a fresh view of
-    // the moved file, then `carry_view_from` to keep the reader's state.
-    // (Driving the whole refresh would need a real git repo for the HEAD
-    // side; the seam under test is what survives the carry.)
-    std::fs::write(&f, "kept\nmine\ntheirs\n").unwrap();
+    // An agent appends a line; the real refresh re-reads the moved file.
+    rewrite_later(&f, "kept\nmine\ntheirs\n");
     let mut seats2 = crate::provenance::Provenance::new();
     seats2.record(1..2, Seat::Me);
     seats2.record(2..3, Seat::Agent(String::from("pane 2")));
-    crate::history::record_with_seats_in(
-        hist.path(),
-        &f,
-        &std::fs::read(&f).unwrap(),
-        500_000,
-        &seats2,
-    )
-    .unwrap();
-    let old = app.editor.diff.take().unwrap();
-    app.editor
-        .open_head_diff_with_text(
-            std::path::PathBuf::from("note.txt (HEAD)"),
-            "kept\n",
-            &f,
-            true,
-        )
-        .unwrap();
-    let mut fresh = app.editor.diff.take().unwrap();
-    fresh.carry_view_from(&old);
+    record(500_000, &seats2);
+    let no_paths = std::collections::BTreeSet::new();
     assert!(
-        fresh.group_by_seat,
-        "the lens stays on across the carry rather than going dark"
+        app.refresh_open_diff_views(false, &[], &no_paths),
+        "staging: the refresh rebuilt the view"
     );
-    assert_eq!(
-        fresh.seats.attributed(),
-        0,
-        "staging: the carry does NOT bring the old map, which named other lines"
-    );
-    app.editor.diff = Some(fresh);
-    // What the refresh does next for a carried lens.
-    app.reload_group_by_seat_map();
     let diff = app.editor.diff.as_ref().unwrap();
+    assert_eq!(
+        diff.right_lines.len(),
+        3,
+        "staging: the rebuilt view shows the new line"
+    );
+    assert!(
+        diff.group_by_seat,
+        "the lens stays on across the rebuild rather than going dark"
+    );
     assert_eq!(
         diff.seat_summary(),
         "you 1 \u{2022} agent (pane 2) 1",
-        "and the map is reloaded against the rebuilt rows: {}",
+        "and its map is reloaded against the rebuilt rows: {}",
         diff.seat_summary()
     );
 }
@@ -12682,6 +12669,51 @@ fn the_group_by_seat_lens_refuses_a_map_for_lines_the_view_does_not_show() {
         diff.seat_summary(),
         "unrecorded 1",
         "the newer map is refused rather than joined onto lines it never described"
+    );
+}
+
+/// A lone carriage return is one line to the diff opener (#349 review):
+/// the comparison that binds a map to the view's rows has to split the same
+/// way, or the lens reports every line unrecorded on such a file.
+#[test]
+fn the_group_by_seat_lens_handles_a_lone_carriage_return() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    // "a\rb" is ONE line to `str::lines`, which is how the view is built.
+    std::fs::write(&f, "kept\na\rb\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.focus_pane(Pane::Editor);
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(1..2, Seat::Me);
+    crate::history::record_with_seats_in(
+        hist.path(),
+        &f,
+        &std::fs::read(&f).unwrap(),
+        1_000,
+        &seats,
+    )
+    .unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("note.txt (HEAD)"),
+            "kept\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        app.editor.diff.as_ref().unwrap().right_lines.len(),
+        2,
+        "staging: the opener made two lines, the lone CR inside the second"
+    );
+    app.run_command(crate::widgets::command_palette::Command::DiffToggleGroupBySeat);
+    assert_eq!(
+        app.editor.diff.as_ref().unwrap().seat_summary(),
+        "you 1",
+        "the map is applied rather than refused over a splitting difference"
     );
 }
 

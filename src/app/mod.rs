@@ -24460,24 +24460,15 @@ impl App {
     /// this puts back a map that describes the rows now on screen, or none.
     /// A no-op for a view whose lens is off.
     fn reload_seats_for(history_root: &Path, diff: &mut crate::widgets::diff::DiffData) {
-        if !diff.group_by_seat {
+        // The same gate the toggle applies, restated rather than assumed:
+        // the map is keyed on working-file line indices, so it may only be
+        // joined onto a view whose right side IS the working tree.
+        if !diff.group_by_seat || !diff.left_is_git_head {
             return;
         }
         let right_lines = diff.right_lines.clone();
         diff.seats = Self::seats_for_working_file(history_root, &diff.right_path, &right_lines)
             .unwrap_or_default();
-    }
-
-    /// [`Self::reload_seats_for`] on the active tab's diff, the step the
-    /// refresh performs for a carried lens. Test-only: production reaches
-    /// the same helper inside the rebuild loop, where the fresh view is in
-    /// hand before it is installed.
-    #[cfg(test)]
-    pub fn reload_group_by_seat_map(&mut self) {
-        let history_root = self.history_root.clone();
-        if let Some(diff) = self.editor.diff.as_mut() {
-            Self::reload_seats_for(&history_root, diff);
-        }
     }
 
     /// The persisted provenance map for a working-tree file, for the rows a
@@ -24505,12 +24496,20 @@ impl App {
         if on_disk != snapshot {
             return None;
         }
-        // Split the way `Editor::open` splits, so the comparison is against
-        // the same lines the view was built from.
+        // Split the way the DIFF OPENER splits (`str::lines`), NOT the way
+        // `Editor::open` does: a lone `\r` is one line to the opener and two
+        // to the editor's splitter, and the comparison has to be against the
+        // lines this view was actually built from. The bare UTF-8 decode
+        // matches the opener too, which reads the right side with
+        // `read_to_string` and so never builds a view for a file this
+        // cannot decode.
         let text = String::from_utf8(snapshot).ok()?;
-        if crate::widgets::editor::split_into_lines(&text) != right_lines {
+        if !text.lines().eq(right_lines.iter().map(String::as_str)) {
             return None;
         }
+        // Defensive: the comparison above already forces equal lengths, so
+        // this drops nothing today. It keeps the map bounded by the rows if
+        // that gate is ever loosened.
         seats.truncate(right_lines.len());
         Some(seats)
     }

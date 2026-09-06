@@ -1363,8 +1363,13 @@ fn render_diff(
         // gutter's last cell, on the lines this change ADDS. An unchanged
         // line's seat describes work the change did not do, and a line with
         // no record paints nothing rather than being guessed.
+        // The REAL row, the basis `added_lines_by_seat` counts on: the
+        // whitespace lens reclassifies a re-indented line as Equal, and a
+        // line this change wrote must not lose its bar while the header
+        // still counts it. `display_rows` is index-for-index with `rows`.
+        let seat_row = diff.rows.get(row_idx).copied().unwrap_or(row);
         if diff.group_by_seat
-            && matches!(row, DiffRow::Added { .. } | DiffRow::Replaced { .. })
+            && matches!(seat_row, DiffRow::Added { .. } | DiffRow::Replaced { .. })
             && let Some(i) = r_right_idx
             && let Some(seat) = diff.seats.seat(i)
         {
@@ -10515,7 +10520,7 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 /// position past that `\r` (semantic tokens, diagnostics, hover, definition)
 /// would then resolve one row off. Normalizing first keeps the two in lockstep
 /// and is a no-op for clean `\n`-only files.
-pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
+fn split_into_lines(text: &str) -> Vec<String> {
     normalize_newlines(text)
         .lines()
         .map(|s| s.to_string())

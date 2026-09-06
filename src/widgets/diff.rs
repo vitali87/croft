@@ -1742,6 +1742,41 @@ mod seat_group_tests {
         );
     }
 
+    /// The bars and the header count the same lines (#349 review): the
+    /// whitespace lens reclassifies a re-indented line as Equal, and if the
+    /// renderer keyed on that the header would report a line with no bar
+    /// beside it.
+    #[test]
+    fn the_bars_and_the_tally_agree_under_the_whitespace_lens() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget as _;
+        let mut d = head_diff(&["  x"], &["    x"]);
+        d.seats.record(0..1, Seat::Me);
+        d.set_whitespace_mode(DiffWhitespace::All);
+        d.group_by_seat = true;
+        assert_eq!(
+            d.added_lines_by_seat(),
+            vec![(Some(Seat::Me), 1)],
+            "staging: the tally counts the re-indented line"
+        );
+        let mut e = crate::widgets::editor::Editor::new();
+        e.diff = Some(d);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let bars = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "\u{258e}")
+            .count();
+        assert_eq!(bars, 1, "and the renderer paints a bar for it");
+    }
+
     /// The header says which part of the change is whose (#349): a lens that
     /// paints seats must name them, or a reader has colours and no key.
     #[test]
