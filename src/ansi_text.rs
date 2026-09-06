@@ -35,6 +35,8 @@ pub struct AnsiStyle {
     /// SGR 7. Swapping fg/bg is left to the painter, which knows the
     /// theme's default pair to swap against.
     pub inverse: bool,
+    /// SGR 9, cleared by 29.
+    pub strikeout: bool,
 }
 
 impl AnsiStyle {
@@ -231,6 +233,7 @@ fn apply_sgr(params: &str, style: &mut AnsiStyle) {
             3 => style.italic = true,
             4 => style.underline = true,
             7 => style.inverse = true,
+            9 => style.strikeout = true,
             22 => {
                 style.bold = false;
                 style.dim = false;
@@ -238,6 +241,7 @@ fn apply_sgr(params: &str, style: &mut AnsiStyle) {
             23 => style.italic = false,
             24 => style.underline = false,
             27 => style.inverse = false,
+            29 => style.strikeout = false,
             30..=37 => style.fg = Some(AnsiColor::Indexed((n - 30) as u8)),
             39 => style.fg = None,
             40..=47 => style.bg = Some(AnsiColor::Indexed((n - 40) as u8)),
@@ -321,6 +325,31 @@ pub fn looks_like_ansi(sample: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SGR 9 and 29 round-trip like the other attributes: a pane's
+    /// struck-through cells come back struck through in the rendered log.
+    #[test]
+    fn strikeout_is_set_by_9_and_cleared_by_29() {
+        let mut style = AnsiStyle::default();
+        let line = parse_line("\x1b[9mgone\x1b[29m kept", &mut style);
+        assert_eq!(line.text, "gone kept");
+        let gone = line
+            .spans
+            .iter()
+            .find(|s| s.start == 0)
+            .expect("a span for the struck run");
+        assert!(
+            gone.style.strikeout,
+            "SGR 9 sets strikeout: {:?}",
+            line.spans
+        );
+        let kept = line.spans.iter().find(|s| s.start >= 4);
+        assert!(
+            kept.is_none_or(|s| !s.style.strikeout),
+            "SGR 29 clears it: {:?}",
+            line.spans
+        );
+    }
 
     fn parse(raw: &str) -> AnsiLine {
         let mut st = AnsiStyle::default();
