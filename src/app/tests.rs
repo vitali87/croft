@@ -39110,6 +39110,9 @@ fn toggling_log_highlighting_flips_open_views_and_the_default() {
     // #466: the palette / Settings toggle reaches the view that is already
     // open AND steers views opened afterwards, so the user sees the change
     // at once and does not get it undone by the next log they open.
+    let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("build.log");
     std::fs::write(&log, b"\x1b[32mok\x1b[0m 2024-01-02 step 1\nplain step 2\n").unwrap();
@@ -39144,4 +39147,38 @@ fn toggling_log_highlighting_flips_open_views_and_the_default() {
     app.toggle_log_highlight();
     assert_eq!(app.log_highlight, before);
     assert_eq!(crate::log_view::default_highlight(), before);
+}
+
+#[test]
+fn startup_seeds_the_log_view_default_from_the_saved_preference() {
+    // #466: `App::new` pushes the saved preference into the log view's
+    // opening default, so the first log opened after startup respects a
+    // saved opt-out instead of waiting for a manual toggle. The saved
+    // preference is whatever this machine's config holds; the invariant is
+    // that the two agree, and that they agree in BOTH directions after a
+    // toggle round-trip.
+    let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    // Leave the default in a state that disagrees with a fresh app's field,
+    // so `App::new` has to overwrite it to pass.
+    let mut probe = App::new(tmp.path().to_path_buf()).unwrap();
+    let saved = probe.log_highlight;
+    crate::log_view::set_default_highlight(!saved);
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert_eq!(
+        app.log_highlight, saved,
+        "the field reads the same preference"
+    );
+    assert_eq!(
+        crate::log_view::default_highlight(),
+        saved,
+        "and startup seeded the log view's opening default from it"
+    );
+    // Restore through the toggle path so the persisted preference and the
+    // process default end where they started.
+    probe.toggle_log_highlight();
+    probe.toggle_log_highlight();
+    assert_eq!(crate::log_view::default_highlight(), saved);
 }

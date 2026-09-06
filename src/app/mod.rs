@@ -4143,6 +4143,11 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
+        // Seed the log view's opening default from the saved preference
+        // BEFORE any log can be opened (#466): the toggle keeps the two in
+        // step afterwards, but a startup that set only `App::log_highlight`
+        // opened the first log highlighted despite a saved opt-out.
+        crate::log_view::set_default_highlight(!loaded_prefs.disable_log_highlight);
         // Same treatment for keybindings: a row croft refused (an unknown
         // command id, a gesture that can never fire, a reserved bare click)
         // used to vanish silently, which reads as croft being broken rather

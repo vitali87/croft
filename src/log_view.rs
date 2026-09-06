@@ -34,6 +34,13 @@ use crate::ansi_text::{AnsiLine, AnsiStyle, parse_into, parse_line};
 /// flipped by the app through [`LogView::set_highlight`].
 static DEFAULT_HIGHLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// Serialises the tests that read or write the process-wide default (#466):
+/// the atomic makes each access sound, not the snapshot / flip / open /
+/// restore sequence a test performs around it, and the suite runs tests on
+/// parallel threads.
+#[cfg(test)]
+pub(crate) static DEFAULT_HIGHLIGHT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Set the highlight default for views opened from now on (#466).
 pub fn set_default_highlight(on: bool) {
     DEFAULT_HIGHLIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -1131,6 +1138,9 @@ mod tests {
     /// and an existing view follows its own toggle, not the default.
     #[test]
     fn the_default_steers_new_views_only() {
+        let _exclusive = DEFAULT_HIGHLIGHT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_d, p) = write_tmp(b"plain 1\n");
         let before = default_highlight();
         set_default_highlight(false);
