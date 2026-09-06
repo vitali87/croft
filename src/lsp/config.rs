@@ -219,6 +219,7 @@ impl ServerConfig {
                 archive: crate::lsp::install::ArchiveKind::Gz,
                 bin_path: None,
                 termux_pkg: Some("rust-analyzer"),
+                sha256: &[],
             }),
         }
     }
@@ -364,6 +365,7 @@ mod tests {
             bin_path,
             termux_pkg,
             targets,
+            ..
         }) = ServerConfig::rust_analyzer().provision
         else {
             panic!("rust-analyzer must carry a Binary provision");

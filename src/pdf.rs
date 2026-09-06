@@ -280,6 +280,10 @@ fn which(cmd: &str) -> Option<PathBuf> {
 
 /// Total pages in `pdf`. Returns None when no detector is available so the
 /// caller renders page 1 with no navigation rather than refusing the file.
+// Unbounded (#493): `pdfinfo` and `mdls` below each run with `.output()` on
+// the same frame-loop open path as the render, just before it. The
+// follow-up that moves the open off the frame loop covers them; until then
+// the pdftoppm runner is the shape to reuse.
 pub fn detect_page_count(pdf: &Path) -> Option<u32> {
     if let Some(n) = page_count_via_pdfinfo(pdf) {
         return Some(n);
@@ -326,6 +330,19 @@ fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
     s.trim().parse::<u32>().ok()
 }
 
+/// How long one page render may take before the renderer is killed and the
+/// open reports a failure instead of parking the frame loop (#493).
+const PDF_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a failed render's stderr is given to finish arriving after the
+/// exit was observed (#493). The settle poll reads it once it has been
+/// quiet for ~60 ms of ticks (≈85 ms of wall clock on a quiet machine, more
+/// under load, since each tick's sleep overshoots),
+/// so this is sized to leave that early exit real headroom rather than
+/// being the exit itself; the worst case, a renderer that keeps writing,
+/// pays the whole grace once, on a path that has already failed.
+const STDERR_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Test-only: the next `rasterize_page` call for exactly this (path, page)
 /// fails once, simulating a transient rasteriser failure (a spawn refused
 /// under load, an OOM-killed child). Keyed on the full path so parallel
@@ -360,14 +377,41 @@ pub fn rasterize_page(pdf: &Path, page: u32, backend: PdfBackend) -> std::io::Re
 }
 
 fn rasterize_with_pdftoppm(pdf: &Path, page: u32) -> std::io::Result<Vec<u8>> {
+    run_pdftoppm(Path::new("pdftoppm"), pdf, page, PDF_RENDER_BUDGET)
+}
+
+/// Render `page` of `pdf` with the pdftoppm at `program` (a parameter so a
+/// test can hand in a script without touching PATH), within `budget`.
+///
+/// Bounded (#493): this runs on the frame loop, so a renderer that hangs on
+/// a malformed document or a stalled filesystem must not park the editor.
+/// The child is spawned in its own process group and polled, and at the
+/// deadline the whole group is killed and the child reaped, as the video
+/// poster's ffmpeg run is bounded; `.output()` would block for as long as
+/// the child cared to run. Stderr is drained on its own thread into a
+/// shared buffer that is never joined on: a descendant the child left
+/// behind (a helper it forked) keeps the pipe's write end open, and a join
+/// would wait on that descendant past the budget, on the success path too.
+/// The timeout error carries no stderr on purpose: a hung renderer's partial
+/// spray is rarely the reason it hung, and settling it would add to an
+/// overrun the user is already waiting through.
+fn run_pdftoppm(
+    program: &Path,
+    pdf: &Path,
+    page: u32,
+    budget: std::time::Duration,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
     let dir = unique_temp_dir("croft-pdf")?;
-    let _guard = TempDirGuard(dir.clone());
+    let guard = TempDirGuard(dir.clone());
     let prefix = dir.join("page");
-    // .output(), never .status(): the child must not inherit croft's TTY.
+    // Null and piped, never inherited: the child must not touch croft's TTY.
     // A half-written PDF (pdflatex rewriting the open file) made pdftoppm
     // spray "Syntax Error: Couldn't find trailer dictionary" over the UI.
-    let out = Command::new("pdftoppm")
-        .arg("-f")
+    let mut cmd = Command::new(program);
+    cmd.arg("-f")
         .arg(page.to_string())
         .arg("-l")
         .arg(page.to_string())
@@ -376,19 +420,151 @@ fn rasterize_with_pdftoppm(pdf: &Path, page: u32) -> std::io::Result<Vec<u8>> {
         .args(["-png", "-singlefile"])
         .arg(pdf)
         .arg(&prefix)
-        .output()?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own group, so the kill at the deadline reaches a descendant
+        // the renderer forked and not only the renderer itself.
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    let stderr_pipe = child.stderr.take();
+    let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&stderr_buf);
+    // Published chunk by chunk, not at end of file: the pipe only reaches
+    // end of file once every holder of its write end has gone, and a
+    // descendant the renderer forked can hold it long after the renderer
+    // itself has exited. A single publish at the end would then arrive
+    // after the exit had already been reported, and the spray this pipe
+    // exists to capture would land nowhere.
+    std::thread::spawn(move || {
+        let Some(mut err) = stderr_pipe else {
+            return;
+        };
+        let mut chunk = [0u8; 4096];
+        loop {
+            match err.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut slot) = sink.lock() {
+                        slot.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + budget;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            Ok(None) => {
+                kill_group(child, guard);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "{} took longer than {:.1} s rendering page {page}; killed",
+                        program.display(),
+                        budget.as_secs_f64()
+                    ),
+                ));
+            }
+            Err(e) => {
+                kill_group(child, guard);
+                return Err(e);
+            }
+        }
+    };
+    if !status.success() {
+        let text = settle_stderr(&stderr_buf, STDERR_SETTLE_GRACE);
         return Err(std::io::Error::other(format!(
-            "pdftoppm exited with {}: {}",
-            out.status,
-            stderr.trim()
+            "{} exited with {status}: {text}",
+            program.display()
         )));
     }
     let png_path = prefix.with_extension("png");
     std::fs::read(&png_path)
 }
 
+/// The renderer's stderr as collected by `grace` after its exit was
+/// observed. Its last words usually land a scheduling tick after the exit,
+/// so the buffer is polled every 5 ms and read once it has been quiet for a
+/// run of ticks long enough to bridge a scheduling gap between two writes
+/// (a shorter run settled early and lost the second write), or once the
+/// grace is spent, whichever comes first: the run is strictly shorter than
+/// the grace, so a renderer whose stderr was complete at exit settles
+/// early and the deadline stays the independent backstop. An empty buffer
+/// counts as quiet, so a silent failure settles just as early. Bytes a
+/// descendant writes after that are not waited for; a reader still blocked
+/// on its copy of the pipe is left to finish on its own. The buffer is
+/// append-only, which is what makes an unchanged trimmed length mean no new
+/// content arrived.
+fn settle_stderr(
+    buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    grace: std::time::Duration,
+) -> String {
+    let tick = std::time::Duration::from_millis(5);
+    let deadline = std::time::Instant::now() + grace;
+    // Twelve ticks (60 ms) bridges the gaps seen between a renderer's
+    // writes; capped below the grace so the two exits stay distinct (the
+    // cap only binds for a grace under 65 ms).
+    let ticks_in_grace = (grace.as_millis() / tick.as_millis()) as u32;
+    let quiet_run = 12.min(ticks_in_grace.saturating_sub(1)).max(1);
+    let mut seen = 0usize;
+    let mut quiet = 0u32;
+    loop {
+        let text = buf
+            .lock()
+            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+            .unwrap_or_default();
+        quiet = if text.len() == seen { quiet + 1 } else { 0 };
+        if quiet >= quiet_run || std::time::Instant::now() >= deadline {
+            return text;
+        }
+        seen = text.len();
+        std::thread::sleep(tick);
+    }
+}
+
+/// Kill the renderer's whole process group on the budget's overrun (and on
+/// a wait error); a renderer that exited on its own is not chased, whatever
+/// it forked. The reap still happens, on its own thread: a renderer stalled
+/// in uninterruptible I/O (a stuck filesystem is one of the hangs this
+/// bound exists for) keeps SIGKILL pending until the kernel lets it go, and
+/// a synchronous `wait` here would hold the frame loop for exactly as long
+/// as the budget was meant to stop it being held. The scratch dir's guard
+/// goes with the child, so the dir is removed only once the renderer is
+/// reaped; deleting it under a child still stalled in I/O would orphan its
+/// output. One such thread exists per overrun of a user-initiated render,
+/// each blocked in `wait` for as long as its renderer stays stuck, which is
+/// bounded by the user's page turns rather than by the frame rate. Off unix
+/// only the child itself can be killed.
+fn kill_group(mut child: std::process::Child, scratch: TempDirGuard) {
+    #[cfg(unix)]
+    {
+        // SAFETY: a negative pid addresses the process group the child was
+        // started in (`process_group(0)` above); the call only sends a signal.
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    std::thread::spawn(move || {
+        // The non-unix path, and a no-op on unix after the group signal.
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(scratch);
+    });
+}
+
+// Unbounded (#493): the follow-up that moves the open off the frame loop
+// covers this backend too; the pdftoppm runner above is the shape to reuse.
 fn rasterize_with_sips(pdf: &Path) -> std::io::Result<Vec<u8>> {
     let dir = unique_temp_dir("croft-pdf")?;
     let _guard = TempDirGuard(dir.clone());
@@ -439,6 +615,301 @@ impl Drop for TempDirGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wait handed to a spawned process, scaled for a loaded host as the
+    /// repo's spawn waits are (CONTRIBUTING: never a fresh fixed constant).
+    #[cfg(unix)]
+    fn budget(base_ms: u64) -> std::time::Duration {
+        crate::test_budget::spawn_budget(std::time::Duration::from_millis(base_ms))
+    }
+
+    /// A pdftoppm script that behaves as told: `sleep <secs>` to hang, or
+    /// write a byte to the `<prefix>.png` it is asked for and exit 0.
+    #[cfg(unix)]
+    fn fake_pdftoppm(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("pdftoppm");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// #493: a renderer that hangs is killed at the budget and the open
+    /// reports it, instead of parking the frame loop for as long as the
+    /// child cares to run.
+    #[cfg(unix)]
+    #[test]
+    fn a_pdftoppm_that_overruns_the_budget_is_killed_and_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The renderer sleeps well past the widest timeout the budget can
+        // reach, so the elapsed ceiling below is met only by the kill.
+        let timeout = budget(300);
+        let script = fake_pdftoppm(
+            tmp.path(),
+            &format!("sleep {}", timeout.as_secs_f64() * 20.0),
+        );
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let started = std::time::Instant::now();
+        let err = run_pdftoppm(&script, &pdf, 1, timeout)
+            .expect_err("an overrunning renderer is a failure, not a wait");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < timeout * 4,
+            "the open returned at the budget, not when the child felt like it: {elapsed:?}"
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            err.to_string().contains("longer than"),
+            "the error names the budget: {err}"
+        );
+    }
+
+    /// A renderer that exits promptly but leaves a descendant behind (a
+    /// helper it forked, a stuck plugin) must not hold the call for as long
+    /// as that descendant keeps the stderr pipe open: the budget bounds the
+    /// whole call, not only the direct child's exit.
+    #[cfg(unix)]
+    #[test]
+    fn a_pdftoppm_whose_descendant_lingers_does_not_hold_the_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let timeout = budget(500);
+        // Comfortably past the cap at every load scale, so a call that
+        // waited for the descendant would blow the assertion.
+        let linger = timeout.as_secs_f64() * 6.0;
+        let script = fake_pdftoppm(
+            tmp.path(),
+            &format!(r#"sleep {linger} & for last; do :; done; printf 'x' > "$last.png""#),
+        );
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let started = std::time::Instant::now();
+        let bytes = run_pdftoppm(&script, &pdf, 1, timeout)
+            .expect("the page was written; a lingering descendant is not a failure");
+        let elapsed = started.elapsed();
+        assert_eq!(bytes, b"x");
+        assert!(
+            elapsed < std::time::Duration::from_secs_f64(linger / 2.0),
+            "the call returned when the page was ready, not when the descendant exited: {elapsed:?}"
+        );
+    }
+
+    /// A renderer that fails still has its stderr reported, through the
+    /// drained pipe: the trailer-dictionary spray this module exists to keep
+    /// off the TUI lands in the error instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_pdftoppm_that_fails_reports_its_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_pdftoppm(tmp.path(), r#"echo "Syntax Error: no trailer" >&2; exit 1"#);
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+            .expect_err("a non-zero exit is a failure");
+        let text = err.to_string();
+        assert!(
+            text.contains("exited with") && text.contains("Syntax Error: no trailer"),
+            "the error carries the exit and the stderr: {text}"
+        );
+    }
+
+    /// A failing renderer's stderr is reported even when a descendant it
+    /// forked keeps the pipe open past its exit: the drain publishes what
+    /// has arrived as it arrives, not only at end of file.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_pdftoppm_with_a_lingering_descendant_still_reports_its_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_pdftoppm(
+            tmp.path(),
+            r#"sleep 5 & echo "Syntax Error: no trailer" >&2; exit 1"#,
+        );
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+            .expect_err("a non-zero exit is a failure");
+        let text = err.to_string();
+        assert!(
+            text.contains("Syntax Error: no trailer"),
+            "the stderr is reported despite the lingering descendant: {text}"
+        );
+    }
+
+    /// A renderer whose stderr arrives in two bursts a scheduling gap apart,
+    /// the second from a helper that writes just after the renderer exits,
+    /// has both reported: the grace poll waits for a run of quiet ticks, not
+    /// for the first lull.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_pdftoppm_has_both_stderr_bursts_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_pdftoppm(
+            tmp.path(),
+            // Past the 30 ms exit-poll tick, so the second burst genuinely
+            // arrives after the exit is observed and the grace poll is what
+            // collects it; a shorter sleep lands before the exit is even seen
+            // and the test would pass with the grace poll gutted.
+            r#"( sleep 0.05; echo "Syntax Error: second" >&2 ) & echo "Syntax Error: first" >&2; exit 1"#,
+        );
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        for _ in 0..5 {
+            let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+                .expect_err("a non-zero exit is a failure");
+            let text = err.to_string();
+            assert!(
+                text.contains("Syntax Error: first") && text.contains("Syntax Error: second"),
+                "both bursts are reported: {text}"
+            );
+        }
+    }
+
+    /// The grace poll bridges a scheduling gap: a second line appended a
+    /// few ticks after the first, long after a one-tick poll would have
+    /// settled, is still collected. Pure threads, no spawned process, so
+    /// the constants are the poll's own and not a spawn wait.
+    #[test]
+    fn the_grace_poll_collects_a_late_line_inside_its_quiet_run() {
+        use std::sync::{Arc, Mutex};
+        let buf = Arc::new(Mutex::new(b"Syntax Error: first\n".to_vec()));
+        let late = Arc::clone(&buf);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            late.lock()
+                .unwrap()
+                .extend_from_slice(b"Syntax Error: second\n");
+        });
+        let text = settle_stderr(&buf, STDERR_SETTLE_GRACE);
+        writer.join().unwrap();
+        assert!(
+            text.contains("first") && text.contains("second"),
+            "a line landing inside the quiet run is collected: {text:?}"
+        );
+    }
+
+    /// A buffer that is already complete settles early: the poll must not
+    /// charge every failing render the whole grace when nothing is coming.
+    #[test]
+    fn the_grace_poll_settles_a_complete_buffer_well_inside_the_grace() {
+        use std::sync::{Arc, Mutex};
+        // The poll's twelve 5 ms ticks are FIXED, so its ideal early exit
+        // is ~60 ms whatever the load; only their overshoot scales. The
+        // grace is therefore the production constant scaled up (spawn_budget
+        // is at least 4x its base, so the floor here is 800 ms, never below
+        // production), and the ceiling is the fraction of it that proves an
+        // early exit: far above the ideal exit's overshoot under load, and
+        // still failed by a poll that ran to its deadline, which returns at
+        // the grace or later.
+        let grace = crate::test_budget::spawn_budget(STDERR_SETTLE_GRACE).max(STDERR_SETTLE_GRACE);
+        let ceiling = grace * 3 / 4;
+        for seed in [&b"Syntax Error: complete\n"[..], &b""[..]] {
+            let buf = Arc::new(Mutex::new(seed.to_vec()));
+            let started = std::time::Instant::now();
+            let _ = settle_stderr(&buf, grace);
+            let took = started.elapsed();
+            assert!(
+                took < ceiling,
+                "a settled buffer does not pay the whole grace: {took:?} against {ceiling:?} for seed {seed:?}"
+            );
+        }
+    }
+
+    /// The deadline is the bound when the buffer never goes quiet: a writer
+    /// appending faster than the quiet run can complete is cut off at the
+    /// grace, with what arrived so far, rather than followed indefinitely.
+    #[test]
+    fn the_grace_poll_stops_at_its_deadline_under_a_writer_that_never_pauses() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sink, halt) = (Arc::clone(&buf), Arc::clone(&stop));
+        let writer = std::thread::spawn(move || {
+            while !halt.load(Ordering::Relaxed) {
+                sink.lock().unwrap().extend_from_slice(b"x");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        let grace = std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let text = settle_stderr(&buf, grace);
+        let took = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            took >= grace,
+            "the deadline is the exit when nothing settles: {took:?}"
+        );
+        assert!(
+            took < crate::test_budget::spawn_budget(grace),
+            "and it is not followed past the grace: {took:?}"
+        );
+        assert!(!text.is_empty(), "what arrived before the deadline is kept");
+    }
+
+    /// A renderer that fails silently still names its exit status.
+    #[cfg(unix)]
+    #[test]
+    fn a_silently_failing_pdftoppm_still_names_its_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_pdftoppm(tmp.path(), "exit 3");
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+            .expect_err("a non-zero exit is a failure");
+        assert!(err.to_string().contains("exited with"), "{err}");
+    }
+
+    /// A hung renderer's descendants go down with it: the kill reaches the
+    /// process group, so a helper the renderer forked cannot outlive the
+    /// budget and keep running (or keep the pipe open) after the open failed.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_pdftoppm_takes_its_descendants_down_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("alive");
+        // The forked helper outlives the renderer unless the GROUP is killed.
+        // Its delay is derived from the scaled timeout, comfortably past the
+        // widest value the budget can reach, so the helper is still pending
+        // when the kill lands at every load scale rather than only at low
+        // ones; the renderer's own sleep is longer still.
+        let timeout = budget(300);
+        let helper_delay = timeout.as_secs_f64() * 3.0;
+        let script = fake_pdftoppm(
+            tmp.path(),
+            &format!(
+                "(sleep {helper_delay}; touch '{}') & sleep {}",
+                marker.display(),
+                helper_delay * 10.0
+            ),
+        );
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        run_pdftoppm(&script, &pdf, 1, timeout).expect_err("an overrun is a failure");
+        std::thread::sleep(std::time::Duration::from_secs_f64(helper_delay * 2.0));
+        assert!(
+            !marker.exists(),
+            "the forked helper survived the group kill"
+        );
+    }
+
+    /// The control for the tests above: a renderer that finishes inside the
+    /// budget hands back the bytes it wrote, budget or no budget.
+    #[cfg(unix)]
+    #[test]
+    fn a_pdftoppm_that_finishes_in_time_hands_back_its_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The prefix is the last argument; the renderer writes `<prefix>.png`.
+        let script = fake_pdftoppm(
+            tmp.path(),
+            r#"for last; do :; done; printf 'x' > "$last.png""#,
+        );
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let bytes = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+            .expect("a renderer that finishes is not a failure");
+        assert_eq!(bytes, b"x");
+    }
 
     /// Two renders in flight at once must never share a scratch directory:
     /// the loser's `remove_dir_all` used to delete the winner's PNG before it

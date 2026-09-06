@@ -13529,6 +13529,544 @@ fn enter_in_file_finder_opens_the_selected_file_and_closes_the_modal() {
     );
 }
 
+/// #465: a viewer runs the declared program on the file in a pane of its own,
+/// with `{file}` replaced by the file's path, and the pane takes focus. The
+/// program here is `sh`, so nothing has to be installed for the test.
+#[test]
+fn opening_a_file_in_a_viewer_runs_the_tool_on_it_in_a_new_terminal_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n1,2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.consented_extensions.insert("csvlens".into());
+    let before = app.terminals.len();
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: "csvlens".into(),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "echo VIEWING \"$1\"; sleep 30".into(),
+            "sh".into(),
+            "{file}".into(),
+        ],
+        extensions: vec!["csv".into()],
+        provision: None,
+    };
+    app.open_in_viewer(&viewer, &data);
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "the viewer gets a pane of its own"
+    );
+    assert!(app.show_terminal, "the panel is shown");
+    assert!(
+        matches!(app.focus, Pane::Terminal),
+        "and the pane takes focus"
+    );
+    let want = format!("VIEWING {}", data.display());
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the viewer to print the file it was handed",
+        || app.terminal().visible_text().contains(&want),
+    );
+}
+
+/// A file name that is not valid UTF-8 must not be handed to the viewer
+/// mangled (#485 review): the tool would open a different path and fail.
+/// Until the pane spawn can carry OS-native arguments, such a file is
+/// refused with a status line rather than opened wrong.
+#[cfg(unix)]
+#[test]
+fn a_viewer_refuses_a_path_it_cannot_pass_faithfully() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    // The file is deliberately not created: APFS refuses such a name, and
+    // the guard fires before the viewer path touches the disk anyway.
+    let odd = tmp
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"d\xffata.csv"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: "csvlens".into(),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30".into(), "sh".into(), "{file}".into()],
+        extensions: vec!["csv".into()],
+        provision: None,
+    };
+    let before = app.terminals.len();
+    app.open_in_viewer(&viewer, &odd);
+    assert_eq!(
+        app.terminals.len(),
+        before,
+        "no pane is spawned for a path that cannot be passed"
+    );
+    assert!(
+        app.status.contains("not valid UTF-8"),
+        "the status says why: {:?}",
+        app.status
+    );
+}
+
+/// A viewer spawns a program from a manifest, so it passes the same
+/// first-run consent gate a sidecar does (#485 review): the first use of an
+/// extension's viewer shows the exact command line and spawns nothing until
+/// the user allows it; a consented extension runs straight away.
+#[test]
+fn a_viewer_asks_for_consent_before_its_first_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: format!("consent-test-{}", std::process::id()),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30".into(), "sh".into(), "{file}".into()],
+        extensions: vec!["csv".into()],
+        provision: None,
+    };
+    let before = app.terminals.len();
+    app.open_in_viewer(&viewer, &data);
+    assert_eq!(app.terminals.len(), before, "nothing spawns before consent");
+    let prompt = app
+        .input_prompt
+        .as_ref()
+        .expect("the consent prompt is open");
+    assert!(
+        prompt.title.contains(&viewer.ext_id) && prompt.title.contains("/bin/sh"),
+        "the prompt names the extension and the exact command: {:?}",
+        prompt.title
+    );
+}
+
+/// A scratch config dir holding the given user extension manifests
+/// (`<id>` → manifest text). An app pointed at it (`app.config_dir`) reads
+/// its extensions and consent from there and nowhere else; the process
+/// environment is never touched, so the test is safe beside every other.
+fn scratch_config(manifests: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let croft = tmp.path().join("croft");
+    for (id, text) in manifests {
+        let dir = croft.join("extensions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("extension.toml"), text).unwrap();
+    }
+    (tmp, croft)
+}
+
+/// The consent set recorded in a scratch config dir.
+fn consent_on_disk(croft: &Path) -> std::collections::BTreeSet<String> {
+    crate::prefs::Prefs::load(&croft.join("config.json"))
+        .unwrap_or_default()
+        .mcp_consented
+}
+
+/// One consent per extension, read from one place (#485 review): the sidecar
+/// gate consults the same session set the viewer gate does, so allowing an
+/// extension through either gate satisfies the other in the same session,
+/// whatever became of the prefs write. And a prefs write that fails is
+/// reported before the command's own argument prompt takes the screen.
+#[test]
+fn the_sidecar_gate_reads_the_session_consent_set() {
+    use crate::widgets::input_prompt::InputPurpose;
+    const EXT: &str = r#"
+id = "tconsent"
+name = "tconsent"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/false"
+[[commands]]
+id = "tconsent.go"
+title = "tconsent: go"
+server = "srv"
+tool = "go"
+arg = "q"
+prompt = "Query"
+"#;
+    let (_scratch, croft) = scratch_config(&[("tconsent", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
+    // Allowed this session, not (yet) on disk: the gate must not re-prompt,
+    // it must move on to the command's own argument prompt.
+    app.consented_extensions.insert("tconsent".into());
+    app.run_extension_command("tconsent.go");
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(InputPurpose::McpArg { .. })
+        ),
+        "a consented extension goes straight to its argument prompt, not consent: {:?}",
+        app.input_prompt.as_ref().map(|p| p.title.clone())
+    );
+    // Allowing through the sidecar prompt with the prefs file unwritable: the
+    // failure is reported where the user can see it and the grant holds.
+    app.close_input_prompt();
+    app.consented_extensions.remove("tconsent");
+    std::fs::create_dir_all(croft.join("config.json")).unwrap();
+    app.run_extension_command("tconsent.go");
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(InputPurpose::McpConsent { .. })
+        ),
+        "fixture: an unconsented extension is asked first"
+    );
+    app.submit_input_prompt();
+    assert!(
+        app.status.contains("could not be saved"),
+        "a failed prefs write is reported: {:?}",
+        app.status
+    );
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(InputPurpose::McpArg { .. })
+        ),
+        "and the command went on to its argument prompt"
+    );
+    assert!(
+        app.consented_extensions.contains("tconsent"),
+        "the session grant holds"
+    );
+}
+
+/// Allowing a viewer records the consent and resumes the open that asked;
+/// a prefs write that fails is said in the status rather than swallowed.
+#[test]
+fn allowing_a_viewer_records_consent_and_resumes_the_open() {
+    const EXT: &str = r#"
+id = "tviewer"
+name = "tviewer"
+api_version = 1
+[[viewers]]
+id = "sh"
+label = "Open in sh"
+command = "/bin/sh"
+args = ["-c", "sleep 30", "sh", "{file}"]
+extensions = ["csv"]
+"#;
+    let (_scratch, croft) = scratch_config(&[("tviewer", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
+    let viewer = crate::mcp::registry::viewer_by_id_in_dir(&croft, "tviewer/sh")
+        .expect("the scratch viewer");
+    let before = app.terminals.len();
+    app.open_in_viewer(&viewer, &data);
+    assert!(
+        app.input_prompt.is_some(),
+        "fixture: consent is asked first"
+    );
+    app.submit_input_prompt();
+    assert_eq!(app.terminals.len(), before + 1, "allowing resumes the open");
+    assert!(
+        app.consented_extensions.contains("tviewer"),
+        "and records the consent"
+    );
+    let saved = consent_on_disk(&croft);
+    assert!(saved.contains("tviewer"), "on disk too: {saved:?}");
+    assert!(
+        !app.status.contains("could not be saved"),
+        "a successful save is not reported as a failure: {:?}",
+        app.status
+    );
+    // Now with the prefs file made unwritable (a directory in its place):
+    // the consent still holds for the session and the status says the save
+    // failed, instead of the failure vanishing.
+    app.consented_extensions.remove("tviewer");
+    let _ = std::fs::remove_file(croft.join("config.json"));
+    std::fs::create_dir_all(croft.join("config.json")).unwrap();
+    app.open_in_viewer(&viewer, &data);
+    app.submit_input_prompt();
+    assert!(
+        app.status.contains("could not be saved"),
+        "a failed prefs write is reported: {:?}",
+        app.status
+    );
+    assert!(
+        app.consented_extensions.contains("tviewer"),
+        "the session grant still holds"
+    );
+}
+
+/// The Explorer row and the palette row for a viewer are built from the
+/// same config dir the click resolves them through: a viewer installed only
+/// under the app's dir gets its row, and the row opens.
+#[test]
+fn a_viewer_row_is_built_and_resolved_through_the_same_config_dir() {
+    const EXT: &str = r#"
+id = "tviewer"
+name = "tviewer"
+api_version = 1
+[[viewers]]
+id = "sh"
+label = "Open in sh"
+command = "/bin/sh"
+args = ["-c", "sleep 30", "sh", "{file}"]
+extensions = ["csv"]
+"#;
+    let (_scratch, croft) = scratch_config(&[("tviewer", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("data.csv");
+    std::fs::write(&csv, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
+    app.consented_extensions.insert("tviewer".into());
+    let n = file_node(&csv);
+    let items = build_tree_context_menu_items_in_dir(
+        &croft,
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&csv),
+        tmp.path(),
+        None,
+        None,
+    );
+    let row = items
+        .iter()
+        .find_map(|(label, a)| match a {
+            MenuAction::OpenInViewer(id, p) if p == &csv => Some((label.clone(), id.clone())),
+            _ => None,
+        })
+        .expect("the viewer under the app's config dir gets a row");
+    assert_eq!(row, ("Open in sh".to_string(), "tviewer/sh".to_string()));
+    let before = app.terminals.len();
+    app.dispatch_menu_action(
+        MenuAction::OpenInViewer(row.1.clone(), csv.clone()),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "and the row resolves and opens"
+    );
+    let palette_ids: Vec<String> = crate::mcp::registry::contributed_viewer_commands_in_dir(&croft)
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert!(
+        palette_ids.iter().any(|id| id == "viewer:tviewer/sh"),
+        "the palette row comes from the same dir: {palette_ids:?}"
+    );
+}
+
+/// Uninstalling an extension forgets its consent, in the session and on
+/// disk: a later re-add is a fresh install of a program the user has not
+/// approved this time, so the first-run gate asks again. The disabled state
+/// it clears lands in the same config file.
+#[test]
+fn uninstalling_an_extension_forgets_its_consent() {
+    let (_scratch, croft) = scratch_config(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
+    crate::prefs::save_mcp_consent_in(&croft, "csvlens").unwrap();
+    app.consented_extensions.insert("csvlens".into());
+    app.disabled_extensions.insert("csvlens".into());
+    crate::prefs::save_disabled_extensions_in(&croft, &app.disabled_extensions).unwrap();
+    app.perform_extension_uninstall("csvlens");
+    let disabled_on_disk = crate::prefs::Prefs::load(&croft.join("config.json"))
+        .unwrap_or_default()
+        .disabled_extensions;
+    assert!(
+        !disabled_on_disk.contains("csvlens"),
+        "the disabled state is cleared in the app's own config file: {disabled_on_disk:?}"
+    );
+    assert!(
+        app.status.starts_with("Uninstalled"),
+        "fixture: the catalog entry uninstalls cleanly: {:?}",
+        app.status
+    );
+    assert!(
+        !app.consented_extensions.contains("csvlens"),
+        "the session grant is gone"
+    );
+    let saved = consent_on_disk(&croft);
+    assert!(
+        !saved.contains("csvlens"),
+        "and so is the one on disk: {saved:?}"
+    );
+}
+
+/// A viewer that is gone by the time its menu row is clicked, or by the time
+/// its consent prompt is allowed (the extension was removed in between),
+/// must say so rather than do nothing: a silent click reads as a broken
+/// menu. Neither path spawns anything or records consent for a viewer it
+/// could not find.
+#[test]
+fn a_vanished_viewer_is_reported_from_the_menu_and_the_consent_prompt() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let before = app.terminals.len();
+    let key = format!("vanished-ext-{}/csvlens", std::process::id());
+    app.status.clear();
+    app.dispatch_menu_action(
+        MenuAction::OpenInViewer(key.clone(), data.clone()),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(app.terminals.len(), before, "the menu click spawns nothing");
+    assert!(
+        app.status.contains("no longer"),
+        "the click says the viewer is gone: {:?}",
+        app.status
+    );
+    app.status.clear();
+    app.open_input_prompt(
+        InputPrompt::new(
+            InputPurpose::ViewerConsent {
+                key: key.clone(),
+                path: data,
+            },
+            "Allow",
+            "",
+        )
+        .with_value("allow"),
+    );
+    app.submit_input_prompt();
+    assert!(app.input_prompt.is_none(), "the prompt closes");
+    assert_eq!(app.terminals.len(), before, "allowing spawns nothing");
+    assert!(
+        app.status.contains("no longer"),
+        "allowing says the viewer is gone: {:?}",
+        app.status
+    );
+    assert!(
+        !app.consented_extensions
+            .iter()
+            .any(|e| key.starts_with(e.as_str())),
+        "no consent is recorded for a viewer that could not be found"
+    );
+}
+
+/// #465: the palette row reaches the viewer route (not the MCP command path)
+/// and guards on the active file before anything is spawned.
+#[test]
+fn a_viewer_palette_row_guards_on_the_active_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let notes = tmp.path().join("notes.md");
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&notes, "# hi\n").unwrap();
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.consented_extensions.insert("csvlens".into());
+    // The `viewer:` prefix is routed before the MCP lookup: an unknown viewer
+    // is reported as a viewer, not as an extension command.
+    app.run_extension_command("viewer:nope");
+    assert_eq!(app.status, "Viewer 'nope' is unavailable");
+
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: "csvlens".into(),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30".into()],
+        extensions: vec!["csv".into(), "tsv".into()],
+        provision: None,
+    };
+    let before = app.terminals.len();
+    app.editor.path = None;
+    app.open_active_file_in_viewer(&viewer);
+    assert_eq!(app.status, "Open in csvlens: open a file first");
+    app.editor.open(&notes).unwrap();
+    app.open_active_file_in_viewer(&viewer);
+    assert_eq!(
+        app.status,
+        "Open in csvlens: the active file is not one of .csv / .tsv"
+    );
+    assert_eq!(app.terminals.len(), before, "a guard spawns nothing");
+    app.editor.open(&data).unwrap();
+    app.open_active_file_in_viewer(&viewer);
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "a matching file opens in a pane"
+    );
+}
+
+/// #465: the Explorer menu offers the viewer for a single file it handles,
+/// after Rename and before the compare entries, and for nothing else.
+#[test]
+fn the_explorer_menu_offers_a_viewer_for_a_single_matching_file_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("data.csv");
+    let md = tmp.path().join("notes.md");
+    std::fs::write(&csv, "a,b\n").unwrap();
+    std::fs::write(&md, "# hi\n").unwrap();
+    let viewer_for = |file: &Path| {
+        (file.extension().and_then(|e| e.to_str()) == Some("csv"))
+            .then(|| (String::from("Open in csvlens"), String::from("csvlens")))
+    };
+    let target = tmp.path().to_path_buf();
+
+    let n = file_node(&csv);
+    let items = build_tree_context_menu_items_with(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&csv),
+        &target,
+        None,
+        None,
+        viewer_for,
+    );
+    let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+    let at = labels
+        .iter()
+        .position(|l| *l == "Open in csvlens")
+        .expect("a csv gets the viewer entry");
+    assert_eq!(labels[at - 1], "Rename", "it follows Rename");
+    assert!(
+        matches!(&items[at].1, MenuAction::OpenInViewer(id, p) if id == "csvlens" && p == &csv)
+    );
+
+    let n = file_node(&md);
+    let items = build_tree_context_menu_items_with(
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&md),
+        &target,
+        None,
+        None,
+        viewer_for,
+    );
+    assert!(
+        !items.iter().any(|(l, _)| l == "Open in csvlens"),
+        "a kind no viewer handles gets no entry"
+    );
+
+    // A multi-selection is not one file, so no viewer entry either.
+    let n = file_node(&csv);
+    let both = vec![csv.clone(), md.clone()];
+    let items = build_tree_context_menu_items_with(
+        Some(&n),
+        tmp.path(),
+        &both,
+        &target,
+        None,
+        None,
+        viewer_for,
+    );
+    assert!(
+        !items.iter().any(|(l, _)| l == "Open in csvlens"),
+        "a multi-selection gets no viewer entry"
+    );
+}
+
 #[test]
 fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
     // #472: `alpha:236-239` in Cmd+P must still find alpha.rs, and Enter

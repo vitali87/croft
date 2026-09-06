@@ -119,15 +119,27 @@ fn remove_from(dir: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Uninstall a catalog entry: delete its manifest from the user extensions dir
-/// so it drops back to AVAILABLE on the next refresh. Reversible via [`install`].
-pub fn uninstall(id: &str) -> Result<()> {
-    remove_from(&manifest::user_extensions_dir(), id)
+/// Remove an added catalog extension from an explicit user-extensions dir (see
+/// `prefs::save_mcp_consent_in` for why the dir is a parameter).
+pub fn uninstall_in(extensions_dir: &Path, id: &str) -> Result<()> {
+    remove_from(extensions_dir, id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #465: csvlens is offered under AVAILABLE and leaves the list once added.
+    #[test]
+    fn csvlens_is_in_the_catalog_until_installed() {
+        let none = BTreeSet::new();
+        assert!(
+            available_from(&none).iter().any(|s| s.id == "csvlens"),
+            "csvlens is a catalog entry"
+        );
+        let installed: BTreeSet<String> = ["csvlens".to_string()].into_iter().collect();
+        assert!(!available_from(&installed).iter().any(|s| s.id == "csvlens"));
+    }
 
     #[test]
     fn catalog_lists_the_seeded_servers() {

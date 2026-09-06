@@ -144,7 +144,7 @@ pub fn record_in(
         // Inside the merge window: this save supersedes the newest snapshot
         // rather than appending, so a 1s auto save can't churn out history.
         if millis.saturating_sub(latest.millis) < MERGE_WINDOW_MILLIS {
-            std::fs::write(dir.join(format!("{millis}.{SNAP_EXT}")), content)?;
+            write_snapshot(&dir, millis, content)?;
             if latest.millis != millis {
                 let _ = std::fs::remove_file(&latest.file);
             }
@@ -152,9 +152,108 @@ pub fn record_in(
         }
     }
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(format!("{millis}.{SNAP_EXT}")), content)?;
+    write_snapshot(&dir, millis, content)?;
     prune_in(root_dir, abs_path);
     Ok(())
+}
+
+/// Put `content` at `<millis>.snap` under `dir` so that the entry is never
+/// listed before its bytes are all there. The save path records off the UI
+/// thread while readers (`entries_in` from the history picker, or a test's
+/// byte-exact check) list the same directory, and a plain `fs::write`
+/// creates the file empty first: a reader in that window saw a listed
+/// snapshot with no bytes (#492). The bytes go to a sibling staging name
+/// (see [`staging_path`]), which `entries_in` skips on extension, and are
+/// renamed over the final name afterwards; a rename is atomic on the same
+/// filesystem. On failure the staging file is removed rather than left to
+/// look like history.
+///
+/// The writer holds an exclusive advisory lock on its staging file from the
+/// write through the rename, so the sweep of abandoned staging files (see
+/// `sweep_abandoned_staging`) can tell a writer that is merely slow from one
+/// that died: age alone must not decide it, or a writer paused past the
+/// window would come back to find its bytes swept and its rename failing.
+fn write_snapshot(dir: &Path, millis: u64, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let final_path = dir.join(format!("{millis}.{SNAP_EXT}"));
+    let tmp = staging_path(dir, millis);
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.lock()?;
+        file.write_all(content)?;
+        // Windows cannot rename a file that is open; the lock is released
+        // with the handle there, and the sweep falls back to age alone.
+        #[cfg(windows)]
+        drop(file);
+        std::fs::rename(&tmp, &final_path)?;
+        #[cfg(not(windows))]
+        drop(file);
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// The extension every staging file carries, so `entries_in` and the
+/// cleanup in `prune_in` recognise one without parsing the rest of its name.
+const STAGING_EXT: &str = "tmp";
+
+/// Staging files older than this, and not locked by a live writer, are
+/// abandoned (a crash between the write and the rename) and swept by
+/// `prune_in`. The age keeps the sweep away from the instant between a
+/// writer creating its file and taking the lock; the lock is what protects
+/// a writer that is merely slow.
+const STAGING_ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A staging name unique to this writer: `<millis>.snap.<pid>-<seq>.tmp`.
+/// Two saves of one file in the same millisecond (two croft instances, or
+/// an explicit save racing the auto save) must not share a staging file, or
+/// each would report success while the final snapshot held only one's
+/// bytes. The pid separates processes and the counter separates threads
+/// inside one.
+fn staging_path(dir: &Path, millis: u64) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    dir.join(format!("{millis}.{SNAP_EXT}.{pid}-{seq}.{STAGING_EXT}"))
+}
+
+/// Remove staging files left behind by a writer that died between its write
+/// and its rename. Listing and retention both ignore them, so without this
+/// sweep every interrupted save would leave a hidden snapshot-sized file
+/// forever. A file goes only when it is older than
+/// [`STAGING_ABANDONED_AFTER`] AND its writer's lock can be taken: a writer
+/// still alive holds that lock (see `write_snapshot`), however long it has
+/// been paused, so it is never swept out from under a rename.
+fn sweep_abandoned_staging(dir: &Path, now: std::time::SystemTime) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some(STAGING_EXT) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age > STAGING_ABANDONED_AFTER);
+        if !old_enough {
+            continue;
+        }
+        // Taking the lock proves no writer holds it; it is released with
+        // the handle once the file is gone.
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if file.try_lock().is_ok() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Snapshots of `abs_path` under `root_dir`, newest first.
@@ -178,17 +277,149 @@ pub fn entries_in(root_dir: &Path, abs_path: &Path) -> Vec<Snapshot> {
     out
 }
 
-/// Delete the oldest snapshots of `abs_path` beyond the cap.
+/// Delete the oldest snapshots of `abs_path` beyond the cap, and any staging
+/// file abandoned there (see `sweep_abandoned_staging`).
 fn prune_in(root_dir: &Path, abs_path: &Path) {
     let all = entries_in(root_dir, abs_path);
     for old in all.into_iter().skip(MAX_SNAPSHOTS_PER_FILE) {
         let _ = std::fs::remove_file(&old.file);
     }
+    sweep_abandoned_staging(&dir_for(root_dir, abs_path), std::time::SystemTime::now());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_is_staged_under_a_name_the_listing_ignores() {
+        // The race in #492: `record_in` must never expose an entry whose
+        // bytes are not all on disk. The staging name is what makes that
+        // hold, so pin both halves: a leftover staging file (a crash between
+        // write and rename) is not a snapshot, and a completed record leaves
+        // only the final name behind.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        record_in(root, f, b"v1", 1000).unwrap();
+        let dir = dir_for(root, f);
+        std::fs::write(staging_path(&dir, 2000), b"half").unwrap();
+        let snaps = entries_in(root, f);
+        assert_eq!(snaps.len(), 1, "the staging file is not listed: {snaps:?}");
+        assert_eq!(snaps[0].millis, 1000);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&String::from("1000.snap")), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("1000.snap.")),
+            "a completed record leaves no staging file: {names:?}"
+        );
+    }
+
+    #[test]
+    fn each_writer_stages_under_its_own_name() {
+        // Two saves of one file in the same millisecond must not share a
+        // staging file: the name carries the pid and a per-process counter,
+        // and still ends in the extension the listing and the sweep key on.
+        let dir = Path::new("/store");
+        let a = staging_path(dir, 1000);
+        let b = staging_path(dir, 1000);
+        assert_ne!(a, b, "two writers, two staging files");
+        for p in [&a, &b] {
+            assert_eq!(p.extension().and_then(|x| x.to_str()), Some(STAGING_EXT));
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                name.starts_with(&format!("1000.{SNAP_EXT}.{}-", std::process::id())),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_abandoned_staging_file_is_swept_but_a_live_one_is_left() {
+        // A crash between write and rename leaves a staging file. The next
+        // record sweeps it once it is older than the abandonment window; a
+        // fresh one (another writer mid-write) survives the same sweep.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        record_in(root, f, b"v1", 1000).unwrap();
+        let dir = dir_for(root, f);
+        let stale = staging_path(&dir, 900);
+        std::fs::write(&stale, b"half").unwrap();
+        let long_ago = std::time::SystemTime::now() - STAGING_ABANDONED_AFTER * 10;
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let fresh = staging_path(&dir, 950);
+        std::fs::write(&fresh, b"half").unwrap();
+        record_in(root, f, b"v2", 120_000).unwrap();
+        assert!(!stale.exists(), "the abandoned staging file was swept");
+        assert!(fresh.exists(), "the live one was left alone");
+        assert_eq!(entries_in(root, f).len(), 2, "and the snapshots are intact");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_slow_writer_keeps_its_staging_file_however_old_it_looks() {
+        // Age alone must not decide a sweep: a writer paused between its
+        // write and its rename still holds the lock on its staging file, and
+        // the sweep skips it. Once the writer lets go, the same file goes.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        record_in(root, f, b"v1", 1000).unwrap();
+        let dir = dir_for(root, f);
+        let paused = staging_path(&dir, 900);
+        let holder = std::fs::File::create(&paused).unwrap();
+        holder.lock().unwrap();
+        holder
+            .set_modified(std::time::SystemTime::now() - STAGING_ABANDONED_AFTER * 10)
+            .unwrap();
+        record_in(root, f, b"v2", 120_000).unwrap();
+        assert!(
+            paused.exists(),
+            "a locked staging file is not swept, whatever its age"
+        );
+        drop(holder);
+        record_in(root, f, b"v3", 240_000).unwrap();
+        assert!(
+            !paused.exists(),
+            "released, it is swept like any abandoned one"
+        );
+    }
+
+    #[test]
+    fn a_record_that_cannot_land_leaves_no_staging_file_behind() {
+        // The cleanup branch of the staged write: a rename that fails (the
+        // final name is taken by a directory, which `rename` refuses on
+        // every platform) surfaces as the error `record_in` returns, and
+        // the staging file is removed rather than left to look like history
+        // to anyone listing the directory by hand.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        let dir = dir_for(root, f);
+        std::fs::create_dir_all(dir.join("1000.snap")).unwrap();
+        assert!(
+            record_in(root, f, b"v1", 1000).is_err(),
+            "a snapshot that cannot land is reported"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(STAGING_EXT))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "and its staging file is gone: {leftovers:?}"
+        );
+    }
 
     #[test]
     fn records_and_lists_snapshots_newest_first() {

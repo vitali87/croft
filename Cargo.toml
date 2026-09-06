@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.893"
+version = "0.1.896"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -177,6 +177,8 @@ umya-spreadsheet = { version = "3.1", default-features = false }
 # direct deps adds no new version to the lock. zip needs only `deflate` (the
 # standard GitHub-release compression); its heavier default codecs are dropped.
 flate2 = "1"
+# xz for cargo-dist release archives (csvlens ships tar.xz only, #465).
+lzma-rs = "0.3"
 # Tar walking for the archive browser (#179): list members and extract
 # one on demand (tar/tar.gz/tgz); zip rides the existing zip crate.
 # 0.4.46 verified current on crates.io 2026-08-18.
