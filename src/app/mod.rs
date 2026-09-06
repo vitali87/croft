@@ -2772,7 +2772,7 @@ pub struct App {
     remote_offer_excluded: Vec<String>,
     /// Hosts whose provisioning failed recently (#364), loaded from the
     /// cache file at startup and extended when an install fails.
-    remote_offer_refused: std::collections::BTreeSet<String>,
+    remote_offer_refused: crate::remote::RefusedHosts,
     /// Explorer-scoped Cut/Copy buffer. Independent from the OS clipboard
     /// (which carries text), this stores filesystem paths and the intent
     /// (move vs. copy) until the next Paste consumes it.
@@ -24558,6 +24558,7 @@ impl App {
                     self.remote_offer_disabled,
                     &self.remote_offer_excluded,
                     &self.remote_offer_refused,
+                    std::time::SystemTime::now(),
                 ) {
                     return;
                 }
@@ -24588,11 +24589,12 @@ impl App {
     /// that merely failed on a bad day is offered again once it works.
     fn note_provisioning_failed(&mut self, host: &str) {
         let key = host.to_ascii_lowercase();
-        self.remote_offer_refused.insert(key.clone());
+        let now = std::time::SystemTime::now();
+        self.remote_offer_refused.insert(key.clone(), now);
         let _ = crate::remote::remember_refused_host(
             &crate::remote::refused_hosts_path(&croft_cache_dir()),
             &key,
-            std::time::SystemTime::now(),
+            now,
         );
     }
 
@@ -30534,33 +30536,15 @@ impl App {
                     // The ssh-pane offer (#364) rides this thread: only a
                     // pane whose foreground IS ssh pays the argv read (a
                     // whole-process-table enumeration), and the config
-                    // parse runs once per pass and only when one does. A
-                    // pane at its prompt samples as `None`, which is what
-                    // ends its session for the offer.
+                    // parse runs once per pass and only when one does. The
+                    // verdicts themselves are `remote::ssh_pane_samples`,
+                    // kept pure so the gate is testable without a pane.
                     if sample_ssh {
-                        let is_ssh = |sp: &i32, fg: &i32, n: &str| {
-                            sp != fg && crate::remote::is_ssh_program(n)
-                        };
-                        let config = if named.iter().any(|(sp, fg, n)| is_ssh(sp, fg, n)) {
-                            crate::remote::discover_ssh_targets()
-                        } else {
-                            Vec::new()
-                        };
-                        let samples: Vec<(i32, Option<String>)> = named
-                            .iter()
-                            .map(|(sp, fg, n)| {
-                                let host = is_ssh(sp, fg, n)
-                                    .then(|| crate::widgets::terminal::process_cmdline(*fg))
-                                    .flatten()
-                                    .and_then(|cmd| {
-                                        let argv: Vec<&str> =
-                                            cmd.iter().map(String::as_str).collect();
-                                        crate::remote::ssh_offer_host(&argv, &config)
-                                    });
-                                (*sp, host)
-                            })
-                            .collect();
-                        let _ = ssh_tx.send(samples);
+                        let _ = ssh_tx.send(crate::remote::ssh_pane_samples(
+                            &named,
+                            crate::remote::discover_ssh_targets,
+                            crate::widgets::terminal::process_cmdline,
+                        ));
                     }
                     let resolved: Vec<(i32, String)> =
                         named.into_iter().map(|(sp, _, n)| (sp, n)).collect();
@@ -39202,7 +39186,10 @@ impl App {
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
-        self.remote_offer_excluded = p.remote_offer_excluded_hosts.clone();
+        let was_excluded = std::mem::replace(
+            &mut self.remote_offer_excluded,
+            p.remote_offer_excluded_hosts.clone(),
+        );
         // Sampling stops while the offer is off, so the per-pane memory stops
         // tracking reality; kept, it would make the first session seen after
         // a re-enable look like a continuation of the last one seen before
@@ -39210,12 +39197,34 @@ impl App {
         if self.remote_offer_disabled {
             self.ssh_offer_seen.clear();
         }
+        // A host taken OFF the exclusion list: a pane already on it was seen
+        // while excluded and would otherwise never be offered for the
+        // session it is in. Forgetting what those panes were seen on makes
+        // the next sample read as a session start, which is the moment the
+        // user asked to be offered at.
+        let freed: Vec<&String> = was_excluded
+            .iter()
+            .filter(|h| {
+                !self
+                    .remote_offer_excluded
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(h))
+            })
+            .collect();
+        if !freed.is_empty() {
+            self.ssh_offer_seen.retain(|_, seen| {
+                !seen
+                    .as_deref()
+                    .is_some_and(|h| freed.iter().any(|f| f.eq_ignore_ascii_case(h)))
+            });
+        }
         if let Some(o) = self.ssh_offer.as_ref()
             && !crate::remote::offer_allowed(
                 &o.host,
                 self.remote_offer_disabled,
                 &self.remote_offer_excluded,
                 &self.remote_offer_refused,
+                std::time::SystemTime::now(),
             )
         {
             self.dismiss_ssh_offer();
