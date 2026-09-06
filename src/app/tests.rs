@@ -4326,17 +4326,14 @@ fn trigger_hits_surface_in_the_status_bar_via_the_drain_tick() {
     .unwrap();
     app.drain_terminal_bells();
     app.terminals[0].write_input(b"\n");
-    let mut waited = 0u32;
-    while !app.status.starts_with("Trigger in") {
-        app.drain_terminal_bells();
-        assert!(
-            waited < 8000,
-            "trigger never surfaced, status: {}",
-            app.status
-        );
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        waited += 40;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the trigger to surface in the status line",
+        || {
+            app.drain_terminal_bells();
+            app.status.starts_with("Trigger in")
+        },
+    );
     assert!(
         app.status.contains("build: OK"),
         "interpolated message expected, status: {}",
@@ -9694,13 +9691,16 @@ fn change_workspace_root_seeds_cd_while_shell_startup_owns_the_tty() {
     )
     .unwrap();
 
-    let mut waited = 0u32;
-    while waited < 4000 && app.terminal_mut().foreground_is_shell() {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the startup child to take the foreground group from the shell",
+        || !app.terminal().foreground_is_shell(),
+    );
+    // await_spawned panics on timeout, so this pins the state the rest of
+    // the test reads rather than guarding the wait, the same shape as
+    // wait_for_conflicted_entry.
     assert!(
-        !app.terminal_mut().foreground_is_shell(),
+        !app.terminal().foreground_is_shell(),
         "precondition: the startup child must own the foreground group"
     );
 
@@ -26748,13 +26748,14 @@ fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
     .unwrap();
     app.drain_terminal_bells();
     app.terminals[0].write_input(b"\n");
-    let mut waited = 0u32;
-    while app.captures.is_empty() {
-        app.drain_terminal_bells();
-        assert!(waited < 8000, "capture never surfaced");
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        waited += 40;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the error line to be captured",
+        || {
+            app.drain_terminal_bells();
+            !app.captures.is_empty()
+        },
+    );
     let entry = app.captures.selected_entry().expect("one capture");
     assert_eq!(entry.message, "boom 7");
     assert!(
@@ -26820,13 +26821,14 @@ fn finished_commands_land_in_durable_history_and_the_popup_types_them() {
             tmp.path(),
         )
         .unwrap();
-        let mut waited = 0u32;
-        while app.command_history.is_empty() {
-            app.drain_terminal_bells();
-            assert!(waited < 8000, "finished command never reached the store");
-            std::thread::sleep(std::time::Duration::from_millis(40));
-            waited += 40;
-        }
+        crate::test_budget::await_spawned(
+            crate::test_budget::tests::SHELL_PAINT_BASE,
+            "the finished command to reach the history store",
+            || {
+                app.drain_terminal_bells();
+                !app.command_history.is_empty()
+            },
+        );
         let e = app.command_history.entries[0].clone();
         assert_eq!(
             e.cmd, "kubectl get pods",
@@ -28986,24 +28988,16 @@ fn a_plain_click_on_the_prompt_row_moves_the_shell_cursor() {
     let (x, y) = (inner.x + 2, inner.y + vrow);
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, y));
-    let mut waited = 0u32;
-    loop {
-        let got = std::fs::read(&sink).unwrap_or_default();
-        if got.len() == 33 {
-            assert_eq!(
-                got,
-                b"\x1b[D".repeat(11),
-                "eleven left-arrows bring the cursor from after 'd' to 'h'"
-            );
-            break;
-        }
-        assert!(
-            waited < 8000,
-            "the click's arrow keys never reached the shell"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the click's arrow keys to reach the shell (33 bytes)",
+        || std::fs::read(&sink).unwrap_or_default().len() == 33,
+    );
+    assert_eq!(
+        std::fs::read(&sink).unwrap(),
+        b"\x1b[D".repeat(11),
+        "eleven left-arrows bring the cursor from after 'd' to 'h'"
+    );
 }
 
 /// An app that enables application cursor keys (DECCKM, `\e[?1h`) — Python's
@@ -29052,20 +29046,16 @@ fn arrow_keys_reach_an_app_cursor_mode_child_as_ss3() {
     ] {
         app.handle_terminal_key(key(code, KeyModifiers::NONE));
     }
-    let mut waited = 0u32;
-    loop {
-        let got = std::fs::read(&sink).unwrap_or_default();
-        if got.len() == 18 {
-            assert_eq!(
-                got, b"\x1bOA\x1bOB\x1bOC\x1bOD\x1bOH\x1bOF",
-                "DECCKM is on: keys must arrive in the SS3 application form"
-            );
-            break;
-        }
-        assert!(waited < 8000, "the key presses never reached the child");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the key presses to reach the child (18 bytes)",
+        || std::fs::read(&sink).unwrap_or_default().len() == 18,
+    );
+    assert_eq!(
+        std::fs::read(&sink).unwrap(),
+        b"\x1bOA\x1bOB\x1bOC\x1bOD\x1bOH\x1bOF",
+        "DECCKM is on: keys must arrive in the SS3 application form"
+    );
 }
 
 /// Broadcast input fans one keystroke out to panes whose children disagree
@@ -29115,19 +29105,24 @@ fn broadcast_arrows_encode_per_pane_cursor_mode() {
         },
     );
     app.handle_terminal_key(key(KeyCode::Up, KeyModifiers::NONE));
-    let mut waited = 0u32;
-    loop {
-        let a = std::fs::read(&sink_a).unwrap_or_default();
-        let b = std::fs::read(&sink_b).unwrap_or_default();
-        if a.len() == 3 && b.len() == 3 {
-            assert_eq!(a, b"\x1b[A", "normal-mode pane must get the CSI form");
-            assert_eq!(b, b"\x1bOA", "DECCKM pane must get the SS3 form");
-            break;
-        }
-        assert!(waited < 8000, "the broadcast never reached both panes");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the broadcast to reach both panes (3 bytes each)",
+        || {
+            std::fs::read(&sink_a).unwrap_or_default().len() == 3
+                && std::fs::read(&sink_b).unwrap_or_default().len() == 3
+        },
+    );
+    assert_eq!(
+        std::fs::read(&sink_a).unwrap(),
+        b"\x1b[A",
+        "normal-mode pane must get the CSI form"
+    );
+    assert_eq!(
+        std::fs::read(&sink_b).unwrap(),
+        b"\x1bOA",
+        "DECCKM pane must get the SS3 form"
+    );
 }
 
 #[test]
@@ -39076,12 +39071,11 @@ fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
     let shell_pid = app.terminals[0]
         .shell_pid()
         .expect("a running pane has a pid");
-    let mut waited = 0;
-    while !app.terminals[0].visible_text().contains("proceed") && waited < 8000 {
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        waited += 40;
-    }
-    assert!(waited < 8000, "the fake agent never painted its prompt");
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the fake agent to paint its prompt",
+        || app.terminals[0].visible_text().contains("proceed"),
+    );
     let zero = std::time::Duration::ZERO;
 
     // First sample: seated straight into a prompt.
@@ -40936,16 +40930,18 @@ fn the_explorer_dots_follow_the_agent_ledger() {
     // and call the function the event loop calls. No explicit sync here —
     // that is the property under test.
     std::fs::write(&touched, "fn a() { todo!() }\n").unwrap();
-    let mut waited = 0;
-    while !app.tree.agent_touched.contains(&touched) && waited < 4000 {
-        app.drain_fs_events();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the watcher event to reach the tree",
+        || {
+            app.drain_fs_events();
+            app.tree.agent_touched.contains(&touched)
+        },
+    );
     assert!(
         app.tree.agent_touched.contains(&touched),
         "the drain must light the row it attributed, without a nudge \
-         (waited {waited}ms; ledger has {} unreviewed)",
+         (ledger has {} unreviewed)",
         app.agent_ledger.unreviewed_files()
     );
     assert!(app.tree.is_agent_touched(&touched));
