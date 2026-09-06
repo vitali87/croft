@@ -55,20 +55,11 @@ The **launching** machine needs `rsync` on its `PATH` — croft uses it to sync 
 
 Only the very first connect (no croft on the box yet) waits for an install. Every later connect attaches to the installed croft immediately: when your local source is newer, the cross-build and ship run in the background while you work, and the running session offers `F9` to reload into the new binary once it lands. Background self-updates use a dedicated throttled SSH lane so install bytes never queue ahead of live keystrokes, keeping input latency at zero even while a newer binary streams in.
 
-#### "Background croft update failed; staying on current version"
+### "Background croft update failed; staying on current version"
 
-A background update declines itself, rather than failing, when you are
-already attached to the remote croft and the fast cross-build path is not
-available. Both halves have to be true, and the outcome is deliberate: the
-only route left is a `cargo install` on the box itself, and starting an
-unrequested compile on the machine you are actively typing into would spend
-its cores and disk on a build nobody asked for. So croft declines, clears
-the `updating` marker, and leaves you on the running binary. Nothing is
-broken and nothing is half-installed; the update simply did not happen.
+A background update declines itself, rather than failing, when you are already attached to the remote croft and the fast cross-build path is not available. Both halves have to be true, and the outcome is deliberate: the only route left is a from-source compile on the box itself, and starting an unrequested build on the machine you are actively typing into would spend its cores and disk on work nobody asked for. So croft declines, clears the `updating` marker, and leaves you on the running binary. Nothing is broken and nothing is half-installed; the update simply did not happen.
 
-The status line is deliberately short, and the reason is written to the
-install log on the **launching** machine — the Mac or laptop you connected
-*from*, not the server named in the message:
+The status line is deliberately short, and the reason is written to the install log on the **launching** machine — the Mac or laptop you connected *from*, not the server named in the message:
 
 ```bash
 tail ~/.cache/croft/install.log
@@ -81,26 +72,16 @@ Local cross-build skipped: rustup target `x86_64-unknown-linux-musl` missing
 Update NOT installed: cross-build unavailable (...)
 ```
 
-The cause is usually a missing prerequisite for the cross-build: the musl
-target, `cargo-zigbuild`, or `zig`. Note that `rustup` targets are
-per-toolchain and this repo pins its channel in `rust-toolchain.toml`, so
-`rustup target list --installed` only answers for the pinned toolchain when
-run from a croft checkout, and a channel bump orphans every target you had
-added. Installing the prerequisites is one command on the launching
-machine:
+The cause is a missing prerequisite for the cross-build: `zig`, `cargo-zigbuild`, or one of the musl rustup targets. Note that rustup targets are per-toolchain and this repo pins its channel in `rust-toolchain.toml`, so `rustup target list --installed` only answers for the pinned toolchain when run from a croft checkout, and a channel bump orphans every target you had added. Install all three prerequisites on the launching machine with:
 
 ```bash
-croft setup-cross
+croft setup-cross          # prints a plan, then asks to confirm
+croft setup-cross --yes    # skip the prompt (scripts, unattended runs)
 ```
 
-It is idempotent, and it runs its `rustup` queries from the checkout so the
-pinned toolchain is the one it inspects. Then **reconnect** — the declined
-update is not retried on the existing session, so a fixed toolchain only
-takes effect on the next connect.
+It is idempotent (each already-present piece is reported and skipped), and it runs its rustup queries from the checkout so the pinned toolchain is the one it inspects. Answering anything but `y` prints `Aborted.` and exits 0 without changing anything, so check the output rather than the exit code. Then **reconnect** — the declined update is not retried on the existing session, so a fixed toolchain only takes effect on the next connect.
 
-Connecting with the dialog still up (no session attached yet) instead asks
-whether to fall back to compiling on the host, since at that point there is
-no live session to disturb.
+Connecting with the dialog still up (no session attached yet) instead asks whether to fall back to compiling on the host, since at that point there is no live session to disturb.
 
 ### Surviving sleep and network drops
 
