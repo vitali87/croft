@@ -39670,3 +39670,90 @@ fn copy_on_select_fires_for_a_click_only_forwarded_drag() {
         "the origin pane's selection landed on the clipboard"
     );
 }
+
+#[test]
+fn edge_autoscroll_stands_down_while_the_forwarded_pane_is_not_active_and_resumes() {
+    // The tick scrolls the ACTIVE pane. With a click-only forwarded drag
+    // parked past pane 0's top edge, Cmd+] must not have the tick walk pane
+    // 1's scrollback, and Cmd+[ back must let it resume without a new Drag
+    // event, since a parked pointer sends none.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    // Enough history in pane 1 that a stray tick would visibly move it.
+    app.terminals[1].feed_bytes_for_test("row\r\n".repeat(200).as_bytes());
+    let inner = app.terminals[0].last_inner;
+    let (col, row) = (inner.x + 2, inner.y + 1);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert_eq!(app.active_terminal, 0);
+    // Park the pointer above the top edge: the drag arms auto-scroll.
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col,
+        inner.y.saturating_sub(1),
+    ));
+    assert!(
+        app.terminal_select_autoscroll.is_some(),
+        "precondition: auto-scroll armed"
+    );
+
+    app.cycle_terminal();
+    assert_eq!(app.active_terminal, 1);
+    let pane1_before = app.terminals[1].viewport_top_line();
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    assert!(
+        !app.tick_terminal_autoscroll(),
+        "the tick stands down for a non-origin active pane"
+    );
+    assert_eq!(
+        app.terminals[1].viewport_top_line(),
+        pane1_before,
+        "pane 1's viewport did not move"
+    );
+    assert!(
+        app.terminal_select_autoscroll.is_some(),
+        "the armed state is held, not dropped"
+    );
+
+    app.cycle_terminal_back();
+    assert_eq!(app.active_terminal, 0);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    assert!(
+        app.tick_terminal_autoscroll(),
+        "back on the origin pane the tick resumes without a new Drag"
+    );
+}
+
+#[test]
+fn a_bare_forwarded_click_never_reaches_the_clipboard() {
+    // The forwarded-release tail runs copy-on-select only for a gesture the
+    // Drag arm turned into croft's selection. A plain click that stayed the
+    // child's leaves the clipboard alone even with copy-on-select on.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, _, _, _, _) = tracking_terminal_app(b"\x1b[?1000h\x1b[?1006h");
+    app.copy_on_select = true;
+    app.terminals[0].feed_bytes_for_test(b"\x1b[H");
+    app.terminals[0].feed_bytes_for_test(b"not-for-the-clipboard\r\n");
+    let inner = app.terminals[0].last_inner;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        inner.x + 2,
+        inner.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        inner.x + 2,
+        inner.y,
+    ));
+    assert_eq!(
+        crate::clipboard::read_string().as_deref().unwrap_or(""),
+        "",
+        "a click that was the child's copies nothing"
+    );
+    assert!(app.terminals[0].selection().is_none());
+}

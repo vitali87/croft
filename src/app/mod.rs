@@ -2893,6 +2893,14 @@ pub struct App {
     /// event of the gesture -- motion, selection extension, release,
     /// copy-on-select -- is aimed at THAT pane, never at the active one:
     /// the keyboard can move the active pane while the button is held.
+    ///
+    /// Same hole as `terminal_drag_from`: a modal that takes the screen
+    /// while the button is held swallows the mouse-up in `handle_mouse`'s
+    /// overlay gates, so the latch stays set until the next release. Two
+    /// consequences the older latch never had: the child keeps a button it
+    /// believes is down until its next click, and the auto-scroll tick keeps
+    /// standing down for a pane that is not active. Reaching it needs a
+    /// keystroke with the button held.
     terminal_pointer_forwarded: Option<ForwardedPointer>,
     /// True while one terminal pane fills the panel's width and the others
     /// are listed in the right-side rail (the per-pane `⛶` button / Cmd+K M).
@@ -28819,11 +28827,13 @@ impl App {
         // active one: Cmd+] moves the active pane mid-drag, and no further
         // Drag event arrives while the pointer rests past the edge to
         // re-check. This tick scrolls the ACTIVE pane, so it stands down
-        // rather than walk the wrong pane's scrollback.
+        // rather than walk the wrong pane's scrollback -- HELD, not dropped:
+        // the parked pointer sends nothing to re-arm, so cycling back to the
+        // origin pane must resume the scroll on its own (and the untouched
+        // `last` stamp makes that first tick fire at once).
         if let Some(fp) = self.terminal_pointer_forwarded
             && self.forwarded_pane_index(fp) != Some(self.active_terminal)
         {
-            self.terminal_select_autoscroll = None;
             return false;
         }
         self.terminal_mut().autoscroll_select(state.dir, state.col);
@@ -37362,7 +37372,11 @@ impl App {
                     };
                     if self.terminals[idx].mouse_motion_reporting() {
                         let (col, row) = self.terminals[idx].clamp_to_grid(m.column, m.row);
-                        self.terminals[idx].report_mouse(
+                        // Motion reporting was just checked, so the verdict
+                        // is known; `let _` says "already decided", not
+                        // "ignored". The encoder re-checks the same modes
+                        // as its own guard; the two are intentional.
+                        let _ = self.terminals[idx].report_mouse(
                             MouseButtonKind::Left,
                             MouseAction::Motion,
                             col,
