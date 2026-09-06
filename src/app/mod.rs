@@ -2367,6 +2367,10 @@ pub struct App {
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
     copy_on_select: bool,
+    /// Tailspin highlighting in rendered log views (#466): the inverse of
+    /// the `disable_log_highlight` preference. Pushed into `log_view`'s
+    /// default for views opened later and into every open view on toggle.
+    log_highlight: bool,
     /// Built-in secret redaction rules are in the trigger set (#360).
     /// Settings "Terminal: Redact Secrets"; stored inverted in config.json
     /// as `disable_secret_redaction` so the default is on.
@@ -4143,6 +4147,15 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
+        // Seed the log view's opening default from the saved preference
+        // BEFORE any log can be opened (#466): the toggle keeps the two in
+        // step afterwards, but a startup that set only `App::log_highlight`
+        // opened the first log highlighted despite a saved opt-out. Test-
+        // inert like the keymap and matcher loads below: the suite builds
+        // hundreds of apps on parallel threads, and an unguarded write to
+        // the process-wide default from each would race the tests that
+        // read it; those call `seed_log_highlight_default` explicitly.
+        seed_log_highlight_default_at_startup(!loaded_prefs.disable_log_highlight);
         // Same treatment for keybindings: a row croft refused (an unknown
         // command id, a gesture that can never fire, a reserved bare click)
         // used to vanish silently, which reads as croft being broken rather
@@ -4265,6 +4278,7 @@ impl App {
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
+            log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
             auto_save: loaded_prefs.auto_save,
@@ -23424,6 +23438,7 @@ impl App {
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
+                    "toggle:log_highlight" => self.toggle_log_highlight(),
                     "toggle:secret_redaction" => self.toggle_secret_redaction(),
                     "toggle:format_on_type" => self.toggle_format_on_type(),
                     "cmd:color_theme" => {
@@ -23583,6 +23598,14 @@ impl App {
                     "Terminal: Copy on Selection: {}{}",
                     on_off(self.copy_on_select),
                     prov("copy_on_select")
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:log_highlight"),
+                label: format!(
+                    "Log: Highlighting (tailspin): {}{}",
+                    on_off(self.log_highlight),
+                    prov("disable_log_highlight")
                 ),
             },
             ListRow {
@@ -32250,6 +32273,7 @@ impl App {
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
+            Cmd::ToggleLogHighlight => self.toggle_log_highlight(),
             Cmd::CollapseTerminalPane => self.collapse_active_terminal_pane(),
             Cmd::RestoreTerminalPanes => self.restore_all_terminal_panes(),
             Cmd::ToggleSecretRedaction => self.toggle_secret_redaction(),
@@ -38334,6 +38358,40 @@ impl App {
         }
     }
 
+    /// Palette "Log: Toggle Highlighting (tailspin)" and the Settings row
+    /// (#466): flip tailspin colouring for every open rendered log, steer
+    /// the default for logs opened later, and persist the preference.
+    pub fn toggle_log_highlight(&mut self) {
+        self.set_log_highlight(!self.log_highlight);
+        self.status = if self.log_highlight {
+            String::from("Log highlighting (tailspin): on")
+        } else {
+            String::from("Log highlighting (tailspin): off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_disable_log_highlight(!self.log_highlight);
+        }
+    }
+
+    /// Apply a log-highlight setting everywhere it lives (#466): the app's
+    /// field, the log view's opening default for logs opened later, and
+    /// every log view already open in any split group. Shared by the
+    /// palette / Settings toggle and by a settings remerge (a workspace
+    /// layer setting `disable_log_highlight`), so the two cannot drift.
+    fn set_log_highlight(&mut self, on: bool) {
+        self.log_highlight = on;
+        seed_log_highlight_default(on);
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                if let Some(log) = ed.log.as_mut() {
+                    log.set_highlight(on);
+                }
+            }
+        }
+    }
+
     fn toggle_copy_on_select(&mut self) {
         self.copy_on_select = !self.copy_on_select;
         self.status = if self.copy_on_select {
@@ -38593,6 +38651,14 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        // Only on a real change: the startup remerge runs before any log is
+        // open and the field already holds the preference, and writing the
+        // process-wide default from here under test would race the tests
+        // that read it (see `seed_log_highlight_default`).
+        let want_highlight = !p.disable_log_highlight;
+        if want_highlight != self.log_highlight {
+            self.set_log_highlight(want_highlight);
+        }
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
         if !p.disable_inline_blame && !self.inline_blame_enabled {
@@ -44996,6 +45062,35 @@ fn scrollback_opens_as_log(rows: &[String]) -> bool {
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// Push a log-highlight setting into the log view's process-wide opening
+/// default (#466), from the toggle and from a settings remerge.
+pub(crate) fn seed_log_highlight_default(on: bool) {
+    crate::log_view::set_default_highlight(on);
+}
+
+/// The startup seed of that default from the saved preference (#466). In
+/// the shipped binary it is the same write; under test it RECORDS the value
+/// per thread instead, because the suite builds hundreds of apps on
+/// parallel threads and each write would race the tests that read the
+/// process-wide default. The record keeps the call site observable: a test
+/// asserts what `App::new` decided to seed, not merely that a setter sets.
+#[cfg(not(test))]
+fn seed_log_highlight_default_at_startup(on: bool) {
+    crate::log_view::set_default_highlight(on);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What the most recent `App::new` on this thread would have seeded.
+    pub(crate) static STARTUP_LOG_HIGHLIGHT_SEED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn seed_log_highlight_default_at_startup(on: bool) {
+    STARTUP_LOG_HIGHLIGHT_SEED.with(|cell| cell.set(Some(on)));
 }
 
 /// Build the up-to-date version of an open diff view from its recorded

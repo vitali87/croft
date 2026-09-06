@@ -103,6 +103,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "disable_indent_guides",
     "disable_inlay_hints",
     "copy_on_select",
+    "disable_log_highlight",
     "explorer_views",
 ];
 
