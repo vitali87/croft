@@ -145,6 +145,11 @@ pub fn record_in(
         // rather than appending, so a 1s auto save can't churn out history.
         if millis.saturating_sub(latest.millis) < MERGE_WINDOW_MILLIS {
             write_snapshot(&dir, millis, content)?;
+            // The sidecar described the bytes just replaced, at either
+            // timestamp: two saves in one millisecond overwrite `<millis>.snap`
+            // in place, and a sidecar left beside it would describe the
+            // previous content.
+            let _ = std::fs::remove_file(seats_path(&dir, millis));
             if latest.millis != millis {
                 let _ = std::fs::remove_file(&latest.file);
                 let _ = std::fs::remove_file(seats_path(&dir, latest.millis));
@@ -276,7 +281,7 @@ const SEATS_EXT: &str = "seats";
 /// A map with nothing attributed writes nothing: an absent sidecar and an
 /// empty one read the same, and the common case (a file nobody's seat has
 /// touched) should not grow the history dir.
-pub fn record_seats_in(
+fn record_seats_in(
     root_dir: &Path,
     abs_path: &Path,
     millis: u64,
@@ -324,8 +329,7 @@ pub fn seats_for(
     abs_path: &Path,
     millis: u64,
 ) -> Option<crate::provenance::Provenance> {
-    let path = dir_for(root_dir, abs_path).join(format!("{millis}.{SEATS_EXT}"));
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = std::fs::read(seats_path(&dir_for(root_dir, abs_path), millis)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -358,14 +362,13 @@ pub fn entries_in(root_dir: &Path, abs_path: &Path) -> Vec<Snapshot> {
 /// Delete the oldest snapshots of `abs_path` beyond the cap, and any staging
 /// file abandoned there (see `sweep_abandoned_staging`).
 fn prune_in(root_dir: &Path, abs_path: &Path) {
+    let dir = dir_for(root_dir, abs_path);
     let all = entries_in(root_dir, abs_path);
     for old in all.into_iter().skip(MAX_SNAPSHOTS_PER_FILE) {
         let _ = std::fs::remove_file(&old.file);
-        if let Some(dir) = old.file.parent() {
-            let _ = std::fs::remove_file(seats_path(dir, old.millis));
-        }
+        let _ = std::fs::remove_file(seats_path(&dir, old.millis));
     }
-    sweep_abandoned_staging(&dir_for(root_dir, abs_path), std::time::SystemTime::now());
+    sweep_abandoned_staging(&dir, std::time::SystemTime::now());
 }
 
 #[cfg(test)]

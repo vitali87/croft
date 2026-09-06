@@ -2529,14 +2529,6 @@ pub struct App {
     /// Local-history root (`~/.config/croft/history`), cached so tests can
     /// redirect snapshots to a tempdir.
     history_root: PathBuf,
-    /// The (file, `edit_seq`) `sync_provenance` last considered, so the
-    /// history read happens once per buffer the active editor lands on rather
-    /// than per tick. Keyed on the buffer generation as well as the path so
-    /// that every whole-buffer swap under an unchanged path (an FS-sync
-    /// reload, a revert, Reopen as Text, a re-decode) is reconsidered by
-    /// construction: each goes through an opener that bumps the seq, and no
-    /// swap site has to remember to say so.
-    provenance_synced_for: Option<(PathBuf, u64)>,
     /// The snapshot currently shown in a local-history diff, `(live file,
     /// snapshot millis, snapshot contents)`, so "Local History: Restore
     /// Snapshot" can write it back and carry its seats (#349). Cleared when a
@@ -4486,7 +4478,6 @@ impl App {
             } else {
                 crate::history::history_dir()
             },
-            provenance_synced_for: None,
             history_restore: None,
             deps_rx,
             deps_tx,
@@ -39612,37 +39603,25 @@ impl App {
     /// map is never applied to text it did not describe.
     fn sync_provenance(&mut self) {
         let Some(path) = self.editor.path.clone() else {
-            self.provenance_synced_for = None;
             return;
         };
         let seq = self.editor.edit_seq;
-        if self
-            .provenance_synced_for
-            .as_ref()
-            .is_some_and(|(p, s)| *p == path && *s == seq)
-        {
+        if self.editor.provenance_synced_seq == Some(seq) {
             return;
         }
         // Not eligible yet is not the same as considered: a dirty buffer, one
-        // that already knows its seats, or a viewer tab (hex, image, sheet,
-        // log, archive, diff, merge, preview: the file shown through its own
-        // path, `lines` a placeholder no map should credit) leaves the marker
-        // unset, so a later tick, after a save or a swap back to text,
-        // reconsiders instead of staying burnt for the session.
+        // that already knows its seats, or a viewer tab (the file shown
+        // through its own path, `lines` a placeholder no map should credit)
+        // leaves the marker unset, so a later tick, after a save or a swap
+        // back to text, reconsiders instead of staying burnt for the session.
         if self.editor.dirty
             || self.editor.provenance.attributed() > 0
-            || self.editor.hex.is_some()
-            || self.editor.image.is_some()
-            || self.editor.sheet.is_some()
-            || self.editor.log.is_some()
-            || self.editor.archive.is_some()
-            || self.editor.diff.is_some()
-            || self.editor.merge.is_some()
+            || self.editor.has_non_text_view()
             || self.editor.markdown_preview.is_some()
         {
             return;
         }
-        self.provenance_synced_for = Some((path.clone(), seq));
+        self.editor.provenance_synced_seq = Some(seq);
         let Some(newest) = crate::history::entries_in(&self.history_root, &path)
             .into_iter()
             .next()
@@ -39650,12 +39629,23 @@ impl App {
             return;
         };
         // The sidecar first: most files have a snapshot and no record, and
-        // the two whole-file reads below are only worth paying on the UI
-        // thread when there is a map to apply.
+        // the reads below are only worth paying on the UI thread when there
+        // is a map to apply.
         let Some(mut seats) = crate::history::seats_for(&self.history_root, &path, newest.millis)
         else {
             return;
         };
+        // Then sizes: this runs on the render thread, and two whole-file
+        // reads of a large file on the frame a tab is switched to would be a
+        // visible stall for what is usually a mismatch.
+        let (Ok(disk_meta), Ok(snap_meta)) =
+            (std::fs::metadata(&path), std::fs::metadata(&newest.file))
+        else {
+            return;
+        };
+        if disk_meta.len() != snap_meta.len() {
+            return;
+        }
         let (Ok(on_disk), Ok(snapshot)) = (std::fs::read(&path), std::fs::read(&newest.file))
         else {
             return;
@@ -39681,12 +39671,20 @@ impl App {
                 .position(|e| e.path.as_deref() == Some(path))
                 .or_else(|| group.find_tab_with_path(path))
         }
+        // A viewer tab (hex, sheet, ...) saves bytes no line map describes:
+        // the openers clear the map, and this refuses to read one regardless.
+        fn map_of(ed: &crate::widgets::editor::Editor) -> crate::provenance::Provenance {
+            if ed.has_non_text_view() || ed.markdown_preview.is_some() {
+                return crate::provenance::Provenance::new();
+            }
+            ed.provenance.clone()
+        }
         if let Some(idx) = tab_in(&self.editor, path) {
-            return self.editor.editors[idx].provenance.clone();
+            return map_of(&self.editor.editors[idx]);
         }
         for group in self.editor_layout.inactive_groups() {
             if let Some(idx) = tab_in(group, path) {
-                return group.editors[idx].provenance.clone();
+                return map_of(&group.editors[idx]);
             }
         }
         crate::provenance::Provenance::new()

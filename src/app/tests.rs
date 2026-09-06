@@ -12613,6 +12613,147 @@ fn provenance_comes_back_after_every_same_path_swap() {
     );
 }
 
+/// Two tabs on one file are two buffers (#349 review): a split opens the
+/// same path in a fresh group, whose tab sits at the same `edit_seq` as the
+/// first one did when it was synced. The marker is per buffer, so the split
+/// pane gets the map too rather than staying blank for the session.
+#[test]
+fn a_split_of_a_synced_file_gets_the_map_in_the_new_group() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\n").unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(0..1, Seat::Navigator);
+    crate::history::record_with_seats_in(
+        hist.path(),
+        &f,
+        &std::fs::read(&f).unwrap(),
+        1_000,
+        &seats,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "staging: the first tab is synced"
+    );
+    app.split_editor();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(f.as_path()),
+        "staging: the split opened the same file in the focused group"
+    );
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "staging: the new group's tab knows nothing yet"
+    );
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "the split pane's buffer is synced on its own"
+    );
+}
+
+/// A swap into a viewer drops the map (#349 review): the hex view's single
+/// placeholder line was written by no seat, and a save from the viewer must
+/// not persist the text tab's map against bytes it never described. The swap
+/// back to text is an ordinary reopen and gets the persisted map again.
+#[test]
+fn a_viewer_swap_drops_the_map_and_the_text_reopen_gets_it_back() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\n").unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(0..1, Seat::Navigator);
+    crate::history::record_with_seats_in(
+        hist.path(),
+        &f,
+        &std::fs::read(&f).unwrap(),
+        1_000,
+        &seats,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "staging: the text tab is synced"
+    );
+    app.editor.open_hex(&f).unwrap();
+    assert!(app.editor.hex.is_some(), "staging: the tab is a hex view");
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "the swap into the viewer dropped the map"
+    );
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "and a sync does not credit the viewer's placeholder line"
+    );
+    assert_eq!(
+        app.provenance_of_tab(&f).attributed(),
+        0,
+        "a save from the viewer would record no map"
+    );
+    app.editor.open(&f).unwrap();
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "the reopen as text gets the persisted map back"
+    );
+}
+
+/// A restore of a snapshot with no sidecar restores every line unknown
+/// (#349 review): the buffer's previous map described the text the restore
+/// replaced, and keeping it would credit lines nobody observed.
+#[test]
+fn restoring_a_snapshot_without_seats_leaves_every_line_unknown() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    let (v1, v2) = (b"one\n".as_slice(), b"one\ntwo\n".as_slice());
+    let mut seats_v2 = crate::provenance::Provenance::new();
+    seats_v2.record(1..2, Seat::Navigator);
+    crate::history::record_in(hist.path(), &f, v1, 1_000).unwrap();
+    let recent = now_millis() - 100;
+    crate::history::record_with_seats_in(hist.path(), &f, v2, recent, &seats_v2).unwrap();
+    std::fs::write(&f, v2).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.sync_provenance();
+    assert_eq!(app.editor.provenance, seats_v2, "staging: v2's map is live");
+    app.open_timeline_diff(f.clone(), String::from("local:1000"));
+    app.editor.open(&f).unwrap();
+    app.restore_history_snapshot();
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        v1,
+        "staging: v1 is back on disk"
+    );
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "a snapshot that recorded no seats restores every line unknown: {:?}",
+        app.editor.provenance
+    );
+}
+
 /// A tab that is not eligible yet is not the same as one considered (#349
 /// review): a sync that lands on a dirty buffer leaves it for a later tick
 /// rather than burning the map for the session.
@@ -12669,7 +12810,7 @@ fn restoring_a_snapshot_carries_its_seats_onto_the_restore() {
     seats_v2.record(2..3, Seat::Agent(String::from("pane 2")));
     // v2 is the newest snapshot and recent enough that the restore lands
     // inside the merge window and supersedes it.
-    let recent = now_millis() - 1_000;
+    let recent = now_millis() - 100;
     crate::history::record_with_seats_in(hist.path(), &f, v1, 1_000, &seats_v1).unwrap();
     crate::history::record_with_seats_in(hist.path(), &f, v2, recent, &seats_v2).unwrap();
     std::fs::write(&f, v2).unwrap();
