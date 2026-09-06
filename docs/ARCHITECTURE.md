@@ -1076,6 +1076,25 @@ Voice input for the Termux OSK mic key. It delegates to `termux-dialog speech` (
 
 **Tap, not hold.** A tap opens the system speech dialog and the result is injected when Android finalizes on silence; a second tap cancels, since killing preempts the result. The process runs in its own process group so cancel kills the whole tree. It is a tap rather than a hold because Termux steals finger-holds for text selection.
 
+### collab_agent.rs
+
+A headless collab guest exposed as an MCP server on stdio, behind the hidden `croft collab-agent --workspace <path>` subcommand. It joins the workspace's relay and serves five `collab_*` tools (open/read/replace/caret/status) over JSON-RPC 2.0 NDJSON, so an external AI co-edits with a live named caret — for example Claude Code via `claude mcp add croft-collab -- croft collab-agent --workspace <path>`.
+
+**Keeping the replica fresh.** A `30ms` pump thread runs between tool calls, so the agent's replica does not go stale while it is thinking.
+
+**It is an ordinary guest.** The agent inherits every guest property: owner-only disk writes, per-file site ids, CRDT convergence, and the 0600-socket trust boundary. croft itself contains no LLM code.
+
+### pair/local.rs
+
+The navigator's local-model transport: one minimal Anthropic-compatible `/v1/messages` streaming call per turn, against Ollama, LM Studio, llama.cpp or vLLM. Selected with `croft pair --provider ollama [--base-url <url>] --model <m>`.
+
+**Deliberately not the claude CLI.** The CLI's roughly `213 KB` tool-schema prefill `500s` local servers regardless of flags, so this transport talks to the endpoint directly instead.
+
+**A per-seat worker owns the conversation**, because the endpoint is stateless. It maps SSE text deltas into the shared fence machine and apply path. When the endpoint is down it fails the turn naming that endpoint, and the seat survives.
+
+**Keyed gateways.** `ANTHROPIC_AUTH_TOKEN` is read from the environment; a token is never persisted.
+
+
 ### File encoding
 
 How croft decodes a file on open, re-encodes it on save, and what it does when the buffer holds characters the target encoding cannot represent.

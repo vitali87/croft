@@ -33,7 +33,15 @@ SHRINK_THRESHOLD = 400
 
 
 def tree_descriptions(text):
-    """Map module name -> its description, for every row of the layout tree."""
+    """Map tree PATH -> description, for every row of the layout tree.
+
+    Keyed on the path, not the filename. Nine basenames repeat in this tree
+    (`registry.rs` four times, `mod.rs` three, `output.rs`, `remote.rs`,
+    `session.rs`, `hover.rs`, `transport.rs`, `install.rs` and `client.rs`
+    twice each), so a dict keyed on the name alone keeps only the last of each
+    and leaves twelve rows unchecked - including, exactly, the gutting this
+    script exists to catch.
+    """
     lines = text.split("\n")
     try:
         opening = next(
@@ -45,10 +53,25 @@ def tree_descriptions(text):
     except StopIteration:
         sys.exit(f"{PATH}: no project-layout code fence found")
     out = {}
+    stack = []  # (indent depth, directory name) for the directories we are inside
     for line in lines[opening + 1 : closing]:
-        m = re.match(r"^[│├└─\s]*(\S+\.rs|\S+/)\s+(.*)$", line)
-        if m:
-            out[m.group(1)] = m.group(2)
+        m = re.match(r"^([│├└─\s]*)(\S+\.rs|\S+/)\s+(.*)$", line)
+        if not m:
+            # A bare directory row carries no description but still nests.
+            d = re.match(r"^([│├└─\s]*)(\S+/)\s*$", line)
+            if d:
+                depth = len(d.group(1))
+                while stack and stack[-1][0] >= depth:
+                    stack.pop()
+                stack.append((depth, d.group(2).rstrip("/")))
+            continue
+        indent, name, desc = len(m.group(1)), m.group(2), m.group(3)
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        path = "/".join([d for _, d in stack] + [name.rstrip("/")])
+        out[path] = desc
+        if name.endswith("/"):
+            stack.append((indent, name.rstrip("/")))
     return out
 
 
@@ -58,14 +81,22 @@ def main():
     new = open(PATH).read()
 
     before, after = tree_descriptions(old), tree_descriptions(new)
-    documented = set(re.findall(r"^### (\S+)", new, re.M))
+    # A section may be headed by the full tree path, by the bare filename, or
+    # by a directory with its trailing slash. Normalise all three to compare.
+    def keys(name):
+        bare = name.rstrip("/")
+        return {bare, bare + "/", bare.split("/")[-1], bare.split("/")[-1] + "/"}
+
+    documented = set()
+    for h in re.findall(r"^### (\S+)", new, re.M):
+        documented |= keys(h)
 
     gutted = [
         (name, len(desc), len(after[name]))
         for name, desc in before.items()
         if name in after
         and len(desc) - len(after[name]) > SHRINK_THRESHOLD
-        and name not in documented
+        and not (keys(name) & documented)
     ]
     dropped = sorted(set(before) - set(after))
 
