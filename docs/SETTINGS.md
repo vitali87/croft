@@ -123,8 +123,8 @@ croft-native workspace file always wins over the VS Code one.
 ## Notification sinks
 
 A `notifications` list forwards events croft already notices to somewhere
-you will see them away from the terminal (#358). Each entry names a sink
-and, optionally, which events it takes:
+you will see them away from the terminal. Each entry names a sink and,
+optionally, which events it takes:
 
 ```json
 {
@@ -140,7 +140,7 @@ and, optionally, which events it takes:
 Events are `command_finished` (a command in a pane you are not focused on,
 lasting at least `min_duration_secs`, default 10), `tests_failed` (once per
 red Test Explorer run), `osc9` (a terminal's own notification), and
-`agent_waiting` (reserved for #344). An empty `events` takes all of them.
+`agent_waiting` (reserved). An empty `events` takes all of them.
 `ntfy` posts to `server` (default `https://ntfy.sh`) under `topic`; both `ntfy` and `webhook` endpoints must be `https`, or `http` only to localhost — a plain-http endpoint across a network is refused and named in the channel;
 `webhook` posts JSON `{event, title, body, workspace, host, link}` with your
 `headers`; `termux` runs `termux-notification`; `command` runs `argv` with

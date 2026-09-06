@@ -5,8 +5,8 @@ every finished command in a terminal pane runs through built-in matchers
 for rustc/cargo, tsc (both output shapes), gcc/clang and anything else
 using the `file:line:col: severity: message` shape, Python tracebacks
 (the deepest frame), and eslint's stylish format. Rerunning a command in
-a pane replaces that pane's previous entries, so a clean rebuild clears
-its errors.
+a pane replaces that pane's entries, so a clean rebuild clears its
+errors.
 
 `matchers.json` extends that to tools croft does not know, and to watch
 tasks that never exit.
@@ -62,13 +62,13 @@ never blocks startup or the stream path.
 
 `tsc --watch`, `cargo watch`, vite: long-running watchers never hit the
 finished-command boundary, so batch scanning never sees them. A matcher
-with a `background` block runs on the live stream instead: when a
-pane's output matches `begins`, croft starts collecting; on `ends` the
-collected window is scanned and published to PROBLEMS, replacing the
-pane's previous batch. Every recompile cycle republishes — and a clean
-cycle publishes an empty batch, which is what clears the errors you just
-fixed. The watcher's own exit does not re-scan its scrollback, so old
-cycles never resurrect.
+with a `background` block runs on the live stream instead: when a pane's
+output matches `begins`, croft starts collecting; on `ends` the window
+is scanned and published to PROBLEMS, replacing the pane's previous
+batch. Every recompile cycle republishes, and a clean cycle publishes an
+empty batch, which is what clears the errors you just fixed. The
+watcher's own exit does not re-scan its scrollback, so old cycles never
+resurrect.
 
 ```jsonc
 [
@@ -91,7 +91,7 @@ runs (Tasks: Run Task / Run Build Task):
 
 - The well-known names **`$tsc`**, **`$tsc-watch`**, **`$rustc`**,
   **`$eslint-stylish`**, **`$gcc`** map onto the built-in table,
-  narrowed to that tool's rows. `$tsc-watch` additionally carries tsc's
+  narrowed to that tool's rows. `$tsc-watch` also carries tsc's
   watch-cycle delimiters, so a `tsc --watch` task repopulates PROBLEMS
   on every recompile without exiting.
 - An inline matcher object translates into the same machinery:
@@ -102,10 +102,10 @@ runs (Tasks: Run Task / Run Build Task):
 - An unknown `$name` degrades to the built-in first-match-wins scan
   rather than erroring.
 
-While a task pane has an explicit matcher, that matcher is exclusive
-for it (VS Code's model: declaring one replaces the defaults). Rerunning
-the task replaces its previous diagnostics; running a matcher-less task
-in the same pane clears the assignment.
+While a task pane has an explicit matcher, that matcher is exclusive for
+it (VS Code's model: declaring one replaces the defaults). Rerunning the
+task replaces its diagnostics; running a matcher-less task in the same
+pane clears the assignment.
 
 **Problems: Clear Build Diagnostics** wipes every build-sourced entry;
 LSP diagnostics are untouched either way.
