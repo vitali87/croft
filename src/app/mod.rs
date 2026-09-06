@@ -14888,6 +14888,7 @@ impl App {
         }
         self.dress_host_accents();
         self.expire_ssh_offer();
+        self.sync_lane_root_badges();
         // Theme background, whole frame. croft's chrome (the sidebar panels,
         // explorer sections, activity bar, gaps) mostly paints `Color::Reset`
         // and leans on the iTerm2 `SetColors` session bg to color it. Ghostty /
@@ -25476,6 +25477,46 @@ impl App {
             lane.path.display(),
             lane.branch
         );
+    }
+
+    /// Give each lane's root row in the Explorer its branch and its agent
+    /// (#348), from the lane panes: `agent/fix-login · ◆ claude ●` while the
+    /// agent is seated, the configured agent's name before it is, the branch
+    /// alone for a plain-shell lane. Runs from the top of `render`; the map
+    /// is swapped only when its contents change, so the common frame costs a
+    /// walk over a handful of lanes and a small map that is then dropped.
+    fn sync_lane_root_badges(&mut self) {
+        // Several panes on one lane: the pane that knows the most decides
+        // the badge, whichever order the map walks them in. Seated beats
+        // configured beats plain, decided from the state rather than by
+        // reading the glyph back out of the text.
+        let mut best: std::collections::HashMap<PathBuf, (u8, String)> =
+            std::collections::HashMap::new();
+        for (uid, lane) in &self.lane_panes {
+            let seated = self
+                .terminals
+                .iter()
+                .find(|t| t.uid() == *uid)
+                .and_then(|t| t.agent());
+            let rank = match (seated, lane.agent.as_deref()) {
+                (Some(_), _) => 2,
+                (None, Some(_)) => 1,
+                (None, None) => 0,
+            };
+            let key = PathBuf::from(&lane.path);
+            if best.get(&key).is_some_and(|(have, _)| *have >= rank) {
+                continue;
+            }
+            let badge = lane_root_badge(&lane.branch, seated, lane.agent.as_deref());
+            best.insert(key, (rank, badge));
+        }
+        let badges: std::collections::HashMap<PathBuf, String> =
+            best.into_iter().map(|(k, (_, b))| (k, b)).collect();
+        // Swapped only on a change: the map built here is dropped, not
+        // handed to the tree, when nothing moved.
+        if *self.tree.root_badges != badges {
+            self.tree.root_badges = std::sync::Arc::new(badges);
+        }
     }
 
     /// Close the panes that belong to the lane at `lane` (#348), through the
@@ -45337,6 +45378,26 @@ fn relative_clipboard_text(path: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+/// The text a lane's Explorer root row wears after its name (#348): the
+/// branch, then the seated agent as the pane pill shows it (`◆ claude ●`),
+/// or the configured agent's bare name while nothing is seated yet, or
+/// nothing more for a plain-shell lane.
+fn lane_root_badge(
+    branch: &str,
+    seated: Option<&crate::agents::AgentLane>,
+    configured: Option<&str>,
+) -> String {
+    match (seated, configured) {
+        (Some(agent), _) => format!(
+            "{branch} \u{b7} \u{25c6} {} {}",
+            agent.name,
+            agent.status.glyph()
+        ),
+        (None, Some(agent)) => format!("{branch} \u{b7} {agent}"),
+        (None, None) => branch.to_string(),
+    }
 }
 
 /// What a lane pane's fresh shell is fed to start its agent (#348):
