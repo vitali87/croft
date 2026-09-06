@@ -39757,3 +39757,35 @@ fn a_bare_forwarded_click_never_reaches_the_clipboard() {
     );
     assert!(app.terminals[0].selection().is_none());
 }
+
+#[test]
+fn edge_autoscroll_is_dropped_when_the_forwarded_pane_closes_mid_gesture() {
+    // A parked, armed forwarded drag whose origin pane is then closed has
+    // nothing to resume on: the tick drops the gesture instead of standing
+    // down until a release that may never come.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1000h\x1b[?1006h");
+    let inner = app.terminals[0].last_inner;
+    let (col, row) = (inner.x + 2, inner.y + 1);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        col,
+        inner.y.saturating_sub(1),
+    ));
+    assert!(app.terminal_select_autoscroll.is_some(), "precondition: armed");
+    assert!(app.close_terminal_at(0), "the origin pane closes under the held button");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    assert!(!app.tick_terminal_autoscroll(), "nothing to scroll");
+    assert!(
+        app.terminal_select_autoscroll.is_none() && app.terminal_pointer_forwarded.is_none(),
+        "the gesture is dropped, not held"
+    );
+}
+

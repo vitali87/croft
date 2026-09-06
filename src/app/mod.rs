@@ -28831,10 +28831,18 @@ impl App {
         // the parked pointer sends nothing to re-arm, so cycling back to the
         // origin pane must resume the scroll on its own (and the untouched
         // `last` stamp makes that first tick fire at once).
-        if let Some(fp) = self.terminal_pointer_forwarded
-            && self.forwarded_pane_index(fp) != Some(self.active_terminal)
-        {
-            return false;
+        if let Some(fp) = self.terminal_pointer_forwarded {
+            let Some(idx) = self.forwarded_pane_index(fp) else {
+                // The origin pane is gone (closed by its button while the
+                // pointer was parked): nothing can ever resume this, so
+                // drop the gesture rather than hold it to the release.
+                self.terminal_pointer_forwarded = None;
+                self.terminal_select_autoscroll = None;
+                return false;
+            };
+            if idx != self.active_terminal {
+                return false;
+            }
         }
         self.terminal_mut().autoscroll_select(state.dir, state.col);
         self.terminal_select_autoscroll = Some(TerminalSelectAutoScroll {
