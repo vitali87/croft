@@ -6632,9 +6632,12 @@ fn cmd_clicking_a_non_web_hyperlink_refuses_instead_of_opening() {
     };
     // Load-scaled rather than a fresh constant (#307): this budget was raised
     // 5s -> 8s once already, which is the shape of a number that cannot be
-    // guessed from inside one test.
+    // guessed from inside one test. The 1000ms literal that first replaced
+    // it was under-calibrated against its own siblings and still lost on a
+    // loaded box, so it now shares `SHELL_PAINT_BASE` with the other
+    // wait-for-the-shell-to-paint test (#397).
     crate::test_budget::await_spawned(
-        std::time::Duration::from_millis(1000),
+        crate::test_budget::tests::SHELL_PAINT_BASE,
         "the shell to paint the linked cell",
         || linked_cell(&app).is_some(),
     );
@@ -9385,19 +9388,20 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     // can only be the sleep.
     app.terminal_mut()
         .write_input(b"echo GO''-MARKER; sleep 60\n");
-    let mut waited = 0u32;
-    loop {
-        let (lines, _) = app.terminal_mut().grid_lines();
-        if lines
-            .iter()
-            .any(|l| l.contains("GO-MARKER") && !l.contains("echo"))
-        {
-            break;
-        }
-        assert!(waited < 8000, "marker output never arrived");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-    }
+    // Load-scaled (#397): the hand-rolled 8000ms loop this replaced did not
+    // stretch under load at all, and its failure said only "marker output
+    // never arrived" — true of a starved shell and a broken one alike.
+    // `await_spawned` names what it waited for and how long it actually had.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the shell's main loop to print the marker",
+        || {
+            let (lines, _) = app.terminal().grid_lines();
+            lines
+                .iter()
+                .any(|l| l.contains("GO-MARKER") && !l.contains("echo"))
+        },
+    );
     // `Some(false)` is a kernel-confirmed foreign foreground group, and
     // with rc ruled out above it can only be the sleep. The fail-closed
     // retry inside `foreground_is_shell` can answer false on an
@@ -9405,17 +9409,28 @@ fn change_workspace_root_skips_cd_when_terminal_runs_a_foreground_app() {
     // Retain the loop's own sample for the assert: re-sampling could see
     // a transient `None` (a failed tcgetpgrp) after the loop already
     // observed the confirmed reading.
-    let mut waited = 0u32;
-    let mut foreground = app.terminal_mut().foreground_resolved_for_test();
-    while waited < 4000 && foreground != Some(false) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        waited += 20;
-        foreground = app.terminal_mut().foreground_resolved_for_test();
-    }
+    // Load-scaled like the marker wait above (#397): a shell that wins the
+    // marker race inside a stretched budget could still lose a fixed 4000ms
+    // here, and this one does not assert on timeout — it falls through to
+    // the precondition assert below, which then reads as a broken
+    // foreground-group check rather than a starved box. Captured from
+    // inside the closure so the assert keeps the sample the wait observed.
+    let mut foreground = None;
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the kernel to report a foreign foreground group (the sleep)",
+        || {
+            foreground = app.terminal().foreground_resolved_for_test();
+            foreground == Some(false)
+        },
+    );
+    // `await_spawned` panics rather than returning on timeout, so this can
+    // only be `Some(false)`; it pins the sample the wait observed rather
+    // than guarding the wait. Same shape as `wait_for_conflicted_entry`.
     assert_eq!(
         foreground,
         Some(false),
-        "precondition: the terminal must be running a foreground command"
+        "await_spawned returns only once the kernel reports the foreign group"
     );
 
     app.change_workspace_root(target_dir.clone());
