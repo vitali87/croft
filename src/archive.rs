@@ -34,7 +34,11 @@ pub const TAR_LIST_CAP: u64 = 100 * 1024 * 1024;
 /// what it is for. Gating the file size is the only bound that precedes
 /// the parse, which is also what the tar branch does (#198).
 ///
-/// 8 MB admits ~97k members, ~400ms worst case. For scale, a large
+/// 8 MB admits ~97k members at the measured 87 bytes each. The true
+/// worst case is higher: `ZipArchive::new` reads only the CENTRAL
+/// directory, whose entry is 46 bytes plus a 1-byte name, so a crafted
+/// archive puts ~182k entries through the constructor, ~800ms. Bounded,
+/// and still an order off the 400k that motivated this. For scale, a large
 /// library jar measured here holds 38k members in 3.2 MB, so ordinary
 /// archives pass with room; a zipped monorepo `node_modules` may not, and
 /// is expected to fall through to the hex viewer with the reason shown.
@@ -378,6 +382,53 @@ mod tests {
             e.status.contains("too large to list"),
             "and the status says why it is hex: {}",
             e.status
+        );
+    }
+
+    /// The reason does not outlive its file (#493 review): the open that
+    /// set it can end without reaching a viewer, and a note left armed
+    /// then explains the NEXT hex view, which is a confident wrong answer
+    /// rather than a missing one. Here the file is deleted between the
+    /// refusal and the read that follows it, so the open errors out with
+    /// the note set; the reopen-as-hex path then must not wear it.
+    #[test]
+    fn a_refusal_reason_does_not_explain_a_later_unrelated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("many.zip");
+        write_zip_with_entries(&big, (ZIP_LIST_CAP / 80) as usize);
+        let mut e = crate::widgets::editor::Editor::new();
+        // Staging: the refusal does reach a reader when the open completes.
+        e.open(&big).unwrap();
+        assert!(
+            e.status.contains("too large to list"),
+            "staging: the refusal explains itself on the normal path: {}",
+            e.status
+        );
+
+        // Now an open that sets the note and then fails: the archive is
+        // refused, and the file vanishes before the fallback reads it.
+        let gone = dir.path().join("gone.zip");
+        write_zip_with_entries(&gone, (ZIP_LIST_CAP / 80) as usize);
+        let mut e2 = crate::widgets::editor::Editor::new();
+        let armed = std::thread::spawn({
+            let gone = gone.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let _ = std::fs::remove_file(&gone);
+            }
+        });
+        let _ = e2.open(&gone);
+        armed.join().unwrap();
+
+        // Whatever that open did, a later hex view of an unrelated file
+        // must describe THAT file, not the archive.
+        let plain = dir.path().join("plain.bin");
+        std::fs::write(&plain, [0u8, 1, 2, 3, 0, 255]).unwrap();
+        e2.open_hex(&plain).unwrap();
+        assert!(
+            !e2.status.contains("too large to list"),
+            "a note from an earlier open must not explain this file: {}",
+            e2.status
         );
     }
 

@@ -2339,7 +2339,7 @@ pub struct Editor {
     /// declined by a deliberate cap rather than by failing to parse (#493).
     /// Consumed by the fallback viewer's status line: a browser silently
     /// replaced by a hex dump reads as a bug rather than as a policy.
-    route_note: Option<String>,
+    route_note: Option<(std::path::PathBuf, String)>,
     /// The `edit_seq` at which `App::sync_provenance` last considered THIS
     /// buffer for a persisted map (#349), so the history read happens once
     /// per buffer generation rather than per tick. Per tab, because
@@ -3921,7 +3921,7 @@ impl Editor {
                     // reason rides along so the viewer can say why the
                     // browser it expected was declined.
                     Err(e) if e.to_string().contains("too large to list") => {
-                        self.route_note = Some(e.to_string());
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
                     }
                     Err(_) => {}
                 }
@@ -4025,7 +4025,7 @@ impl Editor {
                     Ok(()) => return Ok(()),
                     // The same deliberate cap as the extension route (#493).
                     Err(e) if e.to_string().contains("too large to list") => {
-                        self.route_note = Some(e.to_string());
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
                     }
                     Err(_) => {}
                 }
@@ -4843,9 +4843,15 @@ impl Editor {
         // keep painting after "Reopen as Hex" reported success.
         self.log = None;
         self.hex = Some(view);
+        // Only for the file it was set for: an open can set the note and
+        // then fail before reaching a viewer, and this is also reached
+        // directly by "Reopen as Hex", so a note that outlived its open
+        // would explain the wrong file.
         self.status = match self.route_note.take() {
-            Some(why) => format!("Opened {} in the hex viewer: {why}", path.display()),
-            None => format!("Opened {} in the hex viewer", path.display()),
+            Some((noted, why)) if noted == path => {
+                format!("Opened {} in the hex viewer: {why}", path.display())
+            }
+            _ => format!("Opened {} in the hex viewer", path.display()),
         };
         Ok(())
     }
