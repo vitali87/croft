@@ -7,7 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Widget},
 };
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -50,6 +50,11 @@ pub struct FileTree {
     /// something "mark reviewed" can clear, so a dot on one would be a mark
     /// no gesture removes. Fed from `AgentLedger` on the app's sync.
     pub agent_touched: Arc<HashSet<PathBuf>>,
+    /// Text painted after a ROOT row's name (#348): a worktree lane's
+    /// branch and the badge of the agent seated in its pane, keyed by the
+    /// root path. Swapped in by the app whenever a lane or a seat changes;
+    /// a root with no entry paints as before.
+    pub root_badges: Arc<HashMap<PathBuf, String>>,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -107,6 +112,7 @@ impl FileTree {
             theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
             agent_touched: Arc::default(),
+            root_badges: Arc::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
@@ -1511,6 +1517,17 @@ impl Widget for &mut FileTree {
                 ));
                 let base = Style::default().fg(name_fg).add_modifier(Modifier::BOLD);
                 push_name_spans(&mut spans, &name, &query, base, self.theme);
+                // A lane root wears its branch and its agent after the name
+                // (#348), dim so the folder name stays the thing the eye
+                // lands on; trailing for the same reason as the agent dot.
+                if node.depth == 0
+                    && let Some(badge) = self.root_badges.get(&node.path)
+                {
+                    spans.push(Span::styled(
+                        format!("  {badge}"),
+                        Style::default().fg(self.theme.ui(Color::DarkGray)),
+                    ));
+                }
             } else {
                 let suffix = node
                     .path
@@ -2003,6 +2020,68 @@ mod tests {
         assert_eq!(
             cleared, clean,
             "clearing the dot must leave the row exactly as it was"
+        );
+    }
+
+    /// A lane's root row wears its badge (#348): a render test for the same
+    /// reason as the dot's above, since the wiring lives in the painter.
+    #[test]
+    fn a_root_badge_is_painted_after_the_root_name_and_only_there() {
+        // #348: a worktree lane's root row shows its branch and agent. The
+        // badge follows the root's name, never a subdirectory's, and goes
+        // when the map no longer names the root.
+        let (_tmp, _second, mut tree) = two_root_fixture();
+        let lane = tree.root_paths().nth(1).unwrap().to_path_buf();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        let rows = |buf: &Buffer| -> Vec<String> {
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert!(
+            !rows(&buf).iter().any(|r| r.contains("agent/")),
+            "no badge before one is set"
+        );
+        tree.root_badges = Arc::new(HashMap::from([(
+            lane.clone(),
+            String::from("agent/fix-login \u{b7} \u{25c6} claude \u{25cf}"),
+        )]));
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let lane_name = lane.file_name().unwrap().to_string_lossy().into_owned();
+        let rows_now = rows(&buf);
+        let row = rows_now
+            .iter()
+            .find(|r| r.contains(&lane_name))
+            .expect("the lane root row is on screen");
+        assert!(
+            row.contains(&format!(
+                "{lane_name}  agent/fix-login \u{b7} \u{25c6} claude \u{25cf}"
+            )),
+            "the badge follows the root name: {row:?}"
+        );
+        assert_eq!(
+            rows_now.iter().filter(|r| r.contains("agent/")).count(),
+            1,
+            "and appears on that row alone: {rows_now:?}"
+        );
+        tree.root_badges = Arc::default();
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert!(
+            !rows(&buf).iter().any(|r| r.contains("agent/")),
+            "cleared with the map"
         );
     }
 

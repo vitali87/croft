@@ -43141,3 +43141,52 @@ fn cmd_k_shift_l_asks_for_a_new_lane_and_plain_l_still_folds() {
         "plain L is still the fold toggle"
     );
 }
+
+#[test]
+fn a_lanes_root_row_wears_its_branch_and_its_agent() {
+    // The badge text in its three shapes, then the app-side sync: a lane's
+    // root gets a badge keyed by its canonical path, a plain-shell lane shows
+    // the branch alone, and a closed lane's badge goes with it.
+    use crate::agents::{AgentLane, AgentStatus};
+    let seated = AgentLane {
+        name: String::from("claude"),
+        status: AgentStatus::Waiting,
+    };
+    assert_eq!(
+        lane_root_badge("agent/fix-login", Some(&seated), Some("claude")),
+        "agent/fix-login \u{b7} \u{25c6} claude \u{25d0}"
+    );
+    assert_eq!(
+        lane_root_badge("agent/fix-login", None, Some("claude")),
+        "agent/fix-login \u{b7} claude",
+        "configured but not yet seated: the bare name"
+    );
+    assert_eq!(lane_root_badge("agent/docs", None, None), "agent/docs");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("docs");
+    app.sync_lane_root_badges();
+    let lane = tmp.path().join("repo-docs").canonicalize().unwrap();
+    assert_eq!(
+        app.tree.root_badges.get(&lane).map(String::as_str),
+        Some("agent/docs"),
+        "{:?}",
+        app.tree.root_badges
+    );
+    assert!(
+        !app.tree.root_badges.contains_key(app.roots.primary()),
+        "the primary is not a lane"
+    );
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    app.sync_lane_root_badges();
+    assert!(
+        app.tree.root_badges.is_empty(),
+        "the badge went with the lane"
+    );
+}
