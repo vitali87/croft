@@ -336,7 +336,8 @@ const PDF_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 
 /// How long a failed render's stderr is given to finish arriving after the
 /// exit was observed (#493). The settle poll reads it once it has been
-/// quiet for ~60 ms of ticks (≈85 ms of wall clock with per-tick overhead),
+/// quiet for ~60 ms of ticks (≈85 ms of wall clock on a quiet machine, more
+/// under load, since each tick's sleep overshoots),
 /// so this is sized to leave that early exit real headroom rather than
 /// being the exit itself; the worst case, a renderer that keeps writing,
 /// pays the whole grace once, on a path that has already failed.
@@ -510,7 +511,8 @@ fn settle_stderr(
     let tick = std::time::Duration::from_millis(5);
     let deadline = std::time::Instant::now() + grace;
     // Twelve ticks (60 ms) bridges the gaps seen between a renderer's
-    // writes; capped below the grace so the two exits stay distinct.
+    // writes; capped below the grace so the two exits stay distinct (the
+    // cap only binds for a grace under 65 ms).
     let ticks_in_grace = (grace.as_millis() / tick.as_millis()) as u32;
     let quiet_run = 12.min(ticks_in_grace.saturating_sub(1)).max(1);
     let mut seen = 0usize;
@@ -777,7 +779,7 @@ mod tests {
                 .unwrap()
                 .extend_from_slice(b"Syntax Error: second\n");
         });
-        let text = settle_stderr(&buf, std::time::Duration::from_millis(500));
+        let text = settle_stderr(&buf, STDERR_SETTLE_GRACE);
         writer.join().unwrap();
         assert!(
             text.contains("first") && text.contains("second"),
@@ -791,17 +793,20 @@ mod tests {
     fn the_grace_poll_settles_a_complete_buffer_well_inside_the_grace() {
         use std::sync::{Arc, Mutex};
         // The grace the production call site passes, so lost headroom fails
-        // here rather than in a page render; three quarters leaves the
-        // ~85 ms quiet exit room to stretch under load.
+        // here rather than in a page render. The poll's own 5 ms ticks do
+        // not scale with load but their overshoot compounds, so the ceiling
+        // is scaled and clamped to the grace: a poll that degenerated to the
+        // deadline still fails.
         let grace = STDERR_SETTLE_GRACE;
+        let ceiling = crate::test_budget::spawn_budget(grace * 3 / 8).min(grace);
         for seed in [&b"Syntax Error: complete\n"[..], &b""[..]] {
             let buf = Arc::new(Mutex::new(seed.to_vec()));
             let started = std::time::Instant::now();
             let _ = settle_stderr(&buf, grace);
             let took = started.elapsed();
             assert!(
-                took < grace * 3 / 4,
-                "a settled buffer does not pay the whole grace: {took:?} for seed {seed:?}"
+                took < ceiling,
+                "a settled buffer does not pay the whole grace: {took:?} against {ceiling:?} for seed {seed:?}"
             );
         }
     }
