@@ -13534,6 +13534,15 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
     // A pick with no hint replaces the range a hinted pick left: quick open
     // never installed a selection before hints existed, so a bare `alpha`
     // must not re-show one the user did not just ask for.
+    // Extended by hand, the range is the user's now and a re-pick keeps it;
+    // a freshly installed one is cleared by the next pick.
+    let extended = app.editor.selection;
+    type_and_enter(&mut app, "alpha");
+    assert_eq!(
+        app.editor.selection, extended,
+        "a range the user extended survives an unhinted re-pick"
+    );
+    type_and_enter(&mut app, "alpha:236-239");
     type_and_enter(&mut app, "alpha");
     assert!(
         app.editor.selection.is_none(),
@@ -13551,6 +13560,48 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
         app.status.ends_with("alpha.rs:300"),
         "the status names the landed line, not the typed one: {:?}",
         app.status
+    );
+    // Both ends of a range are clamped the same way.
+    type_and_enter(&mut app, "alpha:280-99999999999999999999");
+    assert!(
+        app.status.ends_with("alpha.rs:280-300"),
+        "both ends of the range are clamped to the file: {:?}",
+        app.status
+    );
+    // A selection the user made by hand is theirs: an unhinted pick of the
+    // file already in front of them does not take it away. Only a range a
+    // hinted pick installed is cleared by the next pick.
+    let mine = crate::widgets::editor::EditorSelection {
+        anchor: (10, 0),
+        head: (11, 3),
+    };
+    app.editor.selection = Some(mine);
+    type_and_enter(&mut app, "alpha");
+    assert_eq!(
+        app.editor.selection,
+        Some(mine),
+        "an unhinted re-pick keeps a selection the user made"
+    );
+    // Stale secondary carets do not survive a pick: the next keystroke
+    // would otherwise edit at every one of them.
+    app.editor.cursor_row = 5;
+    app.editor.add_cursor_below();
+    assert!(
+        app.editor.has_multi_cursor(),
+        "fixture: a second caret exists"
+    );
+    type_and_enter(&mut app, "alpha:236-239");
+    assert!(
+        !app.editor.has_multi_cursor(),
+        "a pick collapses the carets along with the selection"
+    );
+    // A zero column (0-based tool output) keeps the line and drops the
+    // column, as the terminal's path:line:col parser does.
+    type_and_enter(&mut app, "alpha:236:0");
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (235, 0),
+        "`:236:0` lands on line 236 at the start"
     );
 
     type_and_enter(&mut app, "alpha:12");

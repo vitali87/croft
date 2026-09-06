@@ -225,6 +225,18 @@ impl FileFinder {
         // match nothing at all (#472).
         let (file_part, hint) = split_line_hint(&self.query);
         let mut needle: String = file_part.trim().to_lowercase();
+        // A hint with no file (`:236`) names a line in nothing: listing every
+        // file and opening the first at that line would be a surprise, so it
+        // matches nothing, as it did before hints existed. The cut, not a
+        // finished hint, is the test: `:236-` and a bare `:` have no file
+        // part either, and listing every file for them would flip the list
+        // from empty to everything between two keystrokes. Decided before
+        // the exact-name pass below, which these queries can never need.
+        let cut = file_part.len() != self.query.trim_end().len();
+        if needle.is_empty() && (hint.is_some() || cut) {
+            self.results = Vec::new();
+            return;
+        }
         // A trailing `:` (or a half-typed hint) is also how a real file name
         // can end on Linux. When a file is named exactly what was typed, the
         // query is that name and is matched literally; otherwise the file
@@ -237,17 +249,6 @@ impl FileFinder {
             if raw != needle && entries_have_filename(&self.entries, &raw) {
                 needle = raw;
             }
-        }
-        // A hint with no file (`:236`) names a line in nothing: listing every
-        // file and opening the first at that line would be a surprise, so it
-        // matches nothing, as it did before hints existed. The cut, not a
-        // finished hint, is the test: `:236-` and a bare `:` have no file
-        // part either, and listing every file for them would flip the list
-        // from empty to everything between two keystrokes.
-        let cut = file_part.len() != self.query.trim_end().len();
-        if needle.is_empty() && (hint.is_some() || cut) {
-            self.results = Vec::new();
-            return;
         }
         if needle.is_empty() {
             let mut scored: Vec<ScoredResult> = Vec::with_capacity(MAX_RESULTS);
@@ -377,7 +378,7 @@ fn push_topk(heap: &mut BinaryHeap<RankedSlot>, slot: RankedSlot, k: usize) {
 /// file part keeps matching between keystrokes; `refresh_results` restores
 /// the literal query when a file is named exactly that. Any other unparsed
 /// suffix (`foo:bar`) stays part of the file name.
-pub fn split_line_hint(query: &str) -> (&str, Option<LineHint>) {
+fn split_line_hint(query: &str) -> (&str, Option<LineHint>) {
     let q = query.trim_end();
     for (i, _) in q.match_indices(':') {
         let rest = &q[i + 1..];
@@ -429,10 +430,16 @@ fn parse_line_hint(s: &str) -> Option<LineHint> {
         });
     }
     if let Some((a, b)) = s.split_once(':') {
+        if b.is_empty() || !b.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        // A zero column is common 0-based tool output: the line is kept and
+        // the column dropped, as the terminal's path:line:col parser does,
+        // rather than the whole hint vanishing.
         return Some(LineHint {
             line: num(a)?,
             end: None,
-            col: Some(num(b)?),
+            col: num(b),
         });
     }
     Some(LineHint {
@@ -1304,6 +1311,13 @@ mod tests {
                 "{q:?} alone matches nothing"
             );
         }
+        // A zero column keeps the line: the hint is `236`, not nothing.
+        finder.set_query("alpha:236:0");
+        assert_eq!(
+            finder.line_hint().map(|h| (h.line, h.col)),
+            Some((236, None)),
+            "`:236:0` is line 236 with no column"
+        );
         // A number past usize saturates instead of vanishing.
         finder.set_query("alpha:99999999999999999999");
         assert_eq!(finder.line_hint().map(|h| h.line), Some(usize::MAX));

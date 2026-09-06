@@ -3364,6 +3364,11 @@ pub struct App {
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
+    /// The range the last hinted quick-open pick installed, and the file it
+    /// was installed in: the next pick clears it if it is still the
+    /// selection there, and nothing else, so a selection the user made by
+    /// hand (or extended from it) survives a re-pick of the same file.
+    quick_open_range: Option<(PathBuf, crate::widgets::editor::EditorSelection)>,
     /// VS Code-style Cmd+Shift+P / Ctrl+Shift+P command palette. None when
     /// the modal is closed.
     pub command_palette: Option<crate::widgets::command_palette::CommandPalette>,
@@ -4580,6 +4585,7 @@ impl App {
             closed_terminals: Vec::new(),
             closed_tabs: Vec::new(),
             file_finder: None,
+            quick_open_range: None,
             command_palette: None,
             go_to_symbol: None,
             workspace_symbols: None,
@@ -30901,11 +30907,23 @@ impl App {
             match opened {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
-                    // A quick-open pick replaces whatever was selected: the
-                    // file may already be open with a range from an earlier
-                    // hinted pick, and neither `alpha:12` nor a bare `alpha`
-                    // must keep showing it.
-                    self.editor.clear_selection();
+                    // A range an earlier hinted pick installed is cleared if
+                    // it is still the selection in its tab, so neither
+                    // `alpha:12` nor a bare `alpha` keeps showing it; a
+                    // selection the user made or extended since is theirs
+                    // and stays. Stale secondary carets never survive a
+                    // pick, as they never survive a click: the next
+                    // keystroke would edit at every one of them.
+                    if let Some((prev, sel)) = self.quick_open_range.take()
+                        && let Some(idx) = self.editor.find_tab_with_path(&prev)
+                        && self.editor.editors[idx].selection == Some(sel)
+                    {
+                        self.editor.editors[idx].selection = None;
+                    }
+                    if hint.is_some() {
+                        self.editor.clear_selection();
+                    }
+                    self.editor.collapse_carets();
                     if let Some(end) = hint.and_then(|h| h.end) {
                         let start = self.editor.cursor_row;
                         let last = self.editor.lines.len().saturating_sub(1);
@@ -30915,10 +30933,12 @@ impl App {
                             .lines
                             .get(end_row)
                             .map_or(0, |l| l.chars().count());
-                        self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+                        let sel = crate::widgets::editor::EditorSelection {
                             anchor: (end_row, end_col),
                             head: (start, 0),
-                        });
+                        };
+                        self.editor.selection = Some(sel);
+                        self.quick_open_range = Some((path.to_path_buf(), sel));
                         // The landing line is the head, and the cursor sits at
                         // the head as every other selection-installing path
                         // leaves it: Shift+motion extends from the cursor, and
