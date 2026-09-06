@@ -1378,7 +1378,9 @@ fn render_diff(
                 r_x + r_gutter - 1,
                 y,
                 "\u{258e}",
-                Style::default().fg(Color::Rgb(sr, sg, sb)).bg(r_cell_bg),
+                Style::default()
+                    .fg(theme.ui(Color::Rgb(sr, sg, sb)))
+                    .bg(r_cell_bg),
             );
         }
         buf.set_string(

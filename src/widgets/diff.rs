@@ -1237,7 +1237,14 @@ impl DiffData {
     /// this change adds, as `you 3 \u{2022} agent (pane 2) 1`, with anything
     /// unattributed named `unrecorded` rather than left out.
     pub fn seat_summary(&self) -> String {
-        self.added_lines_by_seat()
+        let tally = self.added_lines_by_seat();
+        if tally.is_empty() {
+            // A change that only removes lines has no authorship to report.
+            // Named, like the unrecorded bucket, rather than left empty: the
+            // header and the status line both read "by seat: <this>".
+            return String::from("no added lines");
+        }
+        tally
             .into_iter()
             .map(|(seat, n)| match seat {
                 Some(s) => format!("{} {n}", s.label()),
@@ -1775,6 +1782,14 @@ mod seat_group_tests {
             .filter(|&(x, y)| buf[(x, y)].symbol() == "\u{258e}")
             .count();
         assert_eq!(bars, 1, "and the renderer paints a bar for it");
+    }
+
+    /// A change that only removes lines reports that, rather than leaving
+    /// the header and status line trailing an empty label (#349 review).
+    #[test]
+    fn the_seat_summary_of_a_deletion_only_change_says_so() {
+        let d = head_diff(&["one", "two"], &["one"]);
+        assert_eq!(d.seat_summary(), "no added lines");
     }
 
     /// The header says which part of the change is whose (#349): a lens that
