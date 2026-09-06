@@ -356,6 +356,7 @@ mod tests {
             bin_path,
             termux_pkg,
             targets,
+            ..
         }) = &rust[0].provision
         else {
             panic!("rust-analyzer must carry a Binary provision");

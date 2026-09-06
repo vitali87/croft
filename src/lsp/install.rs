@@ -86,6 +86,14 @@ pub enum Provision {
         /// an unsupported platform to fall back to PATH (clangd's linux-aarch64,
         /// which has no Termux package either).
         termux_pkg: Option<&'static str>,
+        /// Per-platform SHA-256 of the asset, keyed like `targets`. Three
+        /// outcomes: an empty map installs unverified (the pre-existing state
+        /// of every older binary provision); a platform with an entry has its
+        /// download verified before anything is unpacked or marked executable;
+        /// a non-empty map with no entry for this platform refuses to install,
+        /// since a partial map is a mistake in the manifest, not a licence to
+        /// skip the gate.
+        sha256: &'static [(&'static str, &'static str)],
     },
 }
 
@@ -96,6 +104,10 @@ pub enum ArchiveKind {
     Gz,
     /// A zip holding the binary plus any sibling files it needs; extracted whole.
     Zip,
+    /// A `.tar.xz` (cargo-dist's archive) holding the binary, usually inside a
+    /// per-target folder; extracted whole, then the named binary is placed at
+    /// `<name>/<bin>` wherever it sat in the tree.
+    TarXz,
 }
 
 /// Latest one-line status of a managed install, polled by the app each tick and
@@ -141,6 +153,37 @@ pub fn take_just_installed() -> Vec<Language> {
 /// Ensures only one install thread is ever spawned per process per server, no
 /// matter how many times the manager re-probes a missing client.
 static INSTALL_STARTED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+
+/// Holds a name in [`INSTALL_STARTED`] for the life of one install attempt
+/// and removes it on drop, panic included, so a gate is never left held by
+/// an attempt that is over.
+struct InstallGate(&'static str);
+
+impl Drop for InstallGate {
+    fn drop(&mut self) {
+        if let Ok(mut started) = INSTALL_STARTED.lock() {
+            started.remove(self.0);
+        }
+    }
+}
+
+/// The names handed out by [`static_name`], so each distinct name is leaked
+/// once however often it is asked for.
+static STATIC_NAMES: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+
+/// A `&'static str` for `name`, leaked at most once per distinct name: the
+/// install machinery keys its one-shot gates on `&'static str`, and a caller
+/// that ran on every click (a viewer whose tool is not installed yet) must
+/// not leak a fresh allocation each time.
+pub fn static_name(name: &str) -> &'static str {
+    let mut names = STATIC_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = names.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
 
 /// The registry name for the TypeScript server, shared so config and the
 /// manager's resolver agree on which server croft provisions itself.
@@ -309,19 +352,42 @@ const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 /// the specific `"<os>-<arch>"` key first (e.g. `linux-x86_64`), then a bare
 /// `"<os>"` key (e.g. `macos` for a universal build). Pure and testable.
 fn target_url<'a>(targets: &'a [(&'a str, &'a str)], os: &str, arch: &str) -> Option<&'a str> {
+    target_entry(targets, os, arch).map(|(_, url)| url)
+}
+
+/// The key and value the platform resolves to in a per-target map, so a
+/// caller that needs two maps to agree (the URL and its digest) can look
+/// both up under the one key the URL came from.
+fn target_entry<'a>(
+    targets: &'a [(&'a str, &'a str)],
+    os: &str,
+    arch: &str,
+) -> Option<(&'a str, &'a str)> {
     let specific = format!("{os}-{arch}");
     targets
         .iter()
         .find(|(k, _)| *k == specific)
         .or_else(|| targets.iter().find(|(k, _)| *k == os))
-        .map(|(_, url)| *url)
+        .map(|(k, v)| (*k, *v))
 }
 
 /// The executable inside a managed binary install. `bin_path` locates a binary
 /// nested in an extracted archive; absent, the binary sits directly at
 /// `<name>/<bin>`.
 fn managed_binary_path(name: &str, bin: &str, bin_path: Option<&str>) -> Option<PathBuf> {
-    Some(servers_dir()?.join(name).join(bin_path.unwrap_or(bin)))
+    Some(managed_binary_path_in(&servers_dir()?, name, bin, bin_path))
+}
+
+/// [`managed_binary_path`] under an explicit servers dir, so a test can
+/// point it at a scratch tree. A `name` with a `/` (a viewer's
+/// `<extension>/<viewer>` key) nests, which is the point of the key.
+fn managed_binary_path_in(
+    servers: &Path,
+    name: &str,
+    bin: &str,
+    bin_path: Option<&str>,
+) -> PathBuf {
+    servers.join(name).join(bin_path.unwrap_or(bin))
 }
 
 /// Resolve an invocable command for a binary-provisioned server. PATH-first
@@ -390,20 +456,243 @@ fn extract_zip(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Extract a `.tar.xz` payload whole into `dir` and place the binary at
+/// `target` (#465). cargo-dist nests the binary in a per-target folder
+/// (`csvlens-aarch64-apple-darwin/csvlens`), whose name differs per platform,
+/// so when `target` is not there after unpacking the tree is searched for a
+/// file with the binary's name and that file is moved into place.
+fn extract_tar_xz(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
+    extract_tar_xz_capped(bytes, dir, target, MAX_BINARY_BYTES)
+}
+
+/// [`extract_tar_xz`] with the unpacked-size ceiling as a parameter; the
+/// decompressed stream and the sum of the entries it holds must both stay
+/// under `cap`, or nothing is written.
+fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> std::io::Result<()> {
+    // The download cap covered compressed bytes; a high-ratio archive could
+    // still expand to fill memory and disk. The stream's own index says how
+    // much it decodes to, so an archive past the ceiling, or one whose index
+    // cannot be read, is refused before a byte is decoded: the pure-Rust
+    // decoder buffers a whole block before it writes, so a check on its
+    // output alone would bound the disk but not the decode. The sink below
+    // bounds only what can reach the disk, for an index that lies about a
+    // stream the decoder then checks against it.
+    let Some(declared) = xz_declared_size(bytes) else {
+        // No readable index means no way to bound the decode before it
+        // runs, and a corrupted footer is exactly what a hostile archive
+        // would carry: refuse rather than decode an unbounded stream.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the archive's xz index cannot be read, so its size cannot be checked before decoding",
+        ));
+    };
+    if declared > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("archive declares {declared} bytes, past the {cap}-byte ceiling"),
+        ));
+    }
+    let mut sink = Capped {
+        buf: Vec::new(),
+        cap,
+    };
+    lzma_rs::xz_decompress(&mut std::io::Cursor::new(bytes), &mut sink)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+    let tar_bytes = sink.buf;
+    // A link entry named like the binary would be found by the walk below,
+    // renamed into place, chmodded through, and run: `tar` refuses links
+    // that escape `dir` but not links that point out of it. A release
+    // archive of a binary has no business carrying links, so any link
+    // refuses the whole archive before anything is unpacked.
+    for entry in tar::Archive::new(std::io::Cursor::new(&tar_bytes)).entries()? {
+        let entry = entry?;
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the archive carries a link entry ({:?}); refusing it",
+                    entry.path()?
+                ),
+            ));
+        }
+    }
+    tar::Archive::new(std::io::Cursor::new(tar_bytes)).unpack(dir)?;
+    if !target.is_file()
+        && let Some(name) = target.file_name()
+        && let Some(found) = find_file_named(dir, name)
+    {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::rename(&found, target).is_err() {
+            std::fs::copy(&found, target)?;
+        }
+    }
+    if !target.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "the archive holds no {:?}",
+                target.file_name().unwrap_or_default()
+            ),
+        ));
+    }
+    set_executable(target)
+}
+
+/// The uncompressed size an xz stream declares in its index, read from the
+/// stream footer without decoding anything, or `None` when the footer or
+/// index cannot be read. Only a single-stream file is understood, which is
+/// what `xz` and cargo-dist produce; a concatenation of streams reads as
+/// unreadable and is refused by the caller, on the conservative side.
+fn xz_declared_size(bytes: &[u8]) -> Option<u64> {
+    // Stream footer, last 12 bytes: CRC32, backward size (index size / 4 - 1),
+    // stream flags, "YZ". The index precedes it: 0x00, a record count, then
+    // per record the unpadded and uncompressed sizes as 7-bit varints.
+    let n = bytes.len();
+    if n < 12 || &bytes[n - 2..] != b"YZ" {
+        return None;
+    }
+    let backward = u32::from_le_bytes(bytes[n - 8..n - 4].try_into().ok()?) as usize;
+    let index_size = backward.checked_add(1)?.checked_mul(4)?;
+    let index_start = n.checked_sub(12)?.checked_sub(index_size)?;
+    let index = &bytes[index_start..n - 12];
+    if index.first() != Some(&0) {
+        return None;
+    }
+    let mut pos = 1;
+    let records = xz_varint(index, &mut pos)?;
+    let mut total: u64 = 0;
+    for _ in 0..records {
+        let _unpadded = xz_varint(index, &mut pos)?;
+        total = total.checked_add(xz_varint(index, &mut pos)?)?;
+    }
+    Some(total)
+}
+
+/// One xz multibyte integer: little-endian 7-bit groups, high bit continues.
+fn xz_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for i in 0..9 {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        value |= u64::from(b & 0x7f) << (7 * i);
+        if b & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// A `Write` sink that refuses to grow past `cap`: nothing past the ceiling
+/// is kept, so nothing past it can reach the disk. It bounds what is
+/// unpacked, not the decoder's own buffering; the declared-size check in
+/// [`extract_tar_xz_capped`] is what keeps an oversize stream from being
+/// decoded at all.
+struct Capped {
+    buf: Vec<u8>,
+    cap: u64,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if (self.buf.len() as u64).saturating_add(data.len() as u64) > self.cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("decompressed data exceeds the {}-byte ceiling", self.cap),
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The integrity verdict on a downloaded asset: `Ok` when the manifest pins
+/// nothing at all (unverified, the pre-existing state of every binary
+/// provision) or when the platform's pinned digest matches; an error naming
+/// the reason otherwise. A manifest that pins SOME platforms but not this
+/// one is refused rather than installed unverified: a partial map is a
+/// mistake in the manifest, not a licence to skip the gate here.
+fn digest_verdict(sha256: &[(&str, &str)], key: &str, bytes: &[u8]) -> Result<(), &'static str> {
+    if sha256.is_empty() {
+        return Ok(());
+    }
+    // Looked up under the exact key the URL resolved to, never by a second
+    // independent resolution: a manifest whose two maps are keyed at
+    // different granularities (a universal `macos` asset, per-arch digests)
+    // would otherwise pair a digest with bytes it was never the digest of.
+    // Such a manifest is a mistake and is refused, as a partial map is.
+    match sha256.iter().find(|(k, _)| *k == key) {
+        None => Err("the manifest's digest list does not cover this platform's download"),
+        Some((_, expected)) if sha256_matches(bytes, expected) => Ok(()),
+        Some(_) => Err("checksum mismatch"),
+    }
+}
+
+/// Whether `bytes` hash to `expected` (hex SHA-256, either case). An empty
+/// or malformed expectation never matches: a gate that passes on a typo is
+/// no gate.
+fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
+    use sha2::Digest;
+    let expected = expected.trim().to_ascii_lowercase();
+    expected.len() == 64 && format!("{:x}", sha2::Sha256::digest(bytes)) == expected
+}
+
+/// First regular file named `name` under `dir`, depth-first. Links are
+/// never followed, in either direction: a link to a directory is not
+/// descended and a link named like the binary is not the binary.
+fn find_file_named(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        // One unreadable directory is skipped, not the whole walk: the
+        // binary may sit in a sibling still on the stack.
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_dir() {
+                stack.push(p);
+            } else if meta.file_type().is_file() && p.file_name() == Some(name) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// The pieces of a [`Provision::Binary`] a managed install needs, borrowed
+/// from the provision for the length of the install.
+struct BinarySpec<'a> {
+    targets: &'a [(&'a str, &'a str)],
+    bin: &'a str,
+    archive: ArchiveKind,
+    bin_path: Option<&'a str>,
+    termux_pkg: Option<&'a str>,
+    sha256: &'a [(&'a str, &'a str)],
+}
+
 /// Download + unpack a prebuilt release binary into `~/.croft/servers/<name>/`.
 /// Resolves the platform tokens, builds the URL, fetches, extracts per archive
 /// kind, and marks the language installed on success. A platform the project
 /// ships no asset for is logged + surfaced and left to PATH (e.g. clangd has no
 /// linux-aarch64 build).
-fn run_binary_install(
-    name: &'static str,
-    language: Language,
-    targets: &[(&str, &str)],
-    bin: &str,
-    archive: ArchiveKind,
-    bin_path: Option<&str>,
-    termux_pkg: Option<&str>,
-) {
+fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'_>) {
+    let BinarySpec {
+        targets,
+        bin,
+        archive,
+        bin_path,
+        termux_pkg,
+        sha256,
+    } = spec;
     // Termux/Android: the cross-distro release (linux-gnu) won't run on bionic
     // libc and `android` is absent from `targets`, so reroute to the native
     // package manager exactly as the uv backend does for ty/ruff. `pkg` lands
@@ -416,7 +705,7 @@ fn run_binary_install(
         return;
     }
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    let Some(url) = target_url(targets, os, arch) else {
+    let Some((key, url)) = target_entry(targets, os, arch) else {
         log_file::log(&format!("lsp[{name}] no prebuilt binary for {os}-{arch}"));
         set_status(format!(
             "{name} unavailable: no prebuilt binary for this platform (install {bin} manually)"
@@ -455,10 +744,25 @@ fn run_binary_install(
         return;
     };
 
+    // A manifest that pins digests has its download verified before a byte
+    // of it is unpacked or marked executable: an altered asset, a tampered
+    // delivery path, or a platform the manifest forgot to pin is refused,
+    // not installed. A manifest that pins nothing stays unverified.
+    if let Err(why) = digest_verdict(sha256, key, &bytes) {
+        log_file::log(&format!("lsp[{name}] {why} for {url}"));
+        crate::output::push(
+            crate::output::CHANNEL_PROVISION,
+            crate::output::OutputLevel::Error,
+            &format!("{name}: {why} for {url}; refusing to install"),
+        );
+        set_status(format!("{name} install refused ({why})"));
+        return;
+    }
     let target = dir.join(bin_path.unwrap_or(bin));
     let extracted = match archive {
         ArchiveKind::Gz => extract_gz(&bytes, &target),
         ArchiveKind::Zip => extract_zip(&bytes, &dir, &target),
+        ArchiveKind::TarXz => extract_tar_xz(&bytes, &dir, &target),
     };
     if let Err(e) = extracted {
         log_file::log(&format!("lsp[{name}] extract failed: {e}"));
@@ -525,28 +829,40 @@ pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
     let name = config.name;
     let language = config.language;
     let provision = provision.clone();
-    std::thread::spawn(move || match &provision {
-        Provision::Npm {
-            package, version, ..
-        } => run_npm_install(name, language, package, *version),
-        Provision::Uv {
-            package, version, ..
-        } => run_uv_install(name, language, package, *version),
-        Provision::Binary {
-            targets,
-            bin,
-            archive,
-            bin_path,
-            termux_pkg,
-        } => run_binary_install(
-            name,
-            language,
-            targets,
-            bin,
-            *archive,
-            *bin_path,
-            *termux_pkg,
-        ),
+    std::thread::spawn(move || {
+        // Released when this attempt ends, however it ends: a download that
+        // failed or a digest that was refused must leave the next request
+        // free to try again rather than told "installing" for the rest of
+        // the session. An attempt that succeeded no longer needs the gate,
+        // since the binary is on disk for `provisioned_command` to find.
+        let _release = InstallGate(name);
+        match &provision {
+            Provision::Npm {
+                package, version, ..
+            } => run_npm_install(name, language, package, *version),
+            Provision::Uv {
+                package, version, ..
+            } => run_uv_install(name, language, package, *version),
+            Provision::Binary {
+                targets,
+                bin,
+                archive,
+                bin_path,
+                termux_pkg,
+                sha256,
+            } => run_binary_install(
+                name,
+                language,
+                BinarySpec {
+                    targets,
+                    bin,
+                    archive: *archive,
+                    bin_path: *bin_path,
+                    termux_pkg: *termux_pkg,
+                    sha256,
+                },
+            ),
+        }
     });
 }
 
@@ -1214,6 +1530,375 @@ mod tests {
         assert!(
             v.to_lowercase().contains("clangd"),
             "clangd reports itself: {v}"
+        );
+    }
+
+    /// #465: cargo-dist ships tar.xz archives with the binary inside a
+    /// per-target folder, so the extractor has to find it by name rather than
+    /// expect it at the root, and it must come out executable.
+    #[test]
+    fn a_tar_xz_archive_yields_the_named_binary_wherever_it_sits() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let script: &[u8] = b"#!/bin/sh\necho csvlens-ok\n";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(script.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "csvlens-x86_64-unknown-linux-gnu/csvlens", script)
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("csvlens");
+        extract_tar_xz(&xz, &dir, &target).expect("unpack the tar.xz");
+        assert!(
+            target.is_file(),
+            "the binary lands at <dir>/<bin>: {target:?}"
+        );
+        let out = Command::new(&target)
+            .output()
+            .expect("run the extracted binary");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "the extracted binary is executable");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("csvlens-ok"));
+    }
+
+    /// A valid archive that expands past the ceiling must not land: the
+    /// download cap covers compressed bytes only, and a high-ratio archive
+    /// would otherwise fill memory and disk during provisioning.
+    #[test]
+    fn a_tar_xz_that_expands_past_the_cap_is_refused() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let payload = vec![0u8; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "big/csvlens", &payload[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("csvlens");
+        let outcome = extract_tar_xz_capped(&xz, &dir, &target, 1024);
+        let landed = target.is_file();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            outcome.is_err(),
+            "a 4 KiB payload under a 1 KiB cap is refused"
+        );
+        assert!(!landed, "and nothing is left at the target");
+    }
+
+    /// An archive that declares more than the ceiling is refused from its
+    /// index, before a byte is decoded: the pure-Rust decoder buffers a
+    /// whole block in memory before it writes, so a sink on its output
+    /// bounds the disk but not the decode itself.
+    #[test]
+    fn an_xz_stream_declares_its_size_and_is_refused_before_decoding() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let payload = vec![0u8; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "big/csvlens", &payload[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        assert_eq!(
+            xz_declared_size(&xz),
+            Some(tar_bytes.len() as u64),
+            "the index names the tar's size"
+        );
+        assert_eq!(xz_declared_size(b"not an xz stream"), None);
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-declared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = extract_tar_xz_capped(&xz, &dir, &dir.join("csvlens"), 1024)
+            .expect_err("a 4 KiB payload under a 1 KiB cap is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("declares"),
+            "the refusal comes from the index, before decoding: {err}"
+        );
+    }
+
+    /// A background install that ends without producing the binary releases
+    /// the one-shot gate (#485 review): the next request is a real retry,
+    /// not a "still installing" that never lands. The download here fails
+    /// at once (nothing listens on that port), which is the failure shape a
+    /// refused digest or a dead mirror also takes.
+    #[test]
+    fn a_failed_install_releases_the_gate_for_a_retry() {
+        let config = ServerConfig {
+            name: "gate-test-viewer",
+            command: String::new(),
+            args: vec![],
+            language: Language::GO,
+            initialization_options: None,
+            provision: None,
+        };
+        let targets: &'static [(&'static str, &'static str)] = Box::leak(
+            vec![(
+                static_name(std::env::consts::OS),
+                "http://127.0.0.1:1/never.tar.gz",
+            )]
+            .into_boxed_slice(),
+        );
+        let provision = Provision::Binary {
+            targets,
+            bin: "never",
+            archive: ArchiveKind::Gz,
+            bin_path: None,
+            termux_pkg: None,
+            sha256: &[],
+        };
+        ensure_in_background(&config, &provision);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let held = INSTALL_STARTED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains("gate-test-viewer");
+            if !held {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the gate is still held long after the download failed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // The attempt created its install dir under the real servers dir
+        // before the download; leave nothing behind on the host.
+        if let Some(dir) = servers_dir() {
+            let _ = std::fs::remove_dir_all(dir.join("gate-test-viewer"));
+        }
+    }
+
+    /// One unreadable directory is skipped, not the whole walk: the binary
+    /// in a sibling still on the stack is found.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_does_not_end_the_binary_walk() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sealed = tmp.path().join("aaa-sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let open = tmp.path().join("zzz-open");
+        std::fs::create_dir(&open).unwrap();
+        let bin = open.join("csvlens");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let found = find_file_named(tmp.path(), std::ffi::OsStr::new("csvlens"));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            found,
+            Some(bin),
+            "the sibling's binary is found past the sealed dir"
+        );
+    }
+
+    /// A manifest that pins digests for some platforms but not this one
+    /// refuses to install here rather than silently skipping the gate; no
+    /// pins at all stays unverified, as every older binary provision is.
+    #[test]
+    fn a_partial_digest_map_refuses_an_unlisted_platform() {
+        let bytes = b"asset";
+        let real = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(bytes))
+        };
+        assert_eq!(
+            digest_verdict(&[], "linux-x86_64", bytes),
+            Ok(()),
+            "no pins: unverified"
+        );
+        assert_eq!(
+            digest_verdict(&[("macos-aarch64", real.as_str())], "macos-aarch64", bytes),
+            Ok(()),
+            "the platform's pin matches"
+        );
+        assert!(
+            digest_verdict(&[("macos-aarch64", "00")], "macos-aarch64", bytes).is_err(),
+            "a wrong pin refuses"
+        );
+        assert!(
+            digest_verdict(&[("macos-aarch64", real.as_str())], "linux-x86_64", bytes).is_err(),
+            "a map that pins other platforms but not this one refuses"
+        );
+    }
+
+    /// The digest is looked up under the key the URL resolved to, so the
+    /// two maps must agree on granularity: a universal `macos` asset pinned
+    /// under `macos` verifies on any Mac, and a per-arch digest map beside a
+    /// universal asset (or the reverse) is refused as the manifest mistake it
+    /// is, rather than checking bytes against a digest of other bytes.
+    #[test]
+    fn a_digest_is_pinned_to_the_key_the_url_resolved_to() {
+        use sha2::Digest;
+        let universal = b"one asset for every mac";
+        let digest = format!("{:x}", sha2::Sha256::digest(universal));
+        let targets = [("macos", "https://example.invalid/mac.tar.xz")];
+        let (key, _) = target_entry(&targets, "macos", "aarch64").unwrap();
+        assert_eq!(key, "macos");
+        assert_eq!(
+            digest_verdict(&[("macos", digest.as_str())], key, universal),
+            Ok(())
+        );
+        assert_eq!(
+            digest_verdict(&[("macos-aarch64", digest.as_str())], key, universal),
+            Err("the manifest's digest list does not cover this platform's download"),
+            "per-arch digests beside a universal asset are a manifest mistake"
+        );
+        let per_arch = [("macos-aarch64", "https://example.invalid/arm.tar.xz")];
+        let (key, _) = target_entry(&per_arch, "macos", "aarch64").unwrap();
+        assert_eq!(key, "macos-aarch64");
+        assert_eq!(
+            digest_verdict(&[("macos", digest.as_str())], key, universal),
+            Err("the manifest's digest list does not cover this platform's download"),
+            "a universal digest beside per-arch assets is refused, not checked against the wrong bytes"
+        );
+    }
+
+    /// A planted symlink named like the binary must not become the binary:
+    /// the walk must not follow it, the archive must be refused, and a file
+    /// it points at must keep its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_archive_is_refused_and_touches_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let victim_dir =
+            std::env::temp_dir().join(format!("croft-tarxz-victim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&victim_dir);
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim = victim_dir.join("victim");
+        std::fs::write(&victim, "keep me private").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_cksum();
+            b.append_link(&mut h, "csvlens-x86_64-unknown-linux-gnu/csvlens", &victim)
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("csvlens");
+        let outcome = extract_tar_xz(&xz, &dir, &target);
+        let target_is_link =
+            std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink());
+        let victim_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&victim_dir);
+        assert!(outcome.is_err(), "an archive carrying a link is refused");
+        assert!(!target_is_link, "no link is left where the binary would go");
+        assert_eq!(victim_mode, 0o600, "the link's target keeps its mode");
+    }
+
+    /// The size ceiling must hold when the stream's index cannot be read:
+    /// a corrupted footer is exactly what a hostile archive would carry, so
+    /// an unreadable index refuses the archive rather than skipping the
+    /// check.
+    #[test]
+    fn a_tar_xz_with_an_unreadable_index_is_refused_before_decoding() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let payload = vec![0u8; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "big/csvlens", &payload[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        // Corrupt the footer magic so the index cannot be located.
+        let n = xz.len();
+        xz[n - 2] = b'X';
+        assert_eq!(
+            xz_declared_size(&xz),
+            None,
+            "fixture: the index is unreadable"
+        );
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-noindex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = extract_tar_xz_capped(&xz, &dir, &dir.join("csvlens"), 1 << 20)
+            .expect_err("an archive whose size cannot be read is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("index"),
+            "the refusal names the unreadable index, not a decode error: {err}"
+        );
+    }
+
+    /// The nested install name resolves to a nested directory and the
+    /// binary is found there afterwards.
+    #[test]
+    fn a_nested_install_name_places_and_finds_the_binary() {
+        let dir = std::env::temp_dir().join(format!("croft-nested-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("alpha").join("csvlens");
+        std::fs::create_dir_all(&nested).unwrap();
+        let bin = nested.join("csvlens");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let found = managed_binary_path_in(&dir, "alpha/csvlens", "csvlens", None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            found, bin,
+            "`<servers>/alpha/csvlens/csvlens` is where the key points"
+        );
+    }
+
+    /// The checksum gate is the only thing between a download and an
+    /// executable; it must reject a mismatch and accept the true digest.
+    #[test]
+    fn sha256_matches_only_the_true_digest() {
+        let bytes = b"csvlens release bytes";
+        // A well-formed digest that is NOT this input's: the real one is
+        // computed below, and the two must differ for the test to mean
+        // anything.
+        let decoy = "8b0fa3ee6b2b3d3b0a0a4f3f6d2d7d5f1a4f0d6b3d5b1f0e3a4b7c2d9e8f1a0b";
+        assert!(!sha256_matches(
+            bytes,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(!sha256_matches(bytes, ""));
+        let real = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(bytes))
+        };
+        assert_ne!(real, decoy, "the decoy is not this input's digest");
+        assert!(sha256_matches(bytes, &real), "the true digest is accepted");
+        assert!(
+            sha256_matches(bytes, &real.to_uppercase()),
+            "case does not matter"
         );
     }
 

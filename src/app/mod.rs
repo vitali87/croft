@@ -1084,6 +1084,9 @@ enum MenuAction {
     /// Finder exists, so the menu omits this entry entirely rather than
     /// offering a no-op.
     RevealInFinder(PathBuf),
+    /// Open the file in an extension-contributed viewer (#465): the viewer's
+    /// id and the file.
+    OpenInViewer(String, PathBuf),
     /// Close the editor tab at `idx`. Mirrors clicking the tab's `×`
     /// glyph; surfaces in the tab-strip right-click menu so the four
     /// close actions (Close / Others / Right / All) live in one place.
@@ -1709,6 +1712,11 @@ fn build_tab_context_menu_items(
 ///   Delete to a count and keeps Rename on a single entry only.
 /// * Right-click on empty tree space, or on the workspace root row →
 ///   workspace-scoped actions: New File, New Folder, Paste.
+///
+/// Test-side entry with no viewer lookup, so a viewer installed on the host
+/// can never reach the built-in rows these tests assert; the app itself goes
+/// through [`build_tree_context_menu_items_in_dir`] with the dir it carries.
+#[cfg(test)]
 fn build_tree_context_menu_items(
     node: Option<&crate::widgets::file_tree::Node>,
     root: &Path,
@@ -1716,6 +1724,57 @@ fn build_tree_context_menu_items(
     target_dir: &Path,
     clipboard: Option<&ExplorerClipboard>,
     compare_anchor: Option<&Path>,
+) -> Vec<(String, MenuAction)> {
+    // No viewer lookup at all: these tests assert the built-in rows, so the
+    // lookup must find nothing whatever the host has installed.
+    build_tree_context_menu_items_with(
+        node,
+        root,
+        selection,
+        target_dir,
+        clipboard,
+        compare_anchor,
+        |_| None,
+    )
+}
+
+/// [`build_tree_context_menu_items`] reading the viewers under an explicit
+/// config dir: the app passes the dir it carries, so the row it builds and
+/// the click that resolves the row read the same extensions.
+fn build_tree_context_menu_items_in_dir(
+    config_dir: &Path,
+    node: Option<&crate::widgets::file_tree::Node>,
+    root: &Path,
+    selection: &[PathBuf],
+    target_dir: &Path,
+    clipboard: Option<&ExplorerClipboard>,
+    compare_anchor: Option<&Path>,
+) -> Vec<(String, MenuAction)> {
+    build_tree_context_menu_items_with(
+        node,
+        root,
+        selection,
+        target_dir,
+        clipboard,
+        compare_anchor,
+        |file| {
+            crate::mcp::registry::viewer_for_path_in_dir(config_dir, file)
+                .map(|v| (v.label.clone(), v.key()))
+        },
+    )
+}
+
+/// [`build_tree_context_menu_items`] with the viewer lookup injected (#465):
+/// `viewer_for` answers "which installed viewer handles this file", as
+/// `(label, id)`, so a test can offer one without an extensions dir.
+fn build_tree_context_menu_items_with(
+    node: Option<&crate::widgets::file_tree::Node>,
+    root: &Path,
+    selection: &[PathBuf],
+    target_dir: &Path,
+    clipboard: Option<&ExplorerClipboard>,
+    compare_anchor: Option<&Path>,
+    viewer_for: impl Fn(&Path) -> Option<(String, String)>,
 ) -> Vec<(String, MenuAction)> {
     let entry_target = crate::widgets::file_tree::delete_target_for(node, root);
     let mut items: Vec<(String, MenuAction)> = Vec::new();
@@ -1763,6 +1822,11 @@ fn build_tree_context_menu_items(
             .filter(|_| paths_for_action.len() == 1)
             .filter(|pp| pp.is_file());
         if let Some(file) = single_file_target {
+            // An installed viewer for this file kind (#465): `Open in csvlens`
+            // on a .csv, once the csvlens extension has been added.
+            if let Some((label, id)) = viewer_for(file) {
+                items.push((label, MenuAction::OpenInViewer(id, file.clone())));
+            }
             match compare_anchor {
                 Some(anchor) if anchor != file.as_path() => {
                     items.push((
@@ -2903,6 +2967,16 @@ pub struct App {
     /// `terminals` (#313). A pane that is hidden, already collapsed, too
     /// narrow for the glyph, or maximized holds an empty rect.
     terminal_collapse_buttons: Vec<Rect>,
+    /// Extensions whose programs the user has allowed to run (the MCP
+    /// consent set, loaded once from prefs and kept current when a consent
+    /// is granted here), so a viewer's gate is a set lookup rather than a
+    /// prefs read per click, and a test can seed it without a prefs file.
+    consented_extensions: std::collections::BTreeSet<String>,
+    /// The config dir this app reads extensions and consent from. Carried
+    /// rather than re-derived so a test can point one app at a scratch dir
+    /// instead of mutating the process-wide environment, which this repo
+    /// has twice seen take an unrelated test down.
+    config_dir: PathBuf,
     /// Where "open scrollback in an editor tab" writes the pane's coloured
     /// scrollback so the rendered log view can index it from disk (#257).
     /// `~/.cache/croft/scrollback` normally; a test points it at a temp dir.
@@ -4542,6 +4616,8 @@ impl App {
             terminal_profile_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
             terminal_collapse_buttons: Vec::new(),
+            consented_extensions: crate::prefs::Prefs::load_or_default().mcp_consented,
+            config_dir: crate::prefs::config_dir(),
             scrollback_dir: crate::session_state::dirs_cache_croft().join("scrollback"),
             terminal_strip_rects: Vec::new(),
             terminal_max_buttons: Vec::new(),
@@ -18817,7 +18893,8 @@ impl App {
         } else {
             self.disabled_extensions.insert(id.clone());
         }
-        let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
+        let _ =
+            crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
         self.refresh_extensions();
         self.status = format!(
             "{} extension '{id}'",
@@ -18860,18 +18937,41 @@ impl App {
     /// Perform the confirmed uninstall (the popup's Enter path). Removes the
     /// catalog/index-installed manifest and refreshes the panel.
     fn perform_extension_uninstall(&mut self, id: &str) {
-        match crate::mcp::catalog::uninstall(id) {
+        match crate::mcp::catalog::uninstall_in(&self.config_dir.join("extensions"), id) {
             Ok(()) => {
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
                 if self.disabled_extensions.remove(id) {
-                    let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
+                    let _ = crate::prefs::save_disabled_extensions_in(
+                        &self.config_dir,
+                        &self.disabled_extensions,
+                    );
                 }
+                // And its consent: a re-add is a program the user has not
+                // approved this time, so the first-run gate asks again.
+                self.forget_extension_consent(id);
                 self.refresh_extensions();
                 self.status = format!("Uninstalled '{id}' — it's back under AVAILABLE to re-add");
             }
             Err(e) => self.status = format!("Could not uninstall '{id}': {e}"),
         }
+    }
+
+    /// Write a first-run consent for `ext_id` to prefs, after the caller has
+    /// put it in the session set both gates read. The session grant holds
+    /// either way; a prefs write that fails is said in the status rather
+    /// than swallowed, since the user would otherwise be asked again next
+    /// launch with no idea why.
+    fn persist_extension_consent(&mut self, ext_id: &str) {
+        if let Err(e) = crate::prefs::save_mcp_consent_in(&self.config_dir, ext_id) {
+            self.status = format!("Allowed {ext_id}, but the consent could not be saved: {e}");
+        }
+    }
+
+    /// Forget `id`'s first-run consent in the session set and in prefs.
+    fn forget_extension_consent(&mut self, id: &str) {
+        self.consented_extensions.remove(id);
+        let _ = crate::prefs::forget_mcp_consent_in(&self.config_dir, id);
     }
 
     /// Whether the extension `id` is currently enabled (not in the disabled set).
@@ -21757,19 +21857,49 @@ impl App {
                 let r = crate::git::create_tag(&self.scm_root(), &value);
                 self.run_scm_op("tag", r, "Created tag");
             }
+            InputPurpose::ViewerConsent { key, path } => {
+                // The user allowed the viewer's extension; record it and
+                // resume the open that asked. The viewer is looked up first:
+                // one removed while the prompt was up gets a status line and
+                // no consent, since what was allowed no longer exists.
+                self.close_input_prompt();
+                let Some(viewer) =
+                    crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, &key)
+                else {
+                    self.status = format!("{key} is no longer available");
+                    return;
+                };
+                // The session grant first, so the open passes the gate; the
+                // prefs write after, so a failure it reports is the status
+                // the user is left with rather than one the open overwrote.
+                self.consented_extensions.insert(viewer.ext_id.clone());
+                self.open_in_viewer(&viewer, &path);
+                self.persist_extension_consent(&viewer.ext_id);
+            }
             InputPurpose::McpConsent { command_id } => {
                 // The user confirmed; record consent for this command's
                 // extension and resume the command (which now passes the gate
                 // and proceeds to its argument prompt or runs).
                 self.close_input_prompt();
-                if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
-                    let _ = crate::prefs::save_mcp_consent(&resolved.ext_id);
+                // The session grant first, so the run passes the gate, and
+                // the prefs write before the run here: a sidecar command's
+                // run ends on its own argument prompt with no status of its
+                // own, so a failure reported after it would sit under that
+                // prompt and be cleared with it.
+                let ext_id =
+                    crate::mcp::registry::resolve_command_in_dir(&self.config_dir, &command_id)
+                        .map(|r| r.ext_id);
+                if let Some(ext_id) = &ext_id {
+                    self.consented_extensions.insert(ext_id.clone());
+                    self.persist_extension_consent(ext_id);
                 }
                 self.run_extension_command(&command_id);
             }
             InputPurpose::McpArg { command_id } => {
                 self.close_input_prompt();
-                if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
+                if let Some(resolved) =
+                    crate::mcp::registry::resolve_command_in_dir(&self.config_dir, &command_id)
+                {
                     self.spawn_mcp_command(resolved, Some(value));
                 }
             }
@@ -31652,6 +31782,9 @@ impl App {
         let ext_commands: Vec<crate::widgets::command_palette::ExtensionCommand> =
             crate::mcp::registry::contributed_commands()
                 .into_iter()
+                .chain(crate::mcp::registry::contributed_viewer_commands_in_dir(
+                    &self.config_dir,
+                ))
                 .map(|c| crate::widgets::command_palette::ExtensionCommand {
                     ext_id: c.ext_id,
                     id: c.id,
@@ -32298,6 +32431,136 @@ impl App {
         }
     }
 
+    /// Open `path` in an extension-contributed viewer (#465): a new terminal
+    /// pane running the tool on the file, focused. `{file}` in the declared
+    /// args is the file's path. A provisioned tool that is not installed yet
+    /// has its managed install kicked off and the user is told to run the
+    /// command again once it lands, the way a sidecar's first run behaves.
+    pub fn open_in_viewer(
+        &mut self,
+        viewer: &crate::mcp::registry::ContributedViewer,
+        path: &Path,
+    ) {
+        // The pane spawn takes `String` args, so a name that is not valid
+        // UTF-8 could only be handed over mangled, and the tool would open a
+        // different path. Refuse with the reason rather than open the wrong
+        // file.
+        let Some(file) = path.to_str().map(str::to_owned) else {
+            self.status = format!(
+                "{}: the file's name is not valid UTF-8, so it cannot be passed to the viewer",
+                viewer.label
+            );
+            return;
+        };
+        // A viewer spawns a program named by a manifest, exactly what the
+        // sidecar consent gate exists for, and manifests can arrive from the
+        // signed remote index, not only the bundled catalog. The first run of
+        // an extension's viewer shows the exact command line and spawns
+        // nothing until the user allows it; allowing resumes this open.
+        if !self.consented_extensions.contains(&viewer.ext_id) {
+            use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+            let spawn_line = std::iter::once(viewer.command.clone())
+                .chain(viewer.args.iter().map(|a| a.replace("{file}", &file)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.open_input_prompt(
+                InputPrompt::new(
+                    InputPurpose::ViewerConsent {
+                        key: viewer.key(),
+                        path: path.to_path_buf(),
+                    },
+                    format!("Allow {} to run:  {}", viewer.ext_id, spawn_line),
+                    "Enter to allow · Esc to cancel",
+                )
+                .with_value("allow"),
+            );
+            return;
+        }
+        let install_name = viewer.install_name();
+        let program = match viewer.provision.as_ref() {
+            None => viewer.command.clone(),
+            Some(provision) => {
+                match crate::lsp::install::provisioned_command(&install_name, provision) {
+                    Some((command, _extra_paths)) => command,
+                    None => {
+                        let name: &'static str = crate::lsp::install::static_name(&install_name);
+                        let config = crate::lsp::config::ServerConfig {
+                            name,
+                            command: viewer.command.clone(),
+                            args: viewer.args.clone(),
+                            language: crate::lsp::config::Language("viewer"),
+                            initialization_options: None,
+                            provision: Some(provision.clone()),
+                        };
+                        crate::lsp::install::resolve_managed(&config, provision, true);
+                        self.status =
+                            format!("Installing {}; run it again once it lands", viewer.label);
+                        return;
+                    }
+                }
+            }
+        };
+        let args: Vec<String> = viewer
+            .args
+            .iter()
+            .map(|a| a.replace("{file}", &file))
+            .collect();
+        let cwd = path
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.workspace_root().to_path_buf());
+        match PtyTerminal::new_running(&program, &args, &cwd) {
+            Ok(term) => {
+                let slot = (self.active_terminal + 1).min(self.terminals.len());
+                self.terminals.insert(slot, term);
+                self.active_terminal = slot;
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.focus_pane(Pane::Terminal);
+                self.status = format!("{}: {}", viewer.label, self.status_path(path));
+            }
+            Err(e) => {
+                self.status = format!("{} failed to start: {e}", viewer.label);
+            }
+        }
+    }
+
+    /// A palette `viewer:<extension id>/<viewer id>` row: open the active
+    /// editor file in that viewer, if the file is a kind it handles.
+    fn run_viewer_command(&mut self, viewer_id: &str) {
+        let Some(viewer) = crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, viewer_id)
+        else {
+            self.status = format!("Viewer '{viewer_id}' is unavailable");
+            return;
+        };
+        self.open_active_file_in_viewer(&viewer);
+    }
+
+    /// The palette row's work once its viewer is known: the active editor
+    /// file must exist and be a kind the viewer handles, or the status line
+    /// says which it is not.
+    fn open_active_file_in_viewer(&mut self, viewer: &crate::mcp::registry::ContributedViewer) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = format!("{}: open a file first", viewer.label);
+            return;
+        };
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !viewer.extensions.contains(&ext) {
+            self.status = format!(
+                "{}: the active file is not one of .{}",
+                viewer.label,
+                viewer.extensions.join(" / .")
+            );
+            return;
+        }
+        self.open_in_viewer(viewer, &path);
+    }
+
     /// Dispatch a chosen palette row: a built-in command runs inline; an
     /// extension-contributed command routes through the MCP sidecar path.
     fn run_palette_item(&mut self, item: crate::widgets::command_palette::PaletteItem) {
@@ -32313,16 +32576,26 @@ impl App {
     /// argument (if any) via an input popup, then spawns the server off-thread.
     fn run_extension_command(&mut self, command_id: &str) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-        let Some(resolved) = crate::mcp::registry::resolve_command(command_id) else {
+        // Viewer rows (#465) run a terminal program on the active file; no
+        // sidecar, so none of the MCP consent or argument flow below applies.
+        if let Some(viewer_id) =
+            command_id.strip_prefix(crate::mcp::registry::VIEWER_COMMAND_PREFIX)
+        {
+            self.run_viewer_command(viewer_id);
+            return;
+        }
+        let Some(resolved) =
+            crate::mcp::registry::resolve_command_in_dir(&self.config_dir, command_id)
+        else {
             self.status = format!("Extension command '{command_id}' is unavailable");
             return;
         };
         // First-run consent gate: never spawn a sidecar until the user has
         // approved this extension, shown the exact command line croft will run.
-        let consented = crate::prefs::Prefs::load_or_default()
-            .mcp_consented
-            .contains(&resolved.ext_id);
-        if !consented {
+        // One set answers this gate and the viewer gate alike: it is loaded
+        // from prefs at startup and fed by every grant since, so the two
+        // cannot disagree, whatever became of a prefs write.
+        if !self.consented_extensions.contains(&resolved.ext_id) {
             let spawn_line = std::iter::once(resolved.server.command.clone())
                 .chain(resolved.server.args.iter().cloned())
                 .collect::<Vec<_>>()
@@ -36366,7 +36639,8 @@ impl App {
                     let target_dir =
                         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root);
                     let selection = self.tree.action_paths();
-                    let mut items = build_tree_context_menu_items(
+                    let mut items = build_tree_context_menu_items_in_dir(
+                        &self.config_dir,
                         node,
                         &self.tree.root,
                         &selection,
@@ -40146,6 +40420,14 @@ impl App {
                 self.change_workspace_root(folder);
             }
             MenuAction::RevealInFinder(path) => self.reveal_in_finder(path),
+            MenuAction::OpenInViewer(id, path) => {
+                // The row was built when the menu opened; an extension
+                // removed since then must not make the click a silent no-op.
+                match crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, &id) {
+                    Some(viewer) => self.open_in_viewer(&viewer, &path),
+                    None => self.status = format!("{id} is no longer available"),
+                }
+            }
             MenuAction::CopyTabPath(path) => self.copy_path_to_clipboard(path),
             MenuAction::CopyTabRelativePath(path) => self.copy_relative_path_to_clipboard(path),
             MenuAction::RevealInExplorer(path) => self.reveal_in_explorer(path),

@@ -65,6 +65,7 @@ pub const CATALOG_MANIFESTS: &[&str] = &[
     include_str!("../../assets/catalog/mcp-fetch/extension.toml"),
     include_str!("../../assets/catalog/mcp-time/extension.toml"),
     include_str!("../../assets/catalog/mcp-markitdown/extension.toml"),
+    include_str!("../../assets/catalog/csvlens/extension.toml"),
 ];
 
 /// A parsed `extension.toml`. Only the fields phase B1 consumes are modelled;
@@ -111,6 +112,27 @@ pub struct ExtensionManifest {
     /// in the command palette, the server is spawned lazily on first invocation.
     #[serde(default)]
     pub commands: Vec<CommandDecl>,
+    /// External viewers this extension contributes (#465): a terminal program
+    /// that opens a file kind in a pane of its own, such as csvlens for CSV.
+    #[serde(default)]
+    pub viewers: Vec<ViewerDecl>,
+}
+
+/// One `[[viewers]]` entry: a terminal program croft runs on a file in a new
+/// pane. `args` may carry `{file}`, replaced by the file's absolute path;
+/// `extensions` are the lower-cased file extensions it is offered for;
+/// `provision` installs it pinned when absent from PATH, as for servers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewerDecl {
+    pub id: String,
+    pub label: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub provision: Option<ProvisionDecl>,
 }
 
 /// One `[[mcp_servers]]` entry: a sidecar server croft spawns and drives over
@@ -384,6 +406,13 @@ pub struct ProvisionDecl {
     /// cross-distro release can't run on Android (absent → PATH fallback).
     #[serde(default)]
     pub termux_pkg: Option<String>,
+    /// `binary`: per-platform SHA-256 of the asset, keyed like `targets`.
+    /// Three outcomes: no map at all installs unverified; a platform with an
+    /// entry has its download verified before anything is unpacked; a map that
+    /// pins other platforms but not this one refuses to install here, so a
+    /// partial map fails loudly rather than skipping the gate.
+    #[serde(default)]
+    pub sha256: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -399,6 +428,10 @@ pub enum ProvisionKind {
 pub enum ArchiveKindDecl {
     Gz,
     Zip,
+    /// A `.tar.xz` holding the binary, possibly inside a per-target folder
+    /// (cargo-dist's layout).
+    #[serde(rename = "tar.xz")]
+    TarXz,
 }
 
 /// A server registration extracted from a manifest: its priority, the language
@@ -410,9 +443,101 @@ pub struct ServerEntry {
     pub config: ServerConfig,
 }
 
-/// Parse an `extension.toml` source.
+/// Parse an `extension.toml` source. Ids are checked here because they name
+/// directories (`~/.croft/servers/<id>/`, the user extensions dir) and
+/// dispatch keys (`viewer:<extension>/<viewer>`): a separator, a parent
+/// reference or whitespace in one would reach a path join or split a key.
 pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
-    toml::from_str(src)
+    let m: ExtensionManifest = toml::from_str(src)?;
+    for (what, id) in std::iter::once(("extension", m.id.as_str()))
+        .chain(m.viewers.iter().map(|v| ("viewer", v.id.as_str())))
+    {
+        if !id_is_sound(id) {
+            return Err(serde::de::Error::custom(format!(
+                "{what} id {id:?} is not allowed: ids are non-empty, contain no `/`, `\\` or whitespace, and are not `.` or `..`"
+            )));
+        }
+    }
+    // A provisioned path is joined under the managed store and then run:
+    // `Path::join` with an absolute argument drops the store prefix, and a
+    // parent reference walks out of it, so either would let a manifest run
+    // (and write) outside the store. Refused for every provision.
+    let provisions = m
+        .viewers
+        .iter()
+        .filter_map(|v| v.provision.as_ref().map(|p| ("viewer", v.id.as_str(), p)))
+        .chain(
+            m.mcp_servers
+                .iter()
+                .filter_map(|s| s.provision.as_ref().map(|p| ("server", s.id.as_str(), p))),
+        )
+        .chain(
+            m.language_servers
+                .iter()
+                .filter_map(|s| s.provision.as_ref().map(|p| ("server", s.name.as_str(), p))),
+        );
+    for (what, id, p) in provisions {
+        let runs = p.bin_path.as_deref().unwrap_or(&p.bin);
+        if !provisioned_path_stays_in_store(runs) {
+            return Err(serde::de::Error::custom(format!(
+                "{what} {id:?} provisions {runs:?}: a provisioned path must stay inside the managed store"
+            )));
+        }
+    }
+    // The consent prompt shows a viewer's `command`; when the viewer is
+    // provisioned, what runs is the provision's `bin_path` when set, else
+    // its `bin`. A manifest in which the two name different programs would
+    // have the user allow one and croft run another, so it is refused here
+    // rather than at spawn time.
+    for v in &m.viewers {
+        if v.command.trim().is_empty() {
+            return Err(serde::de::Error::custom(format!(
+                "viewer {:?} has an empty command",
+                v.id
+            )));
+        }
+        if let Some(p) = &v.provision {
+            let runs = p.bin_path.as_deref().unwrap_or(&p.bin);
+            if command_file_name(&v.command) != command_file_name(runs) {
+                return Err(serde::de::Error::custom(format!(
+                    "viewer {:?} runs {:?} but provisions {runs:?}: the command and the provisioned binary must name one program",
+                    v.id, v.command
+                )));
+            }
+        }
+    }
+    Ok(m)
+}
+
+/// The program a spawn line names, without any directory: `/opt/t/csvlens`
+/// and `csvlens` are the same program for the purpose of the consent check.
+fn command_file_name(command: &str) -> &str {
+    command.rsplit(['/', '\\']).next().unwrap_or(command)
+}
+
+/// Whether a provisioned `bin`/`bin_path` stays under the managed store once
+/// joined there: relative, and never through a parent reference.
+fn provisioned_path_stays_in_store(runs: &str) -> bool {
+    let path = std::path::Path::new(runs);
+    !runs.is_empty()
+        && !path.is_absolute()
+        && !runs.starts_with('\\')
+        && !path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+}
+
+/// Whether an id can safely name a directory and a key segment.
+fn id_is_sound(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !id
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_whitespace())
 }
 
 /// A user-facing extension entry for the Extensions panel: identity and blurb,
@@ -442,21 +567,48 @@ pub fn summaries(sources: &[&str]) -> Vec<ExtensionSummary> {
         .collect()
 }
 
-/// Leak a parsed string to `&'static`. Sound because the data it represents
-/// (server / package names) lives for the whole process; the count is bounded
-/// by the number of installed extensions, loaded once at startup.
+/// The strings handed out by [`intern`], so each distinct string is leaked
+/// once however often it is asked for.
+static INTERNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The slices handed out by [`intern_pairs`], keyed by their content, so a
+/// map seen before hands back the slice it got the first time.
+static INTERNED_PAIRS: std::sync::Mutex<PairTable> = std::sync::Mutex::new(BTreeMap::new());
+
+/// A parsed string map, by content, to the interned slice built from it.
+type PairTable = BTreeMap<Vec<(String, String)>, &'static [(&'static str, &'static str)]>;
+
+/// A `&'static str` for a parsed string, leaked at most once per distinct
+/// string. Sound because the data it represents (server / package names)
+/// lives for the whole process; bounded by the number of distinct strings
+/// the installed manifests carry, not by how often a provision is built,
+/// since a viewer's provision is rebuilt on every right-click and every
+/// palette open (#485 review).
 fn intern(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
+    let mut set = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = set.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    set.insert(leaked);
+    leaked
 }
 
-/// Leak a parsed string map to `&'static [(&'static str, &'static str)]` (the
-/// OS/arch token form `Provision::Binary` carries). Same soundness as
-/// [`intern`]: the data lives for the whole process and is bounded by the
-/// installed extension count.
+/// A `&'static [(&'static str, &'static str)]` (the OS/arch token form
+/// `Provision::Binary` carries) for a parsed string map, leaked at most once
+/// per distinct map. Same soundness and the same bound as [`intern`].
 fn intern_pairs(m: &BTreeMap<String, String>) -> &'static [(&'static str, &'static str)] {
+    let key: Vec<(String, String)> = m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut table = INTERNED_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = table.get(&key) {
+        return existing;
+    }
     let v: Vec<(&'static str, &'static str)> =
         m.iter().map(|(k, val)| (intern(k), intern(val))).collect();
-    Box::leak(v.into_boxed_slice())
+    let leaked: &'static [(&'static str, &'static str)] = Box::leak(v.into_boxed_slice());
+    table.insert(key, leaked);
+    leaked
 }
 
 impl ProvisionDecl {
@@ -481,9 +633,11 @@ impl ProvisionDecl {
                 archive: match self.archive.unwrap_or(ArchiveKindDecl::Gz) {
                     ArchiveKindDecl::Gz => ArchiveKind::Gz,
                     ArchiveKindDecl::Zip => ArchiveKind::Zip,
+                    ArchiveKindDecl::TarXz => ArchiveKind::TarXz,
                 },
                 bin_path: self.bin_path.as_deref().map(intern),
                 termux_pkg: self.termux_pkg.as_deref().map(intern),
+                sha256: intern_pairs(&self.sha256),
             },
         }
     }
@@ -560,6 +714,233 @@ pub fn read_extension_sources(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ids name directories and dispatch keys, so a separator or a parent
+    /// reference in one is refused at parse time rather than reaching a
+    /// path join.
+    #[test]
+    fn ids_with_a_separator_or_parent_reference_do_not_parse() {
+        const OK: &str = "id = \"fine.id-1\"\nname = \"x\"\napi_version = 1\n";
+        assert!(parse(OK).is_ok(), "dots, hyphens and digits are fine");
+        for bad in ["a/b", "a\\b", "..", ".", "", "a b"] {
+            // Literal (single-quoted) TOML strings, so a backslash stays a backslash.
+            let src = format!("id = '{bad}'\nname = \"x\"\napi_version = 1\n");
+            assert!(parse(&src).is_err(), "extension id {bad:?} must be refused");
+            let src = format!(
+                "id = \"ok\"\nname = \"x\"\napi_version = 1\n\n[[viewers]]\nid = '{bad}'\nlabel = \"l\"\ncommand = \"c\"\n"
+            );
+            assert!(parse(&src).is_err(), "viewer id {bad:?} must be refused");
+        }
+    }
+
+    /// A binary provision may pin the asset's digest per platform (#485
+    /// review): the parsed form carries it alongside the URL map.
+    #[test]
+    fn a_binary_provision_carries_per_target_checksums() {
+        const DECL: &str = r#"
+id = "x"
+name = "x"
+api_version = 1
+
+[[viewers]]
+id = "x"
+label = "x"
+command = "x"
+provision = { kind = "binary", bin = "x", archive = "tar.xz", targets = { "macos-aarch64" = "https://example.invalid/x.tar.xz" }, sha256 = { "macos-aarch64" = "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3" } }
+"#;
+        let m = parse(DECL).expect("parses");
+        let Provision::Binary { sha256, .. } =
+            m.viewers[0].provision.as_ref().unwrap().to_provision()
+        else {
+            panic!("binary");
+        };
+        assert_eq!(
+            sha256,
+            &[(
+                "macos-aarch64",
+                "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3"
+            )]
+        );
+    }
+
+    /// The provision is rebuilt on every right-click and every palette open
+    /// (#485 review), so its interned strings must be interned, not leaked
+    /// afresh each time: a second build hands back the same allocations.
+    #[test]
+    fn rebuilding_a_provision_reuses_its_interned_strings() {
+        const DECL: &str = r#"
+id = "y"
+name = "y"
+api_version = 1
+
+[[viewers]]
+id = "y"
+label = "y"
+command = "ybin"
+provision = { kind = "binary", bin = "ybin", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/y.tar.xz" }, sha256 = { "linux-x86_64" = "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3" } }
+"#;
+        let m = parse(DECL).expect("parses");
+        let decl = m.viewers[0].provision.as_ref().unwrap();
+        let (
+            Provision::Binary {
+                targets: t1,
+                sha256: s1,
+                bin: b1,
+                ..
+            },
+            Provision::Binary {
+                targets: t2,
+                sha256: s2,
+                bin: b2,
+                ..
+            },
+        ) = (decl.to_provision(), decl.to_provision())
+        else {
+            panic!("binary");
+        };
+        assert!(std::ptr::eq(t1, t2), "the target map is interned once");
+        assert!(std::ptr::eq(s1, s2), "and so is the digest map");
+        assert!(std::ptr::eq(b1, b2), "and every string");
+    }
+
+    /// The consent prompt shows the viewer's `command`; when the viewer is
+    /// provisioned, what runs is the provision's `bin`. A manifest in which
+    /// the two disagree would have the user allow one program and croft run
+    /// another, so it is refused at parse time (#485 review).
+    #[test]
+    fn a_viewer_whose_provisioned_binary_differs_from_its_command_is_refused() {
+        const MISMATCH: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "csvlens"
+provision = { kind = "binary", bin = "something-else", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        let err = parse(MISMATCH)
+            .expect_err("a viewer that would run a program other than the one it names is refused");
+        assert!(
+            err.to_string().contains("something-else") && err.to_string().contains("csvlens"),
+            "the refusal names both programs: {err}"
+        );
+        // A command given as a path agrees with a bare `bin` by its file name.
+        const AGREES: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "/opt/tools/csvlens"
+provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        assert!(
+            parse(AGREES).is_ok(),
+            "a path whose file name is the bin agrees"
+        );
+    }
+
+    /// The program that runs is `bin_path` when the manifest sets one, not
+    /// `bin`: the consent check follows the path that is spawned, and a
+    /// provisioned path that leaves the managed store (absolute, or through
+    /// a parent reference) is refused for every provision, not only a
+    /// viewer's, since `Path::join` with an absolute argument drops the
+    /// store prefix entirely.
+    #[test]
+    fn a_provisioned_bin_path_must_name_the_command_and_stay_in_the_store() {
+        const OTHER_PROGRAM: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "csvlens"
+provision = { kind = "binary", bin = "csvlens", bin_path = "payload/other-program", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        let err = parse(OTHER_PROGRAM).expect_err("a bin_path naming another program is refused");
+        assert!(err.to_string().contains("other-program"), "{err}");
+        const NESTED_SAME: &str = r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[viewers]]
+id = "z"
+label = "z"
+command = "csvlens"
+provision = { kind = "binary", bin = "csvlens", bin_path = "csvlens-1.0/bin/csvlens", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/z.tar.xz" } }
+"#;
+        assert!(
+            parse(NESTED_SAME).is_ok(),
+            "a nested path to the same program agrees"
+        );
+        for (what, bin_path) in [
+            ("absolute", "/tmp/evil"),
+            ("parent", "../../../../tmp/evil"),
+        ] {
+            let src = format!(
+                r#"
+id = "z"
+name = "z"
+api_version = 1
+
+[[mcp_servers]]
+id = "srv"
+command = "evil"
+provision = {{ kind = "binary", bin = "evil", bin_path = "{bin_path}", archive = "gz", targets = {{ "linux-x86_64" = "https://example.invalid/z.gz" }} }}
+"#
+            );
+            let err = parse(&src).expect_err("a provisioned path that leaves the store is refused");
+            assert!(
+                err.to_string().contains("managed store"),
+                "the {what} path is refused for leaving the store: {err}"
+            );
+        }
+    }
+
+    /// #465: a catalog entry that opens a file kind in an external TUI.
+    #[test]
+    fn a_viewers_block_parses_with_its_provision() {
+        const CSVLENS: &str = r#"id = "csvlens"
+name = "csvlens"
+description = "Browse CSV and TSV files in csvlens, a terminal spreadsheet viewer."
+builtin = false
+api_version = 1
+
+[[viewers]]
+id = "csvlens"
+label = "Open in csvlens"
+command = "csvlens"
+args = ["{file}"]
+extensions = ["csv", "tsv"]
+provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { "macos-aarch64" = "https://example.invalid/csvlens-aarch64-apple-darwin.tar.xz" } }
+"#;
+        let m = parse(CSVLENS).expect("the manifest parses");
+        assert_eq!(m.viewers.len(), 1, "one viewer: {:?}", m.viewers);
+        let v = &m.viewers[0];
+        assert_eq!(
+            (v.id.as_str(), v.label.as_str(), v.command.as_str()),
+            ("csvlens", "Open in csvlens", "csvlens")
+        );
+        assert_eq!(v.args, vec!["{file}"]);
+        assert_eq!(v.extensions, vec!["csv", "tsv"]);
+        let p = v.provision.as_ref().expect("provisioned").to_provision();
+        let Provision::Binary { archive, bin, .. } = p else {
+            panic!("a binary provision was declared");
+        };
+        assert_eq!(
+            archive,
+            ArchiveKind::TarXz,
+            "the archive kind reads `tar.xz`"
+        );
+        assert_eq!(bin, "csvlens");
+    }
 
     const PYTHON: &str = include_str!("../../assets/extensions/lsp-python/extension.toml");
 
