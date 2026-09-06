@@ -159,7 +159,36 @@ pub fn resolve(cwd: &Path, arg: &Path) -> PathBuf {
 /// standing on the client half of the same module. Exposure was low (the only
 /// writer is croft itself, sending one `write_all`) but the asymmetry inside
 /// one file is the point: the fix belonged to the read, not to the caller.
+///
+/// The WRITE half keeps that shape deliberately, and the doc above should not
+/// be read as saying otherwise: `SO_SNDTIMEO` is also per-syscall while
+/// `write_all` loops, so a peer dribbling reads could re-arm it the same way.
+/// It stays because the exposure really is nil here rather than merely low:
+/// the request is one short line to a croft that is about to read it, and a
+/// bounded write would need the same deadline machinery for a case no client
+/// can reach.
 pub fn send(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
+    let first = send_once(socket, req)?;
+    // ONE retry, and only on the one refusal that says nothing about this
+    // request. The server accepts on the frame loop under a 20ms budget
+    // shared by every client it serves that frame, so a scheduling gap
+    // between this process's `connect` and its `write_all` gets the
+    // connection refused for a deadline the user's shell has no part in.
+    // Nothing was opened in that case (the request was never read), so a
+    // second attempt cannot double-open, and a croft that is genuinely wedged
+    // fails the same way one frame later.
+    if matches!(&first, ViewReply::Err { message } if message.ends_with(FRAME_BUDGET_REFUSAL)) {
+        return send_once(socket, req);
+    }
+    Ok(first)
+}
+
+/// The tail of the one reply [`send`] retries. Shared with the server rather
+/// than spelled twice: a reworded refusal would otherwise turn the retry off
+/// silently, which is the failure this constant exists to make impossible.
+pub const FRAME_BUDGET_REFUSAL: &str = "the request did not arrive within the frame budget";
+
+fn send_once(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -302,7 +331,7 @@ pub fn read_request(
     let text = read_line_by_deadline(
         stream,
         deadline,
-        "the request did not arrive within the frame budget",
+        FRAME_BUDGET_REFUSAL,
     )?;
     serde_json::from_str(text.trim())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -504,6 +533,26 @@ pub(crate) fn stage_at(dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<P
 }
 
 /// `croft view <path>` / `croft view -`.
+/// Read at most `cap` bytes, refusing anything longer rather than truncating.
+///
+/// An uncapped `read_to_end` let a runaway producer buffer the whole stream in
+/// RAM and then write a 0600 copy of it into the cache dir.
+///
+/// `take(cap + 1)` rather than `take(cap)`, and `>` rather than `>=`, so a
+/// payload of EXACTLY `cap` is accepted: `take(N)` stops at N, so a read of
+/// exactly N cannot tell a legal N-byte payload from a truncated larger one,
+/// and reading one byte more can. Split out of `run` because that argument is
+/// an off-by-one nobody could test through stdin.
+fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    let read = reader.take(cap + 1).read_to_end(&mut buf)? as u64;
+    if read > cap {
+        anyhow::bail!("more than {cap} bytes arrived on stdin; write it to a file and view that instead");
+    }
+    Ok(buf)
+}
+
 pub fn run(
     target: &std::ffi::OsStr,
     as_hint: Option<&str>,
@@ -516,24 +565,20 @@ pub fn run(
         ),
     };
 
+    // Refused rather than ignored, for the same reason an unusable `--as`
+    // value is refused rather than sniffed past (see `stdin_extension`): the
+    // only signal that the flag did nothing would be the file opening in the
+    // viewer the user was trying to override. `--as` stages piped bytes under
+    // a chosen extension, and a named file already has one.
+    if target != "-" && as_hint.is_some() {
+        anyhow::bail!(
+            "croft view --as applies only to piped input (`croft view - --as csv`); \
+             a named file is routed by its own extension"
+        );
+    }
+
     let path = if target == "-" {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        // Capped: an uncapped `read_to_end` let a runaway producer buffer the
-        // whole stream in RAM and then write a 0600 copy of it into the cache
-        // dir, which the editor refuses past its own limit anyway.
-        // `+ 1` so a payload of EXACTLY the cap is accepted rather than
-        // refused with a message claiming more than the cap arrived. `take(N)`
-        // stops at N, so `== N` cannot tell a legal N-byte payload from a
-        // truncated larger one; reading one byte more can.
-        let read = std::io::Read::take(std::io::stdin(), MAX_STAGED_STDIN_BYTES + 1)
-            .read_to_end(&mut buf)?;
-        if read as u64 > MAX_STAGED_STDIN_BYTES {
-            anyhow::bail!(
-                "more than {MAX_STAGED_STDIN_BYTES} bytes arrived on stdin; \
-                 write it to a file and view that instead"
-            );
-        }
+        let buf = read_capped(std::io::stdin(), MAX_STAGED_STDIN_BYTES)?;
         if buf.is_empty() {
             anyhow::bail!("croft view -: nothing arrived on stdin");
         }
@@ -659,6 +704,72 @@ mod tests {
         assert!(
             ten.starts_with("/c"),
             "and it stays in the cache dir: {ten:?}"
+        );
+    }
+
+    /// The cap accepts EXACTLY `cap` bytes and refuses one more.
+    ///
+    /// `read_capped`'s `take(cap + 1)` and `>` carry a deliberate off-by-one
+    /// argument that nothing could check while it was inline in `run`: a
+    /// `take(cap)` cannot tell a legal cap-byte payload from a truncated
+    /// larger one, and a `>=` would refuse the legal one. Both mutations are
+    /// invisible in a suite that never drives the boundary.
+    #[test]
+    fn the_stdin_cap_accepts_exactly_the_cap_and_refuses_one_more() {
+        assert_eq!(
+            read_capped(&b"1234567"[..], 8).unwrap(),
+            b"1234567",
+            "under the cap"
+        );
+        assert_eq!(
+            read_capped(&b"12345678"[..], 8).unwrap(),
+            b"12345678",
+            "EXACTLY the cap must be accepted: `take(cap)` plus `==` refuses \
+             this, which is the mutation the `+ 1` exists to reject"
+        );
+        let over = read_capped(&b"123456789"[..], 8);
+        assert!(
+            over.is_err(),
+            "one byte past the cap must be refused rather than truncated: \
+             a truncated payload stages a corrupt file and reports success"
+        );
+        assert!(
+            over.unwrap_err().to_string().contains("8"),
+            "and the message must name the cap the user hit"
+        );
+    }
+
+    /// The sniff reads a WINDOW of lines, and the window is load-bearing.
+    ///
+    /// `looks_delimited` takes the first 8 non-empty lines. Nothing
+    /// distinguished that from "all lines", so widening or narrowing the
+    /// window, or dropping the `take` entirely, was invisible: a fixture
+    /// whose rows all agree passes either way.
+    #[test]
+    fn the_delimiter_sniff_judges_the_first_eight_lines_only() {
+        let mut agreeing = String::new();
+        for i in 0..8 {
+            agreeing.push_str(&format!("a{i},b{i}\n"));
+        }
+        let mut disagreeing = agreeing.clone();
+        disagreeing.push_str("this row has no delimiter at all\n");
+        assert_eq!(
+            looks_delimited(agreeing.as_bytes()),
+            Some("csv"),
+            "eight agreeing rows are a table"
+        );
+        assert_eq!(
+            looks_delimited(disagreeing.as_bytes()),
+            Some("csv"),
+            "and a NINTH row that disagrees is outside the window: drop the \
+             `take(8)` and this reads None, which is the change the window \
+             exists to make and nothing else here would notice"
+        );
+        let early = format!("a,b\nno delimiter here\n{agreeing}");
+        assert_eq!(
+            looks_delimited(early.as_bytes()),
+            None,
+            "a row that disagrees INSIDE the window rejects the whole sniff"
         );
     }
 

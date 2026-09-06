@@ -278,6 +278,28 @@ pub(crate) mod tests {
     /// wait now fails loudly, naming what it waited for.
     pub(crate) const TASK_PANE_PROMPT_BASE: Duration = Duration::from_millis(1250);
 
+    /// The four #362 view-socket waits, one constant per budget they replaced.
+    ///
+    /// Named rather than written inline at the call sites for the reason
+    /// `RESTORED_SHELL_BASE` gives: the test that pins them has to be about
+    /// THEM, and a literal retyped beside an assertion stays green when a
+    /// call site drifts. The first version of these conversions used inline
+    /// literals, and two of them overshot the rule below without anything
+    /// noticing.
+    ///
+    /// Each is its old constant divided by `BASE_CALIBRATION * MIN_SCALE`
+    /// (which is 4), so a quiet machine gets exactly what it had and a loaded
+    /// one gets more. Overshooting is not free: the module bounds the worst
+    /// case at `BASE_CALIBRATION * MAX_SCALE`, and a base twice what the rule
+    /// asks doubles the time a genuinely broken test takes to say so.
+    pub(crate) const VIEW_ACCEPT_BASE: Duration = Duration::from_millis(1250);
+    /// Replaced a fixed 500ms server-side deadline in two tests.
+    pub(crate) const VIEW_SERVER_DEADLINE_BASE: Duration = Duration::from_millis(125);
+    /// Replaced two fixed 2000ms poll loops (200 iterations at 10ms).
+    pub(crate) const VIEW_DRAIN_BASE: Duration = Duration::from_millis(500);
+    /// Replaced a fixed 20s `recv_timeout` around a thread running `App::new`.
+    pub(crate) const VIEW_FIFO_RECV_BASE: Duration = Duration::from_secs(5);
+
     // The floor matters more than it looks: every budget this replaces was
     // observed failing at 1x, so a quiet machine must still get more room
     // than the constant it replaced, not less.
@@ -423,6 +445,34 @@ pub(crate) mod tests {
             "the task-pane prompt base must reproduce the 5000ms it replaced at \
              the floor, got {task:?}"
         );
+    }
+
+    /// The same rule for the four #362 view-socket bases: each reproduces, at
+    /// the floor, exactly the constant it replaced. Asserted as equality
+    /// rather than `>=` because these were the ones that drifted: an
+    /// overshoot is as much a defect here as an undershoot, since it doubles
+    /// how long a broken test takes to fail while buying a quiet machine
+    /// nothing.
+    #[test]
+    fn the_view_socket_bases_reproduce_the_constants_they_replaced() {
+        let floor = |base: Duration| base * BASE_CALIBRATION * MIN_SCALE;
+        for (got, want, what) in [
+            (floor(VIEW_ACCEPT_BASE), Duration::from_secs(5), "the accept wait"),
+            (
+                floor(VIEW_SERVER_DEADLINE_BASE),
+                Duration::from_millis(500),
+                "the server deadline",
+            ),
+            (floor(VIEW_DRAIN_BASE), Duration::from_millis(2000), "the drain poll"),
+            (floor(VIEW_FIFO_RECV_BASE), Duration::from_secs(20), "the FIFO recv"),
+        ] {
+            assert_eq!(
+                got, want,
+                "{what} must give back exactly the budget it replaced at the \
+                 floor: a quiet machine keeps what it had, and the worst case \
+                 stays where this module bounds it"
+            );
+        }
     }
 
     /// #397's measured flake, which is the ceiling this rule may not lower:

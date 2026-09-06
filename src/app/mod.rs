@@ -12996,6 +12996,14 @@ impl App {
         // gives a client that spent the whole budget reading a fresh window to
         // spend writing, so one client could cost the frame loop twice the
         // documented 20ms.
+        //
+        // The floor is 1ms and the write's result is discarded, which is worth
+        // being explicit about rather than leaving as an accident. If that
+        // 1ms ever fired on an `Ok`, the file is open in the editor while the
+        // client's shell exits 1 saying croft closed without replying: the
+        // reply is 16 bytes to a socket with a reader already waiting, so it
+        // is unreachable in practice, and the alternative (dropping the reply
+        // rather than the timeout) trades a wrong message for no message.
         let left = deadline
             .saturating_duration_since(std::time::Instant::now())
             .max(std::time::Duration::from_millis(1));
@@ -29375,10 +29383,33 @@ impl App {
         // blocking syscall on a client-supplied path, so `croft view` naming
         // something on a hung NFS mount still parks the frame loop here,
         // before the type check runs. A real bound needs the stat off this
-        // thread. There is also a TOCTOU window between this and the open,
+        // thread.
+        //
+        // The OPEN below is the larger half of the same problem, and it is
+        // not bounded either: `open_pinned` reaches `Editor::open`, which for
+        // a PDF shells out to `pdftoppm` with no timeout (#493), and walks
+        // archives and documents on this thread for their own formats. A
+        // build script running `croft view out.pdf` on a large document parks
+        // the editor for the render. Filed rather than fixed here: moving the
+        // open off the frame loop changes how every viewer reports failure,
+        // which is a bigger change than the channel that exposed it. There is also a TOCTOU window between this and the open,
         // which is same-uid and so inside the trust boundary the module
         // already argues from - noted so a later reader does not mistake the
         // check for airtight.
+        // The invariant `view_ipc`'s header states, actually enforced. The
+        // client resolves against ITS cwd before sending, so a relative path
+        // here came from something that is not `croft view`; resolving it
+        // against croft's own cwd would silently open a different file than
+        // the sender named. Same-uid, so this is not a trust boundary, but
+        // an invariant no code checks is a comment rather than an invariant.
+        if !path.is_absolute() {
+            return ViewReply::Err {
+                message: format!(
+                    "the request must carry an absolute path, got {}",
+                    path.display()
+                ),
+            };
+        }
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
@@ -45774,6 +45805,11 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
         if gone {
             let _ = std::fs::remove_file(entry.path());
+            // `bind_socket_0600` binds inside a `.s<pid>-<n>` dir and removes
+            // it on both paths, but a croft killed inside that window strands
+            // one, and nothing else ever looks at it again. Same argument as
+            // the orphan lock below: it is litter only this sweep can reach.
+            sweep_dead_bind_stages(dir, pid);
             // Derived from the SOCKET's name rather than from this entry's,
             // so sweeping a lock entry does not compose a second suffix onto
             // itself. Removing both from either entry is idempotent.
@@ -45781,6 +45817,32 @@ pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
         }
     }
     sweep_staged_stdin(dir);
+}
+
+/// Remove `.s<pid>-<n>` bind staging directories belonging to a dead croft.
+///
+/// `crate::session::bind_socket_0600` creates one, binds inside it, renames
+/// the socket out and removes the directory on both the success and failure
+/// paths. A croft killed between the create and the remove strands it, and
+/// the counter in that function restarts with the process, so the name is
+/// reused rather than accumulating without bound - but the stranded directory
+/// is never revisited by anything else.
+///
+/// Keyed on the same pid the socket sweep just judged dead, so a LIVE croft's
+/// staging directory is never touched: removing one mid-bind would take the
+/// socket it is about to rename out with it.
+fn sweep_dead_bind_stages(dir: &Path, pid: u32) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".s{pid}-");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&prefix) && name[prefix.len()..].parse::<u64>().is_ok() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// How long a staged stdin file outlives the pipe that wrote it (#362).

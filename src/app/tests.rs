@@ -40984,7 +40984,7 @@ fn accept_when_ready(
     // not the accept: it is every other test in the suite spawning a shell at
     // the same moment, which is contention no constant chosen inside this
     // test can know about.
-    let budget = crate::test_budget::spawn_budget(std::time::Duration::from_secs(2));
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::VIEW_ACCEPT_BASE);
     let started = std::time::Instant::now();
     loop {
         match listener.accept() {
@@ -41022,11 +41022,17 @@ fn view_from_a_pane(
 /// client is a thread racing all of them. Panics rather than returning false,
 /// so a caller cannot turn a timeout into a bare `assert!` that says nothing
 /// about which of the two happened.
-fn drain_until_answered(app: &mut App) {
+fn drain_until_answered(
+    app: &mut App,
+    client: &std::thread::JoinHandle<crate::view_ipc::ViewReply>,
+) {
     crate::test_budget::await_spawned(
-        std::time::Duration::from_millis(500),
-        "the view request to reach the frame loop's drain",
-        || app.drain_view_requests(),
+        crate::test_budget::tests::VIEW_DRAIN_BASE,
+        "the view request to be answered",
+        || {
+            app.drain_view_requests();
+            client.is_finished()
+        },
     );
 }
 
@@ -41042,7 +41048,7 @@ fn a_view_request_from_a_pane_opens_the_file_in_the_editor() {
     let sock = seat_view_listener(&mut app, tmp.path());
 
     let client = view_from_a_pane(&sock, &target);
-    drain_until_answered(&mut app);
+    drain_until_answered(&mut app, &client);
     assert_eq!(client.join().unwrap(), crate::view_ipc::ViewReply::Ok);
 
     let open = app.editor.editors[app.editor.active_index()].path.clone();
@@ -41072,14 +41078,7 @@ fn a_view_request_for_a_directory_is_refused_with_a_reason_the_client_prints() {
     // what it waited for, so the `join` below is only reached once the client
     // thread has finished (CONTRIBUTING.md, "Waiting on a spawned process in
     // a test"). A fixed two seconds decided pass or fail here before.
-    crate::test_budget::await_spawned(
-        std::time::Duration::from_millis(500),
-        "the refusal to reach the client",
-        || {
-            app.drain_view_requests();
-            client.is_finished()
-        },
-    );
+    drain_until_answered(&mut app, &client);
     match client.join().unwrap() {
         crate::view_ipc::ViewReply::Err { message } => {
             assert!(
@@ -41162,6 +41161,17 @@ fn the_socket_sweep_removes_a_dead_crofts_file_and_spares_a_live_one() {
     // lock's creation and the rename leaves this, and nothing keyed on the
     // `.sock` suffix can ever reach it.
     let orphan_lock = tmp.path().join(format!("view-{dead}-99887766.bind.lock"));
+    // `bind_socket_0600` binds inside `.s<pid>-<n>` and removes it on both
+    // paths; a croft killed inside that window strands one, and nothing else
+    // ever looks at it again.
+    let dead_stage = tmp.path().join(format!(".s{dead}-0"));
+    let live_stage = tmp.path().join(format!(".s{live}-0"));
+    // Same prefix, no counter: not ours, so the sweep must leave it.
+    let stage_lookalike = tmp.path().join(format!(".s{dead}-notanumber"));
+    for d in [&dead_stage, &live_stage, &stage_lookalike] {
+        std::fs::create_dir(d).unwrap();
+        std::fs::write(d.join("s"), b"").unwrap();
+    }
     for p in [
         &dead_sock,
         &dead_nonce_sock,
@@ -41177,6 +41187,7 @@ fn the_socket_sweep_removes_a_dead_crofts_file_and_spares_a_live_one() {
     crate::app::sweep_dead_view_sockets(tmp.path());
     let live_survived = live_sock.exists();
     let live_lock_survived = live_lock.exists();
+    let live_stage_survived = live_stage.exists();
     let _ = peer.kill();
     let _ = peer.wait();
 
@@ -41204,9 +41215,113 @@ fn the_socket_sweep_removes_a_dead_crofts_file_and_spares_a_live_one() {
          socket this one is serving"
     );
     assert!(
+        !dead_stage.exists(),
+        "a dead croft's bind staging directory leaks forever otherwise: \
+         nothing but this sweep ever reads that name again"
+    );
+    assert!(
+        live_stage_survived,
+        "and a LIVE croft's staging directory must survive: removing one \
+         mid-bind takes the socket it is about to rename out with it"
+    );
+    assert!(
+        stage_lookalike.exists(),
+        "the counter must parse as a number, or the sweep is matching on a \
+         prefix and will eat directories it did not create"
+    );
+    assert!(
         stranger.exists(),
         "the sweep must only touch files it recognises by name"
     );
+}
+
+/// One drain serves EVERY client waiting, not just the first (#362).
+///
+/// `drain_view_requests` loops on accept under a shared 20ms deadline
+/// precisely so a frame that finds three `croft view` calls queued answers
+/// all three. Nothing pinned that: every other fixture hands it exactly one
+/// connection, so replacing the loop body's tail with `return changed` after
+/// the first client passes the whole suite.
+///
+/// Both requests are written SYNCHRONOUSLY from this thread before the drain
+/// runs, so "both were pending in the same frame" is a property of the
+/// fixture rather than of the scheduler.
+#[test]
+fn one_drain_answers_every_client_already_waiting() {
+    use std::io::{BufRead, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let first = tmp.path().join("first.txt");
+    let second = tmp.path().join("second.txt");
+    std::fs::write(&first, "one").unwrap();
+    std::fs::write(&second, "two").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = seat_view_listener(&mut app, tmp.path());
+
+    let mut clients = Vec::new();
+    for target in [&first, &second] {
+        let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let req = crate::view_ipc::ViewRequest {
+            path: target.as_os_str().as_encoded_bytes().to_vec(),
+        };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        c.write_all(line.as_bytes()).unwrap();
+        c.flush().unwrap();
+        clients.push(c);
+    }
+
+    assert!(
+        app.drain_view_requests(),
+        "one drain, with two complete requests already on the socket"
+    );
+
+    for (i, c) in clients.iter().enumerate() {
+        let mut reply = String::new();
+        std::io::BufReader::new(c).read_line(&mut reply).unwrap();
+        let reply: crate::view_ipc::ViewReply = serde_json::from_str(reply.trim())
+            .unwrap_or_else(|e| panic!("client {i} got no parseable reply: {e}"));
+        assert_eq!(
+            reply,
+            crate::view_ipc::ViewReply::Ok,
+            "client {i} must be answered by the SAME drain as client 0: a loop \
+             that serves one connection and returns leaves this one waiting a \
+             whole frame, and every other test hands the drain a single client"
+        );
+    }
+    let open: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(
+        open.contains(&first) && open.contains(&second),
+        "both files must be open, got {open:?}"
+    );
+}
+
+/// A relative path is refused rather than resolved against croft's cwd (#362).
+///
+/// `view_ipc`'s header states that the server only ever sees absolute paths,
+/// because the client resolves against ITS cwd before sending. Nothing
+/// enforced it, so a relative path from anything that is not `croft view`
+/// opened whatever that name meant from croft's own working directory, which
+/// is a different file than the sender named. Same-uid, so this is an
+/// invariant rather than a boundary, but an unchecked invariant is a comment.
+#[test]
+fn a_relative_path_in_a_request_is_refused_rather_than_resolved_here() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    let reply = app.apply_view_request(std::path::Path::new("relative.txt"));
+
+    match reply {
+        crate::view_ipc::ViewReply::Err { message } => assert!(
+            message.contains("absolute"),
+            "the refusal must name the invariant it is enforcing, got {message:?}"
+        ),
+        other => panic!("a relative path must not be resolved here: {other:?}"),
+    }
 }
 
 /// The status arm that no test could reach (#362).
@@ -41352,6 +41467,15 @@ fn a_client_that_never_sends_a_newline_is_refused_by_the_deadline() {
     let sock = seat_view_listener(&mut app, tmp.path());
 
     let sock2 = sock.clone();
+    // The dribbler stops when the SERVER is done with it, not after a fixed
+    // count. It used to run 240 x 5ms, a flat 1.2s, while the accept it races
+    // is load-scaled to as much as sixteen seconds: on a machine slow enough
+    // to need that budget the dribbler had already exited, the server read
+    // EOF on `{"path":[47,47`, and the test failed on a serde parse error
+    // while asserting about a deadline. That is the same class this fixture
+    // was converted to tolerate, left in the fixture instead of the budget.
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dribbling = std::sync::Arc::clone(&served);
     let dribbler = std::thread::spawn(move || {
         let Ok(mut c) = std::os::unix::net::UnixStream::connect(&sock2) else {
             return;
@@ -41362,7 +41486,7 @@ fn a_client_that_never_sends_a_newline_is_refused_by_the_deadline() {
         // unbounded read too. The hang needs a client that keeps re-arming.
         let _ = std::io::Write::write_all(&mut c, br#"{"path":[47"#);
         let _ = std::io::Write::flush(&mut c);
-        for _ in 0..240 {
+        while !dribbling.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(5));
             if std::io::Write::write_all(&mut c, b",47").is_err() {
                 return;
@@ -41370,12 +41494,12 @@ fn a_client_that_never_sends_a_newline_is_refused_by_the_deadline() {
             let _ = std::io::Write::flush(&mut c);
         }
     });
-    std::thread::sleep(std::time::Duration::from_millis(50));
 
     let listener = app.view_listener.as_ref().unwrap();
     let stream = accept_when_ready(listener);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
     let (reply, opened) = app.answer_view_client(stream, deadline);
+    served.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = dribbler.join();
 
     assert!(
@@ -41454,7 +41578,7 @@ fn a_non_blocking_accepted_stream_is_still_answered() {
     // scheduler, not the server. Load-scaled for the same reason every other
     // spawn wait here is (CONTRIBUTING.md).
     let deadline = std::time::Instant::now()
-        + crate::test_budget::spawn_budget(std::time::Duration::from_millis(250));
+        + crate::test_budget::spawn_budget(crate::test_budget::tests::VIEW_SERVER_DEADLINE_BASE);
     let (reply, opened) = app.answer_view_client(stream, deadline);
     let _ = client.join();
 
@@ -41662,7 +41786,7 @@ fn a_view_request_for_a_fifo_is_refused_rather_than_opened() {
     });
     let reply = rx
         .recv_timeout(crate::test_budget::spawn_budget(
-            std::time::Duration::from_secs(5),
+            crate::test_budget::tests::VIEW_FIFO_RECV_BASE,
         ))
         .expect("opening a FIFO must not block the frame loop forever");
     assert!(
@@ -41707,7 +41831,7 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
     // scheduler, not the server. Load-scaled for the same reason every other
     // spawn wait here is (CONTRIBUTING.md).
     let deadline = std::time::Instant::now()
-        + crate::test_budget::spawn_budget(std::time::Duration::from_millis(250));
+        + crate::test_budget::spawn_budget(crate::test_budget::tests::VIEW_SERVER_DEADLINE_BASE);
     let (reply, opened) = app.answer_view_client(stream, deadline);
     let _ = flood.join();
 

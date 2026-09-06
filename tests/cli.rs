@@ -496,6 +496,42 @@ fn view_from_a_pipe_stages_an_owner_only_file_and_sends_its_path() {
     );
 }
 
+/// `--as` on a NAMED file is refused, not ignored (#362).
+///
+/// The flag only ever reached `stage_stdin`, which only runs for `-`, so
+/// `croft view data.log --as csv` opened a text tab and exited 0. The only
+/// signal that the flag did nothing was the file opening in the viewer the
+/// user was trying to override, which is precisely the reasoning the module
+/// already gives for refusing an unusable `--as` value rather than sniffing
+/// past it.
+#[test]
+fn view_refuses_an_as_flag_on_a_named_file_rather_than_ignoring_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let target = tmp.path().join("data.log");
+    std::fs::write(&target, b"a,b\n1,2\n").unwrap();
+    // A listener that would ACCEPT, so a pass here cannot come from the
+    // socket being unreachable.
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["view", "data.log", "--as", "csv"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("--as"),
+        "the message must name the flag that was refused, was: {stderr}"
+    );
+    assert!(
+        stderr.contains("piped"),
+        "and say what it applies to, or the user cannot tell what to do \
+         instead, was: {stderr}"
+    );
+}
+
 /// An empty pipe is refused by name, and stages nothing (#362).
 #[test]
 fn view_from_an_empty_pipe_says_nothing_arrived() {
