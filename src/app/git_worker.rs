@@ -17,6 +17,13 @@ pub struct GitWorker {
     /// window elapses, so the final change in a burst always lands without
     /// waiting for another filesystem event.
     pending: Option<GitRequest>,
+    /// A status response landed since the last `take_status_arrival`,
+    /// whether or not it changed `status` (#471). An open `git diff --staged`
+    /// view is rebuilt from the INDEX, and replacing an already-staged
+    /// file's bytes leaves porcelain status identical, so "status changed"
+    /// alone would never re-run that view; "a status refresh completed" is
+    /// the signal that the index may have moved.
+    status_arrived: bool,
 }
 
 impl GitWorker {
@@ -33,6 +40,7 @@ impl GitWorker {
             status: GitStatus::default(),
             last_check: Instant::now(),
             pending: None,
+            status_arrived: false,
         }
     }
 
@@ -104,6 +112,7 @@ impl GitWorker {
         loop {
             match self.response_rx.try_recv() {
                 Ok(GitResponse::Status(s)) => {
+                    self.status_arrived = true;
                     if self.status != s {
                         self.status = s.clone();
                         if let Some(p) = panel.as_deref_mut() {
@@ -113,6 +122,7 @@ impl GitWorker {
                     }
                 }
                 Ok(GitResponse::StatusAndChanges(s, entries)) => {
+                    self.status_arrived = true;
                     self.status = s.clone();
                     if let Some(p) = panel.as_deref_mut() {
                         p.set_status(s, entries);
@@ -123,6 +133,12 @@ impl GitWorker {
             }
         }
         changed
+    }
+
+    /// True once per completed status refresh since the last call, changed
+    /// or not (#471). See the `status_arrived` field.
+    pub fn take_status_arrival(&mut self) -> bool {
+        std::mem::take(&mut self.status_arrived)
     }
 }
 
@@ -147,9 +163,41 @@ mod tests {
                     .checked_sub(MIN_GAP * 2)
                     .unwrap_or_else(Instant::now),
                 pending: None,
+                status_arrived: false,
             };
             (worker, request_rx)
         }
+
+        /// Like `for_test`, keeping the response sender so a test can feed
+        /// the worker responses as the background thread would.
+        fn for_test_with_responses() -> (Self, Sender<GitResponse>) {
+            let (request_tx, _request_rx) = std::sync::mpsc::channel::<GitRequest>();
+            let (response_tx, response_rx) = std::sync::mpsc::channel::<GitResponse>();
+            let worker = Self {
+                request_tx,
+                response_rx,
+                status: GitStatus::default(),
+                last_check: Instant::now(),
+                pending: None,
+                status_arrived: false,
+            };
+            (worker, response_tx)
+        }
+    }
+
+    /// #471: a status identical to the last one is not a CHANGE, but it is
+    /// an ARRIVAL, and the staged diff view keys off the latter.
+    #[test]
+    fn a_status_equal_to_the_last_still_counts_as_an_arrival() {
+        let (mut worker, tx) = GitWorker::for_test_with_responses();
+        assert!(!worker.take_status_arrival(), "nothing has landed yet");
+        tx.send(GitResponse::Status(GitStatus::default())).unwrap();
+        assert!(!worker.drain_into(None), "an equal status is not a change");
+        assert!(worker.take_status_arrival(), "but it did arrive");
+        assert!(
+            !worker.take_status_arrival(),
+            "the flag is consumed by the take"
+        );
     }
 
     #[test]
