@@ -67,6 +67,12 @@ thread_local! {
 /// library's `Highlighter::default()` deliberately leaves the keywords out;
 /// a log viewer wants them most of all, so they are added here, and FIRST,
 /// because when two matches overlap the group added first wins.
+///
+/// NO KEYWORD STYLE MAY SET A BACKGROUND. tailspin renders a background-
+/// styled keyword as a badge with a literal space on each side, which
+/// changes the visible text -- and `visible_text` promises the text the
+/// reader sees is the text find and copy read from the raw, unhighlighted
+/// line. `coloured` below therefore sets a foreground only.
 fn build_highlighter() -> tailspin::Highlighter {
     use tailspin::config::*;
     use tailspin::style::{Color, Style};
@@ -122,13 +128,20 @@ fn build_highlighter() -> tailspin::Highlighter {
         .expect("tailspin's default groups plus fixed keywords always build")
 }
 
+/// Lines wider than this are parsed unhighlighted (#466). tailspin's merge
+/// step allocates a style slot per byte of a line that matched anything,
+/// and a line can be as wide as the whole window; a megabyte-wide JSON line
+/// is not one a reader scans for a coloured UUID. Every other sweep in this
+/// file is budgeted (`FIND_SCAN_BYTES`, `MAX_COPY_BYTES`); so is this one.
+const MAX_HIGHLIGHT_BYTES: usize = 16 * 1024;
+
 /// `raw` with tailspin's colours applied (#466), or `raw` untouched when it
 /// already carries an escape sequence: a line that coloured itself (pytest,
 /// cargo, a structured logger) keeps its own colours rather than getting a
 /// second set painted over them. A line tailspin matches nothing on comes
 /// back borrowed, so the common plain line costs no allocation.
 fn highlighted(raw: &str) -> std::borrow::Cow<'_, str> {
-    if raw.is_empty() || raw.contains('\x1b') {
+    if raw.is_empty() || raw.len() > MAX_HIGHLIGHT_BYTES || raw.contains('\x1b') {
         return std::borrow::Cow::Borrowed(raw);
     }
     HIGHLIGHTER.with(|h| h.apply(raw))
@@ -586,7 +599,11 @@ impl LogView {
             // to colour. One still inside a colour block an earlier line
             // opened (a red stack trace under one `\e[31m`) has no escape
             // byte of its own, yet it IS coloured, and tailspin's resets
-            // after each match would cut the block short.
+            // after each match would cut the block short. Exact within a
+            // window; the window's own first line always starts from the
+            // default style (see the doc on `ensure`), so a block that
+            // opened above the window is not seen there -- the same
+            // boundary that already left such a line uncoloured.
             let parsed = if self.highlight && style == AnsiStyle::default() {
                 parse_line(&highlighted(raw), &mut style)
             } else {
@@ -1132,6 +1149,28 @@ mod tests {
                 .iter()
                 .all(|s| s.style.fg == Some(crate::ansi_text::AnsiColor::Indexed(1))),
             "every span of the inherited line stays red: {inherited:?}"
+        );
+    }
+
+    /// #466: a toggle drops the parsed window, so a stale coloured line is
+    /// never served after the flag flips; the next `ensure` re-parses.
+    #[test]
+    fn toggling_highlight_drops_the_parsed_window() {
+        let (_d, p) = write_tmp(b"2024-01-02 plain 42\n");
+        let mut v = LogView::open(&p).unwrap();
+        v.set_highlight(true);
+        v.ensure(0, 1).unwrap();
+        assert!(v.line(0).is_some(), "the window is parsed");
+        v.set_highlight(false);
+        assert!(v.line(0).is_none(), "the flip drops the window");
+        v.set_highlight(false);
+        v.ensure(0, 1).unwrap();
+        assert!(
+            v.line(0)
+                .unwrap()
+                .spans
+                .iter()
+                .all(|s| s.style.fg.is_none())
         );
     }
 

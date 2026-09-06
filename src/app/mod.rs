@@ -4151,9 +4151,7 @@ impl App {
         // hundreds of apps on parallel threads, and an unguarded write to
         // the process-wide default from each would race the tests that
         // read it; those call `seed_log_highlight_default` explicitly.
-        if !cfg!(test) {
-            seed_log_highlight_default(!loaded_prefs.disable_log_highlight);
-        }
+        seed_log_highlight_default_at_startup(!loaded_prefs.disable_log_highlight);
         // Same treatment for keybindings: a row croft refused (an unknown
         // command id, a gesture that can never fire, a reserved bare click)
         // used to vanish silently, which reads as croft being broken rather
@@ -44655,10 +44653,32 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 }
 
 /// Push a log-highlight setting into the log view's process-wide opening
-/// default (#466). A free function so `App::new` can call it before `self`
-/// exists and a test can call it explicitly under the log view's test lock.
+/// default (#466), from the toggle and from a settings remerge.
 pub(crate) fn seed_log_highlight_default(on: bool) {
     crate::log_view::set_default_highlight(on);
+}
+
+/// The startup seed of that default from the saved preference (#466). In
+/// the shipped binary it is the same write; under test it RECORDS the value
+/// per thread instead, because the suite builds hundreds of apps on
+/// parallel threads and each write would race the tests that read the
+/// process-wide default. The record keeps the call site observable: a test
+/// asserts what `App::new` decided to seed, not merely that a setter sets.
+#[cfg(not(test))]
+fn seed_log_highlight_default_at_startup(on: bool) {
+    crate::log_view::set_default_highlight(on);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What the most recent `App::new` on this thread would have seeded.
+    pub(crate) static STARTUP_LOG_HIGHLIGHT_SEED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn seed_log_highlight_default_at_startup(on: bool) {
+    STARTUP_LOG_HIGHLIGHT_SEED.with(|cell| cell.set(Some(on)));
 }
 
 /// Fold a mouse event's Shift/Alt/Ctrl state into the form `report_mouse`
