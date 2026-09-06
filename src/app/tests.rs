@@ -12459,6 +12459,61 @@ fn inline_blame_annotation_paints_on_the_cursor_line() {
     );
 }
 
+/// `Editor: Toggle Provenance` (#349) flips the lens on the active editor
+/// and keeps it across the per-tick sync; off again on a second toggle.
+#[test]
+fn toggle_provenance_command_flips_the_editor_lens() {
+    let mut app = editor_app_with_lines(&["one", "two"]);
+    assert!(!app.editor.provenance_overlay, "the lens is off by default");
+    app.run_command(crate::widgets::command_palette::Command::ToggleProvenance);
+    assert!(app.editor.provenance_overlay, "the command turns it on");
+    assert_eq!(app.status, "Provenance: on");
+    app.sync_blame();
+    assert!(
+        app.editor.provenance_overlay,
+        "and the tick sync keeps it on"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleProvenance);
+    app.sync_blame();
+    assert!(
+        !app.editor.provenance_overlay,
+        "toggling again turns it off"
+    );
+}
+
+/// The lens reaches every tab of every group, not only the focused editor
+/// (#349 review): the gutter bar paints in every pane, so `sync_focus_flags`
+/// carries it the way it carries indent guides.
+#[test]
+fn the_provenance_lens_reaches_every_editor_after_the_flag_sync() {
+    let mut app = editor_app_with_lines(&["one", "two"]);
+    app.editor
+        .push_editor(crate::widgets::editor::Editor::new());
+    assert!(app.editor.editors.len() >= 2, "fixture: two tabs");
+    // A split puts the first group out of focus; the lens must reach it too.
+    app.editor.path = Some(std::path::PathBuf::from("split-anchor.txt"));
+    app.split_editor();
+    app.run_command(crate::widgets::command_palette::Command::ToggleProvenance);
+    app.sync_focus_flags();
+    let every_editor_on = app.editor.editors.iter().all(|e| e.provenance_overlay)
+        && app
+            .editor_layout
+            .inactive_groups()
+            .iter()
+            .flat_map(|g| g.editors.iter())
+            .all(|e| e.provenance_overlay);
+    assert!(
+        every_editor_on,
+        "every tab in every group carries the lens after the sync"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleProvenance);
+    app.sync_focus_flags();
+    assert!(
+        app.editor.editors.iter().all(|e| !e.provenance_overlay),
+        "and every tab drops it"
+    );
+}
+
 #[test]
 fn toggle_inline_blame_command_flips_the_editor_flag_and_pref() {
     let mut app = editor_app_with_lines(&["one", "two"]);
@@ -26373,11 +26428,13 @@ fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_
                     cwd: b.display().to_string(),
                     name: None,
                     transcript: Vec::new(),
+                    lane: None,
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b_sub.display().to_string(),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
+                    lane: None,
                 },
             ],
             active: 1,
@@ -26417,11 +26474,13 @@ fn restoring_a_workspaces_layout_drops_pane_bound_state_from_the_outgoing_panel(
                     cwd: b.display().to_string(),
                     name: None,
                     transcript: Vec::new(),
+                    lane: None,
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
+                    lane: None,
                 },
             ],
             active: 0,
@@ -26471,11 +26530,13 @@ fn change_workspace_root_keeps_live_panes_when_the_terminal_was_touched() {
                     cwd: b.display().to_string(),
                     name: None,
                     transcript: Vec::new(),
+                    lane: None,
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
+                    lane: None,
                 },
             ],
             active: 0,
@@ -42647,6 +42708,437 @@ fn a_success_forgets_a_refusal_another_croft_recorded() {
         !crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now())
             .contains_key("db-1"),
         "the disk refusal is gone even though this instance never held it"
+    );
+}
+
+/// A committed git repo at `dir` for the worktree-lane tests (#348): a lane
+/// is a sibling of the repo, so callers put the repo one level inside their
+/// tempdir to keep the lane inside it too.
+fn init_lane_repo(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    std::fs::write(dir.join("seed.txt"), "one\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+}
+
+#[test]
+fn a_new_lane_opens_a_named_pane_in_the_worktree_running_the_agent_command() {
+    // One chord's worth (#348): worktree, root, and a pane named after the
+    // lane sitting in it with the configured agent's launch line typed in.
+    // The "agent" is a printf whose typed line does not spell the probe.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.agents = crate::agents::AgentTable::from_json(
+        r#"[{ "name": "probe", "launch": "printf '%s%s\\n' 'croft-lane' '-seated-1'" }]"#,
+    );
+    app.lane_agent = Some(String::from("Probe"));
+    let before = app.terminals.len();
+    app.create_worktree_lane("fix login");
+    let lane = tmp.path().join("repo-fix-login");
+    assert!(lane.is_dir(), "the worktree exists: {}", app.status);
+    assert!(
+        app.roots.iter().any(|r| r == lane.canonicalize().unwrap()),
+        "and is a workspace root"
+    );
+    assert_eq!(app.terminals.len(), before + 1, "one new pane");
+    let pane = &app.terminals[app.active_terminal];
+    assert_eq!(pane.manual_name(), Some("Lane: fix-login"));
+    let rec = app
+        .lane_panes
+        .get(&pane.uid())
+        .expect("the pane is recorded as the lane's");
+    assert_eq!(rec.branch, "agent/fix-login");
+    assert_eq!(rec.agent.as_deref(), Some("probe"), "lower-cased row name");
+    assert!(app.status.contains("probe started"), "{}", app.status);
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
+    let started = std::time::Instant::now();
+    while started.elapsed() < budget {
+        if app.terminals[app.active_terminal]
+            .visible_text()
+            .contains("croft-lane-seated-1")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.terminals[app.active_terminal]
+            .visible_text()
+            .contains("croft-lane-seated-1"),
+        "the launch line ran in the lane's pane; screen:\n{}",
+        app.terminals[app.active_terminal].visible_text()
+    );
+    // The saved session carries the lane, so a relaunch can seat it again.
+    let saved = crate::terminal_session::load(&app.terminal_session_path);
+    let root_key = app.workspace_root().display().to_string();
+    let lanes: Vec<_> = saved[&root_key]
+        .panes
+        .iter()
+        .filter_map(|p| p.lane.clone())
+        .collect();
+    assert_eq!(lanes.len(), 1, "{saved:?}");
+    assert_eq!(lanes[0].agent.as_deref(), Some("probe"));
+    assert_eq!(
+        std::path::Path::new(&lanes[0].path),
+        lane.canonicalize().unwrap(),
+        "recorded canonical, like the roots"
+    );
+}
+
+#[test]
+fn a_lane_without_a_configured_agent_opens_a_plain_shell_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("docs");
+    let pane = &app.terminals[app.active_terminal];
+    assert_eq!(pane.manual_name(), Some("Lane: docs"));
+    assert_eq!(app.lane_panes[&pane.uid()].agent, None);
+    assert!(app.status.contains("set lane_agent"), "{}", app.status);
+    // An agent named but without a launch line: shell, and the status names
+    // the gap rather than reading as a working lane.
+    app.agents = crate::agents::AgentTable::from_json(r#"[{ "name": "mute" }]"#);
+    app.lane_agent = Some(String::from("mute"));
+    app.create_worktree_lane("tests");
+    let pane = &app.terminals[app.active_terminal];
+    assert_eq!(pane.manual_name(), Some("Lane: tests"));
+    assert_eq!(
+        app.lane_panes[&pane.uid()].agent,
+        None,
+        "no agent was seated"
+    );
+    assert!(
+        app.status.contains("no launch line for \"mute\""),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
+    // The association survives a relaunch (#348): the saved lane record
+    // brings the pane back in the worktree, re-registered as the lane's, and
+    // the agent's CURRENT launch line typed in. A lane whose worktree is
+    // gone comes back as an ordinary pane.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let session = tmp.path().join("sessions.json");
+    let lane_dir = tmp.path().join("repo-fix-login");
+    std::fs::create_dir_all(&lane_dir).unwrap();
+    let root_key = repo.display().to_string();
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![
+            crate::terminal_session::PaneRecord {
+                cwd: root_key.clone(),
+                name: None,
+                transcript: Vec::new(),
+                lane: None,
+            },
+            crate::terminal_session::PaneRecord {
+                cwd: lane_dir.display().to_string(),
+                name: Some(String::from("Lane: fix-login")),
+                transcript: Vec::new(),
+                lane: Some(crate::terminal_session::LaneRecord {
+                    path: lane_dir.display().to_string(),
+                    branch: String::from("agent/fix-login"),
+                    agent: Some(String::from("probe")),
+                }),
+            },
+            crate::terminal_session::PaneRecord {
+                cwd: root_key.clone(),
+                name: Some(String::from("Lane: gone")),
+                transcript: Vec::new(),
+                lane: Some(crate::terminal_session::LaneRecord {
+                    path: tmp.path().join("repo-gone").display().to_string(),
+                    branch: String::from("agent/gone"),
+                    agent: Some(String::from("probe")),
+                }),
+            },
+        ],
+        active: 1,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = session;
+    app.agents = crate::agents::AgentTable::from_json(
+        r#"[{ "name": "probe", "launch": "printf '%s%s\\n' 'croft-lane' '-back-2'" }]"#,
+    );
+    app.restore_terminal_session();
+    assert_eq!(app.terminals.len(), 3);
+    let uid = app.terminals[1].uid();
+    assert_eq!(
+        app.lane_panes.get(&uid).map(|l| l.branch.as_str()),
+        Some("agent/fix-login")
+    );
+    assert!(
+        !app.lane_panes.contains_key(&app.terminals[2].uid()),
+        "a lane whose worktree is gone is not a lane"
+    );
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
+    let started = std::time::Instant::now();
+    while started.elapsed() < budget
+        && !app.terminals[1]
+            .visible_text()
+            .contains("croft-lane-back-2")
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.terminals[1]
+            .visible_text()
+            .contains("croft-lane-back-2"),
+        "the agent was seated again; screen:\n{}",
+        app.terminals[1].visible_text()
+    );
+    assert!(
+        !app.terminals[2]
+            .visible_text()
+            .contains("croft-lane-back-2"),
+        "nothing was typed into the pane whose lane is gone"
+    );
+}
+
+#[test]
+fn a_restored_lane_pane_spawns_in_its_worktree_not_where_the_shell_had_wandered() {
+    // The launch line is typed into the restored shell, so that shell must
+    // be in the lane: not in the directory the old shell had cd'd to at save
+    // time, and not, when that directory is gone, in the PRIMARY repo the
+    // cwd fallback names. The "agent" prints its cwd so the test can read
+    // where it was seated.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let session = tmp.path().join("sessions.json");
+    let lane_dir = tmp.path().join("repo-fix-login");
+    std::fs::create_dir_all(&lane_dir).unwrap();
+    let elsewhere = tmp.path().join("notes");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let vanished = lane_dir.join("scratch");
+    let root_key = repo.display().to_string();
+    let lane = |agent: &str| crate::terminal_session::LaneRecord {
+        path: lane_dir.display().to_string(),
+        branch: String::from("agent/fix-login"),
+        agent: Some(String::from(agent)),
+    };
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![
+            crate::terminal_session::PaneRecord {
+                cwd: elsewhere.display().to_string(),
+                name: Some(String::from("Lane: fix-login")),
+                transcript: Vec::new(),
+                lane: Some(lane("probe-a")),
+            },
+            crate::terminal_session::PaneRecord {
+                cwd: vanished.display().to_string(),
+                name: Some(String::from("Lane: fix-login")),
+                transcript: Vec::new(),
+                lane: Some(lane("probe-b")),
+            },
+        ],
+        active: 0,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = session;
+    app.agents = crate::agents::AgentTable::from_json(
+        r#"[
+          { "name": "probe-a", "launch": "printf '%s%s\\n' 'croft-seat' \"-a:$(pwd)\"" },
+          { "name": "probe-b", "launch": "printf '%s%s\\n' 'croft-seat' \"-b:$(pwd)\"" }
+        ]"#,
+    );
+    app.restore_terminal_session();
+    assert_eq!(app.terminals.len(), 2);
+    let lane_canon = lane_dir.canonicalize().unwrap().display().to_string();
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
+    let started = std::time::Instant::now();
+    let seated = |app: &App, tag: &str| {
+        app.terminals
+            .iter()
+            .any(|t| t.visible_text().contains(&format!("croft-seat-{tag}:")))
+    };
+    while started.elapsed() < budget && !(seated(&app, "a") && seated(&app, "b")) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for tag in ["a", "b"] {
+        let screen = app
+            .terminals
+            .iter()
+            .map(|t| t.visible_text())
+            .find(|s| s.contains(&format!("croft-seat-{tag}:")))
+            .unwrap_or_else(|| panic!("probe {tag} never printed its cwd"));
+        let line = screen
+            .lines()
+            .find(|l| l.contains(&format!("croft-seat-{tag}:")))
+            .unwrap();
+        assert!(
+            line.trim_end().ends_with(&lane_canon)
+                || line.trim_end().ends_with(&lane_dir.display().to_string()),
+            "agent {tag} was seated in the lane, got: {line:?}"
+        );
+    }
+    for t in &app.terminals {
+        assert!(
+            app.lane_panes.contains_key(&t.uid()),
+            "both restored panes are the lane's"
+        );
+    }
+}
+
+#[test]
+fn a_lane_pane_closed_by_any_route_is_no_longer_the_lanes_even_when_reopened() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let uid = app.terminals[app.active_terminal].uid();
+    assert!(app.lane_panes.contains_key(&uid));
+    assert!(app.close_active_terminal(), "the ordinary close");
+    assert!(
+        app.lane_panes.is_empty(),
+        "the map does not keep dead panes"
+    );
+    app.undo_close_terminal();
+    assert!(
+        app.terminals.iter().any(|t| t.uid() == uid),
+        "the pane came back"
+    );
+    assert!(
+        app.lane_panes.is_empty(),
+        "but not as the lane's: nobody asked for an agent to be re-seated"
+    );
+}
+
+#[test]
+fn closing_a_lane_whose_pane_is_the_last_one_replaces_it_with_a_shell_in_the_primary_root() {
+    // The close refuses the last pane, and a lane pane left standing would
+    // sit in a directory git just removed. So a fresh shell in the primary
+    // root is opened first, and the lane pane closes like any other.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("solo");
+    // Drop the original pane so the lane's is the only one left.
+    assert!(app.close_terminal_at(0));
+    assert_eq!(app.terminals.len(), 1);
+    let lane_uid = app.terminals[0].uid();
+    assert_eq!(app.terminals[0].manual_name(), Some("Lane: solo"));
+    let lane = tmp.path().join("repo-solo").canonicalize().unwrap();
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    assert!(!lane.exists(), "{}", app.status);
+    assert_eq!(app.terminals.len(), 1, "one pane remains: the replacement");
+    assert_ne!(app.terminals[0].uid(), lane_uid, "and it is not the lane's");
+    assert_eq!(app.terminals[0].manual_name(), None);
+    assert!(app.lane_panes.is_empty());
+    assert!(
+        app.closed_terminals
+            .iter()
+            .any(|c| c.term.uid() == lane_uid),
+        "the lane pane went through the undoable close"
+    );
+    assert!(app.status.contains("closed its pane"), "{}", app.status);
+    // The replacement is a live shell in the primary root, not in the
+    // removed directory: it can print its cwd.
+    app.terminals[0].write_input(b"printf '%s%s\\n' 'croft-repl' \"-at:$(pwd)\"\r");
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
+    let started = std::time::Instant::now();
+    while started.elapsed() < budget && !app.terminals[0].visible_text().contains("croft-repl-at:")
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let screen = app.terminals[0].visible_text();
+    let line = screen
+        .lines()
+        .find(|l| l.contains("croft-repl-at:"))
+        .unwrap_or_else(|| panic!("the replacement shell never answered; screen:\n{screen}"));
+    let repo_canon = repo.canonicalize().unwrap().display().to_string();
+    assert!(
+        line.trim_end().ends_with(&repo_canon)
+            || line.trim_end().ends_with(&repo.display().to_string()),
+        "the replacement sits in the primary root, got: {line:?}"
+    );
+}
+
+#[test]
+fn closing_a_lane_closes_its_pane_through_the_undoable_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    assert_eq!(app.terminals.len(), 2);
+    let lane_uid = app.terminals[app.active_terminal].uid();
+    // Close targets the ACTIVE root; the lane is what the user is in.
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    assert!(!lane.exists(), "the worktree is gone: {}", app.status);
+    assert!(!app.roots.iter().any(|r| r == lane), "and the root");
+    assert_eq!(
+        app.terminals.len(),
+        1,
+        "and the lane's pane: {}",
+        app.status
+    );
+    assert!(!app.terminals.iter().any(|t| t.uid() == lane_uid));
+    assert!(app.lane_panes.is_empty());
+    assert!(
+        app.closed_terminals
+            .iter()
+            .any(|c| c.term.uid() == lane_uid),
+        "closed through the undoable path"
+    );
+    assert!(app.status.contains("closed its pane"), "{}", app.status);
+}
+
+#[test]
+fn cmd_k_shift_l_asks_for_a_new_lane_and_plain_l_still_folds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('L'), KeyModifiers::SHIFT)));
+    assert_eq!(
+        app.input_prompt.as_ref().map(|p| p.purpose.clone()),
+        Some(crate::widgets::input_prompt::InputPurpose::NewWorktreeLane)
+    );
+    app.close_input_prompt();
+    // CSI-u hosts report Shift+L as a lower-case char with SHIFT.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('l'), KeyModifiers::SHIFT)));
+    assert_eq!(
+        app.input_prompt.as_ref().map(|p| p.purpose.clone()),
+        Some(crate::widgets::input_prompt::InputPurpose::NewWorktreeLane)
+    );
+    app.close_input_prompt();
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('l'), KeyModifiers::NONE)));
+    assert!(
+        app.input_prompt.is_none(),
+        "plain L is still the fold toggle"
     );
 }
 

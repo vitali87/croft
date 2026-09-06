@@ -2499,6 +2499,12 @@ pub struct App {
     blame_fetched: Option<PathBuf>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
+    /// The provenance lens (#349): who typed each line, in the gutter and
+    /// the blame annotation. Session-only for now; the persisted half of
+    /// #349 (the map beside local history) is a later slice. Pushed onto
+    /// every editor in every group by `sync_focus_flags`, since the gutter
+    /// bar paints in every pane, not only the focused one.
+    provenance_overlay: bool,
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
     /// default, pushed to every editor by the per-frame focus sync.
     indent_guides_enabled: bool,
@@ -2837,6 +2843,13 @@ pub struct App {
     /// Hosts whose provisioning failed recently (#364), loaded from the
     /// cache file at startup and extended when an install fails.
     remote_offer_refused: crate::remote::RefusedHosts,
+    /// The `agents.json` row a new worktree lane starts in its pane (#348);
+    /// `None` opens a plain shell. From `lane_agent` in settings.json.
+    lane_agent: Option<String>,
+    /// Which panes are worktree lanes' (#348), by pane uid: saved with the
+    /// terminal session so a relaunch seats the agent again, and consulted
+    /// when a lane closes so its pane goes with it.
+    lane_panes: std::collections::BTreeMap<u64, crate::terminal_session::LaneRecord>,
     /// Explorer-scoped Cut/Copy buffer. Independent from the OS clipboard
     /// (which carries text), this stores filesystem paths and the intent
     /// (move vs. copy) until the next Paste consumes it.
@@ -4473,6 +4486,7 @@ impl App {
             blame_tx,
             blame_fetched: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
+            provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
             bracket_colors_enabled: !loaded_prefs.disable_bracket_colors,
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
@@ -4610,6 +4624,8 @@ impl App {
                 &crate::remote::refused_hosts_path(&croft_cache_dir()),
                 std::time::SystemTime::now(),
             ),
+            lane_agent: loaded_prefs.lane_agent.clone(),
+            lane_panes: std::collections::BTreeMap::new(),
             tree_clipboard: None,
             tree_typeahead: None,
             compare_anchor: None,
@@ -6979,6 +6995,7 @@ impl App {
     /// Gated on the pref so a subprocess never runs when blame is off.
     fn sync_blame(&mut self) {
         self.editor.blame_enabled = self.inline_blame_enabled;
+        self.editor.provenance_overlay = self.provenance_overlay;
         self.editor.auto_close_pairs = self.auto_close_pairs;
         if !self.inline_blame_enabled {
             return;
@@ -12730,6 +12747,7 @@ impl App {
                     .display()
                     .to_string(),
                 name: t.manual_name().map(str::to_string),
+                lane: self.lane_panes.get(&t.uid()).cloned(),
                 // The pane's own output, so a restored pane shows what you
                 // were doing instead of a blank grid (#249). Trailing blank
                 // rows are dropped: a mostly-empty screen would otherwise
@@ -12785,24 +12803,52 @@ impl App {
             return;
         };
         let mut terms = Vec::new();
+        let mut lanes = std::collections::BTreeMap::new();
         for p in &rec.panes {
-            let dir = PathBuf::from(&p.cwd);
-            let dir = if dir.is_dir() {
-                dir
-            } else {
-                self.workspace_root().to_path_buf()
+            // A lane pane belongs in its worktree, whatever cwd its shell
+            // had drifted to at save time (#348): the launch line below is
+            // typed into THIS shell, so the directory and the lane are
+            // decided together. Deciding them apart seated the agent where
+            // the shell had wandered, or, when that cwd was gone, in the
+            // PRIMARY repo the fallback names, which is the one directory a
+            // lane exists to keep the agent out of. A lane whose worktree
+            // is gone is an ordinary pane now.
+            let lane = p.lane.as_ref().filter(|l| Path::new(&l.path).is_dir());
+            let dir = match lane {
+                Some(l) => PathBuf::from(&l.path),
+                None => {
+                    let dir = PathBuf::from(&p.cwd);
+                    if dir.is_dir() {
+                        dir
+                    } else {
+                        self.workspace_root().to_path_buf()
+                    }
+                }
             };
             // The transcript is painted during the spawn, not after it: a
             // replay that follows the constructor races the new shell's
             // first prompt for the same grid (#249).
             if let Ok(mut t) = PtyTerminal::new_with_transcript(&dir, &p.transcript) {
                 t.set_manual_name(p.name.clone());
+                // The agent is seated again, from the row's CURRENT launch
+                // line, so an edited row applies.
+                if let Some(lane) = lane {
+                    if let Some(cmd) = lane
+                        .agent
+                        .as_deref()
+                        .and_then(|a| self.agents.launch_line(a))
+                    {
+                        t.write_input(lane_launch_input(cmd).as_bytes());
+                    }
+                    lanes.insert(t.uid(), lane.clone());
+                }
                 terms.push(t);
             }
         }
         if terms.is_empty() {
             return;
         }
+        self.lane_panes = lanes;
         // The restored panes are brand-new PtyTerminals, but everything
         // bound to a pane of the OUTGOING panel is keyed by pane index —
         // copy mode, find, quick-select — which an identical index in the
@@ -13020,6 +13066,10 @@ impl App {
             return false;
         }
         let term = self.terminals.remove(idx);
+        // A lane pane closed by any route stops being the lane's (#348): the
+        // map is keyed by uid, and an undo-close brings the pane back as an
+        // ordinary one rather than re-seating an agent nobody asked for.
+        self.lane_panes.remove(&term.uid());
         self.closed_terminals.push(ClosedTerminal {
             term,
             idx,
@@ -14309,6 +14359,7 @@ impl App {
             ed.csv_viewer_enabled = csv_on;
             ed.show_indent_guides = self.indent_guides_enabled;
             ed.show_bracket_colors = self.bracket_colors_enabled;
+            ed.provenance_overlay = self.provenance_overlay;
             ed.whitespace_mode = self.whitespace_mode;
             ed.diff_ws_default = self.diff_ws_default;
         }
@@ -14320,6 +14371,7 @@ impl App {
                 ed.csv_viewer_enabled = csv_on;
                 ed.show_indent_guides = self.indent_guides_enabled;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
+                ed.provenance_overlay = self.provenance_overlay;
                 ed.whitespace_mode = self.whitespace_mode;
                 ed.diff_ws_default = self.diff_ws_default;
                 ed.diff_ws_default = self.diff_ws_default;
@@ -17905,6 +17957,13 @@ impl App {
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'j') => {
                 self.editor.unfold_all();
                 self.poke_cursor();
+                true
+            }
+            // Cmd+K Shift+L: Agent: New Worktree Lane (#348). Matched
+            // case-insensitively for the same CSI-u / iTerm2 split as ⇧W,
+            // and so it must precede the case-insensitive L arm below.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'l') => {
+                self.open_new_lane_prompt();
                 true
             }
             // Cmd+K Cmd+L / Cmd+K L: toggle the fold at the cursor line
@@ -25310,6 +25369,16 @@ impl App {
         true
     }
 
+    /// Ask for a new lane's name (#348); the palette command and `Cmd+K
+    /// Shift+L` both land here.
+    fn open_new_lane_prompt(&mut self) {
+        self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
+            crate::widgets::input_prompt::InputPurpose::NewWorktreeLane,
+            String::from("New worktree lane"),
+            String::from("what the agent will work on"),
+        ));
+    }
+
     /// Create a worktree lane and add it as a workspace root (#348).
     ///
     /// The worktree is a SIBLING of the repo, never a child: a worktree
@@ -25330,10 +25399,129 @@ impl App {
         match crate::git::add_worktree_lane(&repo, &lane) {
             Ok(()) => {
                 self.add_workspace_folder(lane.path.clone());
-                self.status = format!("Lane {} on branch {}", lane.path.display(), lane.branch);
+                self.open_lane_pane(&lane);
             }
             Err(why) => self.status = format!("Could not create the lane: {why}"),
         }
+    }
+
+    /// The pane half of a new lane (#348): a named terminal in the worktree,
+    /// running the configured agent's launch line when there is one. The
+    /// status says which of the three outcomes happened — agent started,
+    /// plain shell because no agent is configured, or plain shell because
+    /// the configured agent has no launch line — since a lane that quietly
+    /// opens a shell where the user expected an agent reads as broken.
+    fn open_lane_pane(&mut self, lane: &crate::git::WorktreeLane) {
+        let slug = lane
+            .branch
+            .strip_prefix("agent/")
+            .unwrap_or(&lane.branch)
+            .to_string();
+        let agent = self
+            .lane_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_ascii_lowercase);
+        let launch = agent
+            .as_deref()
+            .and_then(|a| self.agents.launch_line(a))
+            .map(str::to_string);
+        let mut term = match PtyTerminal::new(&lane.path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!(
+                    "Lane {} on branch {} — could not open its pane: {e}",
+                    lane.path.display(),
+                    lane.branch
+                );
+                return;
+            }
+        };
+        term.set_manual_name(Some(format!("Lane: {slug}")));
+        if let Some(cmd) = &launch {
+            term.write_input(lane_launch_input(cmd).as_bytes());
+        }
+        let seated = launch.is_some();
+        // Recorded BEFORE the insert: `insert_terminal` saves the terminal
+        // session, and the save reads this map.
+        self.lane_panes.insert(
+            term.uid(),
+            crate::terminal_session::LaneRecord {
+                // Canonical, like the workspace roots it is compared with
+                // when the lane closes; taken now, while the directory
+                // exists to resolve.
+                path: lane
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| lane.path.clone())
+                    .display()
+                    .to_string(),
+                branch: lane.branch.clone(),
+                agent: if seated { agent.clone() } else { None },
+            },
+        );
+        self.insert_terminal(term);
+        let pane = match (agent, seated) {
+            (Some(a), true) => format!("{a} started in pane Lane: {slug}"),
+            (Some(a), false) => {
+                format!(
+                    "plain shell in pane Lane: {slug} (agents.json has no launch line for {a:?})"
+                )
+            }
+            (None, _) => format!("shell in pane Lane: {slug} (set lane_agent to start an agent)"),
+        };
+        self.status = format!(
+            "Lane {} on branch {} — {pane}",
+            lane.path.display(),
+            lane.branch
+        );
+    }
+
+    /// Close the panes that belong to the lane at `lane` (#348), through the
+    /// undoable close so a mistaken lane removal does not also lose the
+    /// pane's scrollback. Returns how many closed and how many stayed.
+    ///
+    /// The close refuses the last pane, and a lane pane left standing would
+    /// sit in a directory git just removed; so when the lane's panes are ALL
+    /// the panes, a fresh shell in the primary root is opened first to be
+    /// the one that stays. Only when that shell cannot spawn does a lane
+    /// pane remain, stripped of its lane name, and the caller says so.
+    fn close_lane_panes(&mut self, lane: &Path) -> (usize, usize) {
+        let doomed: Vec<usize> = self
+            .terminals
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                self.lane_panes
+                    .get(&t.uid())
+                    .is_some_and(|l| Path::new(&l.path) == lane)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !doomed.is_empty() && doomed.len() == self.terminals.len() {
+            // Pushed, not `insert_terminal`ed: the doomed indices must stay
+            // where they are, and the session is saved by the closes below.
+            match PtyTerminal::new(self.roots.primary()) {
+                Ok(term) => self.terminals.push(term),
+                Err(e) => self.status = format!("Could not open a replacement pane: {e}"),
+            }
+        }
+        let (mut closed, mut kept) = (0, 0);
+        // Highest index first so the earlier indices stay valid.
+        for idx in doomed.into_iter().rev() {
+            let uid = self.terminals[idx].uid();
+            if self.close_terminal_at(idx) {
+                closed += 1;
+            } else {
+                // The last pane stays; it is no longer a lane's (its
+                // worktree is gone), so it stops wearing the lane's name.
+                kept += 1;
+                self.terminals[idx].set_manual_name(None);
+                self.lane_panes.remove(&uid);
+            }
+        }
+        (closed, kept)
     }
 
     /// Remove the active root's worktree lane, refusing when it is dirty
@@ -25375,9 +25563,20 @@ impl App {
                 // in the status; only claim success when the folder really
                 // left, or a refusal there would be overwritten by a message
                 // saying the whole thing worked.
+                let (closed, kept) = self.close_lane_panes(&lane);
                 if self.roots.iter().any(|r| r == lane) {
                     self.status = format!(
                         "Removed {} on disk, but it is still in this workspace",
+                        lane.display()
+                    );
+                } else if kept > 0 {
+                    self.status = format!(
+                        "Removed lane {} — its pane stays (no replacement pane could open) in a directory that is now gone",
+                        lane.display()
+                    );
+                } else if closed > 0 {
+                    self.status = format!(
+                        "Removed lane {} and closed its pane (Cmd+K Shift+T reopens it)",
                         lane.display()
                     );
                 } else {
@@ -33236,6 +33435,7 @@ impl App {
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
+            Cmd::ToggleProvenance => self.toggle_provenance(),
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
             Cmd::ToggleRenderWhitespace => self.toggle_render_whitespace(),
@@ -33773,13 +33973,7 @@ impl App {
                     String::from("hosts: command   (or  *: command  for every host)"),
                 ))
             }
-            Cmd::NewWorktreeLane => {
-                self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
-                    crate::widgets::input_prompt::InputPurpose::NewWorktreeLane,
-                    String::from("New worktree lane"),
-                    String::from("what the agent will work on"),
-                ))
-            }
+            Cmd::NewWorktreeLane => self.open_new_lane_prompt(),
             Cmd::CloseWorktreeLane => self.close_worktree_lane(),
             Cmd::MarkAgentFileReviewed => {
                 match self.editor.path.clone() {
@@ -39308,6 +39502,19 @@ impl App {
         }
     }
 
+    /// `Editor: Toggle Provenance` (#349): flip the lens for the session and
+    /// push it onto the active editor now (the per-tick sync covers the
+    /// next tab focused).
+    fn toggle_provenance(&mut self) {
+        self.provenance_overlay = !self.provenance_overlay;
+        self.editor.provenance_overlay = self.provenance_overlay;
+        self.status = if self.provenance_overlay {
+            String::from("Provenance: on")
+        } else {
+            String::from("Provenance: off")
+        };
+    }
+
     fn toggle_inline_blame(&mut self) {
         self.inline_blame_enabled = !self.inline_blame_enabled;
         self.editor.blame_enabled = self.inline_blame_enabled;
@@ -39766,6 +39973,7 @@ impl App {
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
+        self.lane_agent = p.lane_agent.clone();
         let was_excluded = std::mem::replace(
             &mut self.remote_offer_excluded,
             p.remote_offer_excluded_hosts.clone(),
@@ -45118,6 +45326,13 @@ fn relative_clipboard_text(path: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+/// What a lane pane's fresh shell is fed to start its agent (#348):
+/// Ctrl-E + Ctrl-U first, as `run_project_task` does, so a half-typed line
+/// cannot concatenate with the command.
+fn lane_launch_input(cmd: &str) -> String {
+    format!("\x05\x15{cmd}\r")
 }
 
 /// Whether `t` is the idle pane named `pane_name` whose shell is standing
