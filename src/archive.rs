@@ -395,6 +395,63 @@ mod tests {
         );
     }
 
+    /// The gate is `>`, so a file exactly at the cap still lists (#493
+    /// review): an off-by-one to `>=` would refuse a legitimate archive
+    /// and no other test straddles the edge. Sparse and not a real zip, so
+    /// it must fail the PARSE rather than the size gate.
+    #[test]
+    fn a_zip_exactly_at_the_list_cap_is_not_refused_by_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("atcap.zip");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(ZIP_LIST_CAP).unwrap();
+        drop(f);
+        let err = list(&p, ArchiveKind::Zip).unwrap_err();
+        assert!(
+            !err.to_string().contains("too large to list"),
+            "at the cap the size gate must not fire, leaving the parse to \
+             reject it: {err}"
+        );
+    }
+
+    /// A tar.gz refused by its DECODED size explains itself through the
+    /// magic route too (#493 review): the zip branch was fixed for that
+    /// asymmetry, and an extensionless archive reaches `open_archive` the
+    /// same second way. A compressed bomb is the reachable case here: a
+    /// file large enough to trip the raw tar cap would exceed the editor's
+    /// own 50MB guard first and never reach magic routing at all.
+    #[test]
+    fn an_extensionless_targz_past_the_decoded_cap_says_why_in_the_hex_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("noext");
+        {
+            let f = std::fs::File::create(&p).unwrap();
+            let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+            let mut t = tar::Builder::new(gz);
+            let zeros = vec![0u8; (TAR_LIST_CAP / 4) as usize];
+            for i in 0..5 {
+                let mut hdr = tar::Header::new_gnu();
+                hdr.set_size(zeros.len() as u64);
+                hdr.set_cksum();
+                t.append_data(&mut hdr, format!("z{i}.bin"), &zeros[..])
+                    .unwrap();
+            }
+            t.finish().unwrap();
+        }
+        assert!(
+            std::fs::metadata(&p).unwrap().len() < 50 * 1024 * 1024,
+            "fixture: under the editor's general cap, so magic routing runs"
+        );
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(&p).unwrap();
+        assert!(e.hex.is_some(), "still viewable, just not as an archive");
+        assert!(
+            crate::archive::is_list_cap_refusal(&e.status),
+            "and the reason reaches the reader on this route too: {}",
+            e.status
+        );
+    }
+
     /// The reason describes only the file it was recorded for (#493
     /// review). An open can arm the note and then fail before reaching any
     /// viewer, and "Reopen as Hex" reaches `open_hex` without passing
