@@ -356,8 +356,8 @@ mod tests {
     fn a_zip_over_the_list_cap_refuses_to_list() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("many.zip");
-        // ~87 bytes a member, so this clears the cap without writing a
-        // pointlessly enormous fixture.
+        // 80, not the measured 87 bytes a member, for margin: this must
+        // clear the cap without writing a pointlessly enormous fixture.
         write_zip_with_entries(&p, (ZIP_LIST_CAP / 80) as usize);
         let size = std::fs::metadata(&p).unwrap().len();
         assert!(size > ZIP_LIST_CAP, "fixture: {size} bytes clears the cap");
@@ -417,9 +417,11 @@ mod tests {
     /// A tar.gz refused by its DECODED size explains itself through the
     /// magic route too (#493 review): the zip branch was fixed for that
     /// asymmetry, and an extensionless archive reaches `open_archive` the
-    /// same second way. A compressed bomb is the reachable case here: a
-    /// file large enough to trip the raw tar cap would exceed the editor's
-    /// own 50MB guard first and never reach magic routing at all.
+    /// same second way. A compressed bomb is the reachable case on THIS
+    /// route: an extensionless tar over the 100MB raw cap is binary-headed,
+    /// so the editor's 50MB guard sends it to hex before magic sniffing
+    /// runs. The raw cap is still live BY EXTENSION, where `kind_from_ext`
+    /// runs above that guard, and the test below covers it.
     #[test]
     fn an_extensionless_targz_past_the_decoded_cap_says_why_in_the_hex_viewer() {
         let dir = tempfile::tempdir().unwrap();
@@ -448,6 +450,34 @@ mod tests {
         assert!(
             crate::archive::is_list_cap_refusal(&e.status),
             "and the reason reaches the reader on this route too: {}",
+            e.status
+        );
+    }
+
+    /// The raw tar cap is live BY EXTENSION (#493 review): `kind_from_ext`
+    /// routes above the editor's own 50MB guard, so a big `.tar` reaches
+    /// the archive listing and its refusal must reach the reader too. The
+    /// magic route cannot get here, which is what the sibling test covers.
+    #[test]
+    fn an_oversized_raw_tar_says_why_in_the_hex_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.tar");
+        {
+            // A real ustar header, so the head sniffs binary and the size
+            // guard routes to hex rather than bailing; sparse past the cap.
+            let mut header = vec![0u8; 512];
+            header[..5].copy_from_slice(b"a.bin");
+            header[257..262].copy_from_slice(b"ustar");
+            std::fs::write(&p, &header).unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_len(TAR_LIST_CAP + 1).unwrap();
+        }
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(&p).unwrap();
+        assert!(e.hex.is_some(), "still viewable, just not as an archive");
+        assert!(
+            crate::archive::is_list_cap_refusal(&e.status),
+            "the raw cap's refusal reaches the reader: {}",
             e.status
         );
     }
