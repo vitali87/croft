@@ -13530,6 +13530,233 @@ fn enter_in_file_finder_opens_the_selected_file_and_closes_the_modal() {
 }
 
 #[test]
+fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
+    // #472: `alpha:236-239` in Cmd+P must still find alpha.rs, and Enter
+    // must land on line 236 with 236-239 selected so the range reads as
+    // highlighted. `alpha:12` lands on the line with nothing selected.
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=300).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(tmp.path().join("alpha.rs"), &body).unwrap();
+    std::fs::write(tmp.path().join("beta.rs"), "fn b() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let type_and_enter = |app: &mut App, text: &str| {
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+    };
+
+    type_and_enter(&mut app, "alpha:236-239");
+    assert!(app.file_finder.is_none(), "Enter closes the modal");
+    assert_eq!(
+        app.editor
+            .path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str()),
+        Some("alpha.rs"),
+        "the file part of the query is what gets opened"
+    );
+    let sel = app
+        .editor
+        .selection
+        .expect("the range is selected so it reads as highlighted");
+    let ((r0, c0), (r1, _)) = sel.normalised();
+    assert_eq!(
+        (r0, c0),
+        (235, 0),
+        "the selection starts at the top of line 236"
+    );
+    assert_eq!(r1, 238, "and reaches line 239");
+    // The cursor sits at the selection's HEAD, as every other
+    // selection-installing path leaves it, and the head is the landing line
+    // (the anchor is the far end), so the line the user asked for is the one
+    // on screen and Shift+motion extends from it.
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        sel.head,
+        "the cursor is at the head of the range"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 235,
+        "and the head is the landing line"
+    );
+    assert!(
+        app.status.ends_with("alpha.rs:236-239"),
+        "the status names the range: {:?}",
+        app.status
+    );
+    app.handle_key(key(KeyCode::Up, KeyModifiers::SHIFT))
+        .unwrap();
+    let ((r0, _), (r1, _)) = app.editor.selection.expect("still selected").normalised();
+    assert_eq!(
+        (r0, r1),
+        (234, 238),
+        "Shift+Up extends the range from the landing line"
+    );
+    let page = app.editor.page_size().max(1);
+    assert!(
+        app.editor.scroll <= 235 && 235 < app.editor.scroll + page,
+        "the landing line is on screen: scroll={} page={page}",
+        app.editor.scroll
+    );
+
+    // A pick with no hint replaces the range a hinted pick left: quick open
+    // never installed a selection before hints existed, so a bare `alpha`
+    // must not re-show one the user did not just ask for.
+    // Extended by hand, the range is the user's now and a re-pick keeps it;
+    // a freshly installed one is cleared by the next pick.
+    let extended = app.editor.selection;
+    type_and_enter(&mut app, "alpha");
+    assert_eq!(
+        app.editor.selection, extended,
+        "a range the user extended survives an unhinted re-pick"
+    );
+    type_and_enter(&mut app, "alpha:236-239");
+    type_and_enter(&mut app, "alpha");
+    assert!(
+        app.editor.selection.is_none(),
+        "an unhinted pick clears the range a hinted pick left"
+    );
+    // A saturated line number goes through the open path like any other
+    // out-of-range line: it lands on the last line and the status reports
+    // the line landed on, never the sentinel.
+    type_and_enter(&mut app, "alpha:99999999999999999999");
+    assert_eq!(
+        app.editor.cursor_row, 299,
+        "a saturated line lands on the last line"
+    );
+    assert!(
+        app.status.ends_with("alpha.rs:300"),
+        "the status names the landed line, not the typed one: {:?}",
+        app.status
+    );
+    // Both ends of a range are clamped the same way.
+    type_and_enter(&mut app, "alpha:280-99999999999999999999");
+    assert!(
+        app.status.ends_with("alpha.rs:280-300"),
+        "both ends of the range are clamped to the file: {:?}",
+        app.status
+    );
+    // A selection the user made by hand is theirs: an unhinted pick of the
+    // file already in front of them does not take it away. Only a range a
+    // hinted pick installed is cleared by the next pick.
+    let mine = crate::widgets::editor::EditorSelection {
+        anchor: (10, 0),
+        head: (11, 3),
+    };
+    app.editor.selection = Some(mine);
+    type_and_enter(&mut app, "alpha");
+    assert_eq!(
+        app.editor.selection,
+        Some(mine),
+        "an unhinted re-pick keeps a selection the user made"
+    );
+    // Stale secondary carets do not survive a pick: the next keystroke
+    // would otherwise edit at every one of them.
+    app.editor.cursor_row = 5;
+    app.editor.add_cursor_below();
+    assert!(
+        app.editor.has_multi_cursor(),
+        "fixture: a second caret exists"
+    );
+    type_and_enter(&mut app, "alpha:236-239");
+    assert!(
+        !app.editor.has_multi_cursor(),
+        "a pick collapses the carets along with the selection"
+    );
+    // A zero column (0-based tool output) keeps the line and drops the
+    // column, as the terminal's path:line:col parser does.
+    type_and_enter(&mut app, "alpha:236:0");
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (235, 0),
+        "`:236:0` lands on line 236 at the start"
+    );
+
+    type_and_enter(&mut app, "alpha:12");
+    assert_eq!(
+        app.editor.cursor_row, 11,
+        "a single line lands on that line"
+    );
+    assert!(
+        app.editor.selection.is_none(),
+        "a single line is a place to land, not a range to select"
+    );
+    assert!(
+        app.status.ends_with("alpha.rs:12"),
+        "the status names the line: {:?}",
+        app.status
+    );
+
+    type_and_enter(&mut app, "alpha:5000");
+    assert_eq!(
+        app.editor.cursor_row, 299,
+        "a line past the end lands on the last line"
+    );
+
+    // A range taller than the viewport still shows the landing line after a
+    // paint: the paint-time clamp follows the cursor, so the cursor must be
+    // on that line. Painted first so the page size is the real one.
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    type_and_enter(&mut app, "alpha:100-200");
+    term.draw(|f| app.render(f)).unwrap();
+    let page = app.editor.page_size().max(1);
+    assert!(
+        app.editor.scroll <= 99 && 99 < app.editor.scroll + page,
+        "line 100 is on screen after the paint: scroll={} page={page}",
+        app.editor.scroll
+    );
+    let ((r0, _), (r1, _)) = app
+        .editor
+        .selection
+        .expect("the tall range is selected")
+        .normalised();
+    assert_eq!((r0, r1), (99, 199));
+
+    type_and_enter(&mut app, "alpha:236:7");
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (235, 6),
+        "`:line:col` lands on the column too"
+    );
+
+    // The click path goes through the same open, so a clicked row honours
+    // the hint as Enter does.
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    for c in "alpha:40".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let finder = app.file_finder.as_ref().unwrap();
+    assert_eq!(
+        finder.results.len(),
+        1,
+        "the file part alone matches alpha.rs"
+    );
+    // The list body starts three rows below the popup top (border, prompt,
+    // separator); row 0 is the only result.
+    let (col, row) = (finder.last_rect.x + 4, finder.last_rect.y + 3);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    assert!(app.file_finder.is_none(), "the click confirms the pick");
+    assert_eq!(
+        app.editor.cursor_row, 39,
+        "a clicked row lands on the hinted line"
+    );
+}
+
+#[test]
 fn down_arrow_moves_selection_in_the_file_finder() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("a1.rs"), "").unwrap();
