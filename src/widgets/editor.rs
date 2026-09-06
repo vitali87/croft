@@ -2304,6 +2304,14 @@ pub struct Editor {
     /// time gets read as fact and the line it gets wrong is the one someone
     /// is arguing about.
     pub provenance: crate::provenance::Provenance,
+    /// The `edit_seq` at which `App::sync_provenance` last considered THIS
+    /// buffer for a persisted map (#349), so the history read happens once
+    /// per buffer generation rather than per tick. Per tab, because
+    /// `edit_seq` is: two tabs on one file both sit at seq 1 after their
+    /// opens, and one marker shared across them would skip the second for
+    /// the session. Every opener bumps the seq, so every whole-buffer swap
+    /// is reconsidered by construction.
+    pub provenance_synced_seq: Option<u64>,
     /// Debugger breakpoints, keyed by file path, as 1-based line numbers.
     /// Rendered as red dots in the gutter and pushed to the DAP adapter on
     /// launch. Keyed by path (not just the active file) so switching the buffer
@@ -2814,6 +2822,7 @@ impl Editor {
             path: None,
             lines: Vec::new(),
             provenance: crate::provenance::Provenance::new(),
+            provenance_synced_seq: None,
             breakpoints: std::collections::HashMap::new(),
             stop_line: None,
             unverified_breakpoints: std::collections::HashMap::new(),
@@ -4166,6 +4175,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -4232,6 +4245,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
@@ -4301,6 +4318,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
@@ -4353,6 +4374,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
@@ -4397,6 +4422,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -4450,6 +4479,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -4508,6 +4541,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -4578,6 +4615,48 @@ impl Editor {
                 .is_some_and(|md| md.doc_path.is_some())
     }
 
+    /// Whether this buffer's text is exactly what `bytes` decode to (#349),
+    /// for checking a stored snapshot against the buffer the map would land
+    /// on. Compared as LINES, the way `open` builds them: a file's trailing
+    /// newline is not a line of its own, so comparing raw bytes would call
+    /// every ordinary text file a mismatch.
+    pub fn holds_exactly(&self, bytes: &[u8]) -> bool {
+        let enc = encoding_rs::Encoding::for_bom(bytes)
+            .map(|(e, _)| e)
+            .unwrap_or(self.encoding);
+        // Built exactly as `open` builds `lines` from the same bytes: the
+        // replacement-character text of an undecodable byte on both sides
+        // (`open` discards `had_errors` too), and the empty file's one
+        // sentinel line. Any divergence here reads as "not this text" and
+        // silently withholds a map that should have come back.
+        let (text, _, _) = enc.decode(bytes);
+        let mut want = split_into_lines(&text);
+        if want.is_empty() {
+            want.push(String::new());
+        }
+        want == self.lines
+    }
+
+    /// The bytes this buffer would write to disk, for binding a recorded
+    /// provenance map to the text it describes (#349). `None` when the
+    /// encoding cannot represent the text, since a save would refuse it too.
+    pub fn bytes_for_disk(&self) -> Option<Vec<u8>> {
+        let content = self.lines.join(self.eol.sequence());
+        let (encoded, had_errors) = self.encode_for_disk(&content);
+        (!had_errors).then_some(encoded)
+    }
+
+    /// The map a save of this tab records beside its history snapshot
+    /// (#349): the buffer's own for text, empty for a viewer, whose
+    /// placeholder line no seat wrote. Read off the tab that was saved, never
+    /// looked up by path: two tabs on one file are two buffers with two maps.
+    pub fn provenance_to_record(&self) -> crate::provenance::Provenance {
+        if self.has_non_text_view() {
+            return crate::provenance::Provenance::new();
+        }
+        self.provenance.clone()
+    }
+
     /// Open `path` as a rendered ANSI log (#257): colours paint through the
     /// theme's palette and escapes never reach the text. Windowed, so the
     /// file is not read whole. Fails (and the caller falls through to the
@@ -4591,6 +4670,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.scroll = 0;
@@ -4678,6 +4761,10 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
         // A whole-buffer swap like every other opener: caches memoised on
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
