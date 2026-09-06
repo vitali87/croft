@@ -25389,9 +25389,13 @@ impl App {
 
     /// Close the panes that belong to the lane at `lane` (#348), through the
     /// undoable close so a mistaken lane removal does not also lose the
-    /// pane's scrollback. Returns how many closed and how many stayed: the
-    /// close refuses the last pane, and that pane then sits in a directory
-    /// git just removed, so it drops its lane name and the caller says so.
+    /// pane's scrollback. Returns how many closed and how many stayed.
+    ///
+    /// The close refuses the last pane, and a lane pane left standing would
+    /// sit in a directory git just removed; so when the lane's panes are ALL
+    /// the panes, a fresh shell in the primary root is opened first to be
+    /// the one that stays. Only when that shell cannot spawn does a lane
+    /// pane remain, stripped of its lane name, and the caller says so.
     fn close_lane_panes(&mut self, lane: &Path) -> (usize, usize) {
         let doomed: Vec<usize> = self
             .terminals
@@ -25404,6 +25408,14 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
+        if !doomed.is_empty() && doomed.len() == self.terminals.len() {
+            // Pushed, not `insert_terminal`ed: the doomed indices must stay
+            // where they are, and the session is saved by the closes below.
+            match PtyTerminal::new(self.roots.primary()) {
+                Ok(term) => self.terminals.push(term),
+                Err(e) => self.status = format!("Could not open a replacement pane: {e}"),
+            }
+        }
         let (mut closed, mut kept) = (0, 0);
         // Highest index first so the earlier indices stay valid.
         for idx in doomed.into_iter().rev() {
@@ -25468,7 +25480,7 @@ impl App {
                     );
                 } else if kept > 0 {
                     self.status = format!(
-                        "Removed lane {} — its pane stays as the last one, in a directory that is now gone",
+                        "Removed lane {} — its pane stays (no replacement pane could open) in a directory that is now gone",
                         lane.display()
                     );
                 } else if closed > 0 {

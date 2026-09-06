@@ -42976,7 +42976,10 @@ fn a_lane_pane_closed_by_any_route_is_no_longer_the_lanes_even_when_reopened() {
 }
 
 #[test]
-fn closing_a_lane_whose_pane_is_the_last_one_keeps_the_pane_and_says_so() {
+fn closing_a_lane_whose_pane_is_the_last_one_replaces_it_with_a_shell_in_the_primary_root() {
+    // The close refuses the last pane, and a lane pane left standing would
+    // sit in a directory git just removed. So a fresh shell in the primary
+    // root is opened first, and the lane pane closes like any other.
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     init_lane_repo(&repo);
@@ -42987,22 +42990,42 @@ fn closing_a_lane_whose_pane_is_the_last_one_keeps_the_pane_and_says_so() {
     // Drop the original pane so the lane's is the only one left.
     assert!(app.close_terminal_at(0));
     assert_eq!(app.terminals.len(), 1);
+    let lane_uid = app.terminals[0].uid();
     assert_eq!(app.terminals[0].manual_name(), Some("Lane: solo"));
     let lane = tmp.path().join("repo-solo").canonicalize().unwrap();
     app.active_scm_root = lane.clone();
     app.close_worktree_lane();
     assert!(!lane.exists(), "{}", app.status);
-    assert_eq!(app.terminals.len(), 1, "the last pane is never closed");
-    assert_eq!(
-        app.terminals[0].manual_name(),
-        None,
-        "but it stops wearing the lane's name"
-    );
+    assert_eq!(app.terminals.len(), 1, "one pane remains: the replacement");
+    assert_ne!(app.terminals[0].uid(), lane_uid, "and it is not the lane's");
+    assert_eq!(app.terminals[0].manual_name(), None);
     assert!(app.lane_panes.is_empty());
     assert!(
-        app.status.contains("stays as the last one"),
-        "{}",
-        app.status
+        app.closed_terminals
+            .iter()
+            .any(|c| c.term.uid() == lane_uid),
+        "the lane pane went through the undoable close"
+    );
+    assert!(app.status.contains("closed its pane"), "{}", app.status);
+    // The replacement is a live shell in the primary root, not in the
+    // removed directory: it can print its cwd.
+    app.terminals[0].write_input(b"printf '%s%s\\n' 'croft-repl' \"-at:$(pwd)\"\r");
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
+    let started = std::time::Instant::now();
+    while started.elapsed() < budget && !app.terminals[0].visible_text().contains("croft-repl-at:")
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let screen = app.terminals[0].visible_text();
+    let line = screen
+        .lines()
+        .find(|l| l.contains("croft-repl-at:"))
+        .unwrap_or_else(|| panic!("the replacement shell never answered; screen:\n{screen}"));
+    let repo_canon = repo.canonicalize().unwrap().display().to_string();
+    assert!(
+        line.trim_end().ends_with(&repo_canon)
+            || line.trim_end().ends_with(&repo.display().to_string()),
+        "the replacement sits in the primary root, got: {line:?}"
     );
 }
 
