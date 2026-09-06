@@ -219,9 +219,9 @@ jobs:
         # no test exits 0, so the step requires the bin target to report
         # exactly one test before it counts as run.
         run: |
-          set -o pipefail
-          cargo test --locked fs_sync_reflects -- --ignored --test-threads=1 2>&1 | tee fs-sync.log
-          grep -q '^running 1 test$' fs-sync.log \
+          set -euo pipefail
+          cargo test --locked --bin croft fs_sync_reflects -- --ignored --test-threads=1 2>&1 | tee target/fs-sync.log
+          grep -q '^running 1 test$' target/fs-sync.log \
             || { echo "::error::fs_sync_reflects selected no test: the filter and the test name have drifted"; exit 1; }
 
   cross-musl:

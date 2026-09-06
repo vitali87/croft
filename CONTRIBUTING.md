@@ -430,7 +430,7 @@ carries it as a count of drain ticks and the wall-clock version runs alone
 (#483). CI runs it serially after the suite; locally:
 
 ```bash
-cargo test fs_sync_reflects -- --ignored --test-threads=1
+cargo test --bin croft fs_sync_reflects -- --ignored --test-threads=1
 ```
 
 To make it permanent, the right number is per-machine, so both files are

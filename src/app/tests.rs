@@ -4561,10 +4561,12 @@ fn drain_fs_events_returns_false_when_nothing_pending() {
 /// a 10 ms pause, so twenty ticks is 200 ms of croft's own opportunities to
 /// notice the change; a suite that starves this thread for 300 ms between
 /// two ticks stretches the clock but not the count. On a quiet machine the
-/// change lands in one or two ticks and the poll fallback alone would land
-/// it in about five, so this bound catches a gross regression (a watcher
-/// and a poll that both stopped delivering), not drift; the wall-clock
-/// figure itself is measured by the `#[ignore]`d serial test below.
+/// change lands in one or two ticks, and the poll fallback alone would land
+/// it in about five at `FS_POLL_INTERVAL`'s floor (more once `back_off`
+/// widens the interval), so this bound catches a gross regression (a
+/// watcher and a poll that both stopped delivering), not drift; the
+/// wall-clock figure itself is measured by the `#[ignore]`d serial test
+/// below.
 const FS_SYNC_TICKS: usize = 20;
 
 #[test]
@@ -4580,23 +4582,23 @@ fn drain_fs_events_returns_true_after_workspace_write() {
     let new_file = tmp.path().join("new.txt");
     std::fs::write(&new_file, "hi").unwrap();
     let mut saw = false;
-    let mut landed = None;
+    let mut landed = false;
     // Bounded at the invariant itself: every tick past it would give the
     // same verdict, so the loop stops where the claim does.
-    for tick in 1..=FS_SYNC_TICKS {
+    for _ in 1..=FS_SYNC_TICKS {
         if app.drain_fs_events() {
             saw = true;
         }
         if app.tree.nodes.iter().any(|n| n.path == new_file) {
-            landed = Some(tick);
+            landed = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(saw, "workspace write should propagate as a dirty signal");
     assert!(
-        landed.is_some(),
-        "created file should appear in Explorer within {FS_SYNC_TICKS} drain ticks"
+        landed,
+        "created file should appear in Explorer within {FS_SYNC_TICKS} drain ticks (never landed)"
     );
 }
 
@@ -4612,18 +4614,18 @@ fn drain_fs_events_removes_deleted_root_file_from_tree() {
     );
 
     std::fs::remove_file(&doomed).unwrap();
-    let mut gone = None;
-    for tick in 1..=FS_SYNC_TICKS {
+    let mut gone = false;
+    for _ in 1..=FS_SYNC_TICKS {
         let _ = app.drain_fs_events();
         if !app.tree.nodes.iter().any(|n| n.path == doomed) {
-            gone = Some(tick);
+            gone = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(
-        gone.is_some(),
-        "deleted file should disappear from Explorer within {FS_SYNC_TICKS} drain ticks"
+        gone,
+        "deleted file should disappear from Explorer within {FS_SYNC_TICKS} drain ticks (never left)"
     );
 }
 
