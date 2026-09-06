@@ -260,6 +260,24 @@ pub(crate) mod tests {
     /// filter deliberately takes.
     pub(crate) const RESTORED_SHELL_BASE: Duration = Duration::from_secs(2);
 
+    /// The base behind the app tests' `await_terminal_probe` (#397), which
+    /// six end-to-end tests go through. It replaced a fixed 15s (#226 had
+    /// raised that from 3s for the same reason). 3750ms because
+    /// `BASE_CALIBRATION * MIN_SCALE` is 4 at the floor: a quiet machine
+    /// keeps the 15s it had, and a loaded one gets up to twice that. The
+    /// captured failure was a probe that had been ECHOED but not answered
+    /// within the 15s during a full parallel suite, so the shell was alive
+    /// and merely starved -- the case a load-scaled budget exists for.
+    pub(crate) const TERMINAL_PROBE_BASE: Duration = Duration::from_millis(3750);
+
+    /// The base the three task-pane tests wait for the pane's shell to come
+    /// back to its prompt (#397). They had a fixed 5000ms loop that `break`s
+    /// on timeout, so under load the rerun met a pane still busy, opened a
+    /// second one, and the count assertion reported "3 panes, expected 2"
+    /// as if reuse were broken. 1250ms keeps the 5s at the floor, and the
+    /// wait now fails loudly, naming what it waited for.
+    pub(crate) const TASK_PANE_PROMPT_BASE: Duration = Duration::from_millis(1250);
+
     // The floor matters more than it looks: every budget this replaces was
     // observed failing at 1x, so a quiet machine must still get more room
     // than the constant it replaced, not less.
@@ -385,6 +403,25 @@ pub(crate) mod tests {
             floor >= Duration::from_millis(8000),
             "the restored-shell base must reproduce the 8000ms it replaced at \
              the floor, got {floor:?}"
+        );
+    }
+
+    /// Same rule for the two #397 bases added later: each must give back,
+    /// at the floor, the constant it replaced. Against the constants the
+    /// call sites use, so lowering either fails here.
+    #[test]
+    fn the_probe_and_task_pane_bases_keep_their_old_budgets() {
+        let probe = TERMINAL_PROBE_BASE * BASE_CALIBRATION * MIN_SCALE;
+        assert!(
+            probe >= Duration::from_secs(15),
+            "the terminal probe base must reproduce the 15s it replaced at the \
+             floor, got {probe:?}"
+        );
+        let task = TASK_PANE_PROMPT_BASE * BASE_CALIBRATION * MIN_SCALE;
+        assert!(
+            task >= Duration::from_millis(5000),
+            "the task-pane prompt base must reproduce the 5000ms it replaced at \
+             the floor, got {task:?}"
         );
     }
 

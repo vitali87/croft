@@ -423,6 +423,16 @@ Half your cores is a reasonable default:
 RUST_TEST_THREADS=$(( ($(getconf _NPROCESSORS_ONLN) + 1) / 2 )) cargo test
 ```
 
+One test is `#[ignore]`d for the same reason and runs separately: the 200 ms
+fs-sync invariant (an external file change reaches the Explorer within 200 ms)
+is a wall-clock claim, and a parallel suite is itself the load, so the suite
+carries it as a count of drain ticks and the wall-clock version runs alone
+(#483). CI runs it serially after the suite; locally:
+
+```bash
+cargo test --bin croft fs_sync_reflects -- --ignored --test-threads=1
+```
+
 To make it permanent, the right number is per-machine, so both files are
 gitignored rather than committed: `/.cargo/config.toml` caps build jobs
 (`[build] jobs = N`), and `/.config/nextest.toml` caps nextest's threads —

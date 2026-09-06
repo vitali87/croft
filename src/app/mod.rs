@@ -5956,7 +5956,12 @@ impl App {
                 self.kick_file_finder_index_rebuild();
             }
         }
-        poll.open_file_changed || poll.dirs_changed
+        // Stamp-gated, so an idle poll costs a stat per open diff view; on
+        // hosts without a native watcher this is how a diff follows the
+        // file (#471).
+        let diffs_changed =
+            self.refresh_open_diff_views(false, &[], &std::collections::BTreeSet::new());
+        poll.open_file_changed || poll.dirs_changed || diffs_changed
     }
 
     /// Drain any pending filesystem events from the watcher and refresh the
@@ -6025,6 +6030,11 @@ impl App {
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
         let mut changed = false;
+        // Roots whose HEAD oid moved in this drain: the open Source Control
+        // diffs for THESE re-read their HEAD blob (#471); the rest are
+        // stamp-gated like any filesystem tick.
+        let mut heads_moved: Vec<PathBuf> = Vec::new();
+        let mut status_arrived = false;
         let primary_root = self.roots.primary().to_path_buf();
         let mut worker_roots: Vec<PathBuf> = vec![primary_root];
         worker_roots.extend(self.git_extra.iter().map(|(r, _)| r.clone()));
@@ -6039,6 +6049,13 @@ impl App {
             };
             w.flush_pending();
             let this_changed = w.drain_into(is_active.then_some(panel));
+            // A completed refresh whose status came back identical is still
+            // news to an open staged / branch / previous-commit diff (#471):
+            // those read the index or a ref, which porcelain status does
+            // not fully describe.
+            if w.take_status_arrival() {
+                status_arrived = true;
+            }
             if !this_changed {
                 continue;
             }
@@ -6053,6 +6070,11 @@ impl App {
             let oid = status.head_oid.clone();
             if self.git_head_oids.get(&ws_root) != Some(&oid) {
                 self.git_head_oids.insert(ws_root.clone(), oid);
+                // The diff tag stores `scm_root()`, the git TOPLEVEL, which
+                // is not the workspace root for a subdirectory workspace or
+                // for a root reached through a symlink (git canonicalises
+                // `--show-toplevel`). Record what the tag will compare with.
+                heads_moved.push(status.repo_root.clone().unwrap_or_else(|| ws_root.clone()));
                 if is_active {
                     self.refresh_commit_graph();
                 }
@@ -6093,7 +6115,15 @@ impl App {
                 self.tree.ignored = std::sync::Arc::new(union);
             }
         }
-        changed
+        // A completed status refresh means HEAD or the index may have moved:
+        // a Source Control diff re-reads its HEAD blob when its root's HEAD
+        // oid changed, a staged / branch / previous-commit view re-runs its
+        // `git diff` on every arrival (#471). This is the debounced cadence,
+        // so a burst of writes costs one re-run, and a rebuilt view owes a
+        // redraw even when the status itself was unchanged.
+        let diffs_refreshed = (changed || status_arrived)
+            && self.refresh_open_diff_views(true, &heads_moved, &std::collections::BTreeSet::new());
+        changed || diffs_refreshed
     }
 
     /// Point the SCM surfaces at `active`'s repository: seed the panel
@@ -8522,6 +8552,7 @@ impl App {
                 self.status = format!("Could not open snapshot diff: {e}");
                 return;
             }
+            self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
             self.history_restore = Some((path, content));
             self.focus_pane(Pane::Editor);
             self.status = format!("Showing {rel} at a local snapshot");
@@ -11502,6 +11533,10 @@ impl App {
         // no-op and won't clobber selection or reload spuriously.
         if drain.got_any {
             self.reload_open_file_after_external_change();
+            // An open diff view follows the file the same way a buffer does
+            // (#471): an agent rewriting the working file, or a save from a
+            // sibling tab, re-diffs it in place.
+            self.refresh_open_diff_views(false, &[], &drain.changed_files);
         }
         // Attribute the writes to whichever agents were working when they
         // landed (#345). Done after the reload so an agent's write to the
@@ -20763,7 +20798,15 @@ impl App {
                             .editor
                             .open_head_diff_with_text(label, &head_text, &abs, true)
                         {
-                            Ok(()) => true,
+                            Ok(()) => {
+                                self.tag_open_diff(
+                                    crate::widgets::diff::DiffSource::HeadVsWorking {
+                                        root: scm_root.to_path_buf(),
+                                        rel: entry.path.clone(),
+                                    },
+                                );
+                                true
+                            }
                             Err(e) => {
                                 self.status = format!("Diff failed: {e}");
                                 false
@@ -23832,6 +23875,10 @@ impl App {
             self.status = format!("Could not open staged diff: {err}");
             return;
         }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+            root: self.scm_root(),
+            kind: crate::widgets::diff::GitDiffKind::Staged,
+        });
         self.source_control.commit_feedback = None;
         self.status = String::from("Showing git diff --staged");
         self.focus_pane(Pane::Editor);
@@ -23868,6 +23915,10 @@ impl App {
             self.status = format!("Could not open diff vs {branch}: {err}");
             return;
         }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+            root: self.scm_root(),
+            kind: crate::widgets::diff::GitDiffKind::AgainstBranch(branch.clone()),
+        });
         self.default_branch_label = Some(branch.clone());
         self.source_control.commit_feedback = None;
         self.status = format!("Showing git diff {branch}");
@@ -23897,6 +23948,10 @@ impl App {
             self.status = format!("Could not open diff vs previous: {err}");
             return;
         }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+            root: self.scm_root(),
+            kind: crate::widgets::diff::GitDiffKind::PreviousCommit,
+        });
         self.source_control.commit_feedback = None;
         self.status = String::from("Showing git diff HEAD~1");
         self.focus_pane(Pane::Editor);
@@ -24100,7 +24155,27 @@ impl App {
             Ok(_) => {
                 self.status = format!("Reverted hunk in {}", pr.rel_path);
                 self.refresh_after_hunk_op();
-                self.rebuild_open_scm_diff(&pr.rel_path);
+                // The revert rewrote the working file; force the HEAD-side rebuild
+                // of the open view so it refreshes even if the rewrite landed
+                // within the stamp's granularity. Forced by the root the VIEW is
+                // tagged with, not `scm_root()` re-read now: the tag may predate the
+                // worker's first status reply and hold the workspace root.
+                let force_root = self
+                    .editor
+                    .diff
+                    .as_ref()
+                    .and_then(|d| match &d.source {
+                        crate::widgets::diff::DiffSource::HeadVsWorking { root, .. } => {
+                            Some(root.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| self.scm_root());
+                self.refresh_open_diff_views(
+                    true,
+                    std::slice::from_ref(&force_root),
+                    &std::collections::BTreeSet::new(),
+                );
             }
             Err(err) => self.status = format!("Revert hunk failed: {err}"),
         }
@@ -24116,31 +24191,97 @@ impl App {
         self.refresh_source_control();
     }
 
-    /// Re-diff HEAD against the working tree after a revert so the open
-    /// diff pane shows the surviving hunks instead of stale rows. Stage /
-    /// unstage don't touch either side of the displayed diff, so only the
-    /// revert path needs this.
-    fn rebuild_open_scm_diff(&mut self, rel: &str) {
-        let root = self.scm_root();
-        let (label, path, scroll) = {
-            let Some(diff) = self.editor.diff.as_ref() else {
-                return;
-            };
-            (diff.left_path.clone(), diff.right_path.clone(), diff.scroll)
-        };
-        let Ok(head) = crate::git::read_file_at_head(&root, rel) else {
-            return;
-        };
-        if self
-            .editor
-            .open_head_diff_with_text(label, &head, &path, true)
-            .is_ok()
-            && let Some(diff) = self.editor.diff.as_mut()
-        {
-            // Keep the viewport where the user was working instead of
-            // snapping back to the first hunk.
-            diff.scroll = scroll.min(diff.rows.len().saturating_sub(1));
+    /// Record on the diff view the opener just made active how it is to be
+    /// rebuilt when a side moves (#471), and take its first disk stamps.
+    fn tag_open_diff(&mut self, source: crate::widgets::diff::DiffSource) {
+        if let Some(diff) = self.editor.diff.as_mut() {
+            diff.source = source;
+            diff.stamp_sides();
         }
+    }
+
+    /// Rebuild every open diff view, in every split group, whose sides may
+    /// have moved (#471), keeping each reader's viewport. Returns true when
+    /// any view's content actually changed, so the caller owes a redraw.
+    ///
+    /// Two triggers, two costs. A filesystem event or poll (`git_too` false)
+    /// re-reads only file-backed sides, and only those whose stat stamp
+    /// moved, so an idle tick is a stat per open diff and nothing more. A
+    /// git-status drain (`git_too` true; the worker debounces it) also
+    /// re-runs the `git diff` behind a staged / branch / previous-commit
+    /// view, whose input is the index or a ref rather than a file, and
+    /// re-reads the HEAD blob behind a Source Control view for the roots in
+    /// `heads_moved` -- the drain already knows whose HEAD oid changed, and
+    /// a `git show` per open diff per status refresh would otherwise run
+    /// during every write burst for a HEAD that had not moved.
+    /// A view whose content came back identical is left untouched: no reset
+    /// of selection or find, no redraw.
+    pub fn refresh_open_diff_views(
+        &mut self,
+        git_too: bool,
+        heads_moved: &[PathBuf],
+        changed_files: &std::collections::BTreeSet<PathBuf>,
+    ) -> bool {
+        // The watcher's own list of written paths bypasses the stamp gate: a
+        // same-length rewrite that lands within the filesystem's mtime
+        // granularity (or restores the mtime) shows the same `(mtime, len)`
+        // as before, and the event is the only evidence it happened.
+        // Canonicalised once, so a path the watcher reports through a
+        // symlinked root (macOS's /tmp -> /private/tmp) still matches the
+        // path the view was opened with.
+        let touched: Vec<PathBuf> = changed_files
+            .iter()
+            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .collect();
+        let mut changed = false;
+        // The active group's active tab, by address: a rebuild there is the
+        // one that owes the find bar a recompute. A diff refreshing in a
+        // background tab or split must not touch the view the reader is on.
+        let active_ptr: *const crate::widgets::editor::Editor = &*self.editor;
+        let mut active_changed = false;
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                let Some(old) = ed.diff.as_ref() else {
+                    continue;
+                };
+                let Some(mut fresh) = rebuild_diff_view(old, git_too, heads_moved, &touched) else {
+                    continue;
+                };
+                if fresh.same_content_as(old) {
+                    // Same rows: keep the reader's selection and find
+                    // state, but take the new stamps so the next tick does
+                    // not re-read the file again for a no-op write.
+                    if let Some(cur) = ed.diff.as_mut() {
+                        cur.left_stamp = fresh.left_stamp;
+                        cur.right_stamp = fresh.right_stamp;
+                    }
+                    continue;
+                }
+                fresh.carry_view_from(old);
+                ed.diff = Some(fresh);
+                changed = true;
+                if std::ptr::eq(&*ed, active_ptr) {
+                    active_changed = true;
+                }
+            }
+        }
+        // A rebuilt ACTIVE diff with a find bar open gets its match set and
+        // active match recomputed against the new rows, the same way a
+        // typed query would; `carry_view_from` deliberately dropped the old
+        // active match because it named rows that may be gone.
+        if active_changed
+            && self.editor.diff.is_some()
+            && self
+                .editor_find
+                .as_ref()
+                .is_some_and(|s| !s.query.is_empty())
+        {
+            let pos = self.diff_find_current_pos();
+            self.diff_find_apply(pos);
+        }
+        changed
     }
 
     pub fn request_discard_source_control_entry(&mut self, entry_idx: usize) {
@@ -44679,6 +44820,98 @@ thread_local! {
 #[cfg(test)]
 fn seed_log_highlight_default_at_startup(on: bool) {
     STARTUP_LOG_HIGHLIGHT_SEED.with(|cell| cell.set(Some(on)));
+}
+
+/// Build the up-to-date version of an open diff view from its recorded
+/// source (#471), or `None` when there is nothing new to build: a `Static`
+/// view, a file-backed view whose sides have not moved on disk, a git-command
+/// view on a filesystem-only trigger, or a side that can no longer be read
+/// (the reader keeps the last good view). The result carries fresh disk
+/// stamps but none of the reader's view state; `DiffData::carry_view_from`
+/// adds that.
+fn rebuild_diff_view(
+    old: &crate::widgets::diff::DiffData,
+    git_too: bool,
+    heads_moved: &[PathBuf],
+    touched: &[PathBuf],
+) -> Option<crate::widgets::diff::DiffData> {
+    use crate::widgets::diff::{DiffData, DiffSource, GitDiffKind};
+    // A side the watcher just reported written, matched on the canonical
+    // path so a symlinked root cannot hide it. Bypasses the stamp gate.
+    let written = |side: &Path| {
+        if touched.is_empty() {
+            return false;
+        }
+        let canon = std::fs::canonicalize(side).unwrap_or_else(|_| side.to_path_buf());
+        touched.iter().any(|t| *t == canon || t == side)
+    };
+    let lines = |t: &str| -> Vec<String> { t.lines().map(str::to_string).collect() };
+    let two_sided = |left_text: &str, right_text: &str| {
+        DiffData::build_with_byte_check(
+            old.left_path.clone(),
+            old.right_path.clone(),
+            lines(left_text),
+            lines(right_text),
+            Some(left_text),
+            Some(right_text),
+        )
+    };
+    let mut fresh = match &old.source {
+        DiffSource::Static => return None,
+        DiffSource::HeadVsWorking { root, rel } => {
+            // Canonical on both sides: git canonicalises `--show-toplevel`
+            // (macOS's /tmp -> /private/tmp), while a root the app carries
+            // as typed may not be, so the same repository can be spelled two
+            // ways between the tag and the drain's record.
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let head_moved = git_too
+                && heads_moved
+                    .iter()
+                    .any(|r| r == root || canon(r) == canon(root));
+            if !head_moved && !written(&old.right_path) && !old.sides_moved_on_disk() {
+                return None;
+            }
+            let head = crate::git::read_file_at_head(root, rel).ok()?;
+            let right = std::fs::read_to_string(&old.right_path).ok()?;
+            two_sided(&head, &right)
+        }
+        DiffSource::FixedLeft { left_text } => {
+            if !written(&old.right_path) && !old.sides_moved_on_disk() {
+                return None;
+            }
+            let right = std::fs::read_to_string(&old.right_path).ok()?;
+            two_sided(left_text, &right)
+        }
+        DiffSource::TwoFiles => {
+            if !written(&old.left_path) && !written(&old.right_path) && !old.sides_moved_on_disk() {
+                return None;
+            }
+            let left = std::fs::read_to_string(&old.left_path).ok()?;
+            let right = std::fs::read_to_string(&old.right_path).ok()?;
+            DiffData::build(
+                old.left_path.clone(),
+                old.right_path.clone(),
+                lines(&left),
+                lines(&right),
+            )
+        }
+        DiffSource::GitCommand { root, kind } => {
+            if !git_too {
+                return None;
+            }
+            let raw = match kind {
+                GitDiffKind::Staged => crate::git::diff_staged(root),
+                GitDiffKind::AgainstBranch(branch) => crate::git::diff_against_branch(root, branch),
+                GitDiffKind::PreviousCommit => crate::git::diff_previous_commit(root),
+            }
+            .ok()?;
+            DiffData::build_side_by_side_from_git_text(old.left_path.clone(), &raw)
+        }
+    };
+    fresh.source = old.source.clone();
+    fresh.left_is_real_file = old.left_is_real_file;
+    fresh.stamp_sides();
+    Some(fresh)
 }
 
 /// Fold a mouse event's Shift/Alt/Ctrl state into the form `report_mouse`

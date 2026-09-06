@@ -22,29 +22,37 @@ fn probe_command(probe: &str) -> String {
     format!("printf '%s%s\\n' '{head}' '{tail}'\r")
 }
 
-/// How long the terminal end-to-end tests wait for their probe to come back
-/// through the PTY. Generous on purpose: a real shell has to start, run the
-/// command, and have the reader thread drain the bytes into the grid, and on
-/// a box running the whole suite in parallel that took longer than the three
-/// seconds this used to allow (issue #226).
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
 /// Run the probe command in the app's embedded terminal and wait until the
 /// probe is on screen. Panics with the actual screen contents if it never
 /// arrives, so a failure says what the terminal was showing instead of
 /// unwrapping `None` several lines later.
+///
+/// The wait is load-scaled (#397): a real shell has to start, run the
+/// command, and have the reader thread drain the bytes into the grid, and
+/// what stretches that is contention from the rest of the suite, not this
+/// test. The fixed 15s this replaced (#226 had raised it from 3s) is what a
+/// quiet machine still gets at the floor; the captured failure had the probe
+/// command echoed on screen and unanswered at 15s, a starved shell rather
+/// than a broken one. `spawn_budget` rather than `await_spawned` so the
+/// panic can keep showing the screen.
 fn await_terminal_probe(app: &mut App, probe: &str) {
     app.terminal_mut()
         .write_input(probe_command(probe).as_bytes());
+    let base = crate::test_budget::tests::TERMINAL_PROBE_BASE;
+    let budget = crate::test_budget::spawn_budget(base);
     let started = std::time::Instant::now();
-    while started.elapsed() < PROBE_TIMEOUT {
+    while started.elapsed() < budget {
         if app.terminal().visible_text().contains(probe) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     panic!(
-        "the shell never printed the probe {probe:?} within {PROBE_TIMEOUT:?}; terminal showed:\n{}",
+        "the shell never printed the probe {probe:?} within {budget:?} ({base:?} base x{} total \
+         for calibration and load); if this is a real failure it would also fail at 1x, so \
+         re-run the full suite on the unmodified merge base under the same load before \
+         suspecting your diff. Terminal showed:\n{}",
+        budget.as_millis() / base.as_millis().max(1),
         app.terminal().visible_text()
     );
 }
@@ -4555,6 +4563,20 @@ fn drain_fs_events_returns_false_when_nothing_pending() {
     assert!(!app.drain_fs_events(), "no fs events ⇒ no redraw needed");
 }
 
+/// How many drain ticks an external filesystem change may take to reach the
+/// Explorer: the 200 ms fs-sync invariant, expressed in croft's own work
+/// rather than in wall clock (#483). Each tick is one `drain_fs_events` and
+/// a 10 ms pause, so twenty ticks is 200 ms of croft's own opportunities to
+/// notice the change; a suite that starves this thread for 300 ms between
+/// two ticks stretches the clock but not the count. On a quiet machine the
+/// change lands in one or two ticks, and the poll fallback alone would land
+/// it in about five at `FS_POLL_INTERVAL`'s floor (more once `back_off`
+/// widens the interval), so this bound catches a gross regression (a
+/// watcher and a poll that both stopped delivering), not drift; the
+/// wall-clock figure itself is measured by the `#[ignore]`d serial test
+/// below.
+const FS_SYNC_TICKS: usize = 20;
+
 #[test]
 fn drain_fs_events_returns_true_after_workspace_write() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4567,27 +4589,24 @@ fn drain_fs_events_returns_true_after_workspace_write() {
     }
     let new_file = tmp.path().join("new.txt");
     std::fs::write(&new_file, "hi").unwrap();
-    let started = std::time::Instant::now();
     let mut saw = false;
-    let mut saw_tree = false;
-    for _ in 0..150 {
+    let mut landed = false;
+    // Bounded at the invariant itself: every tick past it would give the
+    // same verdict, so the loop stops where the claim does.
+    for _ in 1..=FS_SYNC_TICKS {
         if app.drain_fs_events() {
             saw = true;
         }
         if app.tree.nodes.iter().any(|n| n.path == new_file) {
-            saw_tree = true;
+            landed = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(saw, "workspace write should propagate as a dirty signal");
     assert!(
-        saw_tree,
-        "workspace write should refresh the tree with the created file"
-    );
-    assert!(
-        started.elapsed() <= std::time::Duration::from_millis(200),
-        "created file should appear in Explorer within 200ms"
+        landed,
+        "created file should appear in Explorer within {FS_SYNC_TICKS} drain ticks (never landed)"
     );
 }
 
@@ -4603,20 +4622,73 @@ fn drain_fs_events_removes_deleted_root_file_from_tree() {
     );
 
     std::fs::remove_file(&doomed).unwrap();
-    let started = std::time::Instant::now();
-    let mut saw_tree = false;
-    for _ in 0..150 {
+    let mut gone = false;
+    for _ in 1..=FS_SYNC_TICKS {
         let _ = app.drain_fs_events();
         if !app.tree.nodes.iter().any(|n| n.path == doomed) {
-            saw_tree = true;
+            gone = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(saw_tree, "deleted file should disappear from the tree");
     assert!(
-        started.elapsed() <= std::time::Duration::from_millis(200),
-        "deleted file should disappear from Explorer within 200ms"
+        gone,
+        "deleted file should disappear from Explorer within {FS_SYNC_TICKS} drain ticks (never left)"
+    );
+}
+
+/// The 200 ms invariant as wall clock, for a serial run on a quiet machine
+/// (pass `--ignored` with the filter `fs_sync_reflects`). Ignored by default
+/// because a full parallel suite is itself the load (#483): the scheduler,
+/// not croft, decides whether this thread runs again inside 200 ms while
+/// thousands of neighbours spawn shells, so a failure here in that setting
+/// says nothing about the watcher. The tick-counted pair above carries the
+/// check in the suite; this one measures the invariant itself.
+#[test]
+#[ignore = "wall clock: run serially on a quiet machine"]
+fn fs_sync_reflects_external_changes_within_200ms_wall_clock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let doomed = tmp.path().join("doomed.txt");
+    std::fs::write(&doomed, "bye").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for _ in 0..20 {
+        let _ = app.drain_fs_events();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let budget = std::time::Duration::from_millis(200);
+
+    let new_file = tmp.path().join("new.txt");
+    std::fs::write(&new_file, "hi").unwrap();
+    // The budget is checked after every drain as well as before: a drain
+    // that lands the change past the deadline must still fail, not end the
+    // loop quietly on the next condition check.
+    let started = std::time::Instant::now();
+    while !app.tree.nodes.iter().any(|n| n.path == new_file) {
+        let _ = app.drain_fs_events();
+        assert!(
+            started.elapsed() <= budget,
+            "created file should appear in Explorer within {budget:?} (deadline passed mid-drain)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        started.elapsed() <= budget,
+        "created file should appear in Explorer within {budget:?} (deadline passed at the last check)"
+    );
+
+    std::fs::remove_file(&doomed).unwrap();
+    let started = std::time::Instant::now();
+    while app.tree.nodes.iter().any(|n| n.path == doomed) {
+        let _ = app.drain_fs_events();
+        assert!(
+            started.elapsed() <= budget,
+            "deleted file should disappear from Explorer within {budget:?} (deadline passed mid-drain)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        started.elapsed() <= budget,
+        "deleted file should disappear from Explorer within {budget:?} (deadline passed at the last check)"
     );
 }
 
@@ -6227,13 +6299,14 @@ fn rerunning_a_task_reuses_its_pane_instead_of_stacking_new_ones() {
     app.handle_key(chord).unwrap();
     // Wait for the pane's shell to come back to its prompt so the rerun
     // path sees an idle pane (a busy pane legitimately gets a new one).
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) {
-        if app.terminals[app.active_terminal].foreground_is_shell() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled and LOUD (#397): the fixed 5000ms loop broke out silently
+    // on timeout, so under suite load the next step met a pane still busy
+    // and the assertion after it misreported the timeout as its own failure.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the task pane's shell to return to its prompt",
+        || app.terminals[app.active_terminal].foreground_is_shell(),
+    );
     let after_first = app.terminals.len();
     app.handle_key(chord).unwrap();
     assert_eq!(
@@ -6264,13 +6337,14 @@ fn a_reused_task_pane_clears_a_half_typed_prompt_line_first() {
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     );
     app.handle_key(chord).unwrap();
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) {
-        if app.terminals[app.active_terminal].foreground_is_shell() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled and LOUD (#397): the fixed 5000ms loop broke out silently
+    // on timeout, so under suite load the next step met a pane still busy
+    // and the assertion after it misreported the timeout as its own failure.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the task pane's shell to return to its prompt",
+        || app.terminals[app.active_terminal].foreground_is_shell(),
+    );
     app.handle_key(chord).unwrap();
     let bytes = app.terminals[app.active_terminal].written_bytes_for_test();
     let needle = b"\x05\x15make build\r";
@@ -6294,13 +6368,16 @@ fn a_task_pane_from_the_old_workspace_is_not_reused_after_a_re_root() {
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     );
     app.handle_key(chord).unwrap();
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_millis(5000) {
-        if app.terminals[app.active_terminal].foreground_is_shell() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // Load-scaled and LOUD (#397). The fixed 5000ms loop broke out silently
+    // on timeout, and here a still-busy pane passes the assertion below for
+    // the wrong reason: a busy pane always gets a sibling, so `after + 1`
+    // held without the cwd guard ever being exercised. Failing loudly makes
+    // the guard the thing under test.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the task pane's shell to return to its prompt",
+        || app.terminals[app.active_terminal].foreground_is_shell(),
+    );
     // Focus another pane so the re-root's active-pane `cd` cannot move the
     // task pane along (the reviewer's scenario: it is NOT cd'd).
     app.active_terminal = 0;
@@ -26027,15 +26104,43 @@ fn clicking_an_annotated_span_still_clears_the_click_selection() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A SILENT pane (#477). `App::new` spawns the user's interactive shell,
+    // whose prompt lands whenever the machine gets round to it; a prompt
+    // arriving between the anchor below and the click scrolled the
+    // annotation off the row the click was aimed at, and the popup
+    // assertion read as "annotation hover broke" on a merely busy host.
+    // A child that prints nothing cannot move the grid, so the only bytes
+    // on it are the ones this test feeds.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     app.terminals[0].feed_bytes_for_test(b"annotated words here\r\n");
+    // Anchor the note to the grid line the text actually landed on and aim
+    // the click at that same line, rather than assuming both are row 0.
+    let line = app.terminals[0]
+        .find_captured_line("annotated words here")
+        .expect("the fed text is on the grid");
+    assert!(
+        line >= 0,
+        "with no scrollback the text sits on a viewport row, got line {line}"
+    );
     let clock = app.terminals[0].scroll_clock();
-    app.terminals[0].add_annotation(0, clock, 0, 15, String::from("the note"));
+    app.terminals[0].add_annotation(line, clock, 0, 15, String::from("the note"));
     let inner = app.terminals[0].last_inner;
-    let (cx, cy) = (inner.x + 2, inner.y);
+    let (cx, cy) = (inner.x + 2, inner.y + line as u16);
+    assert!(
+        app.terminals[0]
+            .line_text_at(cx, cy)
+            .is_some_and(|(text, idx)| text.starts_with("annotated words here") && idx == 2),
+        "the click must land ON the annotated text, or the popup assertion is vacuous"
+    );
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), cx, cy));
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), cx, cy));
     assert!(app.hover_popup.is_some(), "the click must pop the note");
@@ -30405,21 +30510,32 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
 fn quick_select_labels_follow_content_that_streams_below_them() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A SILENT pane (#397). The row slack below was this test's first fix,
+    // and it held until a full-suite run captured the pane holding ONLY the
+    // shell's wrapped prompt and the trailing x1 x2 x3, the URL gone: the
+    // shell's prompt repaint after the maximize's SIGWINCH landed between
+    // the feeds and rewrote the rows the URL sat on. Slack absorbs a prompt
+    // that appends; it cannot absorb one that repaints. A child that prints
+    // nothing removes the writer entirely, and the subject here -- croft's
+    // label overlay following content the pane streams -- needs a grid, not
+    // a shell. The slack assertion stays: the scroll this test drives still
+    // needs the rows.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     // The panel over the editor, so the pane has ROWS. Unmaximized it is a
     // few rows tall here, and this test parks its URL four rows from the
-    // bottom: almost no slack against a prompt that a real shell writes and
-    // that wraps to several rows on a machine with a long hostname and path.
-    // That is this test's entry in #397, measured at 3 failures in 20 runs
-    // under load, with the URL scrolling off the top in the failure. The
-    // measured numbers are in the PR; the literals are not repeated here,
-    // since they are one configuration's and the code derives its own below.
-    //
-    // The maximize also resizes the PTY, so the pane's shell takes a SIGWINCH
-    // and may repaint its prompt. That lands before the newline flood parks
-    // the cursor, and the slack this exists to create absorbs a late one.
+    // bottom. When the pane still ran the workspace shell that was almost
+    // no slack against a wrapped prompt (this test's first entry in #397,
+    // 3 failures in 20 runs under load); with a silent child the rows are
+    // simply what the scroll below needs, and the maximize is how it gets
+    // them.
     app.toggle_terminal_maximize();
     term.draw(|f| app.render(f)).unwrap();
     // Park the cursor at the pane bottom so every further row SCROLLS.
@@ -30429,21 +30545,19 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     // rows, the test would quietly return to flaking instead of failing.
     assert!(
         h >= 16,
-        "the maximized panel must leave slack for the shell's wrapped prompt; got {h} rows"
+        "the maximized panel must leave rows for the scroll this test drives; got {h} rows"
     );
     app.terminals[0].feed_bytes_for_test("\r\n".repeat(h * 2).as_bytes());
-    // One atomic feed, opening with its own newline: the live child
-    // shell's prompt can flush between feed calls under suite load (#62),
-    // and a prompt landing just before the URL used to push it across the
-    // pane edge, wrapping the match. Advancing "\r\n" + URL under one grid
-    // lock keeps the URL at column 0 whether the prompt arrives before
-    // this chunk (its row is above) or after it (it appends to the right).
+    // One atomic feed, opening with its own newline, so "\r\n" + URL lands
+    // under one grid lock with the URL at column 0. #62 saw the match wrap
+    // the pane edge when another writer got between two feeds; the pane is
+    // silent now, and the shape is kept because it is the one that cannot
+    // wrap whatever else is on screen.
     app.terminals[0].feed_bytes_for_test(b"\r\nhttp://drift.io");
     app.open_terminal_quick_select();
-    // The URL by name, not `is_some()`. Quick select stages every match on
-    // screen and the live shell's prompt path is one, so `is_some()` cannot
-    // tell "the URL is hinted" from "only the prompt is", and maximizing the
-    // pane put more prompt text on screen rather than less.
+    // The URL by name, not `is_some()`: quick select stages every match on
+    // screen, and naming the one this test planted keeps the assertion
+    // about it rather than about whatever else happens to match.
     assert!(
         app.terminal_quick_select
             .as_ref()
@@ -30455,10 +30569,9 @@ fn quick_select_labels_follow_content_that_streams_below_them() {
     let buf = term.backend().buffer().clone();
     // Join the pane's inner rows into one stream before searching, so pane
     // geometry can't split the needle across a row boundary (#62), and
-    // don't pin WHICH gold label the URL drew: when the live shell's
-    // prompt lands above the URL its path is a match too, and label
-    // assignment is bottom-priority, so the URL's letter depends on that
-    // race. The invariant is that SOME label still covers the URL's first
+    // don't pin WHICH gold label the URL drew: label assignment is
+    // bottom-priority over every match on screen, and the letter is not the
+    // claim. The invariant is that SOME label still covers the URL's first
     // cell after the scroll — the 'h' is overlaid, the rest is intact.
     let inner = app.terminals[0].last_inner;
     let joined: String = (inner.y..inner.y + inner.height)
@@ -39304,4 +39417,669 @@ fn a_workspace_layer_setting_disable_log_highlight_applies_on_remerge() {
         "and the parked one"
     );
     crate::log_view::set_default_highlight(before);
+}
+
+/// #471: no watcher-reported paths, for the poll-shaped refresh calls.
+fn no_paths() -> std::collections::BTreeSet<std::path::PathBuf> {
+    std::collections::BTreeSet::new()
+}
+
+/// #471 fixtures: a repo with one committed file, and the app rooted there.
+fn repo_with_seed(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(&args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+    let f = root.join("seed.txt");
+    std::fs::write(&f, text).unwrap();
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "init", "--quiet"]);
+    (tmp, f)
+}
+
+fn git_ok(root: &std::path::Path, args: &[&str]) {
+    let st = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(st.success(), "git {args:?}");
+}
+
+/// Write `text` to `path` so that its `(mtime, len)` stamp differs from the
+/// one before the write: a stamp-gated refresh must not miss a rewrite that
+/// lands within the filesystem's mtime granularity of the previous one. A
+/// different length differs at once; an equal length waits for the clock.
+fn rewrite_later(path: &std::path::Path, text: &str) {
+    let stamp = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len())))
+    };
+    let before = stamp(path);
+    std::fs::write(path, text).unwrap();
+    let mut spins = 0;
+    while stamp(path) == before && spins < 400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(path, text).unwrap();
+        spins += 1;
+    }
+    assert_ne!(
+        stamp(path),
+        before,
+        "the rewrite must move the file's stamp"
+    );
+}
+
+#[test]
+fn an_open_head_diff_follows_the_working_file_and_head() {
+    // The Source Control diff used to be a snapshot: an agent rewriting the
+    // file, or a save from a sibling tab, left the rows stale until the tab
+    // was reopened (#471). Now the view is rebuilt in place -- from disk on
+    // a filesystem trigger, from HEAD too on a git-status trigger -- with
+    // the reader's viewport kept.
+    let (tmp, f) = repo_with_seed("one\ntwo\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    // Open exactly what open_source_control_entry opens for a Modified row.
+    std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "one\ntwo\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    assert_eq!(app.editor.diff.as_ref().unwrap().right_lines.len(), 3);
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "nothing moved yet: the refresh is a no-op"
+    );
+
+    // The working file grows under the open view.
+    rewrite_later(&f, "one\ntwo\nthree\nfour\nfive\n");
+    app.editor.diff.as_mut().unwrap().scroll = 1;
+    assert!(
+        app.refresh_open_diff_views(false, &[], &no_paths()),
+        "a filesystem trigger rebuilds the view from the changed file"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(d.right_lines, vec!["one", "two", "three", "four", "five"]);
+    assert_eq!(d.left_lines, vec!["one", "two"], "HEAD side untouched");
+    assert_eq!(
+        d.scroll, 1,
+        "the reader's viewport is kept, not reset to the first hunk"
+    );
+    assert!(
+        d.left_is_git_head,
+        "the rebuilt view still gates stage/revert like the original"
+    );
+    assert!(
+        matches!(
+            d.source,
+            crate::widgets::diff::DiffSource::HeadVsWorking { .. }
+        ),
+        "the source survives the rebuild"
+    );
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "the stamps were taken: a second tick does not rebuild again"
+    );
+
+    // A commit moves HEAD: the git-status trigger re-reads the left side.
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "grow", "--quiet"]);
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "a filesystem-only trigger does not re-read HEAD"
+    );
+    assert!(
+        !app.refresh_open_diff_views(true, &[], &no_paths()),
+        "nor does a git-status drain in which THIS root's HEAD did not move"
+    );
+    assert!(
+        app.refresh_open_diff_views(true, std::slice::from_ref(&root), &no_paths()),
+        "the drain that saw this root's HEAD move does"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(
+        d.left_lines, d.right_lines,
+        "after the commit both sides agree"
+    );
+}
+
+#[test]
+fn a_staged_diff_view_reruns_git_on_a_status_trigger_only() {
+    let (tmp, f) = repo_with_seed("alpha\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    let raw = crate::git::diff_staged(&root).unwrap();
+    app.editor
+        .open_git_diff_side_by_side(std::path::Path::new("git diff --staged"), &raw)
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+        root: root.clone(),
+        kind: crate::widgets::diff::GitDiffKind::Staged,
+    });
+    assert!(
+        app.editor
+            .diff
+            .as_ref()
+            .unwrap()
+            .right_lines
+            .contains(&String::from("(no changes)")),
+        "nothing is staged yet"
+    );
+
+    std::fs::write(&f, "alpha\nbeta\n").unwrap();
+    git_ok(&root, &["add", "seed.txt"]);
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "a git-command view is not re-run on a filesystem tick: the index is not a file it watches"
+    );
+    assert!(
+        app.refresh_open_diff_views(true, &[], &no_paths()),
+        "the git-status drain re-runs it"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        d.right_lines.iter().any(|l| l == "beta"),
+        "the staged line now shows: {:?}",
+        d.right_lines
+    );
+    assert!(
+        !app.refresh_open_diff_views(true, &[], &no_paths()),
+        "identical output changes nothing"
+    );
+}
+
+#[test]
+fn a_snapshot_and_a_two_file_diff_follow_their_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "x\n").unwrap();
+    std::fs::write(&b, "x\ny\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Timeline snapshot: fixed left text against the working file.
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("b.txt (local snapshot)"),
+            "x\n",
+            &b,
+            false,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft {
+        left_text: String::from("x\n"),
+    });
+    rewrite_later(&b, "x\ny\nz\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(d.right_lines, vec!["x", "y", "z"]);
+    assert_eq!(d.left_lines, vec!["x"], "the snapshot side never changes");
+    assert!(!d.left_is_git_head, "a snapshot view still cannot stage");
+
+    // Two real files: either side moving rebuilds.
+    app.editor.open_diff(&a, &b).unwrap();
+    rewrite_later(&a, "x\nw\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert_eq!(d.left_lines, vec!["x", "w"]);
+    assert!(
+        d.left_is_real_file,
+        "Enter on a Removed row still opens the left file"
+    );
+    assert!(!app.refresh_open_diff_views(false, &[], &no_paths()));
+}
+
+#[test]
+fn a_diff_view_in_an_inactive_split_group_is_refreshed_too() {
+    // Every group is swept, not just the focused one: the diff the user
+    // parked in the other split is exactly the one they are watching while
+    // they type in this one.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "1\n").unwrap();
+    std::fs::write(&b, "1\n2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_diff(&a, &b).unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&a).unwrap();
+    assert!(
+        app.editor.diff.is_none(),
+        "the focused group shows a plain buffer"
+    );
+
+    rewrite_later(&b, "1\n2\n3\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let stale = app
+        .editor_layout
+        .inactive_groups_mut()
+        .into_iter()
+        .flat_map(|g| g.editors.iter())
+        .filter_map(|e| e.diff.as_ref())
+        .any(|d| d.right_lines.len() != 3);
+    assert!(!stale, "the inactive group's diff shows the third line");
+}
+
+#[test]
+fn a_rewrite_that_only_changes_bytes_still_refreshes_the_byte_facts() {
+    // A final newline added to the working file changes no line text, so the
+    // rows come back identical -- but `right_no_final_nl` and the "bytes
+    // differ, lines equal" banner feed the hunk patch and the header. The
+    // same-content skip must see those facts as content, or stage/revert
+    // would build a patch from bytes no longer on disk.
+    let (tmp, f) = repo_with_seed("a\nb\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "a\nb").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "a\nb\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        d.right_no_final_nl && d.bytes_differ_but_lines_equal,
+        "precondition: {d:?}"
+    );
+
+    rewrite_later(&f, "a\nb\n");
+    assert!(
+        app.refresh_open_diff_views(false, &[], &no_paths()),
+        "the byte-only rewrite counts as a change"
+    );
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        !d.right_no_final_nl,
+        "the working side now ends in a newline"
+    );
+    assert!(
+        !d.bytes_differ_but_lines_equal,
+        "and the banner's fact is cleared"
+    );
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "and it is not rebuilt again"
+    );
+}
+
+#[test]
+fn a_same_length_rewrite_with_a_preserved_mtime_refreshes_on_the_watcher_path() {
+    // `(mtime, len)` cannot see a rewrite that keeps both, and the poll has
+    // nothing else to go on. The watcher does: it names the path, and a
+    // named path bypasses the stamp gate.
+    let (tmp, f) = repo_with_seed("one\ntwo\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "one\ntwo\nAAA\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "one\ntwo\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    let mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+    std::fs::write(&f, "one\ntwo\nBBB\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&f)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&f).unwrap().modified().unwrap(),
+        mtime,
+        "precondition: the rewrite preserved the mtime"
+    );
+    assert!(
+        !app.refresh_open_diff_views(false, &[], &no_paths()),
+        "the poll's stamp gate cannot see this rewrite"
+    );
+    let mut written = std::collections::BTreeSet::new();
+    written.insert(f.clone());
+    assert!(
+        app.refresh_open_diff_views(false, &[], &written),
+        "the watcher naming the path rebuilds the view regardless of the stamp"
+    );
+    assert!(
+        app.editor
+            .diff
+            .as_ref()
+            .unwrap()
+            .right_lines
+            .iter()
+            .any(|l| l == "BBB"),
+        "the view shows the rewritten bytes"
+    );
+}
+
+#[test]
+fn a_rebuild_recomputes_the_find_match_against_the_new_rows() {
+    // The active find match names a row of the OLD rows. After a rebuild it
+    // is dropped and, with the find bar open, recomputed: gone when the new
+    // rows no longer hold the needle, back when they do again.
+    let (tmp, f) = repo_with_seed("alpha\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "alpha\nneedle here\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "alpha\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    app.open_editor_find();
+    app.diff_find_set_query(String::from("needle"));
+    assert!(
+        app.editor.diff.as_ref().unwrap().find.active.is_some(),
+        "precondition: the needle is found"
+    );
+
+    rewrite_later(&f, "alpha\nnothing to see\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(d.find.active.is_none(), "no row holds the needle now");
+    assert_eq!(
+        d.find.needle.as_deref(),
+        Some("needle"),
+        "the query itself survives"
+    );
+    assert_eq!(
+        app.editor_find.as_ref().and_then(|s| s.match_index),
+        None,
+        "the find bar agrees: no current match"
+    );
+
+    rewrite_later(&f, "alpha\nthe needle is back\nneedle twice\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let d = app.editor.diff.as_ref().unwrap();
+    assert!(
+        d.find.active.is_some(),
+        "the match is recomputed on the new rows"
+    );
+    assert_eq!(
+        app.editor_find.as_ref().and_then(|s| s.match_index),
+        Some(1),
+        "and the find bar counts from the first"
+    );
+}
+
+#[test]
+fn a_staged_view_reruns_when_a_status_refresh_lands_unchanged() {
+    // Replacing an already-staged file's bytes leaves porcelain status
+    // identical ("M  seed.txt" before and after), so a "status changed"
+    // gate would never re-run the staged view. The completed refresh is the
+    // signal, and it flows through the real worker drain here.
+    let (tmp, f) = repo_with_seed("alpha\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    // Let the worker's first status land so later ones can compare equal.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the git worker's first status",
+        || {
+            app.try_install_pending_init();
+            app.git.status().in_repo
+        },
+    );
+    std::fs::write(&f, "alpha\nbeta\n").unwrap();
+    git_ok(&root, &["add", "seed.txt"]);
+    let raw = crate::git::diff_staged(&root).unwrap();
+    app.editor
+        .open_git_diff_side_by_side(std::path::Path::new("git diff --staged"), &raw)
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+        root: root.clone(),
+        kind: crate::widgets::diff::GitDiffKind::Staged,
+    });
+    assert!(
+        app.editor
+            .diff
+            .as_ref()
+            .unwrap()
+            .right_lines
+            .iter()
+            .any(|l| l == "beta")
+    );
+
+    // Same porcelain status, different index bytes.
+    std::fs::write(&f, "alpha\ngamma\n").unwrap();
+    git_ok(&root, &["add", "seed.txt"]);
+    app.active_git_bypass_debounce();
+    app.refresh_git_status_debounced();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the staged view to show the re-staged bytes",
+        || {
+            app.try_install_pending_init();
+            app.editor
+                .diff
+                .as_ref()
+                .is_some_and(|d| d.right_lines.iter().any(|l| l == "gamma"))
+        },
+    );
+}
+
+#[test]
+fn a_head_diff_tagged_with_the_repo_toplevel_refreshes_from_a_subdirectory_workspace() {
+    // The Source Control opener tags a view with `scm_root()`, the git
+    // TOPLEVEL. From a subdirectory workspace that is not the workspace
+    // root the drain keys its HEAD-oid bookkeeping on, so `heads_moved`
+    // has to record the toplevel (and compare canonically), or a commit
+    // never re-reads the HEAD side. This drives the real drain.
+    let (tmp, f) = repo_with_seed("one\n");
+    let root = tmp.path().to_path_buf();
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut app = App::new(sub.clone()).unwrap();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the git worker's first status",
+        || {
+            app.try_install_pending_init();
+            app.git.status().in_repo
+        },
+    );
+    let scm = app.scm_root();
+    assert_ne!(
+        scm, sub,
+        "precondition: the toplevel is not the workspace root"
+    );
+
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "one\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: scm.clone(),
+        rel: String::from("seed.txt"),
+    });
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "two", "--quiet"]);
+    app.active_git_bypass_debounce();
+    app.refresh_git_status_debounced();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the HEAD side to follow the commit through the status drain",
+        || {
+            app.try_install_pending_init();
+            app.editor
+                .diff
+                .as_ref()
+                .is_some_and(|d| d.left_lines == d.right_lines && d.right_lines.len() == 2)
+        },
+    );
+}
+
+#[test]
+fn a_background_diff_refresh_leaves_the_active_diff_find_and_anchor_alone() {
+    // Only a rebuild of the ACTIVE tab recomputes the find bar; a diff
+    // refreshing in another split must not scroll or re-anchor the view the
+    // reader is on.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    let c = tmp.path().join("c.txt");
+    let d = tmp.path().join("d.txt");
+    std::fs::write(&a, "1\n").unwrap();
+    std::fs::write(&b, "1\n2\n").unwrap();
+    std::fs::write(&c, "x\n").unwrap();
+    std::fs::write(&d, "x\nneedle\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_diff(&a, &b).unwrap();
+    app.split_editor();
+    app.editor.open_diff(&c, &d).unwrap();
+    app.open_editor_find();
+    app.diff_find_set_query(String::from("needle"));
+    // Anchored AFTER the query: `diff_find_apply` scrolls to its match and
+    // clears the hunk anchor, which is exactly why a spurious recompute
+    // from a background refresh would be visible here.
+    app.editor.diff.as_mut().unwrap().nav_anchor = Some(0);
+    let before = app.editor.diff.as_ref().unwrap().clone();
+    assert!(
+        before.find.active.is_some(),
+        "precondition: the active diff has a match"
+    );
+
+    rewrite_later(&b, "1\n2\n3\n");
+    assert!(
+        app.refresh_open_diff_views(false, &[], &no_paths()),
+        "the background split's diff rebuilt"
+    );
+    let after = app.editor.diff.as_ref().unwrap();
+    assert_eq!(
+        after.nav_anchor,
+        Some(0),
+        "the active diff's hunk anchor is untouched"
+    );
+    assert_eq!(after.scroll, before.scroll, "and its viewport");
+    assert_eq!(
+        after.find.active, before.find.active,
+        "and its active match"
+    );
+}
+
+#[test]
+fn a_rebuild_that_changes_the_rows_drops_the_hunk_anchor() {
+    // `nav_anchor` is the one input to `action_row`, which S/U/R read. Over
+    // rebuilt rows the remembered index names whatever now sits there, so
+    // the anchor is dropped and the actions fall back to the viewport, as
+    // after a manual scroll.
+    let (tmp, f) = repo_with_seed("a\nb\nc\nd\ne\n");
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    std::fs::write(&f, "a\nB\nc\nd\nE\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "a\nb\nc\nd\ne\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: root.clone(),
+        rel: String::from("seed.txt"),
+    });
+    app.jump_diff_change(true);
+    assert!(
+        app.editor.diff.as_ref().unwrap().nav_anchor.is_some(),
+        "precondition: a jump anchored a hunk"
+    );
+    // A new hunk ABOVE the anchored one shifts every row under the index.
+    rewrite_later(&f, "A\nB\nc\nd\nE\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    assert_eq!(
+        app.editor.diff.as_ref().unwrap().nav_anchor,
+        None,
+        "the anchor does not survive rows it no longer describes"
+    );
+}
+
+#[test]
+fn a_background_diff_keeps_its_find_band_across_a_rebuild() {
+    // The active match is recomputed inside `carry_view_from`, so a view
+    // rebuilt in a background split keeps its band without the app's
+    // find-bar recompute, which only runs for the active tab.
+    let tmp = tempfile::tempdir().unwrap();
+    let c = tmp.path().join("c.txt");
+    let d = tmp.path().join("d.txt");
+    std::fs::write(&c, "x\n").unwrap();
+    std::fs::write(&d, "x\nneedle\n").unwrap();
+    let plain = tmp.path().join("plain.txt");
+    std::fs::write(&plain, "hi\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_diff(&c, &d).unwrap();
+    app.open_editor_find();
+    app.diff_find_set_query(String::from("needle"));
+    assert!(app.editor.diff.as_ref().unwrap().find.active.is_some());
+    // The diff moves to the background: a split, and a plain file on top.
+    app.split_editor();
+    app.editor.open_pinned(&plain).unwrap();
+    assert!(
+        app.editor.diff.is_none(),
+        "the active tab is the plain file"
+    );
+
+    rewrite_later(&d, "x\nstill a needle\nmore\n");
+    assert!(app.refresh_open_diff_views(false, &[], &no_paths()));
+    let mut seen = 0;
+    for group in app.editor_layout.inactive_groups_mut() {
+        for ed in &group.editors {
+            if let Some(dd) = ed.diff.as_ref().filter(|dd| dd.right_path == d) {
+                seen += 1;
+                assert_eq!(dd.find.needle.as_deref(), Some("needle"));
+                assert!(
+                    dd.find.active.is_some(),
+                    "the background view's active match was recomputed in place"
+                );
+            }
+        }
+    }
+    assert!(seen >= 1, "the background split still holds the diff");
 }
