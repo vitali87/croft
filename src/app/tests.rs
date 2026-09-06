@@ -4555,6 +4555,16 @@ fn drain_fs_events_returns_false_when_nothing_pending() {
     assert!(!app.drain_fs_events(), "no fs events ⇒ no redraw needed");
 }
 
+/// How many drain ticks an external filesystem change may take to reach the
+/// Explorer: the 200 ms fs-sync invariant, expressed in croft's own work
+/// rather than in wall clock (#483). Each tick is one `drain_fs_events` and
+/// a 10 ms pause, so twenty ticks is 200 ms of croft's own opportunities to
+/// notice the change; a suite that starves this thread for 300 ms between
+/// two ticks stretches the clock but not the count, while a watcher or poll
+/// that genuinely takes longer than its debounce and `FS_POLL_INTERVAL`
+/// still fails here.
+const FS_SYNC_TICKS: usize = 20;
+
 #[test]
 fn drain_fs_events_returns_true_after_workspace_write() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4567,27 +4577,23 @@ fn drain_fs_events_returns_true_after_workspace_write() {
     }
     let new_file = tmp.path().join("new.txt");
     std::fs::write(&new_file, "hi").unwrap();
-    let started = std::time::Instant::now();
     let mut saw = false;
-    let mut saw_tree = false;
-    for _ in 0..150 {
+    let mut ticks = None;
+    for tick in 1..=150 {
         if app.drain_fs_events() {
             saw = true;
         }
         if app.tree.nodes.iter().any(|n| n.path == new_file) {
-            saw_tree = true;
+            ticks = Some(tick);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(saw, "workspace write should propagate as a dirty signal");
+    let ticks = ticks.expect("workspace write should refresh the tree with the created file");
     assert!(
-        saw_tree,
-        "workspace write should refresh the tree with the created file"
-    );
-    assert!(
-        started.elapsed() <= std::time::Duration::from_millis(200),
-        "created file should appear in Explorer within 200ms"
+        ticks <= FS_SYNC_TICKS,
+        "created file should appear in Explorer within {FS_SYNC_TICKS} drain ticks, took {ticks}"
     );
 }
 
@@ -4603,21 +4609,64 @@ fn drain_fs_events_removes_deleted_root_file_from_tree() {
     );
 
     std::fs::remove_file(&doomed).unwrap();
-    let started = std::time::Instant::now();
-    let mut saw_tree = false;
-    for _ in 0..150 {
+    let mut ticks = None;
+    for tick in 1..=150 {
         let _ = app.drain_fs_events();
         if !app.tree.nodes.iter().any(|n| n.path == doomed) {
-            saw_tree = true;
+            ticks = Some(tick);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(saw_tree, "deleted file should disappear from the tree");
+    let ticks = ticks.expect("deleted file should disappear from the tree");
     assert!(
-        started.elapsed() <= std::time::Duration::from_millis(200),
-        "deleted file should disappear from Explorer within 200ms"
+        ticks <= FS_SYNC_TICKS,
+        "deleted file should disappear from Explorer within {FS_SYNC_TICKS} drain ticks, took {ticks}"
     );
+}
+
+/// The 200 ms invariant as wall clock, for a serial run on a quiet machine
+/// (pass `--ignored` with the filter `fs_sync_reflects`). Ignored by default
+/// because a full parallel suite is itself the load (#483): the scheduler,
+/// not croft, decides whether this thread runs again inside 200 ms while
+/// thousands of neighbours spawn shells, so a failure here in that setting
+/// says nothing about the watcher. The tick-counted pair above carries the
+/// check in the suite; this one measures the invariant itself.
+#[test]
+#[ignore = "timing: the 200 ms fs-sync invariant as wall clock; run serially on a quiet machine"]
+fn fs_sync_reflects_external_changes_within_200ms_wall_clock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let doomed = tmp.path().join("doomed.txt");
+    std::fs::write(&doomed, "bye").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for _ in 0..20 {
+        let _ = app.drain_fs_events();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let budget = std::time::Duration::from_millis(200);
+
+    let new_file = tmp.path().join("new.txt");
+    std::fs::write(&new_file, "hi").unwrap();
+    let started = std::time::Instant::now();
+    while !app.tree.nodes.iter().any(|n| n.path == new_file) {
+        assert!(
+            started.elapsed() <= budget,
+            "created file should appear in Explorer within {budget:?}"
+        );
+        let _ = app.drain_fs_events();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    std::fs::remove_file(&doomed).unwrap();
+    let started = std::time::Instant::now();
+    while app.tree.nodes.iter().any(|n| n.path == doomed) {
+        assert!(
+            started.elapsed() <= budget,
+            "deleted file should disappear from Explorer within {budget:?}"
+        );
+        let _ = app.drain_fs_events();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[test]
