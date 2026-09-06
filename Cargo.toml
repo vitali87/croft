@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.861"
+version = "0.1.868"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -106,6 +106,9 @@ base64 = "0.22"
 ring = "0.17"
 sha2 = "0.10"
 regex = "1.12"
+# Log highlighting for the rendered log view (#466): tailspin as a library,
+# CLI feature off so none of clap/rayon/signal-hook/toml come along.
+tailspin = { version = "7.0", default-features = false }
 # Already in the tree via regex; taken directly for the log index, whose
 # newline scan is the one hot loop in opening a multi-gigabyte file.
 memchr = "2.8"

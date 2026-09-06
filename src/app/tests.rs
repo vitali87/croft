@@ -39104,3 +39104,44 @@ fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
         "no strip survives maximize, or a click could land on a pane that is not painted"
     );
 }
+
+#[test]
+fn toggling_log_highlighting_flips_open_views_and_the_default() {
+    // #466: the palette / Settings toggle reaches the view that is already
+    // open AND steers views opened afterwards, so the user sees the change
+    // at once and does not get it undone by the next log they open.
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("build.log");
+    std::fs::write(&log, b"\x1b[32mok\x1b[0m 2024-01-02 step 1\nplain step 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&log).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "a coloured .log opens as a rendered log"
+    );
+    let before = app.log_highlight;
+    let view_before = app.editor.log.as_ref().unwrap().highlight();
+    assert_eq!(
+        view_before, before,
+        "the open view starts at the app's setting"
+    );
+
+    app.toggle_log_highlight();
+    assert_eq!(app.log_highlight, !before);
+    assert_eq!(
+        app.editor.log.as_ref().unwrap().highlight(),
+        !before,
+        "the open view followed the toggle"
+    );
+    assert_eq!(
+        crate::log_view::default_highlight(),
+        !before,
+        "and so will the next log opened"
+    );
+    assert!(app.status.starts_with("Log highlighting (tailspin):"));
+
+    // Back to where it was, so the process-wide default is left as found.
+    app.toggle_log_highlight();
+    assert_eq!(app.log_highlight, before);
+    assert_eq!(crate::log_view::default_highlight(), before);
+}
