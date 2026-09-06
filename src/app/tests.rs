@@ -39201,33 +39201,77 @@ fn toggling_log_highlighting_flips_open_views_and_the_default() {
 #[test]
 fn startup_seeds_the_log_view_default_from_the_saved_preference() {
     // #466: `App::new` pushes the saved preference into the log view's
-    // opening default, so the first log opened after startup respects a
-    // saved opt-out instead of waiting for a manual toggle. The saved
-    // preference is whatever this machine's config holds; the invariant is
-    // that the two agree, and that they agree in BOTH directions after a
-    // toggle round-trip.
+    // opening default (through `seed_log_highlight_default`), so the first
+    // log opened after startup respects a saved opt-out instead of waiting
+    // for a manual toggle. Under test that call is inert -- hundreds of
+    // apps are built on parallel threads and each write would race the
+    // tests reading the default -- so the seeding is exercised through the
+    // same helper, under the log view's test lock.
     let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let before = crate::log_view::default_highlight();
     let tmp = tempfile::tempdir().unwrap();
-    // Leave the default in a state that disagrees with a fresh app's field,
-    // so `App::new` has to overwrite it to pass.
-    let mut probe = App::new(tmp.path().to_path_buf()).unwrap();
-    let saved = probe.log_highlight;
-    crate::log_view::set_default_highlight(!saved);
     let app = App::new(tmp.path().to_path_buf()).unwrap();
+    let saved = app.log_highlight;
+    crate::log_view::set_default_highlight(!saved);
+    seed_log_highlight_default(app.log_highlight);
+    let seeded = crate::log_view::default_highlight();
+    crate::log_view::set_default_highlight(before);
     assert_eq!(
-        app.log_highlight, saved,
-        "the field reads the same preference"
+        seeded, saved,
+        "the startup seed puts the saved preference into the default"
     );
-    assert_eq!(
+}
+
+#[test]
+fn a_workspace_layer_setting_disable_log_highlight_applies_on_remerge() {
+    // #466: `disable_log_highlight` is a workspace-allowed key, so a repo's
+    // `.croft/config.json` can set it, and a settings remerge (a save of
+    // that file) must apply it live: to the field, to the default for logs
+    // opened later, and to every open log view. Read at startup too.
+    let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let before = crate::log_view::default_highlight();
+    let tmp = tempfile::tempdir().unwrap();
+    let layer = crate::config_layers::workspace_config_path(tmp.path());
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    std::fs::write(&layer, r#"{"disable_log_highlight": true}"#).unwrap();
+    let log = tmp.path().join("build.log");
+    std::fs::write(&log, b"\x1b[32mok\x1b[0m 2024-01-02 step 1\nplain step 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(!app.log_highlight, "the workspace layer is read at startup");
+    app.editor.open_pinned(&log).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "a coloured .log opens as a rendered log"
+    );
+    // Force the open view on, as a stale default would have left it, so the
+    // remerge below has something visible to fix.
+    app.editor.log.as_mut().unwrap().set_highlight(true);
+
+    std::fs::write(&layer, r#"{"disable_log_highlight": false}"#).unwrap();
+    app.reload_config_for_path(&layer);
+    assert!(
+        app.log_highlight,
+        "the remerge applied the workspace layer's new value"
+    );
+    assert!(
+        app.editor.log.as_ref().unwrap().highlight(),
+        "and pushed it into the open log view"
+    );
+    assert!(
         crate::log_view::default_highlight(),
-        saved,
-        "and startup seeded the log view's opening default from it"
+        "and into the default for later logs"
     );
-    // Restore through the toggle path so the persisted preference and the
-    // process default end where they started.
-    probe.toggle_log_highlight();
-    probe.toggle_log_highlight();
-    assert_eq!(crate::log_view::default_highlight(), saved);
+
+    std::fs::write(&layer, r#"{"disable_log_highlight": true}"#).unwrap();
+    app.reload_config_for_path(&layer);
+    assert!(!app.log_highlight);
+    assert!(
+        !app.editor.log.as_ref().unwrap().highlight(),
+        "the opt-out reaches the open view"
+    );
+    crate::log_view::set_default_highlight(before);
 }

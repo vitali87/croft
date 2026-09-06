@@ -26,12 +26,15 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::ansi_text::{AnsiLine, AnsiStyle, parse_into, parse_line};
+use crate::widgets::editor_find::{MatchPos, line_matches};
+use crate::widgets::search::{SearchOpts, line_may_match};
 
 /// Whether a NEWLY opened view highlights (#466). The app sets it from the
-/// `disable_log_highlight` preference at startup and on the palette toggle,
-/// so a log opened later comes up the way the user last asked without every
-/// opener having to thread the preference through. Existing views are
-/// flipped by the app through [`LogView::set_highlight`].
+/// `disable_log_highlight` preference at startup, on a settings remerge (a
+/// workspace layer may set the key) and on the palette toggle, so a log
+/// opened later comes up the way the user last asked without every opener
+/// having to thread the preference through. Existing views are flipped by
+/// the app through [`LogView::set_highlight`].
 static DEFAULT_HIGHLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Serialises the tests that read or write the process-wide default (#466):
@@ -94,7 +97,7 @@ fn build_highlighter() -> tailspin::Highlighter {
                 style: coloured(Color::Magenta, false),
             },
             KeywordConfig {
-                words: words(&["true", "false", "null", "nil", "None"]),
+                words: words(&["true", "false", "null", "nil"]),
                 style: coloured(Color::Cyan, false),
             },
             KeywordConfig {
@@ -130,8 +133,6 @@ fn highlighted(raw: &str) -> std::borrow::Cow<'_, str> {
     }
     HIGHLIGHTER.with(|h| h.apply(raw))
 }
-use crate::widgets::editor_find::{MatchPos, line_matches};
-use crate::widgets::search::{SearchOpts, line_may_match};
 
 /// One window refill: many screens' worth, still instant to read.
 const WINDOW_BYTES: usize = 256 * 1024;

@@ -4146,8 +4146,14 @@ impl App {
         // Seed the log view's opening default from the saved preference
         // BEFORE any log can be opened (#466): the toggle keeps the two in
         // step afterwards, but a startup that set only `App::log_highlight`
-        // opened the first log highlighted despite a saved opt-out.
-        crate::log_view::set_default_highlight(!loaded_prefs.disable_log_highlight);
+        // opened the first log highlighted despite a saved opt-out. Test-
+        // inert like the keymap and matcher loads below: the suite builds
+        // hundreds of apps on parallel threads, and an unguarded write to
+        // the process-wide default from each would race the tests that
+        // read it; those call `seed_log_highlight_default` explicitly.
+        if !cfg!(test) {
+            seed_log_highlight_default(!loaded_prefs.disable_log_highlight);
+        }
         // Same treatment for keybindings: a row croft refused (an unknown
         // command id, a gesture that can never fire, a reserved bare click)
         // used to vanish silently, which reads as croft being broken rather
@@ -38090,17 +38096,7 @@ impl App {
     /// (#466): flip tailspin colouring for every open rendered log, steer
     /// the default for logs opened later, and persist the preference.
     pub fn toggle_log_highlight(&mut self) {
-        self.log_highlight = !self.log_highlight;
-        crate::log_view::set_default_highlight(self.log_highlight);
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
-            for ed in &mut group.editors {
-                if let Some(log) = ed.log.as_mut() {
-                    log.set_highlight(self.log_highlight);
-                }
-            }
-        }
+        self.set_log_highlight(!self.log_highlight);
         self.status = if self.log_highlight {
             String::from("Log highlighting (tailspin): on")
         } else {
@@ -38108,6 +38104,25 @@ impl App {
         };
         if !cfg!(test) {
             let _ = crate::prefs::save_disable_log_highlight(!self.log_highlight);
+        }
+    }
+
+    /// Apply a log-highlight setting everywhere it lives (#466): the app's
+    /// field, the log view's opening default for logs opened later, and
+    /// every log view already open in any split group. Shared by the
+    /// palette / Settings toggle and by a settings remerge (a workspace
+    /// layer setting `disable_log_highlight`), so the two cannot drift.
+    fn set_log_highlight(&mut self, on: bool) {
+        self.log_highlight = on;
+        seed_log_highlight_default(on);
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                if let Some(log) = ed.log.as_mut() {
+                    log.set_highlight(on);
+                }
+            }
         }
     }
 
@@ -38370,6 +38385,14 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        // Only on a real change: the startup remerge runs before any log is
+        // open and the field already holds the preference, and writing the
+        // process-wide default from here under test would race the tests
+        // that read it (see `seed_log_highlight_default`).
+        let want_highlight = !p.disable_log_highlight;
+        if want_highlight != self.log_highlight {
+            self.set_log_highlight(want_highlight);
+        }
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
         if !p.disable_inline_blame && !self.inline_blame_enabled {
@@ -44629,6 +44652,13 @@ fn log_cell_at(
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// Push a log-highlight setting into the log view's process-wide opening
+/// default (#466). A free function so `App::new` can call it before `self`
+/// exists and a test can call it explicitly under the log view's test lock.
+pub(crate) fn seed_log_highlight_default(on: bool) {
+    crate::log_view::set_default_highlight(on);
 }
 
 /// Fold a mouse event's Shift/Alt/Ctrl state into the form `report_mouse`
