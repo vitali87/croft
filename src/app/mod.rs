@@ -25488,10 +25488,9 @@ impl App {
                                 .unwrap_or_else(|| r.display().to_string())
                         };
                         let label = match (root, branch) {
-                            (Some(r), Some(b))
+                            (Some(_), Some(b))
                                 if branches.iter().flatten().filter(|o| *o == b).count() == 1 =>
                             {
-                                let _ = r;
                                 b.clone()
                             }
                             (Some(r), _) => root_label(r),

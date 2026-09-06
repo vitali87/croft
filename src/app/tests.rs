@@ -43332,6 +43332,58 @@ fn the_review_queue_names_the_lane_each_agents_files_are_in() {
 }
 
 #[test]
+fn two_lanes_sharing_a_branch_are_named_by_their_folders_instead() {
+    // A lane's branch comes from its slug alone, so lanes cut from two
+    // different repos can carry the same one. Naming both groups
+    // `agent/fix` would be worse than naming neither: the fallback is the
+    // disambiguated root label the workspace already computes.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    let one = tmp.path().join("one-fix");
+    let two = tmp.path().join("two-fix");
+    for dir in [&one, &two] {
+        std::fs::create_dir_all(dir).unwrap();
+        app.add_workspace_folder(dir.clone());
+    }
+    let (one, two) = (one.canonicalize().unwrap(), two.canonicalize().unwrap());
+    // Two panes, two lanes, one branch name between them.
+    for (i, dir) in [(0u64, &one), (1, &two)] {
+        app.lane_panes.insert(
+            1000 + i,
+            crate::terminal_session::LaneRecord {
+                path: dir.display().to_string(),
+                branch: String::from("agent/fix"),
+                agent: None,
+            },
+        );
+    }
+    let working = vec![String::from("claude")];
+    app.agent_ledger
+        .record_write(&one.join("a.rs"), 1, &working);
+    app.agent_ledger
+        .record_write(&two.join("b.rs"), 2, &working);
+    let row = app.agent_lane_rows().remove(0);
+    assert!(
+        !row.contains("agent/fix"),
+        "a branch shared by two groups names neither: {row}"
+    );
+    assert!(
+        row.contains("one-fix 1") && row.contains("two-fix 1"),
+        "both groups fall back to their folder labels: {row}"
+    );
+    // One lane alone: the branch is unique again, so it names its group.
+    app.lane_panes.remove(&1001);
+    let row = app.agent_lane_rows().remove(0);
+    assert!(
+        row.contains("agent/fix 1"),
+        "a unique branch still names its lane: {row}"
+    );
+}
+
+#[test]
 fn a_grouped_review_queue_row_survives_the_status_bar() {
     // The bar is one row and elides the MIDDLE (`elide_middle`), so a row
     // long enough to be cut loses its group labels — the one thing grouping
