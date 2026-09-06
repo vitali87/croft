@@ -2153,6 +2153,23 @@ pub enum BranchPurpose {
     Rebase,
 }
 
+/// A left press forwarded to a mouse-tracking child (#474): which pane got
+/// it, the host cell it landed on, and whether the drag since has become
+/// croft's own text selection (a child that asked only for clicks cannot use
+/// a drag, so croft keeps it). See `App::terminal_pointer_forwarded`.
+///
+/// The pane is held by its stable `uid`, NOT its index in `App::terminals`:
+/// a pane closed while the button is held (the close chord, the header
+/// button) shifts every later pane one slot left, and an index would then
+/// deliver the release to the neighbour while the child that got the press
+/// keeps a button it thinks is still down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForwardedPointer {
+    pane: u64,
+    press: (u16, u16),
+    selecting: bool,
+}
+
 /// State for edge auto-scroll during a terminal drag-selection. `dir` is
 /// -1 (pointer above the top edge, scroll into history) or +1 (below the
 /// bottom edge, scroll toward live); `col` is the last drag column so the
@@ -2367,6 +2384,10 @@ pub struct App {
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
     copy_on_select: bool,
+    /// Tailspin highlighting in rendered log views (#466): the inverse of
+    /// the `disable_log_highlight` preference. Pushed into `log_view`'s
+    /// default for views opened later and into every open view on toggle.
+    log_highlight: bool,
     /// Built-in secret redaction rules are in the trigger set (#360).
     /// Settings "Terminal: Redact Secrets"; stored inverted in config.json
     /// as `disable_secret_redaction` so the default is on.
@@ -2878,6 +2899,28 @@ pub struct App {
     /// or its maximize-rail row). The reorder is live: crossing another pane
     /// or rail row moves the terminal there immediately, and this follows it.
     terminal_drag_from: Option<usize>,
+    /// A left press that was FORWARDED to a pane because its child tracks
+    /// the mouse (#474), live until the release. The release goes to the
+    /// same pane, clamped to its grid if the pointer left it. What the drag
+    /// in between does depends on what the child asked for: motion reports
+    /// under 1002/1003, croft's own text selection anchored at the press
+    /// cell under click-only 1000 (Claude Code's mode), since a child that
+    /// never asked for motion cannot use the drag and the user still needs
+    /// to copy text out of it. The pane is named by `uid`, so a pane closed
+    /// or reordered mid-press is found again (or found gone) rather than
+    /// confused with whichever pane now holds its old index. Every later
+    /// event of the gesture -- motion, selection extension, release,
+    /// copy-on-select -- is aimed at THAT pane, never at the active one:
+    /// the keyboard can move the active pane while the button is held.
+    ///
+    /// Same hole as `terminal_drag_from`: a modal that takes the screen
+    /// while the button is held swallows the mouse-up in `handle_mouse`'s
+    /// overlay gates, so the latch stays set until the next release. Two
+    /// consequences the older latch never had: the child keeps a button it
+    /// believes is down until its next click, and the auto-scroll tick keeps
+    /// standing down for a pane that is not active. Reaching it needs a
+    /// keystroke with the button held.
+    terminal_pointer_forwarded: Option<ForwardedPointer>,
     /// True while one terminal pane fills the panel's width and the others
     /// are listed in the right-side rail (the per-pane `⛶` button / Cmd+K M).
     /// Distinct from `terminal_maximized`, which grows the panel vertically
@@ -3379,6 +3422,11 @@ pub struct App {
     /// VS Code-style Cmd+P / Ctrl+P quick-open file finder. None when
     /// the modal is closed.
     pub file_finder: Option<crate::widgets::file_finder::FileFinder>,
+    /// The range the last hinted quick-open pick installed, and the file it
+    /// was installed in: the next pick clears it if it is still the
+    /// selection there, and nothing else, so a selection the user made by
+    /// hand (or extended from it) survives a re-pick of the same file.
+    quick_open_range: Option<(PathBuf, crate::widgets::editor::EditorSelection)>,
     /// VS Code-style Cmd+Shift+P / Ctrl+Shift+P command palette. None when
     /// the modal is closed.
     pub command_palette: Option<crate::widgets::command_palette::CommandPalette>,
@@ -4154,6 +4202,15 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
+        // Seed the log view's opening default from the saved preference
+        // BEFORE any log can be opened (#466): the toggle keeps the two in
+        // step afterwards, but a startup that set only `App::log_highlight`
+        // opened the first log highlighted despite a saved opt-out. Test-
+        // inert like the keymap and matcher loads below: the suite builds
+        // hundreds of apps on parallel threads, and an unguarded write to
+        // the process-wide default from each would race the tests that
+        // read it; those call `seed_log_highlight_default` explicitly.
+        seed_log_highlight_default_at_startup(!loaded_prefs.disable_log_highlight);
         // Same treatment for keybindings: a row croft refused (an unknown
         // command id, a gesture that can never fire, a reserved bare click)
         // used to vanish silently, which reads as croft being broken rather
@@ -4282,6 +4339,7 @@ impl App {
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
+            log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
             auto_save: loaded_prefs.auto_save,
@@ -4470,6 +4528,7 @@ impl App {
             terminal_rail_revealed: None,
             terminal_label_rects: Vec::new(),
             terminal_drag_from: None,
+            terminal_pointer_forwarded: None,
             terminal_pane_maximized: false,
             bottom_panel_tab: BottomPanelTab::Terminal,
             problems: crate::widgets::problems::ProblemsPanel::new(),
@@ -4602,6 +4661,7 @@ impl App {
             closed_terminals: Vec::new(),
             closed_tabs: Vec::new(),
             file_finder: None,
+            quick_open_range: None,
             command_palette: None,
             go_to_symbol: None,
             workspace_symbols: None,
@@ -13443,6 +13503,14 @@ impl App {
     /// Masks on screen across every pane, as painted last frame.
     fn redacted_on_screen(&self) -> usize {
         self.terminals.iter().map(|t| t.redacted_on_screen).sum()
+    }
+
+    /// The current index of the pane a forwarded left press went to (#474),
+    /// or `None` once that pane has been closed. Looked up by uid on every
+    /// event of the gesture because a close or reorder while the button is
+    /// held renumbers the vector under a stored index.
+    fn forwarded_pane_index(&self, fp: ForwardedPointer) -> Option<usize> {
+        self.terminals.iter().position(|t| t.uid() == fp.pane)
     }
 
     /// The clipboard's view of terminal text: rules marked `copy: masked`
@@ -23492,6 +23560,7 @@ impl App {
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
+                    "toggle:log_highlight" => self.toggle_log_highlight(),
                     "toggle:secret_redaction" => self.toggle_secret_redaction(),
                     "toggle:format_on_type" => self.toggle_format_on_type(),
                     "cmd:color_theme" => {
@@ -23651,6 +23720,14 @@ impl App {
                     "Terminal: Copy on Selection: {}{}",
                     on_off(self.copy_on_select),
                     prov("copy_on_select")
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:log_highlight"),
+                label: format!(
+                    "Log: Highlighting (tailspin): {}{}",
+                    on_off(self.log_highlight),
+                    prov("disable_log_highlight")
                 ),
             },
             ListRow {
@@ -28989,6 +29066,27 @@ impl App {
         if state.last.elapsed() < std::time::Duration::from_millis(30) {
             return false;
         }
+        // A forwarded click-only drag (#474) may be on a pane other than the
+        // active one: Cmd+] moves the active pane mid-drag, and no further
+        // Drag event arrives while the pointer rests past the edge to
+        // re-check. This tick scrolls the ACTIVE pane, so it stands down
+        // rather than walk the wrong pane's scrollback -- HELD, not dropped:
+        // the parked pointer sends nothing to re-arm, so cycling back to the
+        // origin pane must resume the scroll on its own (and the untouched
+        // `last` stamp makes that first tick fire at once).
+        if let Some(fp) = self.terminal_pointer_forwarded {
+            let Some(idx) = self.forwarded_pane_index(fp) else {
+                // The origin pane is gone (closed by its button while the
+                // pointer was parked): nothing can ever resume this, so
+                // drop the gesture rather than hold it to the release.
+                self.terminal_pointer_forwarded = None;
+                self.terminal_select_autoscroll = None;
+                return false;
+            };
+            if idx != self.active_terminal {
+                return false;
+            }
+        }
         self.terminal_mut().autoscroll_select(state.dir, state.col);
         self.terminal_select_autoscroll = Some(TerminalSelectAutoScroll {
             last: std::time::Instant::now(),
@@ -31300,18 +31398,91 @@ impl App {
             return;
         };
         let path = finder.selected_entry().map(|e| e.path.clone());
+        let hint = finder.line_hint();
         if let Some(path) = path {
             self.close_file_finder();
-            match self.editor.open_preview(&path) {
+            // `alpha:236-239` (#472): land on the line, centred, and select
+            // the range so it reads as highlighted; `alpha:236` lands with
+            // nothing selected, since one line is a place, not a span.
+            let opened = match hint {
+                Some(hint) => {
+                    let row = hint.line.saturating_sub(1);
+                    let col = hint.col.map_or(0, |c| c.saturating_sub(1));
+                    self.open_at(&path, row, col)
+                }
+                None => self.editor.open_preview(&path),
+            };
+            match opened {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
+                    // A range an earlier hinted pick installed is cleared if
+                    // it is still the selection in its tab, so neither
+                    // `alpha:12` nor a bare `alpha` keeps showing it; a
+                    // selection the user made or extended since is theirs
+                    // and stays. Stale secondary carets never survive a
+                    // pick, as they never survive a click: the next
+                    // keystroke would edit at every one of them.
+                    if let Some((prev, sel)) = self.quick_open_range.take()
+                        && let Some(idx) = self.editor.find_tab_with_path(&prev)
+                        && self.editor.editors[idx].selection == Some(sel)
+                    {
+                        self.editor.editors[idx].selection = None;
+                    }
+                    if hint.is_some() {
+                        self.editor.clear_selection();
+                    }
+                    self.editor.collapse_carets();
+                    if let Some(end) = hint.and_then(|h| h.end) {
+                        let start = self.editor.cursor_row;
+                        let last = self.editor.lines.len().saturating_sub(1);
+                        let end_row = end.saturating_sub(1).clamp(start, last);
+                        let end_col = self
+                            .editor
+                            .lines
+                            .get(end_row)
+                            .map_or(0, |l| l.chars().count());
+                        let sel = crate::widgets::editor::EditorSelection {
+                            anchor: (end_row, end_col),
+                            head: (start, 0),
+                        };
+                        self.editor.selection = Some(sel);
+                        self.quick_open_range = Some((path.to_path_buf(), sel));
+                        // The landing line is the head, and the cursor sits at
+                        // the head as every other selection-installing path
+                        // leaves it: Shift+motion extends from the cursor, and
+                        // the paint-time clamp keeps the cursor on screen, so
+                        // a range taller than the viewport still shows the
+                        // line the user asked for, centred by `open_at`, with
+                        // the selection running down from it.
+                        self.editor.cursor_row = start;
+                        self.editor.cursor_col = 0;
+                    }
                     // VS Code's `explorer.autoReveal` analogue:
                     // expand every parent dir of the picked file
                     // and park the cursor on its row so the user
                     // sees where in the workspace the file lives.
                     self.tree.reveal_path(&path);
                     self.focus_pane(Pane::Editor);
-                    self.status = format!("Opened {}", self.status_path(&path));
+                    // The status names the lines landed on: a number past the
+                    // file (or one that saturated in the parser) was clamped
+                    // above, and the clamped truth is the useful signal.
+                    let last_line = self.editor.lines.len().max(1);
+                    self.status = match hint {
+                        Some(hint) => match hint.end {
+                            Some(end) => format!(
+                                "Opened {}:{}-{}",
+                                self.status_path(&path),
+                                hint.line.min(last_line),
+                                end.min(last_line)
+                            ),
+                            None => format!(
+                                "Opened {}:{}",
+                                self.status_path(&path),
+                                hint.line.min(last_line)
+                            ),
+                        },
+                        None => format!("Opened {}", self.status_path(&path)),
+                    };
                 }
                 Err(e) => {
                     self.status = format!("Open failed: {e}");
@@ -32398,6 +32569,7 @@ impl App {
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
+            Cmd::ToggleLogHighlight => self.toggle_log_highlight(),
             Cmd::CollapseTerminalPane => self.collapse_active_terminal_pane(),
             Cmd::RestoreTerminalPanes => self.restore_all_terminal_panes(),
             Cmd::ToggleSecretRedaction => self.toggle_secret_redaction(),
@@ -35552,17 +35724,20 @@ impl App {
         // one the user had aimed at the TUI in the terminal. Same predicate as
         // the dispatch below, indexed by the pane that was CLICKED.
         let child_owns_pointer = bound_mouse.is_some_and(|(ctx, gesture, _)| {
-            // ONLY THE WHEEL. A tracking child can only "own" a gesture croft
-            // actually forwards, and croft forwards exactly one kind:
-            // `report_mouse` has three production call sites and all three
-            // construct WheelUp/WheelDown. No path constructs
-            // MouseButtonKind::Left/Middle/Right outside `encode_mouse_report`'s
-            // own tests, so declining a bound CLICK hands it to nobody -- and
-            // the built-in Down(Left) arm then runs anyway, since unlike
-            // click-to-move-cursor it never consults `mouse_reporting()`.
+            // Only the gestures croft actually FORWARDS: a tracking child can
+            // own nothing else. That is the wheel (both wheel arms below) and
+            // the LEFT button -- press in the Down(Left) arm, motion in Drag,
+            // release in Up -- since #474, when clicking a TUI's own controls
+            // (Claude Code's diff-panel ×) started working. `Click` and
+            // `DoubleClick` are both Down(Left), so both are the child's.
+            // Middle and right clicks are still croft's (paste, the context
+            // menu), so a binding on them fires over a tracking child too.
             matches!(
                 gesture.kind,
-                crate::keymap::GestureKind::WheelUp | crate::keymap::GestureKind::WheelDown
+                crate::keymap::GestureKind::WheelUp
+                    | crate::keymap::GestureKind::WheelDown
+                    | crate::keymap::GestureKind::Click
+                    | crate::keymap::GestureKind::DoubleClick
             ) && matches!(ctx, crate::keymap::MouseContext::Terminal)
                 && terminal_hit.is_some_and(|idx| {
                     // Tracking is not enough: `terminal_at_pos` hit-tests
@@ -35616,12 +35791,16 @@ impl App {
         // that state anyway: swallowing would cost the built-in and buy
         // nothing. Omitting it here disabled the built-in Ctrl+click over
         // every full-screen TUI for anyone who bound only `ctrl+double_click`.
-        // `child_owns_pointer` used to carry this branch's deferral too, but it
-        // is wheel-only now (croft forwards no clicks), so it is always false
-        // here and cannot decide anything. The question the swallow actually
-        // needs answered is narrower: would declining this click COST the user
-        // a built-in that was going to act? For Ctrl/Cmd the built-in opens a
-        // URL or a file reference, so defer when either is under the cursor.
+        // Over a tracking child the click is forwarded to it (#474), so
+        // `child_owns_pointer` is true for a left click there and the swallow
+        // steps aside: the recording above already declined, the bound double
+        // is unreachable, and swallowing would only cost the child its press.
+        // Where the child does not own it, the question is narrower: would
+        // declining this click COST the user a built-in that was going to act?
+        // For Ctrl/Cmd the built-in opens a URL or a file reference, so defer
+        // when either is under the cursor -- that link-open runs BEFORE the
+        // forward in the Down(Left) arm, so it applies over a tracking child
+        // as well.
         let builtin_would_act = matches!(bound_mouse, Some((ctx, _, _)) if
             matches!(ctx, crate::keymap::MouseContext::Terminal))
             && (m.modifiers.contains(KeyModifiers::CONTROL)
@@ -35631,6 +35810,7 @@ impl App {
         if let Some((ctx, gesture, None)) = bound_mouse
             && !gesture.mods.is_empty()
             && !builtin_would_act
+            && !child_owns_pointer
             && self.keymap.is_double_click_prefix(gesture, ctx)
         {
             // Focus still moves, as a click in a pane always does — otherwise
@@ -37526,6 +37706,42 @@ impl App {
                     {
                         return;
                     }
+                    // A child tracking the mouse (Claude Code's diff panel,
+                    // htop, lazygit, vim with `mouse=a`) gets the click
+                    // itself (#474): an SGR/X10 press now, motion under
+                    // 1002/1003 as the drag goes, and the release on
+                    // mouse-up, all aimed at THIS pane via
+                    // `terminal_pointer_forwarded`. Shift is the bypass,
+                    // the same one the wheel has: croft's own selection when
+                    // held. `report_mouse` is the whole gate -- it declines
+                    // when the child is not tracking or the cell is on the
+                    // border, and either way the click falls through to the
+                    // selection below. The Cmd/Ctrl link-open above still
+                    // wins, as in VS Code and iTerm2: the modifier is
+                    // croft's, and Cmd has no mouse-report encoding anyway.
+                    // A stale croft highlight goes, as it does for a plain
+                    // click anywhere else -- the user is aiming at the TUI,
+                    // not at the text under it -- and the double-click
+                    // tracker is not armed: the pair, if any, is the child's.
+                    if !m.modifiers.contains(KeyModifiers::SHIFT)
+                        && self.terminal_mut().report_mouse(
+                            MouseButtonKind::Left,
+                            MouseAction::Press,
+                            m.column,
+                            m.row,
+                            mouse_mods(&m),
+                        )
+                    {
+                        self.terminal_mut().clear_selection();
+                        self.editor.clear_selection();
+                        self.terminal_pointer_forwarded = Some(ForwardedPointer {
+                            pane: self.terminals[idx].uid(),
+                            press: (m.column, m.row),
+                            selecting: false,
+                        });
+                        self.terminal_click.clear();
+                        return;
+                    }
                     // Shift+click extends the existing selection to the
                     // clicked cell (VS Code / iTerm2) instead of starting a
                     // fresh one.
@@ -37657,6 +37873,61 @@ impl App {
                 // the one tracker not on this list behaved differently from
                 // every other one for no reason a user could discover.
                 self.modified_click.clear_if_moved(m.column, m.row);
+                // A drag after a press that went to a mouse-tracking child
+                // (#474) belongs to whoever can use it. A child that asked
+                // for motion (1002/1003) gets it, at the pane that got the
+                // press, clamped to that pane's grid so a pointer that
+                // wanders out reports the edge cell instead of vanishing. A
+                // child that asked only for clicks (1000: Claude Code) has
+                // no use for a drag, so the drag is croft's text selection,
+                // anchored at the PRESS cell on its first motion so nothing
+                // is lost by the press having been forwarded, then extended
+                // here -- on the ORIGIN pane, found by uid, not through
+                // `terminal_mut()`: Cmd+] can move the active pane while the
+                // button is held, and the generic drag path below would then
+                // extend the wrong pane's selection and leave this one at its
+                // one-cell anchor. Edge auto-scroll is armed only while the
+                // origin is still the active pane, because the tick that
+                // services it scrolls the active one. The child still gets
+                // the release either way. A gesture whose pane is gone ends
+                // here with nothing to deliver.
+                if let Some(fp) = self.terminal_pointer_forwarded {
+                    let Some(idx) = self.forwarded_pane_index(fp) else {
+                        self.terminal_pointer_forwarded = None;
+                        self.terminal_select_autoscroll = None;
+                        return;
+                    };
+                    if self.terminals[idx].mouse_motion_reporting() {
+                        let (col, row) = self.terminals[idx].clamp_to_grid(m.column, m.row);
+                        // Motion reporting was just checked, so the verdict
+                        // is known; `let _` says "already decided", not
+                        // "ignored". The encoder re-checks the same modes
+                        // as its own guard; the two are intentional.
+                        let _ = self.terminals[idx].report_mouse(
+                            MouseButtonKind::Left,
+                            MouseAction::Motion,
+                            col,
+                            row,
+                            mouse_mods(&m),
+                        );
+                        return;
+                    }
+                    if !fp.selecting {
+                        self.terminals[idx].start_selection_at(fp.press.0, fp.press.1);
+                        self.terminal_pointer_forwarded = Some(ForwardedPointer {
+                            selecting: true,
+                            ..fp
+                        });
+                    }
+                    let dir = self.terminals[idx].drag_select_to(m.column, m.row);
+                    self.terminal_select_autoscroll = (dir != 0 && idx == self.active_terminal)
+                        .then_some(TerminalSelectAutoScroll {
+                            dir,
+                            col: m.column,
+                            last: std::time::Instant::now(),
+                        });
+                    return;
+                }
                 // Terminal drag-selection is handled before the per-pane
                 // branches so it keeps extending even when the pointer
                 // leaves the pane: dragging past the bottom edge is how the
@@ -37755,6 +38026,48 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // The release of a press that was forwarded to a tracking
+                // child goes to the same pane (#474), clamped to its grid
+                // like the drag. `report_mouse` may decline if the child
+                // dropped tracking mid-press, which is the child's own
+                // choice; there is nothing croft should do with the release
+                // instead. The pane is found by uid, so one closed under
+                // the held button is simply gone rather than mistaken for
+                // its neighbour. The whole gesture ends here, aimed at the
+                // ORIGIN pane and never the active one: a click, or a drag
+                // the child asked for, gets no copy-on-select, click-to-move,
+                // annotation or secret popup; a drag the Drag arm turned into
+                // croft's selection is finalised on that pane (`end_drag`,
+                // then copy-on-select), the same tail the ordinary mouse-up
+                // below runs for the active pane.
+                if let Some(fp) = self.terminal_pointer_forwarded.take() {
+                    if let Some(idx) = self.forwarded_pane_index(fp) {
+                        let (col, row) = self.terminals[idx].clamp_to_grid(m.column, m.row);
+                        self.terminals[idx].report_mouse(
+                            MouseButtonKind::Left,
+                            MouseAction::Release,
+                            col,
+                            row,
+                            mouse_mods(&m),
+                        );
+                        if fp.selecting {
+                            self.terminals[idx].end_drag();
+                            if self.copy_on_select
+                                && self.terminals[idx]
+                                    .selection()
+                                    .is_some_and(|s| s.has_area())
+                            {
+                                let text = self
+                                    .terminal_text_for_copy(self.terminals[idx].selection_text());
+                                if !text.is_empty() {
+                                    copy_to_clipboard(&text);
+                                }
+                            }
+                        }
+                    }
+                    self.terminal_select_autoscroll = None;
+                    return;
+                }
                 // Releasing the button ends any terminal edge auto-scroll
                 // and finalizes a drag-selection (the alt-screen content
                 // anchor is captured at release).
@@ -38482,6 +38795,40 @@ impl App {
         }
     }
 
+    /// Palette "Log: Toggle Highlighting (tailspin)" and the Settings row
+    /// (#466): flip tailspin colouring for every open rendered log, steer
+    /// the default for logs opened later, and persist the preference.
+    pub fn toggle_log_highlight(&mut self) {
+        self.set_log_highlight(!self.log_highlight);
+        self.status = if self.log_highlight {
+            String::from("Log highlighting (tailspin): on")
+        } else {
+            String::from("Log highlighting (tailspin): off")
+        };
+        if !cfg!(test) {
+            let _ = crate::prefs::save_disable_log_highlight(!self.log_highlight);
+        }
+    }
+
+    /// Apply a log-highlight setting everywhere it lives (#466): the app's
+    /// field, the log view's opening default for logs opened later, and
+    /// every log view already open in any split group. Shared by the
+    /// palette / Settings toggle and by a settings remerge (a workspace
+    /// layer setting `disable_log_highlight`), so the two cannot drift.
+    fn set_log_highlight(&mut self, on: bool) {
+        self.log_highlight = on;
+        seed_log_highlight_default(on);
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                if let Some(log) = ed.log.as_mut() {
+                    log.set_highlight(on);
+                }
+            }
+        }
+    }
+
     fn toggle_copy_on_select(&mut self) {
         self.copy_on_select = !self.copy_on_select;
         self.status = if self.copy_on_select {
@@ -38741,6 +39088,14 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        // Only on a real change: the startup remerge runs before any log is
+        // open and the field already holds the preference, and writing the
+        // process-wide default from here under test would race the tests
+        // that read it (see `seed_log_highlight_default`).
+        let want_highlight = !p.disable_log_highlight;
+        if want_highlight != self.log_highlight {
+            self.set_log_highlight(want_highlight);
+        }
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
         if !p.disable_inline_blame && !self.inline_blame_enabled {
@@ -45002,6 +45357,35 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
+/// Push a log-highlight setting into the log view's process-wide opening
+/// default (#466), from the toggle and from a settings remerge.
+pub(crate) fn seed_log_highlight_default(on: bool) {
+    crate::log_view::set_default_highlight(on);
+}
+
+/// The startup seed of that default from the saved preference (#466). In
+/// the shipped binary it is the same write; under test it RECORDS the value
+/// per thread instead, because the suite builds hundreds of apps on
+/// parallel threads and each write would race the tests that read the
+/// process-wide default. The record keeps the call site observable: a test
+/// asserts what `App::new` decided to seed, not merely that a setter sets.
+#[cfg(not(test))]
+fn seed_log_highlight_default_at_startup(on: bool) {
+    crate::log_view::set_default_highlight(on);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What the most recent `App::new` on this thread would have seeded.
+    pub(crate) static STARTUP_LOG_HIGHLIGHT_SEED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn seed_log_highlight_default_at_startup(on: bool) {
+    STARTUP_LOG_HIGHLIGHT_SEED.with(|cell| cell.set(Some(on)));
+}
+
 /// Build the up-to-date version of an open diff view from its recorded
 /// source (#471), or `None` when there is nothing new to build: a `Static`
 /// view, a file-backed view whose sides have not moved on disk, a git-command
@@ -45095,8 +45479,8 @@ fn rebuild_diff_view(
 }
 
 /// Fold a mouse event's Shift/Alt/Ctrl state into the form `report_mouse`
-/// wants, so a forwarded wheel event carries the same modifiers the child
-/// would have seen natively.
+/// wants, so a forwarded wheel notch or left-button event carries the same
+/// modifiers the child would have seen natively.
 fn mouse_mods(m: &MouseEvent) -> MouseMods {
     MouseMods {
         shift: m.modifiers.contains(KeyModifiers::SHIFT),
