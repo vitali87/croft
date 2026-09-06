@@ -2339,6 +2339,12 @@ pub struct Editor {
     /// declined by a deliberate cap rather than by failing to parse (#493).
     /// Consumed by the fallback viewer's status line: a browser silently
     /// replaced by a hex dump reads as a bug rather than as a policy.
+    /// Keyed on the path it describes and never cleared on entry: an open
+    /// can set it and then fail before reaching any viewer, and `open_hex`
+    /// is also reached directly by "Reopen as Hex" without passing through
+    /// `open`. Keying makes a surviving note explain only its own file,
+    /// which is a stronger guarantee than the clear-after-open the sibling
+    /// `pdf_restore_page` uses, and does not depend on finding every path.
     route_note: Option<(std::path::PathBuf, String)>,
     /// The `edit_seq` at which `App::sync_provenance` last considered THIS
     /// buffer for a persisted map (#349), so the history read happens once
@@ -3920,7 +3926,7 @@ impl Editor {
                     // failure (#493): the file still opens as hex, but the
                     // reason rides along so the viewer can say why the
                     // browser it expected was declined.
-                    Err(e) if e.to_string().contains("too large to list") => {
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
                     }
                     Err(_) => {}
@@ -4024,29 +4030,35 @@ impl Editor {
                 match self.open_archive(path, crate::archive::ArchiveKind::Zip) {
                     Ok(()) => return Ok(()),
                     // The same deliberate cap as the extension route (#493).
-                    Err(e) if e.to_string().contains("too large to list") => {
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
                     }
                     Err(_) => {}
                 }
             }
             // The remaining container kinds browse too when they parse.
-            Some(crate::magic::Magic::Gzip)
-                if self
-                    .open_archive(path, crate::archive::ArchiveKind::TarGz)
-                    .is_ok() =>
-            {
-                return Ok(());
+            // Same shape as the zip arm above: a SIZE refusal is policy,
+            // so its reason rides to the hex fallback rather than vanishing.
+            Some(crate::magic::Magic::Gzip) => {
+                match self.open_archive(path, crate::archive::ArchiveKind::TarGz) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
             }
             Some(crate::magic::Magic::Sqlite) => {
                 return self.open_sqlite(path);
             }
-            Some(crate::magic::Magic::Tar)
-                if self
-                    .open_archive(path, crate::archive::ArchiveKind::Tar)
-                    .is_ok() =>
-            {
-                return Ok(());
+            Some(crate::magic::Magic::Tar) => {
+                match self.open_archive(path, crate::archive::ArchiveKind::Tar) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
             }
             _ => {}
         }
