@@ -24597,15 +24597,17 @@ impl App {
     }
 
     /// A provisioning of `host` succeeded (#364): any remembered refusal is
-    /// stale, in memory and on disk.
+    /// stale, in memory and on disk. The disk side runs unconditionally:
+    /// the file is shared by every croft on the machine, so another
+    /// instance may have recorded a refusal this one never loaded, and
+    /// `forget_refused_host` is a no-op when there is nothing to forget.
     fn note_provisioning_succeeded(&mut self, host: &str) {
         let key = host.to_ascii_lowercase();
-        if self.remote_offer_refused.remove(&key) {
-            let _ = crate::remote::forget_refused_host(
-                &crate::remote::refused_hosts_path(&croft_cache_dir()),
-                &key,
-            );
-        }
+        self.remote_offer_refused.remove(&key);
+        let _ = crate::remote::forget_refused_host(
+            &crate::remote::refused_hosts_path(&croft_cache_dir()),
+            &key,
+        );
     }
 
     /// Drop the open offer and its status line, if any (#364).
@@ -39201,6 +39203,13 @@ impl App {
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
         self.remote_offer_excluded = p.remote_offer_excluded_hosts.clone();
+        // Sampling stops while the offer is off, so the per-pane memory stops
+        // tracking reality; kept, it would make the first session seen after
+        // a re-enable look like a continuation of the last one seen before
+        // it, and that pane would never be offered that host again (#364).
+        if self.remote_offer_disabled {
+            self.ssh_offer_seen.clear();
+        }
         if let Some(o) = self.ssh_offer.as_ref()
             && !crate::remote::offer_allowed(
                 &o.host,

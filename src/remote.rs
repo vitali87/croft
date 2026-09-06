@@ -4357,11 +4357,10 @@ pub fn offer_allowed(
     if disabled {
         return false;
     }
-    let lower = host.to_ascii_lowercase();
     if excluded.iter().any(|h| h.eq_ignore_ascii_case(host)) {
         return false;
     }
-    !refused.contains(&lower)
+    !refused.contains(&host.to_ascii_lowercase())
 }
 
 /// Whether a resolved foreground process name is an ssh program (#364): the

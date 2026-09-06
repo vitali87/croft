@@ -41889,6 +41889,53 @@ fn the_offer_switches_apply_on_a_settings_remerge() {
 }
 
 #[test]
+fn switching_the_offer_off_and_on_forgets_what_each_pane_was_last_seen_on() {
+    // While the offer is off the label thread ships no samples, so the
+    // per-pane memory stops tracking reality. Session A on db-1, offer off,
+    // session A ends and session B to db-1 starts, offer on: B is a new
+    // session and must be offered, not mistaken for a continuation of A.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let pane = app.terminals[0].uid();
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(app.ssh_offer.is_some());
+    let mut prefs = crate::prefs::Prefs {
+        disable_remote_offer: true,
+        ..Default::default()
+    };
+    app.apply_merged_settings(&prefs);
+    assert!(app.ssh_offer.is_none(), "the switch took the offer down");
+    // No `None` sample in between: nothing observed the gap.
+    prefs.disable_remote_offer = false;
+    app.apply_merged_settings(&prefs);
+    app.consider_ssh_offer(pane, Some(String::from("db-1")));
+    assert!(
+        app.ssh_offer.as_ref().is_some_and(|o| o.host == "db-1"),
+        "the first session seen after a re-enable is offered"
+    );
+}
+
+#[test]
+fn cmd_k_g_with_no_offer_open_says_so_instead_of_connecting() {
+    // The chord's guidance branch: nothing to accept, nothing launched, a
+    // status that says where the offer comes from. (The accept branch runs
+    // `request_remote_launch`, which spawns a real ssh; `accept_ssh_offer`
+    // is covered directly instead of reaching the network from a test.)
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.ssh_offer.is_none());
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('g'), KeyModifiers::NONE)));
+    assert!(
+        app.status.starts_with("No ssh workspace offer is open"),
+        "status: {}",
+        app.status
+    );
+    assert!(app.connect_dialog.is_none(), "nothing was launched");
+    assert!(app.pending_remote_launch_host.is_none());
+}
+
+#[test]
 fn ssh_samples_from_the_label_thread_drive_the_offer_by_shell_pid() {
     // The label thread ships `(shell pid, host)`; the app maps the shell pid
     // to the pane's uid and feeds the same transition logic the direct tests
@@ -41958,4 +42005,39 @@ fn a_failed_provisioning_is_remembered_and_a_later_success_forgets_it() {
     app.consider_ssh_offer(pane, None);
     app.consider_ssh_offer(pane, Some(String::from("db-1")));
     assert!(app.ssh_offer.is_some(), "and the host is offered again");
+}
+
+#[test]
+fn a_success_forgets_a_refusal_another_croft_recorded() {
+    // The refusal file is shared by every croft on the machine. A refusal
+    // this instance never loaded (recorded by another one after this one
+    // started) must still be erased by a success here, or it outlives the
+    // host that demonstrably works for its whole seven-day TTL.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+        }
+    }
+    let _restore = Restore;
+    let cache = tmp.path().join("cache");
+    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(cache.clone());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.remote_offer_refused.clear();
+    let refused_path = crate::remote::refused_hosts_path(&cache);
+    // "Another instance" writes the refusal behind this one's back.
+    crate::remote::remember_refused_host(&refused_path, "db-1", std::time::SystemTime::now())
+        .unwrap();
+    assert!(
+        crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now())
+            .contains("db-1")
+    );
+    app.note_provisioning_succeeded("DB-1");
+    assert!(
+        !crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now())
+            .contains("db-1"),
+        "the disk refusal is gone even though this instance never held it"
+    );
 }
