@@ -1712,6 +1712,7 @@ fn build_tab_context_menu_items(
 ///   Delete to a count and keeps Rename on a single entry only.
 /// * Right-click on empty tree space, or on the workspace root row →
 ///   workspace-scoped actions: New File, New Folder, Paste.
+///
 /// Test-side entry: reads the real config dir, which the tests that use it
 /// never populate with viewers; the app itself goes through
 /// [`build_tree_context_menu_items_in_dir`] with the dir it carries.
