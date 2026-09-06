@@ -38468,6 +38468,55 @@ fn clicking_a_collapsed_strip_gives_the_pane_its_width_back() {
 }
 
 #[test]
+fn a_strip_on_the_sidebar_seam_still_unfolds_its_pane() {
+    // #468: the default terminal is the LEFTMOST pane, and its strip sits on
+    // the editor column's left edge, which is exactly the column the sidebar
+    // seam claims for a resize drag. That hit-test runs before the strip's,
+    // so a click on the left pane's strip started a drag and the pane could
+    // never be brought back; a pane opened to the right sat clear of the seam
+    // and unfolded fine. Both sidebar positions are covered because the seam
+    // moves with the side bar: on the right it is the column past the editor,
+    // and its two-column grab zone reaches the LAST pane's strip instead.
+    for &pos in &[SideBarPosition::Left, SideBarPosition::Right] {
+        let (_tmp, mut app, mut term) = app_with_terminal_panes(2);
+        app.side_bar_position = pos;
+        let idx = match pos {
+            SideBarPosition::Left => 0,
+            SideBarPosition::Right => 1,
+        };
+        app.toggle_terminal_collapse(idx);
+        term.draw(|f| app.render(f)).unwrap();
+
+        let strip = app.terminal_strip_rects[idx];
+        assert_eq!(strip.width, 1, "{pos:?}: pane {idx} is folded to a strip");
+        let seam = app
+            .sidebar_splitter_x
+            .expect("the side bar is shown, so its seam exists");
+        // The whole point: the strip must lie inside the seam's grab zone
+        // (the seam column and the one left of it), or this proves nothing.
+        assert!(
+            strip.x == seam || strip.x + 1 == seam,
+            "{pos:?}: precondition - strip x={} must meet the seam at x={seam}",
+            strip.x
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            strip.x,
+            strip.y + strip.height / 2,
+        ));
+        assert!(
+            !app.terminals[idx].collapsed,
+            "{pos:?}: the strip on the seam is still the way back out"
+        );
+        assert_eq!(
+            app.splitter_drag, None,
+            "{pos:?}: a click on a strip is not a sidebar resize"
+        );
+    }
+}
+
+#[test]
 fn a_collapsed_pane_is_never_reflowed_into_its_strip() {
     // `resize` clamps to two columns, so rendering a collapsed pane would not
     // crash - it would quietly rewrap the running shell to a two-column grid
