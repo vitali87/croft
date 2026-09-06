@@ -26061,7 +26061,7 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
 }
 
 #[test]
-fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
+fn cmd_k_d_dumps_the_pane_scrollback_into_a_rendered_log_tab() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
@@ -26074,6 +26074,7 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
     )
     .unwrap();
     app.terminals[0].set_manual_name(Some(String::from("bldlog")));
+    app.scrollback_dir = tmp.path().join("dumps");
     app.focus_pane(Pane::Terminal);
     let mut waited = 0u32;
     while !app.terminals[0]
@@ -26102,27 +26103,28 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
         label.contains("bldlog") && label.contains("scrollback"),
         "the scratch tab is named after the pane: {label:?}"
     );
+    // A pane's output carries colour (croft's own run header does, and so
+    // does any shell prompt), so the dump lands in the rendered log view
+    // (#257) rather than a plain scratch buffer; the text is read from the
+    // view once its index is complete and its window loaded.
+    let text: Vec<String> = {
+        let log = app
+            .editor
+            .log
+            .as_mut()
+            .expect("the dump opens as a rendered log");
+        log.finish_index();
+        let n = log.len();
+        log.ensure(0, n).unwrap();
+        (0..n)
+            .map(|i| log.visible_text(i).unwrap_or("").to_string())
+            .collect()
+    };
     assert!(
-        app.editor
-            .lines
-            .iter()
-            .any(|l| l.contains("scrollback-payload-7")),
-        "the pane's output is in the buffer"
+        text.iter().any(|l| l.contains("scrollback-payload-7")),
+        "the pane's output is in the buffer: {text:?}"
     );
-    assert!(
-        !app.editor
-            .lines
-            .last()
-            .map(String::as_str)
-            .unwrap_or("x")
-            .trim()
-            .is_empty()
-            || app.editor.lines.len() > 1,
-        "the blank live-screen tail is trimmed"
-    );
-    let blank_tail = app
-        .editor
-        .lines
+    let blank_tail = text
         .iter()
         .rev()
         .take_while(|l| l.trim().is_empty())
@@ -26130,6 +26132,750 @@ fn cmd_k_d_dumps_the_pane_scrollback_into_a_scratch_editor_tab() {
     assert!(
         blank_tail <= 1,
         "the unused live-screen rows must not pad the buffer: {blank_tail} blank tail lines"
+    );
+}
+
+/// #257: Cmd+K D lands the pane's scrollback in the rendered log view, so
+/// the colours the pane showed survive into the tab, written to a real file
+/// under the scrollback dir because the log view indexes from disk.
+#[test]
+fn cmd_k_d_opens_the_scrollback_as_a_rendered_log_with_its_colours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}GREEN\\033[0m rest\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the pane to print the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQGREEN rest"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    {
+        // The view indexes in the background and parses a window on demand:
+        // read only what it has actually loaded.
+        let log = app
+            .editor
+            .log
+            .as_mut()
+            .expect("the scrollback opens in the rendered log view");
+        log.finish_index();
+        let n = log.len();
+        log.ensure(0, n).unwrap();
+    }
+    let log = app.editor.log.as_ref().unwrap();
+    let row = (0..log.len())
+        .find(|&i| {
+            log.visible_text(i)
+                .is_some_and(|t| t.contains("QQGREEN rest"))
+        })
+        .expect("the coloured row is in the view, escapes stripped");
+    let line = log.line(row).expect("the row is parsed");
+    let green = line
+        .spans
+        .iter()
+        .find(|s| line.text[s.start..s.end].contains("QQGREEN"))
+        .unwrap_or_else(|| panic!("a span colours the green run: {:?}", line.spans));
+    assert_eq!(
+        green.style.fg,
+        Some(crate::ansi_text::AnsiColor::Indexed(2)),
+        "the pane's green reaches the tab as the symbolic green slot"
+    );
+    let path = app.editor.path.clone().expect("the tab has a path");
+    assert!(
+        path.starts_with(&app.scrollback_dir) && path.extension().is_some_and(|e| e == "log"),
+        "the dump is a .log under the scrollback dir: {path:?}"
+    );
+    assert!(
+        path.is_file(),
+        "the dump exists on disk for the view to index"
+    );
+}
+
+/// The dump file is one per pane and overwritten on each Cmd+K D, so the
+/// second dump must show the pane's NEW output, not the first dump's rows
+/// through a stale index, and must not claim a fresh open it did not make.
+#[test]
+fn a_second_dump_of_the_same_pane_shows_its_new_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from(
+                "s=QQ; printf \"\\033[32m${s}ONE\\033[0m\\n\"; read line; \
+                 printf \"\\033[32m${s}TWO\\033[0m\\n\"; sleep 30",
+            ),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the first coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQONE"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    assert!(app.editor.log.is_some(), "the first dump is a rendered log");
+
+    app.terminals[0].write_input(b"\n");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the second coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQTWO"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let text: Vec<String> = {
+        let log = app
+            .editor
+            .log
+            .as_mut()
+            .expect("the second dump is a rendered log too");
+        log.finish_index();
+        let n = log.len();
+        log.ensure(0, n).unwrap();
+        (0..n)
+            .map(|i| log.visible_text(i).unwrap_or("").to_string())
+            .collect()
+    };
+    assert!(
+        text.iter().any(|l| l.contains("QQTWO")),
+        "the second dump shows the new row, not the stale first dump: {text:?}"
+    );
+}
+
+/// The route gate and the open path's sniff must agree: the sniff reads only
+/// the first 8 KiB, so colour that first appears beyond it must route to the
+/// plain buffer, or the user gets an editable file full of raw escapes.
+#[test]
+fn colour_beyond_the_sniff_prefix_keeps_the_dump_plain() {
+    let plain: Vec<String> = (0..400)
+        .map(|i| format!("plain row {i:04} with padding text"))
+        .collect();
+    let mut late = plain.clone();
+    late.push(String::from("\x1b[32mlate colour\x1b[0m"));
+    assert!(
+        late.iter().map(|r| r.len() + 1).take(400).sum::<usize>() > 8192,
+        "fixture: the colour sits past the 8 KiB sniff prefix"
+    );
+    assert!(
+        !scrollback_opens_as_log(&late),
+        "colour past the prefix is not a log to the sniff"
+    );
+    let mut early = vec![String::from("\x1b[32mearly colour\x1b[0m")];
+    early.extend(plain.iter().cloned());
+    assert!(
+        scrollback_opens_as_log(&early),
+        "colour inside the prefix is"
+    );
+    assert!(!scrollback_opens_as_log(&plain), "no colour at all is not");
+}
+
+/// A dump is a pinned tab of its own, as the scratch buffer was: a later
+/// single-click file peek must not replace it, and two panes' dumps must
+/// not share one preview slot.
+#[test]
+fn a_scrollback_dump_is_a_pinned_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}PIN\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQPIN"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the dump tab has a path");
+    let idx = app
+        .editor
+        .find_tab_with_path(&path)
+        .expect("the dump tab is findable by its path");
+    assert!(
+        !app.editor.is_preview(idx),
+        "the dump is pinned, not a replaceable preview"
+    );
+}
+
+/// Two panes may carry the same label (two unnamed shells both read
+/// `terminal`), so the dump file is keyed on the pane's stable uid too: the
+/// second pane's dump must not overwrite and close the first pane's.
+#[test]
+fn two_panes_with_one_label_dump_to_separate_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    let spawn = |tag: &str| {
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                format!("s=QQ; printf \"\\033[32m${{s}}{tag}\\033[0m\\n\"; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap()
+    };
+    app.terminals = vec![spawn("ONE"), spawn("TWO")];
+    for (i, tag) in ["QQONE", "QQTWO"].iter().enumerate() {
+        app.terminals[i].set_manual_name(Some(String::from("same")));
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the pane to print its row",
+            || {
+                app.terminals[i]
+                    .grid_lines()
+                    .0
+                    .iter()
+                    .any(|l| l.contains(tag))
+            },
+        );
+    }
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let first = app.editor.path.clone().expect("first dump has a path");
+    app.active_terminal = 1;
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let second = app.editor.path.clone().expect("second dump has a path");
+    assert_ne!(first, second, "one file per pane, not per label");
+    assert!(
+        first.is_file() && second.is_file(),
+        "both dumps are still on disk"
+    );
+    assert!(
+        app.editor.find_tab_with_path(&first).is_some(),
+        "the first pane's tab survives the second pane's dump"
+    );
+}
+
+/// A dump holds terminal output, so it is written owner-only: the dir is
+/// 0700 and the file 0600 whatever the umask, so another local account
+/// cannot read it.
+#[cfg(unix)]
+#[test]
+fn a_scrollback_dump_is_owner_only_on_disk() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}SEC\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQSEC"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the dump has a path");
+    let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(&app.scrollback_dir)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600, "the dump is readable by its owner alone");
+    assert_eq!(dir_mode, 0o700, "and so is the dir that holds it");
+}
+
+/// A dump file must not be shared across croft processes: the pane uid is
+/// a per-process counter that restarts at 1, so the file name carries the
+/// pid too, as the session handoff file does.
+#[test]
+fn a_scrollback_dump_file_is_scoped_to_this_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}PID\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQPID"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let name = app
+        .editor
+        .path
+        .clone()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .expect("the dump has a file name");
+    assert!(
+        name.contains(&format!("-{}-", std::process::id())),
+        "the file name carries this process's pid: {name}"
+    );
+}
+
+/// A stale tab from an earlier dump can live in ANY editor group, not only
+/// the focused one, and every copy must go before the file is rewritten:
+/// a tab left in another group would read the new bytes through its old
+/// index and paint garbage, with nothing to heal it.
+#[test]
+fn a_second_dump_closes_the_stale_tab_in_every_editor_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}GRP\\033[0m\\n\"; read line; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQGRP"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the first dump has a path");
+    // Split: the dump tab now sits in the left group; the right is focused.
+    app.split_editor();
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let stale_elsewhere = app
+        .editor_layout
+        .inactive_groups()
+        .iter()
+        .any(|g| g.find_tab_with_path(&path).is_some());
+    assert!(
+        !stale_elsewhere,
+        "no other group keeps a tab over the rewritten dump file"
+    );
+    assert!(
+        app.editor.find_tab_with_path(&path).is_some(),
+        "the focused group holds the rebuilt dump"
+    );
+    // The left group held nothing but the stale dump: closing its only tab
+    // leaves a blank group, which every other close path prunes; a dead
+    // blank pane the user never opened must not survive here either.
+    assert!(
+        app.editor_layout
+            .inactive_groups()
+            .iter()
+            .all(|g| !g.is_blank_initial()),
+        "an inactive group emptied by the close is pruned, not left blank"
+    );
+}
+
+/// The private write must never re-mode something it did not create through
+/// a link: `set_permissions` follows symlinks, so a scrollback dir that is a
+/// link is refused and its target keeps its mode. A real dir left loose by
+/// an older run is tightened, and so is a stale dump file.
+#[cfg(unix)]
+#[test]
+fn write_private_refuses_a_symlinked_dir_and_tightens_a_loose_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let loose = tmp.path().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stale = loose.join("old.log");
+    std::fs::write(&stale, "old").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_private(&loose, &stale, "new").expect("a real dir is written");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode(&loose),
+        0o700,
+        "a loose dir from an older run is tightened"
+    );
+    assert_eq!(mode(&stale), 0o600, "and so is a stale dump file");
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "new");
+
+    let target = tmp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let outcome = write_private(&link, &link.join("x.log"), "x");
+    assert!(
+        outcome.is_err(),
+        "a symlinked dir is refused, not written through"
+    );
+    assert_eq!(mode(&target), 0o755, "the link's target keeps its mode");
+    assert!(!target.join("x.log").exists(), "and gains no file");
+
+    // The same for the dump FILE: a link planted where the dump goes must
+    // not have its target truncated, overwritten and re-moded.
+    let outside = tmp.path().join("outside.txt");
+    std::fs::write(&outside, "secret").unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let planted = loose.join("planted.log");
+    std::os::unix::fs::symlink(&outside, &planted).unwrap();
+    let outcome = write_private(&loose, &planted, "new");
+    assert!(outcome.is_err(), "a symlinked dump file is refused");
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "secret",
+        "its target is untouched"
+    );
+    assert_eq!(mode(&outside), 0o644, "and keeps its mode");
+}
+
+/// The prune after a close is scoped to the group the close emptied: a
+/// group the user left blank on purpose (a split with one side cleared) is
+/// not this command's to fold away.
+#[test]
+fn a_scrollback_dump_leaves_a_blank_group_it_did_not_empty_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}KEEP\\033[0m\\n\"; read line; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQKEEP"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    // Split, blank the new (focused) group, then focus the group that holds
+    // the dump: the blank group is now an inactive leaf with no dump in it.
+    app.split_editor();
+    assert!(app.editor_layout.is_split(), "fixture: the editor is split");
+    app.editor.close_tab(0);
+    assert!(
+        app.editor.is_blank_initial(),
+        "fixture: the focused group is blank"
+    );
+    app.focus_editor_group(true);
+    assert!(
+        app.editor.path.is_some(),
+        "fixture: the dump's group is focused"
+    );
+    assert!(
+        app.editor_layout
+            .inactive_groups()
+            .iter()
+            .any(|g| g.is_blank_initial()),
+        "fixture: the blank group is inactive"
+    );
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    assert!(
+        app.editor_layout.is_split(),
+        "a blank group this dump did not empty survives it"
+    );
+}
+
+/// With two inactive groups, one emptied by the close and one the user
+/// blanked, only the emptied one is pruned: the sweep must be scoped to the
+/// group the close emptied, not to blankness.
+#[test]
+fn a_scrollback_dump_prunes_only_the_group_it_emptied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}THREE\\033[0m\\n\"; read line; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQTHREE"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    // [A(dump) | B(focused)] -> blank B -> focus A -> split A again:
+    // [[A(dump) | C(focused)] | B(blank)], so A and B are both inactive.
+    app.split_editor();
+    app.editor.close_tab(0);
+    app.focus_editor_group(true);
+    assert!(
+        app.editor.path.is_some(),
+        "fixture: the dump's group is focused"
+    );
+    app.split_editor();
+    let inactive = app.editor_layout.inactive_groups();
+    assert_eq!(inactive.len(), 2, "fixture: two inactive groups");
+    assert!(
+        inactive.iter().any(|g| g.is_blank_initial())
+            && inactive.iter().any(|g| g
+                .find_tab_with_path(app.editor.path.as_ref().unwrap())
+                .is_some()),
+        "fixture: one blank, one holding the dump"
+    );
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let inactive = app.editor_layout.inactive_groups();
+    assert!(
+        app.editor_layout.is_split(),
+        "the user's blank group keeps its split"
+    );
+    assert_eq!(
+        inactive.len(),
+        1,
+        "exactly the emptied group is gone: {} left",
+        inactive.len()
+    );
+    assert!(
+        inactive[0].is_blank_initial(),
+        "and the survivor is the user's blank group"
+    );
+}
+
+/// A dump that cannot reach the disk still leaves the user the text: the
+/// plain rows land in the scratch buffer and the status says why.
+#[test]
+fn a_scrollback_dump_that_cannot_be_written_falls_back_to_the_plain_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A file where the dir's parent should be: nothing can be created under it.
+    let blocker = tmp.path().join("blocker");
+    std::fs::write(&blocker, "not a dir").unwrap();
+    app.scrollback_dir = blocker.join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}FALL\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQFALL"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    assert!(app.editor.log.is_none(), "no rendered log view opened");
+    assert!(
+        app.editor.lines.iter().any(|l| l.contains("QQFALL")),
+        "the plain text is in the buffer: {:?}",
+        app.editor.lines
+    );
+    assert!(
+        app.status.starts_with("Rendered scrollback unavailable"),
+        "the status says why: {:?}",
+        app.status
+    );
+}
+
+/// Dumps are named by pid, so a croft that exits leaves its dumps behind
+/// with no process that will ever overwrite them; the next dump reaps the
+/// files of pids that are gone and leaves live processes' files alone.
+#[cfg(unix)]
+#[test]
+fn a_scrollback_dump_reaps_the_dumps_of_dead_processes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    std::fs::create_dir_all(&app.scrollback_dir).unwrap();
+    // A pid that is certainly gone: a child that has already been reaped.
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+    let dead = app
+        .scrollback_dir
+        .join(format!("shell-{}-1-scrollback.log", child.id()));
+    std::fs::write(&dead, "gone").unwrap();
+    let live = app
+        .scrollback_dir
+        .join(format!("shell-{}-99-scrollback.log", std::process::id()));
+    std::fs::write(&live, "mine").unwrap();
+    let other = app.scrollback_dir.join("notes.txt");
+    std::fs::write(&other, "not a dump").unwrap();
+    // A pid no `pid_t` can hold reads as alive: a false "alive" only leaks
+    // a file, a false "dead" would delete one.
+    let huge = app.scrollback_dir.join("shell-4294967295-1-scrollback.log");
+    std::fs::write(&huge, "?").unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}REAP\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQREAP"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    assert!(app.editor.path.is_some(), "the dump itself landed");
+    assert!(!dead.exists(), "a dead process's dump is reaped");
+    assert!(live.exists(), "this process's other dump stays");
+    assert!(other.exists(), "a file that is not a dump is not touched");
+    assert!(huge.exists(), "a pid outside pid_t is left alone");
+}
+
+/// The dump is a new on-disk copy of pane output, so the redact rules must
+/// hold on disk too: the matching row is written masked (and gives up its
+/// colour), while a neighbouring row keeps its colour.
+#[test]
+fn a_scrollback_dump_is_redacted_on_disk_and_only_the_masked_row_loses_colour() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[{ "regex": "token \\S+", "action": "redact" }]"#,
+    ));
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from(
+                "s=QQ; printf \"\\033[32m${s}SAFE\\033[0m\\n\"; \
+                 printf \"\\033[31mtoken ${s}SECRET99\\033[0m\\n\"; sleep 30",
+            ),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "both rows", || {
+        app.terminals[0]
+            .grid_lines()
+            .0
+            .iter()
+            .any(|l| l.contains("QQSECRET99"))
+    });
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the dump has a path");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !on_disk.contains("QQSECRET99"),
+        "the secret never reaches the disk: {on_disk:?}"
+    );
+    let masked_row = on_disk
+        .lines()
+        .find(|l| l.contains(crate::triggers::MASK))
+        .expect("the matching row is written masked");
+    assert!(
+        !masked_row.contains('\x1b'),
+        "the masked row gives up its colour: {masked_row:?}"
+    );
+    let safe_row = on_disk
+        .lines()
+        .find(|l| l.contains("QQSAFE"))
+        .expect("the neighbouring row is there");
+    assert!(
+        safe_row.contains("\x1b[32m"),
+        "and keeps its colour: {safe_row:?}"
     );
 }
 
