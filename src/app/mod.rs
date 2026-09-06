@@ -27541,7 +27541,11 @@ impl App {
             // business reading a shell's history.
             let written = write_private(&self.scrollback_dir, &file, &(rows.join("\n") + "\n"));
             // Dumps left by croft processes that have exited are reaped on
-            // the way past: nothing will ever overwrite them.
+            // the way past: nothing will ever overwrite them. Here rather
+            // than at startup because this is the one place the dir grows,
+            // so its size is bounded at the moment it would grow; the cost
+            // is one `read_dir` and one `kill(0)` per stale file, paid by a
+            // command that just wrote a scrollback to disk.
             if written.is_ok() {
                 reap_dead_scrollback_dumps(&self.scrollback_dir);
             }
@@ -27559,15 +27563,19 @@ impl App {
                 }
                 Ok(()) => {
                     // The open path decided this was not a log after all:
-                    // never leave the user an editable file of raw escapes.
+                    // never leave the user an editable file of raw escapes,
+                    // nor the file itself, which nothing will read now.
                     self.close_tabs_with_path_everywhere(&file);
+                    let _ = std::fs::remove_file(&file);
                     fallback_reason = Some(String::from(
                         "Rendered scrollback unavailable; opened as text",
                     ));
                 }
                 Err(e) => {
                     // Fall through to the plain scratch buffer rather than
-                    // lose the dump: a full disk still leaves the text.
+                    // lose the dump: a full disk still leaves the text. A
+                    // partial file, if one was written, serves nobody.
+                    let _ = std::fs::remove_file(&file);
                     fallback_reason = Some(format!(
                         "Rendered scrollback unavailable ({e}); opened as text"
                     ));
@@ -27601,21 +27609,34 @@ impl App {
         while let Some(idx) = self.editor.find_tab_with_path(path) {
             self.editor.close_tab(idx);
         }
-        // The prune is scoped to a group THIS close emptied, as the move
-        // path scopes its own: a group the user left blank on purpose (a
-        // split with one side cleared) is not this command's to fold away.
-        let mut emptied_one = false;
-        for group in self.editor_layout.inactive_groups_mut() {
+        // The prune names the groups THIS close emptied, by position: a
+        // group the user left blank on purpose (a split with one side
+        // cleared) is not this command's to fold away, and a blankness
+        // sweep would take it along with the emptied one.
+        let pre_blank: Vec<bool> = self
+            .editor_layout
+            .inactive_groups()
+            .iter()
+            .map(|g| g.is_blank_initial())
+            .collect();
+        let mut doomed = Vec::new();
+        for (i, group) in self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .enumerate()
+        {
             let mut closed_here = false;
             while let Some(idx) = group.find_tab_with_path(path) {
                 group.close_tab(idx);
                 closed_here = true;
             }
-            emptied_one |= closed_here && group.is_blank_initial();
+            if closed_here && group.is_blank_initial() && !pre_blank[i] {
+                doomed.push(i);
+            }
         }
-        if emptied_one {
-            self.editor_layout
-                .prune_blank_inactive(|t| t.is_blank_initial());
+        if !doomed.is_empty() {
+            self.editor_layout.prune_inactive_at(&doomed);
         }
     }
 
@@ -44966,13 +44987,15 @@ fn write_private(dir: &Path, file: &Path, contents: &str) -> std::io::Result<()>
                 ),
             ));
         }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(file)?;
-        // Likewise for a file left by an earlier dump.
+        // `O_NOFOLLOW` makes the open itself refuse a link, so a link swapped
+        // in between the check above and this open cannot be followed either
+        // (the same pair config_layers.rs uses); the check above only buys
+        // the clearer error. `mode` applies on creation alone, hence the
+        // chmod below for a file left by an earlier dump.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
+        let mut f = opts.open(file)?;
         f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         f.write_all(contents.as_bytes())
     }

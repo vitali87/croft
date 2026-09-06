@@ -26430,6 +26430,74 @@ fn a_scrollback_dump_leaves_a_blank_group_it_did_not_empty_alone() {
     );
 }
 
+/// With two inactive groups, one emptied by the close and one the user
+/// blanked, only the emptied one is pruned: the sweep must be scoped to the
+/// group the close emptied, not to blankness.
+#[test]
+fn a_scrollback_dump_prunes_only_the_group_it_emptied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}THREE\\033[0m\\n\"; read line; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQTHREE"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    // [A(dump) | B(focused)] -> blank B -> focus A -> split A again:
+    // [[A(dump) | C(focused)] | B(blank)], so A and B are both inactive.
+    app.split_editor();
+    app.editor.close_tab(0);
+    app.focus_editor_group(true);
+    assert!(
+        app.editor.path.is_some(),
+        "fixture: the dump's group is focused"
+    );
+    app.split_editor();
+    let inactive = app.editor_layout.inactive_groups();
+    assert_eq!(inactive.len(), 2, "fixture: two inactive groups");
+    assert!(
+        inactive.iter().any(|g| g.is_blank_initial())
+            && inactive.iter().any(|g| g
+                .find_tab_with_path(app.editor.path.as_ref().unwrap())
+                .is_some()),
+        "fixture: one blank, one holding the dump"
+    );
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let inactive = app.editor_layout.inactive_groups();
+    assert!(
+        app.editor_layout.is_split(),
+        "the user's blank group keeps its split"
+    );
+    assert_eq!(
+        inactive.len(),
+        1,
+        "exactly the emptied group is gone: {} left",
+        inactive.len()
+    );
+    assert!(
+        inactive[0].is_blank_initial(),
+        "and the survivor is the user's blank group"
+    );
+}
+
 /// A dump that cannot reach the disk still leaves the user the text: the
 /// plain rows land in the scratch buffer and the status says why.
 #[test]
