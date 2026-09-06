@@ -26276,6 +26276,126 @@ fn write_private_refuses_a_symlinked_dir_and_tightens_a_loose_one() {
     );
     assert_eq!(mode(&target), 0o755, "the link's target keeps its mode");
     assert!(!target.join("x.log").exists(), "and gains no file");
+
+    // The same for the dump FILE: a link planted where the dump goes must
+    // not have its target truncated, overwritten and re-moded.
+    let outside = tmp.path().join("outside.txt");
+    std::fs::write(&outside, "secret").unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let planted = loose.join("planted.log");
+    std::os::unix::fs::symlink(&outside, &planted).unwrap();
+    let outcome = write_private(&loose, &planted, "new");
+    assert!(outcome.is_err(), "a symlinked dump file is refused");
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "secret",
+        "its target is untouched"
+    );
+    assert_eq!(mode(&outside), 0o644, "and keeps its mode");
+}
+
+/// The prune after a close is scoped to the group the close emptied: a
+/// group the user left blank on purpose (a split with one side cleared) is
+/// not this command's to fold away.
+#[test]
+fn a_scrollback_dump_leaves_a_blank_group_it_did_not_empty_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}KEEP\\033[0m\\n\"; read line; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQKEEP"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    // Split, blank the new (focused) group, then focus the group that holds
+    // the dump: the blank group is now an inactive leaf with no dump in it.
+    app.split_editor();
+    assert!(app.editor_layout.is_split(), "fixture: the editor is split");
+    app.editor.close_tab(0);
+    assert!(
+        app.editor.is_blank_initial(),
+        "fixture: the focused group is blank"
+    );
+    app.focus_editor_group(true);
+    assert!(
+        app.editor.path.is_some(),
+        "fixture: the dump's group is focused"
+    );
+    assert!(
+        app.editor_layout
+            .inactive_groups()
+            .iter()
+            .any(|g| g.is_blank_initial()),
+        "fixture: the blank group is inactive"
+    );
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    assert!(
+        app.editor_layout.is_split(),
+        "a blank group this dump did not empty survives it"
+    );
+}
+
+/// A dump that cannot reach the disk still leaves the user the text: the
+/// plain rows land in the scratch buffer and the status says why.
+#[test]
+fn a_scrollback_dump_that_cannot_be_written_falls_back_to_the_plain_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A file where the dir's parent should be: nothing can be created under it.
+    let blocker = tmp.path().join("blocker");
+    std::fs::write(&blocker, "not a dir").unwrap();
+    app.scrollback_dir = blocker.join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}FALL\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQFALL"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    assert!(app.editor.log.is_none(), "no rendered log view opened");
+    assert!(
+        app.editor.lines.iter().any(|l| l.contains("QQFALL")),
+        "the plain text is in the buffer: {:?}",
+        app.editor.lines
+    );
+    assert!(
+        app.status.starts_with("Rendered scrollback unavailable"),
+        "the status says why: {:?}",
+        app.status
+    );
 }
 
 /// Dumps are named by pid, so a croft that exits leaves its dumps behind
@@ -26301,6 +26421,10 @@ fn a_scrollback_dump_reaps_the_dumps_of_dead_processes() {
     std::fs::write(&live, "mine").unwrap();
     let other = app.scrollback_dir.join("notes.txt");
     std::fs::write(&other, "not a dump").unwrap();
+    // A pid no `pid_t` can hold reads as alive: a false "alive" only leaks
+    // a file, a false "dead" would delete one.
+    let huge = app.scrollback_dir.join("shell-4294967295-1-scrollback.log");
+    std::fs::write(&huge, "?").unwrap();
     app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
         "/bin/sh",
         &[
@@ -26327,6 +26451,7 @@ fn a_scrollback_dump_reaps_the_dumps_of_dead_processes() {
     assert!(!dead.exists(), "a dead process's dump is reaped");
     assert!(live.exists(), "this process's other dump stays");
     assert!(other.exists(), "a file that is not a dump is not touched");
+    assert!(huge.exists(), "a pid outside pid_t is left alone");
 }
 
 /// The dump is a new on-disk copy of pane output, so the redact rules must

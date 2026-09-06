@@ -27437,13 +27437,22 @@ impl App {
         while let Some(idx) = self.editor.find_tab_with_path(path) {
             self.editor.close_tab(idx);
         }
+        // The prune is scoped to a group THIS close emptied, as the move
+        // path scopes its own: a group the user left blank on purpose (a
+        // split with one side cleared) is not this command's to fold away.
+        let mut emptied_one = false;
         for group in self.editor_layout.inactive_groups_mut() {
+            let mut closed_here = false;
             while let Some(idx) = group.find_tab_with_path(path) {
                 group.close_tab(idx);
+                closed_here = true;
             }
+            emptied_one |= closed_here && group.is_blank_initial();
         }
-        self.editor_layout
-            .prune_blank_inactive(|t| t.is_blank_initial());
+        if emptied_one {
+            self.editor_layout
+                .prune_blank_inactive(|t| t.is_blank_initial());
+        }
     }
 
     /// `.http`/`.rest` (#370): send the request under the caret. The env
@@ -44708,8 +44717,10 @@ fn write_private(dir: &Path, file: &Path, contents: &str) -> std::io::Result<()>
         use std::io::Write;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
         // `recursive` also creates any missing parent (`~/.cache/croft`
-        // itself on a first run) at 0700, which is the mode its other
-        // tenants want too.
+        // itself on a first run) at 0700. Its other tenants are `sessions/`
+        // (session.rs), `tmp/` (pdf.rs) and the MCP registry cache
+        // (registry_index.rs), every one of them private per-user state
+        // that gains nothing from a wider parent.
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -44731,6 +44742,22 @@ fn write_private(dir: &Path, file: &Path, contents: &str) -> std::io::Result<()>
         }
         if meta.permissions().mode() & 0o077 != 0 {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        // The same for the file: `create(true).truncate(true)` follows a link
+        // planted where the dump goes, and the chmod below would re-mode its
+        // target after the truncate had emptied it. The dir is 0700, so the
+        // planter is this user's own tooling or a restored backup, and the
+        // answer is still a refusal rather than a destroyed file.
+        if let Ok(fmeta) = std::fs::symlink_metadata(file)
+            && fmeta.file_type().is_symlink()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symlink; refusing to write through it",
+                    file.display()
+                ),
+            ));
         }
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -44787,6 +44814,9 @@ fn reap_dead_scrollback_dumps(dir: &Path) {
 /// Whether a process with `pid` exists. Signal 0 delivers nothing and only
 /// checks; a process this user may not signal still exists, so `EPERM`
 /// reads as alive. Off unix nothing is reaped, on the conservative side.
+/// Existence, not liveness, is enough here (unlike `session::is_alive`,
+/// which probes by connecting): a pid that was reused reads as alive and
+/// only leaks a file, and every wrong answer this can give errs that way.
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
