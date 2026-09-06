@@ -43141,3 +43141,131 @@ fn cmd_k_shift_l_asks_for_a_new_lane_and_plain_l_still_folds() {
         "plain L is still the fold toggle"
     );
 }
+
+#[test]
+fn a_lanes_root_row_wears_its_branch_and_its_agent() {
+    // The badge text in its three shapes, then the app-side sync: a lane's
+    // root gets a badge keyed by its canonical path, a plain-shell lane shows
+    // the branch alone, and a closed lane's badge goes with it.
+    use crate::agents::{AgentLane, AgentStatus};
+    let seated = AgentLane {
+        name: String::from("claude"),
+        status: AgentStatus::Waiting,
+    };
+    assert_eq!(
+        lane_root_badge("agent/fix-login", Some(&seated), Some("claude")),
+        "agent/fix-login \u{b7} \u{25c6} claude \u{25d0}"
+    );
+    assert_eq!(
+        lane_root_badge("agent/fix-login", None, Some("claude")),
+        "agent/fix-login \u{b7} claude",
+        "configured but not yet seated: the bare name"
+    );
+    assert_eq!(lane_root_badge("agent/docs", None, None), "agent/docs");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("docs");
+    app.sync_lane_root_badges();
+    let lane = tmp.path().join("repo-docs").canonicalize().unwrap();
+    assert_eq!(
+        app.tree.root_badges.get(&lane).map(String::as_str),
+        Some("agent/docs"),
+        "{:?}",
+        app.tree.root_badges
+    );
+    assert!(
+        !app.tree.root_badges.contains_key(app.roots.primary()),
+        "the primary is not a lane"
+    );
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    app.sync_lane_root_badges();
+    assert!(
+        app.tree.root_badges.is_empty(),
+        "the badge went with the lane"
+    );
+}
+
+#[test]
+fn a_lanes_badge_follows_the_seat_and_a_seated_pane_outranks_a_plain_one() {
+    // App-side: the configured name shows until the sampler seats the
+    // agent, the seated badge replaces it, and it falls back when the agent
+    // leaves. With two panes on one lane, the seated one decides whichever
+    // uid order the map walks.
+    use crate::agents::{AgentLane, AgentStatus};
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    // A table of the test's own, not this machine's agents.json: claude
+    // needs a launch line for the lane to record the agent, and that line
+    // must not start the real thing in the test's shell.
+    app.agents =
+        crate::agents::AgentTable::from_json(r#"[{ "name": "claude", "launch": "true" }]"#);
+    app.lane_agent = Some(String::from("claude"));
+    app.create_worktree_lane("fix login");
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let idx = app.active_terminal;
+    app.sync_lane_root_badges();
+    assert_eq!(
+        app.tree.root_badges.get(&lane).map(String::as_str),
+        Some("agent/fix-login \u{b7} claude"),
+        "configured, not yet seated"
+    );
+    app.terminals[idx].set_agent(Some(AgentLane {
+        name: String::from("claude"),
+        status: AgentStatus::Working,
+    }));
+    app.sync_lane_root_badges();
+    assert_eq!(
+        app.tree.root_badges.get(&lane).map(String::as_str),
+        Some("agent/fix-login \u{b7} \u{25c6} claude \u{25cf}"),
+        "seated"
+    );
+    // A second pane on the same lane with a HIGHER uid, so the map walks the
+    // first pane before it. Seated-first-then-plain and plain-first-then-
+    // seated must both end on the seated badge.
+    let plain = crate::widgets::terminal::PtyTerminal::new(&lane).unwrap();
+    let second_uid = plain.uid();
+    assert!(app.terminals[idx].uid() < second_uid);
+    app.lane_panes.insert(
+        second_uid,
+        crate::terminal_session::LaneRecord {
+            path: lane.display().to_string(),
+            branch: String::from("agent/fix-login"),
+            agent: None,
+        },
+    );
+    app.terminals.push(plain);
+    let last = app.terminals.len() - 1;
+    app.sync_lane_root_badges();
+    assert_eq!(
+        app.tree.root_badges.get(&lane).map(String::as_str),
+        Some("agent/fix-login \u{b7} \u{25c6} claude \u{25cf}"),
+        "seated first, plain second: the plain sibling does not hide it"
+    );
+    app.terminals[idx].set_agent(None);
+    app.terminals[last].set_agent(Some(AgentLane {
+        name: String::from("claude"),
+        status: AgentStatus::Idle,
+    }));
+    app.sync_lane_root_badges();
+    assert_eq!(
+        app.tree.root_badges.get(&lane).map(String::as_str),
+        Some("agent/fix-login \u{b7} \u{25c6} claude \u{25cb}"),
+        "plain first, seated second: the seated pane still decides"
+    );
+    app.terminals[last].set_agent(None);
+    app.sync_lane_root_badges();
+    assert_eq!(
+        app.tree.root_badges.get(&lane).map(String::as_str),
+        Some("agent/fix-login \u{b7} claude"),
+        "back to the configured name once nobody is seated"
+    );
+}
