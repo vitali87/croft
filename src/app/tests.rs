@@ -1577,9 +1577,11 @@ fn cell_with_link(pane: &crate::widgets::terminal::PtyTerminal, uri: &str) -> Op
 /// depend on that one test surviving: the helper's own doc records that the
 /// column derivation in it was wrong once.
 ///
-/// Placed immediately below the helper rather than in the block it was first
-/// written in, which was some 35,000 lines away and made "beside the helper"
-/// a claim the file did not support.
+/// Placed beside the two helpers rather than in the block it was first
+/// written in, which was some 35,000 lines away and made "beside the
+/// helper" a claim the file did not support. Below `cell_with_link`
+/// rather than between the two: inserting above a `///` block hands that
+/// block to the newcomer, which this file has been bitten by twice.
 #[test]
 fn cell_carrying_lands_inside_the_needle_not_at_the_start_of_its_row() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2986,7 +2988,10 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     // a sibling test was just rewritten to avoid exactly that: this search is
     // anchored on a URI, not on a column, so a prompt arriving between the
     // two feeds moves the link's row and changes nothing the test asserts.
-    // The wrap test cannot say that, because a column is precisely its claim. The decoy is what gives the exact-URI SEARCH a
+    // The wrap test cannot say that, because a column is precisely its
+    // claim.
+    //
+    // The decoy is what gives the exact-URI SEARCH a
     // red state: revert the predicate to `.is_some()` and the row-major scan
     // stops on the decoy, so the status assertion rejects it by name. It does
     // NOT pin the assertion's FORM - with the search intact, `contains`
@@ -38795,6 +38800,15 @@ fn a_recorded_frames_rows_wrap_at_the_width_its_header_declares() {
     // its own, and the bound below is a genuinely independent second check
     // rather than the only one doing the work.
     let rows: Vec<&str> = body.split("\r\n").collect();
+    // Precondition, so a missing payload cannot be reported as a bad wrap.
+    // `record_active_screen` splits scrollback off, so shell startup output
+    // pushing the payload above `topmost_line()` would fail the adjacency
+    // check below while naming the column, which is the exact misdiagnosis
+    // this test's first draft produced for a different reason.
+    assert!(
+        rows.iter().any(|r| r.starts_with(&long[..8])),
+        "the payload must still be on the visible screen: {body:?}"
+    );
     assert!(
         rows.windows(2)
             .any(|w| w[0] == &long[..40] && w[1] == &long[40..80]),
@@ -38888,7 +38902,11 @@ fn a_recorded_resize_precedes_the_frame_it_was_drawn_for() {
 /// zero, which would make the NEXT record emit a resize back to a geometry
 /// the player already had.
 ///
-/// Drop `size.0 > 0` and the sequence gains two `r` events instead of none.
+/// Drop EITHER size conjunct and the sequence gains two `r` events instead
+/// of none: `size.0 > 0` from the width fold, `size.1 > 0` from the height
+/// fold. The first version of this doc named only the width half, which is
+/// the shape an earlier round was pulled up for: the doc is what the next
+/// editor reads before the assert message.
 #[test]
 fn a_collapsed_pane_records_no_resize_and_leaves_the_last_one_standing() {
     let tmp = tempfile::tempdir().unwrap();
@@ -38948,21 +38966,23 @@ fn a_collapsed_pane_records_no_resize_and_leaves_the_last_one_standing() {
     );
 }
 
-/// A fold mid-recording never writes rows wider than the header (#397).
+/// A fold mid-recording narrows the frame, and says nothing about it (#397).
 ///
 /// The sibling above moves `last_inner` alone, because the guard it tests
-/// reads `last_inner`. Production folds differently: `render` hands `resize`
-/// a zero width, which floors the GRID at two columns
-/// (`src/widgets/terminal.rs`), so a real fold leaves a 2-column grid under
-/// whatever width the header already declared. Nothing pinned what the cast
-/// then carries.
+/// reads `last_inner`. Production folds differently: `render` assigns
+/// `last_inner = inner` and then calls `resize(inner.width, inner.height)`,
+/// so a real fold leaves `last_inner.width` at 0 while the GRID floors at two
+/// columns. The zero then suppresses the resize event, and the cast carries a
+/// 2-column frame under a 40-column header with nothing announcing it.
 ///
-/// The claim is one-directional on purpose. Rows NARROWER than the header are
-/// correct here and a player renders them as a small image in a large window;
-/// rows WIDER than it are the corruption, because a player sizes its window
-/// from the header and has nowhere to put the overflow.
+/// The first version of this test asserted `widest <= declared` and could not
+/// fail. Both numbers are arithmetic: no row can exceed the grid, and the
+/// grid is only ever 40 or the floor of 2, so 2 <= 40 held whatever the fold
+/// did. Deleting both fold lines left every assertion green, which is a test
+/// named for a gesture it never exercised. It now asserts what the fold
+/// actually moves.
 #[test]
-fn a_fold_mid_recording_never_writes_rows_wider_than_the_header() {
+fn a_fold_mid_recording_narrows_the_frame_and_announces_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.terminals[0].last_inner = ratatui::layout::Rect {
@@ -38976,8 +38996,12 @@ fn a_fold_mid_recording_never_writes_rows_wider_than_the_header() {
 
     app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
     app.record_active_screen();
-    // The real gesture: a zero width through `resize`, which the grid floors.
-    app.terminals[0].last_inner.width = 2;
+    // Exactly what `render` does on a fold: `last_inner` takes the zero, and
+    // `resize` floors the grid at two columns. Setting `last_inner.width = 2`
+    // instead, as the first version did, is a pairing production never
+    // produces, and it makes the recorder emit an `r` the real gesture
+    // suppresses, so the fixture avoided the case it was written for.
+    app.terminals[0].last_inner.width = 0;
     app.terminals[0].resize(0, 20);
     app.record_active_screen();
     app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
@@ -38993,28 +39017,138 @@ fn a_fold_mid_recording_never_writes_rows_wider_than_the_header() {
     let declared = header["width"]
         .as_u64()
         .expect("the header declares a width");
-    let frames: Vec<String> = text
+    let events: Vec<(String, String)> = text
         .lines()
         .skip(1)
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|ev| ev[1] == "o")
-        .filter_map(|ev| ev[2].as_str().map(String::from))
+        .filter_map(|ev| {
+            Some((
+                ev[1].as_str()?.to_string(),
+                ev[2].as_str().unwrap_or_default().to_string(),
+            ))
+        })
         .collect();
-    assert_eq!(frames.len(), 2, "one frame each side of the fold");
+    let widths: Vec<usize> = events
+        .iter()
+        .filter(|(kind, _)| kind == "o")
+        .map(|(_, frame)| {
+            frame
+                .strip_prefix("\u{1b}[H\u{1b}[2J")
+                .expect("a recorded frame opens with clear-and-home")
+                .split("\r\n")
+                .map(|row| row.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    assert_eq!(widths.len(), 2, "one frame each side of the fold");
 
-    for (i, frame) in frames.iter().enumerate() {
-        let body = frame
-            .strip_prefix("\u{1b}[H\u{1b}[2J")
-            .expect("a recorded frame opens with clear-and-home");
-        let widest = body
-            .split("\r\n")
-            .map(|row| row.chars().count())
-            .max()
-            .unwrap_or(0);
+    // The claim the fold moves. Remove the fold and `after` is 15 like
+    // `before`, so this is the assertion the previous version was missing.
+    let (before, after) = (widths[0], widths[1]);
+    assert!(
+        after < before,
+        "the fold must narrow the recorded rows, got {before} then {after}"
+    );
+    assert_eq!(
+        after, 2,
+        "and the folded frame carries the GRID's two-column floor rather \
+         than a snapshot taken before the resize landed"
+    );
+    assert!(
+        (before as u64) <= declared && (after as u64) <= declared,
+        "neither frame may exceed the {declared}-column window the header \
+         asks for, since a player has nowhere to put the overflow"
+    );
+    // And the suppression is part of the claim rather than a side effect the
+    // filter above discarded: `last_inner.width` of 0 fails the guard's
+    // `size.0 > 0`, so the narrowing reaches the player with no `r` in front
+    // of it. Set `last_inner.width = 2` and an `r` appears here.
+    assert!(
+        events.iter().all(|(kind, _)| kind == "o"),
+        "a fold announces no geometry, got {:?}",
+        events.iter().map(|(k, _)| k).collect::<Vec<_>>()
+    );
+}
+
+/// A pane that GROWS mid-recording announces the new width first (#397).
+///
+/// The fold above narrows, which a player renders as a small image in a large
+/// window and cannot corrupt anything. Widening is the direction that can:
+/// the frame really is wider than the header the recording opened at, and
+/// correctness rests entirely on the `r` event arriving before the frame
+/// drawn at it. Nothing in the suite recorded a pane that grows.
+#[test]
+fn a_widened_pane_announces_its_new_geometry_before_the_wider_frame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 20,
+    };
+    app.terminals[0].resize(40, 20);
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.terminals[0].last_inner.width = 80;
+    app.terminals[0].resize(80, 20);
+    // Longer than the header's 40 and shorter than the new 80, so the row
+    // that lands is one the OLD geometry could not have held.
+    let wide: String = std::iter::repeat_n('w', 60).collect();
+    app.terminals[0].feed_bytes_for_test(format!("\r\n{wide}\r\n").as_bytes());
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let header: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("a header")).expect("the header is JSON");
+    let declared = header["width"]
+        .as_u64()
+        .expect("the header declares a width");
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect();
+    let kinds: Vec<&str> = events.iter().filter_map(|ev| ev[1].as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["o", "r", "o"],
+        "the widened geometry must reach the player BEFORE the frame wrapped \
+         for it, got {kinds:?}"
+    );
+
+    let announced = events[1][3].as_u64().or_else(|| {
+        events[1][2]
+            .as_str()
+            .and_then(|s| s.split('x').next()?.parse().ok())
+    });
+    let widest = events[2][2]
+        .as_str()
+        .expect("the second frame is text")
+        .strip_prefix("\u{1b}[H\u{1b}[2J")
+        .expect("a recorded frame opens with clear-and-home")
+        .split("\r\n")
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        widest as u64 > declared,
+        "the fixture must produce a frame the HEADER cannot hold, or the \
+         resize event is not load-bearing: widest {widest}, header {declared}"
+    );
+    if let Some(announced) = announced {
         assert!(
-            widest as u64 <= declared,
-            "frame {i} carries a row {widest} columns wide under a header \
-             declaring {declared}: a player has nowhere to put the overflow"
+            widest as u64 <= announced,
+            "and the frame must fit the geometry the `r` announced: widest \
+             {widest}, announced {announced}"
         );
     }
 }
