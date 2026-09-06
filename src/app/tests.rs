@@ -39784,6 +39784,158 @@ fn copy_on_select_fires_for_a_click_only_forwarded_drag() {
     );
 }
 
+#[test]
+fn toggling_log_highlighting_flips_open_views_and_the_default() {
+    // #466: the palette / Settings toggle reaches the view that is already
+    // open AND steers views opened afterwards, so the user sees the change
+    // at once and does not get it undone by the next log they open.
+    let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("build.log");
+    std::fs::write(&log, b"\x1b[32mok\x1b[0m 2024-01-02 step 1\nplain step 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&log).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "a coloured .log opens as a rendered log"
+    );
+    let before = app.log_highlight;
+    let view_before = app.editor.log.as_ref().unwrap().highlight();
+    assert_eq!(
+        view_before, before,
+        "the open view starts at the app's setting"
+    );
+
+    app.toggle_log_highlight();
+    assert_eq!(app.log_highlight, !before);
+    assert_eq!(
+        app.editor.log.as_ref().unwrap().highlight(),
+        !before,
+        "the open view followed the toggle"
+    );
+    assert_eq!(
+        crate::log_view::default_highlight(),
+        !before,
+        "and so will the next log opened"
+    );
+    assert!(app.status.starts_with("Log highlighting (tailspin):"));
+
+    // Back to where it was, so the process-wide default is left as found.
+    app.toggle_log_highlight();
+    assert_eq!(app.log_highlight, before);
+    assert_eq!(crate::log_view::default_highlight(), before);
+}
+
+#[test]
+fn startup_seeds_the_log_view_default_from_the_saved_preference() {
+    // #466: `App::new` seeds the log view's opening default from the saved
+    // preference. Under test that seed is recorded per thread instead of
+    // written (hundreds of apps on parallel threads would race the tests
+    // reading the process-wide default), which keeps the CALL SITE
+    // observable: this asserts what `App::new` decided, pinned by a
+    // workspace layer so it does not move with the developer's own config.
+    let tmp = tempfile::tempdir().unwrap();
+    let layer = crate::config_layers::workspace_config_path(tmp.path());
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    std::fs::write(&layer, r#"{"disable_log_highlight": true}"#).unwrap();
+    STARTUP_LOG_HIGHLIGHT_SEED.with(|c| c.set(None));
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        !app.log_highlight,
+        "the workspace layer's opt-out reached the field"
+    );
+    assert_eq!(
+        STARTUP_LOG_HIGHLIGHT_SEED.with(|c| c.get()),
+        Some(false),
+        "and App::new seeded the log view's opening default with the same value"
+    );
+    std::fs::write(&layer, r#"{"disable_log_highlight": false}"#).unwrap();
+    STARTUP_LOG_HIGHLIGHT_SEED.with(|c| c.set(None));
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.log_highlight);
+    assert_eq!(STARTUP_LOG_HIGHLIGHT_SEED.with(|c| c.get()), Some(true));
+}
+
+#[test]
+fn a_workspace_layer_setting_disable_log_highlight_applies_on_remerge() {
+    // #466: `disable_log_highlight` is a workspace-allowed key, so a repo's
+    // `.croft/config.json` can set it, and a settings remerge (a save of
+    // that file) must apply it live: to the field, to the default for logs
+    // opened later, and to every open log view. Read at startup too.
+    let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let before = crate::log_view::default_highlight();
+    let tmp = tempfile::tempdir().unwrap();
+    let layer = crate::config_layers::workspace_config_path(tmp.path());
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    std::fs::write(&layer, r#"{"disable_log_highlight": true}"#).unwrap();
+    let log = tmp.path().join("build.log");
+    std::fs::write(&log, b"\x1b[32mok\x1b[0m 2024-01-02 step 1\nplain step 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(!app.log_highlight, "the workspace layer is read at startup");
+    app.editor.open_pinned(&log).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "a coloured .log opens as a rendered log"
+    );
+    // Force the open view on, as a stale default would have left it, so the
+    // remerge below has something visible to fix.
+    app.editor.log.as_mut().unwrap().set_highlight(true);
+
+    // A second log parked in another split group, so the fan-out over
+    // inactive groups is exercised, not just the active tab.
+    let other = tmp.path().join("other.log");
+    std::fs::write(&other, b"\x1b[31merr\x1b[0m 2024-01-02 step 9\n").unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&other).unwrap();
+    assert!(app.editor.log.is_some());
+    app.editor.log.as_mut().unwrap().set_highlight(true);
+    fn parked_log_flags(app: &mut App) -> Vec<bool> {
+        app.editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .flat_map(|g| g.editors.iter())
+            .filter_map(|e| e.log.as_ref().map(|l| l.highlight()))
+            .collect()
+    }
+
+    std::fs::write(&layer, r#"{"disable_log_highlight": false}"#).unwrap();
+    app.reload_config_for_path(&layer);
+    assert!(
+        app.log_highlight,
+        "the remerge applied the workspace layer's new value"
+    );
+    assert!(
+        app.editor.log.as_ref().unwrap().highlight(),
+        "and pushed it into the open log view"
+    );
+    let parked = parked_log_flags(&mut app);
+    assert!(
+        !parked.is_empty() && parked.iter().all(|&h| h),
+        "and into the log parked in the other split group: {parked:?}"
+    );
+    assert!(
+        crate::log_view::default_highlight(),
+        "and into the default for later logs"
+    );
+
+    std::fs::write(&layer, r#"{"disable_log_highlight": true}"#).unwrap();
+    app.reload_config_for_path(&layer);
+    assert!(!app.log_highlight);
+    assert!(
+        !app.editor.log.as_ref().unwrap().highlight(),
+        "the opt-out reaches the open view"
+    );
+    assert!(
+        parked_log_flags(&mut app).iter().all(|&h| !h),
+        "and the parked one"
+    );
+    crate::log_view::set_default_highlight(before);
+}
+
 /// #471: no watcher-reported paths, for the poll-shaped refresh calls.
 fn no_paths() -> std::collections::BTreeSet<std::path::PathBuf> {
     std::collections::BTreeSet::new()
