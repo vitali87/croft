@@ -14,6 +14,7 @@
 //! resolves to nothing.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use crate::lsp::install::Provision;
 use crate::lsp::manifest::{self, CommandDecl, McpServerDecl};
@@ -64,14 +65,29 @@ fn server_spawn(decl: &McpServerDecl) -> ServerSpawn {
 
 /// Bundled + user manifest sources, in load order.
 fn all_sources() -> Vec<String> {
+    all_sources_in_dir(&crate::prefs::config_dir())
+}
+
+/// Every manifest source, with the user extensions read from under an
+/// explicit config dir: the app carries the dir it was built with, so a
+/// test can seed a scratch dir instead of mutating the process-wide
+/// environment (which races sibling tests).
+fn all_sources_in_dir(config_dir: &Path) -> Vec<String> {
     let mut sources: Vec<String> = manifest::BUNDLED_MANIFESTS
         .iter()
         .map(|s| s.to_string())
         .collect();
     sources.extend(manifest::read_extension_sources(
-        &manifest::user_extensions_dir(),
+        &config_dir.join("extensions"),
     ));
     sources
+}
+
+/// The disabled set as recorded under an explicit config dir.
+fn disabled_in_dir(config_dir: &Path) -> BTreeSet<String> {
+    crate::prefs::Prefs::load(&config_dir.join("config.json"))
+        .unwrap_or_default()
+        .disabled_extensions
 }
 
 /// Pure: every contributed command across `sources` whose extension is enabled,
@@ -240,10 +256,14 @@ fn viewer_by_key_in(
         .find(|v| v.key() == key)
 }
 
-/// The enabled viewer with this key (`<extension id>/<viewer id>`), if any.
-pub fn viewer_by_id(key: &str) -> Option<ContributedViewer> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
-    viewer_by_key_in(&all_sources(), &disabled, key)
+/// The enabled viewer with this key (`<extension id>/<viewer id>`), if any,
+/// read from under an explicit config dir.
+pub fn viewer_by_id_in_dir(config_dir: &Path, key: &str) -> Option<ContributedViewer> {
+    viewer_by_key_in(
+        &all_sources_in_dir(config_dir),
+        &disabled_in_dir(config_dir),
+        key,
+    )
 }
 
 /// Palette rows for the enabled viewers.
@@ -260,11 +280,14 @@ pub fn contributed_commands() -> Vec<ContributedCommand> {
     contributed_in(&all_sources(), &disabled)
 }
 
-/// Resolve a contributed command id to its executable form, or `None` if no
-/// enabled extension contributes it.
-pub fn resolve_command(command_id: &str) -> Option<ResolvedCommand> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
-    resolve_in(&all_sources(), &disabled, command_id)
+/// Resolve a palette command id to its server and tool, reading the
+/// extensions under an explicit config dir.
+pub fn resolve_command_in_dir(config_dir: &Path, command_id: &str) -> Option<ResolvedCommand> {
+    resolve_in(
+        &all_sources_in_dir(config_dir),
+        &disabled_in_dir(config_dir),
+        command_id,
+    )
 }
 
 #[cfg(test)]

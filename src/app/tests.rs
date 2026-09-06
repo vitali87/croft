@@ -13647,17 +13647,11 @@ fn a_viewer_asks_for_consent_before_its_first_run() {
     );
 }
 
-/// Serialises the tests that point `XDG_CONFIG_HOME` at a scratch dir: the
-/// variable is process-global, so two such tests at once would read each
-/// other's config. Every other test sees a scratch config for the duration,
-/// which only means an empty prefs file and no user extensions.
-static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Run `body` with croft's config dir pointed at a scratch dir holding the
-/// given user extension manifests (`<id>` → manifest text), restoring the
-/// previous value afterwards.
-fn with_scratch_config<T>(manifests: &[(&str, &str)], body: impl FnOnce(&Path) -> T) -> T {
-    let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// A scratch config dir holding the given user extension manifests
+/// (`<id>` → manifest text). An app pointed at it (`app.config_dir`) reads
+/// its extensions and consent from there and nowhere else; the process
+/// environment is never touched, so the test is safe beside every other.
+fn scratch_config(manifests: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let croft = tmp.path().join("croft");
     for (id, text) in manifests {
@@ -13665,33 +13659,24 @@ fn with_scratch_config<T>(manifests: &[(&str, &str)], body: impl FnOnce(&Path) -
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("extension.toml"), text).unwrap();
     }
-    struct Restore(Option<std::ffi::OsString>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            // SAFETY: CONFIG_ENV_LOCK serialises every mutation of this
-            // variable, and no other test thread reads it mid-write.
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-            }
-        }
-    }
-    let _restore = Restore(std::env::var_os("XDG_CONFIG_HOME"));
-    // SAFETY: as above.
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-    }
-    body(&croft)
+    (tmp, croft)
+}
+
+/// The consent set recorded in a scratch config dir.
+fn consent_on_disk(croft: &Path) -> std::collections::BTreeSet<String> {
+    crate::prefs::Prefs::load(&croft.join("config.json"))
+        .unwrap_or_default()
+        .mcp_consented
 }
 
 /// One consent per extension, read from one place (#485 review): the sidecar
 /// gate consults the same session set the viewer gate does, so allowing an
 /// extension through either gate satisfies the other in the same session,
-/// whatever became of the prefs write.
+/// whatever became of the prefs write. And a prefs write that fails is
+/// reported before the command's own argument prompt takes the screen.
 #[test]
 fn the_sidecar_gate_reads_the_session_consent_set() {
+    use crate::widgets::input_prompt::InputPurpose;
     const EXT: &str = r#"
 id = "tconsent"
 name = "tconsent"
@@ -13707,26 +13692,52 @@ tool = "go"
 arg = "q"
 prompt = "Query"
 "#;
-    with_scratch_config(&[("tconsent", EXT)], |_| {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        // Allowed this session, not (yet) on disk: the gate must not
-        // re-prompt, it must move on to the command's own argument prompt.
-        app.consented_extensions.insert("tconsent".into());
-        app.run_extension_command("tconsent.go");
-        let prompt = app
-            .input_prompt
-            .as_ref()
-            .expect("the command opened a prompt");
-        assert!(
-            matches!(
-                prompt.purpose,
-                crate::widgets::input_prompt::InputPurpose::McpArg { .. }
-            ),
-            "a consented extension goes straight to its argument prompt, not consent: {:?}",
-            prompt.title
-        );
-    });
+    let (_scratch, croft) = scratch_config(&[("tconsent", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    // Allowed this session, not (yet) on disk: the gate must not re-prompt,
+    // it must move on to the command's own argument prompt.
+    app.consented_extensions.insert("tconsent".into());
+    app.run_extension_command("tconsent.go");
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(InputPurpose::McpArg { .. })
+        ),
+        "a consented extension goes straight to its argument prompt, not consent: {:?}",
+        app.input_prompt.as_ref().map(|p| p.title.clone())
+    );
+    // Allowing through the sidecar prompt with the prefs file unwritable: the
+    // failure is reported where the user can see it and the grant holds.
+    app.close_input_prompt();
+    app.consented_extensions.remove("tconsent");
+    std::fs::create_dir_all(croft.join("config.json")).unwrap();
+    app.run_extension_command("tconsent.go");
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(InputPurpose::McpConsent { .. })
+        ),
+        "fixture: an unconsented extension is asked first"
+    );
+    app.submit_input_prompt();
+    assert!(
+        app.status.contains("could not be saved"),
+        "a failed prefs write is reported: {:?}",
+        app.status
+    );
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(InputPurpose::McpArg { .. })
+        ),
+        "and the command went on to its argument prompt"
+    );
+    assert!(
+        app.consented_extensions.contains("tconsent"),
+        "the session grant holds"
+    );
 }
 
 /// Allowing a viewer records the consent and resumes the open that asked;
@@ -13744,49 +13755,50 @@ command = "/bin/sh"
 args = ["-c", "sleep 30", "sh", "{file}"]
 extensions = ["csv"]
 "#;
-    with_scratch_config(&[("tviewer", EXT)], |croft| {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data.csv");
-        std::fs::write(&data, "a,b\n").unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        let viewer = crate::mcp::registry::viewer_by_id("tviewer/sh").expect("the scratch viewer");
-        let before = app.terminals.len();
-        app.open_in_viewer(&viewer, &data);
-        assert!(
-            app.input_prompt.is_some(),
-            "fixture: consent is asked first"
-        );
-        app.submit_input_prompt();
-        assert_eq!(app.terminals.len(), before + 1, "allowing resumes the open");
-        assert!(
-            app.consented_extensions.contains("tviewer"),
-            "and records the consent"
-        );
-        let saved = crate::prefs::Prefs::load_or_default().mcp_consented;
-        assert!(saved.contains("tviewer"), "on disk too: {saved:?}");
-        assert!(
-            !app.status.contains("could not be saved"),
-            "a successful save is not reported as a failure: {:?}",
-            app.status
-        );
-        // Now with the prefs file made unwritable (a directory in its place):
-        // the consent still holds for the session and the status says the
-        // save failed, instead of the failure vanishing.
-        app.consented_extensions.remove("tviewer");
-        let _ = std::fs::remove_file(croft.join("config.json"));
-        std::fs::create_dir_all(croft.join("config.json")).unwrap();
-        app.open_in_viewer(&viewer, &data);
-        app.submit_input_prompt();
-        assert!(
-            app.status.contains("could not be saved"),
-            "a failed prefs write is reported: {:?}",
-            app.status
-        );
-        assert!(
-            app.consented_extensions.contains("tviewer"),
-            "the session grant still holds"
-        );
-    });
+    let (_scratch, croft) = scratch_config(&[("tviewer", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    let viewer = crate::mcp::registry::viewer_by_id_in_dir(&croft, "tviewer/sh")
+        .expect("the scratch viewer");
+    let before = app.terminals.len();
+    app.open_in_viewer(&viewer, &data);
+    assert!(
+        app.input_prompt.is_some(),
+        "fixture: consent is asked first"
+    );
+    app.submit_input_prompt();
+    assert_eq!(app.terminals.len(), before + 1, "allowing resumes the open");
+    assert!(
+        app.consented_extensions.contains("tviewer"),
+        "and records the consent"
+    );
+    let saved = consent_on_disk(&croft);
+    assert!(saved.contains("tviewer"), "on disk too: {saved:?}");
+    assert!(
+        !app.status.contains("could not be saved"),
+        "a successful save is not reported as a failure: {:?}",
+        app.status
+    );
+    // Now with the prefs file made unwritable (a directory in its place):
+    // the consent still holds for the session and the status says the save
+    // failed, instead of the failure vanishing.
+    app.consented_extensions.remove("tviewer");
+    let _ = std::fs::remove_file(croft.join("config.json"));
+    std::fs::create_dir_all(croft.join("config.json")).unwrap();
+    app.open_in_viewer(&viewer, &data);
+    app.submit_input_prompt();
+    assert!(
+        app.status.contains("could not be saved"),
+        "a failed prefs write is reported: {:?}",
+        app.status
+    );
+    assert!(
+        app.consented_extensions.contains("tviewer"),
+        "the session grant still holds"
+    );
 }
 
 /// Uninstalling an extension forgets its consent, in the session and on
@@ -13794,27 +13806,27 @@ extensions = ["csv"]
 /// approved this time, so the first-run gate asks again.
 #[test]
 fn uninstalling_an_extension_forgets_its_consent() {
-    with_scratch_config(&[], |_| {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        crate::prefs::save_mcp_consent("csvlens").unwrap();
-        app.consented_extensions.insert("csvlens".into());
-        app.perform_extension_uninstall("csvlens");
-        assert!(
-            app.status.starts_with("Uninstalled"),
-            "fixture: the catalog entry uninstalls cleanly: {:?}",
-            app.status
-        );
-        assert!(
-            !app.consented_extensions.contains("csvlens"),
-            "the session grant is gone"
-        );
-        let saved = crate::prefs::Prefs::load_or_default().mcp_consented;
-        assert!(
-            !saved.contains("csvlens"),
-            "and so is the one on disk: {saved:?}"
-        );
-    });
+    let (_scratch, croft) = scratch_config(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    crate::prefs::save_mcp_consent_in(&croft, "csvlens").unwrap();
+    app.consented_extensions.insert("csvlens".into());
+    app.perform_extension_uninstall("csvlens");
+    assert!(
+        app.status.starts_with("Uninstalled"),
+        "fixture: the catalog entry uninstalls cleanly: {:?}",
+        app.status
+    );
+    assert!(
+        !app.consented_extensions.contains("csvlens"),
+        "the session grant is gone"
+    );
+    let saved = consent_on_disk(&croft);
+    assert!(
+        !saved.contains("csvlens"),
+        "and so is the one on disk: {saved:?}"
+    );
 }
 
 /// A viewer that is gone by the time its menu row is clicked, or by the time

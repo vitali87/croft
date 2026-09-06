@@ -371,20 +371,20 @@ pub fn save_disabled_extensions(disabled: &BTreeSet<String>) -> Result<()> {
     prefs.save(&path)
 }
 
-/// Record first-run consent to spawn an MCP sidecar extension, preserving other
-/// settings. Best-effort: a write failure is swallowed by the caller.
-pub fn save_mcp_consent(ext_id: &str) -> Result<()> {
-    let path = config_path();
+/// Record a first-run consent for `ext_id` under an explicit config dir: the app carries the
+/// dir it was built with, so a test can point it at a scratch dir instead
+/// of mutating the process-wide environment (which races sibling tests).
+pub fn save_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
+    let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.mcp_consented.insert(ext_id.to_string());
     prefs.save(&path)
 }
 
-/// Forget a recorded first-run consent, preserving other settings: an
-/// uninstalled extension is a fresh install when it is re-added, and the
-/// gate must ask again. Best-effort like [`save_mcp_consent`].
-pub fn forget_mcp_consent(ext_id: &str) -> Result<()> {
-    let path = config_path();
+/// Forget a recorded first-run consent under an explicit config dir; see
+/// [`save_mcp_consent_in`] for why the dir is a parameter.
+pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
+    let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     if !prefs.mcp_consented.remove(ext_id) {
         return Ok(());

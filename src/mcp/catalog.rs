@@ -119,10 +119,10 @@ fn remove_from(dir: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Uninstall a catalog entry: delete its manifest from the user extensions dir
-/// so it drops back to AVAILABLE on the next refresh. Reversible via [`install`].
-pub fn uninstall(id: &str) -> Result<()> {
-    remove_from(&manifest::user_extensions_dir(), id)
+/// Remove an added catalog extension from an explicit user-extensions dir (see
+/// `prefs::save_mcp_consent_in` for why the dir is a parameter).
+pub fn uninstall_in(extensions_dir: &Path, id: &str) -> Result<()> {
+    remove_from(extensions_dir, id)
 }
 
 #[cfg(test)]

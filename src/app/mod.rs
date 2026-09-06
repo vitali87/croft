@@ -2893,6 +2893,11 @@ pub struct App {
     /// is granted here), so a viewer's gate is a set lookup rather than a
     /// prefs read per click, and a test can seed it without a prefs file.
     consented_extensions: std::collections::BTreeSet<String>,
+    /// The config dir this app reads extensions and consent from. Carried
+    /// rather than re-derived so a test can point one app at a scratch dir
+    /// instead of mutating the process-wide environment, which this repo
+    /// has twice seen take an unrelated test down.
+    config_dir: PathBuf,
     /// Hit-test rectangles of the one-column strips collapsed panes leave
     /// behind, in lock-step with `terminals` (#313). Clicking anywhere down a
     /// strip gives that pane its width back; expanded panes hold an empty
@@ -4491,6 +4496,7 @@ impl App {
             terminal_close_buttons: Vec::new(),
             terminal_collapse_buttons: Vec::new(),
             consented_extensions: crate::prefs::Prefs::load_or_default().mcp_consented,
+            config_dir: crate::prefs::config_dir(),
             terminal_strip_rects: Vec::new(),
             terminal_max_buttons: Vec::new(),
             terminal_rail_rects: Vec::new(),
@@ -18775,7 +18781,7 @@ impl App {
     /// Perform the confirmed uninstall (the popup's Enter path). Removes the
     /// catalog/index-installed manifest and refreshes the panel.
     fn perform_extension_uninstall(&mut self, id: &str) {
-        match crate::mcp::catalog::uninstall(id) {
+        match crate::mcp::catalog::uninstall_in(&self.config_dir.join("extensions"), id) {
             Ok(()) => {
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
@@ -18798,7 +18804,7 @@ impl App {
     /// than swallowed, since the user would otherwise be asked again next
     /// launch with no idea why.
     fn persist_extension_consent(&mut self, ext_id: &str) {
-        if let Err(e) = crate::prefs::save_mcp_consent(ext_id) {
+        if let Err(e) = crate::prefs::save_mcp_consent_in(&self.config_dir, ext_id) {
             self.status = format!("Allowed {ext_id}, but the consent could not be saved: {e}");
         }
     }
@@ -18806,7 +18812,7 @@ impl App {
     /// Forget `id`'s first-run consent in the session set and in prefs.
     fn forget_extension_consent(&mut self, id: &str) {
         self.consented_extensions.remove(id);
-        let _ = crate::prefs::forget_mcp_consent(id);
+        let _ = crate::prefs::forget_mcp_consent_in(&self.config_dir, id);
     }
 
     /// Whether the extension `id` is currently enabled (not in the disabled set).
@@ -21698,7 +21704,9 @@ impl App {
                 // one removed while the prompt was up gets a status line and
                 // no consent, since what was allowed no longer exists.
                 self.close_input_prompt();
-                let Some(viewer) = crate::mcp::registry::viewer_by_id(&key) else {
+                let Some(viewer) =
+                    crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, &key)
+                else {
                     self.status = format!("{key} is no longer available");
                     return;
                 };
@@ -21714,18 +21722,25 @@ impl App {
                 // extension and resume the command (which now passes the gate
                 // and proceeds to its argument prompt or runs).
                 self.close_input_prompt();
-                let ext_id = crate::mcp::registry::resolve_command(&command_id).map(|r| r.ext_id);
+                // The session grant first, so the run passes the gate, and
+                // the prefs write before the run here: a sidecar command's
+                // run ends on its own argument prompt with no status of its
+                // own, so a failure reported after it would sit under that
+                // prompt and be cleared with it.
+                let ext_id =
+                    crate::mcp::registry::resolve_command_in_dir(&self.config_dir, &command_id)
+                        .map(|r| r.ext_id);
                 if let Some(ext_id) = &ext_id {
                     self.consented_extensions.insert(ext_id.clone());
-                }
-                self.run_extension_command(&command_id);
-                if let Some(ext_id) = &ext_id {
                     self.persist_extension_consent(ext_id);
                 }
+                self.run_extension_command(&command_id);
             }
             InputPurpose::McpArg { command_id } => {
                 self.close_input_prompt();
-                if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
+                if let Some(resolved) =
+                    crate::mcp::registry::resolve_command_in_dir(&self.config_dir, &command_id)
+                {
                     self.spawn_mcp_command(resolved, Some(value));
                 }
             }
@@ -31960,7 +31975,8 @@ impl App {
     /// A palette `viewer:<extension id>/<viewer id>` row: open the active
     /// editor file in that viewer, if the file is a kind it handles.
     fn run_viewer_command(&mut self, viewer_id: &str) {
-        let Some(viewer) = crate::mcp::registry::viewer_by_id(viewer_id) else {
+        let Some(viewer) = crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, viewer_id)
+        else {
             self.status = format!("Viewer '{viewer_id}' is unavailable");
             return;
         };
@@ -32013,7 +32029,9 @@ impl App {
             self.run_viewer_command(viewer_id);
             return;
         }
-        let Some(resolved) = crate::mcp::registry::resolve_command(command_id) else {
+        let Some(resolved) =
+            crate::mcp::registry::resolve_command_in_dir(&self.config_dir, command_id)
+        else {
             self.status = format!("Extension command '{command_id}' is unavailable");
             return;
         };
@@ -39662,7 +39680,7 @@ impl App {
             MenuAction::OpenInViewer(id, path) => {
                 // The row was built when the menu opened; an extension
                 // removed since then must not make the click a silent no-op.
-                match crate::mcp::registry::viewer_by_id(&id) {
+                match crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, &id) {
                     Some(viewer) => self.open_in_viewer(&viewer, &path),
                     None => self.status = format!("{id} is no longer available"),
                 }
