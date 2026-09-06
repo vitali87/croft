@@ -43819,6 +43819,131 @@ fn the_sweep_spares_staged_stdin_a_croft_may_still_be_showing() {
     );
 }
 
+/// A staged pipe a LIVE croft holds survives the sweep at any age (#362).
+///
+/// Age alone was the whole rule, and age alone deletes a file that is open in
+/// a tab as soon as the session outlives the window. That is not litter:
+/// `sqlite_view::table_page` re-opens by path on every page turn, so the tab
+/// breaks, and `vault read ... | croft view -` cannot be produced again by
+/// re-running anything. The server stamps its pid in at open time and this
+/// asserts the sweep honours it.
+///
+/// Both files here are twice the retention age, so age cannot be what
+/// separates them: only the holder's liveness can.
+#[test]
+fn the_staging_sweep_spares_a_pipe_a_live_croft_still_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let staged = tmp.path().join("view-stdin");
+    std::fs::create_dir_all(&staged).unwrap();
+
+    // A live pid that is NOT this process, so `holder == process::id()` in
+    // production cannot be what spares it and the liveness probe has to run.
+    let mut peer = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let live = peer.id();
+    let dead = {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+
+    let held_live = staged.join(format!("held-{live}-stdin-999999-0.csv"));
+    let held_dead = staged.join(format!("held-{dead}-stdin-999999-1.csv"));
+    let unclaimed = staged.join("stdin-999999-2.csv");
+    for p in [&held_live, &held_dead, &unclaimed] {
+        std::fs::write(p, b"a,b\n1,2\n").unwrap();
+    }
+    let old = std::time::SystemTime::now() - (STAGED_STDIN_RETENTION * 2);
+    for p in [&held_live, &held_dead, &unclaimed] {
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+
+    crate::app::sweep_dead_view_sockets(tmp.path());
+    let live_survived = held_live.exists();
+    let _ = peer.kill();
+    let _ = peer.wait();
+
+    assert!(
+        live_survived,
+        "a pipe held by a running croft must survive the sweep at any age: \
+         the tab re-opens it by path and the bytes cannot be regenerated"
+    );
+    assert!(
+        !held_dead.exists(),
+        "a pipe whose holder has exited, and which has aged out, is litter"
+    );
+    assert!(
+        !unclaimed.exists(),
+        "and an unclaimed staged file still ages out, or the sweep stops \
+         bounding the pile at all"
+    );
+}
+
+/// The server stamps its own pid onto a staged file when it opens it (#362).
+///
+/// The rename is what gives the sweep a live holder to see. It must happen
+/// BEFORE the open, so the editor holds the name the sweep will spare rather
+/// than one that is about to move under it.
+#[test]
+fn opening_a_staged_pipe_claims_it_for_this_croft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let staged = crate::view_ipc::stage_stdin(tmp.path(), b"a,b\n1,2\n", None).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    let reply = app.apply_view_request(&staged);
+    assert_eq!(reply, crate::view_ipc::ViewReply::Ok, "the pipe must open");
+
+    assert!(
+        !staged.exists(),
+        "the staged name must be gone: it is the name the sweep judges by age"
+    );
+    let open = app.editor.editors[app.editor.active_index()]
+        .path
+        .clone()
+        .expect("a file is open");
+    let name = open.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        crate::view_ipc::holder_of_staged(name),
+        Some(std::process::id()),
+        "the EDITOR must hold the claimed path, or a page turn re-opens a \
+         name that no longer exists: {name}"
+    );
+    assert!(
+        open.exists(),
+        "and the claimed file must be on disk under its new name"
+    );
+}
+
+/// An ordinary file is never renamed by the claim (#362).
+#[test]
+fn opening_a_named_file_does_not_rename_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Deliberately named like a staged file, but NOT in the staging dir: the
+    // directory check is what stops croft renaming a user's own file.
+    let decoy = tmp.path().join("stdin-1-0.txt");
+    std::fs::write(&decoy, b"mine").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    let reply = app.apply_view_request(&decoy);
+    assert_eq!(reply, crate::view_ipc::ViewReply::Ok, "it must still open");
+    assert!(
+        decoy.exists(),
+        "a file the user named must keep its name, whatever it looks like"
+    );
+    assert_eq!(
+        app.editor.editors[app.editor.active_index()]
+            .path
+            .as_deref(),
+        Some(decoy.as_path()),
+        "and the editor holds the path the user asked for"
+    );
+}
+
 #[test]
 fn the_staging_sweep_leaves_a_file_it_did_not_stage() {
     // The name filter, which had no negative case: the socket sweep has one

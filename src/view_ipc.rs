@@ -477,6 +477,57 @@ pub fn stage_stdin(cache_dir: &Path, bytes: &[u8], hint: Option<&str>) -> anyhow
     stage_at(&dir, &name, bytes)
 }
 
+/// The prefix a staged file takes once a croft has opened it (#362).
+pub const HELD_PREFIX: &str = "held-";
+
+/// Hand a staged stdin file to the croft that is about to show it.
+///
+/// The staging sweep cannot judge liveness from a staged name, because
+/// `stage_stdin` runs inside the short-lived `croft view` CLIENT and the pid
+/// baked into the name is dead by construction. Age alone was the fallback,
+/// and age alone deletes a file a croft still has open once the session
+/// outlives the retention window: `sqlite_view::table_page` re-opens by path
+/// on every page turn, so the tab breaks, and piped input cannot be produced
+/// again by re-running anything.
+///
+/// So the SERVER stamps its own pid into the name at the moment it opens the
+/// file, which is the one point where a live holder is known. The sweep then
+/// has the same liveness signal it already uses for sockets.
+///
+/// Returns `None`, leaving the path alone, for anything that is not an
+/// unclaimed file in a `view-stdin` directory: an ordinary file the user
+/// named, and a file another croft has already claimed. The second case keeps
+/// the first holder's pid rather than stacking prefixes; two crofts showing
+/// one staged file is not a case worth a second mechanism, and the file
+/// survives while EITHER of them is alive, which errs the safe way.
+pub fn claim_staged(path: &Path, holder: u32) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    if !name.starts_with("stdin-") {
+        return None;
+    }
+    // Only inside the staging directory, so a user file that happens to be
+    // called `stdin-something` is never renamed under them.
+    let dir = path.parent()?;
+    if dir.file_name()?.to_str()? != "view-stdin" {
+        return None;
+    }
+    let held = dir.join(format!("{HELD_PREFIX}{holder}-{name}"));
+    std::fs::rename(path, &held).ok()?;
+    Some(held)
+}
+
+/// The pid holding a staged file, read back out of its name.
+///
+/// Rejects 0 and anything past `i32::MAX` for the reason `pid_of_socket`
+/// does: the sweep casts this to `pid_t`, where 0 means the caller's process
+/// group and -1 means every process it may signal, and both answer "alive" to
+/// signal 0, so such a file would be spared forever instead of swept.
+pub fn holder_of_staged(name: &str) -> Option<u32> {
+    let (pid, _) = name.strip_prefix(HELD_PREFIX)?.split_once('-')?;
+    let pid = pid.parse::<u32>().ok()?;
+    (pid > 0 && pid <= i32::MAX as u32).then_some(pid)
+}
+
 /// Write `bytes` to `dir/name`, stepping past a name already taken.
 ///
 /// Split out so the collision can be CONSTRUCTED in a test rather than
