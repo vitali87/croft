@@ -364,8 +364,8 @@ pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
 
 /// Persist the set of disabled extension ids, preserving other settings.
 /// Best-effort: a write failure is swallowed by the caller.
-pub fn save_disabled_extensions(disabled: &BTreeSet<String>) -> Result<()> {
-    let path = config_path();
+pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String>) -> Result<()> {
+    let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disabled_extensions = disabled.clone();
     prefs.save(&path)

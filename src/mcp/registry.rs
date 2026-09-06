@@ -7,7 +7,7 @@
 //!
 //! Two reads serve two phases. [`contributed_commands`] is the eager list the
 //! command palette registers at startup (so a command is discoverable before its
-//! server ever spawns). [`resolve_command`] is the lazy lookup the app runs when
+//! server ever spawns). [`resolve_command_in_dir`] is the lazy lookup the app runs when
 //! a command is invoked: it returns the tool to call plus the spawn intent for
 //! its server (program/args/env and the pinned [`Provision`]), which the app
 //! then ensures-installed and spawns. A command whose extension is disabled
@@ -240,9 +240,12 @@ fn viewer_commands_in(sources: &[String], disabled: &BTreeSet<String>) -> Vec<Co
 }
 
 /// The enabled viewer for `path`, if any extension contributes one.
-pub fn viewer_for_path(path: &std::path::Path) -> Option<ContributedViewer> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
-    viewer_for_path_in(&all_sources(), &disabled, path)
+pub fn viewer_for_path_in_dir(config_dir: &Path, path: &Path) -> Option<ContributedViewer> {
+    viewer_for_path_in(
+        &all_sources_in_dir(config_dir),
+        &disabled_in_dir(config_dir),
+        path,
+    )
 }
 
 /// Pure: the enabled viewer whose [`ContributedViewer::key`] is `key`.
@@ -267,9 +270,11 @@ pub fn viewer_by_id_in_dir(config_dir: &Path, key: &str) -> Option<ContributedVi
 }
 
 /// Palette rows for the enabled viewers.
-pub fn contributed_viewer_commands() -> Vec<ContributedCommand> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
-    viewer_commands_in(&all_sources(), &disabled)
+pub fn contributed_viewer_commands_in_dir(config_dir: &Path) -> Vec<ContributedCommand> {
+    viewer_commands_in(
+        &all_sources_in_dir(config_dir),
+        &disabled_in_dir(config_dir),
+    )
 }
 
 /// The contributed commands to register eagerly in the palette (enabled

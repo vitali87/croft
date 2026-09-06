@@ -1712,7 +1712,34 @@ fn build_tab_context_menu_items(
 ///   Delete to a count and keeps Rename on a single entry only.
 /// * Right-click on empty tree space, or on the workspace root row →
 ///   workspace-scoped actions: New File, New Folder, Paste.
+/// Test-side entry: reads the real config dir, which the tests that use it
+/// never populate with viewers; the app itself goes through
+/// [`build_tree_context_menu_items_in_dir`] with the dir it carries.
+#[cfg(test)]
 fn build_tree_context_menu_items(
+    node: Option<&crate::widgets::file_tree::Node>,
+    root: &Path,
+    selection: &[PathBuf],
+    target_dir: &Path,
+    clipboard: Option<&ExplorerClipboard>,
+    compare_anchor: Option<&Path>,
+) -> Vec<(String, MenuAction)> {
+    build_tree_context_menu_items_in_dir(
+        &crate::prefs::config_dir(),
+        node,
+        root,
+        selection,
+        target_dir,
+        clipboard,
+        compare_anchor,
+    )
+}
+
+/// [`build_tree_context_menu_items`] reading the viewers under an explicit
+/// config dir: the app passes the dir it carries, so the row it builds and
+/// the click that resolves the row read the same extensions.
+fn build_tree_context_menu_items_in_dir(
+    config_dir: &Path,
     node: Option<&crate::widgets::file_tree::Node>,
     root: &Path,
     selection: &[PathBuf],
@@ -1727,7 +1754,10 @@ fn build_tree_context_menu_items(
         target_dir,
         clipboard,
         compare_anchor,
-        |file| crate::mcp::registry::viewer_for_path(file).map(|v| (v.label.clone(), v.key())),
+        |file| {
+            crate::mcp::registry::viewer_for_path_in_dir(config_dir, file)
+                .map(|v| (v.label.clone(), v.key()))
+        },
     )
 }
 
@@ -18792,7 +18822,8 @@ impl App {
         } else {
             self.disabled_extensions.insert(id.clone());
         }
-        let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
+        let _ =
+            crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
         self.refresh_extensions();
         self.status = format!(
             "{} extension '{id}'",
@@ -18840,7 +18871,10 @@ impl App {
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
                 if self.disabled_extensions.remove(id) {
-                    let _ = crate::prefs::save_disabled_extensions(&self.disabled_extensions);
+                    let _ = crate::prefs::save_disabled_extensions_in(
+                        &self.config_dir,
+                        &self.disabled_extensions,
+                    );
                 }
                 // And its consent: a re-add is a program the user has not
                 // approved this time, so the first-run gate asks again.
@@ -31375,7 +31409,9 @@ impl App {
         let ext_commands: Vec<crate::widgets::command_palette::ExtensionCommand> =
             crate::mcp::registry::contributed_commands()
                 .into_iter()
-                .chain(crate::mcp::registry::contributed_viewer_commands())
+                .chain(crate::mcp::registry::contributed_viewer_commands_in_dir(
+                    &self.config_dir,
+                ))
                 .map(|c| crate::widgets::command_palette::ExtensionCommand {
                     ext_id: c.ext_id,
                     id: c.id,
@@ -36232,7 +36268,8 @@ impl App {
                     let target_dir =
                         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root);
                     let selection = self.tree.action_paths();
-                    let mut items = build_tree_context_menu_items(
+                    let mut items = build_tree_context_menu_items_in_dir(
+                        &self.config_dir,
                         node,
                         &self.tree.root,
                         &selection,

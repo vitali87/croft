@@ -13693,6 +13693,7 @@ prompt = "Query"
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
     // Allowed this session, not (yet) on disk: the gate must not re-prompt,
     // it must move on to the command's own argument prompt.
     app.consented_extensions.insert("tconsent".into());
@@ -13758,6 +13759,7 @@ extensions = ["csv"]
     std::fs::write(&data, "a,b\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
     let viewer = crate::mcp::registry::viewer_by_id_in_dir(&croft, "tviewer/sh")
         .expect("the scratch viewer");
     let before = app.terminals.len();
@@ -13798,18 +13800,91 @@ extensions = ["csv"]
     );
 }
 
+/// The Explorer row and the palette row for a viewer are built from the
+/// same config dir the click resolves them through: a viewer installed only
+/// under the app's dir gets its row, and the row opens.
+#[test]
+fn a_viewer_row_is_built_and_resolved_through_the_same_config_dir() {
+    const EXT: &str = r#"
+id = "tviewer"
+name = "tviewer"
+api_version = 1
+[[viewers]]
+id = "sh"
+label = "Open in sh"
+command = "/bin/sh"
+args = ["-c", "sleep 30", "sh", "{file}"]
+extensions = ["csv"]
+"#;
+    let (_scratch, croft) = scratch_config(&[("tviewer", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("data.csv");
+    std::fs::write(&csv, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
+    app.consented_extensions.insert("tviewer".into());
+    let n = file_node(&csv);
+    let items = build_tree_context_menu_items_in_dir(
+        &croft,
+        Some(&n),
+        tmp.path(),
+        std::slice::from_ref(&csv),
+        tmp.path(),
+        None,
+        None,
+    );
+    let row = items
+        .iter()
+        .find_map(|(label, a)| match a {
+            MenuAction::OpenInViewer(id, p) if p == &csv => Some((label.clone(), id.clone())),
+            _ => None,
+        })
+        .expect("the viewer under the app's config dir gets a row");
+    assert_eq!(row, ("Open in sh".to_string(), "tviewer/sh".to_string()));
+    let before = app.terminals.len();
+    app.dispatch_menu_action(
+        MenuAction::OpenInViewer(row.1.clone(), csv.clone()),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(
+        app.terminals.len(),
+        before + 1,
+        "and the row resolves and opens"
+    );
+    let palette_ids: Vec<String> = crate::mcp::registry::contributed_viewer_commands_in_dir(&croft)
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert!(
+        palette_ids.iter().any(|id| id == "viewer:tviewer/sh"),
+        "the palette row comes from the same dir: {palette_ids:?}"
+    );
+}
+
 /// Uninstalling an extension forgets its consent, in the session and on
 /// disk: a later re-add is a fresh install of a program the user has not
-/// approved this time, so the first-run gate asks again.
+/// approved this time, so the first-run gate asks again. The disabled state
+/// it clears lands in the same config file.
 #[test]
 fn uninstalling_an_extension_forgets_its_consent() {
     let (_scratch, croft) = scratch_config(&[]);
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.config_dir = croft.clone();
+    app.consented_extensions = consent_on_disk(&croft);
     crate::prefs::save_mcp_consent_in(&croft, "csvlens").unwrap();
     app.consented_extensions.insert("csvlens".into());
+    app.disabled_extensions.insert("csvlens".into());
+    crate::prefs::save_disabled_extensions_in(&croft, &app.disabled_extensions).unwrap();
     app.perform_extension_uninstall("csvlens");
+    let disabled_on_disk = crate::prefs::Prefs::load(&croft.join("config.json"))
+        .unwrap_or_default()
+        .disabled_extensions;
+    assert!(
+        !disabled_on_disk.contains("csvlens"),
+        "the disabled state is cleared in the app's own config file: {disabled_on_disk:?}"
+    );
     assert!(
         app.status.starts_with("Uninstalled"),
         "fixture: the catalog entry uninstalls cleanly: {:?}",
