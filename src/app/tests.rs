@@ -13570,6 +13570,59 @@ fn a_viewer_asks_for_consent_before_its_first_run() {
     );
 }
 
+/// A viewer that is gone by the time its menu row is clicked, or by the time
+/// its consent prompt is allowed (the extension was removed in between),
+/// must say so rather than do nothing: a silent click reads as a broken
+/// menu. Neither path spawns anything or records consent for a viewer it
+/// could not find.
+#[test]
+fn a_vanished_viewer_is_reported_from_the_menu_and_the_consent_prompt() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let before = app.terminals.len();
+    let key = format!("vanished-ext-{}/csvlens", std::process::id());
+    app.status.clear();
+    app.dispatch_menu_action(
+        MenuAction::OpenInViewer(key.clone(), data.clone()),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(app.terminals.len(), before, "the menu click spawns nothing");
+    assert!(
+        app.status.contains("no longer"),
+        "the click says the viewer is gone: {:?}",
+        app.status
+    );
+    app.status.clear();
+    app.open_input_prompt(
+        InputPrompt::new(
+            InputPurpose::ViewerConsent {
+                key: key.clone(),
+                path: data,
+            },
+            "Allow",
+            "",
+        )
+        .with_value("allow"),
+    );
+    app.submit_input_prompt();
+    assert!(app.input_prompt.is_none(), "the prompt closes");
+    assert_eq!(app.terminals.len(), before, "allowing spawns nothing");
+    assert!(
+        app.status.contains("no longer"),
+        "allowing says the viewer is gone: {:?}",
+        app.status
+    );
+    assert!(
+        !app.consented_extensions
+            .iter()
+            .any(|e| key.starts_with(e.as_str())),
+        "no consent is recorded for a viewer that could not be found"
+    );
+}
+
 /// #465: the palette row reaches the viewer route (not the MCP command path)
 /// and guards on the active file before anything is spawned.
 #[test]

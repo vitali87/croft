@@ -498,21 +498,48 @@ pub fn summaries(sources: &[&str]) -> Vec<ExtensionSummary> {
         .collect()
 }
 
-/// Leak a parsed string to `&'static`. Sound because the data it represents
-/// (server / package names) lives for the whole process; the count is bounded
-/// by the number of installed extensions, loaded once at startup.
+/// The strings handed out by [`intern`], so each distinct string is leaked
+/// once however often it is asked for.
+static INTERNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The slices handed out by [`intern_pairs`], keyed by their content, so a
+/// map seen before hands back the slice it got the first time.
+static INTERNED_PAIRS: std::sync::Mutex<PairTable> = std::sync::Mutex::new(BTreeMap::new());
+
+/// A parsed string map, by content, to the interned slice built from it.
+type PairTable = BTreeMap<Vec<(String, String)>, &'static [(&'static str, &'static str)]>;
+
+/// A `&'static str` for a parsed string, leaked at most once per distinct
+/// string. Sound because the data it represents (server / package names)
+/// lives for the whole process; bounded by the number of distinct strings
+/// the installed manifests carry, not by how often a provision is built,
+/// since a viewer's provision is rebuilt on every right-click and every
+/// palette open (#485 review).
 fn intern(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
+    let mut set = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = set.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    set.insert(leaked);
+    leaked
 }
 
-/// Leak a parsed string map to `&'static [(&'static str, &'static str)]` (the
-/// OS/arch token form `Provision::Binary` carries). Same soundness as
-/// [`intern`]: the data lives for the whole process and is bounded by the
-/// installed extension count.
+/// A `&'static [(&'static str, &'static str)]` (the OS/arch token form
+/// `Provision::Binary` carries) for a parsed string map, leaked at most once
+/// per distinct map. Same soundness and the same bound as [`intern`].
 fn intern_pairs(m: &BTreeMap<String, String>) -> &'static [(&'static str, &'static str)] {
+    let key: Vec<(String, String)> = m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut table = INTERNED_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = table.get(&key) {
+        return existing;
+    }
     let v: Vec<(&'static str, &'static str)> =
         m.iter().map(|(k, val)| (intern(k), intern(val))).collect();
-    Box::leak(v.into_boxed_slice())
+    let leaked: &'static [(&'static str, &'static str)] = Box::leak(v.into_boxed_slice());
+    table.insert(key, leaked);
+    leaked
 }
 
 impl ProvisionDecl {
@@ -665,6 +692,46 @@ provision = { kind = "binary", bin = "x", archive = "tar.xz", targets = { "macos
                 "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3"
             )]
         );
+    }
+
+    /// The provision is rebuilt on every right-click and every palette open
+    /// (#485 review), so its interned strings must be interned, not leaked
+    /// afresh each time: a second build hands back the same allocations.
+    #[test]
+    fn rebuilding_a_provision_reuses_its_interned_strings() {
+        const DECL: &str = r#"
+id = "y"
+name = "y"
+api_version = 1
+
+[[viewers]]
+id = "y"
+label = "y"
+command = "y"
+provision = { kind = "binary", bin = "ybin", archive = "tar.xz", targets = { "linux-x86_64" = "https://example.invalid/y.tar.xz" }, sha256 = { "linux-x86_64" = "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3" } }
+"#;
+        let m = parse(DECL).expect("parses");
+        let decl = m.viewers[0].provision.as_ref().unwrap();
+        let (
+            Provision::Binary {
+                targets: t1,
+                sha256: s1,
+                bin: b1,
+                ..
+            },
+            Provision::Binary {
+                targets: t2,
+                sha256: s2,
+                bin: b2,
+                ..
+            },
+        ) = (decl.to_provision(), decl.to_provision())
+        else {
+            panic!("binary");
+        };
+        assert!(std::ptr::eq(t1, t2), "the target map is interned once");
+        assert!(std::ptr::eq(s1, s2), "and so is the digest map");
+        assert!(std::ptr::eq(b1, b2), "and every string");
     }
 
     /// #465: a catalog entry that opens a file kind in an external TUI.

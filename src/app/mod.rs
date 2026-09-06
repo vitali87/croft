@@ -21617,15 +21617,17 @@ impl App {
             }
             InputPurpose::ViewerConsent { key, path } => {
                 // The user allowed the viewer's extension; record it and
-                // resume the open that asked.
+                // resume the open that asked. The viewer is looked up first:
+                // one removed while the prompt was up gets a status line and
+                // no consent, since what was allowed no longer exists.
                 self.close_input_prompt();
-                if let Some(ext_id) = key.split('/').next() {
-                    let _ = crate::prefs::save_mcp_consent(ext_id);
-                    self.consented_extensions.insert(ext_id.to_string());
-                }
-                if let Some(viewer) = crate::mcp::registry::viewer_by_id(&key) {
-                    self.open_in_viewer(&viewer, &path);
-                }
+                let Some(viewer) = crate::mcp::registry::viewer_by_id(&key) else {
+                    self.status = format!("{key} is no longer available");
+                    return;
+                };
+                let _ = crate::prefs::save_mcp_consent(&viewer.ext_id);
+                self.consented_extensions.insert(viewer.ext_id.clone());
+                self.open_in_viewer(&viewer, &path);
             }
             InputPurpose::McpConsent { command_id } => {
                 // The user confirmed; record consent for this command's
@@ -21634,6 +21636,11 @@ impl App {
                 self.close_input_prompt();
                 if let Some(resolved) = crate::mcp::registry::resolve_command(&command_id) {
                     let _ = crate::prefs::save_mcp_consent(&resolved.ext_id);
+                    // The viewer gate reads this set rather than prefs, and
+                    // both gates are one consent per extension: allowing a
+                    // sidecar must not re-prompt for the same extension's
+                    // viewer in the same session.
+                    self.consented_extensions.insert(resolved.ext_id.clone());
                 }
                 self.run_extension_command(&command_id);
             }
@@ -39424,8 +39431,11 @@ impl App {
             }
             MenuAction::RevealInFinder(path) => self.reveal_in_finder(path),
             MenuAction::OpenInViewer(id, path) => {
-                if let Some(viewer) = crate::mcp::registry::viewer_by_id(&id) {
-                    self.open_in_viewer(&viewer, &path);
+                // The row was built when the menu opened; an extension
+                // removed since then must not make the click a silent no-op.
+                match crate::mcp::registry::viewer_by_id(&id) {
+                    Some(viewer) => self.open_in_viewer(&viewer, &path),
+                    None => self.status = format!("{id} is no longer available"),
                 }
             }
             MenuAction::CopyTabPath(path) => self.copy_path_to_clipboard(path),
