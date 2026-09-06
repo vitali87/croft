@@ -282,6 +282,18 @@ pub struct Prefs {
     /// Per-host pane accent rules; see [`HostAccentRule`].
     #[serde(default)]
     pub host_accents: Vec<HostAccentRule>,
+    /// Opt-out for the ssh-pane workspace offer (#364): when a pane's
+    /// foreground becomes `ssh <host>` for a host in `~/.ssh/config`, the
+    /// status bar offers to open the workspace on that host. Stored as the
+    /// disable flag so the derived `Default` and an older config both mean
+    /// "offer". User layers only: an offer is a prompt to connect somewhere.
+    #[serde(default)]
+    pub disable_remote_offer: bool,
+    /// Hosts (ssh config aliases, matched case-insensitively) the offer
+    /// never prompts for (#364): the per-host `auto_offer = off`. A jump
+    /// host, a box you only ever tunnel through. User layers only.
+    #[serde(default)]
+    pub remote_offer_excluded_hosts: Vec<String>,
     /// Scrollback lines kept per terminal pane (VS Code's
     /// `terminal.integrated.scrollback`). 0 — the default for older configs —
     /// means the built-in 5000. Applies to panes opened after the change.
