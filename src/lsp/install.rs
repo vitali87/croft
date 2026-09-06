@@ -413,9 +413,20 @@ fn extract_tar_xz(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()
 /// under `cap`, or nothing is written.
 fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> std::io::Result<()> {
     // The download cap covered compressed bytes; a high-ratio archive could
-    // still expand to fill memory and disk. The decoder writes into a sink
-    // that refuses past `cap`, and the entries' declared sizes are summed
-    // against the same cap before anything is unpacked.
+    // still expand to fill memory and disk. The stream's own index says how
+    // much it decodes to, so an archive past the ceiling is refused before a
+    // byte is decoded: the pure-Rust decoder buffers a whole block before it
+    // writes, so a check on its output alone would bound the disk but not
+    // the decode. The sink below is the second line, for a stream whose
+    // index is missing or lies: what reaches disk can never exceed the cap.
+    if let Some(declared) = xz_declared_size(bytes)
+        && declared > cap
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("archive declares {declared} bytes, past the {cap}-byte ceiling"),
+        ));
+    }
     let mut sink = Capped {
         buf: Vec::new(),
         cap,
@@ -423,16 +434,6 @@ fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> s
     lzma_rs::xz_decompress(&mut std::io::Cursor::new(bytes), &mut sink)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
     let tar_bytes = sink.buf;
-    let mut total: u64 = 0;
-    for entry in tar::Archive::new(std::io::Cursor::new(&tar_bytes)).entries()? {
-        total = total.saturating_add(entry?.header().size()?);
-        if total > cap {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("archive expands past the {cap}-byte ceiling"),
-            ));
-        }
-    }
     tar::Archive::new(std::io::Cursor::new(tar_bytes)).unpack(dir)?;
     if !target.is_file()
         && let Some(name) = target.file_name()
@@ -457,8 +458,53 @@ fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> s
     set_executable(target)
 }
 
-/// A `Write` sink that refuses to grow past `cap`, so a decoder cannot be
-/// made to allocate without bound by a small, high-ratio input.
+/// The uncompressed size an xz stream declares in its index, read from the
+/// stream footer without decoding anything, or `None` when the footer or
+/// index cannot be read (the decoder then reports whatever is wrong).
+fn xz_declared_size(bytes: &[u8]) -> Option<u64> {
+    // Stream footer, last 12 bytes: CRC32, backward size (index size / 4 - 1),
+    // stream flags, "YZ". The index precedes it: 0x00, a record count, then
+    // per record the unpadded and uncompressed sizes as 7-bit varints.
+    let n = bytes.len();
+    if n < 12 || &bytes[n - 2..] != b"YZ" {
+        return None;
+    }
+    let backward = u32::from_le_bytes(bytes[n - 8..n - 4].try_into().ok()?) as usize;
+    let index_size = backward.checked_add(1)?.checked_mul(4)?;
+    let index_start = n.checked_sub(12)?.checked_sub(index_size)?;
+    let index = &bytes[index_start..n - 12];
+    if index.first() != Some(&0) {
+        return None;
+    }
+    let mut pos = 1;
+    let records = xz_varint(index, &mut pos)?;
+    let mut total: u64 = 0;
+    for _ in 0..records {
+        let _unpadded = xz_varint(index, &mut pos)?;
+        total = total.checked_add(xz_varint(index, &mut pos)?)?;
+    }
+    Some(total)
+}
+
+/// One xz multibyte integer: little-endian 7-bit groups, high bit continues.
+fn xz_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for i in 0..9 {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        value |= u64::from(b & 0x7f) << (7 * i);
+        if b & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// A `Write` sink that refuses to grow past `cap`: nothing past the ceiling
+/// is kept, so nothing past it can reach the disk. It bounds what is
+/// unpacked, not the decoder's own buffering; the declared-size check in
+/// [`extract_tar_xz_capped`] is what keeps an oversize stream from being
+/// decoded at all.
 struct Capped {
     buf: Vec<u8>,
     cap: u64,
@@ -1429,6 +1475,43 @@ mod tests {
             "a 4 KiB payload under a 1 KiB cap is refused"
         );
         assert!(!landed, "and nothing is left at the target");
+    }
+
+    /// An archive that declares more than the ceiling is refused from its
+    /// index, before a byte is decoded: the pure-Rust decoder buffers a
+    /// whole block in memory before it writes, so a sink on its output
+    /// bounds the disk but not the decode itself.
+    #[test]
+    fn an_xz_stream_declares_its_size_and_is_refused_before_decoding() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let payload = vec![0u8; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "big/csvlens", &payload[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        assert_eq!(
+            xz_declared_size(&xz),
+            Some(tar_bytes.len() as u64),
+            "the index names the tar's size"
+        );
+        assert_eq!(xz_declared_size(b"not an xz stream"), None);
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-declared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = extract_tar_xz_capped(&xz, &dir, &dir.join("csvlens"), 1024)
+            .expect_err("a 4 KiB payload under a 1 KiB cap is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("declares"),
+            "the refusal comes from the index, before decoding: {err}"
+        );
     }
 
     /// The checksum gate is the only thing between a download and an

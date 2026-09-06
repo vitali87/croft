@@ -1,11 +1,10 @@
 # Catalog entry (external viewer, #465): csvlens, a terminal CSV/TSV browser.
 # Available to add from the Extensions panel; not installed until the user adds
 # it. On add, this manifest is written into ~/.config/croft/extensions/csvlens/
-# The digests are the project's own *.sha256 files for v0.15.1; a download that
-# does not match is refused before it is unpacked.
 # and loaded like any installed extension. The binary is provisioned pinned from
 # the project's own release (cargo-dist tar.xz) when absent from PATH; a copy
-# already on PATH wins.
+# already on PATH wins. The digests are the project's own *.sha256 files for
+# v0.15.1; a download that does not match is refused before it is unpacked.
 id = "csvlens"
 name = "csvlens"
 description = "Browse CSV and TSV files in csvlens, a terminal spreadsheet viewer, in a pane of their own."

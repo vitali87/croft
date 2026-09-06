@@ -31722,8 +31722,8 @@ impl App {
         }
     }
 
-    /// A palette `viewer:<id>` row: open the active editor file in that
-    /// viewer, if the file is a kind it handles.
+    /// A palette `viewer:<extension id>/<viewer id>` row: open the active
+    /// editor file in that viewer, if the file is a kind it handles.
     fn run_viewer_command(&mut self, viewer_id: &str) {
         let Some(viewer) = crate::mcp::registry::viewer_by_id(viewer_id) else {
             self.status = format!("Viewer '{viewer_id}' is unavailable");

@@ -441,9 +441,32 @@ pub struct ServerEntry {
     pub config: ServerConfig,
 }
 
-/// Parse an `extension.toml` source.
+/// Parse an `extension.toml` source. Ids are checked here because they name
+/// directories (`~/.croft/servers/<id>/`, the user extensions dir) and
+/// dispatch keys (`viewer:<extension>/<viewer>`): a separator, a parent
+/// reference or whitespace in one would reach a path join or split a key.
 pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
-    toml::from_str(src)
+    let m: ExtensionManifest = toml::from_str(src)?;
+    for (what, id) in std::iter::once(("extension", m.id.as_str()))
+        .chain(m.viewers.iter().map(|v| ("viewer", v.id.as_str())))
+    {
+        if !id_is_sound(id) {
+            return Err(serde::de::Error::custom(format!(
+                "{what} id {id:?} is not allowed: ids are non-empty, contain no `/`, `\\` or whitespace, and are not `.` or `..`"
+            )));
+        }
+    }
+    Ok(m)
+}
+
+/// Whether an id can safely name a directory and a key segment.
+fn id_is_sound(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !id
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_whitespace())
 }
 
 /// A user-facing extension entry for the Extensions panel: identity and blurb,
@@ -593,6 +616,24 @@ pub fn read_extension_sources(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ids name directories and dispatch keys, so a separator or a parent
+    /// reference in one is refused at parse time rather than reaching a
+    /// path join.
+    #[test]
+    fn ids_with_a_separator_or_parent_reference_do_not_parse() {
+        const OK: &str = "id = \"fine.id-1\"\nname = \"x\"\napi_version = 1\n";
+        assert!(parse(OK).is_ok(), "dots, hyphens and digits are fine");
+        for bad in ["a/b", "a\\b", "..", ".", "", "a b"] {
+            // Literal (single-quoted) TOML strings, so a backslash stays a backslash.
+            let src = format!("id = '{bad}'\nname = \"x\"\napi_version = 1\n");
+            assert!(parse(&src).is_err(), "extension id {bad:?} must be refused");
+            let src = format!(
+                "id = \"ok\"\nname = \"x\"\napi_version = 1\n\n[[viewers]]\nid = '{bad}'\nlabel = \"l\"\ncommand = \"c\"\n"
+            );
+            assert!(parse(&src).is_err(), "viewer id {bad:?} must be refused");
+        }
+    }
 
     /// A binary provision may pin the asset's digest per platform (#485
     /// review): the parsed form carries it alongside the URL map.

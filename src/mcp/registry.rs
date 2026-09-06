@@ -151,10 +151,13 @@ impl ContributedViewer {
     }
 
     /// The name croft's managed install of this viewer's binary lives under
-    /// (`~/.croft/servers/<name>/`): the key with its `/` folded, so two
-    /// extensions' same-named viewers never share an install dir.
+    /// (`~/.croft/servers/<name>/`): the key itself, so the install dir is
+    /// nested `<extension>/<viewer>` and two extensions' same-named viewers
+    /// never share one. Unambiguous because ids may not contain `/` (the
+    /// manifest parser refuses them), which a joined-with-a-hyphen name was
+    /// not: `alpha-x`/`y` and `alpha`/`x-y` folded into one directory.
     pub fn install_name(&self) -> String {
-        format!("{}-{}", self.ext_id, self.id)
+        self.key()
     }
 }
 
@@ -208,7 +211,7 @@ fn viewer_for_path_in(
 }
 
 /// Pure: the palette rows for every enabled viewer, titled
-/// `<extension id>: <label>` with id `viewer:<id>`.
+/// `<extension id>: <label>` with id `viewer:<extension id>/<viewer id>`.
 fn viewer_commands_in(sources: &[String], disabled: &BTreeSet<String>) -> Vec<ContributedCommand> {
     viewers_in(sources, disabled)
         .into_iter()
@@ -312,6 +315,27 @@ provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { 
             keys.len(),
             2,
             "install and dispatch identities do not collide"
+        );
+    }
+
+    /// The managed install dir must be unambiguous across extensions:
+    /// `alpha-x`/`y` and `alpha`/`x-y` are different viewers and must not
+    /// share a directory, however their ids are spelled.
+    #[test]
+    fn install_names_cannot_collide_across_extensions() {
+        let mk = |ext: &str, id: &str| ContributedViewer {
+            ext_id: ext.into(),
+            id: id.into(),
+            label: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            extensions: Vec::new(),
+            provision: None,
+        };
+        assert_ne!(
+            mk("alpha-x", "y").install_name(),
+            mk("alpha", "x-y").install_name(),
+            "hyphenated ids do not fold into one name"
         );
     }
 
