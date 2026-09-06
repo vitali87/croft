@@ -237,6 +237,48 @@ impl AgentLedger {
         rows
     }
 
+    /// One agent's unreviewed files grouped by the workspace root that owns
+    /// them (#348), each group ordered by the same recency `lane` uses.
+    ///
+    /// `roots` is asked which root owns each path; a file under none of them
+    /// (an agent that wrote outside the workspace) groups under `None`
+    /// rather than being dropped, because a review queue that silently omits
+    /// a file an agent changed is worse than one that says "somewhere else".
+    /// Groups come back in root order, `None` last, so a worktree lane's
+    /// files read as their own section rather than interleaved with the main
+    /// checkout's.
+    pub fn lane_by_root<'a>(
+        &'a self,
+        agent: &str,
+        roots: &'a [PathBuf],
+    ) -> Vec<(Option<&'a Path>, Vec<&'a LaneFile>)> {
+        let owner = |path: &Path| -> Option<&'a Path> {
+            roots
+                .iter()
+                .filter(|r| path.starts_with(r))
+                .max_by_key(|r| r.components().count())
+                .map(PathBuf::as_path)
+        };
+        let mut groups: Vec<(Option<&Path>, Vec<&LaneFile>)> = Vec::new();
+        for file in self.lane(agent).into_iter().filter(|f| f.unreviewed()) {
+            let root = owner(&file.path);
+            match groups.iter_mut().find(|(r, _)| *r == root) {
+                Some((_, files)) => files.push(file),
+                None => groups.push((root, vec![file])),
+            }
+        }
+        // Root order, not first-seen order: the queue should read the same
+        // way twice running, whatever the agent touched most recently.
+        groups.sort_by_key(|(root, _)| match root {
+            Some(r) => roots
+                .iter()
+                .position(|candidate| candidate == r)
+                .unwrap_or(usize::MAX),
+            None => usize::MAX,
+        });
+        groups
+    }
+
     /// Every unreviewed file across every lane, deduplicated.
     ///
     /// One set rather than per-agent lists, because the consumer is the
@@ -573,6 +615,92 @@ mod tests {
         led.mark_reviewed("claude", &p("/w/a.rs"), 3);
         assert_eq!(led.lane("claude")[0].path, p("/w/z.rs"));
         assert_eq!(led.lane("claude")[1].path, p("/w/a.rs"));
+    }
+
+    /// The queue read one worktree at a time (#348): grouping is what
+    /// lets a lane's changes be told from the main checkout's.
+    #[test]
+    fn a_lane_groups_its_files_by_the_root_that_owns_them() {
+        // #348: with a worktree lane in the workspace, the review queue reads
+        // as one section per root, in root order, with anything outside every
+        // root last rather than dropped.
+        let mut led = AgentLedger::new();
+        let repo = PathBuf::from("/w/repo");
+        let lane = PathBuf::from("/w/repo-fix");
+        let roots = vec![repo.clone(), lane.clone()];
+        let working = vec![String::from("claude")];
+        // Written lane-first, so first-seen order differs from root order.
+        led.record_write(&lane.join("src/a.rs"), 1, &working);
+        led.record_write(&repo.join("src/b.rs"), 2, &working);
+        led.record_write(&PathBuf::from("/elsewhere/c.rs"), 3, &working);
+        led.record_write(&lane.join("src/d.rs"), 4, &working);
+
+        let groups = led.lane_by_root("claude", &roots);
+        let shape: Vec<(Option<&Path>, Vec<&Path>)> = groups
+            .iter()
+            .map(|(root, files)| (*root, files.iter().map(|f| f.path.as_path()).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (Some(repo.as_path()), vec![repo.join("src/b.rs").as_path()]),
+                (
+                    Some(lane.as_path()),
+                    // Recency inside the group: d.rs was written after a.rs.
+                    vec![
+                        lane.join("src/d.rs").as_path(),
+                        lane.join("src/a.rs").as_path()
+                    ],
+                ),
+                (None, vec![Path::new("/elsewhere/c.rs")]),
+            ],
+            "root order, recency within, unowned last"
+        );
+
+        // A reviewed file leaves the queue, and an emptied group with it.
+        for f in led
+            .lane("claude")
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>()
+        {
+            if f.starts_with(&lane) {
+                let h = led
+                    .lane("claude")
+                    .iter()
+                    .find(|x| x.path == f)
+                    .unwrap()
+                    .current_hash;
+                led.mark_reviewed("claude", &f, h);
+            }
+        }
+        let groups = led.lane_by_root("claude", &roots);
+        assert_eq!(
+            groups.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![Some(repo.as_path()), None],
+            "the lane's group is gone once its files are reviewed"
+        );
+        assert!(
+            led.lane_by_root("nobody", &roots).is_empty(),
+            "an agent with no lane has no groups"
+        );
+
+        // Nested roots: the DEEPER root owns the file, the same rule
+        // `WorkspaceRoots::owning_root` applies, which this re-implements to
+        // stay pure. The two must not drift.
+        let mut led = AgentLedger::new();
+        let inner = repo.join("crates/foo");
+        let nested = vec![repo.clone(), inner.clone()];
+        led.record_write(&inner.join("src/lib.rs"), 1, &working);
+        led.record_write(&repo.join("README.md"), 2, &working);
+        assert_eq!(
+            led.lane_by_root("claude", &nested)
+                .iter()
+                .map(|(r, f)| (*r, f.len()))
+                .collect::<Vec<_>>(),
+            vec![(Some(repo.as_path()), 1), (Some(inner.as_path()), 1)],
+            "the deeper root owns its file, roots still in order"
+        );
     }
 
     /// A dropped-events window makes every count a LOWER BOUND, and says
