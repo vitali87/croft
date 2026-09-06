@@ -4615,6 +4615,19 @@ impl Editor {
                 .is_some_and(|md| md.doc_path.is_some())
     }
 
+    /// Whether this buffer's text is exactly what `bytes` decode to (#349),
+    /// for checking a stored snapshot against the buffer the map would land
+    /// on. Compared as LINES, the way `open` builds them: a file's trailing
+    /// newline is not a line of its own, so comparing raw bytes would call
+    /// every ordinary text file a mismatch.
+    pub fn holds_exactly(&self, bytes: &[u8]) -> bool {
+        let enc = encoding_rs::Encoding::for_bom(bytes)
+            .map(|(e, _)| e)
+            .unwrap_or(self.encoding);
+        let (text, _, had_errors) = enc.decode(bytes);
+        !had_errors && split_into_lines(&text) == self.lines
+    }
+
     /// The map a save of this tab records beside its history snapshot
     /// (#349): the buffer's own for text, empty for a viewer, whose
     /// placeholder line no seat wrote. Read off the tab that was saved, never

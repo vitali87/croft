@@ -39667,6 +39667,15 @@ impl App {
         if on_disk != snapshot {
             return;
         }
+        // And this buffer holds that very text. A clean buffer can still be
+        // stale: when one tab of a split saves, the other keeps the pre-save
+        // lines, and the snapshot then matches DISK while describing text
+        // that tab never held. The disk stamp cannot tell the two apart when
+        // both writes land inside one filesystem timestamp tick, so the
+        // comparison is against the buffer's own bytes.
+        if !ed.holds_exactly(&snapshot) {
+            return;
+        }
         seats.truncate(ed.lines.len());
         ed.provenance = seats;
     }

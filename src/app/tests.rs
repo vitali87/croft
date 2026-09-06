@@ -12853,6 +12853,61 @@ fn an_inactive_group_save_records_the_map_of_that_buffer() {
     );
 }
 
+/// A clean buffer can still be stale (#349 review): when one tab of a split
+/// saves, the other keeps the pre-save text and its own disk stamp. The
+/// newest snapshot then matches disk while describing text that tab never
+/// held, so the map must NOT be applied to it.
+#[test]
+fn a_stale_tab_is_not_credited_with_the_map_of_the_saving_tab() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    // The inactive group types and saves; the focused tab is untouched, so
+    // it stays clean, unattributed, and holding the pre-save text.
+    {
+        let mut groups = app.editor_layout.inactive_groups_mut();
+        let other: &mut crate::widgets::editor::Editor = &mut *groups[0];
+        other.cursor_row = 0;
+        other.cursor_col = 0;
+        other.insert_str_as("nav\n", Seat::Navigator);
+        age_last_edit(other);
+    }
+    app.auto_save = true;
+    assert!(
+        app.tick_auto_save(),
+        "staging: the sweep saved the other buffer"
+    );
+    let snaps = wait_for_snapshots(&app.history_root, &f);
+    wait_for_seats(&app.history_root, &f, snaps[0].millis);
+    // Positive control: there IS a map beside a snapshot matching disk, so a
+    // sync that ignored staleness would have something to apply.
+    assert_eq!(
+        std::fs::read(&snaps[0].file).unwrap(),
+        std::fs::read(&f).unwrap(),
+        "staging: the newest snapshot matches the file on disk"
+    );
+    assert!(!app.editor.dirty, "staging: the focused tab is clean");
+    assert_eq!(
+        app.editor.lines,
+        vec![String::from("one")],
+        "staging: and still holds the pre-save text"
+    );
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "a stale buffer is not credited from a snapshot of text it never held: {:?}",
+        app.editor.provenance
+    );
+}
+
 /// A restore of a snapshot with no sidecar restores every line unknown
 /// (#349 review): the buffer's previous map described the text the restore
 /// replaced, and keeping it would credit lines nobody observed.
