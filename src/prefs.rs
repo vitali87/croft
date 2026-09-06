@@ -294,6 +294,12 @@ pub struct Prefs {
     /// host, a box you only ever tunnel through. User layers only.
     #[serde(default)]
     pub remote_offer_excluded_hosts: Vec<String>,
+    /// The agent a new worktree lane starts in its pane (#348): the name of
+    /// an `agents.json` row (built in: claude, codex, aider, gemini), whose
+    /// `launch` line is typed into the lane's fresh shell. Unset, a lane
+    /// opens a plain shell. User layers only: it names a command to run.
+    #[serde(default)]
+    pub lane_agent: Option<String>,
     /// Scrollback lines kept per terminal pane (VS Code's
     /// `terminal.integrated.scrollback`). 0 — the default for older configs —
     /// means the built-in 5000. Applies to panes opened after the change.
