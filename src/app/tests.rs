@@ -1562,6 +1562,59 @@ fn cell_with_link(pane: &crate::widgets::terminal::PtyTerminal, uri: &str) -> Op
     cells_of(pane).find(|&(c, r)| pane.hyperlink_at_screen(c, r).as_deref() == Some(uri))
 }
 
+/// `cell_carrying` returns a cell INSIDE the needle, not the row's first cell.
+///
+/// The refinement has exactly one red state in the suite, and it is a
+/// downstream word-selection assertion in another test, so it does not
+/// depend on that one test surviving: the helper's own doc records that the
+/// column derivation in it was wrong once.
+///
+/// Placed immediately below the helper rather than in the block it was first
+/// written in, which was some 35,000 lines away and made "beside the helper"
+/// a claim the file did not support.
+#[test]
+fn cell_carrying_lands_inside_the_needle_not_at_the_start_of_its_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminals[0].last_area;
+    assert!(
+        area.width > 4 && area.height > 2,
+        "the terminal must be laid out, or the search finds nothing and the \
+         failure below blames a missing token rather than a missing pane"
+    );
+
+    // The needle is NOT at column 0: a shell-shaped prefix in front of it is
+    // what separates a span predicate from a row-level `contains`, which
+    // would resolve the `b` of `bash-5.2$` instead.
+    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\nbash-5.2$ tok_here\r\n");
+    term.draw(|f| app.render(f)).unwrap();
+
+    let (col, row) =
+        cell_carrying(&app.terminals[0], "tok_here").expect("the pane must show this test's token");
+    let (text, idx) = app.terminals[0]
+        .line_text_at(col, row)
+        .expect("the returned cell must map to a row and a char index");
+    let start = text
+        .find("tok_here")
+        .map(|b| text[..b].chars().count())
+        .expect("the row the search returned must carry the needle");
+    assert!(
+        (start..start + "tok_here".chars().count()).contains(&idx),
+        "the cell must fall inside the needle: row {text:?} put the cell at \
+         char {idx} and the needle spans {start}..{}",
+        start + "tok_here".chars().count()
+    );
+    assert!(
+        idx > 0,
+        "and this fixture must keep the needle off column 0, or a row \
+         predicate and a span predicate pick the same cell and the assertion \
+         above cannot fail"
+    );
+}
+
 fn mouse(
     kind: crossterm::event::MouseEventKind,
     col: u16,
@@ -2922,7 +2975,12 @@ fn a_double_click_prefix_over_a_mouse_tracking_child_leaves_the_builtin_alone() 
     // computed from the border row.
     app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\n");
     // Two links in one feed, in the order the bytes carry them: the DECOY
-    // first, then the payload. The decoy is what gives the exact-URI SEARCH a
+    // first, then the payload. The `a prompt got here first` line above is a
+    // SEPARATE feed, and that is fine here for a reason worth stating, since
+    // a sibling test was just rewritten to avoid exactly that: this search is
+    // anchored on a URI, not on a column, so a prompt arriving between the
+    // two feeds moves the link's row and changes nothing the test asserts.
+    // The wrap test cannot say that, because a column is precisely its claim. The decoy is what gives the exact-URI SEARCH a
     // red state: revert the predicate to `.is_some()` and the row-major scan
     // stops on the decoy, so the status assertion rejects it by name. It does
     // NOT pin the assertion's FORM - with the search intact, `contains`
@@ -36971,12 +37029,23 @@ fn a_recorded_frames_rows_wrap_at_the_width_its_header_declares() {
         declared, 40,
         "the fixture's own premise: the header must declare the 40 columns the pane was sized to"
     );
-    // The wrap itself, pinned as adjacency rather than as a length. With the
-    // period coprime with 40 the two halves are different strings, so no
-    // other grid width puts them on consecutive rows; the width bound below
-    // is then a second, independent rejection rather than the only one.
+    // The wrap, pinned as two WHOLE rows rather than as a substring. The
+    // substring form this replaces did not deliver the uniqueness its comment
+    // claimed: `contains` only needs the first half to END some row and the
+    // second to BEGIN the next, so with a period-P fill it matches at every
+    // width w in 40..=60 with w congruent to 40 mod P. At the period of 10
+    // this started with that was widths 50 and 60; at 7 it is 47 and 54, and
+    // 47 is the very number this test's own first draft misread off a
+    // 40-column grid. Changing the period could never fix it.
+    //
+    // Row EQUALITY can only hold at width 40: at 47 the row is `long[..47]`,
+    // which is not `long[..40]`. So adjacency now rejects every other width on
+    // its own, and the bound below is a genuinely independent second check
+    // rather than the only one doing the work.
+    let rows: Vec<&str> = body.split("\r\n").collect();
     assert!(
-        body.contains(&format!("{}\r\n{}", &long[..40], &long[40..80])),
+        rows.windows(2)
+            .any(|w| w[0] == &long[..40] && w[1] == &long[40..80]),
         "the long line must wrap at column {declared}, the width the header promises: {body:?}"
     );
     // And no row may exceed it. This is the half that catches the 80-column
@@ -37083,12 +37152,23 @@ fn a_collapsed_pane_records_no_resize_and_leaves_the_last_one_standing() {
     app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
     app.record_active_screen();
     // Collapsed: the rect a pane gets when its split is folded to nothing.
+    // `last_inner` only, deliberately: production also calls `resize`, which
+    // floors the GRID at two columns, and the guard under test reads
+    // `last_inner` rather than the grid.
     app.terminals[0].last_inner.width = 0;
     app.record_active_screen();
     // And back to the geometry the recording was opened at. If the collapsed
     // record had written its zero into `recorded_size`, THIS record would
     // announce a resize to 40x20, which the player already has.
     app.terminals[0].last_inner.width = 40;
+    app.record_active_screen();
+    // The HEIGHT conjunct, which the first version of this test left as dead
+    // as it found it: with only `size.0 > 0` deleted the collapsed record
+    // still has a zero width and the sequence does not move, so that mutation
+    // was invisible. A zero-height fold exercises the other half.
+    app.terminals[0].last_inner.height = 0;
+    app.record_active_screen();
+    app.terminals[0].last_inner.height = 20;
     app.record_active_screen();
     app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
 
@@ -37107,54 +37187,84 @@ fn a_collapsed_pane_records_no_resize_and_leaves_the_last_one_standing() {
 
     assert_eq!(
         kinds,
-        vec!["o", "o", "o"],
-        "three frames and NO resize: a collapsed pane has no geometry worth \
-         announcing, and must not make the pane after it look like a change, \
+        vec!["o", "o", "o", "o", "o"],
+        "five frames and NO resize: a collapsed pane has no geometry worth \
+         announcing, and must not make the pane after it look like a change. \
+         Dropping either conjunct of the guard adds two `r` events, the width \
+         half from the first fold and the height half from the second, \
          got {kinds:?}"
     );
 }
 
-/// `cell_carrying` returns a cell INSIDE the needle, not the row's first cell.
+/// A fold mid-recording never writes rows wider than the header (#397).
 ///
-/// The refinement has exactly one red state in the suite, and it is a
-/// downstream word-selection assertion in another test. Pinned here directly,
-/// beside the helper, so it does not depend on that one test surviving: the
-/// helper's own doc records that the column derivation in it was wrong once.
+/// The sibling above moves `last_inner` alone, because the guard it tests
+/// reads `last_inner`. Production folds differently: `render` hands `resize`
+/// a zero width, which floors the GRID at two columns
+/// (`src/widgets/terminal.rs`), so a real fold leaves a 2-column grid under
+/// whatever width the header already declared. Nothing pinned what the cast
+/// then carries.
+///
+/// The claim is one-directional on purpose. Rows NARROWER than the header are
+/// correct here and a player renders them as a small image in a large window;
+/// rows WIDER than it are the corruption, because a player sizes its window
+/// from the header and has nowhere to put the overflow.
 #[test]
-fn cell_carrying_lands_inside_the_needle_not_at_the_start_of_its_row() {
+fn a_fold_mid_recording_never_writes_rows_wider_than_the_header() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let backend = ratatui::backend::TestBackend::new(120, 40);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 40,
+        height: 20,
+    };
+    app.terminals[0].resize(40, 20);
+    app.terminals[0].feed_bytes_for_test(b"\r\nbefore the fold\r\n");
 
-    // The needle is NOT at column 0: a shell-shaped prefix in front of it is
-    // what separates a span predicate from a row-level `contains`, which
-    // would resolve the `b` of `bash-5.2$` instead.
-    app.terminals[0].feed_bytes_for_test(b"a prompt got here first\r\nbash-5.2$ tok_here\r\n");
-    term.draw(|f| app.render(f)).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    // The real gesture: a zero width through `resize`, which the grid floors.
+    app.terminals[0].last_inner.width = 2;
+    app.terminals[0].resize(0, 20);
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
 
-    let (col, row) =
-        cell_carrying(&app.terminals[0], "tok_here").expect("the pane must show this test's token");
-    let (text, idx) = app.terminals[0]
-        .line_text_at(col, row)
-        .expect("the returned cell must map to a row and a char index");
-    let start = text
-        .find("tok_here")
-        .map(|b| text[..b].chars().count())
-        .expect("the row the search returned must carry the needle");
-    assert!(
-        (start..start + "tok_here".chars().count()).contains(&idx),
-        "the cell must fall inside the needle: row {text:?} put the cell at \
-         char {idx} and the needle spans {start}..{}",
-        start + "tok_here".chars().count()
-    );
-    assert!(
-        idx > 0,
-        "and this fixture must keep the needle off column 0, or a row \
-         predicate and a span predicate pick the same cell and the assertion \
-         above cannot fail"
-    );
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let header: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("a header")).expect("the header is JSON");
+    let declared = header["width"]
+        .as_u64()
+        .expect("the header declares a width");
+    let frames: Vec<String> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|ev| ev[1] == "o")
+        .filter_map(|ev| ev[2].as_str().map(String::from))
+        .collect();
+    assert_eq!(frames.len(), 2, "one frame each side of the fold");
+
+    for (i, frame) in frames.iter().enumerate() {
+        let body = frame
+            .strip_prefix("\u{1b}[H\u{1b}[2J")
+            .expect("a recorded frame opens with clear-and-home");
+        let widest = body
+            .split("\r\n")
+            .map(|row| row.chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest as u64 <= declared,
+            "frame {i} carries a row {widest} columns wide under a header \
+             declaring {declared}: a player has nowhere to put the overflow"
+        );
+    }
 }
 
 /// #366: review boxes survive a render, which rebuilds the navigator's.
