@@ -39634,3 +39634,107 @@ fn a_staged_view_reruns_when_a_status_refresh_lands_unchanged() {
         },
     );
 }
+
+#[test]
+fn a_head_diff_tagged_with_the_repo_toplevel_refreshes_from_a_subdirectory_workspace() {
+    // The Source Control opener tags a view with `scm_root()`, the git
+    // TOPLEVEL. From a subdirectory workspace that is not the workspace
+    // root the drain keys its HEAD-oid bookkeeping on, so `heads_moved`
+    // has to record the toplevel (and compare canonically), or a commit
+    // never re-reads the HEAD side. This drives the real drain.
+    let (tmp, f) = repo_with_seed("one\n");
+    let root = tmp.path().to_path_buf();
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut app = App::new(sub.clone()).unwrap();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the git worker's first status",
+        || {
+            app.try_install_pending_init();
+            app.git.status().in_repo
+        },
+    );
+    let scm = app.scm_root();
+    assert_ne!(
+        scm, sub,
+        "precondition: the toplevel is not the workspace root"
+    );
+
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            std::path::PathBuf::from("seed.txt (HEAD)"),
+            "one\n",
+            &f,
+            true,
+        )
+        .unwrap();
+    app.tag_open_diff(crate::widgets::diff::DiffSource::HeadVsWorking {
+        root: scm.clone(),
+        rel: String::from("seed.txt"),
+    });
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "two", "--quiet"]);
+    app.active_git_bypass_debounce();
+    app.refresh_git_status_debounced();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::RESTORED_SHELL_BASE,
+        "the HEAD side to follow the commit through the status drain",
+        || {
+            app.try_install_pending_init();
+            app.editor
+                .diff
+                .as_ref()
+                .is_some_and(|d| d.left_lines == d.right_lines && d.right_lines.len() == 2)
+        },
+    );
+}
+
+#[test]
+fn a_background_diff_refresh_leaves_the_active_diff_find_and_anchor_alone() {
+    // Only a rebuild of the ACTIVE tab recomputes the find bar; a diff
+    // refreshing in another split must not scroll or re-anchor the view the
+    // reader is on.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    let c = tmp.path().join("c.txt");
+    let d = tmp.path().join("d.txt");
+    std::fs::write(&a, "1\n").unwrap();
+    std::fs::write(&b, "1\n2\n").unwrap();
+    std::fs::write(&c, "x\n").unwrap();
+    std::fs::write(&d, "x\nneedle\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_diff(&a, &b).unwrap();
+    app.split_editor();
+    app.editor.open_diff(&c, &d).unwrap();
+    app.open_editor_find();
+    app.diff_find_set_query(String::from("needle"));
+    // Anchored AFTER the query: `diff_find_apply` scrolls to its match and
+    // clears the hunk anchor, which is exactly why a spurious recompute
+    // from a background refresh would be visible here.
+    app.editor.diff.as_mut().unwrap().nav_anchor = Some(0);
+    let before = app.editor.diff.as_ref().unwrap().clone();
+    assert!(
+        before.find.active.is_some(),
+        "precondition: the active diff has a match"
+    );
+
+    rewrite_later(&b, "1\n2\n3\n");
+    assert!(
+        app.refresh_open_diff_views(false, &[], &no_paths()),
+        "the background split's diff rebuilt"
+    );
+    let after = app.editor.diff.as_ref().unwrap();
+    assert_eq!(
+        after.nav_anchor,
+        Some(0),
+        "the active diff's hunk anchor is untouched"
+    );
+    assert_eq!(after.scroll, before.scroll, "and its viewport");
+    assert_eq!(
+        after.find.active, before.find.active,
+        "and its active match"
+    );
+}

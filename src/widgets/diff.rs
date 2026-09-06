@@ -69,10 +69,9 @@ impl DiffWhitespace {
 /// be rebuilt when either side moves (#471): an agent or a save rewrites the
 /// working file, a commit moves HEAD, the index changes under a staged view.
 /// `App::refresh_open_diff_views` reads this; the openers set it.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffSource {
     /// Nothing to re-read (a deletion tombstone, a one-off text diff).
-    #[default]
     Static,
     /// Source Control's HEAD-vs-working-tree view: the left side is
     /// `git show HEAD:<rel>` in `root`, the right side is `right_path` on
@@ -1091,7 +1090,8 @@ impl DiffData {
         };
         self.left_is_git_head = old.left_is_git_head;
         self.left_is_real_file = old.left_is_real_file;
-        self.source = old.source.clone();
+        // `source` is not carried here: the rebuild set it before stamping
+        // the sides, since which sides are files depends on it.
     }
 
     /// `(mtime, len)` of a real file, or `None` when it cannot be stat'ed.

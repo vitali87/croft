@@ -6056,7 +6056,11 @@ impl App {
             let oid = status.head_oid.clone();
             if self.git_head_oids.get(&ws_root) != Some(&oid) {
                 self.git_head_oids.insert(ws_root.clone(), oid);
-                heads_moved.push(ws_root.clone());
+                // The diff tag stores `scm_root()`, the git TOPLEVEL, which
+                // is not the workspace root for a subdirectory workspace or
+                // for a root reached through a symlink (git canonicalises
+                // `--show-toplevel`). Record what the tag will compare with.
+                heads_moved.push(status.repo_root.clone().unwrap_or_else(|| ws_root.clone()));
                 if is_active {
                     self.refresh_commit_graph();
                 }
@@ -24128,11 +24132,27 @@ impl App {
             Ok(_) => {
                 self.status = format!("Reverted hunk in {}", pr.rel_path);
                 self.refresh_after_hunk_op();
-                // The revert rewrote the working file; force the HEAD-side
-                // path for this root so the view is rebuilt even if the
-                // rewrite landed within the stamp's granularity.
-                let root = self.scm_root();
-                self.refresh_open_diff_views(true, &[root], &std::collections::BTreeSet::new());
+                // The revert rewrote the working file; force the HEAD-side rebuild
+                // of the open view so it refreshes even if the rewrite landed
+                // within the stamp's granularity. Forced by the root the VIEW is
+                // tagged with, not `scm_root()` re-read now: the tag may predate the
+                // worker's first status reply and hold the workspace root.
+                let force_root = self
+                    .editor
+                    .diff
+                    .as_ref()
+                    .and_then(|d| match &d.source {
+                        crate::widgets::diff::DiffSource::HeadVsWorking { root, .. } => {
+                            Some(root.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| self.scm_root());
+                self.refresh_open_diff_views(
+                    true,
+                    std::slice::from_ref(&force_root),
+                    &std::collections::BTreeSet::new(),
+                );
             }
             Err(err) => self.status = format!("Revert hunk failed: {err}"),
         }
@@ -24191,6 +24211,11 @@ impl App {
             .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
             .collect();
         let mut changed = false;
+        // The active group's active tab, by address: a rebuild there is the
+        // one that owes the find bar a recompute. A diff refreshing in a
+        // background tab or split must not touch the view the reader is on.
+        let active_ptr: *const crate::widgets::editor::Editor = &*self.editor;
+        let mut active_changed = false;
         for group in
             std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
         {
@@ -24214,13 +24239,16 @@ impl App {
                 fresh.carry_view_from(old);
                 ed.diff = Some(fresh);
                 changed = true;
+                if std::ptr::eq(&*ed, active_ptr) {
+                    active_changed = true;
+                }
             }
         }
         // A rebuilt ACTIVE diff with a find bar open gets its match set and
         // active match recomputed against the new rows, the same way a
         // typed query would; `carry_view_from` deliberately dropped the old
         // active match because it named rows that may be gone.
-        if changed
+        if active_changed
             && self.editor.diff.is_some()
             && self
                 .editor_find
@@ -44736,7 +44764,14 @@ fn rebuild_diff_view(
     let mut fresh = match &old.source {
         DiffSource::Static => return None,
         DiffSource::HeadVsWorking { root, rel } => {
-            let head_moved = git_too && heads_moved.iter().any(|r| r == root);
+            // Canonical on both sides: a tag taken before the worker's first
+            // status reply holds the workspace root (`scm_root()`'s
+            // fallback), while the drain records the toplevel.
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let head_moved = git_too
+                && heads_moved
+                    .iter()
+                    .any(|r| r == root || canon(r) == canon(root));
             if !head_moved && !written(&old.right_path) && !old.sides_moved_on_disk() {
                 return None;
             }
