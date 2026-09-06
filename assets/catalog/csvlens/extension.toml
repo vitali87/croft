@@ -1,0 +1,20 @@
+# Catalog entry (external viewer, #465): csvlens, a terminal CSV/TSV browser.
+# Available to add from the Extensions panel; not installed until the user adds
+# it. On add, this manifest is written into ~/.config/croft/extensions/csvlens/
+# and loaded like any installed extension. The binary is provisioned pinned from
+# the project's own release (cargo-dist tar.xz) when absent from PATH; a copy
+# already on PATH wins. The digests are the project's own *.sha256 files for
+# v0.15.1; a download that does not match is refused before it is unpacked.
+id = "csvlens"
+name = "csvlens"
+description = "Browse CSV and TSV files in csvlens, a terminal spreadsheet viewer, in a pane of their own."
+builtin = false
+api_version = 1
+
+[[viewers]]
+id = "csvlens"
+label = "Open in csvlens"
+command = "csvlens"
+args = ["{file}"]
+extensions = ["csv", "tsv"]
+provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { "macos-aarch64" = "https://github.com/YS-L/csvlens/releases/download/v0.15.1/csvlens-aarch64-apple-darwin.tar.xz", "macos-x86_64" = "https://github.com/YS-L/csvlens/releases/download/v0.15.1/csvlens-x86_64-apple-darwin.tar.xz", "linux-x86_64" = "https://github.com/YS-L/csvlens/releases/download/v0.15.1/csvlens-x86_64-unknown-linux-musl.tar.xz", "linux-aarch64" = "https://github.com/YS-L/csvlens/releases/download/v0.15.1/csvlens-aarch64-unknown-linux-gnu.tar.xz" }, sha256 = { "macos-aarch64" = "d227c0acee1ac49956eacf12f301e7ce2e20ab36aa863d4c44b8bca93ec8e7b3", "macos-x86_64" = "26374c1d11fd628475e26d7ecbc8e6f4c4bbd76b15f48f31dd8609fdbbdd0137", "linux-x86_64" = "ab086b420e453618fd1544eb4e09cc98279e8570b739725592feb241cd1bef4b", "linux-aarch64" = "7671466036ebc22b1b9b958890a638fd21a06452137fb9ca1321448e5afea7ad" } }
