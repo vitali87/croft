@@ -266,6 +266,13 @@ pub struct Prefs {
     /// matching VS Code.
     #[serde(default)]
     pub copy_on_select: bool,
+    /// Opt-out for tailspin highlighting in the rendered log view (#466):
+    /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
+    /// are coloured on lines that carry no colour of their own. Stored as
+    /// the disable flag so the derived `Default` and an older config both
+    /// mean "highlighted".
+    #[serde(default)]
+    pub disable_log_highlight: bool,
     /// Opt-out for the built-in secret redaction rules (#360): AWS keys,
     /// `sk-`/`ghp_`/`xox` tokens, JWTs and bearer tokens are masked in
     /// terminal panes by default. Stored as the disable flag so the
@@ -444,6 +451,15 @@ fn set_disable_secret_redaction(path: &Path, disabled: bool) -> Result<()> {
     let mut prefs = prefs_for_update(path)?;
     prefs.disable_secret_redaction = disabled;
     prefs.save(path)
+}
+
+/// Persist the log-highlight toggle (#466) as its disable flag. Goes through
+/// [`prefs_for_update`] so a malformed config is refused, not replaced.
+pub fn save_disable_log_highlight(disabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = prefs_for_update(&path)?;
+    prefs.disable_log_highlight = disabled;
+    prefs.save(&path)
 }
 
 pub fn save_copy_on_select(enabled: bool) -> Result<()> {
