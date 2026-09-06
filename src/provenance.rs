@@ -79,7 +79,7 @@ impl Seat {
 ///
 /// Keyed on 0-based line index. A line with no entry is `Unknown` and stays
 /// that way: see the module invariant.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Provenance {
     lines: BTreeMap<usize, Seat>,
 }

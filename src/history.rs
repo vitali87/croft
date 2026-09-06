@@ -276,16 +276,16 @@ const SEATS_EXT: &str = "seats";
 /// A map with nothing attributed writes nothing: an absent sidecar and an
 /// empty one read the same, and the common case (a file nobody's seat has
 /// touched) should not grow the history dir.
-pub(crate) fn record_seats_in(
+pub fn record_seats_in(
     root_dir: &Path,
     abs_path: &Path,
     millis: u64,
     seats: &crate::provenance::Provenance,
 ) -> std::io::Result<()> {
-    let dir = dir_for(root_dir, abs_path);
     if seats.attributed() == 0 {
         return Ok(());
     }
+    let dir = dir_for(root_dir, abs_path);
     let json = serde_json::to_vec(seats).map_err(std::io::Error::other)?;
     std::fs::create_dir_all(&dir)?;
     write_staged(&dir, millis, SEATS_EXT, &json)

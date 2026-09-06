@@ -2529,13 +2529,19 @@ pub struct App {
     /// Local-history root (`~/.config/croft/history`), cached so tests can
     /// redirect snapshots to a tempdir.
     history_root: PathBuf,
-    /// The file `sync_provenance` last considered, so the history read
-    /// happens once per file the active editor lands on rather than per tick.
-    provenance_synced_for: Option<PathBuf>,
+    /// The (file, `edit_seq`) `sync_provenance` last considered, so the
+    /// history read happens once per buffer the active editor lands on rather
+    /// than per tick. Keyed on the buffer generation as well as the path so
+    /// that every whole-buffer swap under an unchanged path (an FS-sync
+    /// reload, a revert, Reopen as Text, a re-decode) is reconsidered by
+    /// construction: each goes through an opener that bumps the seq, and no
+    /// swap site has to remember to say so.
+    provenance_synced_for: Option<(PathBuf, u64)>,
     /// The snapshot currently shown in a local-history diff, `(live file,
-    /// snapshot contents)`, so "Local History: Restore Snapshot" can write it
-    /// back. Cleared when a non-snapshot diff opens.
-    history_restore: Option<(PathBuf, Vec<u8>)>,
+    /// snapshot millis, snapshot contents)`, so "Local History: Restore
+    /// Snapshot" can write it back and carry its seats (#349). Cleared when a
+    /// non-snapshot diff opens.
+    history_restore: Option<(PathBuf, u64, Vec<u8>)>,
     /// Completed off-thread history recordings, drained to refresh the
     /// TIMELINE once the snapshot actually exists on disk.
     history_done_rx: std::sync::mpsc::Receiver<PathBuf>,
@@ -6043,9 +6049,6 @@ impl App {
         if report.is_empty() {
             return false;
         }
-        // A reload replaced the buffer and cleared its map (#349); let
-        // `sync_provenance` reconsider this path instead of staying burnt.
-        self.provenance_synced_for = None;
         self.refresh_git_status_debounced();
         match (
             report.reloaded.len(),
@@ -8735,7 +8738,7 @@ impl App {
                 return;
             }
             self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
-            self.history_restore = Some((path, content));
+            self.history_restore = Some((path, millis, content));
             self.focus_pane(Pane::Editor);
             self.status = format!("Showing {rel} at a local snapshot");
             return;
@@ -8768,7 +8771,7 @@ impl App {
     /// contents back to the file and reload the buffer. Reachable from the
     /// Command Palette once a snapshot diff is open (which records the target).
     fn restore_history_snapshot(&mut self) {
-        let Some((file, content)) = self.history_restore.clone() else {
+        let Some((file, millis, content)) = self.history_restore.clone() else {
             self.status = String::from("Open a local snapshot from the TIMELINE first");
             return;
         };
@@ -8776,16 +8779,25 @@ impl App {
             self.status = format!("Restore failed: {e}");
             return;
         }
+        // The snapshot's seats describe exactly the bytes just written (#349),
+        // so they come along: onto the buffer, and onto the snapshot this
+        // restore records below. No open tab's map can serve instead: a
+        // reverted tab has just had its map cleared, and an unreverted one
+        // still describes the text the restore replaced. A snapshot with no
+        // sidecar restores every line unknown, which is what it knows.
+        let seats =
+            crate::history::seats_for(&self.history_root, &file, millis).unwrap_or_default();
         // If that file is the active tab (the snapshot diff opened it), reload
         // so the editor shows the restored contents and the disk stamp resyncs.
-        if self.editor.path.as_deref() == Some(file.as_path()) {
-            let _ = self.editor.revert_to_disk();
-            // The revert swapped the buffer for a stored snapshot's bytes and
-            // cleared its map (#349); the restore is worth a second look.
-            self.provenance_synced_for = None;
+        if self.editor.path.as_deref() == Some(file.as_path())
+            && self.editor.revert_to_disk().is_ok()
+        {
+            let mut onto_buffer = seats.clone();
+            onto_buffer.truncate(self.editor.lines.len());
+            self.editor.provenance = onto_buffer;
         }
         // The restore is itself a new version worth keeping.
-        self.record_history_snapshot(&file);
+        self.record_history_snapshot_with_seats(&file, seats);
         self.status = format!("Restored {}", self.status_path(&file));
     }
 
@@ -39592,24 +39604,45 @@ impl App {
     }
 
     /// Restore a persisted provenance map onto the active editor (#349),
-    /// once per file it lands on: when the editor is clean, knows nothing
-    /// yet, and the newest history snapshot holds exactly the bytes on disk,
-    /// the seats recorded beside that snapshot describe this very text and
-    /// come back. Any difference (an edit since, a save croft never saw, a
-    /// file with no history) leaves every line unknown: a map is never
-    /// applied to text it did not describe.
+    /// once per buffer it lands on: when the editor is a clean text buffer
+    /// that knows nothing yet, and the newest history snapshot holds exactly
+    /// the bytes on disk, the seats recorded beside that snapshot describe
+    /// this very text and come back. Any difference (an edit since, a save
+    /// croft never saw, a file with no history) leaves every line unknown: a
+    /// map is never applied to text it did not describe.
     fn sync_provenance(&mut self) {
         let Some(path) = self.editor.path.clone() else {
             self.provenance_synced_for = None;
             return;
         };
-        if self.provenance_synced_for.as_deref() == Some(path.as_path()) {
+        let seq = self.editor.edit_seq;
+        if self
+            .provenance_synced_for
+            .as_ref()
+            .is_some_and(|(p, s)| *p == path && *s == seq)
+        {
             return;
         }
-        self.provenance_synced_for = Some(path.clone());
-        if self.editor.dirty || self.editor.provenance.attributed() > 0 {
+        // Not eligible yet is not the same as considered: a dirty buffer, one
+        // that already knows its seats, or a viewer tab (hex, image, sheet,
+        // log, archive, diff, merge, preview: the file shown through its own
+        // path, `lines` a placeholder no map should credit) leaves the marker
+        // unset, so a later tick, after a save or a swap back to text,
+        // reconsiders instead of staying burnt for the session.
+        if self.editor.dirty
+            || self.editor.provenance.attributed() > 0
+            || self.editor.hex.is_some()
+            || self.editor.image.is_some()
+            || self.editor.sheet.is_some()
+            || self.editor.log.is_some()
+            || self.editor.archive.is_some()
+            || self.editor.diff.is_some()
+            || self.editor.merge.is_some()
+            || self.editor.markdown_preview.is_some()
+        {
             return;
         }
+        self.provenance_synced_for = Some((path.clone(), seq));
         let Some(newest) = crate::history::entries_in(&self.history_root, &path)
             .into_iter()
             .next()
@@ -39638,11 +39671,21 @@ impl App {
     /// lives, for the history snapshot that save is about to record; an
     /// unopened path (a deferred write after the tab closed) has no map.
     fn provenance_of_tab(&self, path: &Path) -> crate::provenance::Provenance {
-        if let Some(idx) = self.editor.find_tab_with_path(path) {
+        // An exact path match first: `find_tab_with_path` canonicalises, a
+        // syscall per save (every second under auto save) that the common
+        // case of a tab opened under the very path being saved never needs.
+        fn tab_in(group: &EditorTabs, path: &Path) -> Option<usize> {
+            group
+                .editors
+                .iter()
+                .position(|e| e.path.as_deref() == Some(path))
+                .or_else(|| group.find_tab_with_path(path))
+        }
+        if let Some(idx) = tab_in(&self.editor, path) {
             return self.editor.editors[idx].provenance.clone();
         }
         for group in self.editor_layout.inactive_groups() {
-            if let Some(idx) = group.find_tab_with_path(path) {
+            if let Some(idx) = tab_in(group, path) {
                 return group.editors[idx].provenance.clone();
             }
         }
@@ -39656,14 +39699,25 @@ impl App {
     /// save this fires every second, and a large file's read+write on the
     /// render thread is a visible stall.
     fn record_history_snapshot(&mut self, path: &Path) {
+        // Captured now, on the UI thread, from the tab that was just saved:
+        // the map describes the buffer at this save, and the thread records
+        // it beside the snapshot of the same bytes (#349).
+        let seats = self.provenance_of_tab(path);
+        self.record_history_snapshot_with_seats(path, seats);
+    }
+
+    /// [`Self::record_history_snapshot`] with the map to record given rather
+    /// than read off the open tab: a snapshot restore knows the restored
+    /// snapshot's own seats, which no tab holds at that moment.
+    fn record_history_snapshot_with_seats(
+        &mut self,
+        path: &Path,
+        seats: crate::provenance::Provenance,
+    ) {
         let root = self.history_root.clone();
         let path = path.to_path_buf();
         let tx = self.history_done_tx.clone();
         let millis = now_millis();
-        // Captured now, on the UI thread, from the tab that was just saved:
-        // the map describes the buffer at this save, and the thread below
-        // records it beside the snapshot of the same bytes (#349).
-        let seats = self.provenance_of_tab(&path);
         std::thread::spawn(move || {
             if let Ok(bytes) = std::fs::read(&path) {
                 let _ = crate::history::record_with_seats_in(&root, &path, &bytes, millis, &seats);

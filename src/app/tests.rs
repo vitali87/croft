@@ -12251,14 +12251,11 @@ fn editor_app_with_lines(lines: &[&str]) -> App {
 /// Wait for the provenance sidecar the save records after its snapshot
 /// (#349); it lands on the same thread, strictly after the snapshot.
 fn wait_for_seats(root: &std::path::Path, f: &std::path::Path, millis: u64) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while crate::history::seats_for(root, f, millis).is_none() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the sidecar never landed"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the provenance sidecar",
+        || crate::history::seats_for(root, f, millis).is_some(),
+    );
 }
 
 /// History recording runs off-thread; poll until the store has entries (or a
@@ -12556,22 +12553,181 @@ fn provenance_survives_a_restart_when_the_file_is_unchanged() {
         None,
         "the untouched line stays unknown"
     );
-    // A revert swaps the buffer for the snapshot's bytes and clears the map;
-    // the restore fires again for the same path rather than staying burnt.
-    let _ = app.editor.revert_to_disk();
+}
+
+/// A whole-buffer swap under the same path clears the map and is reconsidered
+/// on its own (#349 review): the reload behind an FS-sync sweep or a
+/// disk-conflict popup, a revert, "Reopen as Text" and a re-decode all go
+/// through an opener, and none of them has to reset anything by hand. Driven
+/// through the openers themselves; the marker is never touched.
+#[test]
+fn provenance_comes_back_after_every_same_path_swap() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(0..1, Seat::Navigator);
+    crate::history::record_with_seats_in(
+        hist.path(),
+        &f,
+        &std::fs::read(&f).unwrap(),
+        1_000,
+        &seats,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "staging: the first sync restores"
+    );
+
+    // The revert every reload path ends in.
+    app.editor.revert_to_disk().unwrap();
     assert_eq!(
         app.editor.provenance.attributed(),
         0,
         "staging: the revert cleared the map"
     );
-    app.provenance_synced_for = None;
     app.sync_provenance();
     assert_eq!(
-        app.editor.provenance.seat(0),
-        Some(&Seat::Navigator),
-        "the map comes back after a revert of the same path: {:?}",
-        app.editor.provenance
+        app.editor.provenance, seats,
+        "the map comes back after a revert of the same path"
     );
+
+    // "Reopen as Text": `open` on the path already open.
+    app.editor.open(&f).unwrap();
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "staging: the reopen cleared the map"
+    );
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "and after a reopen of the same path"
+    );
+}
+
+/// A tab that is not eligible yet is not the same as one considered (#349
+/// review): a sync that lands on a dirty buffer leaves it for a later tick
+/// rather than burning the map for the session.
+#[test]
+fn a_dirty_tab_is_reconsidered_for_provenance_once_it_is_clean() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    std::fs::write(&f, "one\n").unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(0..1, Seat::Peer(String::from("ana")));
+    crate::history::record_with_seats_in(
+        hist.path(),
+        &f,
+        &std::fs::read(&f).unwrap(),
+        1_000,
+        &seats,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.editor.dirty = true;
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance.attributed(),
+        0,
+        "staging: a dirty buffer takes no map"
+    );
+    app.editor.dirty = false;
+    app.sync_provenance();
+    assert_eq!(
+        app.editor.provenance, seats,
+        "the same buffer, clean, gets the map on the next tick"
+    );
+}
+
+/// Restoring a snapshot carries that snapshot's seats (#349 review): onto the
+/// reverted buffer, and onto the snapshot the restore records, which inside
+/// the merge window supersedes the newest one and takes its sidecar with it.
+/// Before this the restore recorded the just-cleared (empty) map, so a
+/// persisted map was destroyed by the very command that reinstated its text.
+#[test]
+fn restoring_a_snapshot_carries_its_seats_onto_the_restore() {
+    use crate::provenance::Seat;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("note.txt");
+    let (v1, v2) = (b"one\ntwo\n".as_slice(), b"one\ntwo\nthree\n".as_slice());
+    let mut seats_v1 = crate::provenance::Provenance::new();
+    seats_v1.record(0..1, Seat::Navigator);
+    let mut seats_v2 = crate::provenance::Provenance::new();
+    seats_v2.record(2..3, Seat::Agent(String::from("pane 2")));
+    // v2 is the newest snapshot and recent enough that the restore lands
+    // inside the merge window and supersedes it.
+    let recent = now_millis() - 1_000;
+    crate::history::record_with_seats_in(hist.path(), &f, v1, 1_000, &seats_v1).unwrap();
+    crate::history::record_with_seats_in(hist.path(), &f, v2, recent, &seats_v2).unwrap();
+    std::fs::write(&f, v2).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.sync_provenance();
+    assert_eq!(app.editor.provenance, seats_v2, "staging: v2's map is live");
+
+    // Arm the restore from the timeline, then make the file the active tab
+    // again (the diff view closed) and restore through the real command.
+    app.open_timeline_diff(f.clone(), String::from("local:1000"));
+    assert!(
+        app.history_restore.is_some(),
+        "staging: the restore is armed"
+    );
+    app.editor.open(&f).unwrap();
+    app.restore_history_snapshot();
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        v1,
+        "staging: v1 is back on disk"
+    );
+    assert_eq!(
+        app.editor.provenance, seats_v1,
+        "the reverted buffer wears the restored snapshot's seats"
+    );
+
+    // The record runs off-thread: wait for the superseding snapshot.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the restore's snapshot",
+        || {
+            crate::history::entries_in(hist.path(), &f)
+                .first()
+                .is_some_and(|newest| newest.millis > recent)
+        },
+    );
+    let snaps = crate::history::entries_in(hist.path(), &f);
+    assert_eq!(
+        snaps.len(),
+        2,
+        "the restore superseded v2 inside the merge window: {snaps:?}"
+    );
+    assert_eq!(std::fs::read(&snaps[0].file).unwrap(), v1);
+    wait_for_seats(hist.path(), &f, snaps[0].millis);
+    assert_eq!(
+        crate::history::seats_for(hist.path(), &f, snaps[0].millis),
+        Some(seats_v1.clone()),
+        "and the newest snapshot carries v1's seats, not an empty map"
+    );
+    // A fresh open of the restored file gets them back the ordinary way.
+    let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+    again.history_root = hist.path().to_path_buf();
+    again.editor.open(&f).unwrap();
+    again.sync_provenance();
+    assert_eq!(again.editor.provenance, seats_v1);
 }
 
 /// A persisted map is restored only onto the text it described: a file
