@@ -29,6 +29,11 @@ pub struct AgentKind {
     /// Regexes a recent screen row matches when the agent is waiting for
     /// input: a permission question, a `>` prompt, a Y/n.
     pub prompt: Vec<Regex>,
+    /// The command line a new worktree lane starts this agent with (#348):
+    /// typed into the lane's fresh shell. The built-ins launch as their own
+    /// name; a row may set its own (`claude --model opus`) or none, in
+    /// which case a lane for it opens a plain shell.
+    pub launch: Option<String>,
 }
 
 /// What an agent in a pane is doing.
@@ -91,8 +96,12 @@ pub const TEMPLATE: &str = r##"// croft agent lanes: which foreground processes 
 //   name:    the badge shown on the pane pill
 //   process: foreground process names that mean this agent
 //   prompt:  regexes a recent screen row matches when it is waiting on you
+//   launch:  the command a new worktree lane (Cmd+K Shift+L) starts the agent
+//            with, when `lane_agent` in settings.json names this row (#348);
+//            the built-ins launch as their own name, a row without one opens
+//            a plain shell
 [
-  // { "name": "goose", "process": ["goose"], "prompt": ["^\\s*>\\s*$", "\\(y/n\\)"] }
+  // { "name": "goose", "process": ["goose"], "prompt": ["^\\s*>\\s*$", "\\(y/n\\)"], "launch": "goose" }
 ]
 "##;
 
@@ -104,6 +113,8 @@ struct AgentRow {
     process: Vec<String>,
     #[serde(default)]
     prompt: Vec<String>,
+    #[serde(default)]
+    launch: Option<String>,
 }
 
 /// The table of agents croft recognises.
@@ -121,6 +132,8 @@ fn kind(name: &str, process: &[&str], prompt: &[&str]) -> AgentKind {
         name: name.to_string(),
         process: process.iter().map(|p| p.to_string()).collect(),
         prompt: prompt.iter().filter_map(|p| Regex::new(p).ok()).collect(),
+        // Each built-in is started by the command that is also its name.
+        launch: Some(name.to_string()),
     }
 }
 
@@ -198,14 +211,32 @@ impl AgentTable {
                     Err(_) => table.dropped_patterns += 1,
                 }
             }
-            let k = AgentKind {
-                name: name.clone(),
-                process,
-                prompt,
-            };
+            let launch = row
+                .launch
+                .as_deref()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string);
             match table.kinds.iter_mut().find(|k| k.name == name) {
-                Some(existing) => *existing = k,
-                None => table.kinds.push(k),
+                Some(existing) => {
+                    // A row that replaces a built-in but says nothing about
+                    // launching keeps the built-in's command: the row is
+                    // usually there to fix a prompt pattern, not to unteach
+                    // croft how to start the agent.
+                    let launch = launch.or_else(|| existing.launch.take());
+                    *existing = AgentKind {
+                        name: name.clone(),
+                        process,
+                        prompt,
+                        launch,
+                    };
+                }
+                None => table.kinds.push(AgentKind {
+                    name: name.clone(),
+                    process,
+                    prompt,
+                    launch,
+                }),
             }
         }
         table
@@ -230,6 +261,16 @@ impl AgentTable {
 
     pub fn names(&self) -> Vec<&str> {
         self.kinds.iter().map(|k| k.name.as_str()).collect()
+    }
+
+    /// The command a worktree lane starts `agent` with (#348), by row name
+    /// in any case; `None` for an unknown agent or a row with no launch line.
+    pub fn launch_line(&self, agent: &str) -> Option<&str> {
+        let want = agent.trim();
+        self.kinds
+            .iter()
+            .find(|k| k.name.eq_ignore_ascii_case(want))
+            .and_then(|k| k.launch.as_deref())
     }
 
     /// How many `agents.json` prompt patterns failed to compile.
@@ -396,6 +437,37 @@ mod tests {
         );
         // TEMPLATE parses (comments stripped) to zero rows.
         assert_eq!(AgentTable::from_json(TEMPLATE).names().len(), 4);
+    }
+
+    #[test]
+    fn a_row_can_name_the_command_a_lane_starts_the_agent_with() {
+        // The built-ins launch as their own name; a row sets its own, a row
+        // replacing a built-in without one keeps the built-in's, a blank one
+        // is none, and lookup is by row name in any case.
+        let t = AgentTable::builtin();
+        assert_eq!(t.launch_line("claude"), Some("claude"));
+        assert_eq!(t.launch_line("Codex"), Some("codex"), "any case");
+        assert_eq!(t.launch_line("goose"), None, "unknown agent");
+        let t = AgentTable::from_json(
+            r#"[
+              { "name": "goose", "launch": "  goose session --resume " },
+              { "name": "claude", "prompt": ["Proceed\\?"] },
+              { "name": "quiet", "launch": "   " }
+            ]"#,
+        );
+        assert_eq!(
+            t.launch_line("goose"),
+            Some("goose session --resume"),
+            "trimmed"
+        );
+        assert_eq!(
+            t.launch_line("claude"),
+            Some("claude"),
+            "a replacing row without a launch keeps the built-in's"
+        );
+        assert_eq!(t.launch_line("quiet"), None, "a blank launch is none");
+        let t = AgentTable::from_json(r#"[{ "name": "claude", "launch": "claude --model opus" }]"#);
+        assert_eq!(t.launch_line("claude"), Some("claude --model opus"));
     }
 
     #[test]

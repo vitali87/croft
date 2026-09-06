@@ -770,7 +770,7 @@ impl Command {
             Command::OpenAsSymbolTab => "",
             Command::LoadReviewThreads => "",
             Command::ToggleSessionRecording => "",
-            Command::NewWorktreeLane => "",
+            Command::NewWorktreeLane => "Cmd+K Shift+L",
             Command::CloseWorktreeLane => "",
             Command::MarkAgentLaneReviewed => "",
             Command::ShowAgentLane => "",

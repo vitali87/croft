@@ -26373,11 +26373,13 @@ fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_
                     cwd: b.display().to_string(),
                     name: None,
                     transcript: Vec::new(),
+                    lane: None,
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b_sub.display().to_string(),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
+                    lane: None,
                 },
             ],
             active: 1,
@@ -26417,11 +26419,13 @@ fn restoring_a_workspaces_layout_drops_pane_bound_state_from_the_outgoing_panel(
                     cwd: b.display().to_string(),
                     name: None,
                     transcript: Vec::new(),
+                    lane: None,
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
+                    lane: None,
                 },
             ],
             active: 0,
@@ -26471,11 +26475,13 @@ fn change_workspace_root_keeps_live_panes_when_the_terminal_was_touched() {
                     cwd: b.display().to_string(),
                     name: None,
                     transcript: Vec::new(),
+                    lane: None,
                 },
                 crate::terminal_session::PaneRecord {
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
+                    lane: None,
                 },
             ],
             active: 0,
@@ -42647,5 +42653,269 @@ fn a_success_forgets_a_refusal_another_croft_recorded() {
         !crate::remote::load_refused_hosts(&refused_path, std::time::SystemTime::now())
             .contains_key("db-1"),
         "the disk refusal is gone even though this instance never held it"
+    );
+}
+
+/// A committed git repo at `dir` for the worktree-lane tests (#348): a lane
+/// is a sibling of the repo, so callers put the repo one level inside their
+/// tempdir to keep the lane inside it too.
+fn init_lane_repo(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    std::fs::write(dir.join("seed.txt"), "one\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+}
+
+#[test]
+fn a_new_lane_opens_a_named_pane_in_the_worktree_running_the_agent_command() {
+    // One chord's worth (#348): worktree, root, and a pane named after the
+    // lane sitting in it with the configured agent's launch line typed in.
+    // The "agent" is a printf whose typed line does not spell the probe.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.agents = crate::agents::AgentTable::from_json(
+        r#"[{ "name": "probe", "launch": "printf '%s%s\\n' 'croft-lane' '-seated-1'" }]"#,
+    );
+    app.lane_agent = Some(String::from("Probe"));
+    let before = app.terminals.len();
+    app.create_worktree_lane("fix login");
+    let lane = tmp.path().join("repo-fix-login");
+    assert!(lane.is_dir(), "the worktree exists: {}", app.status);
+    assert!(
+        app.roots.iter().any(|r| r == lane.canonicalize().unwrap()),
+        "and is a workspace root"
+    );
+    assert_eq!(app.terminals.len(), before + 1, "one new pane");
+    let pane = &app.terminals[app.active_terminal];
+    assert_eq!(pane.manual_name(), Some("Lane: fix-login"));
+    let rec = app
+        .lane_panes
+        .get(&pane.uid())
+        .expect("the pane is recorded as the lane's");
+    assert_eq!(rec.branch, "agent/fix-login");
+    assert_eq!(rec.agent.as_deref(), Some("probe"), "lower-cased row name");
+    assert!(app.status.contains("probe started"), "{}", app.status);
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
+    let started = std::time::Instant::now();
+    while started.elapsed() < budget {
+        if app.terminals[app.active_terminal]
+            .visible_text()
+            .contains("croft-lane-seated-1")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.terminals[app.active_terminal]
+            .visible_text()
+            .contains("croft-lane-seated-1"),
+        "the launch line ran in the lane's pane; screen:\n{}",
+        app.terminals[app.active_terminal].visible_text()
+    );
+    // The saved session carries the lane, so a relaunch can seat it again.
+    let saved = crate::terminal_session::load(&app.terminal_session_path);
+    let root_key = app.workspace_root().display().to_string();
+    let lanes: Vec<_> = saved[&root_key]
+        .panes
+        .iter()
+        .filter_map(|p| p.lane.clone())
+        .collect();
+    assert_eq!(lanes.len(), 1, "{saved:?}");
+    assert_eq!(lanes[0].agent.as_deref(), Some("probe"));
+    assert_eq!(
+        std::path::Path::new(&lanes[0].path),
+        lane.canonicalize().unwrap(),
+        "recorded canonical, like the roots"
+    );
+}
+
+#[test]
+fn a_lane_without_a_configured_agent_opens_a_plain_shell_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("docs");
+    let pane = &app.terminals[app.active_terminal];
+    assert_eq!(pane.manual_name(), Some("Lane: docs"));
+    assert_eq!(app.lane_panes[&pane.uid()].agent, None);
+    assert!(app.status.contains("set lane_agent"), "{}", app.status);
+    // An agent named but without a launch line: shell, and the status names
+    // the gap rather than reading as a working lane.
+    app.agents = crate::agents::AgentTable::from_json(r#"[{ "name": "mute" }]"#);
+    app.lane_agent = Some(String::from("mute"));
+    app.create_worktree_lane("tests");
+    let pane = &app.terminals[app.active_terminal];
+    assert_eq!(pane.manual_name(), Some("Lane: tests"));
+    assert_eq!(
+        app.lane_panes[&pane.uid()].agent,
+        None,
+        "no agent was seated"
+    );
+    assert!(
+        app.status.contains("no launch line for \"mute\""),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
+    // The association survives a relaunch (#348): the saved lane record
+    // brings the pane back in the worktree, re-registered as the lane's, and
+    // the agent's CURRENT launch line typed in. A lane whose worktree is
+    // gone comes back as an ordinary pane.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let session = tmp.path().join("sessions.json");
+    let lane_dir = tmp.path().join("repo-fix-login");
+    std::fs::create_dir_all(&lane_dir).unwrap();
+    let root_key = repo.display().to_string();
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![
+            crate::terminal_session::PaneRecord {
+                cwd: root_key.clone(),
+                name: None,
+                transcript: Vec::new(),
+                lane: None,
+            },
+            crate::terminal_session::PaneRecord {
+                cwd: lane_dir.display().to_string(),
+                name: Some(String::from("Lane: fix-login")),
+                transcript: Vec::new(),
+                lane: Some(crate::terminal_session::LaneRecord {
+                    path: lane_dir.display().to_string(),
+                    branch: String::from("agent/fix-login"),
+                    agent: Some(String::from("probe")),
+                }),
+            },
+            crate::terminal_session::PaneRecord {
+                cwd: root_key.clone(),
+                name: Some(String::from("Lane: gone")),
+                transcript: Vec::new(),
+                lane: Some(crate::terminal_session::LaneRecord {
+                    path: tmp.path().join("repo-gone").display().to_string(),
+                    branch: String::from("agent/gone"),
+                    agent: Some(String::from("probe")),
+                }),
+            },
+        ],
+        active: 1,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = session;
+    app.agents = crate::agents::AgentTable::from_json(
+        r#"[{ "name": "probe", "launch": "printf '%s%s\\n' 'croft-lane' '-back-2'" }]"#,
+    );
+    app.restore_terminal_session();
+    assert_eq!(app.terminals.len(), 3);
+    let uid = app.terminals[1].uid();
+    assert_eq!(
+        app.lane_panes.get(&uid).map(|l| l.branch.as_str()),
+        Some("agent/fix-login")
+    );
+    assert!(
+        !app.lane_panes.contains_key(&app.terminals[2].uid()),
+        "a lane whose worktree is gone is not a lane"
+    );
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);
+    let started = std::time::Instant::now();
+    while started.elapsed() < budget
+        && !app.terminals[1]
+            .visible_text()
+            .contains("croft-lane-back-2")
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.terminals[1]
+            .visible_text()
+            .contains("croft-lane-back-2"),
+        "the agent was seated again; screen:\n{}",
+        app.terminals[1].visible_text()
+    );
+    assert!(
+        !app.terminals[2]
+            .visible_text()
+            .contains("croft-lane-back-2"),
+        "nothing was typed into the pane whose lane is gone"
+    );
+}
+
+#[test]
+fn closing_a_lane_closes_its_pane_through_the_undoable_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    assert_eq!(app.terminals.len(), 2);
+    let lane_uid = app.terminals[app.active_terminal].uid();
+    // Close targets the ACTIVE root; the lane is what the user is in.
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    assert!(!lane.exists(), "the worktree is gone: {}", app.status);
+    assert!(!app.roots.iter().any(|r| r == lane), "and the root");
+    assert_eq!(
+        app.terminals.len(),
+        1,
+        "and the lane's pane: {}",
+        app.status
+    );
+    assert!(!app.terminals.iter().any(|t| t.uid() == lane_uid));
+    assert!(app.lane_panes.is_empty());
+    assert!(
+        app.closed_terminals
+            .iter()
+            .any(|c| c.term.uid() == lane_uid),
+        "closed through the undoable path"
+    );
+    assert!(app.status.contains("closed its pane"), "{}", app.status);
+}
+
+#[test]
+fn cmd_k_shift_l_asks_for_a_new_lane_and_plain_l_still_folds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('L'), KeyModifiers::SHIFT)));
+    assert_eq!(
+        app.input_prompt.as_ref().map(|p| p.purpose.clone()),
+        Some(crate::widgets::input_prompt::InputPurpose::NewWorktreeLane)
+    );
+    app.close_input_prompt();
+    // CSI-u hosts report Shift+L as a lower-case char with SHIFT.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('l'), KeyModifiers::SHIFT)));
+    assert_eq!(
+        app.input_prompt.as_ref().map(|p| p.purpose.clone()),
+        Some(crate::widgets::input_prompt::InputPurpose::NewWorktreeLane)
+    );
+    app.close_input_prompt();
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('l'), KeyModifiers::NONE)));
+    assert!(
+        app.input_prompt.is_none(),
+        "plain L is still the fold toggle"
     );
 }
