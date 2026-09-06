@@ -151,6 +151,10 @@ impl FileTree {
         // The old workspace's ignore set is meaningless under the new root;
         // the git worker re-queries after its SetRoot and repopulates.
         self.ignored = Arc::default();
+        // Same reasoning for the lane badges (#348): keyed by absolute root
+        // path, so a re-root would otherwise carry the old roots' entries
+        // until the next sync rebuilt them.
+        self.root_badges = Arc::default();
         // Same for the agent review queue (#345), and it matters more: these
         // are ABSOLUTE paths, and the documented use of Make Root is
         // re-rooting into a CHILD, where the new tree's paths are the very
@@ -1523,9 +1527,11 @@ impl Widget for &mut FileTree {
                 if node.depth == 0
                     && let Some(badge) = self.root_badges.get(&node.path)
                 {
+                    // `Gray`, the dim the theme maps for light grounds;
+                    // `DarkGray` is a named colour `Theme::ui` passes through.
                     spans.push(Span::styled(
                         format!("  {badge}"),
-                        Style::default().fg(self.theme.ui(Color::DarkGray)),
+                        Style::default().fg(self.theme.ui(Color::Gray)),
                     ));
                 }
             } else {
@@ -2082,6 +2088,45 @@ mod tests {
         assert!(
             !rows(&buf).iter().any(|r| r.contains("agent/")),
             "cleared with the map"
+        );
+    }
+
+    /// The depth-0 guard is load-bearing: a nested workspace root is both a
+    /// depth-0 section and a depth-1 child of its ancestor, with one path.
+    #[test]
+    fn a_root_badge_skips_the_same_path_where_it_appears_as_a_child() {
+        let (_tmp, second, mut tree) = two_root_fixture();
+        let nested = second.path().join("lib");
+        // `add_root` loads the section's children, so `lib` is on screen
+        // both as its own section and as the ancestor's child.
+        tree.add_root(nested.clone());
+        tree.root_badges = Arc::new(HashMap::from([(
+            nested.clone(),
+            String::from("agent/nested"),
+        )]));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rows.iter().filter(|r| r.contains("lib")).count() >= 2,
+            "lib is on screen twice, as a section and as a child: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("agent/nested")).count(),
+            1,
+            "the badge is on the section row alone: {rows:?}"
         );
     }
 

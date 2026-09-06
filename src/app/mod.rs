@@ -25403,9 +25403,13 @@ impl App {
     /// agent is seated, the configured agent's name before it is, the branch
     /// alone for a plain-shell lane. Runs from the top of `render`; the map
     /// is swapped only when its contents change, so the common frame costs a
-    /// walk over a handful of lanes and no allocation the tree sees.
+    /// walk over a handful of lanes and a small map that is then dropped.
     fn sync_lane_root_badges(&mut self) {
-        let mut badges: std::collections::HashMap<PathBuf, String> =
+        // Several panes on one lane: the pane that knows the most decides
+        // the badge, whichever order the map walks them in. Seated beats
+        // configured beats plain, decided from the state rather than by
+        // reading the glyph back out of the text.
+        let mut best: std::collections::HashMap<PathBuf, (u8, String)> =
             std::collections::HashMap::new();
         for (uid, lane) in &self.lane_panes {
             let seated = self
@@ -25413,16 +25417,22 @@ impl App {
                 .iter()
                 .find(|t| t.uid() == *uid)
                 .and_then(|t| t.agent());
-            let badge = lane_root_badge(&lane.branch, seated, lane.agent.as_deref());
-            // Several panes on one lane: the first with an agent seated
-            // decides the badge, so a lane's plain shell does not hide it.
-            match badges.get(Path::new(&lane.path)) {
-                Some(existing) if existing.contains('\u{25c6}') => {}
-                _ => {
-                    badges.insert(PathBuf::from(&lane.path), badge);
-                }
+            let rank = match (seated, lane.agent.as_deref()) {
+                (Some(_), _) => 2,
+                (None, Some(_)) => 1,
+                (None, None) => 0,
+            };
+            let key = PathBuf::from(&lane.path);
+            if best.get(&key).is_some_and(|(have, _)| *have >= rank) {
+                continue;
             }
+            let badge = lane_root_badge(&lane.branch, seated, lane.agent.as_deref());
+            best.insert(key, (rank, badge));
         }
+        let badges: std::collections::HashMap<PathBuf, String> =
+            best.into_iter().map(|(k, (_, b))| (k, b)).collect();
+        // Swapped only on a change: the map built here is dropped, not
+        // handed to the tree, when nothing moved.
         if *self.tree.root_badges != badges {
             self.tree.root_badges = std::sync::Arc::new(badges);
         }
