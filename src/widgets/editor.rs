@@ -314,6 +314,9 @@ fn render_log(
             if span.style.underline {
                 style = style.add_modifier(Modifier::UNDERLINED);
             }
+            if span.style.strikeout {
+                style = style.add_modifier(Modifier::CROSSED_OUT);
+            }
             let room = right.saturating_sub(x) as usize;
             buf.set_stringn(x, y, text, room, style);
         }

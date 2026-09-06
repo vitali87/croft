@@ -26040,6 +26040,102 @@ fn a_scrollback_dump_is_a_pinned_tab() {
     );
 }
 
+/// Two panes may carry the same label (two unnamed shells both read
+/// `terminal`), so the dump file is keyed on the pane's stable uid too: the
+/// second pane's dump must not overwrite and close the first pane's.
+#[test]
+fn two_panes_with_one_label_dump_to_separate_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    let spawn = |tag: &str| {
+        crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                format!("s=QQ; printf \"\\033[32m${{s}}{tag}\\033[0m\\n\"; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap()
+    };
+    app.terminals = vec![spawn("ONE"), spawn("TWO")];
+    for (i, tag) in ["QQONE", "QQTWO"].iter().enumerate() {
+        app.terminals[i].set_manual_name(Some(String::from("same")));
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the pane to print its row",
+            || {
+                app.terminals[i]
+                    .grid_lines()
+                    .0
+                    .iter()
+                    .any(|l| l.contains(tag))
+            },
+        );
+    }
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let first = app.editor.path.clone().expect("first dump has a path");
+    app.active_terminal = 1;
+    app.focus_pane(Pane::Terminal);
+    app.open_scrollback_in_editor();
+    let second = app.editor.path.clone().expect("second dump has a path");
+    assert_ne!(first, second, "one file per pane, not per label");
+    assert!(
+        first.is_file() && second.is_file(),
+        "both dumps are still on disk"
+    );
+    assert!(
+        app.editor.find_tab_with_path(&first).is_some(),
+        "the first pane's tab survives the second pane's dump"
+    );
+}
+
+/// A dump holds terminal output, so it is written owner-only: the dir is
+/// 0700 and the file 0600 whatever the umask, so another local account
+/// cannot read it.
+#[cfg(unix)]
+#[test]
+fn a_scrollback_dump_is_owner_only_on_disk() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.scrollback_dir = tmp.path().join("dumps");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("s=QQ; printf \"\\033[32m${s}SEC\\033[0m\\n\"; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.focus_pane(Pane::Terminal);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the coloured row",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("QQSEC"))
+        },
+    );
+    app.open_scrollback_in_editor();
+    let path = app.editor.path.clone().expect("the dump has a path");
+    let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(&app.scrollback_dir)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600, "the dump is readable by its owner alone");
+    assert_eq!(dir_mode, 0o700, "and so is the dir that holds it");
+}
+
 #[test]
 fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
     let tmp = tempfile::tempdir().unwrap();

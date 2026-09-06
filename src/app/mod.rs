@@ -27345,15 +27345,20 @@ impl App {
         // editable buffer of raw escapes. A pane with no colour keeps the
         // scratch buffer it always had.
         if scrollback_opens_as_log(&rows) {
+            // Keyed on the pane's stable uid as well as its label: two
+            // unnamed shells both read `terminal`, and two labels can
+            // sanitise to one name, and neither may overwrite the other's
+            // dump or close its tab.
             let file = self.scrollback_dir.join(format!(
-                "{}-scrollback.log",
+                "{}-{}-scrollback.log",
                 pane.chars()
                     .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' {
                         c
                     } else {
                         '_'
                     })
-                    .collect::<String>()
+                    .collect::<String>(),
+                self.terminal().uid()
             ));
             // A tab from an earlier dump holds a byte index over the OLD
             // file; it is closed so the open below rebuilds the view over the
@@ -27361,8 +27366,10 @@ impl App {
             if let Some(idx) = self.editor.find_tab_with_path(&file) {
                 self.editor.close_tab(idx);
             }
-            let written = std::fs::create_dir_all(&self.scrollback_dir)
-                .and_then(|()| std::fs::write(&file, rows.join("\n") + "\n"));
+            // Terminal output is written owner-only whatever the umask: the
+            // redaction rules are finite, and another local account has no
+            // business reading a shell's history.
+            let written = write_private(&self.scrollback_dir, &file, rows.join("\n") + "\n");
             // Pinned, as the scratch buffer was: a later file peek must not
             // replace the dump, and two panes' dumps must not share a slot.
             let opened = written
@@ -44655,6 +44662,36 @@ fn log_cell_at(
         .map(|t| crate::cell_map::CellMap::new(t).char_at_cell(cell))
         .unwrap_or(cell as usize);
     (line, column)
+}
+
+/// Create `dir` (0700) if needed and write `contents` to `file` (0600). On
+/// non-unix hosts the modes do not exist and the plain write is used.
+fn write_private(dir: &Path, file: &Path, contents: String) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        // An existing dir keeps whatever mode it had; make it owner-only too.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(file)?;
+        // Likewise for a file left by an earlier dump.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(file, contents)
+    }
 }
 
 /// Whether a scrollback dump goes to the rendered log view or to the plain
