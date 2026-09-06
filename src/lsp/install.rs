@@ -526,6 +526,28 @@ impl std::io::Write for Capped {
     }
 }
 
+/// The integrity verdict on a downloaded asset: `Ok` when the manifest pins
+/// nothing at all (unverified, the pre-existing state of every binary
+/// provision) or when the platform's pinned digest matches; an error naming
+/// the reason otherwise. A manifest that pins SOME platforms but not this
+/// one is refused rather than installed unverified: a partial map is a
+/// mistake in the manifest, not a licence to skip the gate here.
+fn digest_verdict(
+    sha256: &[(&str, &str)],
+    os: &str,
+    arch: &str,
+    bytes: &[u8],
+) -> Result<(), &'static str> {
+    if sha256.is_empty() {
+        return Ok(());
+    }
+    match target_url(sha256, os, arch) {
+        None => Err("no pinned digest for this platform"),
+        Some(expected) if sha256_matches(bytes, expected) => Ok(()),
+        Some(_) => Err("checksum mismatch"),
+    }
+}
+
 /// Whether `bytes` hash to `expected` (hex SHA-256, either case). An empty
 /// or malformed expectation never matches: a gate that passes on a typo is
 /// no gate.
@@ -627,19 +649,18 @@ fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'
         return;
     };
 
-    // A platform with a pinned digest has its download verified before a
-    // byte of it is unpacked or marked executable: an altered asset or a
-    // tampered delivery path is refused, not installed.
-    if let Some(expected) = target_url(sha256, os, arch)
-        && !sha256_matches(&bytes, expected)
-    {
-        log_file::log(&format!("lsp[{name}] checksum mismatch for {url}"));
+    // A manifest that pins digests has its download verified before a byte
+    // of it is unpacked or marked executable: an altered asset, a tampered
+    // delivery path, or a platform the manifest forgot to pin is refused,
+    // not installed. A manifest that pins nothing stays unverified.
+    if let Err(why) = digest_verdict(sha256, os, arch, &bytes) {
+        log_file::log(&format!("lsp[{name}] {why} for {url}"));
         crate::output::push(
             crate::output::CHANNEL_PROVISION,
             crate::output::OutputLevel::Error,
-            &format!("{name}: checksum mismatch for {url}; refusing to install"),
+            &format!("{name}: {why} for {url}; refusing to install"),
         );
-        set_status(format!("{name} install refused (checksum mismatch)"));
+        set_status(format!("{name} install refused ({why})"));
         return;
     }
     let target = dir.join(bin_path.unwrap_or(bin));
@@ -1511,6 +1532,47 @@ mod tests {
         assert!(
             err.to_string().contains("declares"),
             "the refusal comes from the index, before decoding: {err}"
+        );
+    }
+
+    /// A manifest that pins digests for some platforms but not this one
+    /// refuses to install here rather than silently skipping the gate; no
+    /// pins at all stays unverified, as every older binary provision is.
+    #[test]
+    fn a_partial_digest_map_refuses_an_unlisted_platform() {
+        let bytes = b"asset";
+        let real = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(bytes))
+        };
+        assert_eq!(
+            digest_verdict(&[], "linux", "x86_64", bytes),
+            Ok(()),
+            "no pins: unverified"
+        );
+        assert_eq!(
+            digest_verdict(
+                &[("macos-aarch64", real.as_str())],
+                "macos",
+                "aarch64",
+                bytes
+            ),
+            Ok(()),
+            "the platform's pin matches"
+        );
+        assert!(
+            digest_verdict(&[("macos-aarch64", "00")], "macos", "aarch64", bytes).is_err(),
+            "a wrong pin refuses"
+        );
+        assert!(
+            digest_verdict(
+                &[("macos-aarch64", real.as_str())],
+                "linux",
+                "x86_64",
+                bytes
+            )
+            .is_err(),
+            "a map that pins other platforms but not this one refuses"
         );
     }
 
