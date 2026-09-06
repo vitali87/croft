@@ -43269,3 +43269,105 @@ fn a_lanes_badge_follows_the_seat_and_a_seated_pane_outranks_a_plain_one() {
         "back to the configured name once nobody is seated"
     );
 }
+
+#[test]
+fn the_review_queue_names_the_lane_each_agents_files_are_in() {
+    // #348: with a worktree lane in the workspace the queue groups by root,
+    // naming a lane by its BRANCH and any other root by its display label,
+    // so two files of the same basename are told apart.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let repo = app.roots.primary().to_path_buf();
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+
+    let working = vec![String::from("claude")];
+    app.agent_ledger
+        .record_write(&repo.join("src/mod.rs"), 1, &working);
+    app.agent_ledger
+        .record_write(&lane.join("src/mod.rs"), 2, &working);
+    app.agent_ledger
+        .record_write(&lane.join("src/other.rs"), 3, &working);
+
+    let rows = app.agent_lane_rows();
+    assert_eq!(rows.len(), 1, "one row per agent: {rows:?}");
+    let row = &rows[0];
+    assert!(row.starts_with("claude: 3 to review \u{2014} "), "{row}");
+    let repo_label = repo
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap();
+    assert!(
+        row.contains(&format!("{repo_label} 1: mod.rs")),
+        "the primary root is named by its folder: {row}"
+    );
+    assert!(
+        row.contains("agent/fix-login 2: other.rs, mod.rs"),
+        "the lane is named by its branch, most recent first: {row}"
+    );
+    assert!(
+        !row.contains('\u{2026}'),
+        "no ellipsis: every file in each group is listed: {row}"
+    );
+    assert!(
+        row.find(&repo_label) < row.find("agent/fix-login"),
+        "root order, primary first: {row}"
+    );
+
+    // A file outside every root still appears, under its own heading.
+    app.agent_ledger
+        .record_write(&tmp.path().join("stray.rs"), 4, &working);
+    let row = app.agent_lane_rows().remove(0);
+    assert!(
+        row.contains("outside the workspace 1: stray.rs"),
+        "an unowned file is named, not dropped: {row}"
+    );
+}
+
+#[test]
+fn a_single_root_review_queue_reads_as_it_always_did() {
+    // Grouping is for workspaces with more than one root: with one, the
+    // label would name the only place the files could be and the group
+    // count would repeat the total, so the row keeps its old flat shape.
+    // A truncated sample says so, and an empty queue has no dangling tail.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let working = vec![String::from("claude")];
+    app.agent_ledger
+        .record_write(&tmp.path().join("a.rs"), 1, &working);
+    app.agent_ledger
+        .record_write(&tmp.path().join("b.rs"), 2, &working);
+    assert_eq!(
+        app.agent_lane_rows(),
+        vec![String::from("claude: 2 to review (b.rs, a.rs)")],
+        "the pre-grouping shape, unchanged"
+    );
+    for i in 0..3 {
+        app.agent_ledger.record_write(
+            &tmp.path().join(format!("f{i}.rs")),
+            10 + i as u64,
+            &working,
+        );
+    }
+    let row = app.agent_lane_rows().remove(0);
+    assert_eq!(
+        row, "claude: 5 to review (f2.rs, f1.rs, f0.rs, \u{2026})",
+        "a sample of three says it is a sample"
+    );
+    // Nothing unreviewed: no trailing separator, no empty group.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let f = tmp.path().join("z.rs");
+    std::fs::write(&f, "x").unwrap();
+    app.agent_ledger.record_write(&f, 1, &working);
+    let hash = app.agent_ledger.lane("claude")[0].current_hash;
+    app.agent_ledger.mark_reviewed("claude", &f, hash);
+    assert_eq!(
+        app.agent_lane_rows(),
+        vec![String::from("claude: 0 to review ()")],
+        "an emptied lane keeps the old shape too"
+    );
+}
