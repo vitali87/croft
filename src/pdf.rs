@@ -792,14 +792,15 @@ mod tests {
     #[test]
     fn the_grace_poll_settles_a_complete_buffer_well_inside_the_grace() {
         use std::sync::{Arc, Mutex};
-        // Derived from the grace the production call site passes, so lost
-        // headroom fails here rather than in a page render. The poll's own
-        // 5 ms ticks do not scale with load but their overshoot compounds,
-        // so the GRACE is scaled (its floor is twice the production value)
-        // and the ceiling stays the fraction of it that proves an early
-        // exit: a poll that ran to the deadline returns at the grace or
-        // later and still fails.
-        let grace = crate::test_budget::spawn_budget(STDERR_SETTLE_GRACE / 4);
+        // The poll's twelve 5 ms ticks are FIXED, so its ideal early exit
+        // is ~60 ms whatever the load; only their overshoot scales. The
+        // grace is therefore the production constant scaled up (spawn_budget
+        // is at least 4x its base, so the floor here is 800 ms, never below
+        // production), and the ceiling is the fraction of it that proves an
+        // early exit: far above the ideal exit's overshoot under load, and
+        // still failed by a poll that ran to its deadline, which returns at
+        // the grace or later.
+        let grace = crate::test_budget::spawn_budget(STDERR_SETTLE_GRACE).max(STDERR_SETTLE_GRACE);
         let ceiling = grace * 3 / 4;
         for seed in [&b"Syntax Error: complete\n"[..], &b""[..]] {
             let buf = Arc::new(Mutex::new(seed.to_vec()));
@@ -811,6 +812,39 @@ mod tests {
                 "a settled buffer does not pay the whole grace: {took:?} against {ceiling:?} for seed {seed:?}"
             );
         }
+    }
+
+    /// The deadline is the bound when the buffer never goes quiet: a writer
+    /// appending faster than the quiet run can complete is cut off at the
+    /// grace, with what arrived so far, rather than followed indefinitely.
+    #[test]
+    fn the_grace_poll_stops_at_its_deadline_under_a_writer_that_never_pauses() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sink, halt) = (Arc::clone(&buf), Arc::clone(&stop));
+        let writer = std::thread::spawn(move || {
+            while !halt.load(Ordering::Relaxed) {
+                sink.lock().unwrap().extend_from_slice(b"x");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        let grace = std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let text = settle_stderr(&buf, grace);
+        let took = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            took >= grace,
+            "the deadline is the exit when nothing settles: {took:?}"
+        );
+        assert!(
+            took < crate::test_budget::spawn_budget(grace),
+            "and it is not followed past the grace: {took:?}"
+        );
+        assert!(!text.is_empty(), "what arrived before the deadline is kept");
     }
 
     /// A renderer that fails silently still names its exit status.
