@@ -1079,7 +1079,16 @@ impl DiffData {
         self.scroll = old.scroll.min(self.rows.len().saturating_sub(1));
         self.scroll_x = old.scroll_x;
         self.nav_anchor = old.nav_anchor.filter(|&row| row < self.rows.len());
-        self.find = old.find.clone();
+        // The needle and its options survive; the ACTIVE match does not. It
+        // names a row and a span of the old rows, and the new rows may not
+        // hold it (or hold it elsewhere). The app recomputes it against the
+        // fresh rows when a find bar is open; a stale one here would paint a
+        // band on whatever now sits at that row.
+        self.find = DiffFindState {
+            needle: old.find.needle.clone(),
+            opts: old.find.opts,
+            active: None,
+        };
         self.left_is_git_head = old.left_is_git_head;
         self.left_is_real_file = old.left_is_real_file;
         self.source = old.source.clone();

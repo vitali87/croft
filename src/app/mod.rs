@@ -5945,7 +5945,8 @@ impl App {
         // Stamp-gated, so an idle poll costs a stat per open diff view; on
         // hosts without a native watcher this is how a diff follows the
         // file (#471).
-        let diffs_changed = self.refresh_open_diff_views(false, &[]);
+        let diffs_changed =
+            self.refresh_open_diff_views(false, &[], &std::collections::BTreeSet::new());
         poll.open_file_changed || poll.dirs_changed || diffs_changed
     }
 
@@ -6019,6 +6020,7 @@ impl App {
         // diffs for THESE re-read their HEAD blob (#471); the rest are
         // stamp-gated like any filesystem tick.
         let mut heads_moved: Vec<PathBuf> = Vec::new();
+        let mut status_arrived = false;
         let primary_root = self.roots.primary().to_path_buf();
         let mut worker_roots: Vec<PathBuf> = vec![primary_root];
         worker_roots.extend(self.git_extra.iter().map(|(r, _)| r.clone()));
@@ -6033,6 +6035,13 @@ impl App {
             };
             w.flush_pending();
             let this_changed = w.drain_into(is_active.then_some(panel));
+            // A completed refresh whose status came back identical is still
+            // news to an open staged / branch / previous-commit diff (#471):
+            // those read the index or a ref, which porcelain status does
+            // not fully describe.
+            if w.take_status_arrival() {
+                status_arrived = true;
+            }
             if !this_changed {
                 continue;
             }
@@ -6069,11 +6078,6 @@ impl App {
             }
         }
         if changed {
-            // New git status means HEAD or the index may have moved: a
-            // Source Control diff re-reads its HEAD blob, a staged / branch
-            // / previous-commit view re-runs its `git diff` (#471). This is
-            // the debounced cadence, so a burst of writes costs one re-run.
-            self.refresh_open_diff_views(true, &heads_moved);
             self.refresh_scm_change_badge();
             // The overview rows track the same drains that feed the badge
             // (#162 review: sync_focus_flags runs on focus TRANSITIONS,
@@ -6093,7 +6097,15 @@ impl App {
                 self.tree.ignored = std::sync::Arc::new(union);
             }
         }
-        changed
+        // A completed status refresh means HEAD or the index may have moved:
+        // a Source Control diff re-reads its HEAD blob when its root's HEAD
+        // oid changed, a staged / branch / previous-commit view re-runs its
+        // `git diff` on every arrival (#471). This is the debounced cadence,
+        // so a burst of writes costs one re-run, and a rebuilt view owes a
+        // redraw even when the status itself was unchanged.
+        let diffs_refreshed = (changed || status_arrived)
+            && self.refresh_open_diff_views(true, &heads_moved, &std::collections::BTreeSet::new());
+        changed || diffs_refreshed
     }
 
     /// Point the SCM surfaces at `active`'s repository: seed the panel
@@ -11506,7 +11518,7 @@ impl App {
             // An open diff view follows the file the same way a buffer does
             // (#471): an agent rewriting the working file, or a save from a
             // sibling tab, re-diffs it in place.
-            self.refresh_open_diff_views(false, &[]);
+            self.refresh_open_diff_views(false, &[], &drain.changed_files);
         }
         // Attribute the writes to whichever agents were working when they
         // landed (#345). Done after the reload so an agent's write to the
@@ -24120,7 +24132,7 @@ impl App {
                 // path for this root so the view is rebuilt even if the
                 // rewrite landed within the stamp's granularity.
                 let root = self.scm_root();
-                self.refresh_open_diff_views(true, &[root]);
+                self.refresh_open_diff_views(true, &[root], &std::collections::BTreeSet::new());
             }
             Err(err) => self.status = format!("Revert hunk failed: {err}"),
         }
@@ -24161,7 +24173,23 @@ impl App {
     /// during every write burst for a HEAD that had not moved.
     /// A view whose content came back identical is left untouched: no reset
     /// of selection or find, no redraw.
-    pub fn refresh_open_diff_views(&mut self, git_too: bool, heads_moved: &[PathBuf]) -> bool {
+    pub fn refresh_open_diff_views(
+        &mut self,
+        git_too: bool,
+        heads_moved: &[PathBuf],
+        changed_files: &std::collections::BTreeSet<PathBuf>,
+    ) -> bool {
+        // The watcher's own list of written paths bypasses the stamp gate: a
+        // same-length rewrite that lands within the filesystem's mtime
+        // granularity (or restores the mtime) shows the same `(mtime, len)`
+        // as before, and the event is the only evidence it happened.
+        // Canonicalised once, so a path the watcher reports through a
+        // symlinked root (macOS's /tmp -> /private/tmp) still matches the
+        // path the view was opened with.
+        let touched: Vec<PathBuf> = changed_files
+            .iter()
+            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .collect();
         let mut changed = false;
         for group in
             std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
@@ -24170,7 +24198,7 @@ impl App {
                 let Some(old) = ed.diff.as_ref() else {
                     continue;
                 };
-                let Some(mut fresh) = rebuild_diff_view(old, git_too, heads_moved) else {
+                let Some(mut fresh) = rebuild_diff_view(old, git_too, heads_moved, &touched) else {
                     continue;
                 };
                 if fresh.same_content_as(old) {
@@ -24187,6 +24215,20 @@ impl App {
                 ed.diff = Some(fresh);
                 changed = true;
             }
+        }
+        // A rebuilt ACTIVE diff with a find bar open gets its match set and
+        // active match recomputed against the new rows, the same way a
+        // typed query would; `carry_view_from` deliberately dropped the old
+        // active match because it named rows that may be gone.
+        if changed
+            && self.editor.diff.is_some()
+            && self
+                .editor_find
+                .as_ref()
+                .is_some_and(|s| !s.query.is_empty())
+        {
+            let pos = self.diff_find_current_pos();
+            self.diff_find_apply(pos);
         }
         changed
     }
@@ -44654,8 +44696,18 @@ fn rebuild_diff_view(
     old: &crate::widgets::diff::DiffData,
     git_too: bool,
     heads_moved: &[PathBuf],
+    touched: &[PathBuf],
 ) -> Option<crate::widgets::diff::DiffData> {
     use crate::widgets::diff::{DiffData, DiffSource, GitDiffKind};
+    // A side the watcher just reported written, matched on the canonical
+    // path so a symlinked root cannot hide it. Bypasses the stamp gate.
+    let written = |side: &Path| {
+        if touched.is_empty() {
+            return false;
+        }
+        let canon = std::fs::canonicalize(side).unwrap_or_else(|_| side.to_path_buf());
+        touched.iter().any(|t| *t == canon || t == side)
+    };
     let lines = |t: &str| -> Vec<String> { t.lines().map(str::to_string).collect() };
     let two_sided = |left_text: &str, right_text: &str| {
         DiffData::build_with_byte_check(
@@ -44671,7 +44723,7 @@ fn rebuild_diff_view(
         DiffSource::Static => return None,
         DiffSource::HeadVsWorking { root, rel } => {
             let head_moved = git_too && heads_moved.iter().any(|r| r == root);
-            if !head_moved && !old.sides_moved_on_disk() {
+            if !head_moved && !written(&old.right_path) && !old.sides_moved_on_disk() {
                 return None;
             }
             let head = crate::git::read_file_at_head(root, rel).ok()?;
@@ -44679,14 +44731,14 @@ fn rebuild_diff_view(
             two_sided(&head, &right)
         }
         DiffSource::FixedLeft { left_text } => {
-            if !old.sides_moved_on_disk() {
+            if !written(&old.right_path) && !old.sides_moved_on_disk() {
                 return None;
             }
             let right = std::fs::read_to_string(&old.right_path).ok()?;
             two_sided(left_text, &right)
         }
         DiffSource::TwoFiles => {
-            if !old.sides_moved_on_disk() {
+            if !written(&old.left_path) && !written(&old.right_path) && !old.sides_moved_on_disk() {
                 return None;
             }
             let left = std::fs::read_to_string(&old.left_path).ok()?;
