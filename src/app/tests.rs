@@ -4647,26 +4647,37 @@ fn fs_sync_reflects_external_changes_within_200ms_wall_clock() {
 
     let new_file = tmp.path().join("new.txt");
     std::fs::write(&new_file, "hi").unwrap();
+    // The budget is checked after every drain as well as before: a drain
+    // that lands the change past the deadline must still fail, not end the
+    // loop quietly on the next condition check.
     let started = std::time::Instant::now();
     while !app.tree.nodes.iter().any(|n| n.path == new_file) {
+        let _ = app.drain_fs_events();
         assert!(
             started.elapsed() <= budget,
             "created file should appear in Explorer within {budget:?}"
         );
-        let _ = app.drain_fs_events();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    assert!(
+        started.elapsed() <= budget,
+        "created file should appear in Explorer within {budget:?}"
+    );
 
     std::fs::remove_file(&doomed).unwrap();
     let started = std::time::Instant::now();
     while app.tree.nodes.iter().any(|n| n.path == doomed) {
+        let _ = app.drain_fs_events();
         assert!(
             started.elapsed() <= budget,
             "deleted file should disappear from Explorer within {budget:?}"
         );
-        let _ = app.drain_fs_events();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    assert!(
+        started.elapsed() <= budget,
+        "deleted file should disappear from Explorer within {budget:?}"
+    );
 }
 
 #[test]
