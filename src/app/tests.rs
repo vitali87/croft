@@ -3698,7 +3698,7 @@ fn ctrl_shift_space_quick_select_labels_matches_and_a_label_commits() {
     // header-only viewport and the hint set is timing-dependent.
     crate::test_budget::await_spawned(
         crate::test_budget::tests::SHELL_PAINT_BASE,
-        "both copies of the pasted hash",
+        "the hash on its own echoed row as well as in the run-label header",
         || {
             app.terminals[0]
                 .grid_lines()
@@ -3952,7 +3952,7 @@ fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
     .unwrap();
     crate::test_budget::await_spawned(
         crate::test_budget::tests::SHELL_PAINT_BASE,
-        "both copies of the pasted URL",
+        "the URL on its own echoed row as well as in the run-label header",
         || {
             app.terminals[0]
                 .grid_lines()

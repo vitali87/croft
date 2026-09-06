@@ -292,7 +292,8 @@ pub(crate) mod tests {
     /// floor assertion below guards the direction that can. That assertion
     /// checks the constant, not its call sites, so converting a wait whose
     /// old bound EXCEEDED 8000ms would need its own base rather than this
-    /// one — none exists today, and this is the note that says why.
+    /// one — no such call site exists among these, and this is the note
+    /// that says why.
     ///
     /// 2s because `BASE_CALIBRATION * MIN_SCALE` is 4 at the floor, so the
     /// call sites keep the 8000ms they had on a quiet machine and get up to
