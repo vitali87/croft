@@ -13464,6 +13464,7 @@ fn opening_a_file_in_a_viewer_runs_the_tool_on_it_in_a_new_terminal_pane() {
     let data = tmp.path().join("data.csv");
     std::fs::write(&data, "a,b\n1,2\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.consented_extensions.insert("csvlens".into());
     let before = app.terminals.len();
     let viewer = crate::mcp::registry::ContributedViewer {
         ext_id: "csvlens".into(),
@@ -13536,6 +13537,39 @@ fn a_viewer_refuses_a_path_it_cannot_pass_faithfully() {
     );
 }
 
+/// A viewer spawns a program from a manifest, so it passes the same
+/// first-run consent gate a sidecar does (#485 review): the first use of an
+/// extension's viewer shows the exact command line and spawns nothing until
+/// the user allows it; a consented extension runs straight away.
+#[test]
+fn a_viewer_asks_for_consent_before_its_first_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data.csv");
+    std::fs::write(&data, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let viewer = crate::mcp::registry::ContributedViewer {
+        ext_id: format!("consent-test-{}", std::process::id()),
+        id: "csvlens".into(),
+        label: "Open in csvlens".into(),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30".into(), "sh".into(), "{file}".into()],
+        extensions: vec!["csv".into()],
+        provision: None,
+    };
+    let before = app.terminals.len();
+    app.open_in_viewer(&viewer, &data);
+    assert_eq!(app.terminals.len(), before, "nothing spawns before consent");
+    let prompt = app
+        .input_prompt
+        .as_ref()
+        .expect("the consent prompt is open");
+    assert!(
+        prompt.title.contains(&viewer.ext_id) && prompt.title.contains("/bin/sh"),
+        "the prompt names the extension and the exact command: {:?}",
+        prompt.title
+    );
+}
+
 /// #465: the palette row reaches the viewer route (not the MCP command path)
 /// and guards on the active file before anything is spawned.
 #[test]
@@ -13546,6 +13580,7 @@ fn a_viewer_palette_row_guards_on_the_active_file() {
     std::fs::write(&notes, "# hi\n").unwrap();
     std::fs::write(&data, "a,b\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.consented_extensions.insert("csvlens".into());
     // The `viewer:` prefix is routed before the MCP lookup: an unknown viewer
     // is reported as a viewer, not as an extension command.
     app.run_extension_command("viewer:nope");

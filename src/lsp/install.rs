@@ -86,10 +86,13 @@ pub enum Provision {
         /// an unsupported platform to fall back to PATH (clangd's linux-aarch64,
         /// which has no Termux package either).
         termux_pkg: Option<&'static str>,
-        /// Per-platform SHA-256 of the asset, keyed like `targets`; a platform
-        /// with an entry has its download verified before anything is
-        /// unpacked or marked executable. Empty means unverified (the
-        /// pre-existing state for every binary provision).
+        /// Per-platform SHA-256 of the asset, keyed like `targets`. Three
+        /// outcomes: an empty map installs unverified (the pre-existing state
+        /// of every older binary provision); a platform with an entry has its
+        /// download verified before anything is unpacked or marked executable;
+        /// a non-empty map with no entry for this platform refuses to install,
+        /// since a partial map is a mistake in the manifest, not a licence to
+        /// skip the gate.
         sha256: &'static [(&'static str, &'static str)],
     },
 }
@@ -150,6 +153,24 @@ pub fn take_just_installed() -> Vec<Language> {
 /// Ensures only one install thread is ever spawned per process per server, no
 /// matter how many times the manager re-probes a missing client.
 static INSTALL_STARTED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+
+/// The names handed out by [`static_name`], so each distinct name is leaked
+/// once however often it is asked for.
+static STATIC_NAMES: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+
+/// A `&'static str` for `name`, leaked at most once per distinct name: the
+/// install machinery keys its one-shot gates on `&'static str`, and a caller
+/// that ran on every click (a viewer whose tool is not installed yet) must
+/// not leak a fresh allocation each time.
+pub fn static_name(name: &str) -> &'static str {
+    let mut names = STATIC_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = names.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
 
 /// The registry name for the TypeScript server, shared so config and the
 /// manager's resolver agree on which server croft provisions itself.
@@ -330,7 +351,19 @@ fn target_url<'a>(targets: &'a [(&'a str, &'a str)], os: &str, arch: &str) -> Op
 /// nested in an extracted archive; absent, the binary sits directly at
 /// `<name>/<bin>`.
 fn managed_binary_path(name: &str, bin: &str, bin_path: Option<&str>) -> Option<PathBuf> {
-    Some(servers_dir()?.join(name).join(bin_path.unwrap_or(bin)))
+    Some(managed_binary_path_in(&servers_dir()?, name, bin, bin_path))
+}
+
+/// [`managed_binary_path`] under an explicit servers dir, so a test can
+/// point it at a scratch tree. A `name` with a `/` (a viewer's
+/// `<extension>/<viewer>` key) nests, which is the point of the key.
+fn managed_binary_path_in(
+    servers: &Path,
+    name: &str,
+    bin: &str,
+    bin_path: Option<&str>,
+) -> PathBuf {
+    servers.join(name).join(bin_path.unwrap_or(bin))
 }
 
 /// Resolve an invocable command for a binary-provisioned server. PATH-first
@@ -414,14 +447,22 @@ fn extract_tar_xz(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()
 fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> std::io::Result<()> {
     // The download cap covered compressed bytes; a high-ratio archive could
     // still expand to fill memory and disk. The stream's own index says how
-    // much it decodes to, so an archive past the ceiling is refused before a
-    // byte is decoded: the pure-Rust decoder buffers a whole block before it
-    // writes, so a check on its output alone would bound the disk but not
-    // the decode. The sink below is the second line, for a stream whose
-    // index is missing or lies: what reaches disk can never exceed the cap.
-    if let Some(declared) = xz_declared_size(bytes)
-        && declared > cap
-    {
+    // much it decodes to, so an archive past the ceiling, or one whose index
+    // cannot be read, is refused before a byte is decoded: the pure-Rust
+    // decoder buffers a whole block before it writes, so a check on its
+    // output alone would bound the disk but not the decode. The sink below
+    // bounds only what can reach the disk, for an index that lies about a
+    // stream the decoder then checks against it.
+    let Some(declared) = xz_declared_size(bytes) else {
+        // No readable index means no way to bound the decode before it
+        // runs, and a corrupted footer is exactly what a hostile archive
+        // would carry: refuse rather than decode an unbounded stream.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the archive's xz index cannot be read, so its size cannot be checked before decoding",
+        ));
+    };
+    if declared > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("archive declares {declared} bytes, past the {cap}-byte ceiling"),
@@ -434,6 +475,24 @@ fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> s
     lzma_rs::xz_decompress(&mut std::io::Cursor::new(bytes), &mut sink)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
     let tar_bytes = sink.buf;
+    // A link entry named like the binary would be found by the walk below,
+    // renamed into place, chmodded through, and run: `tar` refuses links
+    // that escape `dir` but not links that point out of it. A release
+    // archive of a binary has no business carrying links, so any link
+    // refuses the whole archive before anything is unpacked.
+    for entry in tar::Archive::new(std::io::Cursor::new(&tar_bytes)).entries()? {
+        let entry = entry?;
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the archive carries a link entry ({:?}); refusing it",
+                    entry.path()?
+                ),
+            ));
+        }
+    }
     tar::Archive::new(std::io::Cursor::new(tar_bytes)).unpack(dir)?;
     if !target.is_file()
         && let Some(name) = target.file_name()
@@ -460,7 +519,9 @@ fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> s
 
 /// The uncompressed size an xz stream declares in its index, read from the
 /// stream footer without decoding anything, or `None` when the footer or
-/// index cannot be read (the decoder then reports whatever is wrong).
+/// index cannot be read. Only a single-stream file is understood, which is
+/// what `xz` and cargo-dist produce; a concatenation of streams reads as
+/// unreadable and is refused by the caller, on the conservative side.
 fn xz_declared_size(bytes: &[u8]) -> Option<u64> {
     // Stream footer, last 12 bytes: CRC32, backward size (index size / 4 - 1),
     // stream flags, "YZ". The index precedes it: 0x00, a record count, then
@@ -557,15 +618,20 @@ fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
     expected.len() == 64 && format!("{:x}", sha2::Sha256::digest(bytes)) == expected
 }
 
-/// First regular file named `name` under `dir`, depth-first.
+/// First regular file named `name` under `dir`, depth-first. Links are
+/// never followed, in either direction: a link to a directory is not
+/// descended and a link named like the binary is not the binary.
 fn find_file_named(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for entry in std::fs::read_dir(&d).ok()?.flatten() {
             let p = entry.path();
-            if p.is_dir() {
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_dir() {
                 stack.push(p);
-            } else if p.file_name() == Some(name) && p.is_file() {
+            } else if meta.file_type().is_file() && p.file_name() == Some(name) {
                 return Some(p);
             }
         }
@@ -1576,13 +1642,115 @@ mod tests {
         );
     }
 
+    /// A planted symlink named like the binary must not become the binary:
+    /// the walk must not follow it, the archive must be refused, and a file
+    /// it points at must keep its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_archive_is_refused_and_touches_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let victim_dir =
+            std::env::temp_dir().join(format!("croft-tarxz-victim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&victim_dir);
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim = victim_dir.join("victim");
+        std::fs::write(&victim, "keep me private").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_cksum();
+            b.append_link(&mut h, "csvlens-x86_64-unknown-linux-gnu/csvlens", &victim)
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("csvlens");
+        let outcome = extract_tar_xz(&xz, &dir, &target);
+        let target_is_link =
+            std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink());
+        let victim_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&victim_dir);
+        assert!(outcome.is_err(), "an archive carrying a link is refused");
+        assert!(!target_is_link, "no link is left where the binary would go");
+        assert_eq!(victim_mode, 0o600, "the link's target keeps its mode");
+    }
+
+    /// The size ceiling must hold when the stream's index cannot be read:
+    /// a corrupted footer is exactly what a hostile archive would carry, so
+    /// an unreadable index refuses the archive rather than skipping the
+    /// check.
+    #[test]
+    fn a_tar_xz_with_an_unreadable_index_is_refused_before_decoding() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let payload = vec![0u8; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "big/csvlens", &payload[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        // Corrupt the footer magic so the index cannot be located.
+        let n = xz.len();
+        xz[n - 2] = b'X';
+        assert_eq!(
+            xz_declared_size(&xz),
+            None,
+            "fixture: the index is unreadable"
+        );
+        let dir = std::env::temp_dir().join(format!("croft-tarxz-noindex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = extract_tar_xz_capped(&xz, &dir, &dir.join("csvlens"), 1 << 20)
+            .expect_err("an archive whose size cannot be read is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("index"),
+            "the refusal names the unreadable index, not a decode error: {err}"
+        );
+    }
+
+    /// The nested install name resolves to a nested directory and the
+    /// binary is found there afterwards.
+    #[test]
+    fn a_nested_install_name_places_and_finds_the_binary() {
+        let dir = std::env::temp_dir().join(format!("croft-nested-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("alpha").join("csvlens");
+        std::fs::create_dir_all(&nested).unwrap();
+        let bin = nested.join("csvlens");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let found = managed_binary_path_in(&dir, "alpha/csvlens", "csvlens", None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            found, bin,
+            "`<servers>/alpha/csvlens/csvlens` is where the key points"
+        );
+    }
+
     /// The checksum gate is the only thing between a download and an
     /// executable; it must reject a mismatch and accept the true digest.
     #[test]
     fn sha256_matches_only_the_true_digest() {
         let bytes = b"csvlens release bytes";
-        // sha256("csvlens release bytes")
-        let good = "8b0fa3ee6b2b3d3b0a0a4f3f6d2d7d5f1a4f0d6b3d5b1f0e3a4b7c2d9e8f1a0b";
+        // A well-formed digest that is NOT this input's: the real one is
+        // computed below, and the two must differ for the test to mean
+        // anything.
+        let decoy = "8b0fa3ee6b2b3d3b0a0a4f3f6d2d7d5f1a4f0d6b3d5b1f0e3a4b7c2d9e8f1a0b";
         assert!(!sha256_matches(
             bytes,
             "0000000000000000000000000000000000000000000000000000000000000000"
@@ -1592,10 +1760,7 @@ mod tests {
             use sha2::Digest;
             format!("{:x}", sha2::Sha256::digest(bytes))
         };
-        assert_ne!(
-            real, good,
-            "the literal above is a decoy, the real digest is computed"
-        );
+        assert_ne!(real, decoy, "the decoy is not this input's digest");
         assert!(sha256_matches(bytes, &real), "the true digest is accepted");
         assert!(
             sha256_matches(bytes, &real.to_uppercase()),

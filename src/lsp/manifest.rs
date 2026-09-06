@@ -407,8 +407,10 @@ pub struct ProvisionDecl {
     #[serde(default)]
     pub termux_pkg: Option<String>,
     /// `binary`: per-platform SHA-256 of the asset, keyed like `targets`.
-    /// A platform with an entry has its download verified before anything is
-    /// unpacked; a platform without one installs unverified.
+    /// Three outcomes: no map at all installs unverified; a platform with an
+    /// entry has its download verified before anything is unpacked; a map that
+    /// pins other platforms but not this one refuses to install here, so a
+    /// partial map fails loudly rather than skipping the gate.
     #[serde(default)]
     pub sha256: BTreeMap<String, String>,
 }

@@ -2884,6 +2884,11 @@ pub struct App {
     /// `terminals` (#313). A pane that is hidden, already collapsed, too
     /// narrow for the glyph, or maximized holds an empty rect.
     terminal_collapse_buttons: Vec<Rect>,
+    /// Extensions whose programs the user has allowed to run (the MCP
+    /// consent set, loaded once from prefs and kept current when a consent
+    /// is granted here), so a viewer's gate is a set lookup rather than a
+    /// prefs read per click, and a test can seed it without a prefs file.
+    consented_extensions: std::collections::BTreeSet<String>,
     /// Hit-test rectangles of the one-column strips collapsed panes leave
     /// behind, in lock-step with `terminals` (#313). Clicking anywhere down a
     /// strip gives that pane its width back; expanded panes hold an empty
@@ -4471,6 +4476,7 @@ impl App {
             terminal_profile_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
             terminal_collapse_buttons: Vec::new(),
+            consented_extensions: crate::prefs::Prefs::load_or_default().mcp_consented,
             terminal_strip_rects: Vec::new(),
             terminal_max_buttons: Vec::new(),
             terminal_rail_rects: Vec::new(),
@@ -21609,6 +21615,18 @@ impl App {
                 let r = crate::git::create_tag(&self.scm_root(), &value);
                 self.run_scm_op("tag", r, "Created tag");
             }
+            InputPurpose::ViewerConsent { key, path } => {
+                // The user allowed the viewer's extension; record it and
+                // resume the open that asked.
+                self.close_input_prompt();
+                if let Some(ext_id) = key.split('/').next() {
+                    let _ = crate::prefs::save_mcp_consent(ext_id);
+                    self.consented_extensions.insert(ext_id.to_string());
+                }
+                if let Some(viewer) = crate::mcp::registry::viewer_by_id(&key) {
+                    self.open_in_viewer(&viewer, &path);
+                }
+            }
             InputPurpose::McpConsent { command_id } => {
                 // The user confirmed; record consent for this command's
                 // extension and resume the command (which now passes the gate
@@ -31669,6 +31687,30 @@ impl App {
             );
             return;
         };
+        // A viewer spawns a program named by a manifest, exactly what the
+        // sidecar consent gate exists for, and manifests can arrive from the
+        // signed remote index, not only the bundled catalog. The first run of
+        // an extension's viewer shows the exact command line and spawns
+        // nothing until the user allows it; allowing resumes this open.
+        if !self.consented_extensions.contains(&viewer.ext_id) {
+            use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+            let spawn_line = std::iter::once(viewer.command.clone())
+                .chain(viewer.args.iter().map(|a| a.replace("{file}", &file)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.open_input_prompt(
+                InputPrompt::new(
+                    InputPurpose::ViewerConsent {
+                        key: viewer.key(),
+                        path: path.to_path_buf(),
+                    },
+                    format!("Allow {} to run:  {}", viewer.ext_id, spawn_line),
+                    "Enter to allow · Esc to cancel",
+                )
+                .with_value("allow"),
+            );
+            return;
+        }
         let install_name = viewer.install_name();
         let program = match viewer.provision.as_ref() {
             None => viewer.command.clone(),
@@ -31676,7 +31718,7 @@ impl App {
                 match crate::lsp::install::provisioned_command(&install_name, provision) {
                     Some((command, _extra_paths)) => command,
                     None => {
-                        let name: &'static str = Box::leak(install_name.clone().into_boxed_str());
+                        let name: &'static str = crate::lsp::install::static_name(&install_name);
                         let config = crate::lsp::config::ServerConfig {
                             name,
                             command: viewer.command.clone(),

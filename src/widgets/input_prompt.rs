@@ -56,6 +56,14 @@ pub enum InputPurpose {
     AddWatch,
     /// First-run consent to spawn an MCP sidecar: submitting confirms, then the
     /// command (`command_id`) proceeds to its argument prompt or runs.
+    /// First-run consent for an extension-contributed viewer (#485 review):
+    /// the same gate a sidecar passes, since both spawn a program from a
+    /// manifest. Carries the viewer's key and the file, so allowing resumes
+    /// the open the user asked for.
+    ViewerConsent {
+        key: String,
+        path: std::path::PathBuf,
+    },
     McpConsent {
         command_id: String,
     },
