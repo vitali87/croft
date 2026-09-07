@@ -42088,10 +42088,7 @@ fn the_leftmost_pane_comes_back_from_its_strip() {
 
     let strip = app.terminal_strip_rects[0];
     assert_eq!(strip.width, 1, "precondition: pane 0's strip is painted");
-    assert!(
-        app.terminals[0].collapsed,
-        "precondition: pane 0 is folded"
-    );
+    assert!(app.terminals[0].collapsed, "precondition: pane 0 is folded");
 
     app.handle_mouse(mouse(
         MouseEventKind::Down(MouseButton::Left),
