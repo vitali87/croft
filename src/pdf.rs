@@ -323,15 +323,24 @@ pub fn parse_pdfinfo_pages(out: &str) -> Option<u32> {
     None
 }
 
+/// The argv for the `mdls` page-count query, split out so it can be asserted
+/// without spawning anything. A reordering or a misspelt attribute name is
+/// otherwise invisible: `mdls` may be absent on the machine running the
+/// tests, and a test that silently no-ops when its subject is missing is not
+/// a test.
+fn mdls_argv(pdf: &Path) -> [&std::ffi::OsStr; 4] {
+    [
+        std::ffi::OsStr::new("-raw"),
+        std::ffi::OsStr::new("-name"),
+        std::ffi::OsStr::new("kMDItemNumberOfPages"),
+        pdf.as_os_str(),
+    ]
+}
+
 fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
     let (status, out) = run_bounded_stdout(
         std::path::Path::new("mdls"),
-        &[
-            std::ffi::OsStr::new("-raw"),
-            std::ffi::OsStr::new("-name"),
-            std::ffi::OsStr::new("kMDItemNumberOfPages"),
-            pdf.as_os_str(),
-        ],
+        &mdls_argv(pdf),
         PDF_INFO_BUDGET,
     )?;
     // mdls exits 0 and prints "(null)" for a file with no page count, and
@@ -1277,6 +1286,18 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
         assert_eq!(parse_pdfinfo_pages(sample), Some(12));
     }
 
+    /// The `mdls` argv, asserted without spawning `mdls` (#493). This is the
+    /// one part of that probe a test can reach on any machine.
+    #[test]
+    fn the_mdls_argv_names_the_page_count_attribute_in_order() {
+        let pdf = std::path::Path::new("/tmp/doc.pdf");
+        let argv = mdls_argv(pdf);
+        assert_eq!(argv[0], std::ffi::OsStr::new("-raw"));
+        assert_eq!(argv[1], std::ffi::OsStr::new("-name"));
+        assert_eq!(argv[2], std::ffi::OsStr::new("kMDItemNumberOfPages"));
+        assert_eq!(argv[3], pdf.as_os_str(), "the file is the last argument");
+    }
+
     /// The probe budget must stay below the render's. The doc comments argue
     /// the gap at length - a header parse still running that long is wedged,
     /// not slow - and nothing else would notice someone raising it.
@@ -1297,6 +1318,7 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
     /// distinguishes "the deadline fired" from "the child happened to be
     /// fast". Without the elapsed bound this test would also pass if
     /// `recv_timeout` were removed entirely.
+    #[cfg(unix)]
     #[test]
     fn a_hanging_probe_is_killed_at_the_budget_not_waited_on() {
         // Scaled, not a literal: CONTRIBUTING's "Waiting on a spawned
@@ -1321,6 +1343,7 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
 
     /// The paired presence case, so the refusal above cannot pass vacuously:
     /// a child that finishes inside the budget still returns its stdout.
+    #[cfg(unix)]
     #[test]
     fn a_quick_probe_returns_its_output() {
         // `sh -c` with a sleep, not a bare `echo`: the interesting success
@@ -1342,6 +1365,7 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
     /// The status must reach the caller, because both probes gate on it and
     /// the unbounded version they replaced did too. Stdout that parses from a
     /// FAILED run is the case that would otherwise be taken as an answer.
+    #[cfg(unix)]
     #[test]
     fn a_failing_probe_reports_its_status_even_with_parseable_output() {
         let (status, out) = run_bounded_stdout(
