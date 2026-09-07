@@ -113,5 +113,40 @@ class BinstallContract(unittest.TestCase):
         self.assertIn("missing", r.stderr)
 
 
+class TarLayoutDrift(unittest.TestCase):
+    """The drifts the review found the first version could not catch.
+
+    Both change what is INSIDE the tarball while leaving its name alone, so
+    every name-based check still agrees. The checker has to read the tar
+    invocation itself or these pass — which they did, until it did.
+    """
+
+    build_tree = BinstallContract.build_tree
+    run_checker = BinstallContract.run_checker
+
+    def test_flattening_the_archive_is_caught(self):
+        """`-C dist croft` puts the binary at the tar root while the archive
+        keeps its name, so bin-dir points at a directory that is not there.
+        Real binstall fails this with "bin file ... not found"."""
+        tree = self.build_tree(
+            workflow_sub=('tar -czf "dist/$name.tar.gz" -C dist "$name"',
+                          'tar -czf "dist/$name.tar.gz" -C dist croft')
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("look in a directory that is not in it", r.stderr)
+
+    def test_switching_to_zip_is_caught(self):
+        """The guard used to arm itself on `tar -czf` being present, so the
+        drift that removed it also disabled the check."""
+        tree = self.build_tree(
+            workflow_sub=('tar -czf "dist/$name.tar.gz" -C dist "$name"',
+                          'zip -r "dist/$name.zip" "$name"')
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no longer produces a tar.gz", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -101,7 +101,14 @@ def main() -> None:
              f"{url_archive[: -len(suffix)]!r}; binstall would 404")
     if not suffix:
         fail("pkg-url's archive name has no extension")
-    if f"tar -czf" in workflow and suffix != ".tar.gz":
+    # The archive command is REQUIRED, not conditional. Written as
+    # `if "tar -czf" in workflow and suffix != ".tar.gz"`, the guard skipped
+    # itself exactly when the workflow stopped producing a tar.gz — the
+    # drift it exists to catch removes the substring that arms it.
+    if "tar -czf" not in workflow:
+        fail("release.yml no longer produces a tar.gz, but pkg-url expects "
+             f"{suffix}")
+    if suffix != ".tar.gz":
         fail(f"release.yml writes .tar.gz but pkg-url expects {suffix}")
 
     # 2. pkg-fmt must match the extension, or binstall unpacks with the wrong
@@ -121,6 +128,22 @@ def main() -> None:
     if archive_dir != expected_dir:
         fail(f"bin-dir's directory {archive_dir!r} does not match the archive "
              f"name {expected_dir!r}; binstall would look in the wrong folder")
+
+    # And the layout INSIDE the tarball, which is a separate claim from the
+    # archive's name. `tar -czf x.tar.gz -C dist "$name"` wraps the binary in
+    # a directory; `-C dist croft` puts it at the root. Both produce an
+    # identically-named archive, so comparing names cannot tell them apart —
+    # and bin-dir is resolved against the extracted tree, not the file name.
+    tar = re.search(r'tar -czf\s+"?\$?\{?[^"\s]*"?\s+-C\s+(\S+)\s+"?([^"\s]+)"?',
+                    workflow)
+    if not tar:
+        fail("release.yml has no recognisable `tar -czf ... -C <dir> <member>` "
+             "line; cannot tell what the archive contains")
+    member = tar.group(2).replace("$name", expected_dir)
+    if member != expected_dir:
+        fail(f"release.yml archives {member!r} but bin-dir expects the binary "
+             f"under {expected_dir!r}/; binstall would extract the tarball and "
+             "look in a directory that is not in it")
 
     # 4. The tag shape. pkg-url hard-codes the `v` prefix, and the workflow
     #    both triggers on it and strips it to find the notes file.
