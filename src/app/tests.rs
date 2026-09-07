@@ -41763,6 +41763,165 @@ fn a_symbol_range_slices_exactly_its_source() {
     );
 }
 
+/// Focusing another editor GROUP closes a symbol tab too (#369).
+///
+/// A group swap changes the active file with no open call and no path
+/// argument: `focus_editor_group` pulls another group into `self.editor`.
+/// So neither the open-based sync nor a path-keyed guard sees it - it is a
+/// tenth category beyond the nine `open_preview`/`open` bypasses, and the
+/// guard lives in `focus_pane` to catch it.
+#[test]
+fn focusing_another_editor_group_closes_a_symbol_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn one() {\n    let x = 1;\n}\n").unwrap();
+    std::fs::write(&b, "fn two() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.editor.open_pinned(&a).unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&b).unwrap();
+    assert!(app.editor_layout.is_split(), "two groups");
+
+    // The tab belongs to the file in the OTHER group.
+    app.symbol_tab = Some((
+        String::from("fn one"),
+        a.clone(),
+        crate::symbol_range::SymbolRange::new(0, 27),
+    ));
+    assert!(
+        app.symbol_tab.is_some(),
+        "staging: a tab is open for the other group's file"
+    );
+
+    // The layout is DETERMINED, not incidental: `split_active` puts the
+    // existing group at DFS index 0 and the new active one at 1, which
+    // `split_active_makes_a_two_leaf_horizontal_split_with_the_new_group_active_after`
+    // in editor_layout.rs pins directly. So left holds a.rs, right holds
+    // b.rs. Asserting that rather than branching on it - an earlier version
+    // guarded the clear behind an `if`, which is the shape that goes green
+    // having asserted nothing if the layout ever moves.
+    app.focus_editor_group(true);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "the left group holds the file the tab belongs to"
+    );
+    assert!(
+        app.symbol_tab.is_some(),
+        "a swap onto the tab's OWN file must not close it"
+    );
+
+    app.focus_editor_group(false);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "the right group holds the other file"
+    );
+    assert!(
+        app.symbol_tab.is_none(),
+        "a swap onto a different file must close the tab"
+    );
+}
+
+/// A symbol tab belongs to the file it was opened from (#369).
+///
+/// The range is BYTE offsets into one buffer. Navigating to another file
+/// left it attached, so `follow_symbol_tab_edit` then applied edits made in
+/// the NEW file against offsets from the old one - silently walking the
+/// range somewhere meaningless rather than reporting `Gone`. Nothing
+/// cleared it except a straddling edit, so it survived every jump.
+#[test]
+fn a_symbol_tab_does_not_follow_you_into_another_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn one() {\n    let x = 1;\n}\n").unwrap();
+    std::fs::write(&b, "fn two() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+
+    app.symbol_tab = Some((
+        String::from("fn one"),
+        a.clone(),
+        crate::symbol_range::SymbolRange::new(0, 27),
+    ));
+    assert!(app.symbol_tab.is_some(), "staging: a tab is open on a.rs");
+
+    // Navigating to another file must drop it: the range describes a.rs.
+    app.open_at_utf16(&b, 0, 0).unwrap();
+    assert!(
+        app.symbol_tab.is_none(),
+        "the symbol tab must not survive into a different file"
+    );
+
+    // And through a path that never reaches `open_at`. Search hits, a
+    // quick-open pick with no line hint, tree clicks and plain tab switching
+    // all open a file directly - `open_at` looked like the chokepoint and
+    // covers ten of nineteen such sites.
+    app.editor.open(&a).unwrap();
+    app.symbol_tab = Some((
+        String::from("fn one"),
+        a.clone(),
+        crate::symbol_range::SymbolRange::new(0, 27),
+    ));
+    // `open_search_hit` is one of the nine that bypass `open_at`; it calls
+    // `sync_open_file_poll_mtime` directly, which is where the guard now
+    // lives. Driving the real navigation rather than `editor.open` alone,
+    // which is the raw editor call and not a navigation path at all.
+    app.open_search_hit(&crate::widgets::search::SearchHit {
+        path: b.clone(),
+        line_no: 1,
+        line_text: String::from("fn two() {}"),
+    });
+    assert!(
+        app.symbol_tab.is_none(),
+        "a search-hit jump must drop it too, not only the open_at route"
+    );
+
+    // Paired positive: reopening a.rs and a tab there still tracks edits, so
+    // the clear above is scoped to a file CHANGE rather than firing always.
+    // Navigating WITHIN the same file must NOT clear it: a go-to-definition
+    // that lands in the same file, or a Back jump, never left the buffer the
+    // range describes. Clearing unconditionally would fix the bug above and
+    // silently close the tab on every such jump - and it passes a test that
+    // only ever re-seeds the tab AFTER the navigation, which is why this
+    // seeds it BEFORE.
+    app.editor.open(&a).unwrap();
+    // Starting at 11, not 0: an insertion AT `start` is deliberately treated
+    // as inside (src/symbol_range.rs:86), so a range anchored at 0 has no
+    // "above" to test with and the paired case would assert the wrong rule.
+    app.symbol_tab = Some((
+        String::from("fn one"),
+        a.clone(),
+        crate::symbol_range::SymbolRange::new(11, 27),
+    ));
+    app.open_at_utf16(&a, 0, 0).unwrap();
+    assert!(
+        app.symbol_tab.is_some(),
+        "re-opening the tab's OWN file must not close it"
+    );
+    // A DIFFERENT SPELLING of the same file must not clear it. On macOS the
+    // workspace under /tmp canonicalises to /private/tmp, and
+    // `go_to_definition` feeds paths from the server's realpath-resolved
+    // URI while the tab stored whatever the user opened - so a raw `!=`
+    // closes the tab on a jump that never left the file. The old test could
+    // not catch this: it passed the same spelling on both sides, the one
+    // case where a raw comparison is always right.
+
+    app.follow_symbol_tab_edit(0, 0, 4);
+    let (_, _, range) = app
+        .symbol_tab
+        .clone()
+        .expect("an insertion above still tracks");
+    assert_eq!(
+        (range.start, range.end),
+        (15, 31),
+        "an edit above shifts the whole range rather than clearing it"
+    );
+}
+
 /// #369: an open symbol tab follows edits, and closes when its symbol goes.
 ///
 /// The tab is a VIEW over a byte range rather than a copy, so an edit that

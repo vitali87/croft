@@ -6158,6 +6158,48 @@ impl App {
     fn sync_open_file_poll_mtime(&mut self) {
         let paths = self.open_tab_paths();
         self.fs_watch.sync_open_file_mtime(&paths);
+        self.drop_symbol_tab_if_file_changed();
+    }
+
+    /// Close a symbol tab once the editor is showing a different file (#369).
+    ///
+    /// The range is BYTE offsets into ONE buffer, so it cannot survive the
+    /// move: `follow_symbol_tab_edit` would apply the new file's edits
+    /// against the old file's offsets and walk the range somewhere
+    /// meaningless rather than reporting `Gone`.
+    ///
+    /// Keyed on the ACTIVE path after the change, not on a path passed in.
+    /// `open_at` looked like the chokepoint and is not - search hits, a
+    /// quick-open pick with no line hint, file-tree clicks, reopen-closed-tab
+    /// and plain `editor.select` all reach another file without it, and
+    /// `select` carries no path a guard could inspect. Every one of those
+    /// paths does reach `sync_open_file_poll_mtime`.
+    ///
+    /// A plain comparison is enough, and a canonicalising fallback was tried
+    /// and removed. `go_to_definition` does arrive with the server's
+    /// realpath-resolved URI while the tab stored whatever the user opened -
+    /// but `open_preview` resolves through `find_tab_matching`, which
+    /// canonicalises, so it selects the ALREADY-OPEN tab and `editor.path`
+    /// keeps its original spelling. The two sides therefore cannot diverge
+    /// FOR THE SAME FILE - they diverge freely when the file really changes,
+    /// which is the point - because the tab's path is a copy of
+    /// `editor.path` and `find_tab_matching` canonicalises before selecting.
+    /// The field itself is not canonical. A canonicalising branch was
+    /// therefore unreachable: three attempts to
+    /// write a test that entered it all failed, and a mutation deleting it
+    /// survived, which is what proved it dead rather than merely untested.
+    fn drop_symbol_tab_if_file_changed(&mut self) {
+        let Some((_, tab_path, _)) = self.symbol_tab.as_ref() else {
+            return;
+        };
+        let Some(active) = self.editor.path.as_deref() else {
+            // No file open at all: nothing for the range to describe.
+            self.symbol_tab = None;
+            return;
+        };
+        if tab_path.as_path() != active {
+            self.symbol_tab = None;
+        }
     }
 
     /// Every file backing an open tab, across all editor groups. The poll
@@ -14700,6 +14742,12 @@ impl App {
         if self.editor.focused {
             self.poke_cursor();
         }
+        // Group focus changes the active FILE without opening anything and
+        // without a path (#369): `focus_editor_group` and
+        // `move_active_editor` swap another group into `self.editor`, so
+        // neither the open-based sync nor a path-argument guard sees them.
+        // Every focus change lands here, so this is the one place that does.
+        self.drop_symbol_tab_if_file_changed();
     }
 
     fn sync_focus_flags(&mut self) {
