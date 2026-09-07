@@ -8472,11 +8472,10 @@ impl App {
     /// Recorded at install time rather than summed from the store: a file's
     /// entry in `build_diagnostics` holds EVERY producer's items for that
     /// file, so summing it double-counts a file the sweep and a pane both
-    /// report - and undercounts in the reverse order, because
-    /// `install_build_diags` records a path only when the entry was empty,
-    /// so the second producer to reach a shared file never lists it.
-    /// Filtering on the item's `source` would not help either: a pane
-    /// running tsc produces the same source string as this sweep.
+    /// report. Filtering on the item's `source` would not help either: a
+    /// pane running tsc produces the same source string as this sweep.
+    /// (The rows do carry an owner since #532, so an owner-filtered count
+    /// would work - but this field is already exact and cheaper.)
     fn project_check_count(&self) -> usize {
         self.project_check_rows
     }

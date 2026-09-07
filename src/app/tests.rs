@@ -38028,7 +38028,6 @@ fn a_project_checker_that_failed_to_run_does_not_report_a_clean_project() {
 ///
 /// #530 made this routine rather than rare: the whole-project sweep reports
 /// every file in the project, so it overlaps any pane build by default.
-#[cfg(unix)]
 #[test]
 fn each_producer_clears_only_its_own_rows_from_a_shared_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -38084,11 +38083,13 @@ fn each_producer_clears_only_its_own_rows_from_a_shared_file() {
 /// reporting (#256).
 ///
 /// `build_diagnostics[f]` holds every producer's items for that file, so
-/// summing the store double-counts a shared file - and undercounts in the
-/// reverse order, because `install_build_diags` records a path only when the
-/// entry was empty, so the second producer to reach a shared file never
-/// lists it. Both orderings are pinned because they fail in opposite
-/// directions and one alone would look correct.
+/// summing the store double-counts a shared file. Both orderings are pinned
+/// because they fail in opposite directions and one alone would look
+/// correct.
+///
+/// The undercount this doc used to also describe - the second producer never
+/// listing a shared file, so it could not clear its rows - was the other half
+/// of #532 and is fixed; the rows carry an owner now.
 #[cfg(unix)]
 #[test]
 fn a_file_both_producers_report_is_not_double_counted() {
