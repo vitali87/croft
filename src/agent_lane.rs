@@ -30,6 +30,13 @@ pub struct LaneFile {
     /// Content hash when the user last marked it reviewed; `None` until the
     /// first review, which is what makes a newly-touched file unreviewed.
     pub reviewed_hash: Option<u64>,
+    /// Milliseconds of the local-history snapshot holding the content that
+    /// became the baseline, so the row can be DIFFED against what the user
+    /// approved rather than only compared to it (#345). `None` when the
+    /// snapshot could not be taken — the store is best-effort, and a row
+    /// with no anchor refuses the diff rather than showing one against a
+    /// baseline it cannot name.
+    pub reviewed_millis: Option<u64>,
     /// Content hash at the most recent attributed write.
     pub current_hash: u64,
     /// How many attributed writes have landed since the last review.
@@ -200,6 +207,7 @@ impl AgentLedger {
                         LaneFile {
                             path: path.to_path_buf(),
                             reviewed_hash: None,
+                            reviewed_millis: None,
                             current_hash: hash,
                             writes_since_review: 1,
                             last_write_seq: seq,
@@ -322,7 +330,18 @@ impl AgentLedger {
     /// hash now, which may differ from the last attributed write if the
     /// user edited it themselves in between — reviewing means "I have seen
     /// what is on disk", not "I have seen what the agent last wrote".
-    pub fn mark_reviewed(&mut self, agent: &str, path: &Path, current: u64) -> bool {
+    ///
+    /// `snapshot_millis` anchors WHICH local-history snapshot holds that
+    /// content, so the row can later be diffed against it. `None` is a
+    /// legitimate outcome, not an error: the store is best-effort, and a row
+    /// without an anchor is still reviewed — it just cannot show a diff.
+    pub fn mark_reviewed(
+        &mut self,
+        agent: &str,
+        path: &Path,
+        current: u64,
+        snapshot_millis: Option<u64>,
+    ) -> bool {
         let Some(lane) = self.lanes.get_mut(agent) else {
             return false;
         };
@@ -330,14 +349,16 @@ impl AgentLedger {
             return false;
         };
         entry.reviewed_hash = Some(current);
+        entry.reviewed_millis = snapshot_millis;
         entry.current_hash = current;
         entry.writes_since_review = 0;
         self.settle_if_empty();
         true
     }
 
-    /// Mark every file in one lane reviewed, using `read` to see each
-    /// file's current content.
+    /// Mark every file in one lane reviewed, using `read` to see each file's
+    /// current content and, in the same call, the local-history snapshot
+    /// holding exactly those bytes.
     ///
     /// Returns `(reviewed, dropped)`: rows whose current content became the
     /// baseline, and rows removed because the file is gone. They are counted
@@ -346,7 +367,7 @@ impl AgentLedger {
     pub fn mark_lane_reviewed(
         &mut self,
         agent: &str,
-        read: impl Fn(&Path) -> Baseline,
+        read: impl Fn(&Path) -> (Baseline, Option<u64>),
     ) -> (usize, usize) {
         let Some(lane) = self.lanes.get_mut(agent) else {
             return (0, 0);
@@ -357,9 +378,16 @@ impl AgentLedger {
             if !entry.unreviewed() {
                 continue;
             }
-            match read(&entry.path) {
+            // One call per row returns both, from ONE read of the file: a
+            // second read could see different bytes, and the baseline hash
+            // would then describe content the anchor does not hold. Per row,
+            // never once for the lane - a snapshot that failed to record must
+            // not inherit a sibling's anchor.
+            let (baseline, snapshot_millis) = read(&entry.path);
+            match baseline {
                 Baseline::Hash(current) => {
                     entry.reviewed_hash = Some(current);
+                    entry.reviewed_millis = snapshot_millis;
                     entry.current_hash = current;
                     entry.writes_since_review = 0;
                     cleared += 1;
@@ -467,7 +495,7 @@ mod tests {
 
         // Reviewing one clears just that row, and it leaves the lane's
         // ordering with the unreviewed file first.
-        assert!(led.mark_reviewed("claude", &p("/w/src/a.rs"), 1));
+        assert!(led.mark_reviewed("claude", &p("/w/src/a.rs"), 1, None));
         assert_eq!(led.unreviewed_count("claude"), 1);
         assert!(!led.is_unreviewed(&p("/w/src/a.rs")));
         let rows = led.lane("claude");
@@ -482,7 +510,7 @@ mod tests {
         assert_eq!(led.unreviewed_count("claude"), 2);
 
         // A write that restores the reviewed content does NOT re-queue it.
-        led.mark_reviewed("claude", &p("/w/src/a.rs"), 99);
+        led.mark_reviewed("claude", &p("/w/src/a.rs"), 99, None);
         assert!(!led.record_write(&p("/w/src/a.rs"), 99, &claude));
         assert!(!led.is_unreviewed(&p("/w/src/a.rs")));
     }
@@ -508,7 +536,7 @@ mod tests {
 
         // Reviewing it in one lane leaves the other's row standing: each
         // agent's queue is its own.
-        led.mark_reviewed("claude", &p("/w/x.rs"), 7);
+        led.mark_reviewed("claude", &p("/w/x.rs"), 7, None);
         assert_eq!(led.unreviewed_count("claude"), 0);
         assert_eq!(led.unreviewed_count("codex"), 1);
         assert_eq!(led.total_unreviewed(), 1, "one row left");
@@ -559,9 +587,9 @@ mod tests {
         // `gone.rs` no longer exists.
         let (cleared, dropped) = led.mark_lane_reviewed("claude", |path| {
             if path == p("/w/a.rs") {
-                Baseline::Hash(42)
+                (Baseline::Hash(42), None)
             } else {
-                Baseline::Gone
+                (Baseline::Gone, None)
             }
         });
         assert_eq!(
@@ -592,6 +620,75 @@ mod tests {
         assert!(!led.forget("claude"));
     }
 
+    /// Reviewing records WHICH snapshot became the baseline, not just its
+    /// hash. A hash answers "changed?"; diffing the row against what the
+    /// user actually approved needs the content, and the snapshot millis is
+    /// the anchor that retrieves it (#345).
+    #[test]
+    fn reviewing_records_the_snapshot_it_baselined_against() {
+        let mut led = AgentLedger::new();
+        let agent = vec![String::from("claude")];
+        led.record_write(&p("/w/a.rs"), 1, &agent);
+
+        // Before any review there is no baseline to diff against. Paired
+        // with the positive case below so this cannot pass vacuously.
+        let row = led.lane("claude")[0];
+        assert_eq!(row.reviewed_millis, None, "nothing reviewed yet");
+
+        assert!(led.mark_reviewed("claude", &p("/w/a.rs"), 42, Some(1_700)));
+        let row = led.lane("claude")[0];
+        assert_eq!(
+            row.reviewed_millis,
+            Some(1_700),
+            "the snapshot that became the baseline is retrievable later"
+        );
+        assert_eq!(row.reviewed_hash, Some(42));
+
+        // A later write keeps the anchor: the row is unreviewed AGAINST that
+        // snapshot, which is exactly what the diff needs.
+        led.record_write(&p("/w/a.rs"), 43, &agent);
+        let row = led.lane("claude")[0];
+        assert!(row.unreviewed());
+        assert_eq!(
+            row.reviewed_millis,
+            Some(1_700),
+            "a new write does not erase the baseline it is measured against"
+        );
+    }
+
+    /// A whole-lane review records each row's snapshot too, and a row whose
+    /// content could not be snapshotted records none rather than borrowing
+    /// another row's — a diff against the wrong baseline is worse than none.
+    #[test]
+    fn marking_a_whole_lane_records_each_rows_snapshot() {
+        let mut led = AgentLedger::new();
+        let agent = vec![String::from("claude")];
+        led.record_write(&p("/w/a.rs"), 1, &agent);
+        led.record_write(&p("/w/b.rs"), 2, &agent);
+
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |path| {
+            if path == p("/w/a.rs") {
+                (Baseline::Hash(10), Some(2_500))
+            } else {
+                // Snapshotting `b.rs` failed (the store is best-effort), so
+                // it gets a baseline hash but no retrievable content.
+                (Baseline::Hash(20), None)
+            }
+        });
+        assert_eq!((cleared, dropped), (2, 0));
+
+        let rows = led.lane("claude");
+        let a = rows.iter().find(|f| f.path == p("/w/a.rs")).unwrap();
+        let b = rows.iter().find(|f| f.path == p("/w/b.rs")).unwrap();
+        assert_eq!(a.reviewed_millis, Some(2_500));
+        assert_eq!(
+            b.reviewed_millis, None,
+            "a row that could not be snapshotted records no anchor rather \
+             than inheriting the other row's"
+        );
+        assert_eq!(b.reviewed_hash, Some(20), "it is still reviewed");
+    }
+
     /// The queue is ordered by RECENCY, not by path: the file the agent
     /// just wrote belongs at the top even when its name sorts last.
     #[test]
@@ -612,7 +709,7 @@ mod tests {
 
         // Reviewed rows sink below every unreviewed one regardless of when
         // they were written.
-        led.mark_reviewed("claude", &p("/w/a.rs"), 3);
+        led.mark_reviewed("claude", &p("/w/a.rs"), 3, None);
         assert_eq!(led.lane("claude")[0].path, p("/w/z.rs"));
         assert_eq!(led.lane("claude")[1].path, p("/w/a.rs"));
     }
@@ -671,7 +768,7 @@ mod tests {
                     .find(|x| x.path == f)
                     .unwrap()
                     .current_hash;
-                led.mark_reviewed("claude", &f, h);
+                led.mark_reviewed("claude", &f, h, None);
             }
         }
         let groups = led.lane_by_root("claude", &roots);
@@ -722,14 +819,14 @@ mod tests {
         // Reviewing SOME of the queue keeps the doubt: a dropped write may
         // be among what is left.
         led.record_write(&p("/w/b.rs"), 2, &a);
-        led.mark_reviewed("claude", &p("/w/a.rs"), 1);
+        led.mark_reviewed("claude", &p("/w/a.rs"), 1, None);
         assert!(led.may_be_incomplete());
 
         // Emptying it through mark_reviewed ALONE must settle it too: the
         // previous version of this test emptied the queue with
         // mark_lane_reviewed, so it passed whether or not mark_reviewed
         // cleared the flag.
-        led.mark_reviewed("claude", &p("/w/b.rs"), 2);
+        led.mark_reviewed("claude", &p("/w/b.rs"), 2, None);
         assert!(
             !led.may_be_incomplete(),
             "reviewing the last queued file one-by-one settles the doubt too"
@@ -763,7 +860,7 @@ mod tests {
         led.record_write(&p("/w/d.rs"), 4, &a);
 
         // Emptying it settles the question: nothing is left to be wrong.
-        let (reviewed, _) = led.mark_lane_reviewed("claude", |_| Baseline::Hash(4));
+        let (reviewed, _) = led.mark_lane_reviewed("claude", |_| (Baseline::Hash(4), None));
         assert_eq!(reviewed, 1);
         assert!(
             !led.may_be_incomplete(),
@@ -782,7 +879,7 @@ mod tests {
         assert_eq!(led.unreviewed_count("claude"), 1);
 
         // The read fails this instant, whatever the disk holds.
-        let (cleared, dropped) = led.mark_lane_reviewed("claude", |_| Baseline::Unreadable);
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |_| (Baseline::Unreadable, None));
         assert_eq!(
             (cleared, dropped),
             (0, 0),
@@ -796,7 +893,7 @@ mod tests {
 
         // And it is still recoverable once the read succeeds.
         assert_eq!(
-            led.mark_lane_reviewed("claude", |_| Baseline::Hash(555)),
+            led.mark_lane_reviewed("claude", |_| (Baseline::Hash(555), None)),
             (1, 0)
         );
         assert_eq!(led.unreviewed_count("claude"), 0);
