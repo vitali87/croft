@@ -151,10 +151,26 @@ pub struct Compound {
     /// requests nothing, and parking a launch behind a task named `""` would
     /// invent work the file never asked for.
     pub pre_launch_task: Option<String>,
-    /// Keys croft does not honour that this compound ACTUALLY ASKS FOR:
-    /// a non-empty `presentation`.
-    /// A key present but requesting nothing (`null`, `""`, `{}`) is not
-    /// recorded — croft delivers that behaviour by doing nothing.
+    /// `presentation.hidden` (#318): the compound asks not to be listed.
+    ///
+    /// Split out of `unsupported_keys` because it needs no grouping concept
+    /// -- it is a filter on the picker's rows, which croft can honour today,
+    /// where `group` and `order` want an ordering the picker does not have.
+    /// A compound asking ONLY to be hidden is therefore fully served and
+    /// launches like any other; one that also asks for `group` or `order`
+    /// still records those as unsupported.
+    pub hidden: bool,
+    /// Keys croft does not honour that this compound ACTUALLY ASKS FOR,
+    /// named with their parent so they can be found in the file:
+    /// `presentation.group`, `presentation.order`, and the malformed shapes
+    /// `presentation` (present but not an object) and `presentation.hidden`
+    /// (present but not a boolean).
+    ///
+    /// A key present but requesting nothing (`null`, `""`, and an empty
+    /// `presentation` object) is not recorded — croft delivers that
+    /// behaviour by doing nothing. A MALFORMED one is recorded rather than
+    /// ignored: `{"hidden": "true"}` is the likely typo here, and launching
+    /// it unhidden with no signal is worse than the refusal it replaces.
     ///
     /// `stopAll` is deliberately absent at either value: it decides whether
     /// ending one session ends the others, which is meaningless for the
@@ -237,10 +253,49 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // naming it as a reason to refuse would report a limitation croft
             // no longer has. Its VALUE is captured instead - the key alone was
             // enough to refuse and is not enough to run anything.
-            let unsupported_keys: Vec<&'static str> = ["presentation"]
-                .into_iter()
-                .filter(|k| asks_for_something(k))
-                .collect();
+            // `presentation` is no longer refused wholesale (#318). Only the
+            // parts croft cannot deliver are: `hidden` is a row filter and is
+            // honoured below, while `group` and `order` want a picker
+            // ordering that does not exist. Testing the SUB-KEYS rather than
+            // the parent means `{"hidden": true}` alone launches instead of
+            // being refused for a capability it never asked for.
+            let presentation = obj.get("presentation").and_then(|v| v.as_object());
+            let hidden = presentation
+                .and_then(|p| p.get("hidden"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            // Named WITH the parent: "order" alone is a generic word, and a
+            // refusal telling the user to "remove that key" would read as
+            // deleting the whole `presentation` block -- taking a working
+            // `hidden` with it, which is the outcome this split exists to
+            // avoid. The path is what they can find in the file.
+            //
+            // A `presentation` that is present but NOT an object, or a
+            // `hidden` that is not a bool, keeps refusing: on main those
+            // shapes refused and the user found out, and silently launching
+            // a compound whose `{"hidden": "true"}` typo did nothing is a
+            // worse answer than the refusal it replaces.
+            let mut unsupported_keys: Vec<&'static str> = Vec::new();
+            if asks_for_something("presentation") && presentation.is_none() {
+                unsupported_keys.push("presentation");
+            }
+            for (key, path) in [
+                ("group", "presentation.group"),
+                ("order", "presentation.order"),
+            ] {
+                if presentation
+                    .and_then(|p| p.get(key))
+                    .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+                {
+                    unsupported_keys.push(path);
+                }
+            }
+            if presentation
+                .and_then(|p| p.get("hidden"))
+                .is_some_and(|v| !v.is_null() && !v.is_boolean())
+            {
+                unsupported_keys.push("presentation.hidden");
+            }
             let pre_launch_task = asks_for_something("preLaunchTask")
                 .then(|| obj.get("preLaunchTask").and_then(|v| v.as_str()))
                 .flatten()
@@ -250,6 +305,7 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
                 configurations,
                 source,
                 pre_launch_task,
+                hidden,
                 unsupported_keys,
             })
         })
@@ -1266,12 +1322,13 @@ mod tests {
         );
 
         // The positive control: without it, six empties could equally mean the
-        // detection never records anything at all. `presentation` carries it
-        // now that #318 honours `preLaunchTask` - a key croft DOES honour is
-        // no longer a reason to refuse, so it cannot serve as the control.
+        // detection never records anything at all. `presentation.order`
+        // carries it now - `preLaunchTask` and `presentation.hidden` are both
+        // honoured (#318), so neither can serve as the control, and the list
+        // names the SUB-KEY because that is the granularity croft refuses at.
         assert_eq!(
             by("RealPresentation").unsupported_keys,
-            vec!["presentation"],
+            vec!["presentation.order"],
             "and a key that DOES ask for something is still recorded"
         );
     }
@@ -1314,14 +1371,94 @@ mod tests {
         assert_eq!(by("Nulled").pre_launch_task, None);
         assert_eq!(by("Empty").pre_launch_task, None);
 
-        // The positive control: `presentation` is still unhonoured, so the
-        // refusal path must still have something to fire on.
+        // The positive control: `presentation.order` is still unhonoured, so
+        // the refusal path must still have something to fire on. `hidden` is
+        // honoured now (#318) and would make a vacuous control.
         assert_eq!(
             by("Presents").unsupported_keys,
-            vec!["presentation"],
-            "presentation is still not honoured and must still refuse"
+            vec!["presentation.order"],
+            "presentation.order is still not honoured and must still refuse"
         );
         assert_eq!(by("Presents").pre_launch_task, None);
+    }
+
+    #[test]
+    fn presentation_hidden_is_honoured_while_group_and_order_are_not() {
+        let text = r#"{
+          "compounds": [
+            { "name": "Hid",   "configurations": ["A"], "presentation": { "hidden": true } },
+            { "name": "Shown", "configurations": ["A"], "presentation": { "hidden": false } },
+            { "name": "Grouped", "configurations": ["A"], "presentation": { "group": "g" } },
+            { "name": "Ordered", "configurations": ["A"], "presentation": { "order": 2 } },
+            { "name": "Both",  "configurations": ["A"],
+              "presentation": { "hidden": true, "order": 1 } },
+            { "name": "Empty", "configurations": ["A"], "presentation": {} }
+          ]
+        }"#;
+        let cs = parse_compounds(text, "test");
+        let by = |n: &str| cs.iter().find(|c| c.name == n).expect("compound present");
+
+        assert!(by("Hid").hidden, "hidden: true asks not to be listed");
+        assert!(
+            !by("Shown").hidden,
+            "hidden: false is the default, spelled out"
+        );
+        assert!(
+            !by("Empty").hidden,
+            "an empty presentation asks for nothing"
+        );
+
+        // A compound asking ONLY to be hidden is fully served, so it must not
+        // be refused for a capability it never requested.
+        assert!(
+            by("Hid").unsupported_keys.is_empty(),
+            "hidden alone is honoured, so nothing is unsupported: {:?}",
+            by("Hid").unsupported_keys
+        );
+        assert!(
+            by("Empty").unsupported_keys.is_empty(),
+            "an empty presentation refuses nothing"
+        );
+
+        // `group` and `order` still want a picker ordering croft does not
+        // have, so they keep refusing -- and `Both` shows the two halves are
+        // independent: honoured and refused at once.
+        assert_eq!(by("Grouped").unsupported_keys, vec!["presentation.group"]);
+        assert_eq!(by("Ordered").unsupported_keys, vec!["presentation.order"]);
+        // A malformed shape must keep refusing. On main these refused and the
+        // user found out; silently launching a compound whose typo'd
+        // `{"hidden": "true"}` did nothing would be a regression dressed as
+        // a feature.
+        let bad = parse_compounds(
+            r#"{
+              "compounds": [
+                { "name": "QuotedBool", "configurations": ["A"],
+                  "presentation": { "hidden": "true" } },
+                { "name": "NotAnObject", "configurations": ["A"],
+                  "presentation": "grouped" }
+              ]
+            }"#,
+            "test",
+        );
+        let bad_by = |n: &str| bad.iter().find(|c| c.name == n).expect("present");
+        assert!(!bad_by("QuotedBool").hidden, "a quoted bool is not a bool");
+        assert_eq!(
+            bad_by("QuotedBool").unsupported_keys,
+            vec!["presentation.hidden"],
+            "and it refuses rather than launching unhidden in silence"
+        );
+        assert_eq!(
+            bad_by("NotAnObject").unsupported_keys,
+            vec!["presentation"],
+            "a non-object presentation refuses under its own name"
+        );
+
+        assert!(by("Both").hidden, "Both asks to be hidden");
+        assert_eq!(
+            by("Both").unsupported_keys,
+            vec!["presentation.order"],
+            "and is still refused for the half croft cannot do"
+        );
     }
 
     /// A compound resolves to its members in the order written, so the picker
