@@ -41794,6 +41794,30 @@ fn a_symbol_tab_does_not_follow_you_into_another_file() {
         "the symbol tab must not survive into a different file"
     );
 
+    // And through a path that never reaches `open_at`. Search hits, a
+    // quick-open pick with no line hint, tree clicks and plain tab switching
+    // all open a file directly - `open_at` looked like the chokepoint and
+    // covers ten of nineteen such sites.
+    app.editor.open(&a).unwrap();
+    app.symbol_tab = Some((
+        String::from("fn one"),
+        a.clone(),
+        crate::symbol_range::SymbolRange::new(0, 27),
+    ));
+    // `open_search_hit` is one of the nine that bypass `open_at`; it calls
+    // `sync_open_file_poll_mtime` directly, which is where the guard now
+    // lives. Driving the real navigation rather than `editor.open` alone,
+    // which is the raw editor call and not a navigation path at all.
+    app.open_search_hit(&crate::widgets::search::SearchHit {
+        path: b.clone(),
+        line_no: 1,
+        line_text: String::from("fn two() {}"),
+    });
+    assert!(
+        app.symbol_tab.is_none(),
+        "a search-hit jump must drop it too, not only the open_at route"
+    );
+
     // Paired positive: reopening a.rs and a tab there still tracks edits, so
     // the clear above is scoped to a file CHANGE rather than firing always.
     // Navigating WITHIN the same file must NOT clear it: a go-to-definition
@@ -41816,6 +41840,27 @@ fn a_symbol_tab_does_not_follow_you_into_another_file() {
         app.symbol_tab.is_some(),
         "re-opening the tab's OWN file must not close it"
     );
+    // A DIFFERENT SPELLING of the same file must not clear it. On macOS the
+    // workspace under /tmp canonicalises to /private/tmp, and
+    // `go_to_definition` feeds paths from the server's realpath-resolved
+    // URI while the tab stored whatever the user opened - so a raw `!=`
+    // closes the tab on a jump that never left the file. The old test could
+    // not catch this: it passed the same spelling on both sides, the one
+    // case where a raw comparison is always right.
+    // And the same-file case must run the guard with a tab whose stored path
+    // is the one the editor is about to show, so the early return is what
+    // spares it rather than an accident of ordering.
+    app.symbol_tab = Some((
+        String::from("fn one"),
+        a.clone(),
+        crate::symbol_range::SymbolRange::new(11, 27),
+    ));
+    app.open_at_utf16(&a, 0, 0).unwrap();
+    assert!(
+        app.symbol_tab.is_some(),
+        "re-opening the tab's own file must not close it"
+    );
+
     app.follow_symbol_tab_edit(0, 0, 4);
     let (_, _, range) = app
         .symbol_tab

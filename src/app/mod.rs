@@ -6158,6 +6158,44 @@ impl App {
     fn sync_open_file_poll_mtime(&mut self) {
         let paths = self.open_tab_paths();
         self.fs_watch.sync_open_file_mtime(&paths);
+        self.drop_symbol_tab_if_file_changed();
+    }
+
+    /// Close a symbol tab once the editor is showing a different file (#369).
+    ///
+    /// The range is BYTE offsets into ONE buffer, so it cannot survive the
+    /// move: `follow_symbol_tab_edit` would apply the new file's edits
+    /// against the old file's offsets and walk the range somewhere
+    /// meaningless rather than reporting `Gone`.
+    ///
+    /// Keyed on the ACTIVE path after the change, not on a path passed in.
+    /// `open_at` looked like the chokepoint and is not - search hits, a
+    /// quick-open pick with no line hint, file-tree clicks, reopen-closed-tab
+    /// and plain `editor.select` all reach another file without it, and
+    /// `select` carries no path a guard could inspect. Every one of those
+    /// paths does reach `sync_open_file_poll_mtime`.
+    ///
+    /// A plain comparison is enough, and a canonicalising fallback was tried
+    /// and removed. `go_to_definition` does arrive with the server's
+    /// realpath-resolved URI while the tab stored whatever the user opened -
+    /// but `open_preview` resolves through `find_tab_matching`, which
+    /// canonicalises, so it selects the ALREADY-OPEN tab and `editor.path`
+    /// keeps its original spelling. The two sides therefore cannot diverge
+    /// here, and a canonicalising branch was unreachable: three attempts to
+    /// write a test that entered it all failed, and a mutation deleting it
+    /// survived, which is what proved it dead rather than merely untested.
+    fn drop_symbol_tab_if_file_changed(&mut self) {
+        let Some((_, tab_path, _)) = self.symbol_tab.as_ref() else {
+            return;
+        };
+        let Some(active) = self.editor.path.as_deref() else {
+            // No file open at all: nothing for the range to describe.
+            self.symbol_tab = None;
+            return;
+        };
+        if tab_path.as_path() != active {
+            self.symbol_tab = None;
+        }
     }
 
     /// Every file backing an open tab, across all editor groups. The poll
@@ -10761,21 +10799,6 @@ impl App {
     fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
         self.hover_popup = None;
         self.hover_diagnostic = None;
-        // A symbol tab's range is BYTE offsets into ONE buffer (#369), so it
-        // cannot survive a move to a different file: `follow_symbol_tab_edit`
-        // would then apply the new file's edits against the old file's
-        // offsets and walk the range somewhere meaningless rather than
-        // reporting `Gone`. Same reason the hover state above is dropped -
-        // per-file state does not travel. Cleared here rather than at each
-        // call site because `open_at` is the common path for all ten.
-        //
-        // Only on a CHANGE: reopening the file the tab belongs to is
-        // ordinary (go-to-definition within one file, a Back jump), and
-        // clearing then would close the tab for navigation that never left
-        // it.
-        if self.symbol_tab.as_ref().is_some_and(|(_, p, _)| p != path) {
-            self.symbol_tab = None;
-        }
         self.editor.open_preview(path)?;
         self.sync_open_file_poll_mtime();
         let row = row.min(self.editor.lines.len().saturating_sub(1));
