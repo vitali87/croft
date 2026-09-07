@@ -42102,6 +42102,85 @@ fn folding_a_pane_hands_focus_to_its_neighbour_not_to_the_front_of_the_row() {
     );
 }
 
+/// A post-draw overlay whose rect does not fit the screen is not emitted
+/// (#513). The flush block writes with absolute CUP straight to stdout,
+/// so an out-of-range origin cannot panic and ratatui cannot repair it --
+/// the payload has to be refused before it is written.
+#[test]
+fn an_overlay_past_the_screen_edge_is_refused_before_it_is_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Inside the screen: emittable.
+    assert!(
+        app.overlay_fits_on_screen(0, 0, 80, 24),
+        "a payload filling the screen exactly must be allowed"
+    );
+    assert!(app.overlay_fits_on_screen(10, 5, 20, 10), "well inside");
+
+    // Past either edge: refused. These are the shapes a stale rect makes --
+    // the pre-maximize column of a pane that is now narrower, or a row
+    // index from a taller layout.
+    assert!(
+        !app.overlay_fits_on_screen(70, 0, 20, 5),
+        "past the right edge (70+20 > 80)"
+    );
+    assert!(
+        !app.overlay_fits_on_screen(0, 20, 10, 10),
+        "past the bottom edge (20+10 > 24)"
+    );
+    assert!(
+        !app.overlay_fits_on_screen(u16::MAX - 1, 0, 4, 4),
+        "a wild origin must saturate rather than wrap into range"
+    );
+
+    // A zero-sized payload has nothing to place. Refused rather than
+    // trivially in bounds, so a cleared rect cannot slip a bare cursor
+    // park through.
+    assert!(!app.overlay_fits_on_screen(0, 0, 0, 5), "zero width");
+    assert!(!app.overlay_fits_on_screen(0, 0, 5, 0), "zero height");
+}
+
+/// Every raw-CUP writer in the post-draw block is guarded, not just the
+/// ones that had a reported failure (#513). The block's six writers share
+/// one hazard -- an absolute-CUP write ratatui cannot repair -- so a guard
+/// on some of them leaves the same class open at the others. This counts
+/// the call sites rather than exercising each, which is crude but is what
+/// catches a SEVENTH writer being added later without one.
+#[test]
+fn every_post_draw_overlay_writer_checks_the_screen_bound() {
+    let src = include_str!("mod.rs");
+    let guards = src.matches("app.overlay_fits_on_screen(").count();
+    assert_eq!(
+        guards, 5,
+        "expected the five payload writers in the post-draw block to be \
+         guarded (editor split slots share one call site, plus terminal, \
+         markdown, minimap, welcome); the activity-bar writer calls \
+         `self.overlay_fits_on_screen` from inside its own method. A \
+         change here means a writer was added or removed - guard it."
+    );
+    assert!(
+        src.contains("if !self.overlay_fits_on_screen(*x, *y, 1, 1)"),
+        "the activity-bar writer keeps its own guard"
+    );
+}
+
+/// Before any frame is drawn there is no screen to land on, so nothing is
+/// emittable (#513). Guards the window between startup and the first
+/// render, where `last_frame_area` is still zeroed.
+#[test]
+fn no_overlay_is_emittable_before_the_first_frame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        !app.overlay_fits_on_screen(0, 0, 1, 1),
+        "no frame drawn yet: a 1x1 payload at the origin still has no screen"
+    );
+}
+
 #[test]
 fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
     // The two gestures are orthogonal: entering maximize does not clear the

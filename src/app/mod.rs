@@ -5931,6 +5931,22 @@ impl App {
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
         for ((x, y), seq) in &overlays {
+            // Same screen bound as the image writers (#513): a raw
+            // absolute-CUP write that ratatui cannot repair, so the origin
+            // is checked before it is used.
+            //
+            // 1x1 is NARROWER than some payloads here, and knowingly so.
+            // `pending_activity_image_overlays` discards each block's
+            // `Rect` and returns only its origin, and a count badge is 2-3
+            // cells wide (`count_badge_cells_w`), so a badge whose left
+            // edge is on screen and right edge is not would pass this.
+            // Not reachable today -- the badges anchor to the left-hand
+            // activity bar -- and making it exact means returning the
+            // `Rect` from that function, which is a wider change than this
+            // guard. Recorded rather than left to be rediscovered.
+            if !self.overlay_fits_on_screen(*x, *y, 1, 1) {
+                continue;
+            }
             let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); // 1-based
             let _ = out.write_all(seq.as_bytes());
         }
@@ -5941,6 +5957,52 @@ impl App {
         let _ = out.flush();
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
+    }
+
+    /// Whether a post-draw overlay at this cell rect may be emitted (#513).
+    ///
+    /// The flush block below writes with absolute CUP straight to stdout,
+    /// after ratatui's diff. Two properties make a wrong origin dangerous
+    /// rather than merely wrong: it is a raw write, not a buffer index, so
+    /// an out-of-range origin cannot panic the way `Buffer` would; and
+    /// ratatui has no record of the cells it touched, so nothing repairs
+    /// them on the next frame. The corruption persists instead of clearing
+    /// on repaint, which is what #510 looked like from the outside.
+    ///
+    /// So the payload is checked against the screen at EMIT time rather
+    /// than trusting whichever cached rect produced the layout. Every
+    /// writer in the block goes through it, which is the part #512's shape
+    /// could not give: that fixed the terminal carrier by clearing its
+    /// stored rect, but each other writer keeps its own rect with its own
+    /// lifecycle, so every future site a frame can decline to paint is one
+    /// more place to remember the clear.
+    ///
+    /// What this does NOT do, stated plainly because the bound is easy to
+    /// oversell: it removes OFF-SCREEN writes only. It is a screen bound,
+    /// not the owning widget's rect, so an overlay anchored on a stale rect
+    /// that still lands somewhere on screen passes it untouched -- and that
+    /// is the case #510 actually exhibited, a terminal image painted over a
+    /// sibling pane, the sidebar and the status bar, all of them mid-screen
+    /// (#512 records the landing sites). So this does not subsume #512 and
+    /// does not close #513's class; it removes the unbounded half, where a
+    /// wild origin can write anywhere in the terminal.
+    ///
+    /// The bound is the screen because the emitter does not know which
+    /// widget a payload belongs to. Making it exact needs each payload to
+    /// carry its owning rect, which is the wider change #513 describes.
+    fn overlay_fits_on_screen(&self, cell_x: u16, cell_y: u16, cell_w: u16, cell_h: u16) -> bool {
+        let area = self.last_frame_area;
+        if area.width == 0 || area.height == 0 {
+            // No frame has been drawn yet, so there is no screen to land on.
+            return false;
+        }
+        // A zero-sized payload has nothing to place; treat it as unemittable
+        // rather than trivially in-bounds, so a cleared rect cannot slip a
+        // bare cursor park through.
+        if cell_w == 0 || cell_h == 0 {
+            return false;
+        }
+        cell_x.saturating_add(cell_w) <= area.width && cell_y.saturating_add(cell_h) <= area.height
     }
 
     /// Reset the blink phase so the caret is solidly visible for the next
@@ -48323,7 +48385,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // per editor split column (0 = left, 1 = right); when not
             // split only slot 0 ever has a payload.
             for side in 0..2 {
-                if let Some((osc, layout)) = app.editor_image_payload(side) {
+                if let Some((osc, layout)) = app.editor_image_payload(side)
+                    && app.overlay_fits_on_screen(
+                        layout.cell_x,
+                        layout.cell_y,
+                        layout.cell_w,
+                        layout.cell_h,
+                    )
+                {
                     use std::io::Write;
                     let mut out = stdout();
                     let cursor_on = app.cursor_should_be_visible();
@@ -48340,7 +48409,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             // Terminal-pane inline image (captured imgcat output): same
             // bake-once / emit-each-frame overlay, anchored to its grid row.
-            if let Some((osc, layout)) = app.terminal_image_payload() {
+            if let Some((osc, layout)) = app.terminal_image_payload()
+                && app.overlay_fits_on_screen(
+                    layout.cell_x,
+                    layout.cell_y,
+                    layout.cell_w,
+                    layout.cell_h,
+                )
+            {
                 use std::io::Write;
                 let mut out = stdout();
                 let cursor_on = app.cursor_should_be_visible();
@@ -48356,7 +48432,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             // Markdown-preview inline image (#176): same bake-once /
             // emit-each-frame overlay, anchored at its reserved rows.
-            if let Some((osc, layout)) = app.markdown_image_payload() {
+            if let Some((osc, layout)) = app.markdown_image_payload()
+                && app.overlay_fits_on_screen(
+                    layout.cell_x,
+                    layout.cell_y,
+                    layout.cell_w,
+                    layout.cell_h,
+                )
+            {
                 use std::io::Write;
                 let mut out = stdout();
                 let cursor_on = app.cursor_should_be_visible();
@@ -48372,7 +48455,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             // Editor minimap: same bake-once / emit-each-frame overlay, painted
             // after ratatui's diff so the raster lands on the strip cells.
-            if let Some((osc, layout)) = app.minimap_image_payload() {
+            if let Some((osc, layout)) = app.minimap_image_payload()
+                && app.overlay_fits_on_screen(
+                    layout.cell_x,
+                    layout.cell_y,
+                    layout.cell_w,
+                    layout.cell_h,
+                )
+            {
                 use std::io::Write;
                 let mut out = stdout();
                 let cursor_on = app.cursor_should_be_visible();
@@ -48399,7 +48489,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
-            if let Some((img, layout)) = app.welcome_image_emit_payload() {
+            if let Some((img, layout)) = app.welcome_image_emit_payload()
+                && app.overlay_fits_on_screen(
+                    layout.cell_x,
+                    layout.cell_y,
+                    layout.cell_w,
+                    layout.cell_h,
+                )
+            {
                 use std::io::Write;
                 let mut out = stdout();
                 let cursor_on = app.cursor_should_be_visible();
