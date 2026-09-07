@@ -1231,7 +1231,6 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
         assert_eq!(parse_pdfinfo_pages(sample), Some(12));
     }
 
-    #[test]
     /// The budget must actually fire (#493). Without a test that HANGS a
     /// child, the bound is only shown on the path where the child exits on
     /// its own - which is the path that never needed bounding.
