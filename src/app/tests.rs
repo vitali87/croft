@@ -37947,6 +37947,91 @@ fn entering_zen_mode_cancels_a_pending_collapse_rather_than_deferring_it() {
     assert!(app.show_tree, "so the restored sidebar stays up");
 }
 
+/// "Problems: Check Whole Project" puts a whole-project checker's findings
+/// into PROBLEMS for files nobody opened, and a re-run REPLACES them (#256).
+///
+/// Replacement is the half worth pinning. A checker that reports two errors
+/// and then one after a fix must leave one row, not three: the panel is a
+/// current state, and a stale row sends the reader to a line that is now
+/// correct. `apply_build_scan` already owns that semantics per producer, so
+/// the project check gets its own producer id rather than borrowing a
+/// pane's: a pane's next command would otherwise wipe the sweep's rows, and
+/// the sweep would wipe the pane's.
+#[test]
+fn a_project_check_reports_unopened_files_and_replaces_on_rerun() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.ts");
+    let b = tmp.path().join("b.ts");
+    std::fs::write(&a, "export const x: string = 1;\n").unwrap();
+    std::fs::write(&b, "export const y: string = 2;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Neither file is opened: the sweep is exactly for files with no buffer.
+    assert!(app.editor.path.is_none(), "no file is open");
+
+    // Two errors, in tsc's parenthesised form.
+    app.ingest_project_check(
+        None,
+        "a.ts(1,14): error TS2322: Type 'number' is not assignable to type 'string'.\n\
+         b.ts(1,14): error TS2322: Type 'number' is not assignable to type 'string'.\n",
+    );
+    app.rebuild_problems();
+    let paths: Vec<_> = app
+        .problems
+        .groups()
+        .iter()
+        .map(|g| g.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&a) && paths.contains(&b),
+        "both unopened files must reach PROBLEMS, got {paths:?}"
+    );
+
+    // The user fixes b.ts and re-runs: one row, not three.
+    app.ingest_project_check(
+        None,
+        "a.ts(1,14): error TS2322: Type 'number' is not assignable to type 'string'.\n",
+    );
+    app.rebuild_problems();
+    let paths: Vec<_> = app
+        .problems
+        .groups()
+        .iter()
+        .map(|g| g.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&a),
+        "the still-broken file keeps its row, got {paths:?}"
+    );
+    assert!(
+        !paths.contains(&b),
+        "a re-run REPLACES the previous sweep: the fixed file's row must go, \
+         got {paths:?}"
+    );
+
+    // A pane's own build output must not wipe the sweep, which is why the
+    // sweep does not borrow a pane id. Pane 1 reports on its own file.
+    let c = tmp.path().join("c.ts");
+    std::fs::write(&c, "export const z = 3;\n").unwrap();
+    app.apply_build_scan(
+        1,
+        Some(tmp.path()),
+        "tsc",
+        "c.ts(1,1): error TS1005: ';' expected.\n",
+    );
+    app.rebuild_problems();
+    let paths: Vec<_> = app
+        .problems
+        .groups()
+        .iter()
+        .map(|g| g.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&a) && paths.contains(&c),
+        "a pane's build output and the project sweep coexist, got {paths:?}"
+    );
+}
+
 /// #256 step 1: a server that publishes project-wide diagnostics (rust-analyzer
 /// does this from `cargo check`) names files the user never opened. The panel
 /// builds from the diagnostics store rather than from open buffers, so those

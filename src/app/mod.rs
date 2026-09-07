@@ -8114,6 +8114,42 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The producer id for the whole-project check (#256).
+    ///
+    /// `build_diag_files_by_pane` keys a producer's contribution so its next
+    /// run replaces its previous one. Pane uids are allocated from 1 upward
+    /// by an `AtomicU64`, so `u64::MAX` cannot collide with a real pane. The
+    /// sweep needs its OWN id rather than borrowing one: sharing would make a
+    /// pane's next command wipe the sweep's rows, and the sweep wipe the
+    /// pane's.
+    const PROJECT_CHECK_ID: u64 = u64::MAX;
+
+    /// Scan a whole-project checker's output into PROBLEMS (#256).
+    ///
+    /// Routed through `apply_build_scan` rather than a parallel path, so the
+    /// sweep inherits the matcher table (tsc's two output shapes are already
+    /// handled), the relative-path resolution, and the replace-wholesale
+    /// semantics a re-run needs. `cwd` is where the checker ran, which is
+    /// what its relative paths are against; `None` means the workspace root.
+    pub(crate) fn ingest_project_check(&mut self, cwd: Option<&Path>, output: &str) -> bool {
+        let root = self.workspace_root().to_path_buf();
+        let cwd = cwd.unwrap_or(&root).to_path_buf();
+        self.apply_build_scan(Self::PROJECT_CHECK_ID, Some(&cwd), "tsc", output)
+    }
+
+    /// The whole-project check command for this workspace (#256).
+    ///
+    /// `tsc --noEmit` when a `tsconfig.json` sits at the root, which is the
+    /// path VS Code users already take: vtsls exposes project-wide checking
+    /// poorly over LSP, so the pragmatic route is the compiler itself. `None`
+    /// when nothing is recognised - the command then says so rather than
+    /// running a guess.
+    fn project_check_command(root: &Path) -> Option<(&'static str, Vec<&'static str>)> {
+        root.join("tsconfig.json")
+            .is_file()
+            .then_some(("npx", vec!["tsc", "--noEmit"]))
+    }
+
     /// Scan one finished command's output through the build matchers and
     /// install the results (#119). The pane's PREVIOUS contribution is
     /// replaced wholesale — a rebuild that fixed everything clears its old
@@ -8121,7 +8157,13 @@ impl App {
     /// against the command's cwd (falling back to the workspace root);
     /// resolution is lexical, no filesystem probe, so a path the tool
     /// printed oddly still gets a row even if navigation later misses.
-    fn apply_build_scan(&mut self, pane: u64, cwd: Option<&Path>, cmd: &str, output: &str) -> bool {
+    pub(crate) fn apply_build_scan(
+        &mut self,
+        pane: u64,
+        cwd: Option<&Path>,
+        cmd: &str,
+        output: &str,
+    ) -> bool {
         // A watch matcher already published this pane's batch mid-run: the
         // watcher's exit must not overwrite the last cycle with a rescan of
         // its whole history. One skip only — the pane's next command scans.
@@ -34561,6 +34603,47 @@ impl App {
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
+            Cmd::ProblemsCheckProject => {
+                let root = self.workspace_root().to_path_buf();
+                match Self::project_check_command(&root) {
+                    None => {
+                        self.status = String::from(
+                            "No whole-project checker for this workspace (expected tsconfig.json)",
+                        );
+                    }
+                    Some((program, args)) => {
+                        // .output(), never .status(): the checker must not
+                        // inherit croft's TTY, or its diagnostics spray over
+                        // the UI. Same reason as the debug-adapter build.
+                        self.status = format!("Checking the whole project with {program}...");
+                        match std::process::Command::new(program)
+                            .args(&args)
+                            .current_dir(&root)
+                            .output()
+                        {
+                            Err(e) => {
+                                self.status = format!("Could not run {program}: {e}");
+                            }
+                            Ok(out) => {
+                                // tsc reports diagnostics on STDOUT and exits
+                                // non-zero when it finds any, so a failing
+                                // status is the ORDINARY case here and must
+                                // not be treated as an error. Only a spawn
+                                // failure above is one.
+                                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                                self.ingest_project_check(Some(&root), &text);
+                                self.rebuild_problems();
+                                let n = self.problems.total_count();
+                                self.status = match n {
+                                    0 => String::from("Whole-project check: no problems"),
+                                    1 => String::from("Whole-project check: 1 problem"),
+                                    n => format!("Whole-project check: {n} problems"),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             Cmd::ProblemsToggleScope => {
                 self.problems.scope = self.problems.scope.next();
                 let _ = crate::prefs::save_problems_scope(self.problems.scope.to_config());
