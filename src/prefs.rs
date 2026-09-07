@@ -294,6 +294,21 @@ pub struct Prefs {
     /// host, a box you only ever tunnel through. User layers only.
     #[serde(default)]
     pub remote_offer_excluded_hosts: Vec<String>,
+    /// Named sets of SSH hosts for "Terminal: Fleet Run" (#363), so a fleet
+    /// can be named once rather than retyped per run.
+    ///
+    /// User layers only, and for the same reason as the list above: a fleet
+    /// run executes arbitrary text on every host in the set, so a group is a
+    /// list of machines to run commands on. A repo-controlled layer naming
+    /// one could add a production box to a group the user then broadcasts
+    /// to. `WORKSPACE_ALLOWED_KEYS` refuses it, and the refusal is visible
+    /// rather than silent.
+    ///
+    /// Ordered, so the hosts a group names come back in the same order on
+    /// every run: a HashMap would shuffle them, and a fleet comparison is
+    /// read by scanning down the list.
+    #[serde(default)]
+    pub fleet_groups: std::collections::BTreeMap<String, Vec<String>>,
     /// The agent a new worktree lane starts in its pane (#348): the name of
     /// an `agents.json` row (built in: claude, codex, aider, gemini), whose
     /// `launch` line is typed into the lane's fresh shell. Unset, a lane

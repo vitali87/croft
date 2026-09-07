@@ -2841,6 +2841,9 @@ pub struct App {
     remote_offer_disabled: bool,
     /// `remote_offer_excluded_hosts` from prefs (#364).
     remote_offer_excluded: Vec<String>,
+    /// `fleet_groups` from prefs (#363): named host sets a fleet run can
+    /// expand, so a fleet is named once rather than retyped per run.
+    fleet_groups: std::collections::BTreeMap<String, Vec<String>>,
     /// Hosts whose provisioning failed recently (#364), loaded from the
     /// cache file at startup and extended when an install fails.
     remote_offer_refused: crate::remote::RefusedHosts,
@@ -4621,6 +4624,7 @@ impl App {
             ssh_tx,
             remote_offer_disabled: loaded_prefs.disable_remote_offer,
             remote_offer_excluded: loaded_prefs.remote_offer_excluded_hosts.clone(),
+            fleet_groups: loaded_prefs.fleet_groups.clone(),
             remote_offer_refused: crate::remote::load_refused_hosts(
                 &crate::remote::refused_hosts_path(&croft_cache_dir()),
                 std::time::SystemTime::now(),
@@ -25489,7 +25493,9 @@ impl App {
         // a confirmation saying "run on 5 hosts?" asks them to approve a list
         // they cannot see, which is not consent. `*` is how to say "all of
         // them" deliberately.
-        let Some((picked, command)) = crate::fleet::parse_request(command, &known) else {
+        let Some((picked, command)) =
+            crate::fleet::parse_request_with_groups(command, &known, &self.fleet_groups)
+        else {
             self.status = format!(
                 "Fleet run needs 'hosts: command' — e.g. '{}: uptime', or '*: uptime' for all {}",
                 known[0],
@@ -40323,6 +40329,9 @@ impl App {
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
         self.lane_agent = p.lane_agent.clone();
+        // Live like every other pref here (#363): editing a group in
+        // config.json takes effect on the next fleet run without a restart.
+        self.fleet_groups = p.fleet_groups.clone();
         let was_excluded = std::mem::replace(
             &mut self.remote_offer_excluded,
             p.remote_offer_excluded_hosts.clone(),

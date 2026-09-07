@@ -86,7 +86,7 @@ allowlist — appearance and editor/terminal behavior:
 `disable_inline_values`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`.
 
-Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `lane_agent`,
+Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `fleet_groups`, `lane_agent`,
 `mcp_tool_fingerprints`, `host_accents`, `notifications`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.

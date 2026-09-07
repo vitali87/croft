@@ -174,7 +174,25 @@ pub fn fleet_ssh_args(host: &str, command: &str) -> Vec<String> {
 ///
 /// `*` is the explicit way to say "all of them", so the broadcast is still
 /// available to someone who means it.
-pub fn parse_request<'a>(input: &str, known: &'a [String]) -> Option<(Vec<&'a String>, String)> {
+///
+/// A name is looked up as a saved group first and a host second (#363), so a
+/// group named after a host cannot silently shadow it — the group wins, and
+/// naming one after a host is the user's own doing.
+///
+/// Expansion is one level:
+/// a group listing another group's name resolves that entry as a host and
+/// fails the unknown-host check below, rather than recursing. Nesting would
+/// need cycle detection to be safe, and there is no case for it yet.
+///
+/// Every expanded name still goes through the same known-host check as a
+/// typed one. That is the property worth keeping: a group is a shorthand for
+/// hosts croft already knows, never a way to name a machine that is not in
+/// `~/.ssh/config`.
+pub fn parse_request_with_groups<'a>(
+    input: &str,
+    known: &'a [String],
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Option<(Vec<&'a String>, String)> {
     let (spec, command) = input.split_once(':')?;
     let command = command.trim();
     if command.is_empty() {
@@ -186,11 +204,27 @@ pub fn parse_request<'a>(input: &str, known: &'a [String]) -> Option<(Vec<&'a St
     }
     let mut hosts = Vec::new();
     for name in spec.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-        // Only hosts croft actually knows: a typo must not become an ssh
-        // attempt against a hostname the user never configured.
-        let found = known.iter().find(|k| k.eq_ignore_ascii_case(name))?;
-        if !hosts.contains(&found) {
-            hosts.push(found);
+        // A group expands to the names it holds; anything else is one name.
+        let members: Vec<&str> = match groups.iter().find(|(g, _)| g.eq_ignore_ascii_case(name)) {
+            Some((_, members)) => members.iter().map(String::as_str).collect(),
+            None => vec![name],
+        };
+        // A group that resolves to nothing REFUSES rather than contributing
+        // nothing. Silently, `web,db1: cmd` with an empty `web` would run on
+        // db1 alone - the user believes they addressed a fleet and addressed
+        // one box, which is the harm the unknown-host check below exists to
+        // prevent. Every other refusal in this function is loud.
+        if members.is_empty() {
+            return None;
+        }
+        for member in members {
+            // Only hosts croft actually knows: a typo must not become an ssh
+            // attempt against a hostname the user never configured, and a
+            // group cannot smuggle one past that check either.
+            let found = known.iter().find(|k| k.eq_ignore_ascii_case(member))?;
+            if !hosts.contains(&found) {
+                hosts.push(found);
+            }
         }
     }
     (!hosts.is_empty()).then_some((hosts, command.to_string()))
@@ -344,6 +378,123 @@ fn run_one(host: &str, command: &str, timeout: Duration) -> HostResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn groups(pairs: &[(&str, &[&str])]) -> std::collections::BTreeMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(g, m)| {
+                (
+                    (*g).to_string(),
+                    m.iter().map(|h| (*h).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// A saved group expands to its hosts (#363).
+    ///
+    /// The fixture gives the group TWO members out of three known hosts, so
+    /// a bug that expanded to everything - or to nothing and fell back to
+    /// the whole fleet - fails here. Expanding to `known` is the shape `*`
+    /// already has, and is exactly what must not happen by accident.
+    #[test]
+    fn a_saved_group_expands_to_its_hosts_and_only_those() {
+        let known: Vec<String> = ["web1", "web2", "db1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let g = groups(&[("web", &["web1", "web2"])]);
+        let (hosts, cmd) = parse_request_with_groups("web: uname -r", &known, &g).expect("parsed");
+        assert_eq!(
+            hosts.iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+            vec!["web1", "web2"],
+            "the group's members, not the whole fleet"
+        );
+        assert_eq!(cmd, "uname -r");
+    }
+
+    /// The known-host check survives group expansion, which is the safety
+    /// property: a group must be shorthand for hosts croft already knows,
+    /// never a way to name a machine that is not in `~/.ssh/config`.
+    #[test]
+    fn a_group_cannot_smuggle_an_unknown_host_past_the_check() {
+        let known: Vec<String> = ["web1"].iter().map(|s| s.to_string()).collect();
+        let g = groups(&[("web", &["web1", "not-configured"])]);
+        assert!(
+            parse_request_with_groups("web: uname -r", &known, &g).is_none(),
+            "an unknown member refuses the whole request rather than running on the rest"
+        );
+        // Paired presence: the same group without the stray member parses,
+        // so the refusal above is the check and not a broken fixture.
+        let ok = groups(&[("web", &["web1"])]);
+        assert!(parse_request_with_groups("web: uname -r", &known, &ok).is_some());
+    }
+
+    /// A group that resolves to nothing refuses rather than narrowing the
+    /// fleet silently.
+    ///
+    /// The mixed case is the dangerous one: with an empty `web`, the spec
+    /// `web,db1` would otherwise run on db1 alone and report success, so the
+    /// user believes they addressed a fleet and addressed one box.
+    #[test]
+    fn an_empty_group_refuses_rather_than_narrowing_the_fleet() {
+        let known: Vec<String> = ["web1", "db1"].iter().map(|s| s.to_string()).collect();
+        let empty = groups(&[("web", &[])]);
+        assert!(
+            parse_request_with_groups("web: uptime", &known, &empty).is_none(),
+            "an empty group alone refuses"
+        );
+        assert!(
+            parse_request_with_groups("web,db1: uptime", &known, &empty).is_none(),
+            "and mixed with a real host it refuses too, rather than running on db1"
+        );
+        // Paired presence: the same spec with a populated group parses, so
+        // the refusals above are the emptiness and not a broken fixture.
+        let ok = groups(&[("web", &["web1"])]);
+        let (hosts, _) = parse_request_with_groups("web,db1: uptime", &known, &ok).expect("parsed");
+        assert_eq!(hosts.len(), 2);
+    }
+
+    /// Expansion is one level, so a self-referential group terminates at the
+    /// known-host check rather than looping. The doc makes this promise; a
+    /// later move to recursive expansion would break it silently.
+    #[test]
+    fn a_self_referential_group_refuses_instead_of_looping() {
+        let known: Vec<String> = ["web1"].iter().map(|s| s.to_string()).collect();
+        let looped = groups(&[("web", &["web"])]);
+        assert!(
+            parse_request_with_groups("web: uptime", &known, &looped).is_none(),
+            "'web' expands once to 'web', which is not a known host"
+        );
+        let mutual = groups(&[("a", &["b"]), ("b", &["a"])]);
+        assert!(
+            parse_request_with_groups("a: uptime", &known, &mutual).is_none(),
+            "mutual references terminate the same way"
+        );
+    }
+
+    /// A bare host name still works when groups exist, and a group named
+    /// after a host wins - naming one that way is the user's own doing, and
+    /// silent shadowing in either direction is worse than a documented rule.
+    #[test]
+    fn a_group_name_takes_precedence_over_a_host_of_the_same_name() {
+        let known: Vec<String> = ["web1", "web2"].iter().map(|s| s.to_string()).collect();
+        let g = groups(&[("web1", &["web1", "web2"])]);
+        let (hosts, _) = parse_request_with_groups("web1: uptime", &known, &g).expect("parsed");
+        assert_eq!(
+            hosts.len(),
+            2,
+            "the GROUP named web1 expanded, not the host"
+        );
+
+        // With no group of that name, the same spec is the single host.
+        let (one, _) =
+            parse_request_with_groups("web1: uptime", &known, &groups(&[])).expect("parsed");
+        assert_eq!(
+            one.iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+            vec!["web1"]
+        );
+    }
 
     fn r(host: &str, out: &str, exit: Option<i32>) -> HostResult {
         HostResult {
@@ -519,7 +670,7 @@ mod tests {
             .map(|s| String::from(*s))
             .collect();
         let p = |input: &str| {
-            parse_request(input, &known)
+            parse_request_with_groups(input, &known, &std::collections::BTreeMap::new())
                 .map(|(h, c)| (h.iter().map(|s| s.as_str()).collect::<Vec<_>>(), c))
         };
 
