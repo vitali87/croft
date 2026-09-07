@@ -17,7 +17,7 @@ Resizes call `master.resize(...)` and `term.resize(...)` so programs like `htop`
 ```
 src/
 ├── main.rs              entry point + module declarations
-├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / keys subcommands
+├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
 ├── command_history.rs    durable cross-session shell command history as JSONL under `~/.config/croft/command_history.jsonl` (cwd / exit / duration), read off OSC 133 marks with no shell hooks; Ctrl+Shift+H opens the search popup
 ├── fleet.rs              running one command across N ssh hosts and diffing the results, behind "Terminal: Fleet Run"; the fleet must be named (`hosts: command`, `*` for explicit broadcast)
@@ -92,6 +92,7 @@ src/
 ├── marketplace.rs        fetching a theme from a marketplace: resolves an id or URL to an `ExtensionId`, downloads the `.vsix` and lifts one member out; nothing is installed or executed
 ├── vscode_theme.rs       VS Code colour theme import: converts a theme `.json` into a croft `[[themes]]` manifest under `~/.config/croft/extensions/`, behind `croft theme-import`
 ├── workspace.rs          the workspace's root-folder set: `WorkspaceRoots` (ordered, never empty) with `primary`/`owning_root`/`replace_primary`, persisted per primary root, plus `.code-workspace` parsing
+├── view_ipc.rs           `croft view <file>` (#362): the channel a pane uses to ask the croft hosting it to open a file, so a shell prompt can reach the paged-PDF / sheet / SQLite viewers that only exist as editor tabs. The pane's shell is a child of that croft, so both ends share a host and uid and a 0600 socket suffices; the CLIENT resolves the path (croft's idea of a pane cwd is a scraped approximation) and it travels as raw BYTES in a JSON line, since `to_string_lossy` would open a different file. Croft binds `view-<pid>-<nonce>.sock` under the cache dir, accepts non-blocking from the frame loop, and sweeps stale sockets by `kill(pid, 0)` on the pid in the NAME rather than by connecting, which would race a concurrent bind. `croft view -` stages piped bytes under a sniffed extension in `~/.cache/croft/view-stdin/`, 0600 under 0700, swept after 24h
 ├── vim.rs               native modal (vim-style) editing: a pure key state machine (modes, counts, operators, text objects, f/t, search, ex-commands) that emits editing intents the app applies; toggled with Cmd+E
 ├── voice.rs              voice input for the Termux OSK mic key: delegates to `termux-dialog speech`, auto-installs `termux-api`, and injects the transcript via handle_key; a tap opens the dialog, a second tap cancels
 ├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + ensure-install (pkg on Termux, curl script elsewhere) with a logged outcome + InstallState surfaced to the Cmd+Z jump popup

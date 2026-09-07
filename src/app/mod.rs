@@ -2884,6 +2884,21 @@ pub struct App {
     /// Drops awaiting reverse-pull from the user's local Mac via the
     /// drop-relay launched by the local croft parent. Polled each frame.
     pending_remote_pulls: Vec<PendingRemotePull>,
+    /// This croft's `croft view` listener (#362).
+    ///
+    /// `None` when the bind failed: a croft that cannot offer `croft view`
+    /// must still start, so the failure costs the feature and nothing else.
+    /// Panes then see no `CROFT_VIEW_SOCK` and the client says so plainly,
+    /// which is the same message a pane outside croft gets.
+    ///
+    /// No path is kept alongside it. The doc used to promise "the socket path
+    /// to unlink when it goes away" and nothing unlinked it: there is no
+    /// `Drop for App`, both readers discarded the second element, and the
+    /// launch-time sweep is what actually reclaims a dead croft's socket -
+    /// deliberately, since an unclean exit leaves no `Drop` to run either.
+    /// A field carrying a promise the code does not keep is worse than no
+    /// field.
+    view_listener: Option<std::os::unix::net::UnixListener>,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -4360,6 +4375,12 @@ impl App {
         let (deps_tx, deps_rx) = std::sync::mpsc::channel();
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
+        // Bound before the first pane, so that pane's shell carries the
+        // socket like every later one. `spawn_with_preamble` reads
+        // `view_ipc::SOCK_PATH` at spawn time, so this ordering is what
+        // decides whether the startup pane can use `croft view` at all (#362).
+        let view_listener = Self::bind_view_socket();
+        let view_bind_error = VIEW_BIND_ERROR.lock().unwrap().take();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
         // Background git worker: every `git status` / `git status
@@ -4528,7 +4549,7 @@ impl App {
             sidebar_dwell: SidebarDwell::default(),
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
-            status: String::from("Ready"),
+            status: view_status(view_bind_error.as_deref()),
             persistence_warning: remote_persistence_status(
                 is_remote_session(),
                 std::env::var_os("CROFT_SESSION_PERSISTENT").is_some(),
@@ -4614,6 +4635,7 @@ impl App {
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
+            view_listener,
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -13163,6 +13185,65 @@ impl App {
         } else {
             self.status = String::from("Only one terminal open");
         }
+    }
+
+    /// Serve one accepted `croft view` client: bound the socket, read the
+    /// request, apply it, and answer. Returns the reply and whether anything
+    /// was opened (so the caller can redraw).
+    ///
+    /// Split out of the accept loop so a test can hand it a stream and observe
+    /// the REPLY. The previous test for the blocking-mode fix accepted a
+    /// connection, called `set_nonblocking(false)` itself, and then asserted
+    /// the flag it had just set - it could not fail on any platform, which is
+    /// the false-green shape this repo's own guidance names. Given this seam a
+    /// test can hand in a deliberately NON-blocking stream and assert the
+    /// reply is `Ok`, which fails everywhere if the call below is dropped.
+    fn answer_view_client(
+        &mut self,
+        mut stream: std::os::unix::net::UnixStream,
+        deadline: std::time::Instant,
+    ) -> (crate::view_ipc::ViewReply, bool) {
+        // An accepted socket's flags are not portably inherited: Linux's
+        // accept(2) says the new socket does NOT inherit O_NONBLOCK and that
+        // portable programs must set flags explicitly, while BSD (so macOS,
+        // croft's primary platform) does inherit them. Inherited, every read
+        // returns EAGAIN before any timeout applies and every `croft view`
+        // comes back "unreadable request: Resource temporarily unavailable"
+        // while Linux CI stays green.
+        let _ = stream.set_nonblocking(false);
+        // `read_request` re-arms its own read timeout from the deadline on
+        // every recv, so none is set here. The WRITE bound is armed below,
+        // after the read, from whatever the read left — and it exists because
+        // the reply embeds the client-supplied path, so a client that sends a
+        // valid long request and never reads can block `write_all` on a full
+        // socket buffer. Not reproducible on Linux, whose default unix-socket
+        // buffer is far larger than any legal reply, which is why it is set
+        // rather than tested.
+        let reply = match crate::view_ipc::read_request(&stream, deadline) {
+            Ok(req) => self.apply_view_request(&req.to_path()),
+            Err(e) => crate::view_ipc::ViewReply::Err {
+                message: format!("unreadable request: {e}"),
+            },
+        };
+        // Armed AFTER the read, from what the read left: computing it before
+        // gives a client that spent the whole budget reading a fresh window to
+        // spend writing, so one client could cost the frame loop twice the
+        // documented 20ms.
+        //
+        // The floor is 1ms and the write's result is discarded, which is worth
+        // being explicit about rather than leaving as an accident. If that
+        // 1ms ever fired on an `Ok`, the file is open in the editor while the
+        // client's shell exits 1 saying croft closed without replying: the
+        // reply is 16 bytes to a socket with a reader already waiting, so it
+        // is unreachable in practice, and the alternative (dropping the reply
+        // rather than the timeout) trades a wrong message for no message.
+        let left = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_millis(1));
+        let _ = stream.set_write_timeout(Some(left));
+        let opened = matches!(reply, crate::view_ipc::ViewReply::Ok);
+        let _ = crate::view_ipc::write_reply(&mut stream, &reply);
+        (reply, opened)
     }
 
     /// Paint a collapsed pane's one-column strip (#313) and return its hit
@@ -30169,6 +30250,242 @@ impl App {
         }
     }
 
+    /// Bind this croft's `croft view` socket and publish it to panes.
+    ///
+    /// Keyed by pid so two crofts on one box never contend, and published
+    /// through [`crate::view_ipc::SOCK_PATH`], which `apply_pane_env` reads
+    /// at spawn time so no spawn site has to remember it. Not the process
+    /// env: `set_var` is unsound with threads running, and the body below
+    /// says so at length. Under `cfg(test)` the bind is skipped, since a test
+    /// that stood up an App would otherwise leave a live socket in the real
+    /// cache dir and set the one-shot global for every OTHER test in the same
+    /// process.
+    fn bind_view_socket() -> Option<std::os::unix::net::UnixListener> {
+        if cfg!(test) {
+            return None;
+        }
+        let dir = croft_cache_dir();
+        // Latched, not swallowed. "A full or read-only `$HOME`" is one of the
+        // causes VIEW_BIND_ERROR's own doc names, and it fails HERE, one line
+        // above the `map_err` that would have reported it. Returning `None`
+        // quietly left `status` on "Ready" and told the user to run from a
+        // pane inside croft, which is what they were already doing.
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            *VIEW_BIND_ERROR.lock().unwrap() = Some(format!("{e}"));
+            return None;
+        }
+        // ABSOLUTE, always. `croft_cache_dir` falls back to `.` when `HOME`
+        // is unset, and the client resolves what it is handed against the
+        // PANE's cwd - so a relative socket path published here reports "the
+        // croft that opened this pane is gone" from any pane that has `cd`'d,
+        // while the croft is running. The module's own invariant is that the
+        // server only ever sees absolute paths; this is where that starts.
+        let path = crate::view_ipc::socket_path(&dir, std::process::id());
+        let path = std::path::absolute(&path).unwrap_or(path);
+        sweep_dead_view_sockets(&dir);
+        // A bind failure is reported, not swallowed. The reachable causes are
+        // real - `AddrInUse` from the liveness check, a full or read-only
+        // `$HOME`, or the 104-byte `AF_UNIX` path budget with a long home
+        // directory on macOS - and the client's message for an unset socket
+        // tells the user to run from a pane inside croft, which is exactly
+        // what they were doing. Saying so once at startup is the difference
+        // between a feature that is off and a feature that lies about why.
+        let listener = prepare_view_listener(&path)
+            .map_err(|e| {
+                // Latched rather than dropped. The reachable causes are real -
+                // `AddrInUse` from the liveness check, a full or read-only
+                // `$HOME`, the 104-byte `AF_UNIX` path budget with a long home
+                // on macOS - and the client's message for an unset socket
+                // tells the user to run from a pane inside croft, which is
+                // what they were already doing. `App::new` puts this on the
+                // status line, so a feature that is off says why once instead
+                // of misdirecting every time it is used.
+                *VIEW_BIND_ERROR.lock().unwrap() = Some(format!("{e}"));
+            })
+            .ok()?;
+        // Published through a `OnceLock` read at SPAWN time rather than
+        // `std::env::set_var` (#362). Two things were wrong with the env:
+        //
+        // portable-pty snapshots `std::env::vars_os()` inside
+        // `CommandBuilder::new` and then clears the child's environment before
+        // applying only that snapshot, so a variable set after a pane was
+        // constructed never reached its shell. This call happens while
+        // `App::new` runs, which is AFTER the first pane exists, so `croft
+        // view` was broken in the startup pane and working everywhere else.
+        //
+        // And `set_var` is unsafe in edition 2024 because a concurrent
+        // `getenv` in another thread is a data race. By this point croft has
+        // the highlight prewarm, the DAP reaper, a PTY reader, the git worker,
+        // the MCP index refresh and the FS watcher all running, which is
+        // exactly the condition `src/gui_path.rs` and `src/session.rs` both
+        // document when they place their own `set_var` calls at startup.
+        let _ = crate::view_ipc::SOCK_PATH.set(path);
+        Some(listener)
+    }
+
+    /// Accept whatever `croft view` clients have queued and open their files.
+    ///
+    /// Returns whether anything changed, so the frame loop redraws. Every
+    /// connection is answered before the next is accepted, which is right
+    /// here: a request is one path and the work is opening a tab, so a
+    /// thread per client would buy nothing and cost the editor's `&mut self`.
+    pub fn drain_view_requests(&mut self) -> bool {
+        // The drain is bounded by TIME rather than by a connection count.
+        // A per-frame cap of N clients still bounds the frame at N times the
+        // per-read timeout; a deadline bounds it at the deadline however many
+        // clients stall. Whatever is left is accepted on the next frame,
+        // which costs a stalled client latency and costs the user nothing.
+        //
+        // The per-stream timeout below is taken from what REMAINS of this
+        // deadline, which is the half that actually bounds a stalled client.
+        // `SO_RCVTIMEO` applies per `recv`, and `read_line` loops until it
+        // sees a newline, so a flat 50ms is reset on every byte that arrives:
+        // a client dribbling one byte every 40ms and never a newline holds
+        // the frame loop for as long as it likes. Bounding the BYTES does not
+        // fix that either - 50 bytes trickled over a second is under any cap
+        // and still costs the second. Only a deadline the client cannot push
+        // forward does.
+        // A croft whose bind failed has no listener and never gets one, so it
+        // must not pay two clock reads and a loop entry every frame forever.
+        // The per-iteration binding below stays: it cannot be hoisted, since
+        // holding that borrow across `answer_view_client`'s `&mut self` does
+        // not compile.
+        if self.view_listener.is_none() {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let mut changed = false;
+        loop {
+            // Do not accept what we cannot serve. `read_line_by_deadline`
+            // checks its budget BEFORE the first read, so a well-behaved
+            // client accepted at deadline-minus-epsilon is refused without a
+            // single read attempt, and the client does not retry. Deferring it
+            // to the next frame costs that client one frame and costs the user
+            // nothing, which is the same trade the deadline itself makes.
+            if deadline.saturating_duration_since(std::time::Instant::now())
+                < std::time::Duration::from_millis(3)
+            {
+                return changed;
+            }
+            let Some(listener) = self.view_listener.as_ref() else {
+                return changed;
+            };
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // The reply is returned so a TEST can assert on it; the
+                    // drain only needs to know whether a file was opened.
+                    let (_, opened) = self.answer_view_client(stream, deadline);
+                    changed |= opened;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return changed,
+                Err(_) => return changed,
+            }
+        }
+    }
+
+    /// Open one requested path, answering with what the user should see.
+    ///
+    /// The path arrives absolute (the client resolved it against the pane's
+    /// own cwd, which croft only approximates), so the checks here are about
+    /// whether the file can be shown, not about where it is.
+    fn apply_view_request(&mut self, path: &Path) -> crate::view_ipc::ViewReply {
+        use crate::view_ipc::ViewReply;
+        // The invariant `view_ipc`'s header states, actually enforced. The
+        // client resolves against ITS cwd before sending, so a relative path
+        // here came from something that is not `croft view`; resolving it
+        // against croft's own cwd would silently open a different file than
+        // the sender named. Same-uid, so this is not a trust boundary, but
+        // an invariant no code checks is a comment rather than an invariant.
+        if !path.is_absolute() {
+            return ViewReply::Err {
+                message: format!(
+                    "the request must carry an absolute path, got {}",
+                    path.display()
+                ),
+            };
+        }
+        // A REGULAR file, not merely something that exists and is not a
+        // directory. `File::open` on a FIFO blocks until a writer appears, so
+        // `mkfifo /tmp/f && croft view /tmp/f` from any pane froze the whole
+        // editor permanently; `/dev/zero` took the same route and read until
+        // the machine ran out of memory. Neither is reachable through the
+        // Explorer without a deliberate human gesture, and this is reachable
+        // by any process in any pane.
+        //
+        // The 20ms drain deadline does not cover it: that bounds the READ of
+        // the request, and this is the step after. Bounding one stage of a
+        // pipeline says nothing about the next.
+        //
+        // `metadata` follows symlinks, so a symlink to a real file still
+        // opens (and a symlink to a FIFO is refused on the target's kind);
+        // one stat answers all three questions the old `exists` + `is_dir`
+        // pair asked in two.
+        //
+        // This bounds the file's KIND, not the time. `metadata` is itself a
+        // blocking syscall on a client-supplied path, so `croft view` naming
+        // something on a hung NFS mount still parks the frame loop here,
+        // before the type check runs. A real bound needs the stat off this
+        // thread.
+        //
+        // The OPEN below is the larger half of the same problem, and it is
+        // not bounded either: `open_pinned` reaches `Editor::open`, which for
+        // a PDF shells out to `pdftoppm` with no timeout (#493), and walks
+        // archives and documents on this thread for their own formats. A
+        // build script running `croft view out.pdf` on a large document parks
+        // the editor for the render. Filed rather than fixed here: moving the
+        // open off the frame loop changes how every viewer reports failure,
+        // which is a bigger change than the channel that exposed it.
+        //
+        // There is also a TOCTOU window between this and the open,
+        // which is same-uid and so inside the trust boundary the module
+        // already argues from - noted so a later reader does not mistake the
+        // check for airtight.
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                // Not necessarily absence: EACCES and ELOOP land here too,
+                // and the old text claimed "no such file" over an errno that
+                // said otherwise.
+                return ViewReply::Err {
+                    message: format!("cannot read {}: {e}", path.display()),
+                };
+            }
+        };
+        if meta.is_dir() {
+            return ViewReply::Err {
+                message: format!("{} is a directory", path.display()),
+            };
+        }
+        if !meta.is_file() {
+            return ViewReply::Err {
+                message: format!("{} is not a regular file", path.display()),
+            };
+        }
+        // Staged pipe input is stamped with THIS croft's pid before it opens,
+        // so the staging sweep can spare a file a live croft is showing
+        // instead of deleting it on age alone. `croft view -` input cannot be
+        // produced again by re-running anything, and the tab re-opens the
+        // path (a SQLite page turn does it on every page), so a sweep that
+        // wins that race breaks a working tab and loses the only copy.
+        // Returns None for an ordinary file, which is then opened as named.
+        let claimed = crate::view_ipc::claim_staged(path, std::process::id());
+        let path = claimed.as_deref().unwrap_or(path);
+        match self.editor.open_pinned(path) {
+            Ok(()) => {
+                // Same route as an Explorer click, focus included: the user
+                // asked for this from a prompt and expects to be looking at
+                // it, not to find it filed behind the pane they typed in.
+                self.focus_pane(Pane::Editor);
+                self.sync_open_file_poll_mtime();
+                self.status = format!("Opened {}", path.display());
+                ViewReply::Ok
+            }
+            Err(e) => ViewReply::Err {
+                message: format!("could not open {}: {e}", path.display()),
+            },
+        }
+    }
+
     /// Check the relay inbox for completed pulls and surface them in the
     /// explorer. Returns true if any pending pull resolved (success,
     /// failure, or timeout) so the main loop knows to redraw.
@@ -46962,12 +47279,211 @@ struct HttpRunOutcome {
     result: Result<crate::http_file::HttpResponse, String>,
 }
 
+/// Bind the `croft view` socket and put it in the mode the frame loop needs.
+///
+/// Split out so the tests seat a listener through the SAME function rather
+/// than building one themselves. A test that set `set_nonblocking` itself
+/// would be asserting against its own setup: production could drop the call
+/// and the "the drain does not block" test would still pass, which is a
+/// check that cannot fail.
+fn prepare_view_listener(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    let listener = crate::session::bind_socket_0600(path)?;
+    // Polled from the frame loop, so a blocking accept would stall every
+    // redraw until somebody happened to run `croft view`.
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Why the `croft view` socket could not be bound, if it could not.
+///
+/// A `static` because `bind_view_socket` runs before an `App` exists to hold
+/// it: `App::new` reads it once, right after the call, and puts it on the
+/// status line.
+static VIEW_BIND_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The status line a fresh `App` opens on, given whatever `bind_view_socket`
+/// latched (#362).
+///
+/// Split out so it can be tested at all: `bind_view_socket` returns early
+/// under `cfg(test)`, so nothing in the suite reaches the latch, and the arm
+/// that reports a bind failure was the half that had never once run.
+fn view_status(view_bind_error: Option<&str>) -> String {
+    match view_bind_error {
+        // The one startup failure that would otherwise be invisible until a
+        // user ran `croft view` and got told to do what they were doing.
+        Some(e) => format!("croft view is unavailable: {e}"),
+        None => String::from("Ready"),
+    }
+}
+
+/// Remove `view-<pid>-<nonce>.sock` files whose croft is gone (#362).
+///
+/// A Unix socket is not auto-unlinked, so every croft that dies leaves its
+/// file behind. An `impl Drop` would clean up the tidy exits and none of the
+/// others (a SIGKILL, an OOM kill, a panic in another thread), and those are
+/// exactly the cases that litter, so the sweep is the mechanism that has to
+/// exist and Drop would only duplicate its easy half.
+///
+/// Liveness is judged from the PID IN THE NAME rather than by connecting.
+/// A connect probe races a concurrent bind: the other croft can be between
+/// `bind_socket_0600`'s stale-file removal and its `bind`, where the probe
+/// reads "dead" correctly and the unlink then lands on the socket it creates
+/// a moment later. `kill(pid, 0)` has no such window. The cost is that a
+/// recycled PID keeps one dead file indefinitely, which is a stale byte
+/// rather than a stolen socket.
+pub(crate) fn sweep_dead_view_sockets(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // Listed once. `sweep_dead_bind_stages` runs per dead socket and used to
+    // re-read the directory each time.
+    let names: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| Some((e.file_name().to_str()?.to_string(), e.path())))
+        .collect();
+    let me = std::process::id();
+    for (name, entry_path) in &names {
+        // A croft that died between `bind_socket_0600`'s lock creation and its
+        // rename leaves a `.bind.lock` with no socket beside it. The
+        // socket-keyed pass below can never reach one, because
+        // `pid_of_socket` requires the `.sock` suffix, so those leaked
+        // permanently. Judging the lock by the pid in its own name closes it.
+        let sock_name = match name.as_str().strip_suffix(".bind.lock") {
+            Some(stem) => std::borrow::Cow::Owned(format!("{stem}.sock")),
+            None => std::borrow::Cow::Borrowed(name),
+        };
+        let Some(pid) = crate::view_ipc::pid_of_socket(&sock_name) else {
+            continue;
+        };
+        // Signal 0 checks existence and permission without delivering
+        // anything; ESRCH is the only answer that means "gone".
+        let gone = pid != me
+            && unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let _ = std::fs::remove_file(entry_path);
+            // `bind_socket_0600` binds inside a `.s<pid>-<n>` dir and removes
+            // it on both paths, but a croft killed inside that window strands
+            // one, and nothing else ever looks at it again. Same argument as
+            // the orphan lock below: it is litter only this sweep can reach.
+            sweep_dead_bind_stages(&names, pid);
+            // Derived from the SOCKET's name rather than from this entry's,
+            // so sweeping a lock entry does not compose a second suffix onto
+            // itself. Removing both from either entry is idempotent.
+            let _ = std::fs::remove_file(dir.join(sock_name.as_ref()).with_extension("bind.lock"));
+        }
+    }
+    sweep_staged_stdin(dir);
+}
+
+/// Remove `.s<pid>-<n>` bind staging directories belonging to a dead croft.
+///
+/// `crate::session::bind_socket_0600` creates one, binds inside it, renames
+/// the socket out and removes the directory on both the success and failure
+/// paths. A croft killed between the create and the remove strands it, and
+/// the counter in that function restarts with the process, so the name is
+/// reused rather than accumulating without bound - but the stranded directory
+/// is never revisited by anything else.
+///
+/// Keyed on the same pid the socket sweep just judged dead, so a LIVE croft's
+/// staging directory is never touched: removing one mid-bind would take the
+/// socket it is about to rename out with it. "Never" modulo the pid-recycling
+/// window the socket unlink above already accepts, which needs the pid space
+/// to wrap between the `kill` and the removal.
+///
+/// Takes the directory listing rather than reading it: this is called once per
+/// dead socket, and a cache dir holding N stale sockets was costing N full
+/// listings at launch.
+fn sweep_dead_bind_stages(names: &[(String, PathBuf)], pid: u32) {
+    let prefix = format!(".s{pid}-");
+    for (name, path) in names {
+        if name.starts_with(&prefix) && name[prefix.len()..].parse::<u64>().is_ok() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// How long a staged stdin file outlives the pipe that wrote it (#362).
+///
+/// Generous, because the cost of keeping a file too long is disk and the cost
+/// of dropping one too early is a broken tab. It still bounds the pile: the
+/// module's own rationale names `vault read … | croft view -`, and without any
+/// sweep every such pipe left a permanent copy on disk the user was never told
+/// about.
+const STAGED_STDIN_RETENTION: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24);
+
+/// Drop staged stdin that no live croft holds and that has aged out (#362).
+///
+/// TWO signals, and the order matters: a live holder spares a file at any age,
+/// and age only ever reaches files nobody holds.
+///
+/// Age alone was the whole mechanism, for a reason that still stands as far as
+/// it goes. `stage_stdin` runs inside [`crate::view_ipc::run`] - the
+/// short-lived `croft view` CLIENT process, which exits milliseconds later —
+/// so the pid baked into every staged name belongs to something that is always
+/// already dead. A liveness check therefore matched EVERY staged file,
+/// including one a running croft had open in a tab, and launching a second
+/// croft deleted it. That is not litter: `sqlite_view::table_page` re-opens the
+/// file by path on every page turn, so the tab breaks on the next page.
+///
+/// But age alone still deleted a file a croft was showing, once that session
+/// outlived the window: `sqlite_view::table_page` re-opens by path on every
+/// page turn, so the tab breaks, and piped input cannot be regenerated by
+/// re-running anything. So the SERVER stamps its pid into the name when it
+/// opens the file ([`crate::view_ipc::claim_staged`]), which is the one point
+/// where a live holder is known, and this reads it back.
+///
+/// Runs at launch, from `sweep_dead_view_sockets`, so a file staged inside a
+/// long-lived session survives until the next croft starts, and now survives
+/// that too for as long as its holder is running.
+fn sweep_staged_stdin(dir: &Path) {
+    let staged = dir.join("view-stdin");
+    let Ok(entries) = std::fs::read_dir(&staged) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // Only croft's own staging names, so a file dropped in this directory
+        // by anything else is left alone rather than deleted on a guess.
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("stdin-") && !name.starts_with(crate::view_ipc::HELD_PREFIX) {
+            continue;
+        }
+        // A file a LIVE croft is showing is never swept, whatever its age.
+        // `apply_view_request` stamps its own pid in at open time, which is
+        // the one moment a live holder is known; the name a client staged
+        // carries a pid that is dead by construction, which is why age was
+        // the only signal here before. Signal 0 checks existence and
+        // permission without delivering anything, and ESRCH is the only
+        // answer that means gone, exactly as the socket sweep judges it.
+        if let Some(holder) = crate::view_ipc::holder_of_staged(name) {
+            let alive = holder == std::process::id()
+                || unsafe { libc::kill(holder as libc::pid_t, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+            if alive {
+                continue;
+            }
+        }
+        // Age still bounds the pile, but now it only ever reaches files no
+        // live croft holds: a client that staged bytes nobody opened, and a
+        // holder that has since exited.
+        let too_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|age| age > STAGED_STDIN_RETENTION);
+        if too_old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// How long an ssh-pane offer stays up untouched (#364) before it clears
 /// itself: long enough to read and act on, short enough not to be stale
 /// when the user next looks at the status bar.
 const SSH_OFFER_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
-fn croft_cache_dir() -> PathBuf {
+pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
         return dir;
@@ -48142,6 +48658,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
+        let view_changed = app.drain_view_requests();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
@@ -48267,6 +48784,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || log_index_changed
             || remote_changed
             || pulls_changed
+            || view_changed
             || ports_changed
             || session_presence_changed
             || session_typing_changed
