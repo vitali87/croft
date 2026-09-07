@@ -8227,6 +8227,39 @@ impl App {
         }
     }
 
+    /// Queue a finished check on the REAL channel WITHOUT draining (#256).
+    ///
+    /// Test-only. The sibling helper drains immediately, which is right for
+    /// testing the reporting logic but wrong for the same-tick race: the
+    /// hint is applied by `sync_explorer_panels`, so the test must let that
+    /// function do the draining.
+    #[cfg(all(test, unix))]
+    pub(crate) fn queue_project_check_result_for_test(
+        &mut self,
+        cwd: &Path,
+        stdout: &str,
+        stderr: &str,
+        success: bool,
+    ) {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        self.project_check_running = true;
+        let _ = self.project_check_tx.send((cwd.to_path_buf(), Ok(out)));
+    }
+
+    /// Queue a size hint on the REAL channel (#256). Test-only.
+    ///
+    /// Does not drain: the point is to have it in flight when the result
+    /// arrives, which is the race that erased it.
+    #[cfg(all(test, unix))]
+    pub(crate) fn send_project_hint_for_test(&mut self) {
+        let _ = self.project_hint_tx.send(());
+    }
+
     /// Push a finished check through the REAL channel and drain it (#256).
     ///
     /// Test-only, and deliberately not a shortcut: it sends down
@@ -9032,18 +9065,24 @@ impl App {
             }
         }
         // The workspace is too large for the sweep to start on its own.
-        // Drained before the result below so the result's status wins: the
-        // hint is context, not the outcome the user just asked for.
-        if self.project_hint_rx.try_recv().is_ok() {
-            self.status = String::from(
-                "This workspace is too large for the whole-project check to run on its own; \
-                 use the palette, or set it to always in Problems: Whole-Project Check Auto-Run",
-            );
-            changed = true;
-        }
+        // Held rather than written: the result below sets `status`
+        // unconditionally and nothing paints between the two, so writing it
+        // here DESTROYED the hint whenever the checker finished inside one
+        // tick - and it is a one-shot, so it never came back. The
+        // fast-failure path (over-cap root, no compiler installed) is
+        // exactly where that happened.
+        let hinted_now = self.project_hint_rx.try_recv().is_ok();
         // A whole-project check finished: its rows and its verdict land
         // together, so the status cannot describe a different run's result.
         if self.drain_project_check() {
+            changed = true;
+        }
+        if hinted_now {
+            // Appended, so the outcome the user asked for still leads.
+            self.status.push_str(
+                " - too large for the whole-project check to run on its own; \
+                 set it to always in Problems: Whole-Project Check Auto-Run",
+            );
             changed = true;
         }
         // Drain any TIMELINE replies; ignore one for a since-closed file.

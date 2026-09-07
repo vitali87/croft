@@ -38190,6 +38190,40 @@ fn the_sweep_auto_enables_only_under_the_file_threshold() {
     );
 }
 
+/// The size hint survives a result landing in the same tick (#256).
+///
+/// Both drains run in one `sync_explorer_panels` body with no paint
+/// between them, and the result sets `status` unconditionally. Writing the
+/// hint before it DESTROYED the hint rather than deprioritising it - and
+/// the hint is one-shot, so it never returned. The fast-failure path (an
+/// over-cap root with no compiler installed) is exactly where the checker
+/// finishes inside a single tick.
+#[cfg(unix)]
+#[test]
+fn the_size_hint_is_not_erased_by_a_result_in_the_same_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Both messages in flight before ONE drain, which is the race. Driven
+    // through `sync_explorer_panels` rather than the direct-drain helper:
+    // the hint logic lives in that function, so calling `drain_project_check`
+    // itself would test a path the app never takes.
+    app.send_project_hint_for_test();
+    app.queue_project_check_result_for_test(tmp.path(), "", "", true);
+    app.sync_explorer_panels();
+
+    assert!(
+        app.status.contains("no problems"),
+        "the outcome the user asked for still leads: {:?}",
+        app.status
+    );
+    assert!(
+        app.status.contains("too large"),
+        "and the one-shot hint survives rather than being overwritten: {:?}",
+        app.status
+    );
+}
+
 /// The cap hints ONCE per session, and only under `auto` (#256).
 ///
 /// The hint is the cap's user-visible half: an explicit sweep still runs on
