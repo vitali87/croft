@@ -38842,9 +38842,11 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
     );
 
     // The guard that must stay GREEN: honouring one key must not be
-    // satisfiable by launching everything. `presentation` is still unhonoured,
-    // so a compound asking for it is still refused, and the refusal must name
-    // THAT key rather than the one croft now runs.
+    // satisfiable by launching everything. `presentation.order` is still
+    // unhonoured, so a compound asking for it is still refused, and the
+    // refusal must name THAT key rather than one croft now runs -- and
+    // `hidden` is one of those now (#318), which is why the fixture uses
+    // `order` and the assertion below rejects the parent name.
     let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
     select(&mut fresh, "Presented");
     assert!(
@@ -38852,9 +38854,25 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         "presentation is still not honoured, so it still refuses: {:?}",
         fresh.run_debug.feedback
     );
+    // The message names the SUB-KEY, not `presentation` (#318). That is the
+    // point of the split: `hidden` is honoured now, so telling a user that
+    // "presentation" is unsupported would be wrong for half the key and
+    // would send them deleting a line that works.
     assert!(
-        fresh.status.contains("presentation"),
+        fresh.status.contains("presentation.order"),
         "and names the key it cannot honour: {}",
+        fresh.status
+    );
+    // The BARE parent would overstate it -- `hidden` is honoured, so "sets
+    // presentation" would send a user deleting a line that works. The
+    // qualified path is what they can find in the file, so the check is
+    // that `presentation` never appears WITHOUT its sub-key.
+    assert!(
+        !fresh
+            .status
+            .replace("presentation.order", "")
+            .contains("presentation"),
+        "the parent is named only as part of the qualified path: {}",
         fresh.status
     );
     assert!(
@@ -43500,6 +43518,148 @@ fn closing_the_last_expanded_pane_leaves_one_expanded_behind() {
          has no cursor and no way back that does not depend on the strip \
          click still working"
     );
+}
+
+/// The config row and the picker must agree about hidden compounds (#318).
+///
+/// The row is the documented route INTO the picker, so a count that
+/// includes what the picker drops advertises an entry that is not there:
+/// a workspace whose only compound is hidden would render "1 debug entry"
+/// over a picker offering nothing to debug.
+#[test]
+fn the_config_row_does_not_count_a_hidden_compound() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"{
+          "configurations": [
+            { "name": "A", "type": "lldb", "request": "launch", "program": "/bin/ls" }
+          ],
+          "compounds": [
+            { "name": "OnlyHidden", "configurations": ["A"],
+              "presentation": { "hidden": true } }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    // `A` is declared, so the compound RESOLVES and the only thing keeping it
+    // out of the count is `hidden`. With an empty `configurations` the count
+    // could equally come from an unresolvable member, and the assertion would
+    // hold for a reason it does not claim.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.refresh_run_debug();
+    // Pin the fixture's discriminating property rather than leaving it in a
+    // comment: the counts below only mean "the compound was excluded" while
+    // exactly one configuration is declared. A later edit adding a second
+    // config would make 1 and 2 wrong for a reason that has nothing to do
+    // with hiding, and the obvious repair -- bumping the numbers -- would
+    // leave a test that no longer measures what it claims.
+    assert_eq!(
+        crate::dap::configs::discover_configs(tmp.path()).len(),
+        1,
+        "fixture: exactly one configuration, so the counts isolate the compound"
+    );
+    assert_eq!(
+        app.run_debug.config_count, 1,
+        "the visible configuration counts; the hidden compound does not"
+    );
+
+    // And the picker agrees: nothing but the always-present active-file row.
+    app.open_debug_config_picker();
+    let picker = app.list_picker.as_ref().expect("the picker opened");
+    assert!(
+        !picker.rows.iter().any(|r| r.id.starts_with("compound:")),
+        "no compound rows: {:?}",
+        picker.rows.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+    app.list_picker = None;
+
+    // The POSITIVE leg. Everything above asserts an absence, and an absence
+    // is what a broken parser, an unreadable launch.json and a working
+    // filter all produce. Unhiding the same compound in the same workspace
+    // must make it appear -- without this the test passes with the filter
+    // deleted and the file never parsed.
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"{
+          "configurations": [
+            { "name": "A", "type": "lldb", "request": "launch", "program": "/bin/ls" }
+          ],
+          "compounds": [
+            { "name": "OnlyHidden", "configurations": ["A"],
+              "presentation": { "hidden": false } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let mut shown = App::new(tmp.path().to_path_buf()).unwrap();
+    shown.refresh_run_debug();
+    assert_eq!(
+        shown.run_debug.config_count, 2,
+        "the same compound, unhidden, IS an entry the row offers alongside A"
+    );
+    shown.open_debug_config_picker();
+    let picker = shown.list_picker.as_ref().expect("the picker opened");
+    assert!(
+        picker.rows.iter().any(|r| r.id.starts_with("compound:")),
+        "and the picker lists it: {:?}",
+        picker.rows.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+}
+
+/// A compound asking `presentation.hidden` is not listed, and hiding one
+/// does not misdirect the rows that remain (#318).
+///
+/// The second half is the subtle one: row ids are `compound:{i}` where `i`
+/// indexes `debug_compounds`. Filtering AFTER `enumerate` keeps those ids
+/// naming the same compound; filtering before would make every row after a
+/// hidden one launch its neighbour.
+#[test]
+fn a_hidden_compound_is_not_listed_and_the_rest_keep_their_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"{
+          "configurations": [
+            { "name": "A", "type": "lldb", "request": "launch", "program": "/bin/ls" }
+          ],
+          "compounds": [
+            { "name": "First",  "configurations": ["A"] },
+            { "name": "Hidden", "configurations": ["A"], "presentation": { "hidden": true } },
+            { "name": "Third",  "configurations": ["A"] }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_debug_config_picker();
+    let picker = app.list_picker.as_ref().expect("the picker opened");
+    let rows: Vec<(String, String)> = picker
+        .rows
+        .iter()
+        .filter(|r| r.id.starts_with("compound:"))
+        .map(|r| (r.id.clone(), r.label.clone()))
+        .collect();
+
+    assert_eq!(rows.len(), 2, "the hidden compound is not listed: {rows:?}");
+    assert!(
+        !rows.iter().any(|(_, l)| l.contains("Hidden")),
+        "and it is the hidden one that went: {rows:?}"
+    );
+
+    // Third was at index 2 before the filter and must still say so, or
+    // selecting it would launch the compound the id points at instead.
+    assert_eq!(rows[0].0, "compound:0", "First keeps its index");
+    assert!(rows[0].1.contains("First"));
+    assert_eq!(
+        rows[1].0, "compound:2",
+        "Third keeps index 2 across the hidden row, not 1"
+    );
+    assert!(rows[1].1.contains("Third"));
 }
 
 /// EXHAUSTIVE recovery sweep for #468: every pane index, both side bar

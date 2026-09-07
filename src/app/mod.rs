@@ -20081,9 +20081,17 @@ impl App {
         // Compounds count too — the row is the documented route to the picker,
         // and the picker lists them, so counting only configurations makes the
         // row vanish for a compounds-only workspace and undercount otherwise.
+        //
+        // A HIDDEN compound is not listed (#318), so it must not be counted
+        // either: the row and the picker have to agree, or a workspace whose
+        // only entry is hidden advertises "1 debug entry" over a picker that
+        // offers nothing. Same filter as `open_debug_config_picker`.
         let root = self.active_workspace_root();
         self.run_debug.config_count = crate::dap::configs::discover_configs(&root).len()
-            + crate::dap::configs::discover_compounds(&root).len();
+            + crate::dap::configs::discover_compounds(&root)
+                .iter()
+                .filter(|c| !c.hidden)
+                .count();
         self.run_debug.selected_config = self.selected_debug_config.clone();
     }
 
@@ -20706,6 +20714,13 @@ impl App {
             self.debug_compounds
                 .iter()
                 .enumerate()
+                // `presentation.hidden` asks not to be listed (#318). The
+                // index still comes from `enumerate` over the FULL list, so
+                // `compound:{i}` keeps naming the same compound whether or
+                // not earlier rows were filtered -- indexing the filtered
+                // sequence would launch a different compound than the row
+                // says as soon as one is hidden.
+                .filter(|(_, c)| !c.hidden)
                 .map(|(i, c)| ListRow {
                     id: format!("compound:{i}"),
                     label: format!("{} — compound of {}", c.name, c.configurations.join(", ")),
