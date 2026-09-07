@@ -303,7 +303,12 @@ pub fn detect_page_count(pdf: &Path) -> Option<u32> {
 
 fn page_count_via_pdfinfo(pdf: &Path) -> Option<u32> {
     let program = which("pdfinfo")?;
-    let out = run_bounded_stdout(&program, &[pdf], PDF_INFO_BUDGET)?;
+    let (status, out) = run_bounded_stdout(&program, &[pdf.as_os_str()], PDF_INFO_BUDGET)?;
+    // The guard the unbounded version had: stdout from a failed run is not a
+    // page count, and every other subprocess in this file checks the same.
+    if !status.success() {
+        return None;
+    }
     parse_pdfinfo_pages(&out)
 }
 
@@ -319,32 +324,54 @@ pub fn parse_pdfinfo_pages(out: &str) -> Option<u32> {
 }
 
 fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
-    let mdls = std::path::PathBuf::from("mdls");
-    let out = run_bounded_stdout(
-        &mdls,
+    let (status, out) = run_bounded_stdout(
+        std::path::Path::new("mdls"),
         &[
-            std::path::Path::new("-raw"),
-            std::path::Path::new("-name"),
-            std::path::Path::new("kMDItemNumberOfPages"),
-            pdf,
+            std::ffi::OsStr::new("-raw"),
+            std::ffi::OsStr::new("-name"),
+            std::ffi::OsStr::new("kMDItemNumberOfPages"),
+            pdf.as_os_str(),
         ],
         PDF_INFO_BUDGET,
     )?;
+    // mdls exits 0 and prints "(null)" for a file with no page count, and
+    // exits non-zero on a missing one. Both fail the parse below today, but
+    // the guard is what keeps that true.
+    if !status.success() {
+        return None;
+    }
     out.trim().parse::<u32>().ok()
 }
 
-/// Run `program` with a deadline and return its stdout, or `None` on timeout,
-/// spawn failure, or a non-UTF-8 read (#493).
+/// Run `program` with a deadline, returning its exit status and stdout, or
+/// `None` on timeout or spawn failure (#493).
+///
+/// `dap/install.rs` has a `run_bounded` of the same shape. They are NOT
+/// merged, and the reason is the exit status: that one discards it, which is
+/// right for its caller (a version probe where any output at all is the
+/// answer) and wrong here, because both page-count probes must reject stdout
+/// from a failed run - `mdls` exits non-zero on a missing file and prints to
+/// a stderr this deliberately drops. This one also caps the read and recovers
+/// lossily from bad bytes. Folding them together would mean pushing this
+/// caller's requirements onto a function that does not want them; if a third
+/// caller wants THIS contract, that is the point to lift it into a shared
+/// module.
 ///
 /// The reader runs on its own thread and is never joined: a descendant the
 /// child left behind keeps the pipe's write end open, and a join would then
 /// wait on that descendant past the budget - on the success path too. This is
 /// the same reasoning `run_pdftoppm` records for its stderr drain.
+///
+/// No process group, unlike `run_pdftoppm`, which kills `-pid` so a forked
+/// descendant dies with it. Neither probe forks: `pdfinfo` is a single
+/// poppler process, and `mdls` queries `mdworker` over Mach IPC rather than
+/// spawning. A caller whose program does fork wants the group treatment
+/// instead.
 fn run_bounded_stdout(
     program: &Path,
-    args: &[&Path],
+    args: &[&std::ffi::OsStr],
     budget: std::time::Duration,
-) -> Option<String> {
+) -> Option<(std::process::ExitStatus, String)> {
     use std::io::Read;
     use std::process::Stdio;
     let mut child = Command::new(program)
@@ -355,17 +382,30 @@ fn run_bounded_stdout(
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        // Unreachable while stdout is piped, but returning through `?` here
+        // would leave the child unreaped.
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout.read_to_string(&mut buf);
+        // Bytes, not a String: `read_to_string` fails outright on one bad
+        // byte, losing a `Pages:` line that is itself valid. A title in
+        // another encoding echoed into pdfinfo's header block does that.
+        // Capped, because a program printing without end would otherwise
+        // fill memory until the budget fires.
+        let mut buf = Vec::new();
+        let _ = stdout.by_ref().take(MAX_PROBE_STDOUT).read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
     let out = rx.recv_timeout(budget).ok();
     let _ = child.kill();
-    let _ = child.wait();
-    out
+    // Reap either way: on the timeout path the kill needs collecting, and on
+    // the success path the child has exited but is still a zombie.
+    let status = child.wait().ok()?;
+    out.map(|bytes| (status, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 /// How long one page render may take before the renderer is killed and the
@@ -377,6 +417,12 @@ const PDF_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 /// one still running after two seconds is wedged, not slow. Overrunning costs
 /// only the page count, and the viewer degrades to the single-page path.
 const PDF_INFO_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Cap on a page-count probe's stdout. `pdfinfo` prints a header block of a
+/// few hundred bytes and `mdls -raw` prints one number, so this is orders
+/// above either; it exists so a program that prints without end cannot fill
+/// memory while the budget runs down.
+const MAX_PROBE_STDOUT: u64 = 1 << 20;
 
 /// How long a failed render's stderr is given to finish arriving after the
 /// exit was observed (#493). The settle poll reads it once it has been
@@ -1231,6 +1277,17 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
         assert_eq!(parse_pdfinfo_pages(sample), Some(12));
     }
 
+    /// The probe budget must stay below the render's. The doc comments argue
+    /// the gap at length - a header parse still running that long is wedged,
+    /// not slow - and nothing else would notice someone raising it.
+    #[test]
+    fn the_probe_budget_stays_under_the_render_budget() {
+        assert!(
+            PDF_INFO_BUDGET < PDF_RENDER_BUDGET,
+            "a page-count probe must not be allowed to outlive a rasterisation"
+        );
+    }
+
     /// The budget must actually fire (#493). Without a test that HANGS a
     /// child, the bound is only shown on the path where the child exits on
     /// its own - which is the path that never needed bounding.
@@ -1242,16 +1299,22 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
     /// `recv_timeout` were removed entirely.
     #[test]
     fn a_hanging_probe_is_killed_at_the_budget_not_waited_on() {
+        // Scaled, not a literal: CONTRIBUTING's "Waiting on a spawned
+        // process in a test" names exactly this case - a deadline handed to
+        // a recv_timeout - and the test twelve lines up already uses this
+        // helper. A fixed 150ms is a spawn plus a channel round trip on a
+        // contended runner.
+        let timeout = budget(150);
         let start = std::time::Instant::now();
         let out = run_bounded_stdout(
             std::path::Path::new("sleep"),
-            &[std::path::Path::new("30")],
-            std::time::Duration::from_millis(150),
+            &[std::ffi::OsStr::new("30")],
+            timeout,
         );
         let elapsed = start.elapsed();
         assert!(out.is_none(), "a child that outruns the budget yields None");
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
+            elapsed < timeout.mul_f64(20.0),
             "the deadline must fire rather than wait out the child: took {elapsed:?}"
         );
     }
@@ -1260,13 +1323,45 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
     /// a child that finishes inside the budget still returns its stdout.
     #[test]
     fn a_quick_probe_returns_its_output() {
-        let out = run_bounded_stdout(
-            std::path::Path::new("echo"),
-            &[std::path::Path::new("Pages:          7")],
-            std::time::Duration::from_secs(5),
-        );
-        let out = out.expect("a child that exits in time yields its stdout");
+        // `sh -c` with a sleep, not a bare `echo`: the interesting success
+        // path is a child that writes and exits while the parent is INSIDE
+        // recv_timeout, which an immediate exit never reaches.
+        let (status, out) = run_bounded_stdout(
+            std::path::Path::new("sh"),
+            &[
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("sleep 0.05; echo 'Pages:          7'"),
+            ],
+            budget(2000),
+        )
+        .expect("a child that exits in time yields its stdout");
+        assert!(status.success(), "a clean exit is reported as success");
         assert_eq!(parse_pdfinfo_pages(&out), Some(7));
+    }
+
+    /// The status must reach the caller, because both probes gate on it and
+    /// the unbounded version they replaced did too. Stdout that parses from a
+    /// FAILED run is the case that would otherwise be taken as an answer.
+    #[test]
+    fn a_failing_probe_reports_its_status_even_with_parseable_output() {
+        let (status, out) = run_bounded_stdout(
+            std::path::Path::new("sh"),
+            &[
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("echo 'Pages:          9'; exit 1"),
+            ],
+            budget(2000),
+        )
+        .expect("output is still returned; the status is what says to ignore it");
+        assert!(
+            !status.success(),
+            "a non-zero exit must be visible to the caller"
+        );
+        assert_eq!(
+            parse_pdfinfo_pages(&out),
+            Some(9),
+            "the output really would have parsed, which is why the guard matters"
+        );
     }
 
     #[test]
