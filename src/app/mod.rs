@@ -18522,7 +18522,24 @@ impl App {
             self.toggle_minimap();
             return Ok(());
         }
-        if is_sidebar_toggle_key(key) {
+        // Ctrl+B while the terminal pane is focused belongs to the app in
+        // the shell, not to croft (#304). Claude Code backgrounds a running
+        // command with it and has no other route to that; croft's sidebar
+        // toggle has three (Cmd+B, the palette, the menu). The asymmetry is
+        // the argument: releasing costs a chord that is reachable three
+        // other ways, holding costs a chord that is reachable no other way.
+        //
+        // Same conditional shape as the bare F5/F9/F10/F11 rule above, and
+        // for the same reason -- it is a rule about when the chord is
+        // UNAMBIGUOUS, not a user preference, so it needs no setting and
+        // cannot drift out of step with a config. Cmd+B is untouched
+        // everywhere, which is what keeps the sidebar reachable from the
+        // terminal; only the Ctrl form is released, matching iTerm2 and
+        // Ghostty, which reserve Cmd and pass Ctrl through.
+        let terminal_owns_ctrl_b = self.focus == Pane::Terminal
+            && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal)
+            && key.modifiers == KeyModifiers::CONTROL;
+        if is_sidebar_toggle_key(key) && !terminal_owns_ctrl_b {
             self.toggle_side_bar();
             return Ok(());
         }
