@@ -4461,15 +4461,32 @@ impl Widget for &mut PtyTerminal {
         // The panel group's tab strip already labels this region "TERMINAL", so
         // each pane stays titleless — a bare bordered box, matching VS Code's
         // unlabelled split terminal panes. The border alone frames the pane.
+        //
+        // The focused pane draws its box in heavy line-drawing glyphs
+        // (┏━┓) against the unfocused pane's light ones (┌─┐), so which
+        // pane has the keyboard reads at a glance and not only from the
+        // border's colour (#470).
+        //
+        // Weight rather than a second ring: the issue asks for "twice as
+        // thick", and a terminal cell is the smallest unit there is, so a
+        // literally doubled border means a second box one cell inside the
+        // first -- costing the shell a row and a column on every side of
+        // every pane. Heavy glyphs give the emphasis for free, which is
+        // what iTerm2 and WezTerm do for the same reason.
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(if self.focused {
+                ratatui::widgets::BorderType::Thick
+            } else {
+                ratatui::widgets::BorderType::Plain
+            })
             .border_style(block_style);
         let inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
         // gradient (matching the welcome activity box).
         if self.focused && self.focus_gradient && self.accent.is_none() {
-            crate::gradient::paint_gradient_box(buf, area);
+            crate::gradient::paint_gradient_box_heavy(buf, area);
         }
         self.last_area = area;
         self.last_inner = inner;
@@ -4810,10 +4827,18 @@ impl Widget for &mut PtyTerminal {
                 _ => self.theme.ui(Color::Rgb(0x1b, 0x81, 0xa8)),
             };
             let by = area.y + area.height - 1;
+            // The fill glyph has to be HEAVIER than the border it sits on,
+            // or the gauge reads as full (#470): a focused pane's border is
+            // already `━`, so painting `━` over it leaves only colour to
+            // distinguish filled from unfilled -- and the focused pane is
+            // the one most likely to be running the build being measured.
+            // `═` against a heavy border is the same trick `━` plays
+            // against a light one.
+            let fill_glyph = if self.focused { "═" } else { "━" };
             for i in 0..fill_len.min(w) {
                 let x = inner.x + (fill_from + i) as u16;
                 let cell = &mut buf[(x, by)];
-                cell.set_symbol("━");
+                cell.set_symbol(fill_glyph);
                 cell.set_style(Style::default().fg(color));
             }
         }
