@@ -42070,6 +42070,69 @@ fn a_collapsed_strip_carries_the_pane_name_down_its_column() {
     );
 }
 
+/// #468 reports the LEFTMOST pane specifically: "works fine for
+/// right-side-opened terminals but the default terminal that is on the left
+/// side, which fold also on the left side, cannot be recovered after
+/// collapse."
+///
+/// Every other strip test in this file uses index 1 or 2, so index 0 has
+/// never been exercised - the shape in which a bug survives a green suite.
+/// Two theories (the splitter grab zone, the sidebar seam) already died
+/// against the tree, so this asserts the user's gesture end to end rather
+/// than any mechanism: fold pane 0, click its strip, and require it back.
+#[test]
+fn the_leftmost_pane_comes_back_from_its_strip() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(0);
+    term.draw(|f| app.render(f)).unwrap();
+
+    let strip = app.terminal_strip_rects[0];
+    assert_eq!(strip.width, 1, "precondition: pane 0's strip is painted");
+    assert!(app.terminals[0].collapsed, "precondition: pane 0 is folded");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        strip.x,
+        strip.y + 1,
+    ));
+    assert!(
+        !app.terminals[0].collapsed,
+        "a left-click on the leftmost strip unfolds it, the same as any other"
+    );
+}
+
+/// The right-click half of the same gesture, for the same untested index.
+#[test]
+fn the_leftmost_panes_strip_offers_expand_terminal() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.toggle_terminal_collapse(0);
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.terminal_strip_rects[0];
+    assert_eq!(strip.width, 1, "precondition: pane 0's strip is painted");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        strip.x,
+        strip.y + 1,
+    ));
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("a strip right-click opens the pane menu");
+    let labels: Vec<String> = menu
+        .items
+        .iter()
+        .filter_map(|e| match e {
+            MenuEntry::Item { label, .. } => Some(label.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "Expand Terminal"),
+        "the leftmost folded pane offers the way back out too: {labels:?}"
+    );
+}
+
 #[test]
 fn a_long_pane_name_never_paints_past_the_end_of_its_strip() {
     // A PROPERTY, not a case: this never states which row the name should end
