@@ -5876,6 +5876,49 @@ fn render_welcome_does_not_panic_in_default_80x25_with_many_notes() {
     term.draw(|f| app.render_welcome(f, area)).unwrap();
 }
 
+/// The focused pane's box is drawn in HEAVY glyphs and an unfocused one
+/// in light, so which pane owns the keyboard reads from weight and not
+/// only from colour (#470). Both weights keep the rounded corners: there
+/// is no heavy arc glyph, and the corners are the house look every other
+/// caller of the gradient box shares.
+#[test]
+fn the_gradient_box_comes_in_two_weights() {
+    use ratatui::buffer::Buffer;
+    let area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 4,
+    };
+    let sym = |b: &Buffer, x: u16, y: u16| b[(x, y)].symbol().to_string();
+
+    let mut light = Buffer::empty(area);
+    crate::gradient::paint_gradient_box(&mut light, area);
+    let mut heavy = Buffer::empty(area);
+    crate::gradient::paint_gradient_box_heavy(&mut heavy, area);
+
+    // All four edges, not just two: the bug this was written for replaced
+    // one horizontal edge and left the other light, so a test that reads
+    // only the top would miss its own inverse.
+    for (x, y, what) in [(3u16, 0u16, "top"), (3, 3, "bottom")] {
+        assert_eq!(sym(&light, x, y), "\u{2500}", "light {what} edge");
+        assert_eq!(sym(&heavy, x, y), "\u{2501}", "heavy {what} edge");
+    }
+    for (x, y, what) in [(0u16, 1u16, "left"), (7, 1, "right")] {
+        assert_eq!(sym(&light, x, y), "\u{2502}", "light {what} edge");
+        assert_eq!(sym(&heavy, x, y), "\u{2503}", "heavy {what} edge");
+    }
+    // The corners are shared, which is what keeps the two boxes the same
+    // shape rather than two different visual languages.
+    for (x, y) in [(0, 0), (7, 0), (0, 3), (7, 3)] {
+        assert_eq!(
+            sym(&light, x, y),
+            sym(&heavy, x, y),
+            "corner ({x},{y}) is the same arc in both weights"
+        );
+    }
+}
+
 #[test]
 fn paint_gradient_box_draws_rounded_corners_with_corner_colours() {
     let rect = Rect {
@@ -18536,6 +18579,98 @@ fn clicking_terminal_maximize_button_maximizes_that_pane() {
     );
 }
 
+/// #510: a pane the frame does not paint must drop `last_inner` as well as
+/// `last_area`.
+///
+/// `last_area` guards clicks and is cleared at six terminal-pane sites.
+/// `last_inner` was assigned in exactly one place - inside `render` - and
+/// cleared nowhere, so a hidden pane kept the rect it held under the PREVIOUS
+/// layout. That rect anchors the terminal image overlay, which is emitted
+/// after `terminal.draw()` with absolute cursor positioning and is bounded by
+/// nothing else: `update_terminal_image_overlay` checks the payload against
+/// the same stale rect, so every check passes and the write lands wherever
+/// the old origin pointed - over a sibling pane, the sidebar, or the status
+/// bar. Being a raw write rather than a buffer index it cannot panic, and
+/// ratatui's diff has no record of the cells it touched, so nothing repairs
+/// them on the next frame.
+///
+/// Maximize is the reachable route: it hands every non-active pane
+/// `Rect::default()`, so the render loop skips them while they keep the split
+/// column they occupied a frame earlier.
+#[test]
+fn a_hidden_pane_drops_last_inner_not_just_last_area() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+
+    // Paint the split first, so every pane holds a real inner rect.
+    term.draw(|f| app.render(f)).unwrap();
+    let active = app.active_terminal;
+    let hidden = (0..app.terminals.len()).find(|i| *i != active).unwrap();
+    assert!(
+        app.terminals[hidden].last_inner.width > 0,
+        "precondition: the pane painted a real inner rect while split"
+    );
+
+    // Maximize, which stops painting it.
+    app.terminal_pane_maximized = true;
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(
+        app.terminals[hidden].last_inner,
+        Rect::default(),
+        "a pane the frame skipped must not keep an inner rect the overlay \
+         would anchor a raw write to"
+    );
+}
+
+/// The same invariant through the PUBLIC gesture rather than the flag, so a
+/// regression that stops `toggle_terminal_pane_maximize` reaching this state
+/// is caught too. Setting `terminal_pane_maximized` directly pins the render
+/// loop; this pins the command.
+#[test]
+fn the_maximize_gesture_also_drops_a_hidden_panes_last_inner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let active = app.active_terminal;
+    let hidden = (0..app.terminals.len()).find(|i| *i != active).unwrap();
+    assert!(app.terminals[hidden].last_inner.width > 0, "precondition");
+
+    app.toggle_terminal_pane_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(
+        app.terminals[hidden].last_inner,
+        Rect::default(),
+        "the gesture, not just the flag, must drop the hidden pane's rect"
+    );
+}
+
+/// The collapse arm of the same condition. `t.collapsed && !maximized` is the
+/// other route into that clear, and the maximize tests never reach it.
+#[test]
+fn a_collapsed_pane_drops_last_inner_too() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(app.terminals[1].last_inner.width > 0, "precondition");
+
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(
+        app.terminals[1].last_inner,
+        Rect::default(),
+        "a folded pane keeps no rect for the overlay to anchor to"
+    );
+}
+
 #[test]
 fn maximized_terminal_fills_width_and_lists_others_in_rail() {
     let tmp = tempfile::tempdir().unwrap();
@@ -27847,11 +27982,21 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     let inner = app.terminals[0].last_inner;
     let rows = screen_rows(&term);
     let border_row = &rows[(area.y + area.height - 1) as usize];
+    // The gauge's fill glyph contrasts with the pane's own border weight
+    // (#470): a focused pane draws a heavy border, so its fill is `═`
+    // against `━`; an unfocused one draws light, so its fill is `━`
+    // against `─`. Counting the glyph that marks FILL keeps this test
+    // about the gauge rather than about which border weight is in force.
+    let fill_glyph = if app.terminals[0].focused {
+        '═'
+    } else {
+        '━'
+    };
     let fill: usize = border_row
         .chars()
         .skip(inner.x as usize)
         .take(inner.width as usize)
-        .filter(|c| *c == '━')
+        .filter(|c| *c == fill_glyph)
         .count();
     let expected = (inner.width as u32 * 46 / 100) as usize;
     assert!(
@@ -27878,8 +28023,11 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     term.draw(|f| app.render(f)).unwrap();
     let rows = screen_rows(&term);
     let border_row = &rows[(area.y + area.height - 1) as usize];
+    // No FILL glyph remains. `━` is the border's own glyph on a focused
+    // pane (#470), so a literal check here would fail on an intact border
+    // rather than on a leftover gauge.
     assert!(
-        !border_row.contains('━'),
+        !border_row.contains(fill_glyph),
         "a cleared gauge restores the plain border: {border_row:?}"
     );
     assert!(
@@ -42010,6 +42158,142 @@ fn folding_a_pane_hands_focus_to_its_neighbour_not_to_the_front_of_the_row() {
     );
 }
 
+/// A post-draw overlay whose rect does not fit the screen is not emitted
+/// (#513). The flush block writes with absolute CUP straight to stdout,
+/// so an out-of-range origin cannot panic and ratatui cannot repair it --
+/// the payload has to be refused before it is written.
+#[test]
+fn an_overlay_past_the_screen_edge_is_refused_before_it_is_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Inside the screen: emittable.
+    assert!(
+        app.overlay_fits_on_screen(0, 0, 80, 24),
+        "a payload filling the screen exactly must be allowed"
+    );
+    assert!(app.overlay_fits_on_screen(10, 5, 20, 10), "well inside");
+
+    // Past either edge: refused. These are the shapes a stale rect makes --
+    // the pre-maximize column of a pane that is now narrower, or a row
+    // index from a taller layout.
+    assert!(
+        !app.overlay_fits_on_screen(70, 0, 20, 5),
+        "past the right edge (70+20 > 80)"
+    );
+    assert!(
+        !app.overlay_fits_on_screen(0, 20, 10, 10),
+        "past the bottom edge (20+10 > 24)"
+    );
+    assert!(
+        !app.overlay_fits_on_screen(u16::MAX - 1, 0, 4, 4),
+        "a wild origin must saturate rather than wrap into range"
+    );
+
+    // A zero-sized payload has nothing to place. Refused rather than
+    // trivially in bounds, so a cleared rect cannot slip a bare cursor
+    // park through.
+    assert!(!app.overlay_fits_on_screen(0, 0, 0, 5), "zero width");
+    assert!(!app.overlay_fits_on_screen(0, 0, 5, 0), "zero height");
+}
+
+/// Every raw-CUP writer in the post-draw block is guarded, not just the
+/// ones that had a reported failure (#513). The block's six writers share
+/// one hazard -- an absolute-CUP write ratatui cannot repair -- so a guard
+/// on some of them leaves the same class open at the others. This counts
+/// the call sites rather than exercising each, which is crude but is what
+/// catches a SEVENTH writer being added later without one.
+#[test]
+fn every_post_draw_overlay_writer_checks_the_screen_bound() {
+    let src = include_str!("mod.rs");
+    let guards = src.matches("app.overlay_fits_on_screen(").count();
+    assert_eq!(
+        guards, 5,
+        "expected the five payload writers in the post-draw block to be \
+         guarded (editor split slots share one call site, plus terminal, \
+         markdown, minimap, welcome); the activity-bar writer calls \
+         `self.overlay_fits_on_screen` from inside its own method. A \
+         change here means a writer was added or removed - guard it."
+    );
+    assert!(
+        src.contains("if !self.overlay_fits_on_screen(*x, *y, 1, 1)"),
+        "the activity-bar writer keeps its own guard"
+    );
+}
+
+/// Before any frame is drawn there is no screen to land on, so nothing is
+/// emittable (#513). Guards the window between startup and the first
+/// render, where `last_frame_area` is still zeroed.
+#[test]
+fn no_overlay_is_emittable_before_the_first_frame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        !app.overlay_fits_on_screen(0, 0, 1, 1),
+        "no frame drawn yet: a 1x1 payload at the origin still has no screen"
+    );
+}
+
+/// Ctrl+B reaches the app running in a focused terminal instead of
+/// toggling the side bar (#304). Claude Code backgrounds a running
+/// command with it and has no other route to that gesture; croft's
+/// sidebar toggle keeps three.
+#[test]
+fn ctrl_b_belongs_to_the_app_in_a_focused_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    let before = app.show_tree;
+
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        app.show_tree, before,
+        "Ctrl+B in a focused terminal must not move the side bar"
+    );
+    // The byte has to ARRIVE, not merely fail to toggle. A guard that
+    // declined the toggle and then swallowed the key would satisfy the
+    // assertion above while delivering nothing -- which is the whole
+    // point of the change, so it is the thing to pin.
+    assert!(
+        app.terminals[app.active_terminal]
+            .written_bytes_for_test()
+            .contains(&0x02),
+        "Ctrl+B must reach the PTY as 0x02"
+    );
+
+    // Cmd+B is untouched, which is what keeps the side bar reachable from
+    // the terminal -- releasing the Ctrl form only costs a chord that has
+    // three other routes.
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_ne!(
+        app.show_tree, before,
+        "Cmd+B still toggles the side bar from the terminal"
+    );
+}
+
+/// The release is conditional on focus, not global (#304): the same
+/// chord keeps its croft meaning everywhere else, so the rule is about
+/// when the chord is unambiguous rather than a preference.
+#[test]
+fn ctrl_b_still_toggles_the_side_bar_outside_the_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    let before = app.show_tree;
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_ne!(
+        app.show_tree, before,
+        "with the editor focused, Ctrl+B is still croft's"
+    );
+}
+
 #[test]
 fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
     // The two gestures are orthogonal: entering maximize does not clear the
@@ -42038,6 +42322,127 @@ fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
         app.terminal_strip_rects[2].width, 1,
         "leaving maximize brings the strip back"
     );
+}
+
+/// Closing the last EXPANDED pane leaves a panel of nothing but strips,
+/// and something must bring one back (part of #468).
+///
+/// `toggle_terminal_collapse` refuses to fold the last expanded pane,
+/// but closing reaches that state from the other side, which is a route
+/// the fold guard cannot see. `ensure_a_terminal_pane_is_expanded` is
+/// the answer and has exactly one caller; this pins that the caller is
+/// on the path that needs it.
+#[test]
+fn closing_the_last_expanded_pane_leaves_one_expanded_behind() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(2);
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.toggle_terminal_collapse(1);
+    assert!(app.terminals[1].collapsed, "premise: pane 1 is folded");
+    assert!(
+        !app.terminals[0].collapsed,
+        "premise: pane 0 is the only expanded one"
+    );
+
+    // Close the expanded one. The fold guard never fires -- nothing is
+    // being folded -- so the panel would be all strips without the
+    // close path's own guard.
+    app.close_terminal_at(0);
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(app.terminals.len(), 1, "one pane left");
+    assert!(
+        !app.terminals[0].collapsed,
+        "the surviving pane must be expanded: a panel of nothing but strips \
+         has no cursor and no way back that does not depend on the strip \
+         click still working"
+    );
+}
+
+/// EXHAUSTIVE recovery sweep for #468: every pane index, both side bar
+/// positions, and with a resize or a maximize cycle interleaved, must be
+/// recoverable from its strip.
+///
+/// Four theories about this bug died against the tree by inspection --
+/// the editor/panel splitter's grab zone, the maximize/collapse flag
+/// interaction, index 0 being special, and the last-expanded guard. This
+/// stops arguing and drives the combinations instead, because "I could
+/// not construct the path" is a much weaker claim than "the paths were
+/// enumerated and all of them recover".
+///
+/// If this ever goes red it names the reproduction directly.
+#[test]
+fn every_collapsed_pane_recovers_from_its_strip_in_every_layout() {
+    for panes in [2usize, 3] {
+        for right_bar in [false, true] {
+            for perturb in ["none", "resize", "maximize"] {
+                for idx in 0..panes {
+                    let (_tmp, mut app, mut term) = app_with_terminal_panes(panes);
+                    app.side_bar_position = if right_bar {
+                        crate::app::SideBarPosition::Right
+                    } else {
+                        crate::app::SideBarPosition::Left
+                    };
+                    term.draw(|f| app.render(f)).unwrap();
+
+                    app.toggle_terminal_collapse(idx);
+                    assert!(
+                        app.terminals[idx].collapsed,
+                        "premise: pane {idx} folds ({panes} panes, right_bar={right_bar})"
+                    );
+
+                    // The perturbations #475 and #478 make plausible: a
+                    // resize leaves stale geometry behind, and maximize
+                    // bypasses the pane-constraint path entirely.
+                    match perturb {
+                        "resize" => {
+                            term =
+                                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+                                    .unwrap();
+                        }
+                        "maximize" => {
+                            app.toggle_terminal_pane_maximize();
+                            term.draw(|f| app.render(f)).unwrap();
+                            app.toggle_terminal_pane_maximize();
+                        }
+                        _ => {}
+                    }
+                    term.draw(|f| app.render(f)).unwrap();
+
+                    // The perturbation must PRESERVE the fold. A `continue`
+                    // here would let a maximize cycle that clears `collapsed`
+                    // pass the case without ever clicking a strip, so the
+                    // sweep would report paths it never walked -- the exact
+                    // shape of green this test exists to refuse.
+                    assert!(
+                        app.terminals[idx].collapsed,
+                        "pane {idx} must still be folded after {perturb} \
+                         ({panes} panes, right_bar={right_bar}); if this \
+                         perturbation legitimately unfolds panes the case \
+                         needs its own assertion, not a skip"
+                    );
+                    let strip = app.terminal_strip_rects[idx];
+                    assert_eq!(
+                        strip.width, 1,
+                        "pane {idx} keeps a one-column strip after {perturb} \
+                         ({panes} panes, right_bar={right_bar})"
+                    );
+
+                    app.handle_mouse(mouse(
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                        strip.x,
+                        strip.y,
+                    ));
+                    assert!(
+                        !app.terminals[idx].collapsed,
+                        "pane {idx} must unfold from its strip at ({}, {}) after \
+                         {perturb} ({panes} panes, right_bar={right_bar})",
+                        strip.x, strip.y
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
