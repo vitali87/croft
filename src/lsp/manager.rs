@@ -5002,6 +5002,72 @@ fn signature_help_supported(cap: &Option<lsp_types::SignatureHelpOptions>) -> bo
     cap.is_some()
 }
 
+/// Result ids from the last `workspace/diagnostic` pull, per file (#533).
+///
+/// The incrementality contract: send back what the server last told us, and
+/// it answers `Unchanged` for anything that has not moved instead of
+/// resending the diagnostics. Without this every pull is a full re-report of
+/// the whole workspace, which is the cost the pull path exists to avoid.
+///
+/// Keyed by URI string rather than `PathBuf` because that is what the server
+/// echoes back, and round-tripping through a path loses the distinction on
+/// any URI that is not a plain file (a server may report `untitled:` or a
+/// virtual scheme). Comparing what it sent to what it sends is the whole job.
+#[derive(Default)]
+pub struct DiagnosticResultIds {
+    by_uri: std::collections::HashMap<String, String>,
+}
+
+impl DiagnosticResultIds {
+    /// What to send as `previousResultIds` on the next pull.
+    pub fn previous(&self) -> Vec<lsp_types::PreviousResultId> {
+        self.by_uri
+            .iter()
+            .filter_map(|(uri, value)| {
+                Url::parse(uri).ok().map(|uri| lsp_types::PreviousResultId {
+                    uri,
+                    value: value.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Record the id a `Full` report carried, or forget the file when it
+    /// carried none.
+    ///
+    /// A report with no `result_id` is the server declining to offer
+    /// incrementality for that file. Keeping the OLD id would then send back
+    /// an id the server never issued for the current content, and a server
+    /// that trusts it answers `Unchanged` for a file that has in fact
+    /// changed - stale diagnostics that never refresh.
+    pub fn record(&mut self, uri: &str, result_id: Option<&str>) {
+        match result_id {
+            Some(id) => {
+                self.by_uri.insert(uri.to_string(), id.to_string());
+            }
+            None => {
+                self.by_uri.remove(uri);
+            }
+        }
+    }
+
+    /// Drop everything, for when the server restarts or the workspace moves.
+    pub fn clear(&mut self) {
+        self.by_uri.clear();
+    }
+
+    /// How many files carry an id, so a caller can tell a cold cache from a
+    /// warm one without reaching inside.
+    pub fn len(&self) -> usize {
+        self.by_uri.len()
+    }
+
+    /// Whether the cache is cold.
+    pub fn is_empty(&self) -> bool {
+        self.by_uri.is_empty()
+    }
+}
+
 /// Whether the server answers `workspace/diagnostic`, the LSP 3.17 PULL of
 /// whole-project diagnostics (#533).
 ///
@@ -6283,6 +6349,52 @@ mod tests {
         assert!(one_of_supported(&on));
         assert!(one_of_supported(&opts));
         assert!(!one_of_supported(&None::<OneOf<bool, ()>>));
+    }
+
+    /// A `Full` report with no `result_id` must FORGET the file, not keep
+    /// the old id (#533).
+    ///
+    /// Keeping it sends back an id the server never issued for the current
+    /// content; a server that trusts it answers `Unchanged` for a file that
+    /// has changed, and the diagnostics never refresh.
+    #[test]
+    fn a_report_without_a_result_id_forgets_the_file() {
+        let mut ids = DiagnosticResultIds::default();
+        assert!(ids.is_empty(), "cold to start");
+
+        ids.record("file:///w/a.rs", Some("v1"));
+        ids.record("file:///w/b.rs", Some("v1"));
+        assert_eq!(ids.len(), 2);
+
+        // b.rs comes back with no id: the server is declining incrementality
+        // for it, so the stale id must go rather than being resent.
+        ids.record("file:///w/b.rs", None);
+        assert_eq!(ids.len(), 1, "the file without an id is forgotten");
+        let sent: Vec<String> = ids
+            .previous()
+            .into_iter()
+            .map(|p| p.uri.to_string())
+            .collect();
+        assert!(
+            sent.iter().any(|u| u.contains("a.rs")),
+            "the file that DID carry an id is still sent: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|u| u.contains("b.rs")),
+            "the forgotten file is not sent: {sent:?}"
+        );
+
+        // A new id for the same file replaces rather than accumulating.
+        ids.record("file:///w/a.rs", Some("v2"));
+        assert_eq!(ids.len(), 1, "replacing an id does not add an entry");
+        assert_eq!(
+            ids.previous().first().map(|p| p.value.clone()),
+            Some(String::from("v2")),
+            "the newest id is what goes back"
+        );
+
+        ids.clear();
+        assert!(ids.is_empty(), "a restart drops everything");
     }
 
     /// A server that pulls per-document but NOT per-workspace advertises
