@@ -2567,6 +2567,9 @@ pub struct App {
     /// Whether a sweep is in flight, so a second invocation says so rather
     /// than stacking compilers.
     project_check_running: bool,
+    /// How many rows the last sweep produced (#256), counted before its
+    /// items join a store shared with every other producer.
+    project_check_rows: usize,
     /// Replies from the background test-source locator (the workspace grep is
     /// too slow for the render thread): the root the search ran under, the
     /// test name, and the hit. A reply from before a re-root is dropped.
@@ -4517,6 +4520,7 @@ impl App {
             project_check_rx,
             project_check_tx,
             project_check_running: false,
+            project_check_rows: 0,
             test_jump_rx,
             test_jump_tx,
             timeline_fetched: None,
@@ -8138,6 +8142,19 @@ impl App {
     /// pane's.
     const PROJECT_CHECK_ID: u64 = u64::MAX;
 
+    /// The first line with something to say, escapes stripped (#256).
+    ///
+    /// A checker's failure output is not a tidy single line: npx opens with
+    /// a blank line and an ANSI-coloured banner, so both a leading-blank
+    /// skip and the stripping are needed for the message to carry a reason
+    /// rather than an escape sequence.
+    fn first_meaningful_line(text: &str) -> Option<String> {
+        text.lines()
+            .map(|l| crate::remote_connect::strip_ansi(l.as_bytes()))
+            .map(|l| l.trim().to_string())
+            .find(|l| !l.is_empty())
+    }
+
     /// Take a finished project check off the channel and report it (#256).
     ///
     /// Three outcomes, deliberately distinguished. A spawn failure names the
@@ -8155,8 +8172,10 @@ impl App {
         self.project_check_running = false;
         match done {
             Err(e) => {
+                // true, not false: the status changed, so the frame must be
+                // redrawn or the message waits for an unrelated repaint.
                 self.status = format!("Could not run the project checker: {e}");
-                false
+                true
             }
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -8164,22 +8183,17 @@ impl App {
                 self.rebuild_problems();
                 let n = self.project_check_count();
                 if n == 0 && !out.status.success() {
-                    // stderr first: npx puts "This is not the tsc command you
-                    // are looking for" there. Fall back to stdout, which is
-                    // where tsc's own global errors go.
-                    let why = {
-                        let e = String::from_utf8_lossy(&out.stderr);
-                        let e = e.trim();
-                        if e.is_empty() {
-                            text.lines()
-                                .next()
-                                .unwrap_or("no output")
-                                .trim()
-                                .to_string()
-                        } else {
-                            e.lines().next().unwrap_or(e).to_string()
-                        }
-                    };
+                    // The first NON-BLANK line, from either stream. Which
+                    // stream carries the reason is not predictable: npx
+                    // reports a missing compiler on STDOUT (with an empty
+                    // stderr and a leading blank line), while tsc's own
+                    // global errors also go to stdout and a missing binary
+                    // goes to stderr. Taking `.next()` showed the blank line
+                    // and reported a failure with no reason at all.
+                    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                    let why = Self::first_meaningful_line(&stderr)
+                        .or_else(|| Self::first_meaningful_line(&text))
+                        .unwrap_or_else(|| String::from("no output"));
                     self.status = format!("The project checker failed: {why}");
                 } else {
                     self.status = match n {
@@ -8231,6 +8245,9 @@ impl App {
     pub(crate) fn ingest_project_check(&mut self, cwd: Option<&Path>, output: &str) -> bool {
         let root = self.workspace_root().to_path_buf();
         let cwd = cwd.unwrap_or(&root).to_path_buf();
+        // Count what THIS scan produced, before it is merged into a store
+        // shared with every other producer.
+        self.project_check_rows = self.matchers.scan_batch(output, "tsc").len();
         self.apply_build_scan(Self::PROJECT_CHECK_ID, Some(&cwd), "tsc", output)
     }
 
@@ -8270,17 +8287,17 @@ impl App {
     /// scope a sweep whose findings are all in unopened files would report
     /// "no problems", defeating the feature. Count this producer's own
     /// contribution instead.
+    ///
+    /// Recorded at install time rather than summed from the store: a file's
+    /// entry in `build_diagnostics` holds EVERY producer's items for that
+    /// file, so summing it double-counts a file the sweep and a pane both
+    /// report - and undercounts in the reverse order, because
+    /// `install_build_diags` records a path only when the entry was empty,
+    /// so the second producer to reach a shared file never lists it.
+    /// Filtering on the item's `source` would not help either: a pane
+    /// running tsc produces the same source string as this sweep.
     fn project_check_count(&self) -> usize {
-        self.build_diag_files_by_pane
-            .get(&Self::PROJECT_CHECK_ID)
-            .map(|files| {
-                files
-                    .iter()
-                    .filter_map(|f| self.build_diagnostics.get(f))
-                    .map(Vec::len)
-                    .sum()
-            })
-            .unwrap_or(0)
+        self.project_check_rows
     }
 
     /// Scan one finished command's output through the build matchers and

@@ -37984,17 +37984,29 @@ fn a_project_checker_that_failed_to_run_does_not_report_a_clean_project() {
         app.status
     );
 
-    // npx puts its refusal on stderr instead.
+    // npx reports a missing compiler on STDOUT, not stderr, and opens with
+    // a blank line and an ANSI-coloured banner. The earlier version of this
+    // test put the text on stderr - the implementation's own wrong
+    // assumption, encoded in the fixture, so the bug passed the suite.
     app.finish_project_check_for_test(
         tmp.path(),
+        "\n\x1b[41m\x1b[37m This is not the tsc command you are looking for \x1b[0m\n",
         "",
-        "This is not the tsc command you are looking for\n",
         false,
     );
     assert!(
         app.status.contains("not the tsc command"),
-        "stderr is used when stdout is empty, got {:?}",
+        "the reason is found past a blank line and escapes, got {:?}",
         app.status
+    );
+    assert!(
+        !app.status.contains('\u{1b}'),
+        "and carries no escape sequences, got {:?}",
+        app.status
+    );
+    assert_ne!(
+        app.status, "The project checker failed: ",
+        "an empty reason is the bug this replaced"
     );
 
     // A genuinely clean project: zero rows AND a zero exit.
@@ -38002,6 +38014,51 @@ fn a_project_checker_that_failed_to_run_does_not_report_a_clean_project() {
     assert_eq!(
         app.status, "Whole-project check: no problems",
         "a real clean run still reports clean"
+    );
+}
+
+/// A file BOTH the sweep and a pane report is counted once, by whoever is
+/// reporting (#256).
+///
+/// `build_diagnostics[f]` holds every producer's items for that file, so
+/// summing the store double-counts a shared file - and undercounts in the
+/// reverse order, because `install_build_diags` records a path only when the
+/// entry was empty, so the second producer to reach a shared file never
+/// lists it. Both orderings are pinned because they fail in opposite
+/// directions and one alone would look correct.
+#[cfg(unix)]
+#[test]
+fn a_file_both_producers_report_is_not_double_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("shared.ts");
+    let only = tmp.path().join("only.ts");
+    std::fs::write(&shared, "export const a = 1;\n").unwrap();
+    std::fs::write(&only, "export const b = 2;\n").unwrap();
+    let line = |f: &str| format!("{f}(1,1): error TS2322: Type error.\n");
+
+    // Sweep first, then a pane reports the SAME file.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.finish_project_check_for_test(tmp.path(), &line("shared.ts"), "", false);
+    assert_eq!(app.status, "Whole-project check: 1 problem");
+    app.apply_build_scan(1, Some(tmp.path()), "tsc", &line("shared.ts"));
+    app.finish_project_check_for_test(tmp.path(), &line("shared.ts"), "", false);
+    assert_eq!(
+        app.status, "Whole-project check: 1 problem",
+        "the pane's row for the same file is not the sweep's to count"
+    );
+
+    // Pane first, then the sweep reports that file AND another.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_build_scan(1, Some(tmp.path()), "tsc", &line("shared.ts"));
+    app.finish_project_check_for_test(
+        tmp.path(),
+        &format!("{}{}", line("shared.ts"), line("only.ts")),
+        "",
+        false,
+    );
+    assert_eq!(
+        app.status, "Whole-project check: 2 problems",
+        "the sweep found two, even though a pane got to one of them first"
     );
 }
 
