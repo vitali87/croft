@@ -45679,7 +45679,7 @@ fn a_single_root_review_queue_reads_as_it_always_did() {
     std::fs::write(&f, "x").unwrap();
     app.agent_ledger.record_write(&f, 1, &working);
     let hash = app.agent_ledger.lane("claude")[0].current_hash;
-    app.agent_ledger.mark_reviewed("claude", &f, hash);
+    app.agent_ledger.mark_reviewed("claude", &f, hash, None);
     assert_eq!(
         app.agent_lane_rows(),
         vec![String::from("claude: 0 to review ()")],

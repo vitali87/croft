@@ -31390,6 +31390,86 @@ impl App {
         self.tree.agent_touched = std::sync::Arc::new(paths);
     }
 
+    /// The newest local-history snapshot of `path`, which is the content the
+    /// user is looking at when they mark a row reviewed (#345).
+    ///
+    /// `None` when the store has nothing for the file: snapshots are
+    /// best-effort and recorded on a background thread, so a review can land
+    /// before the first one exists. The row is still REVIEWED — it just has
+    /// no baseline content to diff against later.
+    fn newest_snapshot_millis(history_root: &Path, path: &Path) -> Option<u64> {
+        crate::history::entries_in(history_root, path)
+            .first()
+            .map(|s| s.millis)
+    }
+
+    /// Diff one agent-lane row against the snapshot that was its baseline
+    /// when the user last marked it reviewed (#345), rather than against
+    /// HEAD.
+    ///
+    /// Refuses rather than falling back to a different baseline. A row with
+    /// no recorded snapshot (never reviewed, or reviewed before the store
+    /// had one) and a row whose snapshot has since been PRUNED — the store
+    /// keeps 50 per file against a 1s autosave, so this is a live case, not
+    /// only a legacy one — both say so. A diff against a baseline other than
+    /// the one claimed is worse than no diff, because the user cannot see
+    /// which one they got.
+    pub(crate) fn diff_agent_lane_row(&mut self, agent: &str, path: &Path) {
+        let Some(row) = self
+            .agent_ledger
+            .lane(agent)
+            .into_iter()
+            .find(|f| f.path == path)
+        else {
+            self.status = format!("{} is not in {agent}'s lane", path.display());
+            return;
+        };
+        let Some(millis) = row.reviewed_millis else {
+            self.status = if row.reviewed_hash.is_some() {
+                format!(
+                    "{} was reviewed before a snapshot existed - nothing to diff against",
+                    path.display()
+                )
+            } else {
+                format!("{} has not been reviewed yet", path.display())
+            };
+            return;
+        };
+        let Some(snap_file) = crate::history::snapshot_file_in(&self.history_root, path, millis)
+        else {
+            self.status = format!(
+                "The snapshot {} was reviewed against is no longer available",
+                path.display()
+            );
+            return;
+        };
+        let Ok(content) = std::fs::read(&snap_file) else {
+            self.status = format!("Could not read the reviewed snapshot of {}", path.display());
+            return;
+        };
+        // Snapshots hold raw bytes; decode like the local-history diff above
+        // so a UTF-16 file diffs as text rather than mojibake.
+        let enc = encoding_rs::Encoding::for_bom(&content)
+            .map(|(e, _)| e)
+            .unwrap_or(encoding_rs::UTF_8);
+        let text = enc.decode(&content).0.into_owned();
+        let rel = match path.strip_prefix(&self.tree.root) {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => path.display().to_string(),
+        };
+        let label = std::path::PathBuf::from(format!("{rel} (reviewed)"));
+        if let Err(e) = self
+            .editor
+            .open_head_diff_with_text(label, &text, path, false)
+        {
+            self.status = format!("Could not open the reviewed diff: {e}");
+            return;
+        }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
+        self.focus_pane(Pane::Editor);
+        self.status = format!("{rel}: changes since you last reviewed it");
+    }
+
     /// Mark one file reviewed in one agent's lane (#345): the content on
     /// DISK now becomes the baseline, so the row returns only on a later
     /// write.
@@ -31404,7 +31484,8 @@ impl App {
     fn mark_agent_file_reviewed_inner(&mut self, agent: &str, path: &Path) -> bool {
         match crate::agent_lane::read_baseline(path) {
             crate::agent_lane::Baseline::Hash(hash) => {
-                self.agent_ledger.mark_reviewed(agent, path, hash)
+                let snap = Self::newest_snapshot_millis(&self.history_root, path);
+                self.agent_ledger.mark_reviewed(agent, path, hash, snap)
             }
             // Nothing left to review: drop the row rather than baselining a
             // file that is not there.
@@ -31420,9 +31501,12 @@ impl App {
 
     /// Mark an agent's whole lane reviewed (#345).
     pub(crate) fn mark_agent_lane_reviewed(&mut self, agent: &str) -> usize {
-        let (reviewed, dropped) = self
-            .agent_ledger
-            .mark_lane_reviewed(agent, crate::agent_lane::read_baseline);
+        let root = self.history_root.clone();
+        let (reviewed, dropped) =
+            self.agent_ledger
+                .mark_lane_reviewed(agent, crate::agent_lane::read_baseline, |path| {
+                    Self::newest_snapshot_millis(&root, path)
+                });
         // A file that vanished was not REVIEWED; saying so would tell the
         // user they looked at something that is not there.
         let gone = match dropped {
@@ -34387,6 +34471,29 @@ impl App {
                 } else {
                     rows.join(" \u{b7} ")
                 };
+            }
+            Cmd::DiffAgentFileSinceReview => {
+                match self.editor.path.clone() {
+                    None => self.status = String::from("No file open"),
+                    Some(path) => {
+                        // The first lane holding it. A file two agents both
+                        // touched has one baseline per lane, and diffing
+                        // against an arbitrary second one would silently
+                        // answer a different question than the row shows.
+                        let agent = self
+                            .agent_ledger
+                            .agents()
+                            .into_iter()
+                            .map(String::from)
+                            .find(|a| self.agent_ledger.lane(a).iter().any(|f| f.path == path));
+                        match agent {
+                            None => {
+                                self.status = String::from("No agent has changed this file");
+                            }
+                            Some(agent) => self.diff_agent_lane_row(&agent, &path),
+                        }
+                    }
+                }
             }
             Cmd::MarkAgentLaneReviewed => {
                 let agents: Vec<String> = self
