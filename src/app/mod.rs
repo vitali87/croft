@@ -25904,13 +25904,6 @@ impl App {
         (closed, kept)
     }
 
-    /// Remove the active root's worktree lane, refusing when it is dirty
-    /// (#348).
-    ///
-    /// The refusal is the point. `git worktree remove` DISCARDS uncommitted
-    /// work, so this is the one place in the lane flow where being wrong
-    /// destroys something rather than annoying someone — and the check fails
-    /// closed, treating a tree git cannot report on as unsafe.
     /// Point the COMMITS graph at `base..lane` for the active lane (#348).
     ///
     /// Uses `active_scm_root` like `close_worktree_lane` beside it, rather
@@ -25952,6 +25945,13 @@ impl App {
         self.status = format!("COMMITS: {branch} against {base}");
     }
 
+    /// Remove the active root's worktree lane, refusing when it is dirty
+    /// (#348).
+    ///
+    /// The refusal is the point. `git worktree remove` DISCARDS uncommitted
+    /// work, so this is the one place in the lane flow where being wrong
+    /// destroys something rather than annoying someone — and the check fails
+    /// closed, treating a tree git cannot report on as unsafe.
     fn close_worktree_lane(&mut self) {
         // The ACTIVE root, not the primary. `workspace_root()` is
         // `roots.primary()`, and a lane is appended by `add_workspace_folder`
