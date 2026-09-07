@@ -2885,26 +2885,40 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
 /// A `path:line` printed in a RENDERED ANSI log is Ctrl+clickable, the
 /// same as one printed in a terminal pane (#257).
 ///
-/// The rendered view strips the escapes, so the reference is scanned
-/// against the text the user can SEE - the raw bytes would put the column
-/// in the wrong place, or hide the path inside an escape entirely.
+/// The reference is scanned against the text the user SEES. The fixture is
+/// built so that matters: the second path sits after a 36-character SGR run
+/// with no printed width, so its visible column falls INSIDE an escape
+/// sequence in the raw bytes. A raw-bytes scan finds no reference at that
+/// column at all, which is what makes this test turn on the mapping rather
+/// than merely coexist with it.
 ///
 /// Ctrl is what separates it from a selection drag: `begin_log_selection`
-/// runs before the editor's Ctrl handling, so without this the modifier
-/// click just starts a selection.
+/// runs before the editor's Ctrl handling, so without the guard the modifier
+/// click would just start a selection.
 #[test]
 fn a_file_reference_in_a_rendered_log_is_ctrl_clickable() {
     let tmp = tempfile::tempdir().unwrap();
-    // The file the log points AT.
-    let target = tmp.path().join("src.rs");
-    std::fs::write(&target, "one\ntwo\nthree\n").unwrap();
+    let first = tmp.path().join("first.rs");
+    let second = tmp.path().join("second.rs");
+    std::fs::write(&first, "a\nb\nc\n").unwrap();
+    std::fs::write(&second, "one\ntwo\nthree\nfour\nfive\nsix\nseven\n").unwrap();
 
-    // A log line with SGR escapes around the reference, so the escape-free
-    // column mapping is exercised rather than bypassed.
+    // An SGR run with zero printed width, placed BETWEEN the two references
+    // so the second one's screen column and byte offset diverge. It must be
+    // LONGER than the path itself, or the shifted column still lands inside
+    // the raw path token and both implementations agree - tempdir paths are
+    // ~50 characters and vary per platform, so scale it rather than picking
+    // a constant that silently stops discriminating. The assertion below
+    // proves the fixture actually discriminates.
+    let esc = "\x1b[1;3;4;38;2;255;0;0m".repeat(second.display().to_string().len() / 10 + 4);
     let log = tmp.path().join("build.log");
     std::fs::write(
         &log,
-        format!("\x1b[31merror\x1b[0m: {}:2 failed\n", target.display()),
+        format!(
+            "{}:1 {esc}then {}:7 end\nconnecting to host.com:443\n",
+            first.display(),
+            second.display()
+        ),
     )
     .unwrap();
 
@@ -2915,49 +2929,82 @@ fn a_file_reference_in_a_rendered_log_is_ctrl_clickable() {
         "the log must open in the rendered view, or this tests nothing"
     );
 
-    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let backend = ratatui::backend::TestBackend::new(200, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
-
-    // Find the cell holding the target path in the RENDERED text.
     let body = app.editor.log.as_ref().unwrap().last_body;
-    let text = app
-        .editor
-        .log
-        .as_ref()
-        .unwrap()
-        .visible_text(0)
-        .expect("line 0 is parsed")
-        .to_string();
-    let at = text
-        .find("src.rs")
-        .expect("the path is visible after stripping");
-    let col = body.x + u16::try_from(at).unwrap();
 
-    let before = app.editor.path.clone();
+    let visible = |app: &App, line: usize| -> String {
+        app.editor
+            .log
+            .as_ref()
+            .unwrap()
+            .visible_text(line)
+            .expect("line is parsed")
+            .to_string()
+    };
+
+    // The second reference: visible column lands inside an escape in the raw
+    // bytes, so only the escape-free scan can resolve it.
+    let text = visible(&app, 0);
+    let at = text.find("second.rs").expect("visible after stripping");
+    let raw = std::fs::read_to_string(&log).unwrap();
+    let raw_line = raw.lines().next().unwrap();
+    assert!(
+        crate::file_ref::file_ref_at(raw_line, at)
+            .is_none_or(|fr| fr.path != second.display().to_string()),
+        "fixture is wrong: a raw-bytes scan at column {at} already finds this \
+         reference, so the test would pass without the escape-free mapping"
+    );
+
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: col,
+        column: body.x + u16::try_from(at).unwrap(),
         row: body.y,
         modifiers: KeyModifiers::CONTROL,
     });
     assert_eq!(
         app.editor.path.as_deref(),
-        Some(target.as_path()),
-        "Ctrl+click on a path in a rendered log opens that file (was {before:?})"
+        Some(second.as_path()),
+        "Ctrl+click on a path after an escape run opens that file"
     );
     assert_eq!(
-        app.editor.cursor_row, 1,
-        "and lands on the referenced line (0-based)"
+        app.editor.cursor_row, 6,
+        "and lands on the referenced line (`:7`, 0-based)"
     );
 
-    // Without Ctrl the same cell still starts a selection, so the ref click
-    // did not eat the ordinary gesture.
+    // A lookalike must NOT be opened: only `is_file()` separates
+    // `host.com:443` from a real reference, and nothing else asserts it.
+    app.editor.open(&log).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let host_line = visible(&app, 1);
+    let hat = host_line
+        .find("host.com")
+        .expect("the lookalike is on line 1");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: body.x + u16::try_from(hat).unwrap(),
+        row: body.y + 1,
+        modifiers: KeyModifiers::CONTROL,
+    });
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(log.as_path()),
+        "`host.com:443` resolves to no file, so the click must not navigate"
+    );
+    assert!(
+        app.editor.log.as_ref().is_some_and(|l| l.dragging),
+        "and it falls through to a selection drag rather than being eaten"
+    );
+
+    // Without Ctrl the same cell still starts a selection drag. `has_selection`
+    // needs a != b, so a press alone is not yet a selection: the anchor IS the
+    // head until a drag moves it.
     app.editor.open(&log).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: col,
+        column: body.x + u16::try_from(at).unwrap(),
         row: body.y,
         modifiers: KeyModifiers::NONE,
     });
@@ -2966,9 +3013,6 @@ fn a_file_reference_in_a_rendered_log_is_ctrl_clickable() {
         Some(log.as_path()),
         "a plain click stays in the log"
     );
-    // `has_selection` needs a != b, so a press alone is not yet a selection:
-    // the anchor IS the head until a drag moves it. What distinguishes the
-    // two paths is that the plain press armed a drag at all.
     assert!(
         app.editor.log.as_ref().is_some_and(|l| l.dragging),
         "a plain click still begins a selection drag"
