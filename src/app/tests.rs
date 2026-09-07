@@ -2882,6 +2882,99 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     );
 }
 
+/// A `path:line` printed in a RENDERED ANSI log is Ctrl+clickable, the
+/// same as one printed in a terminal pane (#257).
+///
+/// The rendered view strips the escapes, so the reference is scanned
+/// against the text the user can SEE - the raw bytes would put the column
+/// in the wrong place, or hide the path inside an escape entirely.
+///
+/// Ctrl is what separates it from a selection drag: `begin_log_selection`
+/// runs before the editor's Ctrl handling, so without this the modifier
+/// click just starts a selection.
+#[test]
+fn a_file_reference_in_a_rendered_log_is_ctrl_clickable() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The file the log points AT.
+    let target = tmp.path().join("src.rs");
+    std::fs::write(&target, "one\ntwo\nthree\n").unwrap();
+
+    // A log line with SGR escapes around the reference, so the escape-free
+    // column mapping is exercised rather than bypassed.
+    let log = tmp.path().join("build.log");
+    std::fs::write(
+        &log,
+        format!("\x1b[31merror\x1b[0m: {}:2 failed\n", target.display()),
+    )
+    .unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "the log must open in the rendered view, or this tests nothing"
+    );
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+
+    // Find the cell holding the target path in the RENDERED text.
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    let text = app
+        .editor
+        .log
+        .as_ref()
+        .unwrap()
+        .visible_text(0)
+        .expect("line 0 is parsed")
+        .to_string();
+    let at = text
+        .find("src.rs")
+        .expect("the path is visible after stripping");
+    let col = body.x + u16::try_from(at).unwrap();
+
+    let before = app.editor.path.clone();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: col,
+        row: body.y,
+        modifiers: KeyModifiers::CONTROL,
+    });
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(target.as_path()),
+        "Ctrl+click on a path in a rendered log opens that file (was {before:?})"
+    );
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "and lands on the referenced line (0-based)"
+    );
+
+    // Without Ctrl the same cell still starts a selection, so the ref click
+    // did not eat the ordinary gesture.
+    app.editor.open(&log).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: col,
+        row: body.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(log.as_path()),
+        "a plain click stays in the log"
+    );
+    // `has_selection` needs a != b, so a press alone is not yet a selection:
+    // the anchor IS the head until a drag moves it. What distinguishes the
+    // two paths is that the plain press armed a drag at all.
+    assert!(
+        app.editor.log.as_ref().is_some_and(|l| l.dragging),
+        "a plain click still begins a selection drag"
+    );
+}
+
 #[test]
 fn a_prefix_click_defers_to_the_builtin_for_a_file_reference_too() {
     // The built-in Ctrl+click tries `terminal_url_click` OR

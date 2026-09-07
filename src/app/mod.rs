@@ -29286,6 +29286,51 @@ impl App {
         true
     }
 
+    /// Ctrl+click a `path:line` printed in a RENDERED log (#257).
+    ///
+    /// Scanned against the escape-free text, not the raw bytes: the
+    /// reference's column in the file is not its column on screen once SGR
+    /// sequences are stripped, and a path can sit inside an escape entirely.
+    /// `log_cell_at` already maps a screen cell to that text's column.
+    ///
+    /// Dispatched ahead of `begin_log_selection`, which runs before the
+    /// editor's own Ctrl handling and would otherwise swallow the gesture
+    /// into a selection drag. Relative paths resolve against the workspace
+    /// root - a log has no shell cwd to consult, unlike a terminal pane.
+    fn log_file_click(&mut self, col: u16, row: u16) -> bool {
+        let scroll = self.editor.scroll;
+        let Some(log) = self.editor.log.as_ref() else {
+            return false;
+        };
+        if !rect_contains(log.last_body, col, row) {
+            return false;
+        }
+        let (line, column) = log_cell_at(log, scroll, col, row);
+        let Some(text) = log.visible_text(line).map(str::to_string) else {
+            return false;
+        };
+        let Some(fr) = crate::file_ref::file_ref_at(&text, column) else {
+            return false;
+        };
+        let raw = std::path::PathBuf::from(&fr.path);
+        let abs = if let Some(rest) = fr.path.strip_prefix("~/") {
+            match std::env::var_os("HOME") {
+                Some(h) => std::path::PathBuf::from(h).join(rest),
+                None => return false,
+            }
+        } else if raw.is_absolute() {
+            raw
+        } else {
+            self.tree.root.join(raw)
+        };
+        // Only when it resolves to a real file, which is also what filters
+        // lookalikes like `host.com:443`.
+        if !abs.is_file() {
+            return false;
+        }
+        self.open_resolved_file_ref(&abs, fr.line, fr.column)
+    }
+
     /// Extend a live log drag and finish it on release.
     fn update_log_selection(&mut self, m: MouseEvent) -> bool {
         let scroll = self.editor.scroll;
@@ -37935,6 +37980,13 @@ impl App {
                 // the rendered view starts a drag-selection over what the
                 // user can SEE, not the source buffer beneath it.
                 if self.begin_preview_selection(m.column, m.row) {
+                    return;
+                }
+                // Before the selection: a Ctrl+click on a printed
+                // `path:line` follows it rather than starting a drag (#257).
+                if m.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.log_file_click(m.column, m.row)
+                {
                     return;
                 }
                 if self.begin_log_selection(m.column, m.row) {
