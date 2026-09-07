@@ -554,7 +554,7 @@ mod tests {
         );
         write(
             &root.join(".croft/config.json"),
-            r#"{"theme":"nord","mcp_consented":["evil"],"disabled_extensions":[],"host_accents":[{"pattern":"*"}]}"#,
+            r#"{"theme":"nord","mcp_consented":["evil"],"disabled_extensions":[],"host_accents":[{"pattern":"*"}],"fleet_groups":{"all":["prod-db"]}}"#,
         );
         let m = load_merged_from(&user, Some(&root), "macos");
         assert_eq!(m.prefs.theme, "nord", "allowlisted key applies");
@@ -567,10 +567,18 @@ mod tests {
             "the user's own value survives the refused workspace override"
         );
         assert!(m.prefs.host_accents.is_empty());
+        // A fleet group is a list of machines to run commands on (#363), so
+        // a checked-out repo naming one could add a production box to a set
+        // the user then broadcasts to.
+        assert!(
+            m.prefs.fleet_groups.is_empty(),
+            "a cloned repo must not name hosts for a fleet run"
+        );
         let joined = m.warnings.join("\n");
         assert!(joined.contains("mcp_consented"), "{joined}");
         assert!(joined.contains("disabled_extensions"), "{joined}");
         assert!(joined.contains("host_accents"), "{joined}");
+        assert!(joined.contains("fleet_groups"), "{joined}");
     }
 
     #[test]
