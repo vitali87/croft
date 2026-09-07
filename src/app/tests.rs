@@ -38139,6 +38139,19 @@ fn the_sweep_auto_enables_only_under_the_file_threshold() {
         !App::workspace_exceeds(tmp.path(), 100),
         "12 files is under a cap of 100"
     );
+
+    // The exact boundary, both sides. "Exceeds" means strictly more, so a
+    // root holding exactly `limit` files does NOT exceed it - without this
+    // pair, `>` and `>=` are indistinguishable and the doc comment's claim
+    // is unverified.
+    assert!(
+        !App::workspace_exceeds(tmp.path(), 12),
+        "exactly 12 files does not exceed a cap of 12"
+    );
+    assert!(
+        App::workspace_exceeds(tmp.path(), 11),
+        "12 files exceeds a cap of 11"
+    );
     assert!(
         App::project_check_auto_enabled(tmp.path(), "auto", 100),
         "auto enables under the cap"
@@ -38174,6 +38187,64 @@ fn the_sweep_auto_enables_only_under_the_file_threshold() {
     assert!(
         App::project_check_auto_enabled(tmp.path(), "definitely-not-a-mode", 100),
         "and to auto's yes under the cap, not a blanket no"
+    );
+}
+
+/// The cap hints ONCE per session, and only under `auto` (#256).
+///
+/// The hint is the cap's user-visible half: an explicit sweep still runs on
+/// a huge root, but the user is told once that automatic runs will not
+/// start. Repeating it every sweep would train them to ignore the status
+/// line, and showing it under `on` would contradict the setting they chose.
+#[test]
+fn the_size_hint_fires_once_and_only_under_auto() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // `on` means run regardless of size, so a size hint would contradict it.
+    app.problems_project_scope = String::from("on");
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), &app.problems_project_scope, 0),
+        "`on` runs even against a zero-file cap"
+    );
+
+    // `off` never auto-runs, so the size is not the reason - no hint either.
+    app.problems_project_scope = String::from("off");
+    assert!(!App::project_check_auto_enabled(
+        tmp.path(),
+        &app.problems_project_scope,
+        usize::MAX
+    ));
+
+    // Only `auto` makes size the deciding factor. The root needs a file for
+    // a cap of 0 to be EXCEEDED - an empty tree does not exceed zero, and
+    // asserting against one would have passed for the wrong reason.
+    std::fs::write(tmp.path().join("a.ts"), "export const a = 1;\n").unwrap();
+    app.problems_project_scope = String::from("auto");
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), "auto", 0),
+        "auto declines when the root exceeds the cap"
+    );
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), "auto", usize::MAX),
+        "and enables under it - the paired case, so the line above cannot \
+         pass by the predicate always saying no"
+    );
+
+    // Config values are normalised like the sibling pref: a hand-edited
+    // "Off " must mean off, not a size-dependent maybe.
+    assert_eq!(App::project_scope_mode(" Off "), "off");
+    assert_eq!(App::project_scope_mode("ON"), "on");
+    assert_eq!(App::project_scope_mode("always"), "on");
+    assert_eq!(App::project_scope_mode("never"), "off");
+    assert_eq!(
+        App::project_scope_mode("wat"),
+        "auto",
+        "an unknown value is auto, never on"
+    );
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), " Off ", usize::MAX),
+        "a padded, capitalised off is honoured rather than read as auto"
     );
 }
 

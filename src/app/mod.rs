@@ -2573,6 +2573,14 @@ pub struct App {
     /// Whether the sweep may run unasked (#256): `auto`, `on` or `off`.
     /// Read at startup; an unrecognised value behaves as `auto`.
     problems_project_scope: String,
+    /// Signals that this workspace is too large for `auto` to run the sweep
+    /// unasked (#256). Sent from the sweep's worker, since deciding it is a
+    /// whole-workspace walk.
+    project_hint_rx: std::sync::mpsc::Receiver<()>,
+    project_hint_tx: std::sync::mpsc::Sender<()>,
+    /// One hint per session, not per run: repeating it every sweep would
+    /// train the user to ignore the status line.
+    project_check_hinted: bool,
     /// Replies from the background test-source locator (the workspace grep is
     /// too slow for the render thread): the root the search ran under, the
     /// test name, and the hit. A reply from before a re-root is dropped.
@@ -4408,6 +4416,7 @@ impl App {
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
         let (project_check_tx, project_check_rx) = std::sync::mpsc::channel();
+        let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
         let (graph_tx, graph_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
@@ -4524,6 +4533,9 @@ impl App {
             project_check_tx,
             project_check_running: false,
             project_check_rows: 0,
+            project_hint_rx,
+            project_hint_tx,
+            project_check_hinted: false,
             problems_project_scope: if loaded_prefs.problems_project_scope.is_empty() {
                 String::from("auto")
             } else {
@@ -8310,10 +8322,26 @@ impl App {
     /// rather than as `on`, so a typo cannot start a compile on a 100k-file
     /// root - the failure the cap exists to prevent.
     pub(crate) fn project_check_auto_enabled(root: &Path, mode: &str, limit: usize) -> bool {
-        match mode {
+        match Self::project_scope_mode(mode) {
             "on" => true,
             "off" => false,
             _ => !Self::workspace_exceeds(root, limit),
+        }
+    }
+
+    /// Normalise a `problems_project_scope` value (#256).
+    ///
+    /// Mirrors `ProblemScope::from_config`: a hand-edited config saying
+    /// `"Off"` or `" off "` means off, and reading it as `auto` would give
+    /// the user a size-dependent maybe when they asked for never. Anything
+    /// unrecognised still becomes `auto`, so a typo cannot turn the sweep
+    /// ON. Returns a `&'static str` so the cycle and the predicate agree by
+    /// construction rather than by both remembering to normalise.
+    pub(crate) fn project_scope_mode(raw: &str) -> &'static str {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "on" | "always" => "on",
+            "off" | "never" => "off",
+            _ => "auto",
         }
     }
 
@@ -9002,6 +9030,16 @@ impl App {
                 self.timeline_fetched = None;
                 changed = true;
             }
+        }
+        // The workspace is too large for the sweep to start on its own.
+        // Drained before the result below so the result's status wins: the
+        // hint is context, not the outcome the user just asked for.
+        if self.project_hint_rx.try_recv().is_ok() {
+            self.status = String::from(
+                "This workspace is too large for the whole-project check to run on its own; \
+                 use the palette, or set it to always in Problems: Whole-Project Check Auto-Run",
+            );
+            changed = true;
         }
         // A whole-project check finished: its rows and its verdict land
         // together, so the status cannot describe a different run's result.
@@ -34828,32 +34866,33 @@ impl App {
                 // auto -> on -> off -> auto. Cycling rather than a boolean
                 // because `auto` is a distinct answer from both, not a
                 // default the other two override.
-                let next = match self.problems_project_scope.as_str() {
+                let next = match Self::project_scope_mode(&self.problems_project_scope) {
                     "auto" => "on",
                     "on" => "off",
                     _ => "auto",
                 };
                 self.problems_project_scope = String::from(next);
                 let _ = crate::prefs::save_problems_project_scope(next);
-                let root = self.workspace_root().to_path_buf();
-                // Say what the setting MEANS for this root, not just its
-                // name: under `auto` the answer depends on a count the user
-                // cannot see, and "auto" alone would leave them guessing
-                // which way it went.
-                let effect = if Self::project_check_auto_enabled(
-                    &root,
-                    next,
-                    Self::PROJECT_CHECK_AUTO_MAX_FILES,
-                ) {
-                    "may run on its own here"
-                } else if next == "auto" {
-                    "will not run on its own here - this workspace is too large"
-                } else {
-                    "will not run on its own"
+                // `on` and `off` are answers on their own. `auto` is the
+                // only mode whose effect depends on a count, and counting is
+                // a whole-workspace walk - which this repo runs on a
+                // background thread, never on a keypress. The early stop
+                // bounds the walk only ABOVE the cap; a root under it is
+                // walked to completion, which is the common case.
+                let effect = match next {
+                    "on" => " (runs on its own)",
+                    "off" => " (never runs on its own)",
+                    // Deliberately not the answer: reporting it here would
+                    // cost the walk. The check itself reports when it
+                    // declines, at the point it actually declines.
+                    _ => " (runs on its own unless the workspace is very large)",
                 };
-                self.status = format!("Whole-project check: {next} ({effect})");
+                self.status = format!("Whole-project check: {next}{effect}");
             }
             Cmd::ProblemsCheckProject => {
+                // An explicit ask always runs: the cap governs UNASKED runs
+                // (#256 criterion 5), and refusing what the user just
+                // requested would be answering a question nobody asked.
                 let root = self.workspace_root().to_path_buf();
                 match Self::project_check_command(&root) {
                     None => {
@@ -34873,7 +34912,28 @@ impl App {
                         // the tick.
                         let tx = self.project_check_tx.clone();
                         let root_for_thread = root.clone();
+                        let mode = self.problems_project_scope.clone();
+                        let hint_tx = self.project_hint_tx.clone();
+                        let hinted = self.project_check_hinted;
+                        self.project_check_hinted = true;
                         std::thread::spawn(move || {
+                            // The cap's one-time hint (#256 criterion 5).
+                            // Computed HERE, on the thread already spawned
+                            // for the compile, because it is a whole-
+                            // workspace walk - never on the UI thread. The
+                            // explicit run still proceeds either way; the
+                            // cap governs UNASKED runs, and this tells the
+                            // user once that automatic ones will not start.
+                            if !hinted
+                                && !Self::project_check_auto_enabled(
+                                    &root_for_thread,
+                                    &mode,
+                                    Self::PROJECT_CHECK_AUTO_MAX_FILES,
+                                )
+                                && Self::project_scope_mode(&mode) == "auto"
+                            {
+                                let _ = hint_tx.send(());
+                            }
                             // .output(), never .status(): the checker must not
                             // inherit croft's TTY, or its diagnostics spray
                             // over the UI.
