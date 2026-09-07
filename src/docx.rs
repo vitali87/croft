@@ -10,8 +10,85 @@ use quick_xml::events::Event;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-/// Source cap: these parse fully in memory.
+/// Source cap: these parse fully in memory. This bounds the DECOMPRESSED
+/// bytes a member may yield, which is why it is generous.
 pub const MAX_DOC_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Pre-parse cap on the FILE, checked before `ZipArchive::new` (#506).
+///
+/// A different limit from [`MAX_DOC_BYTES`], and conflating them is the bug
+/// this fixes: that one bounds how much a member may DECOMPRESS to once the
+/// archive is open, while the constructor's cost is the central-directory
+/// parse it performs to open it at all. That parse allocates per member
+/// before the entry count is knowable, so it cannot be bounded from the
+/// inside.
+///
+/// A CRUDE PROXY, and the honest description of it. File size is not a
+/// measure of parse cost: media is bytes without members, a crafted archive
+/// is members without bytes. Measured against this 8 MB cap:
+///
+/// | shape | size | members | parse | verdict |
+/// |---|---|---|---|---|
+/// | crafted, empty members | 8.39 MB | 97,799 | 384 ms | ADMITTED |
+/// | document of 600 KB photos | 12.3 MB | 21 | 0.19 ms | REFUSED |
+///
+/// The most expensive thing it admits costs about 2000x the cheapest thing
+/// it blocks. It orders the two cases backwards: uncorrelated with cost
+/// benignly, anti-correlated adversarially.
+///
+/// The benign threshold is a RANGE, not a number. Holding this cap fixed
+/// and varying only the media size inside moves it 27x -- 165 members of
+/// 50 KB images, 26 of 330 KB, 6 of 2 MB photographs. So do not read a
+/// member count out of these rows and tune against it: any such figure
+/// describes the fixture it came from, not the format.
+///
+/// The residual is explicit: a crafted archive of ~98k empty members fits
+/// under this cap and still costs ~400 ms on the frame loop. Bounding the
+/// real cost needs a member-count limit, which needs a partial
+/// central-directory reader.
+///
+/// It stays at `ZIP_LIST_CAP` rather than being raised toward
+/// [`MAX_DOC_BYTES`], although the rows above show size buys little. That
+/// sibling's own doc accepts ~800 ms as its bounded worst case at this
+/// value, so the ~400 ms this admits is INSIDE the budget #504 chose
+/// deliberately for the same constructor. Raising this one would take the
+/// same parse several times past that bound on one of its two routes,
+/// break the alias that keeps them honest, and trade a recoverable refusal
+/// for a longer freeze -- the direction the asymmetry below argues against.
+///
+/// It ships anyway because file size is the only thing checkable BEFORE the
+/// call whose cost we are bounding: `ZipArchive::len()` exists, but only on
+/// a constructed archive, so asking how many members there are costs
+/// exactly what we are trying to avoid. Bounding the count properly needs a
+/// partial central-directory reader, which is a design change rather than a
+/// constant.
+///
+/// This is a TRADE, not an improvement. A large real document that opened
+/// under the old 50 MB gate will now be refused. The justification is the
+/// asymmetry of the two failures: a refused document is recoverable -- it
+/// opens in the hex viewer and says why -- and a frame loop frozen inside
+/// the parse is not.
+///
+/// Aliased to `archive::ZIP_LIST_CAP` rather than repeating its value: it
+/// is the same parse reached by a second route, the editor's docx/odt
+/// branch, which `croft view` (#362) makes reachable from any pane. One
+/// definition means the two cannot drift.
+pub const MAX_DOC_LISTING_BYTES: u64 = crate::archive::ZIP_LIST_CAP;
+
+/// Whether the preview declined this file only because of its SIZE (#506),
+/// as opposed to not recognising it. The cascade needs the distinction:
+/// `archive::kind_from_ext` claims `.zip`/`.jar`/`.whl` and NOT `.docx`
+/// or `.odt`, so an over-cap document does not reach the archive route
+/// and cannot pick up that route's cap refusal. Without this it falls
+/// past every viewer to hex with nothing said, which is the silent dump
+/// #504 added `route_note` to prevent.
+pub fn is_past_listing_cap(path: &Path) -> bool {
+    extension_is_doc(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default(),
+    ) && std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_DOC_LISTING_BYTES)
+}
 
 pub fn extension_is_doc(ext: &str) -> bool {
     matches!(ext.to_ascii_lowercase().as_str(), "docx" | "odt")
@@ -79,7 +156,9 @@ fn extract_image(
 /// docx/odt.
 pub fn to_markdown(path: &Path, scratch: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > MAX_DOC_BYTES {
+    // Before the open, not after: the constructor below is where the
+    // per-member central-directory cost is paid (#506).
+    if meta.len() > MAX_DOC_LISTING_BYTES {
         return None;
     }
     let f = std::fs::File::open(path).ok()?;
@@ -384,6 +463,100 @@ mod tests {
         assert!(md.contains("|h1|h2|"), "{md}");
         assert!(md.contains("|a|b|"), "{md}");
     }
+
+    /// A document whose FILE size clears the listing cap is refused before
+    /// `ZipArchive::new` runs, so the crafted many-member layout cannot put
+    /// its central directory through the constructor (#506). The fixture is
+    /// a valid docx -- it holds a real `word/document.xml` -- so what the
+    /// cap refuses is the size, not the shape.
+    #[test]
+    fn a_document_past_the_listing_cap_is_refused_before_the_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.docx");
+        docx_fixture(&p);
+        // Pad past the cap without building a real many-member archive:
+        // the gate reads the file's length, which is what a crafted
+        // central directory inflates.
+        let f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.set_len(MAX_DOC_LISTING_BYTES + 1).unwrap();
+        // Both bounds, so the refusal can only be the NEW cap. Past the
+        // listing cap says the gate under test should fire; still under
+        // `MAX_DOC_BYTES` says the old gate cannot be what fired instead.
+        // Without the second, raising the listing cap above 50 MB would
+        // leave this test green while the old bound did the work -- passing
+        // for a reason it does not claim.
+        let len = std::fs::metadata(&p).unwrap().len();
+        assert!(len > MAX_DOC_LISTING_BYTES, "fixture clears the new cap");
+        assert!(
+            len <= MAX_DOC_BYTES,
+            "and stays under the old one, so only the new cap can refuse it"
+        );
+        assert!(
+            to_markdown(&p, tmp.path()).is_none(),
+            "a file past the listing cap must not reach the parse"
+        );
+        // And the same fixture under the cap still opens, so the refusal
+        // above is the size and not the padding.
+        let q = tmp.path().join("small.docx");
+        docx_fixture(&q);
+        assert!(
+            std::fs::metadata(&q).unwrap().len() <= MAX_DOC_LISTING_BYTES,
+            "fixture premise: the unpadded document is under the cap"
+        );
+        assert!(to_markdown(&q, tmp.path()).is_some(), "under the cap opens");
+    }
+
+    /// An over-cap document does NOT reach the archive route, and that is
+    /// why the size refusal has to be named here (#506).
+    /// `archive::kind_from_ext` claims `.zip`/`.jar`/`.whl` and not
+    /// `.docx`/`.odt`, so the cascade's archive branch is skipped and the
+    /// file would otherwise fall to hex with no reason shown. Pinning the
+    /// premise here means a later widening of `kind_from_ext` fails this
+    /// test rather than silently making the message redundant.
+    #[test]
+    fn an_over_cap_document_needs_its_own_refusal_because_the_archive_route_skips_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.docx");
+        docx_fixture(&p);
+        let f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.set_len(MAX_DOC_LISTING_BYTES + 1).unwrap();
+
+        assert!(
+            to_markdown(&p, tmp.path()).is_none(),
+            "the preview declines"
+        );
+        assert!(
+            crate::archive::kind_from_ext(&p).is_none(),
+            "premise: the archive route does not claim a .docx, so it cannot \
+             supply the refusal reason on this path"
+        );
+        // Control: the same call DOES claim a plain zip, so the assertion
+        // above is about .docx and not a broken call.
+        assert!(
+            crate::archive::kind_from_ext(&tmp.path().join("x.zip")).is_some(),
+            "control: kind_from_ext claims a .zip"
+        );
+        assert!(
+            is_past_listing_cap(&p),
+            "so the size refusal must be named by the doc path itself"
+        );
+    }
+
+    /// The listing cap must stay the tighter of the two (#506). A
+    /// `const` block rather than a runtime test: both are compile-time
+    /// constants, so an assertion on them has a constant value, which
+    /// clippy rejects and which would never have run as a check anyway --
+    /// it fails the BUILD if the relationship is ever inverted, which is
+    /// strictly earlier than a test could.
+    ///
+    /// The equality to `archive::ZIP_LIST_CAP` that stood here is gone
+    /// deliberately: `MAX_DOC_LISTING_BYTES` is now defined AS that
+    /// constant, so asserting they match compares a thing to itself and
+    /// can never fail. The alias is what enforces it.
+    const _: () = assert!(
+        MAX_DOC_LISTING_BYTES < MAX_DOC_BYTES,
+        "the pre-parse cap must be tighter than the decompressed-member cap"
+    );
 
     #[test]
     fn odt_walks_headings_and_paragraphs() {

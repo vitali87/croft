@@ -3917,9 +3917,25 @@ impl Editor {
                 }
             }
             // docx/odt (#181): a document that fails the walk falls
-            // through (its zip container then reaches the archive route).
-            if crate::docx::extension_is_doc(ext) && self.open_doc_preview(path).is_ok() {
-                return Ok(());
+            // through to content routing and, ultimately, hex.
+            if crate::docx::extension_is_doc(ext) {
+                if self.open_doc_preview(path).is_ok() {
+                    return Ok(());
+                }
+                // A SIZE refusal must say so here (#506). Unlike the archive
+                // branch below, this path has no second route to explain
+                // itself: `archive::kind_from_ext` does not claim .docx or
+                // .odt, so an over-cap document reaches hex with nothing
+                // said unless the reason is recorded now.
+                if crate::docx::is_past_listing_cap(path) {
+                    self.route_note = Some((
+                        path.to_path_buf(),
+                        format!(
+                            "document too large to list ({} bytes)",
+                            std::fs::metadata(path).map(|m| m.len()).unwrap_or_default()
+                        ),
+                    ));
+                }
             }
             // A corrupt archive falls through to content routing and,
             // ultimately, the hex fallback.
@@ -13921,6 +13937,52 @@ fn tab_label(e: &Editor) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An over-cap document reaches the hex viewer WITH a reason (#506).
+    ///
+    /// End to end rather than by inspection: this drives the real `open`
+    /// and reads the status line the user sees, so it stays true if either
+    /// side is reworded. The docx branch has no second route to explain
+    /// itself -- `archive::kind_from_ext` does not claim `.docx` -- so
+    /// without the note this open is a silent hex dump.
+    #[test]
+    fn an_over_cap_document_says_why_it_landed_in_hex() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("huge.docx");
+        {
+            let f = std::fs::File::create(&p).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            let o = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            z.start_file("word/document.xml", o).unwrap();
+            z.write_all(b"<?xml version=\"1.0\"?><w:document/>")
+                .unwrap();
+            z.finish().unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .set_len(crate::docx::MAX_DOC_LISTING_BYTES + 1)
+            .unwrap();
+
+        let mut ed = Editor::new();
+        ed.open(&p)
+            .expect("an over-cap document still opens, as hex");
+        assert!(
+            ed.status.contains("hex viewer:"),
+            "the open must carry a reason, not land silently: {:?}",
+            ed.status
+        );
+        assert!(
+            crate::archive::is_list_cap_refusal(&ed.status),
+            "and the reason must be recognisable as a SIZE refusal by the \
+             predicate that owns that vocabulary, so a reword on either \
+             side cannot silently decouple them: {:?}",
+            ed.status
+        );
+    }
+
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
