@@ -11,16 +11,17 @@ use lsp_types::{
     CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionOrCommand,
     CodeActionProviderCapability, CodeActionResponse, CompletionClientCapabilities,
     CompletionItemCapability, CompletionItemKind, CompletionItemKindCapability, CompletionResponse,
-    DeclarationCapability, DocumentChangeOperation, DocumentChanges, DocumentSymbol,
-    DocumentSymbolClientCapabilities, DocumentSymbolResponse, GotoDefinitionResponse,
-    HoverContents, HoverProviderCapability, ImplementationProviderCapability, Location,
-    MarkedString, MarkupKind, OneOf, Position, PublishDiagnosticsClientCapabilities,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
-    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions, SemanticTokensRangeResult,
-    SemanticTokensResult, SemanticTokensServerCapabilities,
-    SemanticTokensWorkspaceClientCapabilities, ServerCapabilities, SymbolKind,
-    TextDocumentClientCapabilities, TextEdit, TokenFormat, TypeDefinitionProviderCapability, Url,
-    WindowClientCapabilities, WorkspaceClientCapabilities, WorkspaceEdit,
+    DeclarationCapability, DiagnosticServerCapabilities, DocumentChangeOperation, DocumentChanges,
+    DocumentSymbol, DocumentSymbolClientCapabilities, DocumentSymbolResponse,
+    GotoDefinitionResponse, HoverContents, HoverProviderCapability,
+    ImplementationProviderCapability, Location, MarkedString, MarkupKind, OneOf, Position,
+    PublishDiagnosticsClientCapabilities, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    SemanticTokensFullOptions, SemanticTokensRangeResult, SemanticTokensResult,
+    SemanticTokensServerCapabilities, SemanticTokensWorkspaceClientCapabilities,
+    ServerCapabilities, SymbolKind, TextDocumentClientCapabilities, TextEdit, TokenFormat,
+    TypeDefinitionProviderCapability, Url, WindowClientCapabilities, WorkspaceClientCapabilities,
+    WorkspaceEdit,
 };
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc, oneshot};
 
@@ -4994,6 +4995,28 @@ fn signature_help_supported(cap: &Option<lsp_types::SignatureHelpOptions>) -> bo
     cap.is_some()
 }
 
+/// Whether the server answers `workspace/diagnostic`, the LSP 3.17 PULL of
+/// whole-project diagnostics (#533).
+///
+/// The inner `workspace_diagnostics` flag, NOT `Option::is_some`. A server
+/// that supports only per-document pulls still advertises
+/// `diagnosticProvider` with that flag `false`; reading the outer `Option`
+/// would send it a request it does not implement and get `-32601 Unhandled
+/// method` back, which is the exact shape that made croft call
+/// `textDocument/declaration` on vtsls.
+///
+/// Both capability variants carry the same options, so both are unwrapped
+/// rather than treating `RegistrationOptions` as an unconditional yes.
+fn workspace_diagnostics_supported(cap: &Option<DiagnosticServerCapabilities>) -> bool {
+    match cap {
+        Some(DiagnosticServerCapabilities::Options(o)) => o.workspace_diagnostics,
+        Some(DiagnosticServerCapabilities::RegistrationOptions(r)) => {
+            r.diagnostic_options.workspace_diagnostics
+        }
+        None => false,
+    }
+}
+
 /// Flatten an LSP `SignatureHelp` into the widget-facing [`SignatureInfo`]
 /// list, resolving each parameter label to a (start, end) char range within
 /// the signature label so the popup can bold the active parameter. The active
@@ -6253,6 +6276,46 @@ mod tests {
         assert!(one_of_supported(&on));
         assert!(one_of_supported(&opts));
         assert!(!one_of_supported(&None::<OneOf<bool, ()>>));
+    }
+
+    /// A server that pulls per-document but NOT per-workspace advertises
+    /// `diagnosticProvider` with `workspaceDiagnostics: false` (#533).
+    /// Reading the outer `Option` would send it a request it does not
+    /// implement; the inner flag is the only thing that separates them.
+    #[test]
+    fn workspace_diagnostics_reads_the_inner_flag_not_the_option() {
+        let opts = |workspace: bool| lsp_types::DiagnosticOptions {
+            identifier: None,
+            inter_file_dependencies: false,
+            workspace_diagnostics: workspace,
+            work_done_progress_options: Default::default(),
+        };
+
+        // The trap: present, but per-document only.
+        assert!(!workspace_diagnostics_supported(&Some(
+            DiagnosticServerCapabilities::Options(opts(false))
+        )));
+        // Paired positive, so the assertion above cannot pass by the
+        // predicate simply always saying no.
+        assert!(workspace_diagnostics_supported(&Some(
+            DiagnosticServerCapabilities::Options(opts(true))
+        )));
+
+        // The registration-options variant carries the same flag and must
+        // not read as an unconditional yes.
+        let reg = |workspace: bool| lsp_types::DiagnosticRegistrationOptions {
+            text_document_registration_options: Default::default(),
+            diagnostic_options: opts(workspace),
+            static_registration_options: Default::default(),
+        };
+        assert!(!workspace_diagnostics_supported(&Some(
+            DiagnosticServerCapabilities::RegistrationOptions(reg(false))
+        )));
+        assert!(workspace_diagnostics_supported(&Some(
+            DiagnosticServerCapabilities::RegistrationOptions(reg(true))
+        )));
+
+        assert!(!workspace_diagnostics_supported(&None));
     }
 
     #[test]
