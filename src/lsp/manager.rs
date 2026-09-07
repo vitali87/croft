@@ -1736,6 +1736,10 @@ struct ManagedClient {
     /// Whether the server answers `workspace/diagnostic` (#533), read from
     /// the capability's inner `workspaceDiagnostics` flag rather than the
     /// outer `Option` - see `workspace_diagnostics_supported`.
+    ///
+    /// Written but not yet read: the request slice filters on it. Verified
+    /// not to warn - a forced non-test rebuild under `-D warnings` with no
+    /// `allow` is clean, because the field is written in a real constructor.
     supports_workspace_diagnostics: bool,
     supports_hover: bool,
     supports_definition: bool,
