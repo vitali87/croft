@@ -186,6 +186,13 @@ jobs:
           base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
           python3 scripts/check_arch_content.py "$base"
 
+      - name: binstall metadata must match what release.yml builds
+        # Cargo.toml's pkg-url and bin-dir are resolved by `cargo binstall` at
+        # INSTALL time, so drift between them and the release workflow is
+        # invisible to every other job here and lands on users as a 404 or a
+        # "corrupt download". Nothing else compares the two files (#376).
+        run: python3 scripts/check_binstall_contract.py
+
   test:
     name: clippy + tests
     runs-on: ubuntu-latest

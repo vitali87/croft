@@ -50,6 +50,22 @@ Then open a new terminal â€” or run `. "$HOME/.cargo/env"` in the current one â€
 
 ## Install
 
+Prebuilt binaries, no toolchain and no compile:
+
+```bash
+cargo binstall croft-software
+```
+
+That downloads the tagged release for your platform (macOS arm64/x86_64, Linux
+musl arm64/x86_64) and puts `croft` on `PATH` in seconds. Every release also
+carries a `SHA256SUMS` file, so a download can be verified independently:
+
+```bash
+sha256sum -c SHA256SUMS   # or: shasum -a 256 -c SHA256SUMS
+```
+
+To build from source instead:
+
 ```bash
 cargo install croft-software --locked
 ```

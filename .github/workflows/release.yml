@@ -1,0 +1,189 @@
+# Prebuilt release binaries (#376).
+#
+# `cargo install croft-software` compiles for ten minutes on a laptop and needs
+# a Rust toolchain first. This publishes four archives per tag so
+# `cargo binstall croft-software` is a download instead, and so the Homebrew
+# formula (#375) has something to point at.
+#
+# The build recipe is deliberately the same one ci.yml's `ship-path build` job
+# proved for the musl targets, including its two non-obvious fixes: `rustup
+# target add` runs from the checkout so rust-toolchain.toml resolves the
+# channel (adding to the default toolchain instead is the bug that job exists
+# to catch), and cargo-zigbuild needs `pip install --break-system-packages`
+# because recent runner images mark the system Python externally managed.
+#
+# The profile is `release`, NOT the `remote-fast` profile ci.yml builds.
+# remote-fast trades LTO and codegen-units for build speed because a user is
+# waiting on it during `croft <host>`; a published artifact is built once and
+# run many times, so it takes the slow, fully-optimised profile.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Building the matrix without publishing, to prove a tag would work before
+  # cutting one. Upload only ever happens on a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple targets need a macOS runner: zigbuild does not cross to them
+          # without an SDK, and shipping an unsigned SDK copy is not something
+          # a release job should be doing.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          # The musl pair is what ci.yml already builds and what the remote
+          # install fast path (#261) consumes.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Add the target to the PINNED toolchain
+        # From the checkout, so rust-toolchain.toml resolves the channel.
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install zig and cargo-zigbuild
+        if: matrix.cross
+        run: |
+          python3 -m pip install --break-system-packages ziglang \
+            || python3 -m pip install ziglang
+          python3 -m ziglang version
+          cargo install cargo-zigbuild --locked
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo zigbuild --profile release --locked --bin croft \
+              --target ${{ matrix.target }}
+          else
+            cargo build --profile release --locked --bin croft \
+              --target ${{ matrix.target }}
+          fi
+
+      - name: The artifact must exist and be the right kind of binary
+        # A cross build that silently produced a host binary is the failure
+        # this catches: `file` names the architecture, so a mismatch here is
+        # a wrong artifact rather than a missing one.
+        run: |
+          bin="target/${{ matrix.target }}/release/croft"
+          test -x "$bin"
+          file "$bin"
+          case "${{ matrix.target }}" in
+            *-linux-musl) file "$bin" | grep -q 'ELF 64-bit LSB' ;;
+            *-apple-darwin) file "$bin" | grep -q 'Mach-O 64-bit' ;;
+          esac
+
+      - name: Package
+        # The archive layout binstall resolves against: a single `croft` at the
+        # root of a tar.gz named for the target. The crate is croft-software
+        # and the binary is croft, so the two names differ on purpose.
+        id: package
+        run: |
+          name="croft-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/croft" "dist/$name/croft"
+          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Checksum
+        # Per-target sums here, concatenated into one SHA256SUMS by the publish
+        # job. Computing them on the runner that built the artifact means the
+        # sum covers the bytes that were actually produced.
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "croft-${{ matrix.target }}.tar.gz" > "croft-${{ matrix.target }}.tar.gz.sha256"
+          else
+            shasum -a 256 "croft-${{ matrix.target }}.tar.gz" > "croft-${{ matrix.target }}.tar.gz.sha256"
+          fi
+          cat "croft-${{ matrix.target }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: croft-${{ matrix.target }}
+          path: |
+            dist/croft-${{ matrix.target }}.tar.gz
+            dist/croft-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only a tag publishes. A workflow_dispatch run builds and stops, which is
+    # how you prove the matrix works without cutting a release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+
+      - name: Collect the archives and build SHA256SUMS
+        run: |
+          mkdir -p dist
+          find staged -name 'croft-*.tar.gz' -exec cp {} dist/ \;
+          cd dist
+          # Four archives, or the release is incomplete. Publishing three and
+          # a checksum file that says three is worse than failing: binstall
+          # would resolve for some users and 404 for others.
+          count=$(ls -1 croft-*.tar.gz | wc -l | tr -d ' ')
+          if [ "$count" -ne 4 ]; then
+            echo "expected 4 archives, found $count:"
+            ls -1
+            exit 1
+          fi
+          sha256sum croft-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          # The sums must verify here, on a different machine from the one
+          # that produced them, or the artifact was corrupted in transit.
+          sha256sum -c SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          notes="src/release_notes/$version.md"
+          if [ -f "$notes" ]; then
+            gh release create "$tag" --title "$tag" --notes-file "$notes" \
+              dist/croft-*.tar.gz dist/SHA256SUMS
+          else
+            # Every shipped version has a notes file by the release-hygiene
+            # gate, so a missing one means the tag does not match any version
+            # that went through it. Say so rather than inventing a body.
+            echo "no src/release_notes/$version.md for tag $tag" >&2
+            exit 1
+          fi
