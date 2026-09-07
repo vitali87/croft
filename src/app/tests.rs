@@ -37947,6 +37947,121 @@ fn entering_zen_mode_cancels_a_pending_collapse_rather_than_deferring_it() {
     assert!(app.show_tree, "so the restored sidebar stays up");
 }
 
+/// A checker that failed to RUN must not read as a clean project (#256).
+///
+/// `tsc` prints global errors (`error TS5023: Unknown compiler option`)
+/// with no `file(line,col)` prefix, so no matcher claims them and the row
+/// count is zero - which is exactly what a clean project looks like.
+/// Reporting "no problems" there tells the user their code is fine when the
+/// checker never checked it. The exit status is the only thing separating
+/// the two, which is why it cannot simply be ignored.
+#[cfg(unix)]
+#[test]
+fn a_project_checker_that_failed_to_run_does_not_report_a_clean_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // A failed invocation: non-zero exit, output no matcher claims.
+    app.finish_project_check_for_test(
+        tmp.path(),
+        "error TS5023: Unknown compiler option '--nosuchflag'.\n",
+        "",
+        false,
+    );
+    assert!(
+        app.status.contains("failed"),
+        "an invocation failure must say so, got {:?}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("no problems"),
+        "and must NOT read as a clean project, got {:?}",
+        app.status
+    );
+    assert!(
+        app.status.contains("TS5023"),
+        "naming the reason, got {:?}",
+        app.status
+    );
+
+    // npx puts its refusal on stderr instead.
+    app.finish_project_check_for_test(
+        tmp.path(),
+        "",
+        "This is not the tsc command you are looking for\n",
+        false,
+    );
+    assert!(
+        app.status.contains("not the tsc command"),
+        "stderr is used when stdout is empty, got {:?}",
+        app.status
+    );
+
+    // A genuinely clean project: zero rows AND a zero exit.
+    app.finish_project_check_for_test(tmp.path(), "", "", true);
+    assert_eq!(
+        app.status, "Whole-project check: no problems",
+        "a real clean run still reports clean"
+    );
+}
+
+/// The sweep's status counts ITS OWN findings, not the whole panel (#256).
+///
+/// `problems.total_count()` is the panel's projection: it mixes in every
+/// language server's diagnostics and every pane's build output, and the
+/// Open Files scope filters it. Under that scope a sweep whose findings are
+/// all in unopened files would have reported "no problems" - defeating the
+/// one thing the feature exists to do.
+#[cfg(unix)]
+#[test]
+fn the_project_check_count_is_its_own_not_the_panels() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let swept = tmp.path().join("swept.ts");
+    let other = tmp.path().join("other.rs");
+    std::fs::write(&swept, "export const x: string = 1;\n").unwrap();
+    std::fs::write(&other, "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // An unrelated language-server diagnostic is already in the panel.
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rust-analyzer"),
+        vec![diag(0, 4, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(other.clone(), by_server);
+
+    app.finish_project_check_for_test(
+        tmp.path(),
+        "swept.ts(1,14): error TS2322: Type 'number' is not assignable.\n",
+        "",
+        false,
+    );
+    assert_eq!(
+        app.status, "Whole-project check: 1 problem",
+        "the sweep found one; the LSP's row is not its to count"
+    );
+    assert!(
+        app.problems.total_count() > 1,
+        "staging check: the panel really does hold more than the sweep's row"
+    );
+
+    // Under Open Files the panel hides the unopened file - the count must
+    // not follow it down, or the sweep reports nothing it just found.
+    app.problems.scope = crate::widgets::problems::ProblemScope::OpenFiles;
+    app.rebuild_problems();
+    app.finish_project_check_for_test(
+        tmp.path(),
+        "swept.ts(1,14): error TS2322: Type 'number' is not assignable.\n",
+        "",
+        false,
+    );
+    assert_eq!(
+        app.status, "Whole-project check: 1 problem",
+        "the scope filters the PANEL, not what the sweep found"
+    );
+}
+
 /// "Problems: Check Whole Project" puts a whole-project checker's findings
 /// into PROBLEMS for files nobody opened, and a re-run REPLACES them (#256).
 ///
