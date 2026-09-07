@@ -144,6 +144,8 @@ pub enum Command {
     ToggleMinimap,
     /// Run the whole-project checker and put its findings in PROBLEMS (#256).
     ProblemsCheckProject,
+    /// Cycle whether that check may run WITHOUT being asked (#256).
+    ProblemsToggleProjectAuto,
     ProblemsToggleScope,
     DiffToggleIgnoreWhitespace,
     NewTerminal,
@@ -365,6 +367,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleTerminal,
     Command::ToggleMinimap,
     Command::ProblemsCheckProject,
+    Command::ProblemsToggleProjectAuto,
     Command::ProblemsToggleScope,
     Command::DiffToggleIgnoreWhitespace,
     Command::NewTerminal,
@@ -552,6 +555,9 @@ impl Command {
             Command::ToggleTerminal => "View: Toggle Terminal",
             Command::ToggleMinimap => "View: Toggle Minimap",
             Command::ProblemsCheckProject => "Problems: Check Whole Project",
+            Command::ProblemsToggleProjectAuto => {
+                "Problems: Whole-Project Check Auto-Run (Auto / On / Off)"
+            }
             Command::ProblemsToggleScope => "Problems: Toggle Scope (Open Files / Whole Project)",
             Command::DiffToggleIgnoreWhitespace => "Diff: Toggle Ignore Whitespace",
             Command::NewTerminal => "Terminal: Create New Terminal",
@@ -742,6 +748,7 @@ impl Command {
             Command::ToggleTerminal => "Ctrl+J",
             Command::ToggleMinimap => "Cmd+Opt+M",
             Command::ProblemsCheckProject => "",
+            Command::ProblemsToggleProjectAuto => "",
             Command::ProblemsToggleScope => "",
             Command::DiffToggleIgnoreWhitespace => "",
             Command::NewTerminal => "Cmd+T",
@@ -939,6 +946,7 @@ impl Command {
             Command::ToggleTerminal => "toggle_terminal",
             Command::ToggleMinimap => "toggle_minimap",
             Command::ProblemsCheckProject => "problems_check_project",
+            Command::ProblemsToggleProjectAuto => "problems_toggle_project_auto",
             Command::ProblemsToggleScope => "problems_toggle_scope",
             Command::DiffToggleIgnoreWhitespace => "diff_toggle_ignore_whitespace",
             Command::NewTerminal => "new_terminal",

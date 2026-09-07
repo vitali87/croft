@@ -38119,6 +38119,239 @@ fn the_project_check_count_is_its_own_not_the_panels() {
     );
 }
 
+/// The sweep's auto-enable is capped by workspace size, and the setting
+/// overrides the cap in both directions (#256, criterion 5).
+///
+/// `auto` is a size question, so it has to be answered by counting - but
+/// counting a giant tree to decide not to walk a giant tree is the cost the
+/// cap exists to avoid. `workspace_exceeds` stops at the threshold rather
+/// than completing the walk, so the answer costs at most `limit + 1`
+/// entries however large the root is.
+#[test]
+fn the_sweep_auto_enables_only_under_the_file_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    for i in 0..12 {
+        std::fs::write(tmp.path().join(format!("f{i}.ts")), "export const x = 1;\n").unwrap();
+    }
+
+    // Under the cap: auto enables.
+    assert!(
+        !App::workspace_exceeds(tmp.path(), 100),
+        "12 files is under a cap of 100"
+    );
+
+    // The exact boundary, both sides. "Exceeds" means strictly more, so a
+    // root holding exactly `limit` files does NOT exceed it - without this
+    // pair, `>` and `>=` are indistinguishable and the doc comment's claim
+    // is unverified.
+    assert!(
+        !App::workspace_exceeds(tmp.path(), 12),
+        "exactly 12 files does not exceed a cap of 12"
+    );
+    assert!(
+        App::workspace_exceeds(tmp.path(), 11),
+        "12 files exceeds a cap of 11"
+    );
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), "auto", 100),
+        "auto enables under the cap"
+    );
+
+    // Over the cap: auto declines.
+    assert!(
+        App::workspace_exceeds(tmp.path(), 5),
+        "12 files exceeds a cap of 5"
+    );
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), "auto", 5),
+        "auto declines over the cap"
+    );
+
+    // The setting overrides the count in BOTH directions - a cap that only
+    // ever said no would make `on` meaningless on the roots that need it.
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), "on", 5),
+        "`on` runs on a root the cap would have declined"
+    );
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), "off", 100),
+        "`off` declines a root the cap would have allowed"
+    );
+
+    // An unrecognised value reads as `auto` rather than silently enabling a
+    // sweep on a monorepo: a typo must not cost more than it saves.
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), "definitely-not-a-mode", 5),
+        "an unknown setting falls back to auto, which declines here"
+    );
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), "definitely-not-a-mode", 100),
+        "and to auto's yes under the cap, not a blanket no"
+    );
+}
+
+/// A check that warrants no hint does not spend the one-shot (#256).
+///
+/// The flag was set when a check STARTED, so any run under `on`, `off`, or
+/// an under-cap `auto` consumed the only hint opportunity and a later
+/// oversized `auto` run stayed silent forever. It is now set where the hint
+/// is received, which is the only point that knows one was warranted.
+#[cfg(unix)]
+#[test]
+fn a_check_that_warrants_no_hint_does_not_spend_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // A run that produces no hint: the flag must stay unspent.
+    app.queue_project_check_result_for_test(tmp.path(), "", "", true);
+    app.sync_explorer_panels();
+    assert!(
+        !app.project_check_hinted_for_test(),
+        "a check with no hint must not consume the one-shot"
+    );
+
+    // A later run that DOES warrant one still gets it.
+    app.send_project_hint_for_test();
+    app.queue_project_check_result_for_test(tmp.path(), "", "", true);
+    app.sync_explorer_panels();
+    assert!(
+        app.status.contains("too large"),
+        "the hint the earlier run would have eaten still arrives: {:?}",
+        app.status
+    );
+    assert!(
+        app.project_check_hinted_for_test(),
+        "and NOW the one-shot is spent"
+    );
+}
+
+/// The size hint survives a result landing in the same tick (#256).
+///
+/// Both drains run in one `sync_explorer_panels` body with no paint
+/// between them, and the result sets `status` unconditionally. Writing the
+/// hint before it DESTROYED the hint rather than deprioritising it - and
+/// the hint is one-shot, so it never returned. The fast-failure path (an
+/// over-cap root with no compiler installed) is exactly where the checker
+/// finishes inside a single tick.
+#[cfg(unix)]
+#[test]
+fn the_size_hint_is_not_erased_by_a_result_in_the_same_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Both messages in flight before ONE drain, which is the race. Driven
+    // through `sync_explorer_panels` rather than the direct-drain helper:
+    // the hint logic lives in that function, so calling `drain_project_check`
+    // itself would test a path the app never takes.
+    app.send_project_hint_for_test();
+    app.queue_project_check_result_for_test(tmp.path(), "", "", true);
+    app.sync_explorer_panels();
+
+    assert!(
+        app.status.contains("no problems"),
+        "the outcome the user asked for still leads: {:?}",
+        app.status
+    );
+    assert!(
+        app.status.contains("too large"),
+        "and the one-shot hint survives rather than being overwritten: {:?}",
+        app.status
+    );
+}
+
+/// The cap hints ONCE per session, and only under `auto` (#256).
+///
+/// The hint is the cap's user-visible half: an explicit sweep still runs on
+/// a huge root, but the user is told once that automatic runs will not
+/// start. Repeating it every sweep would train them to ignore the status
+/// line, and showing it under `on` would contradict the setting they chose.
+#[test]
+fn the_size_hint_fires_once_and_only_under_auto() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // `on` means run regardless of size, so a size hint would contradict it.
+    app.problems_project_scope = String::from("on");
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), &app.problems_project_scope, 0),
+        "`on` runs even against a zero-file cap"
+    );
+
+    // `off` never auto-runs, so the size is not the reason - no hint either.
+    app.problems_project_scope = String::from("off");
+    assert!(!App::project_check_auto_enabled(
+        tmp.path(),
+        &app.problems_project_scope,
+        usize::MAX
+    ));
+
+    // Only `auto` makes size the deciding factor. The root needs a file for
+    // a cap of 0 to be EXCEEDED - an empty tree does not exceed zero, and
+    // asserting against one would have passed for the wrong reason.
+    std::fs::write(tmp.path().join("a.ts"), "export const a = 1;\n").unwrap();
+    app.problems_project_scope = String::from("auto");
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), "auto", 0),
+        "auto declines when the root exceeds the cap"
+    );
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), "auto", usize::MAX),
+        "and enables under it - the paired case, so the line above cannot \
+         pass by the predicate always saying no"
+    );
+
+    // Config values are normalised like the sibling pref: a hand-edited
+    // "Off " must mean off, not a size-dependent maybe.
+    assert_eq!(App::project_scope_mode(" Off "), "off");
+    assert_eq!(App::project_scope_mode("ON"), "on");
+    assert_eq!(App::project_scope_mode("always"), "on");
+    assert_eq!(App::project_scope_mode("never"), "off");
+    assert_eq!(
+        App::project_scope_mode("wat"),
+        "auto",
+        "an unknown value is auto, never on"
+    );
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), " Off ", usize::MAX),
+        "a padded, capitalised off is honoured rather than read as auto"
+    );
+}
+
+/// Counting stops at the threshold instead of walking the whole tree
+/// (#256, criterion 5).
+///
+/// Pinned by making the tree far larger than the cap and asserting the
+/// answer arrives anyway: a full walk of a deep tree is the thing the cap
+/// is protecting against, so a cap that walks it has already lost.
+#[test]
+fn the_threshold_check_stops_counting_at_the_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 500 files against a cap of 3.
+    for d in 0..10 {
+        let dir = tmp.path().join(format!("d{d}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..50 {
+            std::fs::write(dir.join(format!("f{i}.ts")), "x\n").unwrap();
+        }
+    }
+    assert!(App::workspace_exceeds(tmp.path(), 3), "500 files exceeds 3");
+
+    // Ignored directories do not count toward the cap: node_modules alone
+    // would put every JS project over it, which would disable the sweep for
+    // exactly the projects the feature is for.
+    let clean = tempfile::tempdir().unwrap();
+    let heavy = clean.path().join("node_modules").join("pkg");
+    std::fs::create_dir_all(&heavy).unwrap();
+    for i in 0..200 {
+        std::fs::write(heavy.join(format!("m{i}.js")), "x\n").unwrap();
+    }
+    std::fs::write(clean.path().join("a.ts"), "export const a = 1;\n").unwrap();
+    assert!(
+        !App::workspace_exceeds(clean.path(), 10),
+        "node_modules is not the user's code and must not trip the cap"
+    );
+}
+
 /// "Problems: Check Whole Project" puts a whole-project checker's findings
 /// into PROBLEMS for files nobody opened, and a re-run REPLACES them (#256).
 ///
