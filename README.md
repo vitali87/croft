@@ -50,6 +50,29 @@ Then open a new terminal â€” or run `. "$HOME/.cargo/env"` in the current one â€
 
 ## Install
 
+Prebuilt binaries, no toolchain and no compile:
+
+```bash
+cargo binstall croft-software
+```
+
+`cargo binstall` itself needs installing once (`cargo install cargo-binstall`,
+or a prebuilt from [its releases](https://github.com/cargo-bins/cargo-binstall#installation)).
+
+That downloads the tagged release for your platform (macOS arm64/x86_64, Linux
+musl arm64/x86_64) and puts `croft` on `PATH` in seconds.
+
+Every release also carries a `SHA256SUMS` covering all four archives, so a
+download can be verified independently. It lists every archive, so check only
+the one you fetched rather than running it whole:
+
+```bash
+grep "croft-aarch64-apple-darwin.tar.gz" SHA256SUMS | sha256sum -c -
+# macOS: grep "..." SHA256SUMS | shasum -a 256 -c -
+```
+
+To build from source instead:
+
 ```bash
 cargo install croft-software --locked
 ```

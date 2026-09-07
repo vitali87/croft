@@ -1,11 +1,26 @@
 [package]
 name = "croft-software"
-version = "0.1.924"
+version = "0.1.925"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
 repository = "https://github.com/vitali87/croft"
 homepage = "https://croft.software"
+
+# Prebuilt binaries for `cargo binstall croft-software` (#376). The release
+# workflow publishes one tar.gz per target holding a single `croft` at the
+# root of a directory named for the target, so the template and `bin-dir`
+# below must stay in step with .github/workflows/release.yml's Package step:
+# they are two halves of one contract and nothing checks them against each
+# other at build time.
+#
+# `{ name }` is the CRATE name (croft-software) and `{ bin }` the binary
+# (croft); the archives are named for the binary, which is why the template
+# spells `croft-` literally rather than interpolating `{ name }`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/croft-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "croft-{ target }/{ bin }{ binary-ext }"
 
 # The binary stays `croft` — the package is the suite name, the command is
 # the tool. `cargo install croft-software` puts `croft` on PATH.
