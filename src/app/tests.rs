@@ -10530,7 +10530,21 @@ fn a_graph_refresh_swallowed_by_an_inflight_fetch_refires_when_the_reply_drains(
     app.refresh_commit_graph();
     // The stale reply lands: dropped by the root tag.
     app.graph_tx
-        .send((std::path::PathBuf::from("/since-left/root"), Vec::new()))
+        .send((
+            std::path::PathBuf::from("/since-left/root"),
+            None,
+            Vec::new(),
+        ))
+        .unwrap();
+    // And one for the RIGHT root but the wrong view (#348): a history reply
+    // arriving while a lane diff is up must be dropped too, or a background
+    // refresh would silently replace the diff the user asked for.
+    app.graph_tx
+        .send((
+            app.active_scm_root.clone(),
+            Some(String::from("a..b")),
+            Vec::new(),
+        ))
         .unwrap();
     // The re-fire is the contract, but the inflight latch is transient: the
     // drain that re-fires can also drain the re-fired worker's reply in the
@@ -45080,6 +45094,7 @@ fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
                     path: lane_dir.display().to_string(),
                     branch: String::from("agent/fix-login"),
                     agent: Some(String::from("probe")),
+                    base: None,
                 }),
             },
             crate::terminal_session::PaneRecord {
@@ -45090,6 +45105,7 @@ fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
                     path: tmp.path().join("repo-gone").display().to_string(),
                     branch: String::from("agent/gone"),
                     agent: Some(String::from("probe")),
+                    base: None,
                 }),
             },
         ],
@@ -45157,6 +45173,7 @@ fn a_restored_lane_pane_spawns_in_its_worktree_not_where_the_shell_had_wandered(
         path: lane_dir.display().to_string(),
         branch: String::from("agent/fix-login"),
         agent: Some(String::from(agent)),
+        base: None,
     };
     let rec = crate::terminal_session::SessionRecord {
         panes: vec![
@@ -45459,6 +45476,7 @@ fn a_lanes_badge_follows_the_seat_and_a_seated_pane_outranks_a_plain_one() {
             path: lane.display().to_string(),
             branch: String::from("agent/fix-login"),
             agent: None,
+            base: None,
         },
     );
     app.terminals.push(plain);
@@ -45576,6 +45594,7 @@ fn two_lanes_sharing_a_branch_are_named_by_their_folders_instead() {
                 path: dir.display().to_string(),
                 branch: String::from("agent/fix"),
                 agent: None,
+                base: None,
             },
         );
     }

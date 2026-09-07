@@ -2362,6 +2362,17 @@ type PendingTestDebug = (
     PathBuf,
 );
 
+/// A COMMITS graph reply: the root and revspec it answers, and the rows.
+/// Tagged rather than bare so a reply for a since-left root or a superseded
+/// view is discarded on drain (#348).
+type GraphReply = (
+    PathBuf,
+    Option<String>,
+    Vec<crate::widgets::commit_graph::GraphRow>,
+);
+type GraphReplyRx = std::sync::mpsc::Receiver<GraphReply>;
+type GraphReplyTx = std::sync::mpsc::Sender<GraphReply>;
+
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
@@ -2373,8 +2384,16 @@ pub struct App {
     /// Background `git log --topo-order` + lane layout for the COMMITS
     /// section, tagged by the root it describes so a stale reply after a
     /// Make Root is ignored on drain.
-    graph_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::widgets::commit_graph::GraphRow>)>,
-    graph_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::widgets::commit_graph::GraphRow>)>,
+    graph_rx: GraphReplyRx,
+    graph_tx: GraphReplyTx,
+    /// What the COMMITS panel is currently showing: `None` for the root's
+    /// own history, `Some("base..lane")` for a worktree lane's diff (#348).
+    ///
+    /// The reply tag carries this too, so a history refresh landing while a
+    /// lane diff is up is discarded rather than replacing it - the panel
+    /// already discarded replies for a since-left ROOT, and this is the same
+    /// rule at the resolution the lane diff needs.
+    graph_revspec: Option<String>,
     /// A graph fetch is running; suppresses duplicate spawns when a burst of
     /// StatusAndChanges responses lands. Cleared when the reply drains.
     graph_fetch_inflight: bool,
@@ -4440,6 +4459,7 @@ impl App {
             source_control,
             commit_graph: crate::widgets::commit_graph::CommitGraphPanel::new(),
             graph_rx,
+            graph_revspec: None,
             graph_tx,
             graph_fetch_inflight: false,
             graph_refetch_queued: false,
@@ -8727,9 +8747,9 @@ impl App {
             }
         }
         // Drain any COMMITS graph replies; ignore one for a since-left root.
-        while let Ok((root, rows)) = self.graph_rx.try_recv() {
+        while let Ok((root, revspec, rows)) = self.graph_rx.try_recv() {
             self.graph_fetch_inflight = false;
-            if root == self.active_scm_root {
+            if root == self.active_scm_root && revspec == self.graph_revspec {
                 self.commit_graph.set_rows(rows);
                 changed = true;
             }
@@ -19023,11 +19043,15 @@ impl App {
         self.graph_fetch_inflight = true;
         // The COMMITS section follows the active repo (#149).
         let root = self.active_scm_root.clone();
+        let revspec = self.graph_revspec.clone();
         let tx = self.graph_tx.clone();
         std::thread::spawn(move || {
-            let commits = crate::git::commit_graph(&root, 400);
+            let commits = match revspec.as_deref() {
+                Some(spec) => crate::git::branch_history_range(&root, spec, 400),
+                None => crate::git::commit_graph(&root, 400),
+            };
             let rows = crate::widgets::commit_graph::layout_graph(commits);
-            let _ = tx.send((root, rows));
+            let _ = tx.send((root, revspec, rows));
         });
     }
 
@@ -25662,6 +25686,7 @@ impl App {
                     .to_string(),
                 branch: lane.branch.clone(),
                 agent: if seated { agent.clone() } else { None },
+                base: lane.base.clone(),
             },
         );
         self.insert_terminal(term);
@@ -25886,6 +25911,47 @@ impl App {
     /// work, so this is the one place in the lane flow where being wrong
     /// destroys something rather than annoying someone — and the check fails
     /// closed, treating a tree git cannot report on as unsafe.
+    /// Point the COMMITS graph at `base..lane` for the active lane (#348).
+    ///
+    /// Uses `active_scm_root` like `close_worktree_lane` beside it, rather
+    /// than the primary: a lane is never index 0, and a sibling command that
+    /// silently switched which root it acted on is how that one destroyed a
+    /// lane in testing.
+    ///
+    /// Leaves the panel showing the diff until something else refreshes it -
+    /// the tag on the reply keeps a background history fetch from replacing
+    /// it, and returning to history is the ordinary refresh path.
+    fn diff_worktree_lane(&mut self) {
+        let lane = self.active_scm_root.clone();
+        if lane == self.roots.primary() {
+            self.status =
+                String::from("The primary folder is not a lane - open a file in the lane first");
+            return;
+        }
+        let Some(record) = self
+            .lane_panes
+            .values()
+            .find(|r| std::path::Path::new(&r.path) == lane)
+        else {
+            self.status = String::from("No lane is open for this folder");
+            return;
+        };
+        // A lane made before the base was recorded, or cut from a detached
+        // HEAD, has nothing to diff against. Say which rather than showing an
+        // empty graph that reads as "no commits".
+        let Some(base) = record.base.clone() else {
+            self.status = format!(
+                "Lane {} records no base branch to diff against",
+                record.branch
+            );
+            return;
+        };
+        let branch = record.branch.clone();
+        self.graph_revspec = Some(format!("{base}..{branch}"));
+        self.refresh_commit_graph();
+        self.status = format!("COMMITS: {branch} against {base}");
+    }
+
     fn close_worktree_lane(&mut self) {
         // The ACTIVE root, not the primary. `workspace_root()` is
         // `roots.primary()`, and a lane is appended by `add_workspace_folder`
@@ -34341,6 +34407,7 @@ impl App {
                 ))
             }
             Cmd::NewWorktreeLane => self.open_new_lane_prompt(),
+            Cmd::DiffWorktreeLane => self.diff_worktree_lane(),
             Cmd::CloseWorktreeLane => self.close_worktree_lane(),
             Cmd::MarkAgentFileReviewed => {
                 match self.editor.path.clone() {

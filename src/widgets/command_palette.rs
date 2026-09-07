@@ -206,6 +206,7 @@ pub enum Command {
     NewWorktreeLane,
     /// Remove the current worktree lane, refusing when it is dirty (#348).
     CloseWorktreeLane,
+    DiffWorktreeLane,
     /// Mark every file every agent changed as reviewed (#345).
     MarkAgentLaneReviewed,
     /// Summarise each agent's review queue (#345).
@@ -406,6 +407,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleSessionRecording,
     Command::NewWorktreeLane,
     Command::CloseWorktreeLane,
+    Command::DiffWorktreeLane,
     Command::MarkAgentLaneReviewed,
     Command::ShowAgentLane,
     Command::MarkAgentFileReviewed,
@@ -592,6 +594,7 @@ impl Command {
             Command::ToggleSessionRecording => "Session: Record Terminal as Asciicast",
             Command::NewWorktreeLane => "Agent: New Worktree Lane",
             Command::CloseWorktreeLane => "Agent: Close Worktree Lane",
+            Command::DiffWorktreeLane => "Agent: Diff Lane Against Its Base",
             Command::MarkAgentLaneReviewed => "Agents: Mark Changed Files Reviewed",
             Command::ShowAgentLane => "Agents: Show Changed Files",
             Command::MarkAgentFileReviewed => "Agents: Mark This File Reviewed",
@@ -780,6 +783,10 @@ impl Command {
             Command::ToggleSessionRecording => "",
             Command::NewWorktreeLane => "Cmd+K Shift+L",
             Command::CloseWorktreeLane => "",
+            // No chord: the lane commands that have one are the ones you
+            // reach mid-flow; a diff is deliberate and the palette is where
+            // you go for it.
+            Command::DiffWorktreeLane => "",
             Command::MarkAgentLaneReviewed => "",
             Command::ShowAgentLane => "",
             Command::MarkAgentFileReviewed => "",
@@ -965,6 +972,7 @@ impl Command {
             Command::ToggleSessionRecording => "session_toggle_recording",
             Command::NewWorktreeLane => "agent_new_worktree_lane",
             Command::CloseWorktreeLane => "agent_close_worktree_lane",
+            Command::DiffWorktreeLane => "diff_worktree_lane",
             Command::MarkAgentLaneReviewed => "agents_mark_reviewed",
             Command::ShowAgentLane => "agents_show_lane",
             Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",
