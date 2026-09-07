@@ -25976,6 +25976,13 @@ impl App {
         // The diff outlives the lane otherwise: `remove_workspace_folder`
         // re-seeds the primary, and its COMMITS panel is then stuck on a
         // range whose right side no longer resolves.
+        //
+        // Cleared BEFORE the refusals, not in the success arm: `git worktree
+        // remove` can still fail after `lane_removal_block` passed (a locked
+        // worktree, below), and that arm returns too. On a refusal the rows
+        // already drawn outlive the clear until the next refresh, which is
+        // correct - they are still this lane's commits, and the lane is
+        // still here.
         self.graph_revspec = None;
         if let Some(why) = crate::git::lane_removal_block(&lane) {
             self.status = format!("Keeping the lane: {why}");
