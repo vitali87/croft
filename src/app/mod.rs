@@ -8251,6 +8251,13 @@ impl App {
         let _ = self.project_check_tx.send((cwd.to_path_buf(), Ok(out)));
     }
 
+    /// Whether the session's one-shot size hint has been spent (#256).
+    /// Test-only reader; the field is private.
+    #[cfg(all(test, unix))]
+    pub(crate) fn project_check_hinted_for_test(&self) -> bool {
+        self.project_check_hinted
+    }
+
     /// Queue a size hint on the REAL channel (#256). Test-only.
     ///
     /// Does not drain: the point is to have it in flight when the result
@@ -9072,6 +9079,11 @@ impl App {
         // fast-failure path (over-cap root, no compiler installed) is
         // exactly where that happened.
         let hinted_now = self.project_hint_rx.try_recv().is_ok();
+        if hinted_now {
+            // Here, not at the spawn: only a hint that was actually WARRANTED
+            // spends the one-shot.
+            self.project_check_hinted = true;
+        }
         // A whole-project check finished: its rows and its verdict land
         // together, so the status cannot describe a different run's result.
         if self.drain_project_check() {
@@ -34953,8 +34965,13 @@ impl App {
                         let root_for_thread = root.clone();
                         let mode = self.problems_project_scope.clone();
                         let hint_tx = self.project_hint_tx.clone();
+                        // NOT set here: this fires for every explicit check,
+                        // so a run under `on`, `off`, or an under-cap `auto`
+                        // would consume the one-shot and a later oversized
+                        // `auto` run would stay silent forever. The flag is
+                        // set where the hint is RECEIVED, which is the only
+                        // point that knows one was warranted.
                         let hinted = self.project_check_hinted;
-                        self.project_check_hinted = true;
                         std::thread::spawn(move || {
                             // The cap's one-time hint (#256 criterion 5).
                             // Computed HERE, on the thread already spawned

@@ -38190,6 +38190,41 @@ fn the_sweep_auto_enables_only_under_the_file_threshold() {
     );
 }
 
+/// A check that warrants no hint does not spend the one-shot (#256).
+///
+/// The flag was set when a check STARTED, so any run under `on`, `off`, or
+/// an under-cap `auto` consumed the only hint opportunity and a later
+/// oversized `auto` run stayed silent forever. It is now set where the hint
+/// is received, which is the only point that knows one was warranted.
+#[cfg(unix)]
+#[test]
+fn a_check_that_warrants_no_hint_does_not_spend_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // A run that produces no hint: the flag must stay unspent.
+    app.queue_project_check_result_for_test(tmp.path(), "", "", true);
+    app.sync_explorer_panels();
+    assert!(
+        !app.project_check_hinted_for_test(),
+        "a check with no hint must not consume the one-shot"
+    );
+
+    // A later run that DOES warrant one still gets it.
+    app.send_project_hint_for_test();
+    app.queue_project_check_result_for_test(tmp.path(), "", "", true);
+    app.sync_explorer_panels();
+    assert!(
+        app.status.contains("too large"),
+        "the hint the earlier run would have eaten still arrives: {:?}",
+        app.status
+    );
+    assert!(
+        app.project_check_hinted_for_test(),
+        "and NOW the one-shot is spent"
+    );
+}
+
 /// The size hint survives a result landing in the same tick (#256).
 ///
 /// Both drains run in one `sync_explorer_panels` body with no paint
