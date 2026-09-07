@@ -280,10 +280,15 @@ fn which(cmd: &str) -> Option<PathBuf> {
 
 /// Total pages in `pdf`. Returns None when no detector is available so the
 /// caller renders page 1 with no navigation rather than refusing the file.
-// Unbounded (#493): `pdfinfo` and `mdls` below each run with `.output()` on
-// the same frame-loop open path as the render, just before it. The
-// follow-up that moves the open off the frame loop covers them; until then
-// the pdftoppm runner is the shape to reuse.
+// Bounded (#493). These run on the frame-loop open path, just before the
+// render that `run_pdftoppm` already bounds, so an unbounded one parks the
+// editor exactly as a hung renderer would - one call earlier. `croft view`
+// makes that reachable from any pane.
+//
+// The budget is separate from and much smaller than the render's: reading a
+// page count is a header parse, not a rasterisation, so a `pdfinfo` still
+// running after this long is wedged rather than slow. Losing the count
+// degrades to the single-page path; it does not fail the open.
 pub fn detect_page_count(pdf: &Path) -> Option<u32> {
     if let Some(n) = page_count_via_pdfinfo(pdf) {
         return Some(n);
@@ -297,13 +302,9 @@ pub fn detect_page_count(pdf: &Path) -> Option<u32> {
 }
 
 fn page_count_via_pdfinfo(pdf: &Path) -> Option<u32> {
-    which("pdfinfo")?;
-    let out = Command::new("pdfinfo").arg(pdf).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    parse_pdfinfo_pages(&s)
+    let program = which("pdfinfo")?;
+    let out = run_bounded_stdout(&program, &[pdf], PDF_INFO_BUDGET)?;
+    parse_pdfinfo_pages(&out)
 }
 
 pub fn parse_pdfinfo_pages(out: &str) -> Option<u32> {
@@ -318,21 +319,64 @@ pub fn parse_pdfinfo_pages(out: &str) -> Option<u32> {
 }
 
 fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
-    let out = Command::new("mdls")
-        .args(["-raw", "-name", "kMDItemNumberOfPages"])
-        .arg(pdf)
-        .output()
+    let mdls = std::path::PathBuf::from("mdls");
+    let out = run_bounded_stdout(
+        &mdls,
+        &[
+            std::path::Path::new("-raw"),
+            std::path::Path::new("-name"),
+            std::path::Path::new("kMDItemNumberOfPages"),
+            pdf,
+        ],
+        PDF_INFO_BUDGET,
+    )?;
+    out.trim().parse::<u32>().ok()
+}
+
+/// Run `program` with a deadline and return its stdout, or `None` on timeout,
+/// spawn failure, or a non-UTF-8 read (#493).
+///
+/// The reader runs on its own thread and is never joined: a descendant the
+/// child left behind keeps the pipe's write end open, and a join would then
+/// wait on that descendant past the budget - on the success path too. This is
+/// the same reasoning `run_pdftoppm` records for its stderr drain.
+fn run_bounded_stdout(
+    program: &Path,
+    args: &[&Path],
+    budget: std::time::Duration,
+) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // Null, never inherited: the child must not touch croft's TTY.
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.trim().parse::<u32>().ok()
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let out = rx.recv_timeout(budget).ok();
+    let _ = child.kill();
+    let _ = child.wait();
+    out
 }
 
 /// How long one page render may take before the renderer is killed and the
 /// open reports a failure instead of parking the frame loop (#493).
 const PDF_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Deadline for the page-count probes (#493). Far below `PDF_RENDER_BUDGET`
+/// on purpose: `pdfinfo` and `mdls` parse a header rather than rasterise, so
+/// one still running after two seconds is wedged, not slow. Overrunning costs
+/// only the page count, and the viewer degrades to the single-page path.
+const PDF_INFO_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long a failed render's stderr is given to finish arriving after the
 /// exit was observed (#493). The settle poll reads it once it has been
@@ -1185,6 +1229,45 @@ mod tests {
 Title:          \nAuthor:         \nCreator:        \nProducer:       \n\
 Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
         assert_eq!(parse_pdfinfo_pages(sample), Some(12));
+    }
+
+    #[test]
+    /// The budget must actually fire (#493). Without a test that HANGS a
+    /// child, the bound is only shown on the path where the child exits on
+    /// its own - which is the path that never needed bounding.
+    ///
+    /// `sleep 30` against a 150ms budget: the call must return `None` in
+    /// well under the sleep, and the assertion on elapsed time is what
+    /// distinguishes "the deadline fired" from "the child happened to be
+    /// fast". Without the elapsed bound this test would also pass if
+    /// `recv_timeout` were removed entirely.
+    #[test]
+    fn a_hanging_probe_is_killed_at_the_budget_not_waited_on() {
+        let start = std::time::Instant::now();
+        let out = run_bounded_stdout(
+            std::path::Path::new("sleep"),
+            &[std::path::Path::new("30")],
+            std::time::Duration::from_millis(150),
+        );
+        let elapsed = start.elapsed();
+        assert!(out.is_none(), "a child that outruns the budget yields None");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the deadline must fire rather than wait out the child: took {elapsed:?}"
+        );
+    }
+
+    /// The paired presence case, so the refusal above cannot pass vacuously:
+    /// a child that finishes inside the budget still returns its stdout.
+    #[test]
+    fn a_quick_probe_returns_its_output() {
+        let out = run_bounded_stdout(
+            std::path::Path::new("echo"),
+            &[std::path::Path::new("Pages:          7")],
+            std::time::Duration::from_secs(5),
+        );
+        let out = out.expect("a child that exits in time yields its stdout");
+        assert_eq!(parse_pdfinfo_pages(&out), Some(7));
     }
 
     #[test]
