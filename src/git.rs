@@ -1008,6 +1008,18 @@ pub struct WorktreeLane {
     pub path: PathBuf,
     /// The branch created for the lane.
     pub branch: String,
+    /// The branch the lane was cut FROM, recorded at creation (#348).
+    ///
+    /// Not derivable later. `worktree add -b` takes no start-point, so the
+    /// lane forks from whatever HEAD was; git records that only in the
+    /// reflog, which is local, prunable and absent from a fresh clone — so a
+    /// lane made on one machine has no base to recover on another.
+    /// `merge-base` cannot help either: it needs the candidate, which is the
+    /// thing being asked for. Creation is the only moment the answer is free.
+    ///
+    /// `None` when HEAD was detached at creation, which has no branch name
+    /// to record and must not be guessed at.
+    pub base: Option<String>,
 }
 
 impl WorktreeLane {
@@ -1033,6 +1045,10 @@ impl WorktreeLane {
         Some(Self {
             path: parent.join(format!("{base}-{slug}")),
             branch: format!("agent/{slug}"),
+            // `plan` is pure - it runs no git. The base is filled in by
+            // `add_worktree_lane`, which is already running git and is the
+            // moment HEAD is still the branch being forked from.
+            base: None,
         })
     }
 }
@@ -1162,11 +1178,25 @@ fn run_git_mut(dir: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 /// Add `lane` as a worktree of `repo` on a new branch.
-pub fn add_worktree_lane(repo: &Path, lane: &WorktreeLane) -> Result<(), String> {
-    let Some(path) = lane.path.to_str() else {
+pub fn add_worktree_lane(repo: &Path, lane: &mut WorktreeLane) -> Result<(), String> {
+    let Some(path) = lane.path.to_str().map(str::to_owned) else {
         return Err(String::from("lane path is not valid UTF-8"));
     };
-    run_git_mut(repo, &["worktree", "add", "-b", &lane.branch, path])
+    // Read HEAD BEFORE creating the worktree, while it is still the branch
+    // the lane forks from, and record it (#348). Afterwards it is gone: see
+    // `WorktreeLane::base`.
+    lane.base = current_branch(repo);
+    run_git_mut(repo, &["worktree", "add", "-b", &lane.branch, &path])
+}
+
+/// The branch HEAD is on, or `None` when detached.
+///
+/// `--quiet` so a detached HEAD is an empty result rather than an error the
+/// caller has to distinguish from a failure.
+pub fn current_branch(root: &Path) -> Option<String> {
+    let out = run_git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok()?;
+    let name = out.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Remove `lane`'s worktree.
@@ -1200,6 +1230,21 @@ pub fn remove_worktree_lane(lane: &Path) -> Result<(), String> {
 /// Empty on any failure — no repo, no commits, no git — so the caller shows
 /// an empty state rather than an error, matching `commit_graph`.
 pub fn branch_history(root: &Path, limit: usize) -> Vec<GraphCommit> {
+    branch_history_range(root, "HEAD", limit)
+}
+
+/// [`branch_history`] over an explicit revision spec rather than `HEAD`.
+///
+/// Takes the spec as a string so a caller can pass a range: `base..lane`
+/// lists the commits a lane added and none of the base's, which is what
+/// "the branch's diff against the base" means for a worktree lane (#348).
+/// `HEAD` reproduces the unranged behaviour exactly, which is why
+/// `branch_history` is now a one-line call rather than a second copy of
+/// this body.
+///
+/// Empty on any failure, like its caller: an unknown revision is a git
+/// error, and the graph shows an empty state rather than an error row.
+pub fn branch_history_range(root: &Path, revspec: &str, limit: usize) -> Vec<GraphCommit> {
     let Some(path_str) = root.to_str() else {
         return Vec::new();
     };
@@ -1209,7 +1254,7 @@ pub fn branch_history(root: &Path, limit: usize) -> Vec<GraphCommit> {
             path_str,
             "log",
             "--first-parent",
-            "HEAD",
+            revspec,
             &format!("-n{limit}"),
             "--format=%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct",
         ])
@@ -3152,6 +3197,35 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().is_empty()
     }
 
+    /// The base is recorded at creation and is not derivable afterwards
+    /// (#348). Asserts against a branch the fixture NAMES, so a bug that
+    /// wrote a constant, or the lane's own branch, fails here rather than
+    /// looking plausible.
+    #[test]
+    fn a_lane_records_the_branch_it_was_cut_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        // A NON-default name, so passing "main"/"master" through cannot pass.
+        run_git_mut(p, &["checkout", "-b", "release-42"]).expect("branch");
+
+        let mut lane = WorktreeLane::plan(p, "parser work").expect("planned");
+        assert_eq!(lane.base, None, "plan is pure and reads no git");
+        add_worktree_lane(p, &mut lane).expect("git worktree add should succeed");
+
+        assert_eq!(
+            lane.base.as_deref(),
+            Some("release-42"),
+            "the lane records the branch HEAD was on, not a default"
+        );
+        assert_ne!(
+            lane.base.as_deref(),
+            Some(lane.branch.as_str()),
+            "the base is what it forked FROM, never the lane's own branch"
+        );
+        remove_worktree_lane(&lane.path).expect("cleanup");
+    }
+
     /// A lane round-trips through the real git commands (#348).
     ///
     /// Driven through `add_worktree_lane` / `remove_worktree_lane` rather
@@ -3164,10 +3238,10 @@ mod tests {
         let p = tmp.path();
         init_repo_with_commit(p);
 
-        let lane = WorktreeLane::plan(p, "parser work").expect("planned");
+        let mut lane = WorktreeLane::plan(p, "parser work").expect("planned");
         assert!(lane.path.starts_with(p.parent().unwrap()), "a sibling");
 
-        add_worktree_lane(p, &lane).expect("git worktree add should succeed");
+        add_worktree_lane(p, &mut lane).expect("git worktree add should succeed");
         assert!(lane.path.is_dir(), "the lane directory exists");
 
         // The branch really was created, and the lane is on it.
@@ -3186,7 +3260,7 @@ mod tests {
         // A second lane of the same name is refused by git rather than
         // silently reusing the branch.
         assert!(
-            add_worktree_lane(p, &lane).is_err(),
+            add_worktree_lane(p, &mut lane).is_err(),
             "a duplicate lane must fail rather than adopt the existing one"
         );
 
