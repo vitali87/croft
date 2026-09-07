@@ -292,7 +292,7 @@ A tree-sitter highlighted editor with a full write path, mouse-drag selection, n
 
 **Breadcrumbs and sticky scroll.** `EditorTabs` renders both. App pushes `breadcrumbs` and `sticky_lines` each frame from the outline scope chain, and `breadcrumb_target_at` / `sticky_line_at` map clicks to jumps. Crumbs are budgeted and advanced in display CELLS via `set_stringn`, so a CJK segment is neither overpainted by the next crumb nor mis-hit. The sticky band floats over content but stops above the caret's PAINTED row, read back out of the frame's own row layout so a collapsed fold or comment box between the top and the caret cannot make the band overshoot. A caret under the band cannot be painted at all, so `caret_floor_row` keeps the scroll from parking it there in the first place — dragging it to the first row the band does not cover, instead of to `scroll`, which had suppressed the band for the whole of a wheel scroll.
 
-### remote.rs
+### src/remote.rs
 
 Remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offer.
 
@@ -835,7 +835,7 @@ The curated MCP catalog, the AVAILABLE tier of the Extensions panel. Bundled `CA
 
 **Destructive actions need confirmation.** Add goes through the panel's +Add. Remove goes through the trash button or Delete, and both open a confirmation popup (`InputPurpose::ExtensionUninstall`, Enter uninstalls, Esc keeps), so a destructive action never fires from a single click or keypress.
 
-### client.rs
+### lsp/client.rs
 
 The async-lsp client wrapper. Its router forwards diagnostics and work-done progress (`$/progress`, for example rust-analyzer's "Indexing…") to the status bar, and acknowledges workspace refresh requests (`semanticTokens/refresh`, `inlayHint/refresh`) into shared re-pull flags the app polls.
 
@@ -1037,13 +1037,19 @@ The Run and Debug sidebar widget: an empty-state Run [filename] button, and when
 
 **Row mechanics.** A rejected expression renders `<not available>`, the `success:false` branch of `DapEvent::Evaluated`. Rows carry a right-edge remove `✕` with hit rects cleared per render, and the trailing "+ Add Expression" row and the palette's "Debug: Add Watch Expression" both open the input popup.
 
-### session.rs
+### dap/session.rs
 
 One launch session: the initialize -> setBreakpoints -> configurationDone -> stopped state machine, the event classifier, the stackTrace -> scopes -> variables inspection chain, `evaluate` (REPL, hover, watch), breakpoint-verification tracking, pause and reverse-request replies — all over one adapter-agnostic `launch_with`.
 
 **Conditional breakpoints and logpoints.** `SourceBreakpoint` carries `condition` and `log_message`. A logpoint's message is interpolated and printed by the adapter instead of pausing; it is set with Shift+Alt+F9 or the gutter menu and shows as an amber diamond in the gutter.
 
 **No vendored protocol types.** Requests are built from `Value`-based builders, and `AdapterKind` names the launch mechanisms.
+
+### src/session.rs
+
+Local session persistence. `croft attach` and `croft ls` run croft under the session host (`session_host.rs`) so terminals, LSP and DAP survive closing the window. Live legacy dtach sessions keep reattaching through dtach.
+
+**`ls` skips the collab relay socket.** The workspace's `<hash>.collab.sock` shares the directory and the keying but is not a session, so listing it printed a phantom row. Pruning it belongs to the relay's own bind path, not here.
 
 ### svg.rs
 
@@ -1095,6 +1101,184 @@ The navigator's local-model transport: one minimal Anthropic-compatible `/v1/mes
 
 **Keyed gateways.** `ANTHROPIC_AUTH_TOKEN` is read from the environment; a token is never persisted.
 
+
+### agent_lane.rs
+
+A per-agent ledger of the files an agent changed while you were looking elsewhere. While a pane's agent is `Working`, every workspace content event is attributed to it.
+
+**Each row carries a review baseline.** The baseline is an FNV-1a content hash taken at the last "mark reviewed", so a row leaves the queue only once its content has actually been seen. Reviewing is not dismissing.
+
+**Concurrent writes are attributed, not guessed.** A write while two agents work is attributed to BOTH and flagged `shared`. A write with no agent working belongs to the user and never enters a lane.
+
+### dap/reaper.rs
+
+Sweeps orphaned vscode-js-debug processes left behind when croft crashes or force-quits without running `Drop` — both the server and its detached watchdog, which setsids into its own session and so survives a group-kill. It runs async at startup and after each session teardown.
+
+**It kills only scripts under `~/.croft/js-debug` that have been reparented to init (pid 1).** That restriction is what keeps a live session from ever being touched.
+
+### dap/registry.rs
+
+A data-driven debug-adapter registry. It maps a file extension to an `AdapterKind` using the `[[debug_adapters]]` blocks in the bundled and user manifests, and skips adapters whose extension is disabled in the Extensions panel.
+
+**Manifest data replaced a hardcoded match.** It supersedes the old `adapter_for_extension` match, but only the mapping is data-driven: the launch mechanisms themselves stay native, like the PDF/CSV viewers.
+
+### docx.rs
+
+A read-only preview for docx and odt. Both are zip+XML, so the walker emits markdown — headings from styles and outline levels, bold/italic runs, list items, tables as pipe rows, and embedded pictures extracted hash-named into scratch — which the proven markdown builder then renders, reusing its styling, wrap, and inline-image overlay.
+
+**The preview stores its `doc_path`** so a theme switch can re-walk the file.
+
+**The text side is a stub.** Reopen as Text routes the zip container onward to the archive browser, and then to hex.
+
+**Structure fidelity, not layout**, with a 50MB source cap.
+
+### history.rs
+
+Local history: per-save snapshots under `~/.config/croft/history`, FNV-keyed with legacy-key migration, stored as raw bytes so any encoding round-trips, deduped and capped. It merges into the Explorer TIMELINE beside git commits (out-of-root files list snapshots only) and backs snapshot diff and restore. Recording runs off the render thread.
+
+**Saves inside a 10s merge window replace the newest entry**, the way VS Code's mergeWindow does.
+
+**A `<millis>.seats` JSON sidecar records who typed each line.** It is written and removed with its snapshot, and read back onto an unchanged file.
+
+### iterm2.rs
+
+iTerm2 plist mutation helpers for fonts and Croft key mappings.
+
+**User-keybinding forwarders are tracked in a ledger.** They are recorded in a root-plist ledger (`Croft User Keymap Forwarders`, key to hex) and swept on the next setup run before any inserts, but only while their value is still the exact croft forwarder. That way a chord deleted from `keybindings.json` releases its Cmd chord without destroying an entry the user has since rewired in iTerm2 prefs.
+
+### keymap.rs
+
+User key bindings from `~/.config/croft/keybindings.json`. It parses chord strings (ctrl/alt/shift/cmd/mod + key) into normalized Chords mapped to palette Command ids.
+
+**User chords are consulted at the top of `handle_key`, ahead of the built-in chords** — only off the terminal, and only for modifier/function-key chords.
+
+**The parser is tolerant JSONC** (it strips `//` comments), and it reloads on save.
+
+### lsp/config.rs
+
+Per-language LSP config for basedpyright, ruff, ty, vtsls, rust-analyzer and gopls. The `ServerConfig` factories are the executable spec that the bundled manifests reproduce.
+
+**Language is an open newtype — an interned `lsp_id`, not a closed enum** — so an extension can contribute a new language with no Rust change. Per-language data (extensions, root markers, family) lives in the language table.
+
+### lsp/install.rs
+
+Croft-managed server provisioning: lazy background installs into `~/.croft/servers` through three backends. npm covers vtsls, JSON/HTML/CSS, yaml and bash; uv covers ty and ruff, including the uv bootstrap, and is rerouted to Termux's `pkg` on Android; Binary covers clangd, taplo and rust-analyzer, downloading and unzipping or gunzipping a host-agnostic per-platform release binary, PATH-first including `~/.cargo/bin`.
+
+**A Binary can carry a `termux_pkg`.** On Android the glibc release can't run on bionic, so such a backend reroutes to `pkg`, as rust-analyzer does.
+
+### lsp/semantic_cache.rs
+
+A content-keyed disk cache of semantic-token batches at `~/.croft/sem-cache`.
+
+**Only a batch whose `seq` still matches the live buffer is applied OR stored.** A reply can sit in the request retry backoff while an external tool rewrites the file; decoding it over the new lines would both mis-colour the buffer and persist that result under the NEW content's key, replaying it on every future open.
+
+### mcp/registry.rs
+
+Data-driven MCP registration. `contributed_commands()` does eager palette registration and skips disabled entries; `resolve_command_in_dir()` is lazy, yielding a tool plus a spawnable server with a pinned `Provision`, with the app passing the config dir it carries. Both read the `[[commands]]` and `[[mcp_servers]]` manifests.
+
+**Viewers come from the same manifest path.** `contributed_viewer_commands_in_dir()` and `viewer_for_path_in_dir()` read `[[viewers]]`, which is a terminal program run on a file in its own pane.
+
+### media.rs
+
+An audio/video info view for `.mp3`, `.wav`, `.flac`, `.m4a`, `.mp4`, `.m4v` and `.mov`.
+
+**Pure-Rust header parsers over a bounded head read; streams are never decoded.** The parsers are the WAV fmt chunk, FLAC STREAMINFO, MP3 ID3v2 text tags plus the first MPEG frame with a size-based duration estimate, and an MP4/MOV mvhd + tkhd box walk.
+
+**The card renders as markdown through the preview machinery**, with `doc_path` and media flags driving theme rebuilds. Video gets a hash-named ffmpeg poster frame when the tool exists on PATH, following the pdftoppm optional-tool pattern.
+
+**Junk wearing a media extension falls through to the binary path.**
+
+### notifications.rs
+
+Notification sinks, configured under the `notifications` config key: one delivery worker fed by a bounded queue, pure request builders for ntfy and webhooks, and `termux-notification` and `command` sinks that pass the payload in `CROFT_*` environment variables.
+
+**Events arrive from three sources**: the finished-command drain, the OSC 9 drain, and the Test Explorer's once-per-run failed latch.
+
+### outline_syntax.rs
+
+The tree-sitter outline provider. It extracts the OUTLINE panel's symbol tree — functions, structs, methods, fields and so on — directly from the buffer's syntax tree using hand-written per-language queries.
+
+**Tree-sitter first, LSP second.** The panel paints instantly instead of waiting for a cold language server to answer `documentSymbol`; the LSP reply supersedes the syntax-tree outline when it arrives. This is the same approach Zed and aerial.nvim take. Rust, Python, JS, TS, TSX and Go are covered by queries; other languages fall back to the LSP outline.
+
+### src/output.rs
+
+The in-process OUTPUT bus behind the panel group's OUTPUT tab. It holds named channels — one per language server, plus Debug Adapter, Git, Server Provisioning and Navigator (the resident AI pair programmer's commentary) — each a capped ring buffer of levelled lines.
+
+**Producers push here and mirror to disk.** Code across the codebase writes to the bus while also mirroring to the on-disk `lsp.log`. A generation counter lets the widget re-pull only when something actually changed.
+
+### plot.rs
+
+`croft plot` reads numbers, CSV/TSV or JSON lines on stdin — delimiter and header auto-detected, with `--x`/`--y` picking columns — and draws them as a line, bar, spark or histogram chart.
+
+**Image output, with a text fallback.** An SVG in the theme's colours is rasterised through `svg.rs` and emitted with the previews' inline-image escape. iTerm2/Kitty are detected from the environment; the sixel probe needs a raw tty on stdin, which here is the data pipe. With no image protocol, or with `--text`, the same data renders as braille (line/spark) or block (bar/hist) characters.
+
+**Long series are bucketed to the pixel/dot width.** That keeps 10k rows linear.
+
+### prefs.rs
+
+Durable user preferences — color theme, Customize Layout chrome, format-on-save, auto-save — persisted at `~/.config/croft/config.json`. The searchable "Preferences: Open Settings" hub toggles these and links to the raw JSON.
+
+**`host_accents` dresses terminal panes per host.** Its rules ({pattern glob, accent hex, badge}) are compiled to globset matchers in the App and re-read whenever `config.json` is saved.
+
+### snippets.rs
+
+User snippets loaded from `~/.config/croft/snippets.json` in VS Code format: prefix, body as a string or array, and an optional language scope. It reloads on save.
+
+**`parse_body` turns tab-stop syntax into stops the editor drives.** A body's `$1`/`$0`/`${1:placeholder}` syntax becomes insert text plus ordered stops that the editor walks on Tab.
+
+**Snippets also reach the completion popup.** Matching snippets are injected as `CompletionItem.is_snippet` and expanded on accept — the same path LSP snippet completions take.
+
+### sqlite_view.rs
+
+A read-only SQLite browser. Every table becomes a worksheet in the existing sheet grid, so navigation, the cell cursor and Tab table-switching are all reused. Rows are capped at 500 with the true count shown in the sheet name, and cells are typed (NULL empty, blobs summarised). Files are routed both by extension and by the magic-byte sniff.
+
+**Read-only over the bundled sqlite3.** It opens with `SQLITE_OPEN_READONLY` over the BUNDLED sqlite3, so there is no system dependency, and a live application database is never locked, mutated, or created. Locked or corrupt files surface their error.
+
+### testing/failure_site.rs
+
+Works out where a failing test actually failed. It parses libtest panic lines (both the current and the pre-2023 shapes), pytest traceback frames, and jest/vitest stack frames down to a `file:line`.
+
+**Only locations in the user's own code count.** A location under `.cargo/registry`, `node_modules`, `site-packages` or the standard library is rejected rather than offered, because a breakpoint there fires before the interesting state exists.
+
+**The LAST location in a failure block wins.** Every runner prints outward-in.
+
+### testing/registry.rs
+
+A data-driven test-runner registry. It maps a workspace root to a Runner using the `[[test_runners]]` blocks in the bundled and user manifests, matching on marker files and/or `package.json` (dev)dependency names.
+
+**Manifests replaced a hardcoded ladder.** This supersedes the old hardcoded `runner_for` ladder, and it skips runners whose extension is disabled in the Extensions panel. The run mechanisms — commands, parsers, binary resolution — stay native, like the debug adapters.
+
+### widgets/dependencies.rs
+
+A collapsible, language-aware DEPENDENCIES section, offered as a ⋯-menu Explorer sub-view and display-only. It detects the workspace's package ecosystem(s) from manifest files at the root (`Cargo.toml`→Rust via `cargo metadata`, `pyproject.toml`/`requirements.txt`→Python, `package.json`→Node, `go.mod`→Go), resolves the packages off-thread, and labels the header for what it found ("RUST DEPENDENCIES" and so on).
+
+**Gated on detection.** A folder with no manifest shows no dependency view and drops it from the ⋯ menu. The App holds the detected ecosystems in `dep_ecosystems`, recomputed on every re-root.
+
+### widgets/editor_find.rs
+
+A VS Code-style inline Find bar (Cmd+F) with an active-match orange highlight, Enter / Shift+Enter to walk matches, and case-sensitive / whole-word / regex toggles. The Replace row (Cmd+Opt+F) adds Tab to switch field, Enter to replace-and-advance, and Cmd+Opt+Enter to replace all in one undo step.
+
+**Replace All uses the same enumeration as the display.** It walks matches via the same `split_for_highlight` that the count, paint and navigation use, so it never touches what the bar cannot show, and it recounts afterwards.
+
+**Regex replacements expand `$n` captures** plus VS Code's `\n`/`\t` escapes, where a replacement newline splits the line.
+
+### widgets/history_popup.rs
+
+The Ctrl+Shift+H command-history popup over `command_history.rs`: a query line with a caret, newest-first deduped results (green/red exit dot, plus duration, cwd and non-zero exit meta), and Ctrl+R to cycle the scope filter.
+
+**A pure widget.** The App runs the search on each edit and types the pick via `paste_input`.
+
+### widgets/output.rs
+
+The panel group's OUTPUT tab: a read-only viewer over the `output.rs` bus with a channel dropdown, a minimum-level filter, an RPC trace toggle, and a clear action. It renders the selected channel's level-coloured tail and auto-follows new lines until the user scrolls up.
+
+**The open dropdown windows its list when the channels outnumber the body rows** (`dropdown_scroll`). It opens at the current selection, the wheel and PageUp/Down scroll the window instead of the log, and a one-column scrollbar (click-to-jump) marks the truncation. Before this, overflow channels were unreachable by any gesture.
+
+### widgets/workspace_symbols.rs
+
+VS Code's "Go to Symbol in Workspace", reached with `#` in Quick Open. The query box's text fans out to every running server as `workspace/symbol`. Rows show a kind icon, the name and the workspace-relative path; Enter opens the file at the definition.
+
+**Requests are debounced per keystroke burst and keyed by request id,** so stale replies are dropped. Selection restarts at the top on each reply.
 
 ### File encoding
 

@@ -5,7 +5,7 @@ every finished command in a terminal pane runs through built-in matchers
 for rustc/cargo, tsc (both output shapes), gcc/clang and anything else
 using the `file:line:col: severity: message` shape, Python tracebacks
 (the deepest frame), and eslint's stylish format. Rerunning a command in
-a pane replaces that pane's entries, so a clean rebuild clears its
+a pane replaces that pane's previous entries, so a clean rebuild clears its
 errors.
 
 `matchers.json` extends that to tools croft does not know, and to watch
