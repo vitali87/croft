@@ -38017,6 +38017,69 @@ fn a_project_checker_that_failed_to_run_does_not_report_a_clean_project() {
     );
 }
 
+/// Each producer clears only ITS OWN rows from a shared file (#532).
+///
+/// `build_diagnostics` held one flat `Vec` per file, so a re-run removed the
+/// whole entry and took the other producer's rows with it - and
+/// `install_build_diags` recorded a path in `touched` only when the entry was
+/// empty, so the SECOND producer to reach a file never listed it and could
+/// not clear its rows at all. Two halves of one problem: rows did not carry
+/// who produced them.
+///
+/// #530 made this routine rather than rare: the whole-project sweep reports
+/// every file in the project, so it overlaps any pane build by default.
+#[cfg(unix)]
+#[test]
+fn each_producer_clears_only_its_own_rows_from_a_shared_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("shared.ts");
+    std::fs::write(&shared, "export const a = 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let line = |code: &str| format!("shared.ts(1,1): error {code}: boom.\n");
+
+    // Pane 1 reports the file, then the sweep reports it too.
+    app.apply_build_scan(1, Some(tmp.path()), "tsc", &line("TS1001"));
+    app.ingest_project_check(Some(tmp.path()), &line("TS2002"));
+    app.rebuild_problems();
+    let rows = |app: &App| -> Vec<String> {
+        app.problems
+            .groups()
+            .iter()
+            .filter(|g| g.path == shared)
+            .flat_map(|g| g.items.iter().map(|i| i.message.clone()))
+            .collect()
+    };
+    assert_eq!(
+        rows(&app).len(),
+        2,
+        "both producers' rows are on the shared file, got {:?}",
+        rows(&app)
+    );
+
+    // The SECOND producer re-runs clean. Its row must go; the pane's stays.
+    app.ingest_project_check(Some(tmp.path()), "");
+    app.rebuild_problems();
+    let after = rows(&app);
+    assert_eq!(
+        after.len(),
+        1,
+        "the sweep's row goes and the pane's remains, got {after:?}"
+    );
+    assert!(
+        after[0].contains("TS1001"),
+        "the surviving row is the PANE's, not the sweep's: {after:?}"
+    );
+
+    // And the reverse: the pane re-runs clean, leaving nothing.
+    app.apply_build_scan(1, Some(tmp.path()), "tsc", "");
+    app.rebuild_problems();
+    assert!(
+        rows(&app).is_empty(),
+        "with both producers clean the file has no rows, got {:?}",
+        rows(&app)
+    );
+}
+
 /// A file BOTH the sweep and a pane report is counted once, by whoever is
 /// reporting (#256).
 ///

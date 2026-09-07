@@ -3820,8 +3820,13 @@ pub struct App {
     pub git_output_log: Vec<String>,
     /// Build diagnostics from the problem matchers (#119): finished-command
     /// output scanned into PROBLEMS entries, keyed by resolved file path.
+    /// Paired with the producer that installed it (the pane uid, or
+    /// `PROJECT_CHECK_ID` for the whole-project sweep). Without the pairing
+    /// a re-run removed the whole entry and took the OTHER producer's rows
+    /// with it, and the second producer to reach a file could not clear its
+    /// own rows at all (#532).
     build_diagnostics:
-        std::collections::HashMap<PathBuf, Vec<crate::widgets::problems::ProblemItem>>,
+        std::collections::HashMap<PathBuf, Vec<(u64, crate::widgets::problems::ProblemItem)>>,
     /// Which files each terminal pane contributed, keyed by the pane's
     /// STABLE uid (Vec positions shift on close/insert/reorder), so a
     /// pane's next scanned command replaces its previous run's diagnostics
@@ -8522,7 +8527,15 @@ impl App {
         }
         if let Some(files) = self.build_diag_files_by_pane.remove(&pane) {
             for f in files {
-                self.build_diagnostics.remove(&f);
+                // Filter, never remove: another producer may hold rows on
+                // this same file, and dropping the entry took them too
+                // (#532). The entry goes only once nothing is left in it.
+                if let Some(rows) = self.build_diagnostics.get_mut(&f) {
+                    rows.retain(|(owner, _)| *owner != pane);
+                    if rows.is_empty() {
+                        self.build_diagnostics.remove(&f);
+                    }
+                }
             }
         }
         let base = cwd.unwrap_or(self.workspace_root()).to_path_buf();
@@ -8537,19 +8550,26 @@ impl App {
                 }
             };
             let entry = self.build_diagnostics.entry(path.clone()).or_default();
-            if entry.is_empty() {
+            // Unconditionally: recording only when the entry was empty meant
+            // the SECOND producer to reach a file never listed it, so its
+            // next run had nothing to clear (#532). `touched` is this
+            // producer's own file list, not a set of first-touchers.
+            if !touched.contains(&path) {
                 touched.push(path);
             }
-            entry.push(crate::widgets::problems::ProblemItem {
-                line: d.line,
-                col: d.col,
-                // Build tools report characters (rustc counts code points),
-                // not the UTF-16 units an LSP position carries.
-                col_utf16: false,
-                severity: d.severity,
-                message: d.message,
-                source: d.source.to_string(),
-            });
+            entry.push((
+                pane,
+                crate::widgets::problems::ProblemItem {
+                    line: d.line,
+                    col: d.col,
+                    // Build tools report characters (rustc counts code
+                    // points), not the UTF-16 units an LSP position carries.
+                    col_utf16: false,
+                    severity: d.severity,
+                    message: d.message,
+                    source: d.source.to_string(),
+                },
+            ));
         }
         self.build_diag_files_by_pane.insert(pane, touched);
         self.rebuild_problems();
@@ -8664,7 +8684,7 @@ impl App {
                 }
             }
             if let Some(build) = self.build_diagnostics.get(path) {
-                items.extend(build.iter().cloned());
+                items.extend(build.iter().map(|(_, item)| item.clone()));
             }
             if items.is_empty() {
                 continue;
