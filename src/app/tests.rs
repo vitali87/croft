@@ -42237,6 +42237,63 @@ fn no_overlay_is_emittable_before_the_first_frame() {
     );
 }
 
+/// Ctrl+B reaches the app running in a focused terminal instead of
+/// toggling the side bar (#304). Claude Code backgrounds a running
+/// command with it and has no other route to that gesture; croft's
+/// sidebar toggle keeps three.
+#[test]
+fn ctrl_b_belongs_to_the_app_in_a_focused_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    let before = app.show_tree;
+
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        app.show_tree, before,
+        "Ctrl+B in a focused terminal must not move the side bar"
+    );
+    // The byte has to ARRIVE, not merely fail to toggle. A guard that
+    // declined the toggle and then swallowed the key would satisfy the
+    // assertion above while delivering nothing -- which is the whole
+    // point of the change, so it is the thing to pin.
+    assert!(
+        app.terminals[app.active_terminal]
+            .written_bytes_for_test()
+            .contains(&0x02),
+        "Ctrl+B must reach the PTY as 0x02"
+    );
+
+    // Cmd+B is untouched, which is what keeps the side bar reachable from
+    // the terminal -- releasing the Ctrl form only costs a chord that has
+    // three other routes.
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_ne!(
+        app.show_tree, before,
+        "Cmd+B still toggles the side bar from the terminal"
+    );
+}
+
+/// The release is conditional on focus, not global (#304): the same
+/// chord keeps its croft meaning everywhere else, so the rule is about
+/// when the chord is unambiguous rather than a preference.
+#[test]
+fn ctrl_b_still_toggles_the_side_bar_outside_the_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    let before = app.show_tree;
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_ne!(
+        app.show_tree, before,
+        "with the editor focused, Ctrl+B is still croft's"
+    );
+}
+
 #[test]
 fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
     // The two gestures are orthogonal: entering maximize does not clear the
