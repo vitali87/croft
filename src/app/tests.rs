@@ -41763,6 +41763,71 @@ fn a_symbol_range_slices_exactly_its_source() {
     );
 }
 
+/// A symbol tab belongs to the file it was opened from (#369).
+///
+/// The range is BYTE offsets into one buffer. Navigating to another file
+/// left it attached, so `follow_symbol_tab_edit` then applied edits made in
+/// the NEW file against offsets from the old one - silently walking the
+/// range somewhere meaningless rather than reporting `Gone`. Nothing
+/// cleared it except a straddling edit, so it survived every jump.
+#[test]
+fn a_symbol_tab_does_not_follow_you_into_another_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn one() {\n    let x = 1;\n}\n").unwrap();
+    std::fs::write(&b, "fn two() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+
+    app.symbol_tab = Some((
+        String::from("fn one"),
+        a.clone(),
+        crate::symbol_range::SymbolRange::new(0, 27),
+    ));
+    assert!(app.symbol_tab.is_some(), "staging: a tab is open on a.rs");
+
+    // Navigating to another file must drop it: the range describes a.rs.
+    app.open_at_utf16(&b, 0, 0).unwrap();
+    assert!(
+        app.symbol_tab.is_none(),
+        "the symbol tab must not survive into a different file"
+    );
+
+    // Paired positive: reopening a.rs and a tab there still tracks edits, so
+    // the clear above is scoped to a file CHANGE rather than firing always.
+    // Navigating WITHIN the same file must NOT clear it: a go-to-definition
+    // that lands in the same file, or a Back jump, never left the buffer the
+    // range describes. Clearing unconditionally would fix the bug above and
+    // silently close the tab on every such jump - and it passes a test that
+    // only ever re-seeds the tab AFTER the navigation, which is why this
+    // seeds it BEFORE.
+    app.editor.open(&a).unwrap();
+    // Starting at 11, not 0: an insertion AT `start` is deliberately treated
+    // as inside (src/symbol_range.rs:86), so a range anchored at 0 has no
+    // "above" to test with and the paired case would assert the wrong rule.
+    app.symbol_tab = Some((
+        String::from("fn one"),
+        a.clone(),
+        crate::symbol_range::SymbolRange::new(11, 27),
+    ));
+    app.open_at_utf16(&a, 0, 0).unwrap();
+    assert!(
+        app.symbol_tab.is_some(),
+        "re-opening the tab's OWN file must not close it"
+    );
+    app.follow_symbol_tab_edit(0, 0, 4);
+    let (_, _, range) = app
+        .symbol_tab
+        .clone()
+        .expect("an insertion above still tracks");
+    assert_eq!(
+        (range.start, range.end),
+        (15, 31),
+        "an edit above shifts the whole range rather than clearing it"
+    );
+}
+
 /// #369: an open symbol tab follows edits, and closes when its symbol goes.
 ///
 /// The tab is a VIEW over a byte range rather than a copy, so an edit that

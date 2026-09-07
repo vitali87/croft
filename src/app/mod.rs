@@ -10761,6 +10761,21 @@ impl App {
     fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
         self.hover_popup = None;
         self.hover_diagnostic = None;
+        // A symbol tab's range is BYTE offsets into ONE buffer (#369), so it
+        // cannot survive a move to a different file: `follow_symbol_tab_edit`
+        // would then apply the new file's edits against the old file's
+        // offsets and walk the range somewhere meaningless rather than
+        // reporting `Gone`. Same reason the hover state above is dropped -
+        // per-file state does not travel. Cleared here rather than at each
+        // call site because `open_at` is the common path for all ten.
+        //
+        // Only on a CHANGE: reopening the file the tab belongs to is
+        // ordinary (go-to-definition within one file, a Back jump), and
+        // clearing then would close the tab for navigation that never left
+        // it.
+        if self.symbol_tab.as_ref().is_some_and(|(_, p, _)| p != path) {
+            self.symbol_tab = None;
+        }
         self.editor.open_preview(path)?;
         self.sync_open_file_poll_mtime();
         let row = row.min(self.editor.lines.len().saturating_sub(1));
