@@ -1182,11 +1182,15 @@ pub fn add_worktree_lane(repo: &Path, lane: &mut WorktreeLane) -> Result<(), Str
     let Some(path) = lane.path.to_str().map(str::to_owned) else {
         return Err(String::from("lane path is not valid UTF-8"));
     };
-    // Read HEAD BEFORE creating the worktree, while it is still the branch
-    // the lane forks from, and record it (#348). Afterwards it is gone: see
-    // `WorktreeLane::base`.
-    lane.base = current_branch(repo);
-    run_git_mut(repo, &["worktree", "add", "-b", &lane.branch, &path])
+    // READ before the command, while HEAD is still the branch the lane forks
+    // from - afterwards it is gone, see `WorktreeLane::base`. But ASSIGN only
+    // once creation succeeded: a failed `worktree add` leaves no lane, and a
+    // base recorded on one that does not exist is a fact about nothing that a
+    // retry would then carry.
+    let base = current_branch(repo);
+    run_git_mut(repo, &["worktree", "add", "-b", &lane.branch, &path])?;
+    lane.base = base;
+    Ok(())
 }
 
 /// The branch HEAD is on, or `None` when detached.
@@ -3195,6 +3199,34 @@ mod tests {
             .output()
             .expect("git status");
         String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    }
+
+    /// A failed creation leaves the base untouched (#348).
+    ///
+    /// The read has to happen BEFORE the command, while HEAD is still the
+    /// fork point - but writing it before the command succeeds records a
+    /// base for a lane that does not exist, which a retry would then carry.
+    /// Driven through the real duplicate-name refusal rather than a mocked
+    /// failure, so it fails the way callers actually see it.
+    #[test]
+    fn a_failed_lane_creation_leaves_the_base_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        run_git_mut(p, &["checkout", "-b", "release-9"]).expect("branch");
+
+        let mut first = WorktreeLane::plan(p, "parser work").expect("planned");
+        add_worktree_lane(p, &mut first).expect("the first lane is created");
+        assert_eq!(first.base.as_deref(), Some("release-9"), "precondition");
+
+        // Same name: git refuses, so nothing was created to have a base.
+        let mut second = WorktreeLane::plan(p, "parser work").expect("planned");
+        assert!(add_worktree_lane(p, &mut second).is_err(), "precondition");
+        assert_eq!(
+            second.base, None,
+            "a lane git refused to create records no base"
+        );
+        remove_worktree_lane(&first.path).expect("cleanup");
     }
 
     /// The base is recorded at creation and is not derivable afterwards
