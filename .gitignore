@@ -53,3 +53,6 @@ preview*.svg
 # Anchored, so it scopes to the root file the guide describes rather than any
 # CLAUDE.md a subdirectory might later want tracked.
 /CLAUDE.md
+# ...and any local backup of it. A `git add -A` swept a `.bak-` copy into a
+# commit once; the pattern is here so the next one cannot.
+/CLAUDE.md.*
