@@ -18536,6 +18536,98 @@ fn clicking_terminal_maximize_button_maximizes_that_pane() {
     );
 }
 
+/// #510: a pane the frame does not paint must drop `last_inner` as well as
+/// `last_area`.
+///
+/// `last_area` guards clicks and is cleared at six terminal-pane sites.
+/// `last_inner` was assigned in exactly one place - inside `render` - and
+/// cleared nowhere, so a hidden pane kept the rect it held under the PREVIOUS
+/// layout. That rect anchors the terminal image overlay, which is emitted
+/// after `terminal.draw()` with absolute cursor positioning and is bounded by
+/// nothing else: `update_terminal_image_overlay` checks the payload against
+/// the same stale rect, so every check passes and the write lands wherever
+/// the old origin pointed - over a sibling pane, the sidebar, or the status
+/// bar. Being a raw write rather than a buffer index it cannot panic, and
+/// ratatui's diff has no record of the cells it touched, so nothing repairs
+/// them on the next frame.
+///
+/// Maximize is the reachable route: it hands every non-active pane
+/// `Rect::default()`, so the render loop skips them while they keep the split
+/// column they occupied a frame earlier.
+#[test]
+fn a_hidden_pane_drops_last_inner_not_just_last_area() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+
+    // Paint the split first, so every pane holds a real inner rect.
+    term.draw(|f| app.render(f)).unwrap();
+    let active = app.active_terminal;
+    let hidden = (0..app.terminals.len()).find(|i| *i != active).unwrap();
+    assert!(
+        app.terminals[hidden].last_inner.width > 0,
+        "precondition: the pane painted a real inner rect while split"
+    );
+
+    // Maximize, which stops painting it.
+    app.terminal_pane_maximized = true;
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(
+        app.terminals[hidden].last_inner,
+        Rect::default(),
+        "a pane the frame skipped must not keep an inner rect the overlay \
+         would anchor a raw write to"
+    );
+}
+
+/// The same invariant through the PUBLIC gesture rather than the flag, so a
+/// regression that stops `toggle_terminal_pane_maximize` reaching this state
+/// is caught too. Setting `terminal_pane_maximized` directly pins the render
+/// loop; this pins the command.
+#[test]
+fn the_maximize_gesture_also_drops_a_hidden_panes_last_inner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let active = app.active_terminal;
+    let hidden = (0..app.terminals.len()).find(|i| *i != active).unwrap();
+    assert!(app.terminals[hidden].last_inner.width > 0, "precondition");
+
+    app.toggle_terminal_pane_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(
+        app.terminals[hidden].last_inner,
+        Rect::default(),
+        "the gesture, not just the flag, must drop the hidden pane's rect"
+    );
+}
+
+/// The collapse arm of the same condition. `t.collapsed && !maximized` is the
+/// other route into that clear, and the maximize tests never reach it.
+#[test]
+fn a_collapsed_pane_drops_last_inner_too() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(app.terminals[1].last_inner.width > 0, "precondition");
+
+    app.toggle_terminal_collapse(1);
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(
+        app.terminals[1].last_inner,
+        Rect::default(),
+        "a folded pane keeps no rect for the overlay to anchor to"
+    );
+}
+
 #[test]
 fn maximized_terminal_fills_width_and_lists_others_in_rail() {
     let tmp = tempfile::tempdir().unwrap();
