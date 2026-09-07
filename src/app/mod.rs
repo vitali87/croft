@@ -25589,7 +25589,7 @@ impl App {
     /// and the Explorer would show the lane inside the root it was cut from.
     fn create_worktree_lane(&mut self, name: &str) {
         let repo = self.workspace_root().to_path_buf();
-        let Some(lane) = crate::git::WorktreeLane::plan(&repo, name) else {
+        let Some(mut lane) = crate::git::WorktreeLane::plan(&repo, name) else {
             // Refused rather than defaulted: a name with nothing usable in
             // it would otherwise become the branch `agent/`.
             self.status = format!("{name:?} has no letters or digits to name a lane after");
@@ -25599,7 +25599,7 @@ impl App {
             self.status = format!("{} already exists — pick another name", lane.path.display());
             return;
         }
-        match crate::git::add_worktree_lane(&repo, &lane) {
+        match crate::git::add_worktree_lane(&repo, &mut lane) {
             Ok(()) => {
                 self.add_workspace_folder(lane.path.clone());
                 self.open_lane_pane(&lane);
