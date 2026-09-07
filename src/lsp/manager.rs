@@ -1733,6 +1733,10 @@ struct ManagedClient {
     client: Arc<TokioMutex<LspClient>>,
     supports_completion: bool,
     supports_signature_help: bool,
+    /// Whether the server answers `workspace/diagnostic` (#533), read from
+    /// the capability's inner `workspaceDiagnostics` flag rather than the
+    /// outer `Option` - see `workspace_diagnostics_supported`.
+    supports_workspace_diagnostics: bool,
     supports_hover: bool,
     supports_definition: bool,
     supports_document_symbol: bool,
@@ -2333,6 +2337,8 @@ impl WorkerState {
                         let supports = caps.completion_provider.is_some();
                         let supports_signature_help =
                             signature_help_supported(&caps.signature_help_provider);
+                        let supports_workspace_diagnostics =
+                            workspace_diagnostics_supported(&caps.diagnostic_provider);
                         let supports_hover = hover_supported(&caps.hover_provider);
                         let supports_definition = one_of_supported(&caps.definition_provider);
                         let supports_document_symbol =
@@ -2389,6 +2395,7 @@ impl WorkerState {
                             client: Arc::new(TokioMutex::new(client)),
                             supports_completion: supports,
                             supports_signature_help,
+                            supports_workspace_diagnostics,
                             supports_hover,
                             supports_definition,
                             supports_document_symbol,
