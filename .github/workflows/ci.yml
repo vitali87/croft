@@ -175,6 +175,16 @@ jobs:
           set -euo pipefail
           base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
           python3 scripts/check_doc_ownership.py "$base" HEAD
+      # ARCHITECTURE.md's tree carries the reasons behind each module, and a
+      # rewrite can cut a line's rationale away while the row and its
+      # identifiers survive - which is what a row-level or identifier-level
+      # check sees as a pass. This one compares per-module description
+      # length and asks for a `### <module>` section wherever one shrank.
+      - name: No module may lose its reasoning
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
+          python3 scripts/check_arch_content.py "$base"
 
   test:
     name: clippy + tests
