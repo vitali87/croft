@@ -212,6 +212,9 @@ pub enum Command {
     MarkAgentLaneReviewed,
     /// Summarise each agent's review queue (#345).
     ShowAgentLane,
+    /// Diff the active file against the snapshot it was last reviewed
+    /// against (#345).
+    DiffAgentFileSinceReview,
     /// Mark the active file reviewed in every agent lane holding it (#345).
     MarkAgentFileReviewed,
     /// Have the navigator fix the diagnostic under the caret as a streamed,
@@ -412,6 +415,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::MarkAgentLaneReviewed,
     Command::ShowAgentLane,
     Command::MarkAgentFileReviewed,
+    Command::DiffAgentFileSinceReview,
     Command::FixProblemWithNavigator,
     Command::SendHttpRequest,
     Command::CopyHttpRequestAsCurl,
@@ -599,6 +603,7 @@ impl Command {
             Command::MarkAgentLaneReviewed => "Agents: Mark Changed Files Reviewed",
             Command::ShowAgentLane => "Agents: Show Changed Files",
             Command::MarkAgentFileReviewed => "Agents: Mark This File Reviewed",
+            Command::DiffAgentFileSinceReview => "Agents: Diff This File Since Review",
             Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
             Command::SendHttpRequest => "HTTP: Send Request Under Caret",
             Command::CopyHttpRequestAsCurl => "HTTP: Copy Request as curl",
@@ -791,6 +796,7 @@ impl Command {
             Command::MarkAgentLaneReviewed => "",
             Command::ShowAgentLane => "",
             Command::MarkAgentFileReviewed => "",
+            Command::DiffAgentFileSinceReview => "",
             Command::FixProblemWithNavigator => "",
             Command::SendHttpRequest => "Cmd+Enter",
             Command::CopyHttpRequestAsCurl => "",
@@ -977,6 +983,7 @@ impl Command {
             Command::MarkAgentLaneReviewed => "agents_mark_reviewed",
             Command::ShowAgentLane => "agents_show_lane",
             Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",
+            Command::DiffAgentFileSinceReview => "agents_diff_since_review",
             Command::FixProblemWithNavigator => "problems_fix_navigator",
             Command::SendHttpRequest => "http_send_request",
             Command::CopyHttpRequestAsCurl => "http_copy_curl",

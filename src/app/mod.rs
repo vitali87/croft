@@ -31473,6 +31473,109 @@ impl App {
         self.tree.agent_touched = std::sync::Arc::new(paths);
     }
 
+    /// Snapshot `bytes` as `path`'s review baseline and return the millis
+    /// that names it (#345).
+    ///
+    /// The store is only ever written by croft's OWN saves; the agent-write
+    /// path that creates lane rows records nothing. So adopting whatever
+    /// snapshot happened to be newest anchored the review to an unrelated
+    /// earlier save and then labelled the diff "(reviewed)" — the exact
+    /// "baseline other than the one claimed" the diff refuses elsewhere.
+    /// Recording here is what makes the anchor name the reviewed content.
+    ///
+    /// `record_in` dedupes identical content and, inside the merge window,
+    /// REPLACES the newest entry instead of appending — so the snapshot that
+    /// ends up holding these bytes need not be at `millis`. Read the store
+    /// back rather than assuming, and return `None` when nothing holds them:
+    /// history is best-effort, and a row with no anchor is still reviewed,
+    /// it just cannot show a diff.
+    fn record_review_baseline(history_root: &Path, path: &Path, bytes: &[u8]) -> Option<u64> {
+        let millis = now_millis();
+        let _ = crate::history::record_in(history_root, path, bytes, millis);
+        crate::history::entries_in(history_root, path)
+            .into_iter()
+            .find(|s| std::fs::read(&s.file).is_ok_and(|held| held == bytes))
+            .map(|s| s.millis)
+    }
+
+    /// Diff one agent-lane row against the snapshot that was its baseline
+    /// when the user last marked it reviewed (#345), rather than against
+    /// HEAD.
+    ///
+    /// Refuses rather than falling back to a different baseline. A row with
+    /// no recorded snapshot (never reviewed, or reviewed before the store
+    /// had one) and a row whose snapshot has since been PRUNED — the store
+    /// keeps 50 per file against a 1s autosave, so this is a live case, not
+    /// only a legacy one — both say so. A diff against a baseline other than
+    /// the one claimed is worse than no diff, because the user cannot see
+    /// which one they got.
+    pub(crate) fn diff_agent_lane_row(&mut self, agent: &str, path: &Path) {
+        // "Restore Snapshot" writes to the path recorded here, and only
+        // `open_timeline_diff` cleared it. Browsing a.txt's timeline and then
+        // opening this diff on b.txt left restore armed at a.txt, so the
+        // command would overwrite a file the user was not even looking at.
+        // Disarm on every exit below, including the refusals: a refused diff
+        // leaves the PREVIOUS diff on screen, and arming restore to that is
+        // exactly the stale pairing this guards.
+        self.history_restore = None;
+        let Some(row) = self
+            .agent_ledger
+            .lane(agent)
+            .into_iter()
+            .find(|f| f.path == path)
+        else {
+            self.status = format!("{} is not in {agent}'s lane", path.display());
+            return;
+        };
+        let Some(millis) = row.reviewed_millis else {
+            self.status = if row.reviewed_hash.is_some() {
+                format!(
+                    "{} was reviewed before a snapshot existed - nothing to diff against",
+                    path.display()
+                )
+            } else {
+                format!("{} has not been reviewed yet", path.display())
+            };
+            return;
+        };
+        let Some(snap_file) = crate::history::snapshot_file_in(&self.history_root, path, millis)
+        else {
+            self.status = format!(
+                "The snapshot {} was reviewed against is no longer available",
+                path.display()
+            );
+            return;
+        };
+        let Ok(content) = std::fs::read(&snap_file) else {
+            self.status = format!("Could not read the reviewed snapshot of {}", path.display());
+            return;
+        };
+        // Snapshots hold raw bytes; decode like the local-history diff above
+        // so a UTF-16 file diffs as text rather than mojibake.
+        let enc = encoding_rs::Encoding::for_bom(&content)
+            .map(|(e, _)| e)
+            .unwrap_or(encoding_rs::UTF_8);
+        let text = enc.decode(&content).0.into_owned();
+        let rel = match path.strip_prefix(&self.tree.root) {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => path.display().to_string(),
+        };
+        let label = std::path::PathBuf::from(format!("{rel} (reviewed)"));
+        if let Err(e) = self
+            .editor
+            .open_head_diff_with_text(label, &text, path, false)
+        {
+            self.status = format!("Could not open the reviewed diff: {e}");
+            return;
+        }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
+        // Armed to the snapshot now on screen, matching `open_timeline_diff`:
+        // "Restore Snapshot" puts back the version the user reviewed.
+        self.history_restore = Some((path.to_path_buf(), millis, content));
+        self.focus_pane(Pane::Editor);
+        self.status = format!("{rel}: changes since you last reviewed it");
+    }
+
     /// Mark one file reviewed in one agent's lane (#345): the content on
     /// DISK now becomes the baseline, so the row returns only on a later
     /// write.
@@ -31485,16 +31588,38 @@ impl App {
     }
 
     fn mark_agent_file_reviewed_inner(&mut self, agent: &str, path: &Path) -> bool {
-        match crate::agent_lane::read_baseline(path) {
-            crate::agent_lane::Baseline::Hash(hash) => {
-                self.agent_ledger.mark_reviewed(agent, path, hash)
+        // A file too big to hash is too big to snapshot: `read_baseline`
+        // stamps those from metadata rather than slurping 4 MiB+, and
+        // copying one into the history store on every review would be worse.
+        // It reviews with NO anchor - honest, and the diff then says it has
+        // nothing to compare against.
+        if std::fs::metadata(path).is_ok_and(|m| m.len() > crate::agent_lane::MAX_HASH_BYTES) {
+            return match crate::agent_lane::read_baseline(path) {
+                crate::agent_lane::Baseline::Hash(hash) => {
+                    self.agent_ledger.mark_reviewed(agent, path, hash, None)
+                }
+                crate::agent_lane::Baseline::Gone => self.agent_ledger.forget_path(path),
+                crate::agent_lane::Baseline::Unreadable => {
+                    self.status = format!("Could not read {} to mark it reviewed", path.display());
+                    false
+                }
+            };
+        }
+        // One read, used for BOTH the hash and the snapshot: reading twice
+        // lets a write land in between, and the baseline would then be a hash
+        // of content the anchor does not hold.
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let hash = crate::agent_lane::content_hash(&bytes);
+                let snap = Self::record_review_baseline(&self.history_root, path, &bytes);
+                self.agent_ledger.mark_reviewed(agent, path, hash, snap)
             }
-            // Nothing left to review: drop the row rather than baselining a
-            // file that is not there.
-            crate::agent_lane::Baseline::Gone => self.agent_ledger.forget_path(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.agent_ledger.forget_path(path)
+            }
             // Unreadable right now is NOT reviewed: say so instead of
             // clearing content the user has not seen.
-            crate::agent_lane::Baseline::Unreadable => {
+            Err(_) => {
                 self.status = format!("Could not read {} to mark it reviewed", path.display());
                 false
             }
@@ -31503,9 +31628,27 @@ impl App {
 
     /// Mark an agent's whole lane reviewed (#345).
     pub(crate) fn mark_agent_lane_reviewed(&mut self, agent: &str) -> usize {
-        let (reviewed, dropped) = self
-            .agent_ledger
-            .mark_lane_reviewed(agent, crate::agent_lane::read_baseline);
+        let root = self.history_root.clone();
+        // Same contract as the single-file path: the anchor must hold the
+        // bytes that were hashed, so read once and snapshot THOSE. Reading
+        // separately in the two closures would let a write land between them.
+        let (reviewed, dropped) = self.agent_ledger.mark_lane_reviewed(agent, |path| {
+            // Too big to hash is too big to snapshot: stamp it and
+            // review with no anchor, as the single-file path does.
+            if std::fs::metadata(path).is_ok_and(|m| m.len() > crate::agent_lane::MAX_HASH_BYTES) {
+                return (crate::agent_lane::read_baseline(path), None);
+            }
+            match std::fs::read(path) {
+                Ok(bytes) => (
+                    crate::agent_lane::Baseline::Hash(crate::agent_lane::content_hash(&bytes)),
+                    Self::record_review_baseline(&root, path, &bytes),
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    (crate::agent_lane::Baseline::Gone, None)
+                }
+                Err(_) => (crate::agent_lane::Baseline::Unreadable, None),
+            }
+        });
         // A file that vanished was not REVIEWED; saying so would tell the
         // user they looked at something that is not there.
         let gone = match dropped {
@@ -34471,6 +34614,29 @@ impl App {
                 } else {
                     rows.join(" \u{b7} ")
                 };
+            }
+            Cmd::DiffAgentFileSinceReview => {
+                match self.editor.path.clone() {
+                    None => self.status = String::from("No file open"),
+                    Some(path) => {
+                        // The first lane holding it. A file two agents both
+                        // touched has one baseline per lane, and diffing
+                        // against an arbitrary second one would silently
+                        // answer a different question than the row shows.
+                        let agent = self
+                            .agent_ledger
+                            .agents()
+                            .into_iter()
+                            .map(String::from)
+                            .find(|a| self.agent_ledger.lane(a).iter().any(|f| f.path == path));
+                        match agent {
+                            None => {
+                                self.status = String::from("No agent has changed this file");
+                            }
+                            Some(agent) => self.diff_agent_lane_row(&agent, &path),
+                        }
+                    }
+                }
             }
             Cmd::MarkAgentLaneReviewed => {
                 let agents: Vec<String> = self

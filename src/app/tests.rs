@@ -12795,6 +12795,98 @@ fn saving_records_a_local_history_snapshot_that_diffs_and_restores() {
     );
 }
 
+/// The agent review diff must not leave another file's "Restore Snapshot"
+/// armed (#345): it opens a snapshot diff like the TIMELINE does, so it
+/// owes the same disarm, or restore silently overwrites a file the user is
+/// not looking at.
+#[test]
+fn the_review_diff_disarms_another_files_restore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "a-disk\n").unwrap();
+    std::fs::write(&b, "b-disk\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+
+    // a.txt's timeline snapshot is on screen: restore is armed for a.txt.
+    crate::history::record_in(&app.history_root, &a, b"a-old\n", 1000).unwrap();
+    app.editor.open(&a).unwrap();
+    app.open_timeline_diff(a.clone(), "local:1000".into());
+    assert!(app.history_restore.is_some(), "staging: a's snapshot armed");
+
+    // b.txt is in an agent lane and has never been reviewed, so the diff
+    // REFUSES - and a refusal leaves a's diff on screen, which is exactly
+    // when a stale restore is most dangerous.
+    let working = vec![String::from("claude")];
+    app.agent_ledger.record_write(&b, 7, &working);
+    app.diff_agent_lane_row("claude", &b);
+    assert!(
+        app.history_restore.is_none(),
+        "the review diff left the previous file's restore armed"
+    );
+    app.restore_history_snapshot();
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "a-disk\n",
+        "restore wrote a stale snapshot over an unrelated file"
+    );
+}
+
+/// Marking a file reviewed records a snapshot of the bytes it just hashed,
+/// so the row can be diffed against what the user actually approved (#345).
+///
+/// The store is written only by croft's own saves; the agent-write path
+/// records nothing. Adopting whatever snapshot was newest anchored the
+/// review to an unrelated earlier save and then labelled it "(reviewed)".
+#[test]
+fn reviewing_anchors_to_the_content_it_baselined_not_an_older_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("touched.rs");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+
+    // An OLD, unrelated save is already in the store - the trap: it is the
+    // newest snapshot at review time but is not what the agent wrote.
+    crate::history::record_in(&app.history_root, &f, b"an older user save\n", 1000).unwrap();
+
+    // The agent writes; the user never saved this content in croft.
+    std::fs::write(&f, "what the agent wrote\n").unwrap();
+    let working = vec![String::from("claude")];
+    app.agent_ledger.record_write(
+        &f,
+        crate::agent_lane::content_hash(b"what the agent wrote\n"),
+        &working,
+    );
+
+    assert!(app.mark_agent_file_reviewed("claude", &f));
+    let millis = app.agent_ledger.lane("claude")[0]
+        .reviewed_millis
+        .expect("the review recorded an anchor");
+    let snap = crate::history::snapshot_file_in(&app.history_root, &f, millis)
+        .expect("the anchor names a snapshot that exists");
+    assert_eq!(
+        std::fs::read(&snap).unwrap(),
+        b"what the agent wrote\n",
+        "the anchor must hold the reviewed content, not the older save"
+    );
+    assert_ne!(
+        millis, 1000,
+        "it must not adopt the unrelated older snapshot"
+    );
+
+    // And the diff opens against that content rather than refusing.
+    std::fs::write(&f, "what the agent wrote next\n").unwrap();
+    app.diff_agent_lane_row("claude", &f);
+    assert!(
+        app.status.contains("since you last reviewed"),
+        "the diff opens against the reviewed baseline: {}",
+        app.status
+    );
+}
+
 /// A snapshot click that fails (pruned .snap, unreadable file) must disarm
 /// "Restore Snapshot": the palette entry otherwise writes whatever snapshot
 /// was viewed BEFORE over a file that is not even on screen.
@@ -45885,7 +45977,7 @@ fn a_single_root_review_queue_reads_as_it_always_did() {
     std::fs::write(&f, "x").unwrap();
     app.agent_ledger.record_write(&f, 1, &working);
     let hash = app.agent_ledger.lane("claude")[0].current_hash;
-    app.agent_ledger.mark_reviewed("claude", &f, hash);
+    app.agent_ledger.mark_reviewed("claude", &f, hash, None);
     assert_eq!(
         app.agent_lane_rows(),
         vec![String::from("claude: 0 to review ()")],
