@@ -2570,6 +2570,9 @@ pub struct App {
     /// How many rows the last sweep produced (#256), counted before its
     /// items join a store shared with every other producer.
     project_check_rows: usize,
+    /// Whether the sweep may run unasked (#256): `auto`, `on` or `off`.
+    /// Read at startup; an unrecognised value behaves as `auto`.
+    problems_project_scope: String,
     /// Replies from the background test-source locator (the workspace grep is
     /// too slow for the render thread): the root the search ran under, the
     /// test name, and the hit. A reply from before a re-root is dropped.
@@ -4521,6 +4524,11 @@ impl App {
             project_check_tx,
             project_check_running: false,
             project_check_rows: 0,
+            problems_project_scope: if loaded_prefs.problems_project_scope.is_empty() {
+                String::from("auto")
+            } else {
+                loaded_prefs.problems_project_scope.clone()
+            },
             test_jump_rx,
             test_jump_tx,
             timeline_fetched: None,
@@ -8249,6 +8257,64 @@ impl App {
         // shared with every other producer.
         self.project_check_rows = self.matchers.scan_batch(output, "tsc").len();
         self.apply_build_scan(Self::PROJECT_CHECK_ID, Some(&cwd), "tsc", output)
+    }
+
+    /// How many files put a root out of the sweep's automatic reach (#256).
+    ///
+    /// VS Code's own workspace-diagnostics guidance draws the line around
+    /// the size where a project-wide compile stops being a background cost
+    /// and starts being the foreground one. The exact number matters less
+    /// than having one: the setting overrides it either way.
+    const PROJECT_CHECK_AUTO_MAX_FILES: usize = 100_000;
+
+    /// Whether `root` holds more than `limit` files worth counting (#256).
+    ///
+    /// Stops at `limit + 1` rather than completing the walk. Counting a
+    /// giant tree to decide not to walk a giant tree would cost exactly what
+    /// the cap exists to avoid, and the question is a threshold one - the
+    /// total is never used.
+    ///
+    /// Ignored and vendored directories do not count: `node_modules` alone
+    /// puts most JS projects over any sensible cap, and disabling the sweep
+    /// for JS projects would disable it for the projects it is FOR.
+    pub(crate) fn workspace_exceeds(root: &Path, limit: usize) -> bool {
+        let mut seen = 0usize;
+        for entry in ignore::WalkBuilder::new(root)
+            .git_ignore(true)
+            .require_git(false)
+            .hidden(false)
+            .filter_entry(|e| {
+                e.depth() == 0
+                    || !e.file_type().is_some_and(|t| t.is_dir())
+                    || !crate::widgets::file_finder::is_noise_dir(e.file_name())
+            })
+            .build()
+        {
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_some_and(|t| t.is_file()) {
+                seen += 1;
+                if seen > limit {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the sweep may run WITHOUT the user asking, for `mode` (#256).
+    ///
+    /// `on` and `off` are answers, not hints: a cap that only ever declined
+    /// would make `on` useless on the monorepos that most want it, and a cap
+    /// that could not be turned off would surprise someone who knows their
+    /// tree. `auto` asks the size question. Anything else reads as `auto`
+    /// rather than as `on`, so a typo cannot start a compile on a 100k-file
+    /// root - the failure the cap exists to prevent.
+    pub(crate) fn project_check_auto_enabled(root: &Path, mode: &str, limit: usize) -> bool {
+        match mode {
+            "on" => true,
+            "off" => false,
+            _ => !Self::workspace_exceeds(root, limit),
+        }
     }
 
     /// The whole-project check command for this workspace (#256).
@@ -34758,6 +34824,35 @@ impl App {
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
+            Cmd::ProblemsToggleProjectAuto => {
+                // auto -> on -> off -> auto. Cycling rather than a boolean
+                // because `auto` is a distinct answer from both, not a
+                // default the other two override.
+                let next = match self.problems_project_scope.as_str() {
+                    "auto" => "on",
+                    "on" => "off",
+                    _ => "auto",
+                };
+                self.problems_project_scope = String::from(next);
+                let _ = crate::prefs::save_problems_project_scope(next);
+                let root = self.workspace_root().to_path_buf();
+                // Say what the setting MEANS for this root, not just its
+                // name: under `auto` the answer depends on a count the user
+                // cannot see, and "auto" alone would leave them guessing
+                // which way it went.
+                let effect = if Self::project_check_auto_enabled(
+                    &root,
+                    next,
+                    Self::PROJECT_CHECK_AUTO_MAX_FILES,
+                ) {
+                    "may run on its own here"
+                } else if next == "auto" {
+                    "will not run on its own here - this workspace is too large"
+                } else {
+                    "will not run on its own"
+                };
+                self.status = format!("Whole-project check: {next} ({effect})");
+            }
             Cmd::ProblemsCheckProject => {
                 let root = self.workspace_root().to_path_buf();
                 match Self::project_check_command(&root) {

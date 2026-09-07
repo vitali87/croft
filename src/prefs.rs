@@ -170,6 +170,11 @@ pub struct Prefs {
     /// rather than silently hiding diagnostics.
     #[serde(default)]
     pub problems_scope: String,
+    /// Whether the whole-project check may run without being asked (#256):
+    /// `auto` (under a file-count cap), `on`, or `off`. Unrecognised values
+    /// read as `auto`, so a typo cannot start a compile on a huge root.
+    #[serde(default)]
+    pub problems_project_scope: String,
     /// Default whitespace handling for new diff views: `off` (every byte
     /// counts), `leading` (ignore indentation changes), or `all` (ignore every
     /// whitespace-only difference). Unrecognised values read as `off`, so a
@@ -567,6 +572,15 @@ fn prefs_for_update(path: &Path) -> Result<Prefs> {
             Err(e)
         }
     }
+}
+
+/// Persist whether the whole-project check may auto-run (#256).
+/// Best-effort, like [`save_problems_scope`].
+pub fn save_problems_project_scope(mode: &str) -> Result<()> {
+    let path = config_path();
+    let mut prefs = prefs_for_update(&path)?;
+    prefs.problems_project_scope = mode.to_string();
+    prefs.save(&path)
 }
 
 /// Persist the PROBLEMS scope (#256), preserving other settings.

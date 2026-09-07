@@ -38119,6 +38119,99 @@ fn the_project_check_count_is_its_own_not_the_panels() {
     );
 }
 
+/// The sweep's auto-enable is capped by workspace size, and the setting
+/// overrides the cap in both directions (#256, criterion 5).
+///
+/// `auto` is a size question, so it has to be answered by counting - but
+/// counting a giant tree to decide not to walk a giant tree is the cost the
+/// cap exists to avoid. `workspace_exceeds` stops at the threshold rather
+/// than completing the walk, so the answer costs at most `limit + 1`
+/// entries however large the root is.
+#[test]
+fn the_sweep_auto_enables_only_under_the_file_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    for i in 0..12 {
+        std::fs::write(tmp.path().join(format!("f{i}.ts")), "export const x = 1;\n").unwrap();
+    }
+
+    // Under the cap: auto enables.
+    assert!(
+        !App::workspace_exceeds(tmp.path(), 100),
+        "12 files is under a cap of 100"
+    );
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), "auto", 100),
+        "auto enables under the cap"
+    );
+
+    // Over the cap: auto declines.
+    assert!(
+        App::workspace_exceeds(tmp.path(), 5),
+        "12 files exceeds a cap of 5"
+    );
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), "auto", 5),
+        "auto declines over the cap"
+    );
+
+    // The setting overrides the count in BOTH directions - a cap that only
+    // ever said no would make `on` meaningless on the roots that need it.
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), "on", 5),
+        "`on` runs on a root the cap would have declined"
+    );
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), "off", 100),
+        "`off` declines a root the cap would have allowed"
+    );
+
+    // An unrecognised value reads as `auto` rather than silently enabling a
+    // sweep on a monorepo: a typo must not cost more than it saves.
+    assert!(
+        !App::project_check_auto_enabled(tmp.path(), "definitely-not-a-mode", 5),
+        "an unknown setting falls back to auto, which declines here"
+    );
+    assert!(
+        App::project_check_auto_enabled(tmp.path(), "definitely-not-a-mode", 100),
+        "and to auto's yes under the cap, not a blanket no"
+    );
+}
+
+/// Counting stops at the threshold instead of walking the whole tree
+/// (#256, criterion 5).
+///
+/// Pinned by making the tree far larger than the cap and asserting the
+/// answer arrives anyway: a full walk of a deep tree is the thing the cap
+/// is protecting against, so a cap that walks it has already lost.
+#[test]
+fn the_threshold_check_stops_counting_at_the_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 500 files against a cap of 3.
+    for d in 0..10 {
+        let dir = tmp.path().join(format!("d{d}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..50 {
+            std::fs::write(dir.join(format!("f{i}.ts")), "x\n").unwrap();
+        }
+    }
+    assert!(App::workspace_exceeds(tmp.path(), 3), "500 files exceeds 3");
+
+    // Ignored directories do not count toward the cap: node_modules alone
+    // would put every JS project over it, which would disable the sweep for
+    // exactly the projects the feature is for.
+    let clean = tempfile::tempdir().unwrap();
+    let heavy = clean.path().join("node_modules").join("pkg");
+    std::fs::create_dir_all(&heavy).unwrap();
+    for i in 0..200 {
+        std::fs::write(heavy.join(format!("m{i}.js")), "x\n").unwrap();
+    }
+    std::fs::write(clean.path().join("a.ts"), "export const a = 1;\n").unwrap();
+    assert!(
+        !App::workspace_exceeds(clean.path(), 10),
+        "node_modules is not the user's code and must not trip the cap"
+    );
+}
+
 /// "Problems: Check Whole Project" puts a whole-project checker's findings
 /// into PROBLEMS for files nobody opened, and a re-run REPLACES them (#256).
 ///
