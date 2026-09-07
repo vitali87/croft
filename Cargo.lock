@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "croft-software"
-version = "0.1.915"
+version = "0.1.916"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
