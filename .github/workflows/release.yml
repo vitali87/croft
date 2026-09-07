@@ -26,8 +26,11 @@ on:
   # cutting one. Upload only ever happens on a tag.
   workflow_dispatch:
 
+# Read at the top level; only the publish job needs write, and only to
+# create the release. A build job that can write contents is a build job that
+# can rewrite the repo if any step it runs is compromised.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -59,6 +62,10 @@ jobs:
             cross: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The token is not needed after the fetch; leaving it
+          # in .git/config lets any later step push with it.
+          persist-credentials: false
 
       - name: Install the pinned toolchain
         run: rustup show
@@ -140,11 +147,17 @@ jobs:
     name: publish the release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     # Only a tag publishes. A workflow_dispatch run builds and stops, which is
     # how you prove the matrix works without cutting a release.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The token is not needed after the fetch; leaving it
+          # in .git/config lets any later step push with it.
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:

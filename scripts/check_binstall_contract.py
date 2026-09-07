@@ -134,12 +134,20 @@ def main() -> None:
     # a directory; `-C dist croft` puts it at the root. Both produce an
     # identically-named archive, so comparing names cannot tell them apart —
     # and bin-dir is resolved against the extracted tree, not the file name.
-    tar = re.search(r'tar -czf\s+"?\$?\{?[^"\s]*"?\s+-C\s+(\S+)\s+"?([^"\s]+)"?',
+    tar = re.search(r'tar -czf\s+"?([^"\s]+)"?\s+-C\s+(\S+)\s+"?([^"\s]+)"?',
                     workflow)
     if not tar:
-        fail("release.yml has no recognisable `tar -czf ... -C <dir> <member>` "
+        fail("release.yml has no recognisable `tar -czf <out> -C <dir> <member>` "
              "line; cannot tell what the archive contains")
-    member = tar.group(2).replace("$name", expected_dir)
+    # The OUTPUT path, which the first version captured and then discarded.
+    # `tar -czf dist/$name.zip` writes a file binstall will never request,
+    # and every name-based check still agrees because the archive NAME is
+    # built from $name either way.
+    out = tar.group(1).replace("$name", expected_dir)
+    want_out = f"dist/{expected_dir}{suffix}"
+    if out != want_out:
+        fail(f"release.yml writes {out!r} but pkg-url expects {want_out!r}")
+    member = tar.group(3).replace("$name", expected_dir)
     if member != expected_dir:
         fail(f"release.yml archives {member!r} but bin-dir expects the binary "
              f"under {expected_dir!r}/; binstall would extract the tarball and "

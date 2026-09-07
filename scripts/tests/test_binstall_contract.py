@@ -136,6 +136,22 @@ class TarLayoutDrift(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("look in a directory that is not in it", r.stderr)
 
+    def test_a_mismatched_output_extension_is_caught(self):
+        """`tar -czf dist/$name.zip` writes a file binstall never requests.
+
+        Every name-based check still agrees, because the archive NAME is built
+        from $name either way — only the extension moved. The checker has to
+        compare the tar OUTPUT path against pkg-url, which the first version
+        captured into a group and then discarded.
+        """
+        tree = self.build_tree(
+            workflow_sub=('tar -czf "dist/$name.tar.gz" -C dist "$name"',
+                          'tar -czf "dist/$name.zip" -C dist "$name"')
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("but pkg-url expects", r.stderr)
+
     def test_switching_to_zip_is_caught(self):
         """The guard used to arm itself on `tar -czf` being present, so the
         drift that removed it also disabled the check."""
