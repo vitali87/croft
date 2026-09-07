@@ -206,6 +206,7 @@ pub enum Command {
     NewWorktreeLane,
     /// Remove the current worktree lane, refusing when it is dirty (#348).
     CloseWorktreeLane,
+    /// Point the COMMITS graph at what the current lane added (#348).
     DiffWorktreeLane,
     /// Mark every file every agent changed as reviewed (#345).
     MarkAgentLaneReviewed,
@@ -972,7 +973,7 @@ impl Command {
             Command::ToggleSessionRecording => "session_toggle_recording",
             Command::NewWorktreeLane => "agent_new_worktree_lane",
             Command::CloseWorktreeLane => "agent_close_worktree_lane",
-            Command::DiffWorktreeLane => "diff_worktree_lane",
+            Command::DiffWorktreeLane => "agent_diff_worktree_lane",
             Command::MarkAgentLaneReviewed => "agents_mark_reviewed",
             Command::ShowAgentLane => "agents_show_lane",
             Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",

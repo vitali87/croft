@@ -6430,6 +6430,12 @@ impl App {
     fn seed_active_scm(&mut self, active: PathBuf) {
         self.active_scm_root = active.clone();
         self.default_branch_label = None;
+        // A lane diff belongs to the root it was asked for. Carried into
+        // another repo the range names a branch that does not exist there,
+        // and `branch_history_range` answers an unresolvable range with an
+        // EMPTY vec rather than an error - so the panel would show a repo
+        // with commits as having none, with nothing on screen saying why.
+        self.graph_revspec = None;
         let w = self.git_worker_for_root_mut(&active);
         w.bypass_debounce();
         w.request_status_and_changes();
@@ -25918,7 +25924,7 @@ impl App {
         let lane = self.active_scm_root.clone();
         if lane == self.roots.primary() {
             self.status =
-                String::from("The primary folder is not a lane - open a file in the lane first");
+                String::from("The primary folder is not a lane — open a file in the lane first");
             return;
         }
         let Some(record) = self
@@ -25967,6 +25973,10 @@ impl App {
                 String::from("The primary folder is not a lane — open a file in the lane first");
             return;
         }
+        // The diff outlives the lane otherwise: `remove_workspace_folder`
+        // re-seeds the primary, and its COMMITS panel is then stuck on a
+        // range whose right side no longer resolves.
+        self.graph_revspec = None;
         if let Some(why) = crate::git::lane_removal_block(&lane) {
             self.status = format!("Keeping the lane: {why}");
             return;
