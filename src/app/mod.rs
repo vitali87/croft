@@ -15421,6 +15421,16 @@ impl App {
                         // grid that is no longer painted there.
                         if cols[i].width == 0 || (t.collapsed && !maximized) {
                             t.last_area = Rect::default();
+                            // `last_inner` too (#510): it anchors the image
+                            // overlay's raw CUP write, so a stale rect sends
+                            // the payload outside the pane with nothing to
+                            // catch it. The other terminal-pane clears below
+                            // need no counterpart - the overlay returns early
+                            // when the panel is hidden or off the Terminal
+                            // tab, which is what makes them unreachable for
+                            // it. A consumer that drops that guard inherits
+                            // this obligation.
+                            t.last_inner = Rect::default();
                             t.redacted_on_screen = 0;
                         } else {
                             frame.render_widget(
@@ -41776,6 +41786,12 @@ impl App {
             return;
         };
         let inner = t.last_inner;
+        // The floors below reject a pane the last frame did not paint ONLY
+        // because the pane-skip site zeroes `last_inner` first (#510). They
+        // are magnitude checks, not freshness checks: a pane painted at a
+        // real size that then stops being painted keeps a full-size rect and
+        // passes both. That was the bug. Delete the clear and these floors
+        // will not catch it.
         if t.alt_screen() || inner.width < 6 || inner.height < 3 {
             self.disable_terminal_image();
             return;
