@@ -41795,37 +41795,34 @@ fn focusing_another_editor_group_closes_a_symbol_tab() {
         "staging: a tab is open for the other group's file"
     );
 
-    // Which group holds which file depends on split/focus order, so assert
-    // against what is ACTUALLY active rather than assuming the swap lands on
-    // b.rs. The guard's contract is "active file differs from the tab's" -
-    // that is what to test, not a particular group layout.
+    // The layout is DETERMINED, not incidental: `split_active` puts the
+    // existing group at DFS index 0 and the new active one at 1, which
+    // `split_active_makes_a_two_leaf_horizontal_split_with_the_new_group_active_after`
+    // in editor_layout.rs pins directly. So left holds a.rs, right holds
+    // b.rs. Asserting that rather than branching on it - an earlier version
+    // guarded the clear behind an `if`, which is the shape that goes green
+    // having asserted nothing if the layout ever moves.
     app.focus_editor_group(true);
-    let active = app
-        .editor
-        .path
-        .clone()
-        .expect("a file is open after the swap");
-    if active == a {
-        // The swap landed back on the tab's own file: it must SURVIVE, which
-        // is the same guard declining rather than a missed clear.
-        assert!(
-            app.symbol_tab.is_some(),
-            "the swap showed the tab's own file, so it must not close"
-        );
-        // Now move to the group holding the other file and it must close.
-        app.focus_editor_group(false);
-        if app.editor.path.as_deref() != Some(a.as_path()) {
-            assert!(
-                app.symbol_tab.is_none(),
-                "swapping to a different file must close the tab"
-            );
-        }
-    } else {
-        assert!(
-            app.symbol_tab.is_none(),
-            "swapping groups showed {active:?}, not the tab's {a:?}, so it must close"
-        );
-    }
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "the left group holds the file the tab belongs to"
+    );
+    assert!(
+        app.symbol_tab.is_some(),
+        "a swap onto the tab's OWN file must not close it"
+    );
+
+    app.focus_editor_group(false);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "the right group holds the other file"
+    );
+    assert!(
+        app.symbol_tab.is_none(),
+        "a swap onto a different file must close the tab"
+    );
 }
 
 /// A symbol tab belongs to the file it was opened from (#369).
