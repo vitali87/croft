@@ -45686,3 +45686,1040 @@ fn a_single_root_review_queue_reads_as_it_always_did() {
         "an emptied lane keeps the old shape too"
     );
 }
+
+/// Stand up a `croft view` listener on `app` without touching process env.
+///
+/// The real `bind_view_socket` also exports `CROFT_VIEW_SOCK`, which is
+/// process-global: setting it in one test would publish a socket into every
+/// other test running in the same process. This binds the same way and
+/// publishes nothing, so the server half is exercised and the neighbours are
+/// left alone.
+fn seat_view_listener(app: &mut App, dir: &std::path::Path) -> std::path::PathBuf {
+    let sock = dir.join("view-test.sock");
+    // Deliberately the production helper: seating a hand-built listener here
+    // would let `prepare_view_listener` lose its non-blocking mode without a
+    // single test noticing.
+    let listener = crate::app::prepare_view_listener(&sock).unwrap();
+    app.view_listener = Some(listener);
+    sock
+}
+
+/// Accept one client from a NON-blocking listener, waiting for it (#362).
+///
+/// `prepare_view_listener` makes the listener non-blocking on purpose, so a
+/// single `accept()` after a fixed sleep asserts that the client thread was
+/// scheduled inside that window - a property of machine load rather than of
+/// the code under test. When it loses, the panic names the client rather than
+/// the deadline, the blocking flag or the length cap the test is about.
+fn accept_when_ready(
+    listener: &std::os::unix::net::UnixListener,
+) -> std::os::unix::net::UnixStream {
+    // Load-scaled rather than a fresh constant (CONTRIBUTING.md, "Waiting on
+    // a spawned process in a test"). What blows a flat five seconds here is
+    // not the accept: it is every other test in the suite spawning a shell at
+    // the same moment, which is contention no constant chosen inside this
+    // test can know about.
+    let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::VIEW_ACCEPT_BASE);
+    let started = std::time::Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    started.elapsed() < budget,
+                    "no client connected within {budget:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    }
+}
+
+/// Send one request from a client thread and hand back its reply.
+fn view_from_a_pane(
+    sock: &std::path::Path,
+    path: &std::path::Path,
+) -> std::thread::JoinHandle<crate::view_ipc::ViewReply> {
+    let sock = sock.to_path_buf();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        crate::view_ipc::send(&sock, &crate::view_ipc::ViewRequest::new(&path)).unwrap()
+    })
+}
+
+/// Drain until the request lands: the client connects on another thread, so
+/// the first non-blocking accept can legitimately find nothing yet.
+///
+/// The budget is the shared load-scaled one rather than a fixed two seconds
+/// (CONTRIBUTING.md, "Waiting on a spawned process in a test"): `App::new`
+/// has already spawned a PTY shell, a git worker and an FS watcher, and the
+/// client is a thread racing all of them. Panics rather than returning false,
+/// so a caller cannot turn a timeout into a bare `assert!` that says nothing
+/// about which of the two happened.
+fn drain_until_answered(
+    app: &mut App,
+    client: &std::thread::JoinHandle<crate::view_ipc::ViewReply>,
+) {
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::VIEW_DRAIN_BASE,
+        "the view request to be answered",
+        || {
+            app.drain_view_requests();
+            client.is_finished()
+        },
+    );
+}
+
+#[test]
+fn a_view_request_from_a_pane_opens_the_file_in_the_editor() {
+    // #362: the point of the whole channel. A shell prompt asks, and the file
+    // arrives as an editor tab exactly as an Explorer click would leave it.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("report.txt");
+    std::fs::write(&target, "hello from a pane").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    let sock = seat_view_listener(&mut app, tmp.path());
+
+    let client = view_from_a_pane(&sock, &target);
+    drain_until_answered(&mut app, &client);
+    assert_eq!(client.join().unwrap(), crate::view_ipc::ViewReply::Ok);
+
+    let open = app.editor.editors[app.editor.active_index()].path.clone();
+    assert_eq!(
+        open.as_deref(),
+        Some(target.as_path()),
+        "the requested file must be the active tab"
+    );
+    assert!(
+        app.focus == Pane::Editor,
+        "the user asked to look at it, so focus follows"
+    );
+}
+
+#[test]
+fn a_view_request_for_a_directory_is_refused_with_a_reason_the_client_prints() {
+    // The server knows why; the client only relays. A silent refusal would
+    // exit the user's shell 0 having opened nothing.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("subdir");
+    std::fs::create_dir(&dir).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = seat_view_listener(&mut app, tmp.path());
+
+    let client = view_from_a_pane(&sock, &dir);
+    // Load-scaled, and it still cannot hang: `await_spawned` panics naming
+    // what it waited for, so the `join` below is only reached once the client
+    // thread has finished (CONTRIBUTING.md, "Waiting on a spawned process in
+    // a test"). A fixed two seconds decided pass or fail here before.
+    drain_until_answered(&mut app, &client);
+    match client.join().unwrap() {
+        crate::view_ipc::ViewReply::Err { message } => {
+            assert!(
+                message.contains("is a directory"),
+                "the reason must name what went wrong, got {message:?}"
+            );
+        }
+        other => panic!("a directory must not open as a file: {other:?}"),
+    }
+}
+
+#[test]
+fn draining_an_idle_listener_reports_no_change_and_does_not_block() {
+    // Polled from the frame loop: a blocking accept here would freeze every
+    // redraw until somebody happened to run `croft view`.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    seat_view_listener(&mut app, tmp.path());
+    // Asserted on the fd rather than only on elapsed time: if the mode is
+    // lost, `accept` blocks forever and a timing assertion is never reached,
+    // so the test would HANG instead of failing and read as a CI timeout
+    // rather than as this defect. Reading O_NONBLOCK turns that into a
+    // one-line failure that names the cause.
+    let flags = {
+        use std::os::unix::io::AsRawFd;
+        let listener = app.view_listener.as_ref().unwrap();
+        unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) }
+    };
+    assert!(
+        flags != -1 && flags & libc::O_NONBLOCK != 0,
+        "the frame loop polls this listener, so it must be non-blocking"
+    );
+    let started = std::time::Instant::now();
+    assert!(!app.drain_view_requests(), "nothing was sent");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "the drain blocked for {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn the_socket_sweep_removes_a_dead_crofts_file_and_spares_a_live_one() {
+    // Sockets are not auto-unlinked, so a crashed croft leaves its file for
+    // the next one to clear. Getting this wrong in the other direction would
+    // be worse than litter: deleting a LIVE croft's socket silently breaks
+    // `croft view` in every pane it owns.
+    let tmp = tempfile::tempdir().unwrap();
+    // A pid that has certainly exited: spawn, reap, and its number is free.
+    let dead = {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+    // A live pid that is NOT this process. Naming the live socket for
+    // `process::id()` made this half unfalsifiable: production reads
+    // `pid != me && kill(pid, 0) != 0`, so for our own pid the first term
+    // decides it and the liveness probe never runs. Measured - replacing the
+    // whole condition with `pid != me` left all three assertions passing,
+    // while production would then unlink the socket of every OTHER running
+    // croft, which is the outcome the comment above calls worse than litter.
+    let mut peer = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let live = peer.id();
+    // `view-<pid>-<nonce>.sock` is the ONLY shape production writes now, so
+    // the fixture uses it. The pre-nonce spelling is kept for the dead pid as
+    // well, because the sweep still has to clear what an older croft left.
+    let dead_sock = tmp.path().join(format!("view-{dead}.sock"));
+    let dead_nonce_sock = tmp.path().join(format!("view-{dead}-a1b2c3d4.sock"));
+    let live_sock = tmp.path().join(format!("view-{live}-e5f6a7b8.sock"));
+    let stranger = tmp.path().join("not-a-view-socket");
+    // The lock `bind_socket_0600` writes beside each socket, which the sweep
+    // is supposed to take with it.
+    let dead_lock = tmp.path().join(format!("view-{dead}-a1b2c3d4.bind.lock"));
+    let live_lock = tmp.path().join(format!("view-{live}-e5f6a7b8.bind.lock"));
+    // A lock whose socket NEVER APPEARED: a croft that died between the
+    // lock's creation and the rename leaves this, and nothing keyed on the
+    // `.sock` suffix can ever reach it.
+    let orphan_lock = tmp.path().join(format!("view-{dead}-99887766.bind.lock"));
+    // `bind_socket_0600` binds inside `.s<pid>-<n>` and removes it on both
+    // paths; a croft killed inside that window strands one, and nothing else
+    // ever looks at it again.
+    let dead_stage = tmp.path().join(format!(".s{dead}-0"));
+    let live_stage = tmp.path().join(format!(".s{live}-0"));
+    // Same prefix, no counter: not ours, so the sweep must leave it.
+    let stage_lookalike = tmp.path().join(format!(".s{dead}-notanumber"));
+    for d in [&dead_stage, &live_stage, &stage_lookalike] {
+        std::fs::create_dir(d).unwrap();
+        std::fs::write(d.join("s"), b"").unwrap();
+    }
+    for p in [
+        &dead_sock,
+        &dead_nonce_sock,
+        &live_sock,
+        &stranger,
+        &dead_lock,
+        &live_lock,
+        &orphan_lock,
+    ] {
+        std::fs::write(p, b"").unwrap();
+    }
+
+    crate::app::sweep_dead_view_sockets(tmp.path());
+    let live_survived = live_sock.exists();
+    let live_lock_survived = live_lock.exists();
+    let live_stage_survived = live_stage.exists();
+    let _ = peer.kill();
+    let _ = peer.wait();
+
+    assert!(!dead_sock.exists(), "a dead croft's socket must be cleared");
+    assert!(
+        !dead_nonce_sock.exists(),
+        "and the nonce-shaped name, which is the only one production writes"
+    );
+    assert!(
+        !dead_lock.exists(),
+        "the lock beside a dead croft's socket goes with it"
+    );
+    assert!(
+        !orphan_lock.exists(),
+        "a lock whose socket never appeared must be swept too, or it leaks \
+         forever: nothing else in croft ever looks at it again"
+    );
+    assert!(
+        live_survived,
+        "another croft is alive, so its socket must survive the sweep"
+    );
+    assert!(
+        live_lock_survived,
+        "and so must its lock: removing it lets a second croft bind the \
+         socket this one is serving"
+    );
+    assert!(
+        !dead_stage.exists(),
+        "a dead croft's bind staging directory leaks forever otherwise: \
+         nothing but this sweep ever reads that name again"
+    );
+    assert!(
+        live_stage_survived,
+        "and a LIVE croft's staging directory must survive: removing one \
+         mid-bind takes the socket it is about to rename out with it"
+    );
+    assert!(
+        stage_lookalike.exists(),
+        "the counter must parse as a number, or the sweep is matching on a \
+         prefix and will eat directories it did not create"
+    );
+    assert!(
+        stranger.exists(),
+        "the sweep must only touch files it recognises by name"
+    );
+}
+
+/// One drain serves EVERY client waiting, not just the first (#362).
+///
+/// `drain_view_requests` loops on accept under a shared 20ms deadline
+/// precisely so a frame that finds three `croft view` calls queued answers
+/// all three. Nothing pinned that: every other fixture hands it exactly one
+/// connection, so replacing the loop body's tail with `return changed` after
+/// the first client passes the whole suite.
+///
+/// Both requests are written SYNCHRONOUSLY from this thread before the drain
+/// runs, so "both were pending in the same frame" is a property of the
+/// fixture rather than of the scheduler.
+#[test]
+fn one_drain_answers_every_client_already_waiting() {
+    use std::io::{BufRead, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let first = tmp.path().join("first.txt");
+    let second = tmp.path().join("second.txt");
+    std::fs::write(&first, "one").unwrap();
+    std::fs::write(&second, "two").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = seat_view_listener(&mut app, tmp.path());
+
+    let mut clients = Vec::new();
+    for target in [&first, &second] {
+        let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        // A read timeout, so losing FAILS rather than hangs. Whether both are
+        // served in one drain rests on production's 20ms budget, which no
+        // test scale can stretch: if the first open costs most of it, the
+        // drain returns having served client 0, the assert below still passes
+        // because something opened, and an untimed `read_line` on client 1
+        // blocks forever. That is a CI timeout with no message, which two
+        // other tests in this file go out of their way to avoid.
+        c.set_read_timeout(Some(crate::test_budget::spawn_budget(
+            crate::test_budget::tests::VIEW_DRAIN_BASE,
+        )))
+        .unwrap();
+        // Through `ViewRequest::new`, so a change to the byte encoding is
+        // exercised here rather than bypassed by hand-rolling the field.
+        let req = crate::view_ipc::ViewRequest::new(target);
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        c.write_all(line.as_bytes()).unwrap();
+        c.flush().unwrap();
+        clients.push(c);
+    }
+
+    assert!(
+        app.drain_view_requests(),
+        "one drain, with two complete requests already on the socket"
+    );
+
+    for (i, c) in clients.iter().enumerate() {
+        let mut reply = String::new();
+        std::io::BufReader::new(c)
+            .read_line(&mut reply)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "client {i} was never answered ({e}): one drain must serve \
+                     every client already waiting, not just the first"
+                )
+            });
+        let reply: crate::view_ipc::ViewReply = serde_json::from_str(reply.trim())
+            .unwrap_or_else(|e| panic!("client {i} got no parseable reply: {e}"));
+        assert_eq!(
+            reply,
+            crate::view_ipc::ViewReply::Ok,
+            "client {i} must be answered by the SAME drain as client 0: a loop \
+             that serves one connection and returns leaves this one waiting a \
+             whole frame, and every other test hands the drain a single client"
+        );
+    }
+    let open: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(
+        open.contains(&first) && open.contains(&second),
+        "both files must be open, got {open:?}"
+    );
+}
+
+/// A relative path is refused rather than resolved against croft's cwd (#362).
+///
+/// `view_ipc`'s header states that the server only ever sees absolute paths,
+/// because the client resolves against ITS cwd before sending. Nothing
+/// enforced it, so a relative path from anything that is not `croft view`
+/// opened whatever that name meant from croft's own working directory, which
+/// is a different file than the sender named. Same-uid, so this is an
+/// invariant rather than a boundary, but an unchecked invariant is a comment.
+#[test]
+fn a_relative_path_in_a_request_is_refused_rather_than_resolved_here() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    let reply = app.apply_view_request(std::path::Path::new("relative.txt"));
+
+    match reply {
+        crate::view_ipc::ViewReply::Err { message } => assert!(
+            message.contains("absolute"),
+            "the refusal must name the invariant it is enforcing, got {message:?}"
+        ),
+        other => panic!("a relative path must not be resolved here: {other:?}"),
+    }
+}
+
+/// The status arm that no test could reach (#362).
+///
+/// `bind_view_socket` returns early under `cfg(test)` so a test cannot leave
+/// a live socket in the real cache dir, which also means nothing in the suite
+/// ever latches `VIEW_BIND_ERROR`: the arm that tells the user their bind
+/// failed had never once run. `view_status` is the pure half, split out so it
+/// can. Short-circuit it to always answer "Ready" and this goes red.
+#[test]
+fn a_failed_view_bind_reaches_the_status_line_with_its_cause() {
+    assert_eq!(
+        crate::app::view_status(None),
+        "Ready",
+        "a croft whose bind succeeded says nothing about it"
+    );
+    let said = crate::app::view_status(Some("Permission denied (os error 13)"));
+    assert!(
+        said.contains("croft view"),
+        "the message must name the feature that is off, or the user cannot \
+         connect it to the command that fails: {said:?}"
+    );
+    assert!(
+        said.contains("Permission denied (os error 13)"),
+        "and it must carry the CAUSE: a bare 'unavailable' sends the user \
+         looking in the wrong place, which is what the latch exists to \
+         prevent: {said:?}"
+    );
+}
+
+// --- #362 fallback-review blocker: the startup pane's environment ----------
+
+#[test]
+fn a_pane_command_carries_the_view_socket_when_one_is_bound() {
+    // The blocker this replaces: the socket was published with `set_var`
+    // AFTER `App::new` had already built the first pane, and portable-pty
+    // snapshots `std::env::vars_os()` inside `CommandBuilder::new` and then
+    // clears the child's environment before applying only that snapshot. So
+    // `croft view` failed in the startup pane and worked in every pane opened
+    // later. No test could see it: `bind_view_socket` returns early under
+    // `cfg!(test)` and the server-side helper seats a listener by hand, so
+    // nothing exercised the publish path at all.
+    //
+    // Passing the path IN keeps this pure: a process-global set once inside
+    // one test would leak into every other test in the binary.
+    let mut cmd = portable_pty::CommandBuilder::new("/bin/sh");
+    crate::widgets::terminal::apply_pane_env(
+        &mut cmd,
+        Some(std::path::Path::new("/tmp/croft-view-probe.sock")),
+    );
+    let carried: Vec<(String, String)> = cmd
+        .iter_extra_env_as_str()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert!(
+        carried
+            .iter()
+            .any(|(k, v)| k == crate::view_ipc::SOCK_ENV && v == "/tmp/croft-view-probe.sock"),
+        "a pane's command must carry the view socket: {carried:?}"
+    );
+    // Presence half over the same state: the terminal identity still travels,
+    // so this cannot pass by the env application having been removed.
+    assert!(
+        carried
+            .iter()
+            .any(|(k, v)| k == "TERM" && v == "xterm-256color"),
+        "TERM must still be applied: {carried:?}"
+    );
+}
+
+#[test]
+fn a_pane_command_clears_an_inherited_view_socket_when_none_is_bound() {
+    // A croft launched FROM a croft pane inherits the outer croft's
+    // `CROFT_VIEW_SOCK` through `CommandBuilder::new`, which seeds itself from
+    // `std::env::vars_os()`. If the inner croft's own bind fails, adding
+    // nothing is not the same as clearing: its panes keep the PARENT's socket,
+    // and `croft view report.pdf` opens the file in the wrong window and exits
+    // 0. The field doc promises the opposite ("panes then see no
+    // CROFT_VIEW_SOCK and the client says so plainly").
+    //
+    // Asserted through `iter_full_env_as_str`, which is what the CHILD
+    // receives. The sibling test below reads `iter_extra_env_as_str`, which
+    // filters out every inherited entry and is therefore structurally blind to
+    // this: it can only ever prove nothing was ADDED.
+    let mut cmd = portable_pty::CommandBuilder::new("/bin/sh");
+    cmd.env(crate::view_ipc::SOCK_ENV, "/tmp/outer-croft.sock");
+    crate::widgets::terminal::apply_pane_env(&mut cmd, None);
+    let carried: Vec<(String, String)> = cmd
+        .iter_full_env_as_str()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert!(
+        !carried.iter().any(|(k, _)| k == crate::view_ipc::SOCK_ENV),
+        "an inherited socket must be CLEARED, not merely not-added, or a \
+         nested croft routes `croft view` to its parent: {carried:?}"
+    );
+    // Presence half over the same view: the terminal identity still reaches
+    // the child, so this cannot pass by the whole env having been dropped.
+    assert!(
+        carried
+            .iter()
+            .any(|(k, v)| k == "TERM" && v == "xterm-256color"),
+        "TERM must still reach the child: {carried:?}"
+    );
+}
+
+#[test]
+fn a_pane_command_omits_the_view_socket_when_none_is_bound() {
+    // A croft that failed to bind must not hand its panes a stale or empty
+    // path: `croft view` then says the socket is unset, which is true and
+    // actionable, rather than failing to connect to a name that is not there.
+    let mut cmd = portable_pty::CommandBuilder::new("/bin/sh");
+    crate::widgets::terminal::apply_pane_env(&mut cmd, None);
+    let carried: Vec<(String, String)> = cmd
+        .iter_extra_env_as_str()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert!(
+        !carried.iter().any(|(k, _)| k == crate::view_ipc::SOCK_ENV),
+        "no socket bound means no variable: {carried:?}"
+    );
+    assert!(
+        carried.iter().any(|(k, _)| k == "TERM"),
+        "and the pane is still given its terminal identity: {carried:?}"
+    );
+}
+
+#[test]
+fn a_client_that_never_sends_a_newline_is_refused_by_the_deadline() {
+    // The socket's read timeout does NOT bound `read_request` on its own:
+    // SO_RCVTIMEO applies per `recv`, while the read loops until it sees a
+    // newline. A client writing inside every window re-arms it forever, and
+    // the drain runs on the frame loop, so that freezes the editor.
+    //
+    // Asserted on the REPLY, not on elapsed time. The wall-clock version of
+    // this test was load-sensitive to the point of being a flake in waiting:
+    // measured, the fixed path took 20-90ms and the broken path 147-495ms, so
+    // the two bands nearly touch and any threshold between them is a coin
+    // toss on a busy machine. The deadline path produces a message no other
+    // path produces, which is load-independent and says WHICH bound fired.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = seat_view_listener(&mut app, tmp.path());
+
+    let sock2 = sock.clone();
+    // The dribbler stops when the SERVER is done with it, not after a fixed
+    // count. It used to run 240 x 5ms, a flat 1.2s, while the accept it races
+    // is load-scaled to as much as sixteen seconds: on a machine slow enough
+    // to need that budget the dribbler had already exited, the server read
+    // EOF on `{"path":[47,47`, and the test failed on a serde parse error
+    // while asserting about a deadline. That is the same class this fixture
+    // was converted to tolerate, left in the fixture instead of the budget.
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dribbling = std::sync::Arc::clone(&served);
+    let dribbler = std::thread::spawn(move || {
+        let Ok(mut c) = std::os::unix::net::UnixStream::connect(&sock2) else {
+            return;
+        };
+        // Continuously, and INSIDE the budget. Writing once and going quiet
+        // does not reproduce the defect: the per-read timeout fires and the
+        // drain moves on, so a fixture shaped that way passes against the
+        // unbounded read too. The hang needs a client that keeps re-arming.
+        let _ = std::io::Write::write_all(&mut c, br#"{"path":[47"#);
+        let _ = std::io::Write::flush(&mut c);
+        while !dribbling.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if std::io::Write::write_all(&mut c, b",47").is_err() {
+                return;
+            }
+            let _ = std::io::Write::flush(&mut c);
+        }
+    });
+
+    let listener = app.view_listener.as_ref().unwrap();
+    let stream = accept_when_ready(listener);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    let (reply, opened) = app.answer_view_client(stream, deadline);
+    served.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = dribbler.join();
+
+    assert!(
+        !opened,
+        "nothing was ever named, so nothing can have opened"
+    );
+    match reply {
+        crate::view_ipc::ViewReply::Err { message } => assert!(
+            message.contains("did not arrive within the frame budget"),
+            "the DEADLINE must be what refuses this client. Any other error \
+             means some incidental bound fired instead and the deadline is \
+             still unenforced: {message}"
+        ),
+        other => panic!("a request with no newline cannot succeed: {other:?}"),
+    }
+}
+
+#[test]
+fn a_non_blocking_accepted_stream_is_still_answered() {
+    // The PREVIOUS version of this test could not fail: it accepted a
+    // connection, called `set_nonblocking(false)` itself, and then asserted
+    // the flag it had just set. Deleting the production call left it green on
+    // every platform, and its own comment claimed the opposite.
+    //
+    // The version after that could not fail either, for a NEW reason, and the
+    // fix that broke it was in the same round: `read_line_by_deadline` now
+    // swallows `WouldBlock`/`TimedOut` and loops, precisely so a per-recv
+    // errno cannot end a read early. A non-blocking stream therefore busy
+    // spins until the bytes arrive and the reply is `Ok` either way, so
+    // asserting the reply says nothing about the flag. Measured: with
+    // `set_nonblocking(false)` deleted from production, that version passed.
+    //
+    // The flag itself is the claim, so the flag is what this asserts. The
+    // probe is a DUP rather than a second connection: a dup shares the open
+    // file description, so it reads back the same `O_NONBLOCK` the server
+    // cleared on the original. The reply assertion stays alongside it, since
+    // a cleared flag on an unanswered request would not be a pass either.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = seat_view_listener(&mut app, tmp.path());
+    let target = tmp.path().join("seen.txt");
+    std::fs::write(&target, b"hello").unwrap();
+
+    let sock2 = sock.clone();
+    let target2 = target.clone();
+    let client = std::thread::spawn(move || {
+        let mut c = std::os::unix::net::UnixStream::connect(&sock2).unwrap();
+        // Connect, PAUSE, then write. The pause is what makes the blocking
+        // mode observable at all: a client that writes before the server
+        // accepts leaves the bytes sitting in the socket buffer, so the first
+        // read succeeds immediately whether the socket blocks or not, and the
+        // test passes with the flag cleared or set. The read has to WAIT for
+        // the mode to matter, which is exactly the case a real `croft view`
+        // hits whenever the shell is a little slower than the frame loop.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        // `ViewRequest::new` rather than the field by hand, so the byte
+        // encoding is exercised rather than reimplemented beside it.
+        let req = crate::view_ipc::ViewRequest::new(&target2);
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        let _ = std::io::Write::write_all(&mut c, line.as_bytes());
+        let _ = std::io::Write::flush(&mut c);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    // Long enough for the CONNECT to land, short enough that the request has
+    // not been written yet.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    let listener = app.view_listener.as_ref().unwrap();
+    let stream = accept_when_ready(listener);
+    // The state macOS hands production, forced here so Linux exercises it too.
+    stream.set_nonblocking(true).unwrap();
+    let probe = stream.try_clone().expect("a dup of the accepted stream");
+
+    // The client thread sleeps before it writes, so this deadline is racing a
+    // scheduler, not the server. Load-scaled for the same reason every other
+    // spawn wait here is (CONTRIBUTING.md).
+    let deadline = std::time::Instant::now()
+        + crate::test_budget::spawn_budget(crate::test_budget::tests::VIEW_SERVER_DEADLINE_BASE);
+    let (reply, opened) = app.answer_view_client(stream, deadline);
+    let _ = client.join();
+
+    let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&probe), libc::F_GETFL) };
+    assert!(
+        flags >= 0,
+        "F_GETFL on the dup failed: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        flags & libc::O_NONBLOCK,
+        0,
+        "production must clear O_NONBLOCK on an accepted stream: macOS inherits \
+         the listener's flags across accept, and a non-blocking read there \
+         returns before the client has written"
+    );
+
+    assert_eq!(
+        reply,
+        crate::view_ipc::ViewReply::Ok,
+        "and the request is still answered: a cleared flag with no reply \
+         behind it would not be a pass"
+    );
+    assert!(opened, "and the file must actually have been opened");
+}
+
+#[test]
+fn the_sweep_spares_staged_stdin_a_croft_may_still_be_showing() {
+    // The previous version of this test modelled the "live" file as
+    // `stdin-{own_pid}-0.csv` and passed. Production never produces that name:
+    // `stage_stdin` runs inside `view_ipc::run`, the short-lived `croft view`
+    // CLIENT, which exits milliseconds later. So every staged file carries a
+    // pid that is dead by construction, the pid-liveness sweep matched all of
+    // them, and launching a second croft deleted a file the first one had open
+    // in a tab. `sqlite_view::table_page` re-opens by path on every page turn,
+    // so that breaks the tab rather than merely littering.
+    //
+    // Staged through the real function, so the name is the shape production
+    // makes rather than the shape the old fixture assumed.
+    let tmp = tempfile::tempdir().unwrap();
+    let fresh = crate::view_ipc::stage_stdin(tmp.path(), b"a,b\n1,2\n", None).unwrap();
+    assert!(fresh.exists(), "precondition: the pipe was staged");
+
+    crate::app::sweep_dead_view_sockets(tmp.path());
+    assert!(
+        fresh.exists(),
+        "a just-staged pipe must survive: a pane may be showing it right now"
+    );
+}
+
+/// A staged pipe a LIVE croft holds survives the sweep at any age (#362).
+///
+/// Age alone was the whole rule, and age alone deletes a file that is open in
+/// a tab as soon as the session outlives the window. That is not litter:
+/// `sqlite_view::table_page` re-opens by path on every page turn, so the tab
+/// breaks, and `vault read ... | croft view -` cannot be produced again by
+/// re-running anything. The server stamps its pid in at open time and this
+/// asserts the sweep honours it.
+///
+/// Both files here are twice the retention age, so age cannot be what
+/// separates them: only the holder's liveness can.
+#[test]
+fn the_staging_sweep_spares_a_pipe_a_live_croft_still_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let staged = tmp.path().join("view-stdin");
+    std::fs::create_dir_all(&staged).unwrap();
+
+    // A live pid that is NOT this process, so `holder == process::id()` in
+    // production cannot be what spares it and the liveness probe has to run.
+    let mut peer = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let live = peer.id();
+    let dead = {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+
+    let held_live = staged.join(format!("held-{live}-stdin-999999-0.csv"));
+    let held_dead = staged.join(format!("held-{dead}-stdin-999999-1.csv"));
+    let unclaimed = staged.join("stdin-999999-2.csv");
+    for p in [&held_live, &held_dead, &unclaimed] {
+        std::fs::write(p, b"a,b\n1,2\n").unwrap();
+    }
+    let old = std::time::SystemTime::now() - (STAGED_STDIN_RETENTION * 2);
+    for p in [&held_live, &held_dead, &unclaimed] {
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+
+    crate::app::sweep_dead_view_sockets(tmp.path());
+    let live_survived = held_live.exists();
+    let _ = peer.kill();
+    let _ = peer.wait();
+
+    assert!(
+        live_survived,
+        "a pipe held by a running croft must survive the sweep at any age: \
+         the tab re-opens it by path and the bytes cannot be regenerated"
+    );
+    assert!(
+        !held_dead.exists(),
+        "a pipe whose holder has exited, and which has aged out, is litter"
+    );
+    assert!(
+        !unclaimed.exists(),
+        "and an unclaimed staged file still ages out, or the sweep stops \
+         bounding the pile at all"
+    );
+}
+
+/// The server stamps its own pid onto a staged file when it opens it (#362).
+///
+/// The rename is what gives the sweep a live holder to see. It must happen
+/// BEFORE the open, so the editor holds the name the sweep will spare rather
+/// than one that is about to move under it.
+#[test]
+fn opening_a_staged_pipe_claims_it_for_this_croft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let staged = crate::view_ipc::stage_stdin(tmp.path(), b"a,b\n1,2\n", None).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    let reply = app.apply_view_request(&staged);
+    assert_eq!(reply, crate::view_ipc::ViewReply::Ok, "the pipe must open");
+
+    assert!(
+        !staged.exists(),
+        "the staged name must be gone: it is the name the sweep judges by age"
+    );
+    let open = app.editor.editors[app.editor.active_index()]
+        .path
+        .clone()
+        .expect("a file is open");
+    let name = open.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        crate::view_ipc::holder_of_staged(name),
+        Some(std::process::id()),
+        "the EDITOR must hold the claimed path, or a page turn re-opens a \
+         name that no longer exists: {name}"
+    );
+    assert!(
+        open.exists(),
+        "and the claimed file must be on disk under its new name"
+    );
+}
+
+/// An ordinary file is never renamed by the claim (#362).
+#[test]
+fn opening_a_named_file_does_not_rename_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Deliberately named like a staged file, but NOT in the staging dir: the
+    // directory check is what stops croft renaming a user's own file.
+    let decoy = tmp.path().join("stdin-1-0.txt");
+    std::fs::write(&decoy, b"mine").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    let reply = app.apply_view_request(&decoy);
+    assert_eq!(reply, crate::view_ipc::ViewReply::Ok, "it must still open");
+    assert!(
+        decoy.exists(),
+        "a file the user named must keep its name, whatever it looks like"
+    );
+    assert_eq!(
+        app.editor.editors[app.editor.active_index()]
+            .path
+            .as_deref(),
+        Some(decoy.as_path()),
+        "and the editor holds the path the user asked for"
+    );
+}
+
+#[test]
+fn the_staging_sweep_leaves_a_file_it_did_not_stage() {
+    // The name filter, which had no negative case: the socket sweep has one
+    // and this did not. A user who drops a note in the staging directory, or
+    // any other program that writes there, must not have it deleted on a
+    // guess just for being old.
+    let tmp = tempfile::tempdir().unwrap();
+    let staged = tmp.path().join("view-stdin");
+    std::fs::create_dir_all(&staged).unwrap();
+    let stranger = staged.join("notes.txt");
+    std::fs::write(&stranger, b"not croft's").unwrap();
+    let ours = staged.join("stdin-999999-0.txt");
+    std::fs::write(&ours, b"croft's").unwrap();
+
+    // Both older than the window, so age cannot be what separates them.
+    let old = std::time::SystemTime::now() - (STAGED_STDIN_RETENTION * 2);
+    for p in [&stranger, &ours] {
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+
+    crate::app::sweep_staged_stdin(tmp.path());
+
+    assert!(
+        stranger.exists(),
+        "a file croft did not stage is not croft's to delete"
+    );
+    assert!(
+        !ours.exists(),
+        "and the control: a staged file that old goes"
+    );
+}
+#[test]
+fn the_sweep_removes_staged_stdin_old_enough_that_nothing_can_be_showing_it() {
+    // The other half. Age is the honest key here: the pid in the name belongs
+    // to a process that is always gone, so liveness answers a question the
+    // name cannot pose. Anything older than the retention window predates any
+    // running croft's session.
+    let tmp = tempfile::tempdir().unwrap();
+    let stale = crate::view_ipc::stage_stdin(tmp.path(), b"secret", Some("txt")).unwrap();
+    // Backdate past the window without waiting for it.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 30);
+    let f = std::fs::File::options().write(true).open(&stale).unwrap();
+    f.set_modified(old).unwrap();
+    drop(f);
+
+    crate::app::sweep_dead_view_sockets(tmp.path());
+    assert!(
+        !stale.exists(),
+        "a staged pipe older than the window must not outlive it: the module's \
+         own rationale names `vault read | croft view -`"
+    );
+}
+
+// NOT a test: `a_client_that_never_reads_its_reply` was written for the
+// missing write timeout and removed rather than kept green. Measured, the
+// drain returned in 13ms because the reply is bounded by MAX_REQUEST_BYTES
+// (~16KB of path) while Linux's default unix-socket buffer is an order of
+// magnitude larger, so `write_all` never blocks here whatever the timeout is.
+// The fix (`set_write_timeout` in `answer_view_client`) is correct on macOS,
+// whose buffers are small enough to hit it and which is croft's primary
+// platform - but a test that passes identically with and without it is not
+// evidence, and keeping one would misrepresent this as covered.
+
+#[test]
+fn the_view_socket_is_bound_before_the_first_pane_is_spawned() {
+    // The blocker this PR exists to fix, pinned. `croft view` failed in the
+    // STARTUP pane because `App::new` built that pane before binding the
+    // socket, and portable-pty snapshots the environment inside
+    // `CommandBuilder::new`. Every other test on this branch seats a listener
+    // by hand and skips the bind entirely, so reverting the ordering left the
+    // whole suite green - the one defect this branch is about had no guard.
+    //
+    // Checked against the SOURCE rather than at runtime, deliberately.
+    // `view_ipc::SOCK_PATH` is a set-once process global: a test that ran the
+    // real bind would publish a temp path into every other test in this
+    // binary, which is the hazard `CACHE_DIR_OVERRIDE_FOR_TEST` exists to
+    // avoid for the cache dir. The repo already checks source-level properties
+    // this way (`scripts/check_doc_ownership.py`). It is brittle to a rename,
+    // and it fails loudly and says why, which is the trade being made.
+    let src = include_str!("mod.rs");
+    let ctor = src
+        .find("pub fn new(root: PathBuf)")
+        .expect("App::new must exist for this guard to mean anything");
+    // Bounded to App::new's own body. Slicing to the end of the file let two
+    // plausible edits satisfy the guard while inverting the runtime order:
+    // extracting the pane spawn into a helper defined BELOW App::new (the
+    // marker's offset then jumps past the bind's), or a doc comment naming
+    // `Self::bind_view_socket()` somewhere above a later spawn.
+    let end = src[ctor..]
+        .find("\n    pub fn ")
+        .map(|i| ctor + i)
+        .unwrap_or(src.len());
+    let body = &src[ctor..end];
+    // And each marker must be unique in the file, so a second occurrence
+    // cannot silently be the one measured.
+    for marker in ["Self::bind_view_socket()", "PtyTerminal::new(&root)"] {
+        assert_eq!(
+            src.matches(marker).count(),
+            1,
+            "{marker} must appear exactly once, or this guard measures whichever \
+             copy comes first rather than the one that runs"
+        );
+    }
+    let bind = body
+        .find("Self::bind_view_socket()")
+        .expect("App::new must bind the view socket");
+    let pane = body
+        .find("PtyTerminal::new(&root)")
+        .expect("App::new must spawn the first pane");
+    assert!(
+        bind < pane,
+        "the view socket must be bound BEFORE the first pane is spawned: \
+         portable-pty snapshots the environment when a pane's CommandBuilder \
+         is built, so a pane constructed first never learns the socket and \
+         `croft view` fails in it while working in every pane opened later"
+    );
+}
+
+#[test]
+fn a_view_request_for_a_fifo_is_refused_rather_than_opened() {
+    // `apply_view_request` refused only directories, so a FIFO passed the
+    // check and reached `Editor::open`, whose `File::open` BLOCKS until a
+    // writer appears. `mkfifo /tmp/f && croft view /tmp/f` from any pane froze
+    // the whole editor permanently, recoverable only by SIGKILL, and
+    // `/dev/zero` took the same route and read until OOM.
+    //
+    // The 20ms drain deadline does not help: it bounds the READ of the
+    // request, and this is the step after it. Bounding one stage of a pipeline
+    // says nothing about the next.
+    //
+    // Run on a thread with a join deadline: against the old behaviour this
+    // hangs forever, and a hang reads as a CI timeout rather than as this
+    // defect.
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo = tmp.path().join("pipe");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "precondition: the fixture must actually create a FIFO"
+    );
+    assert!(
+        fifo.exists(),
+        "and `exists()` must say yes, as it did in production"
+    );
+
+    let root = tmp.path().to_path_buf();
+    let target = fifo.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut app = App::new(root).unwrap();
+        let _ = tx.send(app.apply_view_request(&target));
+    });
+    let reply = rx
+        .recv_timeout(crate::test_budget::spawn_budget(
+            crate::test_budget::tests::VIEW_FIFO_RECV_BASE,
+        ))
+        .expect("opening a FIFO must not block the frame loop forever");
+    assert!(
+        matches!(reply, crate::view_ipc::ViewReply::Err { .. }),
+        "a FIFO is not a regular file and must be refused with a reason the \
+         client prints, got {reply:?}"
+    );
+}
+
+#[test]
+fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
+    // The cap was tested on the iteration AFTER the newline branch, so a
+    // request carrying its newline in the very chunk that crossed the limit
+    // was accepted and deserialised. The bound held for an unterminated flood
+    // and not for a terminated one - which is the shape a real client sends.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = seat_view_listener(&mut app, tmp.path());
+
+    let sock2 = sock.clone();
+    let flood = std::thread::spawn(move || {
+        let Ok(mut c) = std::os::unix::net::UnixStream::connect(&sock2) else {
+            return;
+        };
+        // Just past the cap, and TERMINATED, so the newline lands INSIDE the
+        // chunk that crosses the limit. The size matters: overshoot by more
+        // than one 4096-byte chunk and the accumulate-path check fires on an
+        // earlier read, before the newline arrives, which the old ordering
+        // also refused - a fixture that big cannot tell the two apart. This is
+        // the only window where the newline branch runs first.
+        let mut line = vec![b'x'; (crate::view_ipc::MAX_REQUEST_BYTES as usize) + 100];
+        line.push(b'\n');
+        let _ = std::io::Write::write_all(&mut c, &line);
+        let _ = std::io::Write::flush(&mut c);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let listener = app.view_listener.as_ref().unwrap();
+    let stream = accept_when_ready(listener);
+    // The client thread sleeps before it writes, so this deadline is racing a
+    // scheduler, not the server. Load-scaled for the same reason every other
+    // spawn wait here is (CONTRIBUTING.md).
+    let deadline = std::time::Instant::now()
+        + crate::test_budget::spawn_budget(crate::test_budget::tests::VIEW_SERVER_DEADLINE_BASE);
+    let (reply, opened) = app.answer_view_client(stream, deadline);
+    let _ = flood.join();
+
+    assert!(!opened, "an oversized request names nothing to open");
+    match reply {
+        crate::view_ipc::ViewReply::Err { message } => assert!(
+            message.contains("exceeded the maximum length"),
+            "the LENGTH cap must be what refuses this, not an incidental parse \
+             failure downstream of accepting it: {message}"
+        ),
+        other => panic!("an oversized request must not be accepted: {other:?}"),
+    }
+}
