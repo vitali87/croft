@@ -10438,6 +10438,203 @@ fn mouse_wheel_over_search_panel_scrolls_the_results_list() {
     );
 }
 
+/// `diff_worktree_lane` refuses rather than diffing the wrong thing, and
+/// each refusal names its own reason (#348).
+///
+/// The three arms are separate because they need separate answers: the
+/// primary folder is not a lane at all, a lane pane may not be open for
+/// this root, and a lane made before the base was recorded has nothing to
+/// diff against. Collapsing them would tell the user to fix the wrong
+/// thing.
+#[test]
+fn diffing_a_lane_refuses_when_there_is_no_base_to_diff_against() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // The primary folder is not a lane.
+    app.diff_worktree_lane();
+    assert_eq!(app.graph_revspec, None, "no diff was set up");
+    assert!(
+        app.status.contains("not a lane"),
+        "the primary folder says so: {}",
+        app.status
+    );
+
+    // A non-primary root with no lane pane recorded for it.
+    let lane_dir = tmp.path().join("lane");
+    std::fs::create_dir_all(&lane_dir).unwrap();
+    app.active_scm_root = lane_dir.clone();
+    app.diff_worktree_lane();
+    assert_eq!(app.graph_revspec, None);
+    assert!(
+        app.status.contains("No lane is open"),
+        "an unrecorded root says so: {}",
+        app.status
+    );
+
+    // A lane whose base was never recorded (made before #348, or cut from a
+    // detached HEAD).
+    app.lane_panes.insert(
+        1,
+        crate::terminal_session::LaneRecord {
+            path: lane_dir.to_string_lossy().into_owned(),
+            branch: String::from("agent/fix"),
+            agent: None,
+            base: None,
+        },
+    );
+    app.diff_worktree_lane();
+    assert_eq!(
+        app.graph_revspec, None,
+        "no base means no diff, not a diff against something else"
+    );
+    assert!(
+        app.status.contains("no base branch"),
+        "a baseless lane says so: {}",
+        app.status
+    );
+
+    // With a base recorded, the range is the lane against what it was cut
+    // from - the positive control that the refusals above are refusals and
+    // not just an inert function.
+    app.lane_panes.insert(
+        1,
+        crate::terminal_session::LaneRecord {
+            path: lane_dir.to_string_lossy().into_owned(),
+            branch: String::from("agent/fix"),
+            agent: None,
+            base: Some(String::from("main")),
+        },
+    );
+    app.diff_worktree_lane();
+    assert_eq!(
+        app.graph_revspec,
+        Some(String::from("main..agent/fix")),
+        "the range is base..lane"
+    );
+}
+
+/// The lane diff belongs to the root it was asked for, and does not outlive
+/// it (#348).
+///
+/// `branch_history_range` answers an unresolvable range with an EMPTY vec
+/// rather than an error, so a revspec carried into another repo - or kept
+/// after the lane is gone - renders a repo with commits as having none,
+/// with nothing on screen saying why.
+#[test]
+fn switching_roots_drops_the_lane_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+
+    app.graph_revspec = Some(String::from("main..agent/fix"));
+    app.seed_active_scm(other);
+    assert_eq!(
+        app.graph_revspec, None,
+        "a lane diff must not follow the user into another repository"
+    );
+}
+
+/// A background history refresh must not replace a lane diff (#348).
+///
+/// The reply tag carries the revspec as well as the root, because both
+/// views are for the SAME root and the root alone cannot tell them apart.
+/// Pinned against a positive value: the panel starts holding the lane
+/// diff's own row, so a dropped reply and an accepted one differ in what
+/// is on screen, not merely in timing.
+#[test]
+fn a_history_reply_does_not_replace_the_lane_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while app.graph_fetch_inflight {
+        app.sync_explorer_panels();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup graph fetch must settle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let row = |hash: &str, summary: &str| crate::git::GraphCommit {
+        hash: String::from(hash),
+        short_hash: hash[..7.min(hash.len())].to_string(),
+        parents: Vec::new(),
+        refs: Vec::new(),
+        summary: String::from(summary),
+        author: String::from("t"),
+        age_secs: 0,
+    };
+    app.sidebar_view = SidebarView::SourceControl;
+    app.show_tree = true;
+    app.source_control.status.in_repo = true;
+
+    // The lane diff is up and showing its own commit.
+    app.graph_revspec = Some(String::from("main..lane"));
+    app.commit_graph
+        .set_rows(crate::widgets::commit_graph::layout_graph(vec![row(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "the lane commit",
+        )]));
+
+    // `commit_at` is a click hit-test and needs rendered geometry, so read
+    // the top row the way a click would - after a draw.
+    let backend = ratatui::backend::TestBackend::new(100, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    let shown = |app: &mut App, term: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+        term.draw(|frame| app.render(frame)).unwrap();
+        let area = app.commit_graph.last_area;
+        app.commit_graph
+            .commit_at(area.y + 2)
+            .map(|c| c.hash.clone())
+    };
+    let lane_hash = shown(&mut app, &mut term);
+    assert_eq!(
+        lane_hash,
+        Some(String::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+        "the lane diff must be on screen first"
+    );
+
+    // A plain history reply for the SAME root arrives (revspec None) carrying
+    // a DIFFERENT commit. Same root, different view: the tag must drop it.
+    app.graph_tx
+        .send((
+            app.active_scm_root.clone(),
+            None,
+            crate::widgets::commit_graph::layout_graph(vec![row(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "a background history refresh",
+            )]),
+        ))
+        .unwrap();
+    app.sync_explorer_panels();
+    assert_eq!(
+        shown(&mut app, &mut term),
+        lane_hash,
+        "a history reply must not replace the lane diff the user asked for"
+    );
+
+    // The matching reply IS taken, so the drop above is the tag working
+    // rather than the channel being dead.
+    app.graph_tx
+        .send((
+            app.active_scm_root.clone(),
+            Some(String::from("main..lane")),
+            crate::widgets::commit_graph::layout_graph(vec![row(
+                "cccccccccccccccccccccccccccccccccccccccc",
+                "the refreshed lane diff",
+            )]),
+        ))
+        .unwrap();
+    app.sync_explorer_panels();
+    assert_eq!(
+        shown(&mut app, &mut term),
+        Some(String::from("cccccccccccccccccccccccccccccccccccccccc")),
+        "a reply for the view that IS up must land"
+    );
+}
+
 #[test]
 fn mouse_wheel_over_the_commits_graph_scrolls_it() {
     // Codeberg #41: the COMMITS section cannot be scrolled. The graph
@@ -10530,7 +10727,11 @@ fn a_graph_refresh_swallowed_by_an_inflight_fetch_refires_when_the_reply_drains(
     app.refresh_commit_graph();
     // The stale reply lands: dropped by the root tag.
     app.graph_tx
-        .send((std::path::PathBuf::from("/since-left/root"), Vec::new()))
+        .send((
+            std::path::PathBuf::from("/since-left/root"),
+            None,
+            Vec::new(),
+        ))
         .unwrap();
     // The re-fire is the contract, but the inflight latch is transient: the
     // drain that re-fires can also drain the re-fired worker's reply in the
@@ -45080,6 +45281,7 @@ fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
                     path: lane_dir.display().to_string(),
                     branch: String::from("agent/fix-login"),
                     agent: Some(String::from("probe")),
+                    base: None,
                 }),
             },
             crate::terminal_session::PaneRecord {
@@ -45090,6 +45292,7 @@ fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
                     path: tmp.path().join("repo-gone").display().to_string(),
                     branch: String::from("agent/gone"),
                     agent: Some(String::from("probe")),
+                    base: None,
                 }),
             },
         ],
@@ -45157,6 +45360,7 @@ fn a_restored_lane_pane_spawns_in_its_worktree_not_where_the_shell_had_wandered(
         path: lane_dir.display().to_string(),
         branch: String::from("agent/fix-login"),
         agent: Some(String::from(agent)),
+        base: None,
     };
     let rec = crate::terminal_session::SessionRecord {
         panes: vec![
@@ -45459,6 +45663,7 @@ fn a_lanes_badge_follows_the_seat_and_a_seated_pane_outranks_a_plain_one() {
             path: lane.display().to_string(),
             branch: String::from("agent/fix-login"),
             agent: None,
+            base: None,
         },
     );
     app.terminals.push(plain);
@@ -45576,6 +45781,7 @@ fn two_lanes_sharing_a_branch_are_named_by_their_folders_instead() {
                 path: dir.display().to_string(),
                 branch: String::from("agent/fix"),
                 agent: None,
+                base: None,
             },
         );
     }

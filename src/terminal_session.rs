@@ -30,6 +30,12 @@ pub struct LaneRecord {
     pub branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The branch the lane was cut from (#348), so "diff against the base"
+    /// survives a restart. `worktree add -b` records no start-point and the
+    /// reflog that does is local and prunable, so this is the only copy that
+    /// outlives the session that made the lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// One pane to bring back.
@@ -188,6 +194,9 @@ mod tests {
             path: String::from("/work/repo-fix-login"),
             branch: String::from("agent/fix-login"),
             agent: Some(String::from("claude")),
+            // A real base, so the round-trip below proves the field
+            // survives rather than that `None` survives (#348).
+            base: Some(String::from("main")),
         };
         let rec = SessionRecord {
             panes: vec![
