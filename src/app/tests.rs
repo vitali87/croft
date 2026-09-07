@@ -42324,6 +42324,127 @@ fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
     );
 }
 
+/// Closing the last EXPANDED pane leaves a panel of nothing but strips,
+/// and something must bring one back (part of #468).
+///
+/// `toggle_terminal_collapse` refuses to fold the last expanded pane,
+/// but closing reaches that state from the other side, which is a route
+/// the fold guard cannot see. `ensure_a_terminal_pane_is_expanded` is
+/// the answer and has exactly one caller; this pins that the caller is
+/// on the path that needs it.
+#[test]
+fn closing_the_last_expanded_pane_leaves_one_expanded_behind() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(2);
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.toggle_terminal_collapse(1);
+    assert!(app.terminals[1].collapsed, "premise: pane 1 is folded");
+    assert!(
+        !app.terminals[0].collapsed,
+        "premise: pane 0 is the only expanded one"
+    );
+
+    // Close the expanded one. The fold guard never fires -- nothing is
+    // being folded -- so the panel would be all strips without the
+    // close path's own guard.
+    app.close_terminal_at(0);
+    term.draw(|f| app.render(f)).unwrap();
+
+    assert_eq!(app.terminals.len(), 1, "one pane left");
+    assert!(
+        !app.terminals[0].collapsed,
+        "the surviving pane must be expanded: a panel of nothing but strips \
+         has no cursor and no way back that does not depend on the strip \
+         click still working"
+    );
+}
+
+/// EXHAUSTIVE recovery sweep for #468: every pane index, both side bar
+/// positions, and with a resize or a maximize cycle interleaved, must be
+/// recoverable from its strip.
+///
+/// Four theories about this bug died against the tree by inspection --
+/// the editor/panel splitter's grab zone, the maximize/collapse flag
+/// interaction, index 0 being special, and the last-expanded guard. This
+/// stops arguing and drives the combinations instead, because "I could
+/// not construct the path" is a much weaker claim than "the paths were
+/// enumerated and all of them recover".
+///
+/// If this ever goes red it names the reproduction directly.
+#[test]
+fn every_collapsed_pane_recovers_from_its_strip_in_every_layout() {
+    for panes in [2usize, 3] {
+        for right_bar in [false, true] {
+            for perturb in ["none", "resize", "maximize"] {
+                for idx in 0..panes {
+                    let (_tmp, mut app, mut term) = app_with_terminal_panes(panes);
+                    app.side_bar_position = if right_bar {
+                        crate::app::SideBarPosition::Right
+                    } else {
+                        crate::app::SideBarPosition::Left
+                    };
+                    term.draw(|f| app.render(f)).unwrap();
+
+                    app.toggle_terminal_collapse(idx);
+                    assert!(
+                        app.terminals[idx].collapsed,
+                        "premise: pane {idx} folds ({panes} panes, right_bar={right_bar})"
+                    );
+
+                    // The perturbations #475 and #478 make plausible: a
+                    // resize leaves stale geometry behind, and maximize
+                    // bypasses the pane-constraint path entirely.
+                    match perturb {
+                        "resize" => {
+                            term =
+                                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+                                    .unwrap();
+                        }
+                        "maximize" => {
+                            app.toggle_terminal_pane_maximize();
+                            term.draw(|f| app.render(f)).unwrap();
+                            app.toggle_terminal_pane_maximize();
+                        }
+                        _ => {}
+                    }
+                    term.draw(|f| app.render(f)).unwrap();
+
+                    // The perturbation must PRESERVE the fold. A `continue`
+                    // here would let a maximize cycle that clears `collapsed`
+                    // pass the case without ever clicking a strip, so the
+                    // sweep would report paths it never walked -- the exact
+                    // shape of green this test exists to refuse.
+                    assert!(
+                        app.terminals[idx].collapsed,
+                        "pane {idx} must still be folded after {perturb} \
+                         ({panes} panes, right_bar={right_bar}); if this \
+                         perturbation legitimately unfolds panes the case \
+                         needs its own assertion, not a skip"
+                    );
+                    let strip = app.terminal_strip_rects[idx];
+                    assert_eq!(
+                        strip.width, 1,
+                        "pane {idx} keeps a one-column strip after {perturb} \
+                         ({panes} panes, right_bar={right_bar})"
+                    );
+
+                    app.handle_mouse(mouse(
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                        strip.x,
+                        strip.y,
+                    ));
+                    assert!(
+                        !app.terminals[idx].collapsed,
+                        "pane {idx} must unfold from its strip at ({}, {}) after \
+                         {perturb} ({panes} panes, right_bar={right_bar})",
+                        strip.x, strip.y
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn a_collapsed_strip_carries_the_pane_name_down_its_column() {
     // The strip is what makes the gesture obviously reversible, so it has to
