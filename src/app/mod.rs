@@ -15438,6 +15438,22 @@ impl App {
                         // grid that is no longer painted there.
                         if cols[i].width == 0 || (t.collapsed && !maximized) {
                             t.last_area = Rect::default();
+                            // `last_inner` too, and for a second reason
+                            // (#510). It anchors the raw-stdout image
+                            // overlay, which parks the cursor with absolute
+                            // CUP and so is bounded by nothing but this
+                            // rect. Left stale it names the rect the pane
+                            // held under the PREVIOUS layout - in maximize
+                            // mode, its old split column - and every bounds
+                            // check downstream passes against that, so the
+                            // payload lands wherever the stale origin points:
+                            // over a sibling pane, the sidebar, or the status
+                            // bar. Being a raw write rather than a buffer
+                            // index, an out-of-range result cannot panic, and
+                            // ratatui's diff has no record of the cells it
+                            // touched, so nothing repairs them on the next
+                            // frame.
+                            t.last_inner = Rect::default();
                             t.redacted_on_screen = 0;
                         } else {
                             frame.render_widget(
@@ -41793,6 +41809,11 @@ impl App {
             return;
         };
         let inner = t.last_inner;
+        // A pane the last frame did not paint has a zeroed `last_inner`
+        // (#510), and the width/height floors below already reject it. The
+        // floors are the guard: an overlay anchored on a rect the pane no
+        // longer occupies is written with absolute CUP and lands outside
+        // every rect the widget layer respects.
         if t.alt_screen() || inner.width < 6 || inner.height < 3 {
             self.disable_terminal_image();
             return;
