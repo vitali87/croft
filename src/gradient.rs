@@ -59,6 +59,28 @@ pub fn rgb_color((r, g, b): (u8, u8, u8)) -> Color {
 /// (e.g., a 80x25 default startup buffer with a tall recents list) draws
 /// nothing instead of panicking inside `set_string`.
 pub fn paint_gradient_box(buf: &mut Buffer, rect: Rect) {
+    paint_gradient_box_weighted(buf, rect, false)
+}
+
+/// The gradient box in either weight (#470).
+///
+/// `heavy` swaps the light line-drawing glyphs for their heavy siblings so
+/// a focused terminal pane reads as focused on the Black theme too, where
+/// this overlay REPLACES the block border the rest of the app draws -- a
+/// `BorderType::Thick` underneath would be painted straight over. The
+/// corners stay rounded in both weights: there is no heavy rounded corner
+/// in the box-drawing block, and the arc glyphs are the house look every
+/// other caller of this function shares.
+pub fn paint_gradient_box_heavy(buf: &mut Buffer, rect: Rect) {
+    paint_gradient_box_weighted(buf, rect, true)
+}
+
+fn paint_gradient_box_weighted(buf: &mut Buffer, rect: Rect, heavy: bool) {
+    // The one guard for both entry points. It lived in `paint_gradient_box`
+    // and a weaker copy landed here when the weight parameter was added,
+    // which left the heavy path able to panic on a rect the light path
+    // safely declined -- the offsets and the lower bounds matter whenever
+    // the buffer does not start at (0,0).
     if rect.width < 2 || rect.height < 2 {
         return;
     }
@@ -70,6 +92,8 @@ pub fn paint_gradient_box(buf: &mut Buffer, rect: Rect) {
     {
         return;
     }
+    let horiz = if heavy { "\u{2501}" } else { "\u{2500}" };
+    let vert = if heavy { "\u{2503}" } else { "\u{2502}" };
     let max_x = rect.width - 1;
     let max_y = rect.height - 1;
     for x in 0..rect.width {
@@ -85,14 +109,14 @@ pub fn paint_gradient_box(buf: &mut Buffer, rect: Rect) {
         } else if x == max_x {
             "\u{256e}"
         } else {
-            "\u{2500}"
+            horiz
         };
         let bot_ch = if x == 0 {
             "\u{2570}"
         } else if x == max_x {
             "\u{256f}"
         } else {
-            "\u{2500}"
+            horiz
         };
         buf.set_string(
             rect.x + x,
@@ -118,13 +142,13 @@ pub fn paint_gradient_box(buf: &mut Buffer, rect: Rect) {
         buf.set_string(
             rect.x,
             rect.y + y,
-            "\u{2502}",
+            vert,
             Style::default().fg(rgb_color(left)),
         );
         buf.set_string(
             rect.x + max_x,
             rect.y + y,
-            "\u{2502}",
+            vert,
             Style::default().fg(rgb_color(right)),
         );
     }

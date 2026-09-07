@@ -5876,6 +5876,49 @@ fn render_welcome_does_not_panic_in_default_80x25_with_many_notes() {
     term.draw(|f| app.render_welcome(f, area)).unwrap();
 }
 
+/// The focused pane's box is drawn in HEAVY glyphs and an unfocused one
+/// in light, so which pane owns the keyboard reads from weight and not
+/// only from colour (#470). Both weights keep the rounded corners: there
+/// is no heavy arc glyph, and the corners are the house look every other
+/// caller of the gradient box shares.
+#[test]
+fn the_gradient_box_comes_in_two_weights() {
+    use ratatui::buffer::Buffer;
+    let area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 4,
+    };
+    let sym = |b: &Buffer, x: u16, y: u16| b[(x, y)].symbol().to_string();
+
+    let mut light = Buffer::empty(area);
+    crate::gradient::paint_gradient_box(&mut light, area);
+    let mut heavy = Buffer::empty(area);
+    crate::gradient::paint_gradient_box_heavy(&mut heavy, area);
+
+    // All four edges, not just two: the bug this was written for replaced
+    // one horizontal edge and left the other light, so a test that reads
+    // only the top would miss its own inverse.
+    for (x, y, what) in [(3u16, 0u16, "top"), (3, 3, "bottom")] {
+        assert_eq!(sym(&light, x, y), "\u{2500}", "light {what} edge");
+        assert_eq!(sym(&heavy, x, y), "\u{2501}", "heavy {what} edge");
+    }
+    for (x, y, what) in [(0u16, 1u16, "left"), (7, 1, "right")] {
+        assert_eq!(sym(&light, x, y), "\u{2502}", "light {what} edge");
+        assert_eq!(sym(&heavy, x, y), "\u{2503}", "heavy {what} edge");
+    }
+    // The corners are shared, which is what keeps the two boxes the same
+    // shape rather than two different visual languages.
+    for (x, y) in [(0, 0), (7, 0), (0, 3), (7, 3)] {
+        assert_eq!(
+            sym(&light, x, y),
+            sym(&heavy, x, y),
+            "corner ({x},{y}) is the same arc in both weights"
+        );
+    }
+}
+
 #[test]
 fn paint_gradient_box_draws_rounded_corners_with_corner_colours() {
     let rect = Rect {
@@ -27939,11 +27982,21 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     let inner = app.terminals[0].last_inner;
     let rows = screen_rows(&term);
     let border_row = &rows[(area.y + area.height - 1) as usize];
+    // The gauge's fill glyph contrasts with the pane's own border weight
+    // (#470): a focused pane draws a heavy border, so its fill is `═`
+    // against `━`; an unfocused one draws light, so its fill is `━`
+    // against `─`. Counting the glyph that marks FILL keeps this test
+    // about the gauge rather than about which border weight is in force.
+    let fill_glyph = if app.terminals[0].focused {
+        '═'
+    } else {
+        '━'
+    };
     let fill: usize = border_row
         .chars()
         .skip(inner.x as usize)
         .take(inner.width as usize)
-        .filter(|c| *c == '━')
+        .filter(|c| *c == fill_glyph)
         .count();
     let expected = (inner.width as u32 * 46 / 100) as usize;
     assert!(
@@ -27970,8 +28023,11 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     term.draw(|f| app.render(f)).unwrap();
     let rows = screen_rows(&term);
     let border_row = &rows[(area.y + area.height - 1) as usize];
+    // No FILL glyph remains. `━` is the border's own glyph on a focused
+    // pane (#470), so a literal check here would fail on an intact border
+    // rather than on a leftover gauge.
     assert!(
-        !border_row.contains('━'),
+        !border_row.contains(fill_glyph),
         "a cleared gauge restores the plain border: {border_row:?}"
     );
     assert!(
