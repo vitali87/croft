@@ -356,8 +356,9 @@ impl AgentLedger {
         true
     }
 
-    /// Mark every file in one lane reviewed, using `read` to see each
-    /// file's current content.
+    /// Mark every file in one lane reviewed, using `read` to see each file's
+    /// current content and, in the same call, the local-history snapshot
+    /// holding exactly those bytes.
     ///
     /// Returns `(reviewed, dropped)`: rows whose current content became the
     /// baseline, and rows removed because the file is gone. They are counted
@@ -366,8 +367,7 @@ impl AgentLedger {
     pub fn mark_lane_reviewed(
         &mut self,
         agent: &str,
-        read: impl Fn(&Path) -> Baseline,
-        snapshot: impl Fn(&Path) -> Option<u64>,
+        read: impl Fn(&Path) -> (Baseline, Option<u64>),
     ) -> (usize, usize) {
         let Some(lane) = self.lanes.get_mut(agent) else {
             return (0, 0);
@@ -378,13 +378,16 @@ impl AgentLedger {
             if !entry.unreviewed() {
                 continue;
             }
-            match read(&entry.path) {
+            // One call per row returns both, from ONE read of the file: a
+            // second read could see different bytes, and the baseline hash
+            // would then describe content the anchor does not hold. Per row,
+            // never once for the lane - a snapshot that failed to record must
+            // not inherit a sibling's anchor.
+            let (baseline, snapshot_millis) = read(&entry.path);
+            match baseline {
                 Baseline::Hash(current) => {
                     entry.reviewed_hash = Some(current);
-                    // Per row, not once for the lane: each file has its own
-                    // snapshot, and one that failed to record must not
-                    // inherit a sibling's anchor.
-                    entry.reviewed_millis = snapshot(&entry.path);
+                    entry.reviewed_millis = snapshot_millis;
                     entry.current_hash = current;
                     entry.writes_since_review = 0;
                     cleared += 1;
@@ -582,17 +585,13 @@ mod tests {
 
         // `a.rs` moved on disk since the agent's write (the user edited it);
         // `gone.rs` no longer exists.
-        let (cleared, dropped) = led.mark_lane_reviewed(
-            "claude",
-            |path| {
-                if path == p("/w/a.rs") {
-                    Baseline::Hash(42)
-                } else {
-                    Baseline::Gone
-                }
-            },
-            |_| None,
-        );
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |path| {
+            if path == p("/w/a.rs") {
+                (Baseline::Hash(42), None)
+            } else {
+                (Baseline::Gone, None)
+            }
+        });
         assert_eq!(
             (cleared, dropped),
             (1, 1),
@@ -667,19 +666,15 @@ mod tests {
         led.record_write(&p("/w/a.rs"), 1, &agent);
         led.record_write(&p("/w/b.rs"), 2, &agent);
 
-        let (cleared, dropped) = led.mark_lane_reviewed(
-            "claude",
-            |path| {
-                if path == p("/w/a.rs") {
-                    Baseline::Hash(10)
-                } else {
-                    Baseline::Hash(20)
-                }
-            },
-            // Snapshotting `b.rs` failed (the store is best-effort), so it
-            // gets a baseline hash but no retrievable content.
-            |path| (path == p("/w/a.rs")).then_some(2_500),
-        );
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |path| {
+            if path == p("/w/a.rs") {
+                (Baseline::Hash(10), Some(2_500))
+            } else {
+                // Snapshotting `b.rs` failed (the store is best-effort), so
+                // it gets a baseline hash but no retrievable content.
+                (Baseline::Hash(20), None)
+            }
+        });
         assert_eq!((cleared, dropped), (2, 0));
 
         let rows = led.lane("claude");
@@ -865,7 +860,7 @@ mod tests {
         led.record_write(&p("/w/d.rs"), 4, &a);
 
         // Emptying it settles the question: nothing is left to be wrong.
-        let (reviewed, _) = led.mark_lane_reviewed("claude", |_| Baseline::Hash(4), |_| None);
+        let (reviewed, _) = led.mark_lane_reviewed("claude", |_| (Baseline::Hash(4), None));
         assert_eq!(reviewed, 1);
         assert!(
             !led.may_be_incomplete(),
@@ -884,8 +879,7 @@ mod tests {
         assert_eq!(led.unreviewed_count("claude"), 1);
 
         // The read fails this instant, whatever the disk holds.
-        let (cleared, dropped) =
-            led.mark_lane_reviewed("claude", |_| Baseline::Unreadable, |_| None);
+        let (cleared, dropped) = led.mark_lane_reviewed("claude", |_| (Baseline::Unreadable, None));
         assert_eq!(
             (cleared, dropped),
             (0, 0),
@@ -899,7 +893,7 @@ mod tests {
 
         // And it is still recoverable once the read succeeds.
         assert_eq!(
-            led.mark_lane_reviewed("claude", |_| Baseline::Hash(555), |_| None),
+            led.mark_lane_reviewed("claude", |_| (Baseline::Hash(555), None)),
             (1, 0)
         );
         assert_eq!(led.unreviewed_count("claude"), 0);
