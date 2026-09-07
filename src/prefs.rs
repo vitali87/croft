@@ -304,8 +304,9 @@ pub struct Prefs {
     /// to. `WORKSPACE_ALLOWED_KEYS` refuses it, and the refusal is visible
     /// rather than silent.
     ///
-    /// Ordered, so the fleet a group names is stable between runs: a
-    /// HashMap would reorder the tiles a comparison is read across.
+    /// Ordered, so the hosts a group names come back in the same order on
+    /// every run: a HashMap would shuffle them, and a fleet comparison is
+    /// read by scanning down the list.
     #[serde(default)]
     pub fleet_groups: std::collections::BTreeMap<String, Vec<String>>,
     /// The agent a new worktree lane starts in its pane (#348): the name of

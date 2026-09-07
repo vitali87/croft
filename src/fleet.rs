@@ -174,11 +174,12 @@ pub fn fleet_ssh_args(host: &str, command: &str) -> Vec<String> {
 ///
 /// `*` is the explicit way to say "all of them", so the broadcast is still
 /// available to someone who means it.
-/// Parse `hosts: command`, expanding any saved host groups (#363).
 ///
-/// A name in the spec is looked up as a GROUP first and a host second, so a
-/// group named after a host cannot silently shadow it - the group wins, and
-/// naming one after a host is the user's own doing. Expansion is one level:
+/// A name is looked up as a saved group first and a host second (#363), so a
+/// group named after a host cannot silently shadow it — the group wins, and
+/// naming one after a host is the user's own doing.
+///
+/// Expansion is one level:
 /// a group listing another group's name resolves that entry as a host and
 /// fails the unknown-host check below, rather than recursing. Nesting would
 /// need cycle detection to be safe, and there is no case for it yet.
@@ -208,6 +209,14 @@ pub fn parse_request_with_groups<'a>(
             Some((_, members)) => members.iter().map(String::as_str).collect(),
             None => vec![name],
         };
+        // A group that resolves to nothing REFUSES rather than contributing
+        // nothing. Silently, `web,db1: cmd` with an empty `web` would run on
+        // db1 alone - the user believes they addressed a fleet and addressed
+        // one box, which is the harm the unknown-host check below exists to
+        // prevent. Every other refusal in this function is loud.
+        if members.is_empty() {
+            return None;
+        }
         for member in members {
             // Only hosts croft actually knows: a typo must not become an ssh
             // attempt against a hostname the user never configured, and a
@@ -419,6 +428,49 @@ mod tests {
         // so the refusal above is the check and not a broken fixture.
         let ok = groups(&[("web", &["web1"])]);
         assert!(parse_request_with_groups("web: uname -r", &known, &ok).is_some());
+    }
+
+    /// A group that resolves to nothing refuses rather than narrowing the
+    /// fleet silently.
+    ///
+    /// The mixed case is the dangerous one: with an empty `web`, the spec
+    /// `web,db1` would otherwise run on db1 alone and report success, so the
+    /// user believes they addressed a fleet and addressed one box.
+    #[test]
+    fn an_empty_group_refuses_rather_than_narrowing_the_fleet() {
+        let known: Vec<String> = ["web1", "db1"].iter().map(|s| s.to_string()).collect();
+        let empty = groups(&[("web", &[])]);
+        assert!(
+            parse_request_with_groups("web: uptime", &known, &empty).is_none(),
+            "an empty group alone refuses"
+        );
+        assert!(
+            parse_request_with_groups("web,db1: uptime", &known, &empty).is_none(),
+            "and mixed with a real host it refuses too, rather than running on db1"
+        );
+        // Paired presence: the same spec with a populated group parses, so
+        // the refusals above are the emptiness and not a broken fixture.
+        let ok = groups(&[("web", &["web1"])]);
+        let (hosts, _) = parse_request_with_groups("web,db1: uptime", &known, &ok).expect("parsed");
+        assert_eq!(hosts.len(), 2);
+    }
+
+    /// Expansion is one level, so a self-referential group terminates at the
+    /// known-host check rather than looping. The doc makes this promise; a
+    /// later move to recursive expansion would break it silently.
+    #[test]
+    fn a_self_referential_group_refuses_instead_of_looping() {
+        let known: Vec<String> = ["web1"].iter().map(|s| s.to_string()).collect();
+        let looped = groups(&[("web", &["web"])]);
+        assert!(
+            parse_request_with_groups("web: uptime", &known, &looped).is_none(),
+            "'web' expands once to 'web', which is not a known host"
+        );
+        let mutual = groups(&[("a", &["b"]), ("b", &["a"])]);
+        assert!(
+            parse_request_with_groups("a: uptime", &known, &mutual).is_none(),
+            "mutual references terminate the same way"
+        );
     }
 
     /// A bare host name still works when groups exist, and a group named
