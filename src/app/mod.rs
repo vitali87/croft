@@ -2557,6 +2557,19 @@ pub struct App {
     /// TIMELINE once the snapshot actually exists on disk.
     history_done_rx: std::sync::mpsc::Receiver<PathBuf>,
     history_done_tx: std::sync::mpsc::Sender<PathBuf>,
+    /// The whole-project check's result: where it ran, and what the process
+    /// did (#256). The `io::Result` carries a spawn failure separately from
+    /// a run that produced output, because those need different messages.
+    #[allow(clippy::type_complexity)]
+    project_check_rx: std::sync::mpsc::Receiver<(PathBuf, std::io::Result<std::process::Output>)>,
+    #[allow(clippy::type_complexity)]
+    project_check_tx: std::sync::mpsc::Sender<(PathBuf, std::io::Result<std::process::Output>)>,
+    /// Whether a sweep is in flight, so a second invocation says so rather
+    /// than stacking compilers.
+    project_check_running: bool,
+    /// How many rows the last sweep produced (#256), counted before its
+    /// items join a store shared with every other producer.
+    project_check_rows: usize,
     /// Replies from the background test-source locator (the workspace grep is
     /// too slow for the render thread): the root the search ran under, the
     /// test name, and the hit. A reply from before a re-root is dropped.
@@ -4391,6 +4404,7 @@ impl App {
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
+        let (project_check_tx, project_check_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
         let (graph_tx, graph_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
@@ -4503,6 +4517,10 @@ impl App {
             timeline_tx,
             history_done_rx,
             history_done_tx,
+            project_check_rx,
+            project_check_tx,
+            project_check_running: false,
+            project_check_rows: 0,
             test_jump_rx,
             test_jump_tx,
             timeline_fetched: None,
@@ -8114,6 +8132,174 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The producer id for the whole-project check (#256).
+    ///
+    /// `build_diag_files_by_pane` keys a producer's contribution so its next
+    /// run replaces its previous one. Pane uids are allocated from 1 upward
+    /// by an `AtomicU64`, so `u64::MAX` cannot collide with a real pane. The
+    /// sweep needs its OWN id rather than borrowing one: sharing would make a
+    /// pane's next command wipe the sweep's rows, and the sweep wipe the
+    /// pane's.
+    const PROJECT_CHECK_ID: u64 = u64::MAX;
+
+    /// The first line with something to say, escapes stripped (#256).
+    ///
+    /// A checker's failure output is not a tidy single line: npx opens with
+    /// a blank line and an ANSI-coloured banner, so both a leading-blank
+    /// skip and the stripping are needed for the message to carry a reason
+    /// rather than an escape sequence.
+    fn first_meaningful_line(text: &str) -> Option<String> {
+        text.lines()
+            .map(|l| crate::remote_connect::strip_ansi(l.as_bytes()))
+            .map(|l| l.trim().to_string())
+            .find(|l| !l.is_empty())
+    }
+
+    /// Take a finished project check off the channel and report it (#256).
+    ///
+    /// Three outcomes, deliberately distinguished. A spawn failure names the
+    /// error. A run that produced no rows AND exited non-zero is an
+    /// INVOCATION failure, not a clean project: `tsc` prints global errors
+    /// like `error TS5023: Unknown compiler option` with no `file(line,col)`
+    /// prefix, so no matcher claims them and the row count is zero - exactly
+    /// what a clean project looks like. Reporting "no problems" there tells
+    /// the user their code is fine when the checker never checked it.
+    /// Otherwise the count is this producer's own, not the panel's.
+    fn drain_project_check(&mut self) -> bool {
+        let Ok((cwd, done)) = self.project_check_rx.try_recv() else {
+            return false;
+        };
+        self.project_check_running = false;
+        match done {
+            Err(e) => {
+                // true, not false: the status changed, so the frame must be
+                // redrawn or the message waits for an unrelated repaint.
+                self.status = format!("Could not run the project checker: {e}");
+                true
+            }
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                self.ingest_project_check(Some(&cwd), &text);
+                self.rebuild_problems();
+                let n = self.project_check_count();
+                if n == 0 && !out.status.success() {
+                    // The first NON-BLANK line, from either stream. Which
+                    // stream carries the reason is not predictable: npx
+                    // reports a missing compiler on STDOUT (with an empty
+                    // stderr and a leading blank line), while tsc's own
+                    // global errors also go to stdout and a missing binary
+                    // goes to stderr. Taking `.next()` showed the blank line
+                    // and reported a failure with no reason at all.
+                    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                    let why = Self::first_meaningful_line(&stderr)
+                        .or_else(|| Self::first_meaningful_line(&text))
+                        .unwrap_or_else(|| String::from("no output"));
+                    self.status = format!("The project checker failed: {why}");
+                } else {
+                    self.status = match n {
+                        0 => String::from("Whole-project check: no problems"),
+                        1 => String::from("Whole-project check: 1 problem"),
+                        n => format!("Whole-project check: {n} problems"),
+                    };
+                }
+                true
+            }
+        }
+    }
+
+    /// Push a finished check through the REAL channel and drain it (#256).
+    ///
+    /// Test-only, and deliberately not a shortcut: it sends down
+    /// `project_check_tx` and calls `drain_project_check`, so the reporting
+    /// logic under test is the shipped one. A helper that set the status
+    /// itself would pass while the drain was broken.
+    /// Unix-only: `ExitStatusExt::from_raw` has a different meaning on
+    /// Windows, and an ungated spawning helper breaks that target's test
+    /// build without failing anything here or in CI.
+    #[cfg(all(test, unix))]
+    pub(crate) fn finish_project_check_for_test(
+        &mut self,
+        cwd: &Path,
+        stdout: &str,
+        stderr: &str,
+        success: bool,
+    ) {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        self.project_check_running = true;
+        let _ = self.project_check_tx.send((cwd.to_path_buf(), Ok(out)));
+        self.drain_project_check();
+    }
+
+    /// Scan a whole-project checker's output into PROBLEMS (#256).
+    ///
+    /// Routed through `apply_build_scan` rather than a parallel path, so the
+    /// sweep inherits the matcher table (tsc's two output shapes are already
+    /// handled), the relative-path resolution, and the replace-wholesale
+    /// semantics a re-run needs. `cwd` is where the checker ran, which is
+    /// what its relative paths are against; `None` means the workspace root.
+    pub(crate) fn ingest_project_check(&mut self, cwd: Option<&Path>, output: &str) -> bool {
+        let root = self.workspace_root().to_path_buf();
+        let cwd = cwd.unwrap_or(&root).to_path_buf();
+        // Count what THIS scan produced, before it is merged into a store
+        // shared with every other producer.
+        self.project_check_rows = self.matchers.scan_batch(output, "tsc").len();
+        self.apply_build_scan(Self::PROJECT_CHECK_ID, Some(&cwd), "tsc", output)
+    }
+
+    /// The whole-project check command for this workspace (#256).
+    ///
+    /// `tsc --noEmit` when a `tsconfig.json` sits at the root, which is the
+    /// path VS Code users already take: vtsls exposes project-wide checking
+    /// poorly over LSP, so the pragmatic route is the compiler itself. `None`
+    /// when nothing is recognised - the command then says so rather than
+    /// running a guess.
+    ///
+    /// The PROJECT's compiler first, `npx --no-install` second. Bare `npx
+    /// tsc` on a project without TypeScript installed does not fail: it
+    /// fetches `tsc` from the registry, which is an unrelated Unix
+    /// terminal-control tool, and runs THAT against the user's source. The
+    /// `--no-install` flag turns a missing compiler into an error, which is
+    /// the honest outcome.
+    fn project_check_command(root: &Path) -> Option<(std::ffi::OsString, Vec<&'static str>)> {
+        if !root.join("tsconfig.json").is_file() {
+            return None;
+        }
+        let local = root.join("node_modules").join(".bin").join("tsc");
+        if local.is_file() {
+            return Some((local.into_os_string(), vec!["--noEmit"]));
+        }
+        Some((
+            std::ffi::OsString::from("npx"),
+            vec!["--no-install", "tsc", "--noEmit"],
+        ))
+    }
+
+    /// How many rows the last project check contributed (#256).
+    ///
+    /// NOT `problems.total_count()`: that is the panel's projection, which
+    /// mixes in every language server's diagnostics and every pane's build
+    /// output, and which the Open Files scope filters down - so under that
+    /// scope a sweep whose findings are all in unopened files would report
+    /// "no problems", defeating the feature. Count this producer's own
+    /// contribution instead.
+    ///
+    /// Recorded at install time rather than summed from the store: a file's
+    /// entry in `build_diagnostics` holds EVERY producer's items for that
+    /// file, so summing it double-counts a file the sweep and a pane both
+    /// report - and undercounts in the reverse order, because
+    /// `install_build_diags` records a path only when the entry was empty,
+    /// so the second producer to reach a shared file never lists it.
+    /// Filtering on the item's `source` would not help either: a pane
+    /// running tsc produces the same source string as this sweep.
+    fn project_check_count(&self) -> usize {
+        self.project_check_rows
+    }
+
     /// Scan one finished command's output through the build matchers and
     /// install the results (#119). The pane's PREVIOUS contribution is
     /// replaced wholesale — a rebuild that fixed everything clears its old
@@ -8121,7 +8307,13 @@ impl App {
     /// against the command's cwd (falling back to the workspace root);
     /// resolution is lexical, no filesystem probe, so a path the tool
     /// printed oddly still gets a row even if navigation later misses.
-    fn apply_build_scan(&mut self, pane: u64, cwd: Option<&Path>, cmd: &str, output: &str) -> bool {
+    pub(crate) fn apply_build_scan(
+        &mut self,
+        pane: u64,
+        cwd: Option<&Path>,
+        cmd: &str,
+        output: &str,
+    ) -> bool {
         // A watch matcher already published this pane's batch mid-run: the
         // watcher's exit must not overwrite the last cycle with a rescan of
         // its whole history. One skip only — the pane's next command scans.
@@ -8744,6 +8936,11 @@ impl App {
                 self.timeline_fetched = None;
                 changed = true;
             }
+        }
+        // A whole-project check finished: its rows and its verdict land
+        // together, so the status cannot describe a different run's result.
+        if self.drain_project_check() {
+            changed = true;
         }
         // Drain any TIMELINE replies; ignore one for a since-closed file.
         while let Ok((path, entries)) = self.timeline_rx.try_recv() {
@@ -34561,6 +34758,41 @@ impl App {
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
+            Cmd::ProblemsCheckProject => {
+                let root = self.workspace_root().to_path_buf();
+                match Self::project_check_command(&root) {
+                    None => {
+                        self.status = String::from(
+                            "No whole-project checker for this workspace (expected tsconfig.json)",
+                        );
+                    }
+                    Some(_) if self.project_check_running => {
+                        self.status = String::from("A whole-project check is already running");
+                    }
+                    Some((program, args)) => {
+                        // Off the main loop: tsc on a large project takes tens
+                        // of seconds, and running it inline froze input and
+                        // redraw for the duration - the "Checking..." status
+                        // below never even painted. Same shape as
+                        // `record_history_snapshot_of`: spawn, send, drain on
+                        // the tick.
+                        let tx = self.project_check_tx.clone();
+                        let root_for_thread = root.clone();
+                        std::thread::spawn(move || {
+                            // .output(), never .status(): the checker must not
+                            // inherit croft's TTY, or its diagnostics spray
+                            // over the UI.
+                            let done = std::process::Command::new(&program)
+                                .args(&args)
+                                .current_dir(&root_for_thread)
+                                .output();
+                            let _ = tx.send((root_for_thread, done));
+                        });
+                        self.project_check_running = true;
+                        self.status = String::from("Checking the whole project...");
+                    }
+                }
+            }
             Cmd::ProblemsToggleScope => {
                 self.problems.scope = self.problems.scope.next();
                 let _ = crate::prefs::save_problems_scope(self.problems.scope.to_config());

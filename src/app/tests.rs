@@ -37947,6 +37947,263 @@ fn entering_zen_mode_cancels_a_pending_collapse_rather_than_deferring_it() {
     assert!(app.show_tree, "so the restored sidebar stays up");
 }
 
+/// A checker that failed to RUN must not read as a clean project (#256).
+///
+/// `tsc` prints global errors (`error TS5023: Unknown compiler option`)
+/// with no `file(line,col)` prefix, so no matcher claims them and the row
+/// count is zero - which is exactly what a clean project looks like.
+/// Reporting "no problems" there tells the user their code is fine when the
+/// checker never checked it. The exit status is the only thing separating
+/// the two, which is why it cannot simply be ignored.
+#[cfg(unix)]
+#[test]
+fn a_project_checker_that_failed_to_run_does_not_report_a_clean_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // A failed invocation: non-zero exit, output no matcher claims.
+    app.finish_project_check_for_test(
+        tmp.path(),
+        "error TS5023: Unknown compiler option '--nosuchflag'.\n",
+        "",
+        false,
+    );
+    assert!(
+        app.status.contains("failed"),
+        "an invocation failure must say so, got {:?}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("no problems"),
+        "and must NOT read as a clean project, got {:?}",
+        app.status
+    );
+    assert!(
+        app.status.contains("TS5023"),
+        "naming the reason, got {:?}",
+        app.status
+    );
+
+    // npx reports a missing compiler on STDOUT, not stderr, and opens with
+    // a blank line and an ANSI-coloured banner. The earlier version of this
+    // test put the text on stderr - the implementation's own wrong
+    // assumption, encoded in the fixture, so the bug passed the suite.
+    app.finish_project_check_for_test(
+        tmp.path(),
+        "\n\x1b[41m\x1b[37m This is not the tsc command you are looking for \x1b[0m\n",
+        "",
+        false,
+    );
+    assert!(
+        app.status.contains("not the tsc command"),
+        "the reason is found past a blank line and escapes, got {:?}",
+        app.status
+    );
+    assert!(
+        !app.status.contains('\u{1b}'),
+        "and carries no escape sequences, got {:?}",
+        app.status
+    );
+    assert_ne!(
+        app.status, "The project checker failed: ",
+        "an empty reason is the bug this replaced"
+    );
+
+    // A genuinely clean project: zero rows AND a zero exit.
+    app.finish_project_check_for_test(tmp.path(), "", "", true);
+    assert_eq!(
+        app.status, "Whole-project check: no problems",
+        "a real clean run still reports clean"
+    );
+}
+
+/// A file BOTH the sweep and a pane report is counted once, by whoever is
+/// reporting (#256).
+///
+/// `build_diagnostics[f]` holds every producer's items for that file, so
+/// summing the store double-counts a shared file - and undercounts in the
+/// reverse order, because `install_build_diags` records a path only when the
+/// entry was empty, so the second producer to reach a shared file never
+/// lists it. Both orderings are pinned because they fail in opposite
+/// directions and one alone would look correct.
+#[cfg(unix)]
+#[test]
+fn a_file_both_producers_report_is_not_double_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("shared.ts");
+    let only = tmp.path().join("only.ts");
+    std::fs::write(&shared, "export const a = 1;\n").unwrap();
+    std::fs::write(&only, "export const b = 2;\n").unwrap();
+    let line = |f: &str| format!("{f}(1,1): error TS2322: Type error.\n");
+
+    // Sweep first, then a pane reports the SAME file.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.finish_project_check_for_test(tmp.path(), &line("shared.ts"), "", false);
+    assert_eq!(app.status, "Whole-project check: 1 problem");
+    app.apply_build_scan(1, Some(tmp.path()), "tsc", &line("shared.ts"));
+    app.finish_project_check_for_test(tmp.path(), &line("shared.ts"), "", false);
+    assert_eq!(
+        app.status, "Whole-project check: 1 problem",
+        "the pane's row for the same file is not the sweep's to count"
+    );
+
+    // Pane first, then the sweep reports that file AND another.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_build_scan(1, Some(tmp.path()), "tsc", &line("shared.ts"));
+    app.finish_project_check_for_test(
+        tmp.path(),
+        &format!("{}{}", line("shared.ts"), line("only.ts")),
+        "",
+        false,
+    );
+    assert_eq!(
+        app.status, "Whole-project check: 2 problems",
+        "the sweep found two, even though a pane got to one of them first"
+    );
+}
+
+/// The sweep's status counts ITS OWN findings, not the whole panel (#256).
+///
+/// `problems.total_count()` is the panel's projection: it mixes in every
+/// language server's diagnostics and every pane's build output, and the
+/// Open Files scope filters it. Under that scope a sweep whose findings are
+/// all in unopened files would have reported "no problems" - defeating the
+/// one thing the feature exists to do.
+#[cfg(unix)]
+#[test]
+fn the_project_check_count_is_its_own_not_the_panels() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let swept = tmp.path().join("swept.ts");
+    let other = tmp.path().join("other.rs");
+    std::fs::write(&swept, "export const x: string = 1;\n").unwrap();
+    std::fs::write(&other, "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // An unrelated language-server diagnostic is already in the panel.
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rust-analyzer"),
+        vec![diag(0, 4, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(other.clone(), by_server);
+
+    app.finish_project_check_for_test(
+        tmp.path(),
+        "swept.ts(1,14): error TS2322: Type 'number' is not assignable.\n",
+        "",
+        false,
+    );
+    assert_eq!(
+        app.status, "Whole-project check: 1 problem",
+        "the sweep found one; the LSP's row is not its to count"
+    );
+    assert!(
+        app.problems.total_count() > 1,
+        "staging check: the panel really does hold more than the sweep's row"
+    );
+
+    // Under Open Files the panel hides the unopened file - the count must
+    // not follow it down, or the sweep reports nothing it just found.
+    app.problems.scope = crate::widgets::problems::ProblemScope::OpenFiles;
+    app.rebuild_problems();
+    app.finish_project_check_for_test(
+        tmp.path(),
+        "swept.ts(1,14): error TS2322: Type 'number' is not assignable.\n",
+        "",
+        false,
+    );
+    assert_eq!(
+        app.status, "Whole-project check: 1 problem",
+        "the scope filters the PANEL, not what the sweep found"
+    );
+}
+
+/// "Problems: Check Whole Project" puts a whole-project checker's findings
+/// into PROBLEMS for files nobody opened, and a re-run REPLACES them (#256).
+///
+/// Replacement is the half worth pinning. A checker that reports two errors
+/// and then one after a fix must leave one row, not three: the panel is a
+/// current state, and a stale row sends the reader to a line that is now
+/// correct. `apply_build_scan` already owns that semantics per producer, so
+/// the project check gets its own producer id rather than borrowing a
+/// pane's: a pane's next command would otherwise wipe the sweep's rows, and
+/// the sweep would wipe the pane's.
+#[test]
+fn a_project_check_reports_unopened_files_and_replaces_on_rerun() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.ts");
+    let b = tmp.path().join("b.ts");
+    std::fs::write(&a, "export const x: string = 1;\n").unwrap();
+    std::fs::write(&b, "export const y: string = 2;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    // Neither file is opened: the sweep is exactly for files with no buffer.
+    assert!(app.editor.path.is_none(), "no file is open");
+
+    // Two errors, in tsc's parenthesised form.
+    app.ingest_project_check(
+        None,
+        "a.ts(1,14): error TS2322: Type 'number' is not assignable to type 'string'.\n\
+         b.ts(1,14): error TS2322: Type 'number' is not assignable to type 'string'.\n",
+    );
+    app.rebuild_problems();
+    let paths: Vec<_> = app
+        .problems
+        .groups()
+        .iter()
+        .map(|g| g.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&a) && paths.contains(&b),
+        "both unopened files must reach PROBLEMS, got {paths:?}"
+    );
+
+    // The user fixes b.ts and re-runs: one row, not three.
+    app.ingest_project_check(
+        None,
+        "a.ts(1,14): error TS2322: Type 'number' is not assignable to type 'string'.\n",
+    );
+    app.rebuild_problems();
+    let paths: Vec<_> = app
+        .problems
+        .groups()
+        .iter()
+        .map(|g| g.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&a),
+        "the still-broken file keeps its row, got {paths:?}"
+    );
+    assert!(
+        !paths.contains(&b),
+        "a re-run REPLACES the previous sweep: the fixed file's row must go, \
+         got {paths:?}"
+    );
+
+    // A pane's own build output must not wipe the sweep, which is why the
+    // sweep does not borrow a pane id. Pane 1 reports on its own file.
+    let c = tmp.path().join("c.ts");
+    std::fs::write(&c, "export const z = 3;\n").unwrap();
+    app.apply_build_scan(
+        1,
+        Some(tmp.path()),
+        "tsc",
+        "c.ts(1,1): error TS1005: ';' expected.\n",
+    );
+    app.rebuild_problems();
+    let paths: Vec<_> = app
+        .problems
+        .groups()
+        .iter()
+        .map(|g| g.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&a) && paths.contains(&c),
+        "a pane's build output and the project sweep coexist, got {paths:?}"
+    );
+}
+
 /// #256 step 1: a server that publishes project-wide diagnostics (rust-analyzer
 /// does this from `cargo check`) names files the user never opened. The panel
 /// builds from the diagnostics store rather than from open buffers, so those
