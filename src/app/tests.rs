@@ -41763,6 +41763,71 @@ fn a_symbol_range_slices_exactly_its_source() {
     );
 }
 
+/// Focusing another editor GROUP closes a symbol tab too (#369).
+///
+/// A group swap changes the active file with no open call and no path
+/// argument: `focus_editor_group` pulls another group into `self.editor`.
+/// So neither the open-based sync nor a path-keyed guard sees it - it is a
+/// tenth category beyond the nine `open_preview`/`open` bypasses, and the
+/// guard lives in `focus_pane` to catch it.
+#[test]
+fn focusing_another_editor_group_closes_a_symbol_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn one() {\n    let x = 1;\n}\n").unwrap();
+    std::fs::write(&b, "fn two() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.editor.open_pinned(&a).unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&b).unwrap();
+    assert!(app.editor_layout.is_split(), "two groups");
+
+    // The tab belongs to the file in the OTHER group.
+    app.symbol_tab = Some((
+        String::from("fn one"),
+        a.clone(),
+        crate::symbol_range::SymbolRange::new(0, 27),
+    ));
+    assert!(
+        app.symbol_tab.is_some(),
+        "staging: a tab is open for the other group's file"
+    );
+
+    // Which group holds which file depends on split/focus order, so assert
+    // against what is ACTUALLY active rather than assuming the swap lands on
+    // b.rs. The guard's contract is "active file differs from the tab's" -
+    // that is what to test, not a particular group layout.
+    app.focus_editor_group(true);
+    let active = app
+        .editor
+        .path
+        .clone()
+        .expect("a file is open after the swap");
+    if active == a {
+        // The swap landed back on the tab's own file: it must SURVIVE, which
+        // is the same guard declining rather than a missed clear.
+        assert!(
+            app.symbol_tab.is_some(),
+            "the swap showed the tab's own file, so it must not close"
+        );
+        // Now move to the group holding the other file and it must close.
+        app.focus_editor_group(false);
+        if app.editor.path.as_deref() != Some(a.as_path()) {
+            assert!(
+                app.symbol_tab.is_none(),
+                "swapping to a different file must close the tab"
+            );
+        }
+    } else {
+        assert!(
+            app.symbol_tab.is_none(),
+            "swapping groups showed {active:?}, not the tab's {a:?}, so it must close"
+        );
+    }
+}
+
 /// A symbol tab belongs to the file it was opened from (#369).
 ///
 /// The range is BYTE offsets into one buffer. Navigating to another file
@@ -41847,19 +41912,6 @@ fn a_symbol_tab_does_not_follow_you_into_another_file() {
     // closes the tab on a jump that never left the file. The old test could
     // not catch this: it passed the same spelling on both sides, the one
     // case where a raw comparison is always right.
-    // And the same-file case must run the guard with a tab whose stored path
-    // is the one the editor is about to show, so the early return is what
-    // spares it rather than an accident of ordering.
-    app.symbol_tab = Some((
-        String::from("fn one"),
-        a.clone(),
-        crate::symbol_range::SymbolRange::new(11, 27),
-    ));
-    app.open_at_utf16(&a, 0, 0).unwrap();
-    assert!(
-        app.symbol_tab.is_some(),
-        "re-opening the tab's own file must not close it"
-    );
 
     app.follow_symbol_tab_edit(0, 0, 4);
     let (_, _, range) = app

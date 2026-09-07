@@ -6181,7 +6181,11 @@ impl App {
     /// but `open_preview` resolves through `find_tab_matching`, which
     /// canonicalises, so it selects the ALREADY-OPEN tab and `editor.path`
     /// keeps its original spelling. The two sides therefore cannot diverge
-    /// here, and a canonicalising branch was unreachable: three attempts to
+    /// FOR THE SAME FILE - they diverge freely when the file really changes,
+    /// which is the point - because the tab's path is a copy of
+    /// `editor.path` and `find_tab_matching` canonicalises before selecting.
+    /// The field itself is not canonical. A canonicalising branch was
+    /// therefore unreachable: three attempts to
     /// write a test that entered it all failed, and a mutation deleting it
     /// survived, which is what proved it dead rather than merely untested.
     fn drop_symbol_tab_if_file_changed(&mut self) {
@@ -14738,6 +14742,12 @@ impl App {
         if self.editor.focused {
             self.poke_cursor();
         }
+        // Group focus changes the active FILE without opening anything and
+        // without a path (#369): `focus_editor_group` and
+        // `move_active_editor` swap another group into `self.editor`, so
+        // neither the open-based sync nor a path-argument guard sees them.
+        // Every focus change lands here, so this is the one place that does.
+        self.drop_symbol_tab_if_file_changed();
     }
 
     fn sync_focus_flags(&mut self) {
