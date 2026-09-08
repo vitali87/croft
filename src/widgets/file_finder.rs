@@ -583,10 +583,52 @@ const NOISE_DIR_NAMES: &[&str] = &[
     ".docker",
     ".claude",
     ".codex",
+    // The same class of $HOME toolchain cache for the .NET, Dart and Go
+    // ecosystems, plus oh-my-zsh's plugin tree. Measured on a Linux
+    // remote opened at /root: .nuget 1127 dirs, .pub-cache 1271,
+    // go/pkg/mod 1357 (below, by path) — together the top consumers of a
+    // readlink storm that held ~210% CPU for 19 minutes without
+    // finishing the walk.
+    ".nuget",
+    ".pub-cache",
+    ".dart-tool",
+    ".dotnet",
+    ".oh-my-zsh",
 ];
+
+/// Noise trees whose LEADING component is too generic to blacklist by
+/// name: a workspace really can hold a `go/` source directory, so only
+/// the module/checksum caches GOPATH parks in `$HOME` are pruned. Matched
+/// as a consecutive component run anywhere in the path, so both the cache
+/// root and everything under it are covered.
+const NOISE_PATH_RUNS: &[&[&str]] = &[&["go", "pkg", "mod"], &["go", "pkg", "sumdb"]];
+
+/// True when `run` appears as consecutive `Normal` components of `path`.
+fn has_component_run(path: &Path, run: &[&str]) -> bool {
+    let comps: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    comps.windows(run.len()).any(|w| {
+        w.iter()
+            .zip(run)
+            .all(|(a, b)| *a == std::ffi::OsStr::new(b))
+    })
+}
 
 pub fn is_noise_dir(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|n| NOISE_DIR_NAMES.contains(&n))
+}
+
+/// The full noise test for a path: a noise component name anywhere in it,
+/// or one of the [`NOISE_PATH_RUNS`] cache trees. Prefer this over
+/// [`is_noise_dir`] wherever the whole path is in hand — the name-only
+/// check cannot see `go/pkg/mod`.
+pub fn is_noise_path(path: &Path) -> bool {
+    is_path_under_noise_dir(path) || NOISE_PATH_RUNS.iter().any(|r| has_component_run(path, r))
 }
 
 /// True when `path` sits inside (or names) one of the noise dirs the
@@ -717,6 +759,12 @@ fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<File
                 return true;
             }
             if is_noise_dir(entry.file_name()) {
+                return false;
+            }
+            if NOISE_PATH_RUNS
+                .iter()
+                .any(|r| has_component_run(entry.path(), r))
+            {
                 return false;
             }
             // Hard-skip macOS app-data containers so readdir does not
@@ -1751,5 +1799,74 @@ mod tests {
         assert!(!is_path_under_noise_dir(Path::new(
             "/Users/v/proj/docs/target.md"
         )));
+    }
+
+    #[test]
+    fn is_noise_path_flags_dotnet_dart_and_go_module_caches() {
+        // Root-cause guard for the second home-dir readlink storm: these
+        // trees were absent from the ignore set, so opening /root walked
+        // and watched all of them. Measured there: .nuget 1127 dirs,
+        // .pub-cache 1271, go/pkg/mod 1357.
+        for p in [
+            "/root/.nuget/packages/microsoft.codeanalysis.common/5.0.0/lib/x.dll",
+            "/root/.pub-cache/hosted/pub.dev/args-2.4.2/lib/args.dart",
+            "/root/.dart-tool/pub/bin/x",
+            "/root/.dotnet/sdk/8.0.100/x.dll",
+            "/root/.oh-my-zsh/plugins/git/git.plugin.zsh",
+            "/root/go/pkg/mod/golang.org/x/tools@v0.28.0/go/analysis/x.go",
+            "/root/go/pkg/sumdb/sum.golang.org/lookup/x",
+        ] {
+            assert!(is_noise_path(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn is_noise_path_keeps_a_real_go_source_tree() {
+        // `go` alone is a legitimate source directory name, so only the
+        // GOPATH cache runs are pruned. A project's own go/ must survive,
+        // and so must a go/pkg that is not the module cache.
+        for p in [
+            "/Users/v/proj/go/main.go",
+            "/Users/v/proj/go/pkg/handler/handler.go",
+            "/Users/v/proj/src/mod/thing.rs",
+            "/Users/v/proj/pkg/mod/thing.go",
+        ] {
+            assert!(!is_noise_path(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn has_component_run_matches_only_consecutive_whole_components() {
+        assert!(has_component_run(
+            Path::new("/a/go/pkg/mod/b"),
+            &["go", "pkg", "mod"]
+        ));
+        // Non-consecutive: go/pkg/OTHER/mod must not match.
+        assert!(!has_component_run(
+            Path::new("/a/go/pkg/other/mod"),
+            &["go", "pkg", "mod"]
+        ));
+        // Substring of a component must not match.
+        assert!(!has_component_run(
+            Path::new("/a/cargo/pkg/mod"),
+            &["go", "pkg", "mod"]
+        ));
+    }
+
+    #[test]
+    fn build_file_index_skips_the_go_module_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("go/pkg/mod/golang.org/x")).unwrap();
+        std::fs::write(root.join("go/pkg/mod/golang.org/x/cached.go"), "x").unwrap();
+        std::fs::create_dir_all(root.join("go/cmd")).unwrap();
+        std::fs::write(root.join("go/cmd/main.go"), "x").unwrap();
+        let idx = build_file_index(root);
+        let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&"go/cmd/main.go"), "{rels:?}");
+        assert!(
+            !rels.iter().any(|r| r.contains("pkg/mod")),
+            "module cache leaked into the index: {rels:?}"
+        );
     }
 }
