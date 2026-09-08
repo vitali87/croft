@@ -1139,6 +1139,9 @@ fn run_pump(
             Some(RelayRequest::Clipboard { id }) => {
                 handle_clipboard_request(&host, &socket, &inbox_dir, &id);
             }
+            Some(RelayRequest::Copy { src }) => {
+                handle_copy_request(&host, &socket, &src);
+            }
             Some(RelayRequest::Open { id, url }) => {
                 handle_open_request(&host, &socket, &inbox_dir, &id, &url);
             }
@@ -1251,6 +1254,42 @@ fn handle_clipboard_request(host: &str, socket: &Path, inbox_dir: &str, request_
     }
 }
 
+/// Bring a remote croft's copied text home and put it on this machine's
+/// clipboard. The reverse of [`handle_clipboard_request`], and the reason a
+/// copy on a remote box reaches the clipboard the user actually pastes from
+/// rather than the remote box's own (#538).
+///
+/// The payload file is removed in the same command that reads it: a copy is
+/// transient, and leaving them behind grows the relay dir for the life of the
+/// session. There is no inbox sentinel to write — nothing on the remote side
+/// is waiting on the answer.
+fn handle_copy_request(host: &str, socket: &Path, src: &str) {
+    let quoted = shell_quote(src);
+    let remote_cmd = format!("cat {quoted}; rm -f {quoted}");
+    let Ok(out) = Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg(host)
+        .arg(&remote_cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    if text.is_empty() {
+        return;
+    }
+    let _ = crate::clipboard::write_string(&text);
+}
+
 enum RelayRequest {
     Pull {
         id: String,
@@ -1258,6 +1297,14 @@ enum RelayRequest {
     },
     Clipboard {
         id: String,
+    },
+    /// The remote croft copied text and wants it on THIS machine's clipboard,
+    /// which is the one the user pastes from (#538). `src` is the payload file
+    /// on the remote box. Fire and forget, like [`RelayRequest::Unforward`]:
+    /// the request id is validated by the parser but carries no reply, since
+    /// the remote side has already told the user what it copied.
+    Copy {
+        src: String,
     },
     Open {
         id: String,
@@ -1296,6 +1343,13 @@ fn parse_relay_request(line: &str) -> Option<RelayRequest> {
             Some(RelayRequest::Pull { id, src })
         }
         "clipboard" => Some(RelayRequest::Clipboard { id }),
+        "copy" => {
+            let src = parts.next()?.to_string();
+            if src.is_empty() {
+                return None;
+            }
+            Some(RelayRequest::Copy { src })
+        }
         "open" => {
             let url = parts.next()?.to_string();
             if url.is_empty() {
@@ -3865,6 +3919,19 @@ Host !blocked *.internal
             Some(super::RelayRequest::Clipboard { id }) => assert_eq!(id, "clip-7"),
             _ => panic!("expected Clipboard variant"),
         }
+    }
+
+    #[test]
+    fn parse_relay_request_copy_carries_the_payload_path() {
+        match super::parse_relay_request("copy\tcopy-7\t/home/u/.cache/croft/relay-x/copy-7.txt") {
+            Some(super::RelayRequest::Copy { src }) => {
+                assert_eq!(src, "/home/u/.cache/croft/relay-x/copy-7.txt");
+            }
+            _ => panic!("expected Copy variant"),
+        }
+        // A copy with no payload path names nothing to fetch.
+        assert!(super::parse_relay_request("copy\tcopy-7").is_none());
+        assert!(super::parse_relay_request("copy\tcopy-7\t").is_none());
     }
 
     #[test]

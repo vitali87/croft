@@ -18455,6 +18455,136 @@ fn remote_launched_drop_queues_pull_request_via_relay_log() {
     assert_eq!(app.pending_remote_pulls.len(), 1);
 }
 
+/// #538, half one: Cmd+C inside a program that tracks the mouse.
+///
+/// Claude Code turns mouse tracking on, so a left-drag inside it is FORWARDED
+/// to the child and croft deliberately clears its own selection (#474). Cmd+C
+/// then found no selection and returned in SILENCE — the user pressed copy,
+/// nothing reached the clipboard, and nothing said why or what would work.
+#[test]
+fn cmd_c_inside_a_mouse_tracking_program_says_why_nothing_was_copied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.show_terminal = true;
+    app.focus_pane(Pane::Terminal);
+    // The child asks for click + drag tracking, as every full-screen TUI does.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?1002h\x1b[?1006h");
+    assert!(
+        app.terminals[0].mouse_reporting(),
+        "precondition: the child is tracking the mouse"
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.terminals[0].last_inner;
+
+    // The user drags across the TUI's output, which is the child's gesture.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        inner.x + 2,
+        inner.y + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        inner.x + 12,
+        inner.y + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        inner.x + 12,
+        inner.y + 1,
+    ));
+    assert!(
+        !app.terminals[0].selection().is_some_and(|s| s.has_area()),
+        "precondition: the drag belonged to the child, so croft holds no selection"
+    );
+
+    app.status.clear();
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(
+        !app.status.is_empty(),
+        "Cmd+C that copies nothing must say so rather than fail silently"
+    );
+    assert!(
+        app.status.contains("Shift"),
+        "and must name the gesture that DOES select inside a tracking program, got {:?}",
+        app.status
+    );
+}
+
+/// #538, half two: what "the clipboard" means when croft runs on a remote box.
+///
+/// The user's clipboard is on the machine they are typing at, not on the Linux
+/// box croft runs on. A copy there wrote the REMOTE box's clipboard (usually no
+/// tool at all in an SSH session) and fell back to OSC 52, which the host
+/// terminal may silently refuse — while the status line claimed success either
+/// way. The drop relay already pulls the local clipboard for paste; this is the
+/// same road in the other direction.
+#[test]
+fn copying_on_a_relay_session_pushes_the_text_to_the_local_clipboard() {
+    let _guard = relay_test_lock().lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A silent child, so the grid holds exactly what the test feeds it.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 60")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.show_terminal = true;
+    app.focus_pane(Pane::Terminal);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.terminals[0].last_inner;
+    app.terminals[0].feed_bytes_for_test(b"copy-me-538\r\n");
+    let (lines, top) = app.terminals[0].grid_lines();
+    let vrow = (top
+        + lines
+            .iter()
+            .position(|l| l.starts_with("copy-me-538"))
+            .expect("the fed text reached the grid") as i32) as u16;
+    app.terminals[0].start_selection_at(inner.x, inner.y + vrow);
+    app.terminals[0].extend_selection_to(inner.x + 20, inner.y + vrow);
+    let expected = app.terminals[0].selection_text();
+    assert!(
+        expected.contains("copy-me-538"),
+        "precondition: the selection covers the fed text, got {expected:?}"
+    );
+
+    // Opt in explicitly. The flag is inert under cfg(test) precisely so that
+    // this test's CROFT_RELAY_KEY cannot reroute a concurrent test's copy.
+    app.is_relay_session = true;
+    let log = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
+            .unwrap();
+        log
+    });
+
+    let written = std::fs::read_to_string(&log).expect("relay log was written");
+    assert!(
+        written.starts_with("copy\t"),
+        "a copy on a relay session must queue a copy request, got {written:?}"
+    );
+    let payload_path = written
+        .trim_end()
+        .split('\t')
+        .nth(2)
+        .expect("the request names the payload file");
+    let payload = std::fs::read_to_string(payload_path).expect("the payload file was written");
+    assert_eq!(
+        payload, expected,
+        "the payload must be exactly what was selected"
+    );
+    assert!(
+        app.status.contains("local"),
+        "and the status must say WHERE it went, got {:?}",
+        app.status
+    );
+}
+
 #[test]
 fn pure_path_payload_distinguishes_finder_drag_from_text_paste() {
     // A genuine Finder drag carries only absolute path tokens.

@@ -2872,6 +2872,18 @@ pub struct App {
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
     /// can swap in a deterministic reader for Cmd+V routing assertions.
     clipboard_reader: fn() -> Option<String>,
+    /// Whether this croft is a relay session: a `croft remote` child whose
+    /// LOCAL launcher runs the drop pump, so the clipboard the user pastes
+    /// from lives on the other machine (#538).
+    ///
+    /// Resolved ONCE here rather than read per copy. `CROFT_RELAY_KEY` is
+    /// process-global, and `deliver_copied_text` asks this question on every
+    /// copy: a relay test that sets the variable would otherwise reroute the
+    /// copy of every test running beside it, which is exactly what it did
+    /// (three suites broke). Inert under `cfg(test)` for the same reason the
+    /// collab channel's read is — a test opts in by setting the field — so no
+    /// test can be steered by another's environment.
+    is_relay_session: bool,
     remote_launch: Option<RemoteLaunch>,
     pending_remote_launch_host: Option<String>,
     pending_remote_launch_path: Option<String>,
@@ -4685,6 +4697,7 @@ impl App {
             minimap_content_h: 0,
             minimap_drag: false,
             clipboard_reader: read_system_clipboard,
+            is_relay_session: !cfg!(test) && std::env::var_os("CROFT_RELAY_KEY").is_some(),
             remote_launch: None,
             pending_remote_launch_host: None,
             pending_remote_launch_path: None,
@@ -29671,22 +29684,80 @@ impl App {
         }
     }
 
-    /// Copy the terminal pane's current selection to the host clipboard via
-    /// OSC 52.  Selection stays visible so the user can verify what was
-    /// copied. No-op when the selection is empty / zero-area.
+    /// Copy the terminal pane's current selection to the user's clipboard.
+    /// Selection stays visible so the user can verify what was copied.
+    ///
+    /// A copy that finds NOTHING now says so (#538). Inside a program that
+    /// tracks the mouse — any full-screen TUI, Claude Code included — a plain
+    /// drag is the child's gesture and croft deliberately holds no selection
+    /// of its own (#474), so the old silent return left the user pressing copy
+    /// with nothing happening and no way to learn that Shift+drag is the
+    /// gesture that selects there.
     fn copy_terminal_selection(&mut self) {
-        let Some(sel) = self.terminal().selection() else {
-            return;
-        };
-        if !sel.has_area() {
+        if !self.terminal().selection().is_some_and(|s| s.has_area()) {
+            self.status = String::from(if self.terminal().mouse_reporting() {
+                "Nothing selected: Shift+drag selects inside a program that tracks the mouse"
+            } else {
+                "Nothing selected: drag to select first"
+            });
             return;
         }
         let text = self.terminal_text_for_copy(self.terminal().selection_text());
         if text.is_empty() {
+            // A real selection, but over blank cells: saying "nothing
+            // selected" here would describe the wrong thing to fix.
+            self.status = String::from("Selection has no text to copy");
             return;
         }
-        copy_to_clipboard(&text);
-        self.status = format!("Copied {} chars to clipboard", text.chars().count());
+        self.deliver_copied_text(&text);
+    }
+
+    /// Put copied text where the user can actually paste it.
+    ///
+    /// "The clipboard" is not always this machine's. On a relay session croft
+    /// runs on a remote box while the user types at another machine, and it is
+    /// THAT clipboard a paste comes from — so the text goes home over the drop
+    /// relay, the same road `request_remote_clipboard` uses to fetch it for a
+    /// paste, travelled in the other direction (#538). Writing the remote
+    /// box's clipboard instead put the text somewhere nothing could reach, and
+    /// an SSH session usually has no clipboard tool to write to at all.
+    ///
+    /// Everywhere else it is this machine's clipboard, with the OSC 52
+    /// fallback `copy_to_clipboard` already keeps for a host terminal that
+    /// honours it. That fallback is reported HONESTLY: whether the sequence is
+    /// acted on is the host terminal's choice, not something croft can see, so
+    /// claiming a copy landed would be a claim croft cannot make.
+    fn deliver_copied_text(&mut self, text: &str) {
+        let n = text.chars().count();
+        if self.is_relay_session && self.push_clipboard_via_relay(text) {
+            self.status = format!("Copied {n} chars to the local clipboard");
+            return;
+        }
+        if copy_to_clipboard(text) {
+            self.status = format!("Copied {n} chars to clipboard");
+        } else {
+            self.status = format!("Copied {n} chars via OSC 52 (the host terminal decides)");
+        }
+    }
+
+    /// Push copied text to the LOCAL machine's clipboard over the drop relay.
+    /// Returns whether the request was queued.
+    ///
+    /// The payload goes in a file beside the log rather than into the request
+    /// line: a request is one TAB-SEPARATED LINE, while copied text carries
+    /// newlines and tabs of its own and can be megabytes of scrollback.
+    fn push_clipboard_via_relay(&mut self, text: &str) -> bool {
+        let (Some(log_path), Some(dir)) = (self.relay_log_path(), self.relay_dir()) else {
+            return false;
+        };
+        self.ensure_relay_dir();
+        let request_id = Self::relay_request_id("copy");
+        let payload = dir.join(format!("{request_id}.txt"));
+        if std::fs::write(&payload, text).is_err() {
+            return false;
+        }
+        let line = format!("copy\t{request_id}\t{}\n", payload.display());
+        append_to_relay_log(&log_path, &line).is_ok()
     }
 
     /// Paste the host clipboard into the terminal: the chord (Cmd+V /
