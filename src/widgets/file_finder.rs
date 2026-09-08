@@ -583,10 +583,107 @@ const NOISE_DIR_NAMES: &[&str] = &[
     ".docker",
     ".claude",
     ".codex",
+    // The same class of $HOME toolchain cache for the .NET, Dart and Go
+    // ecosystems, plus oh-my-zsh's plugin tree. Measured on a Linux
+    // remote opened at /root: .nuget 1127 dirs, .pub-cache 1271,
+    // go/pkg/mod 1357 (below, by path) — together the top consumers of a
+    // readlink storm that held ~210% CPU for 19 minutes without
+    // finishing the walk.
+    ".nuget",
+    ".pub-cache",
+    ".dart-tool",
+    ".dotnet",
+    ".oh-my-zsh",
 ];
+
+/// Noise trees whose LEADING component is too generic to blacklist by
+/// name: a workspace really can hold a `go/` source directory, so only
+/// the module/checksum caches GOPATH parks in `$HOME` are pruned. Matched
+/// as a consecutive component run anywhere in the path, so both the cache
+/// root and everything under it are covered.
+const NOISE_PATH_RUNS: &[&[&str]] = &[&["go", "pkg", "mod"], &["go", "pkg", "sumdb"]];
+
+/// Number of `Normal` components in `path` — its depth, ignoring the root
+/// prefix and any `.` / `..` the caller left in.
+fn normal_component_count(path: &Path) -> usize {
+    path.components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count()
+}
+
+/// True when `run` appears as consecutive `Normal` components of `path`
+/// ENDING deeper than `min_end` components in — that is, the run must reach
+/// below the first `min_end` components. `0` matches a run anywhere.
+///
+/// The depth bound is what lets a run straddle a workspace root: the head of
+/// the run may lie in the root's own path as long as its tail does not.
+fn has_component_run(path: &Path, run: &[&str], min_end: usize) -> bool {
+    let comps: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    comps.windows(run.len()).enumerate().any(|(i, w)| {
+        i + run.len() > min_end
+            && w.iter()
+                .zip(run)
+                .all(|(a, b)| *a == std::ffi::OsStr::new(b))
+    })
+}
 
 pub fn is_noise_dir(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|n| NOISE_DIR_NAMES.contains(&n))
+}
+
+/// True when `path` contains one of the [`NOISE_PATH_RUNS`] cache trees,
+/// measured RELATIVE TO `root`: the run must REACH BELOW the root.
+///
+/// The relative part is load-bearing. The workspace root's OWN path is not
+/// part of the workspace, so matching the absolute path would prune the
+/// entire tree of anyone whose checkout happens to live under a matching
+/// ancestor — opening a dependency inside `~/go/pkg/mod/...` to read it
+/// would index zero files.
+///
+/// "Reaches below the root" rather than "lies below it", because a run can
+/// STRADDLE the root. A workspace opened at `~/go` — the ordinary GOPATH —
+/// keeps its cache at `pkg/mod`, a run whose first component is the root's
+/// own last one. Stripping the root off and matching what remained missed
+/// exactly that, re-admitting the tree this rule exists to prune.
+pub fn has_noise_path_run(path: &Path, root: &Path) -> bool {
+    // Components at or above the root cannot make an entry noise on their
+    // own; they can only supply the head of a run whose tail is below it. A
+    // path outside the root has no root to be measured against, so every
+    // component of it counts, as it did before roots entered this rule.
+    let depth = if path.starts_with(root) {
+        normal_component_count(root)
+    } else {
+        0
+    };
+    NOISE_PATH_RUNS
+        .iter()
+        .any(|r| has_component_run(path, r, depth))
+}
+
+/// True when `path` is noise measured RELATIVE TO `root`: it carries a
+/// noise-named component, or one of the [`NOISE_PATH_RUNS`] cache trees, at
+/// or below the root.
+///
+/// This is the reading every EVENT path wants. [`is_path_under_noise_dir`]
+/// answers the same question about a path in isolation, which is right for
+/// the walk (it starts at the root, so everything it reaches is already
+/// below it) and wrong for a watcher event, whose path is absolute: a
+/// checkout at `~/build/myapp` would have `build` matched among its own
+/// ancestors and every file in it classified as noise. The root's ancestors
+/// are not part of the workspace, exactly as in [`has_noise_path_run`].
+///
+/// A `path` that is not under `root` is measured whole. There is no root for
+/// its components to be relative to, and a path outside the workspace is not
+/// workspace content whichever way it is read.
+pub fn is_noise_path_under_root(path: &Path, root: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    is_path_under_noise_dir(rel) || has_noise_path_run(path, root)
 }
 
 /// True when `path` sits inside (or names) one of the noise dirs the
@@ -702,6 +799,7 @@ pub fn build_multi_file_index(roots: &[PathBuf]) -> Vec<FileEntry> {
 fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<FileEntry> {
     let collected: Arc<Mutex<Vec<FileEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let root_buf = root.to_path_buf();
+    let filter_root = root.to_path_buf();
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
         .require_git(false)
@@ -717,6 +815,9 @@ fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<File
                 return true;
             }
             if is_noise_dir(entry.file_name()) {
+                return false;
+            }
+            if has_noise_path_run(entry.path(), &filter_root) {
                 return false;
             }
             // Hard-skip macOS app-data containers so readdir does not
@@ -1738,6 +1839,37 @@ mod tests {
         }
     }
 
+    /// The root-relative reading, which is the one every EVENT path wants:
+    /// the workspace root's own ancestors are not part of the workspace.
+    #[test]
+    fn noise_is_measured_from_the_workspace_root_not_the_filesystem_root() {
+        let root = Path::new("/home/dev/build/myapp");
+        assert!(
+            !is_noise_path_under_root(&root.join("src/a.rs"), root),
+            "a source file in a workspace under build/ is not noise"
+        );
+        assert!(
+            !is_noise_path_under_root(root, root),
+            "nor is the root itself"
+        );
+        // Noise at or below the root still counts, by name and by run.
+        for rel in ["target/debug/x", "node_modules/p/i.js", "go/pkg/mod/x"] {
+            assert!(
+                is_noise_path_under_root(&root.join(rel), root),
+                "{rel} is noise below the root"
+            );
+        }
+        // A path under NEITHER root is measured whole: there is no root for
+        // its components to be relative to.
+        assert!(is_noise_path_under_root(
+            Path::new("/elsewhere/target/x"),
+            root
+        ));
+        // The contrast that was the bug: read absolutely, the workspace's
+        // own source file is noise because an ANCESTOR is named `build`.
+        assert!(is_path_under_noise_dir(&root.join("src/a.rs")));
+    }
+
     #[test]
     fn is_path_under_noise_dir_does_not_flag_workspace_source_paths() {
         assert!(!is_path_under_noise_dir(Path::new(
@@ -1751,5 +1883,195 @@ mod tests {
         assert!(!is_path_under_noise_dir(Path::new(
             "/Users/v/proj/docs/target.md"
         )));
+    }
+
+    #[test]
+    fn noise_rules_flag_dotnet_dart_and_go_module_caches() {
+        // Root-cause guard for the second home-dir readlink storm: these
+        // trees were absent from the ignore set, so opening /root walked
+        // and watched all of them. Measured there: .nuget 1127 dirs,
+        // .pub-cache 1271, go/pkg/mod 1357.
+        // Name-matched, from a $HOME workspace root.
+        for p in [
+            "/root/.nuget/packages/microsoft.codeanalysis.common/5.0.0/lib/x.dll",
+            "/root/.pub-cache/hosted/pub.dev/args-2.4.2/lib/args.dart",
+            "/root/.dart-tool/pub/bin/x",
+            "/root/.dotnet/sdk/8.0.100/x.dll",
+            "/root/.oh-my-zsh/plugins/git/git.plugin.zsh",
+        ] {
+            assert!(is_path_under_noise_dir(Path::new(p)), "{p}");
+        }
+        // Run-matched, measured relative to the workspace root.
+        for p in [
+            "/root/go/pkg/mod/golang.org/x/tools@v0.28.0/go/analysis/x.go",
+            "/root/go/pkg/sumdb/sum.golang.org/lookup/x",
+        ] {
+            assert!(has_noise_path_run(Path::new(p), Path::new("/root")), "{p}");
+        }
+    }
+
+    #[test]
+    fn build_file_index_indexes_a_workspace_opened_inside_the_module_cache() {
+        // The root's own path is not part of the workspace: opening a
+        // checked-out dependency to read it must still index its files.
+        // Matching the absolute path pruned every entry at depth >= 1.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("go/pkg/mod/github.com/x/y@v1.0.0");
+        std::fs::create_dir_all(root.join("internal")).unwrap();
+        std::fs::write(root.join("main.go"), "x").unwrap();
+        std::fs::write(root.join("internal/a.go"), "x").unwrap();
+        let idx = build_file_index(&root);
+        let mut rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        rels.sort_unstable();
+        assert_eq!(rels, vec!["internal/a.go", "main.go"]);
+    }
+
+    #[test]
+    fn build_file_index_indexes_a_workspace_under_a_noise_named_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("build/myapp");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "x").unwrap();
+        let idx = build_file_index(&root);
+        let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn noise_rules_keep_a_real_go_source_tree() {
+        // `go` alone is a legitimate source directory name, so only the
+        // GOPATH cache runs are pruned. A project's own go/ must survive,
+        // and so must a go/pkg that is not the module cache.
+        let root = Path::new("/Users/v/proj");
+        for p in [
+            "/Users/v/proj/go/main.go",
+            "/Users/v/proj/go/pkg/handler/handler.go",
+            "/Users/v/proj/src/mod/thing.rs",
+            "/Users/v/proj/pkg/mod/thing.go",
+        ] {
+            assert!(!has_noise_path_run(Path::new(p), root), "{p}");
+            assert!(!is_path_under_noise_dir(Path::new(p)), "{p}");
+        }
+        // And the root's OWN path never makes its contents noise.
+        assert!(!has_noise_path_run(
+            Path::new("/home/u/go/pkg/mod/x@v1/main.go"),
+            Path::new("/home/u/go/pkg/mod/x@v1")
+        ));
+    }
+
+    /// A cache run can STRADDLE the root, and both halves of the rule have
+    /// to hold at once.
+    #[test]
+    fn a_gopath_root_still_prunes_the_module_cache_below_it() {
+        // A workspace opened at `~/go` - the ordinary GOPATH - keeps its
+        // cache at `pkg/mod`, a run whose first component IS the root's own
+        // last one. Stripping the root and matching only what was left
+        // missed it, re-admitting the tree this rule exists to prune.
+        let gopath = Path::new("/home/u/go");
+        for p in [
+            "/home/u/go/pkg/mod/x@v1/a.go",
+            "/home/u/go/pkg/sumdb/lookup/y",
+        ] {
+            assert!(has_noise_path_run(Path::new(p), gopath), "{p}");
+        }
+        // The sibling source tree under that same root is not noise.
+        assert!(!has_noise_path_run(
+            Path::new("/home/u/go/src/app/main.go"),
+            gopath
+        ));
+        // And the other half, unchanged: opening a dependency INSIDE the
+        // cache indexes it, because there the whole run is the root's own
+        // path rather than anything below it.
+        assert!(!has_noise_path_run(
+            Path::new("/home/u/go/pkg/mod/x@v1/a.go"),
+            Path::new("/home/u/go/pkg/mod/x@v1")
+        ));
+        // The boundary that decides `>` from `>=`: the run ends exactly at
+        // the root's last component, so the cache IS the root and its
+        // contents are what the user asked to open.
+        assert!(!has_noise_path_run(
+            Path::new("/home/u/go/pkg/mod/x/a.go"),
+            Path::new("/home/u/go/pkg/mod")
+        ));
+        // One component shallower, the run's tail lands below the root and
+        // the same path is noise again.
+        assert!(has_noise_path_run(
+            Path::new("/home/u/go/pkg/mod/x/a.go"),
+            Path::new("/home/u/go/pkg")
+        ));
+    }
+
+    #[test]
+    fn has_component_run_matches_only_consecutive_whole_components() {
+        assert!(has_component_run(
+            Path::new("/a/go/pkg/mod/b"),
+            &["go", "pkg", "mod"],
+            0
+        ));
+        // Non-consecutive: go/pkg/OTHER/mod must not match.
+        assert!(!has_component_run(
+            Path::new("/a/go/pkg/other/mod"),
+            &["go", "pkg", "mod"],
+            0
+        ));
+        // Substring of a component must not match.
+        assert!(!has_component_run(
+            Path::new("/a/cargo/pkg/mod"),
+            &["go", "pkg", "mod"],
+            0
+        ));
+        // The depth bound: the same run is ignored when it ends at or above
+        // `min_end`, which is how a run inside the ROOT'S own path is kept
+        // from making the workspace's contents noise.
+        assert!(!has_component_run(
+            Path::new("/a/go/pkg/mod/b"),
+            &["go", "pkg", "mod"],
+            4
+        ));
+        assert!(has_component_run(
+            Path::new("/a/go/pkg/mod/b"),
+            &["go", "pkg", "mod"],
+            3
+        ));
+    }
+
+    #[test]
+    fn build_file_index_skips_the_go_module_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("go/pkg/mod/golang.org/x")).unwrap();
+        std::fs::write(root.join("go/pkg/mod/golang.org/x/cached.go"), "x").unwrap();
+        std::fs::create_dir_all(root.join("go/cmd")).unwrap();
+        std::fs::write(root.join("go/cmd/main.go"), "x").unwrap();
+        let idx = build_file_index(root);
+        let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&"go/cmd/main.go"), "{rels:?}");
+        assert!(
+            !rels.iter().any(|r| r.contains("pkg/mod")),
+            "module cache leaked into the index: {rels:?}"
+        );
+    }
+
+    /// The degenerate root: the walk STARTS at the GOPATH, so the cache run
+    /// straddles the root instead of lying below it.
+    ///
+    /// `build_file_index_skips_the_go_module_cache` cannot see this: it roots
+    /// at `tmp` with the cache at `tmp/go/pkg/mod`, where the whole run is
+    /// below the root, so it passed both before and after the straddle fix.
+    #[test]
+    fn build_file_index_skips_the_module_cache_of_a_gopath_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("go");
+        std::fs::create_dir_all(root.join("pkg/mod/golang.org/x")).unwrap();
+        std::fs::write(root.join("pkg/mod/golang.org/x/cached.go"), "x").unwrap();
+        std::fs::create_dir_all(root.join("cmd")).unwrap();
+        std::fs::write(root.join("cmd/main.go"), "x").unwrap();
+        let idx = build_file_index(&root);
+        let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&"cmd/main.go"), "{rels:?}");
+        assert!(
+            !rels.iter().any(|r| r.contains("pkg/mod")),
+            "a GOPATH root's own module cache leaked into the index: {rels:?}"
+        );
     }
 }

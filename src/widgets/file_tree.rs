@@ -1141,12 +1141,39 @@ pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Res
 /// * Otherwise returns the parent directory of `event_path`. The watcher
 ///   layer is the one that decides whether the event is a create / remove /
 ///   rename; this helper is only concerned with which subtree to invalidate.
-pub fn affected_dir_for_event(event_path: &Path, root: &Path) -> Option<PathBuf> {
-    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+///
+/// `canon_root` is `root` resolved through symlinks. The caller supplies it
+/// because the watch root cannot change without a rebind, so it is resolved
+/// once per bind rather than once per path of every event.
+pub fn affected_dir_for_event(
+    event_path: &Path,
+    root: &Path,
+    canon_root: &Path,
+) -> Option<PathBuf> {
+    // Fast path: zero syscalls. Taken only when the root is ALREADY its own
+    // canonical form and the event path is spelled under it — the ordinary
+    // case, and the one that was costing everything. When the root reaches
+    // the tree through a symlink (a macOS TempDir under /var -> /private/var,
+    // a symlinked checkout) the answer must be the resolved parent, so that
+    // case falls through to the original path below and is unchanged.
+    //
+    // `canonicalize` is not a cheap accessor: glibc `realpath()` walks the
+    // path a component at a time and issues a `readlink` per component, each
+    // failing `EINVAL` on an ordinary directory. Resolving the root here for
+    // every path of every event, every frame, is what made
+    // `__x64_sys_readlink` 30% of process cycles and held ~210% CPU on a
+    // home-dir workspace — `readlink("/root")` alone fired ~770 times a
+    // second purely to re-learn that the root is not a symlink.
+    if root == canon_root && event_path.starts_with(root) {
+        if event_path == root {
+            return None;
+        }
+        return event_path.parent().map(Path::to_path_buf);
+    }
     let canon_event = event_path
         .canonicalize()
         .unwrap_or_else(|_| event_path.to_path_buf());
-    if !canon_event.starts_with(&canon_root) {
+    if !canon_event.starts_with(canon_root) {
         return None;
     }
     if canon_event == canon_root {
@@ -2763,14 +2790,16 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let f = sub.join("a.txt");
         std::fs::write(&f, "").unwrap();
-        let res = affected_dir_for_event(&f, tmp.path()).unwrap();
+        let canon = tmp.path().canonicalize().unwrap();
+        let res = affected_dir_for_event(&f, tmp.path(), &canon).unwrap();
         assert_eq!(res, sub.canonicalize().unwrap());
     }
 
     #[test]
     fn affected_dir_for_event_returns_none_for_root_itself() {
         let tmp = TempDir::new().unwrap();
-        assert!(affected_dir_for_event(tmp.path(), tmp.path()).is_none());
+        let canon = tmp.path().canonicalize().unwrap();
+        assert!(affected_dir_for_event(tmp.path(), tmp.path(), &canon).is_none());
     }
 
     #[test]
@@ -2779,7 +2808,8 @@ mod tests {
         let other = TempDir::new().unwrap();
         let f = other.path().join("x.txt");
         std::fs::write(&f, "").unwrap();
-        assert!(affected_dir_for_event(&f, tmp.path()).is_none());
+        let canon = tmp.path().canonicalize().unwrap();
+        assert!(affected_dir_for_event(&f, tmp.path(), &canon).is_none());
     }
 
     #[test]
@@ -2787,7 +2817,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let f = tmp.path().join("top.txt");
         std::fs::write(&f, "").unwrap();
-        let res = affected_dir_for_event(&f, tmp.path()).unwrap();
+        let canon = tmp.path().canonicalize().unwrap();
+        let res = affected_dir_for_event(&f, tmp.path(), &canon).unwrap();
         assert_eq!(res, tmp.path().canonicalize().unwrap());
     }
 
@@ -2801,7 +2832,8 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let f = sub.join("x.txt");
         std::fs::write(&f, "external write").unwrap();
-        let dir = affected_dir_for_event(&f, tmp.path()).expect("inside root");
+        let canon = tmp.path().canonicalize().unwrap();
+        let dir = affected_dir_for_event(&f, tmp.path(), &canon).expect("inside root");
         // Reload the tree's children of `sub` and verify x.txt is found.
         let mut tree = FileTree::new(tmp.path().to_path_buf());
         // Expand `sub` so its children are loaded.
@@ -3347,6 +3379,56 @@ mod tests {
         assert!(
             tree.sticky_rows.is_empty(),
             "the band never covers the selected row"
+        );
+    }
+
+    #[test]
+    fn affected_dir_for_event_fast_path_agrees_with_the_resolving_path() {
+        // The zero-syscall fast path must answer exactly what resolving both
+        // sides answers, for the ordinary case: a canonical root and an event
+        // path spelled under it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sub = root.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let f = sub.join("f.rs");
+        std::fs::write(&f, "x").unwrap();
+        assert_eq!(
+            affected_dir_for_event(&f, &root, &root),
+            Some(sub.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn affected_dir_for_event_ignores_the_root_and_outsiders() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        assert!(affected_dir_for_event(&root, &root, &root).is_none());
+        let outside = TempDir::new().unwrap();
+        let other = outside.path().canonicalize().unwrap().join("x.rs");
+        std::fs::write(&other, "x").unwrap();
+        assert!(affected_dir_for_event(&other, &root, &root).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn affected_dir_for_event_resolves_a_root_reached_through_a_symlink() {
+        // A non-canonical root must NOT take the fast path: the answer has to
+        // be the resolved parent, which is what the caller's tree is keyed on.
+        // This is the case a macOS TempDir hits for real (/var -> /private/var).
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let f = real.join("sub/f.rs");
+        std::fs::write(&f, "x").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon_link = link.canonicalize().unwrap();
+        assert_ne!(link, canon_link, "the symlink must not be its own canon");
+        assert_eq!(
+            affected_dir_for_event(&f, &link, &canon_link),
+            Some(real.join("sub"))
         );
     }
 }

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 
 use crate::widgets::editor::EditorTabs;
-use crate::widgets::file_finder::{is_noise_dir, is_path_under_noise_dir};
+use crate::widgets::file_finder::{has_noise_path_run, is_noise_dir, is_noise_path_under_root};
 use crate::widgets::file_tree::{FileTree, affected_dir_for_event};
 
 const FS_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -82,6 +82,19 @@ pub struct FsWatch {
     /// event against ITS root — attributing against the shared tree's
     /// primary root silently dropped every event from a secondary root.
     watch_root: PathBuf,
+    /// `watch_root` resolved through symlinks, computed once per bind.
+    /// `drain_fs_events` compares every event path against the root, and
+    /// resolving it inline made `canonicalize` — one `readlink` per path
+    /// component, each failing `EINVAL` on a real directory — the largest
+    /// single CPU consumer in the process when the root was a home dir.
+    canon_watch_root: PathBuf,
+}
+
+/// Resolve `root` through symlinks, falling back to the path as given when
+/// it cannot be resolved (it may not exist yet). Called once per bind, never
+/// per event.
+fn canon_of(root: &Path) -> PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
 impl FsWatch {
@@ -103,6 +116,7 @@ impl FsWatch {
             poll_dir_mtimes: Self::snapshot_expanded_dir_mtimes(tree),
             poll_open_files: BTreeMap::new(),
             watch_root: root.to_path_buf(),
+            canon_watch_root: canon_of(root),
         }
     }
 
@@ -122,6 +136,7 @@ impl FsWatch {
             poll_dir_mtimes: BTreeMap::new(),
             poll_open_files: BTreeMap::new(),
             watch_root: root.to_path_buf(),
+            canon_watch_root: canon_of(root),
         }
     }
 
@@ -136,6 +151,7 @@ impl FsWatch {
         self.init_rx = Some(Self::start_watcher_thread(root, shares));
         self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
         self.watch_root = root.to_path_buf();
+        self.canon_watch_root = canon_of(root);
     }
 
     pub fn disable(&mut self) {
@@ -174,6 +190,57 @@ impl FsWatch {
             .collect()
     }
 
+    /// True when `path` is noise measured against THIS instance's root.
+    ///
+    /// Event paths are absolute, and the root's own ancestors are not part of
+    /// the workspace, so classifying one whole made every event in a
+    /// workspace under `~/build/` (or inside `~/go/pkg/mod/`) read as noise:
+    /// `changed_files` never filled and `finder_relevant` never went true.
+    /// The watch-target walk already measures relative to the root (the
+    /// `is_skippable` closure on Linux, `is_skippable_path` on macOS); this
+    /// is that same rule applied to the events the walk delivers.
+    ///
+    /// Both roots are tried because they can disagree: a watcher installed on
+    /// a symlinked root reports CANONICAL paths while `watch_root` holds the
+    /// path as the user gave it.
+    ///
+    /// A path under NEITHER falls back to the whole-path reading. Every
+    /// EVENT reaching here came from this instance's own watcher, so that
+    /// fallback is unreachable for them; the poll, whose dirs can belong to
+    /// another root entirely, resolves the owning root first and never asks
+    /// this question with the wrong one — see [`Self::is_noise_polled_dir`].
+    fn is_noise_event_path(&self, path: &Path) -> bool {
+        let root = if path.starts_with(&self.watch_root) {
+            &self.watch_root
+        } else {
+            &self.canon_watch_root
+        };
+        is_noise_path_under_root(path, root)
+    }
+
+    /// True when a POLLED directory is noise, measured against the workspace
+    /// root that OWNS it rather than against this instance's.
+    ///
+    /// The primary instance's poll walks EVERY root's expanded rows (#147),
+    /// so a multi-root workspace's secondary folders arrive here. Measuring
+    /// one against `watch_root` answers for the wrong workspace, and the
+    /// whole-path fallback behind it is worse: a secondary folder at
+    /// `~/build/myapp` matched neither root, so its own `build` ancestor made
+    /// every change under it read as noise and the finder index stayed stale
+    /// for that folder. The owning root is the longest root row that prefixes
+    /// the dir, the same resolution `FileTree::owning_root` uses; a dir under
+    /// no root at all is left to the event reading.
+    fn is_noise_polled_dir(&self, tree: &FileTree, dir: &Path) -> bool {
+        match tree
+            .root_paths()
+            .filter(|r| dir.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+        {
+            Some(root) => is_noise_path_under_root(dir, root),
+            None => self.is_noise_event_path(dir),
+        }
+    }
+
     pub fn drain(&mut self, tree: &mut FileTree, editor: &EditorTabs) -> FsDrain {
         let mut out = FsDrain::default();
         let Some(rx) = self.rx.as_ref() else {
@@ -201,16 +268,19 @@ impl FsWatch {
                     // apart: `is_dir()` is already false once it is gone.
                     if mutates_content
                         && !removes_a_directory(&ev.event.kind)
-                        && !is_path_under_noise_dir(path)
+                        && !self.is_noise_event_path(path)
                         && !path.is_dir()
                     {
                         out.changed_files.insert(path.clone());
                     }
-                    if let Some(dir) = affected_dir_for_event(path, &self.watch_root) {
+                    if let Some(dir) =
+                        affected_dir_for_event(path, &self.watch_root, &self.canon_watch_root)
+                    {
                         affected.insert(dir);
                     } else if path == &self.watch_root
+                        || path.as_path() == self.canon_watch_root
                         || path.canonicalize().ok().as_deref()
-                            == self.watch_root.canonicalize().ok().as_deref()
+                            == Some(self.canon_watch_root.as_path())
                     {
                         affected.insert(self.watch_root.clone());
                     }
@@ -229,7 +299,7 @@ impl FsWatch {
             }
             self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
             out.dirs_changed = true;
-            out.finder_relevant = affected.iter().any(|p| !is_path_under_noise_dir(p));
+            out.finder_relevant = affected.iter().any(|p| !self.is_noise_event_path(p));
         }
         out
     }
@@ -273,7 +343,9 @@ impl FsWatch {
         }
         self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
         out.dirs_changed = true;
-        out.finder_relevant = changed_dirs.iter().any(|p| !is_path_under_noise_dir(p));
+        out.finder_relevant = changed_dirs
+            .iter()
+            .any(|p| !self.is_noise_polled_dir(tree, p));
         self.poll_interval = Self::back_off(poll_start);
         out
     }
@@ -399,7 +471,7 @@ impl FsWatch {
             // exceeds it gets watches on the subtrees discovered before the cap
             // and the adaptive poll covers the rest.
             let mut budget = WATCH_WALK_DIR_BUDGET / shares.max(1);
-            if collect_macos_watch_targets(root, &mut targets, &mut budget) {
+            if collect_macos_watch_targets(root, root, &mut targets, &mut budget) {
                 // Whole tree is noise-free (e.g. a small repo with no
                 // node_modules): one recursive watch covers it in a single
                 // stream, exactly as before.
@@ -430,8 +502,15 @@ impl FsWatch {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let is_skippable = |name: &std::ffi::OsStr| -> bool {
-                FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_dir(name)
+            // The run rule is measured relative to `root`: the workspace
+            // root's own ancestors are not part of the workspace, so a
+            // checkout that happens to live under e.g. `build/` or inside
+            // `go/pkg/mod` must not have its whole subtree pruned.
+            let is_skippable = |path: &Path| -> bool {
+                let name = path.file_name().unwrap_or_default();
+                FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n)
+                    || is_noise_dir(name)
+                    || has_noise_path_run(path, root)
             };
             // Hard ceiling so a pathological tree can't spend forever
             // issuing inotify_add_watch syscalls on the init thread;
@@ -462,7 +541,7 @@ impl FsWatch {
                     continue;
                 };
                 for entry in rd.filter_map(Result::ok) {
-                    if is_skippable(&entry.file_name()) {
+                    if is_skippable(&entry.path()) {
                         continue;
                     }
                     // `file_type()` does not follow symlinks, so a symlinked
@@ -497,13 +576,19 @@ impl FsWatch {
     }
 }
 
-/// True for a directory name croft must never watch: a protected macOS dir
-/// (`Library`/`.Trash`, which trip Sonoma's App Management TCC class) or a
+/// True for a directory croft must never watch: a protected macOS dir
+/// (`Library`/`.Trash`, which trip Sonoma's App Management TCC class), a
 /// build/VCS noise dir (`node_modules`/`target`/`.git`/…) whose cargo/npm/git
-/// write storms the debouncer's FileIdMap loop cannot keep up with.
+/// write storms the debouncer's FileIdMap loop cannot keep up with, or one of
+/// the `go/pkg/mod` cache runs. The name rules read the entry's own name; the
+/// run rule is measured relative to `root`, because the workspace root's own
+/// ancestors are not part of the workspace.
 #[cfg(target_os = "macos")]
-fn is_skippable_name(name: &std::ffi::OsStr) -> bool {
-    FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_dir(name)
+fn is_skippable_path(path: &Path, root: &Path) -> bool {
+    let name = path.file_name().unwrap_or_default();
+    FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n)
+        || is_noise_dir(name)
+        || has_noise_path_run(path, root)
 }
 
 /// Walk `dir` and append the FSEvents watch targets that cover every
@@ -520,6 +605,7 @@ fn is_skippable_name(name: &std::ffi::OsStr) -> bool {
 #[cfg(target_os = "macos")]
 pub(super) fn collect_macos_watch_targets(
     dir: &Path,
+    root: &Path,
     targets: &mut Vec<(PathBuf, notify::RecursiveMode)>,
     budget: &mut usize,
 ) -> bool {
@@ -542,7 +628,7 @@ pub(super) fn collect_macos_watch_targets(
     let mut subdirs: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.filter_map(Result::ok) {
-            if is_skippable_name(&entry.file_name()) {
+            if is_skippable_path(&entry.path(), root) {
                 has_noise = true;
                 continue;
             }
@@ -558,7 +644,7 @@ pub(super) fn collect_macos_watch_targets(
     let child_clean: Vec<(PathBuf, bool)> = subdirs
         .into_iter()
         .map(|sd| {
-            let clean = collect_macos_watch_targets(&sd, targets, budget);
+            let clean = collect_macos_watch_targets(&sd, root, targets, budget);
             (sd, clean)
         })
         .collect();
