@@ -44342,6 +44342,8 @@ fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
     };
     let folded = labels(&app);
     for entry in [
+        "Copy",
+        "Paste",
         "Quick Select",
         "Copy Mode",
         "Command History",
@@ -44372,6 +44374,7 @@ fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
     ));
     let expanded = labels(&app);
     for entry in [
+        "Paste",
         "Quick Select",
         "Copy Mode",
         "Command History",
@@ -44382,6 +44385,105 @@ fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
             "{entry:?} belongs on an expanded pane's menu: {expanded:?}"
         );
     }
+}
+
+/// #540: the terminal pane menu carried every terminal gesture except the
+/// two a right-click is most often reached for. Copy is offered only while
+/// the pane has a selection - the menu model has no disabled state, so an
+/// entry that would copy nothing is worse than no entry - and both entries
+/// go through the same routes the Cmd+C / Cmd+V chords already use.
+#[test]
+fn the_pane_menu_copies_a_selection_and_pastes_the_clipboard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A silent child: the grid then holds exactly what the test feeds it,
+    // with no shell prompt racing the selection coordinates.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 60")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.show_terminal = true;
+    app.focus_pane(Pane::Terminal);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminals[0].last_area;
+    let inner = app.terminals[0].last_inner;
+    let labels = |app: &App| -> Vec<String> {
+        menu_labels(
+            &app.context_menu
+                .as_ref()
+                .expect("a right-click opens the pane menu")
+                .items,
+        )
+        .iter()
+        .map(|l| l.to_string())
+        .collect()
+    };
+
+    // Nothing selected: Paste is offered, Copy is not.
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 1,
+        area.y + 1,
+    ));
+    let empty = labels(&app);
+    assert!(
+        empty.iter().any(|l| l == "Paste"),
+        "Paste needs no selection: {empty:?}"
+    );
+    assert!(
+        !empty.iter().any(|l| l == "Copy"),
+        "Copy must not be offered while there is nothing to copy: {empty:?}"
+    );
+    app.context_menu = None;
+
+    // With a selection, Copy joins the menu and reaches the clipboard. The
+    // row is located in the grid rather than assumed: the pane paints a
+    // launch banner of its own above whatever the child prints.
+    app.terminals[0].feed_bytes_for_test(b"copy-me-540\r\n");
+    let (lines, top) = app.terminals[0].grid_lines();
+    let vrow = (top
+        + lines
+            .iter()
+            .position(|l| l.starts_with("copy-me-540"))
+            .expect("the fed text must reach the grid") as i32) as u16;
+    app.terminals[0].start_selection_at(inner.x, inner.y + vrow);
+    app.terminals[0].extend_selection_to(inner.x + 20, inner.y + vrow);
+    let expected = app.terminals[0].selection_text();
+    assert!(
+        expected.contains("copy-me-540"),
+        "precondition: the selection covers the fed text, got {expected:?}"
+    );
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 1,
+        area.y + 1,
+    ));
+    let selected = labels(&app);
+    assert!(
+        selected.iter().any(|l| l == "Copy"),
+        "Copy belongs on a pane that has a selection: {selected:?}"
+    );
+    app.context_menu = None;
+    app.dispatch_menu_action(MenuAction::TerminalCopySelection, tmp.path().to_path_buf());
+    assert_eq!(
+        crate::clipboard::read_string().as_deref(),
+        Some(expected.as_str()),
+        "the menu's Copy must put the selection on the clipboard"
+    );
+
+    // And Paste sends the clipboard on to the pane's child.
+    let before = app.terminals[0].written_bytes_for_test().len();
+    assert!(crate::clipboard::write_string("pasted-540"));
+    app.dispatch_menu_action(MenuAction::TerminalPaste, tmp.path().to_path_buf());
+    let written = app.terminals[0].written_bytes_for_test();
+    let sent = String::from_utf8_lossy(&written[before..]).to_string();
+    assert!(
+        sent.contains("pasted-540"),
+        "the menu's Paste must reach the shell, sent {sent:?}"
+    );
 }
 
 #[test]
