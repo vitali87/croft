@@ -1986,6 +1986,19 @@ mod tests {
             Path::new("/home/u/go/pkg/mod/x@v1/a.go"),
             Path::new("/home/u/go/pkg/mod/x@v1")
         ));
+        // The boundary that decides `>` from `>=`: the run ends exactly at
+        // the root's last component, so the cache IS the root and its
+        // contents are what the user asked to open.
+        assert!(!has_noise_path_run(
+            Path::new("/home/u/go/pkg/mod/x/a.go"),
+            Path::new("/home/u/go/pkg/mod")
+        ));
+        // One component shallower, the run's tail lands below the root and
+        // the same path is noise again.
+        assert!(has_noise_path_run(
+            Path::new("/home/u/go/pkg/mod/x/a.go"),
+            Path::new("/home/u/go/pkg")
+        ));
     }
 
     #[test]
@@ -2036,6 +2049,29 @@ mod tests {
         assert!(
             !rels.iter().any(|r| r.contains("pkg/mod")),
             "module cache leaked into the index: {rels:?}"
+        );
+    }
+
+    /// The degenerate root: the walk STARTS at the GOPATH, so the cache run
+    /// straddles the root instead of lying below it.
+    ///
+    /// `build_file_index_skips_the_go_module_cache` cannot see this: it roots
+    /// at `tmp` with the cache at `tmp/go/pkg/mod`, where the whole run is
+    /// below the root, so it passed both before and after the straddle fix.
+    #[test]
+    fn build_file_index_skips_the_module_cache_of_a_gopath_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("go");
+        std::fs::create_dir_all(root.join("pkg/mod/golang.org/x")).unwrap();
+        std::fs::write(root.join("pkg/mod/golang.org/x/cached.go"), "x").unwrap();
+        std::fs::create_dir_all(root.join("cmd")).unwrap();
+        std::fs::write(root.join("cmd/main.go"), "x").unwrap();
+        let idx = build_file_index(&root);
+        let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&"cmd/main.go"), "{rels:?}");
+        assert!(
+            !rels.iter().any(|r| r.contains("pkg/mod")),
+            "a GOPATH root's own module cache leaked into the index: {rels:?}"
         );
     }
 }

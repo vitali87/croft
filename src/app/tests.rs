@@ -4835,6 +4835,47 @@ fn fs_watcher_still_watches_a_workspace_whose_own_path_is_noise_named() {
     );
 }
 
+/// #147 + #539: the PRIMARY instance's poll walks EVERY root's expanded rows,
+/// so a multi-root workspace's secondary folders reach the noise classifier
+/// matching neither of the primary's own roots. Measured whole, a secondary
+/// folder at `<tmp>/build/second` had its `build` ancestor make every change
+/// under it read as noise: the poll refreshed the tree but reported
+/// `finder_relevant = false`, so the Cmd+P index stayed stale for that folder
+/// for as long as it was open.
+#[test]
+fn poll_classifies_a_secondary_root_against_the_root_that_owns_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = tmp.path().join("primary");
+    let secondary = tmp.path().join("build/second");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&secondary).unwrap();
+    let mut app = App::new(primary.clone()).unwrap();
+    // The watcher is off: this is the POLL's question, and leaving events on
+    // would let them answer it instead.
+    app.fs_watch.disable();
+    app.tree.add_root(secondary.clone());
+
+    // Baseline every expanded dir, so the next poll sees ONLY what moves
+    // after it. Without this the primary's own row is "changed" too and
+    // would set `finder_relevant` on its own, hiding the secondary entirely.
+    app.fs_watch.force_poll_due();
+    let _ = app.fs_watch.poll(&mut app.tree, &[]);
+
+    std::fs::write(secondary.join("a.rs"), b"fn main() {}").unwrap();
+    app.fs_watch.force_poll_due();
+    let poll = app.fs_watch.poll(&mut app.tree, &[]);
+
+    assert!(
+        poll.dirs_changed,
+        "precondition: the write moved the secondary root's mtime"
+    );
+    assert!(
+        poll.finder_relevant,
+        "a secondary workspace folder is workspace content, whatever its own \
+         path is spelled under"
+    );
+}
+
 /// #539 review: the WATCHER stopped rooting streams at or above a
 /// noise-named ancestor, but `drain` still classified EVENT paths whole. A
 /// workspace living under `build/` therefore had every one of its own events

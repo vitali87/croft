@@ -196,24 +196,19 @@ impl FsWatch {
     /// the workspace, so classifying one whole made every event in a
     /// workspace under `~/build/` (or inside `~/go/pkg/mod/`) read as noise:
     /// `changed_files` never filled and `finder_relevant` never went true.
-    /// The watch-target walk already measures relative to the root
-    /// (`is_skippable_path`); this is that same rule applied to the events
-    /// the walk delivers.
+    /// The watch-target walk already measures relative to the root (the
+    /// `is_skippable` closure on Linux, `is_skippable_path` on macOS); this
+    /// is that same rule applied to the events the walk delivers.
     ///
     /// Both roots are tried because they can disagree: a watcher installed on
     /// a symlinked root reports CANONICAL paths while `watch_root` holds the
     /// path as the user gave it.
     ///
-    /// A path under NEITHER falls back to the whole-path reading, and that
-    /// fallback is a KNOWN GAP rather than a correct answer. The primary
-    /// instance's poll walks every root's expanded rows in a multi-root
-    /// workspace (#147), so a secondary root's dirs reach this function
-    /// matching neither of the primary's roots: a secondary folder that
-    /// itself lives under a `build/` ancestor still never sets
-    /// `finder_relevant`. That is the classification those dirs already had,
-    /// so nothing regresses here, but closing it needs the owning root per
-    /// dir (`FileTree::root_paths`) rather than this instance's, which is a
-    /// wider change than the event path this commit is fixing.
+    /// A path under NEITHER falls back to the whole-path reading. Every
+    /// EVENT reaching here came from this instance's own watcher, so that
+    /// fallback is unreachable for them; the poll, whose dirs can belong to
+    /// another root entirely, resolves the owning root first and never asks
+    /// this question with the wrong one — see [`Self::is_noise_polled_dir`].
     fn is_noise_event_path(&self, path: &Path) -> bool {
         let root = if path.starts_with(&self.watch_root) {
             &self.watch_root
@@ -221,6 +216,29 @@ impl FsWatch {
             &self.canon_watch_root
         };
         is_noise_path_under_root(path, root)
+    }
+
+    /// True when a POLLED directory is noise, measured against the workspace
+    /// root that OWNS it rather than against this instance's.
+    ///
+    /// The primary instance's poll walks EVERY root's expanded rows (#147),
+    /// so a multi-root workspace's secondary folders arrive here. Measuring
+    /// one against `watch_root` answers for the wrong workspace, and the
+    /// whole-path fallback behind it is worse: a secondary folder at
+    /// `~/build/myapp` matched neither root, so its own `build` ancestor made
+    /// every change under it read as noise and the finder index stayed stale
+    /// for that folder. The owning root is the longest root row that prefixes
+    /// the dir, the same resolution `FileTree::owning_root` uses; a dir under
+    /// no root at all is left to the event reading.
+    fn is_noise_polled_dir(&self, tree: &FileTree, dir: &Path) -> bool {
+        match tree
+            .root_paths()
+            .filter(|r| dir.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+        {
+            Some(root) => is_noise_path_under_root(dir, root),
+            None => self.is_noise_event_path(dir),
+        }
     }
 
     pub fn drain(&mut self, tree: &mut FileTree, editor: &EditorTabs) -> FsDrain {
@@ -325,7 +343,9 @@ impl FsWatch {
         }
         self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
         out.dirs_changed = true;
-        out.finder_relevant = changed_dirs.iter().any(|p| !self.is_noise_event_path(p));
+        out.finder_relevant = changed_dirs
+            .iter()
+            .any(|p| !self.is_noise_polled_dir(tree, p));
         self.poll_interval = Self::back_off(poll_start);
         out
     }
