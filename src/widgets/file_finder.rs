@@ -637,6 +637,26 @@ pub fn has_noise_path_run(path: &Path, root: &Path) -> bool {
     NOISE_PATH_RUNS.iter().any(|r| has_component_run(rel, r))
 }
 
+/// True when `path` is noise measured RELATIVE TO `root`: it carries a
+/// noise-named component, or one of the [`NOISE_PATH_RUNS`] cache trees, at
+/// or below the root.
+///
+/// This is the reading every EVENT path wants. [`is_path_under_noise_dir`]
+/// answers the same question about a path in isolation, which is right for
+/// the walk (it starts at the root, so everything it reaches is already
+/// below it) and wrong for a watcher event, whose path is absolute: a
+/// checkout at `~/build/myapp` would have `build` matched among its own
+/// ancestors and every file in it classified as noise. The root's ancestors
+/// are not part of the workspace, exactly as in [`has_noise_path_run`].
+///
+/// A `path` that is not under `root` is measured whole. There is no root for
+/// its components to be relative to, and a path outside the workspace is not
+/// workspace content whichever way it is read.
+pub fn is_noise_path_under_root(path: &Path, root: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    is_path_under_noise_dir(rel) || has_noise_path_run(path, root)
+}
+
 /// True when `path` sits inside (or names) one of the noise dirs the
 /// finder index already excludes from its walk. Callers use this to
 /// avoid kicking a full index rebuild for FS events the finder would
@@ -1788,6 +1808,37 @@ mod tests {
         ] {
             assert!(is_path_under_noise_dir(Path::new(p)), "{p}");
         }
+    }
+
+    /// The root-relative reading, which is the one every EVENT path wants:
+    /// the workspace root's own ancestors are not part of the workspace.
+    #[test]
+    fn noise_is_measured_from_the_workspace_root_not_the_filesystem_root() {
+        let root = Path::new("/home/dev/build/myapp");
+        assert!(
+            !is_noise_path_under_root(&root.join("src/a.rs"), root),
+            "a source file in a workspace under build/ is not noise"
+        );
+        assert!(
+            !is_noise_path_under_root(root, root),
+            "nor is the root itself"
+        );
+        // Noise at or below the root still counts, by name and by run.
+        for rel in ["target/debug/x", "node_modules/p/i.js", "go/pkg/mod/x"] {
+            assert!(
+                is_noise_path_under_root(&root.join(rel), root),
+                "{rel} is noise below the root"
+            );
+        }
+        // A path under NEITHER root is measured whole: there is no root for
+        // its components to be relative to.
+        assert!(is_noise_path_under_root(
+            Path::new("/elsewhere/target/x"),
+            root
+        ));
+        // The contrast that was the bug: read absolutely, the workspace's
+        // own source file is noise because an ANCESTOR is named `build`.
+        assert!(is_path_under_noise_dir(&root.join("src/a.rs")));
     }
 
     #[test]

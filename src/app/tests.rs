@@ -4835,6 +4835,60 @@ fn fs_watcher_still_watches_a_workspace_whose_own_path_is_noise_named() {
     );
 }
 
+/// #539 review: the WATCHER stopped rooting streams at or above a
+/// noise-named ancestor, but `drain` still classified EVENT paths whole. A
+/// workspace living under `build/` therefore had every one of its own events
+/// read as noise: `changed_files` never filled, so the agent-lane ledger saw
+/// nothing, and `finder_relevant` never went true, so the Cmd+P index never
+/// rebuilt. That is the same freeze the branch fixes, reached from the other
+/// side.
+#[test]
+fn drain_reports_writes_in_a_workspace_under_a_noise_named_ancestor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_raw = tmp.path().join("build/myapp/src");
+    std::fs::create_dir_all(&src_raw).unwrap();
+    let root = tmp
+        .path()
+        .join("build/myapp")
+        .canonicalize()
+        .expect("the workspace root exists");
+    let src = src_raw.canonicalize().unwrap();
+
+    let mut app = App::new(root.clone()).unwrap();
+    // Let the watcher thread hand its debouncer over, then swallow whatever
+    // the install itself produced, so the only events left are the write's.
+    for _ in 1..=FS_SYNC_TICKS {
+        app.try_install_pending_init();
+        let _ = app.fs_watch.drain(&mut app.tree, &app.editor);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let signal = src.join("a.rs");
+    std::fs::write(&signal, b"fn main() {}").unwrap();
+
+    let mut changed: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
+    let mut finder_relevant = false;
+    for _ in 1..=FS_SYNC_TICKS {
+        let d = app.fs_watch.drain(&mut app.tree, &app.editor);
+        changed.extend(d.changed_files);
+        finder_relevant |= d.finder_relevant;
+        if changed.contains(&signal) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        changed.contains(&signal),
+        "a write inside a workspace under a build/ ancestor is the workspace's \
+         own content, not noise; got {changed:?}"
+    );
+    assert!(
+        finder_relevant,
+        "and it is worth a finder index rebuild, since the finder indexes it"
+    );
+}
+
 #[test]
 fn fs_watcher_prunes_noise_dirs_nested_below_the_workspace_root() {
     // Regression for the freeze when the workspace root is a *parent of

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 
 use crate::widgets::editor::EditorTabs;
-use crate::widgets::file_finder::{has_noise_path_run, is_noise_dir, is_path_under_noise_dir};
+use crate::widgets::file_finder::{has_noise_path_run, is_noise_dir, is_noise_path_under_root};
 use crate::widgets::file_tree::{FileTree, affected_dir_for_event};
 
 const FS_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -190,6 +190,31 @@ impl FsWatch {
             .collect()
     }
 
+    /// True when `path` is noise measured against THIS instance's root.
+    ///
+    /// Event paths are absolute, and the root's own ancestors are not part of
+    /// the workspace, so classifying one whole made every event in a
+    /// workspace under `~/build/` (or inside `~/go/pkg/mod/`) read as noise:
+    /// `changed_files` never filled and `finder_relevant` never went true.
+    /// The watch-target walk already measures relative to the root
+    /// (`is_skippable_path`); this is that same rule applied to the events
+    /// the walk delivers.
+    ///
+    /// Both roots are tried because they can disagree: a watcher installed on
+    /// a symlinked root reports CANONICAL paths while `watch_root` holds the
+    /// path as the user gave it. A path under neither is left to the whole-path
+    /// reading — the primary instance's poll walks every root's expanded rows
+    /// in a multi-root workspace (#147), so a secondary root's dirs arrive
+    /// here, and for those this is exactly the classification they had before.
+    fn is_noise_event_path(&self, path: &Path) -> bool {
+        let root = if path.starts_with(&self.watch_root) {
+            &self.watch_root
+        } else {
+            &self.canon_watch_root
+        };
+        is_noise_path_under_root(path, root)
+    }
+
     pub fn drain(&mut self, tree: &mut FileTree, editor: &EditorTabs) -> FsDrain {
         let mut out = FsDrain::default();
         let Some(rx) = self.rx.as_ref() else {
@@ -217,7 +242,7 @@ impl FsWatch {
                     // apart: `is_dir()` is already false once it is gone.
                     if mutates_content
                         && !removes_a_directory(&ev.event.kind)
-                        && !is_path_under_noise_dir(path)
+                        && !self.is_noise_event_path(path)
                         && !path.is_dir()
                     {
                         out.changed_files.insert(path.clone());
@@ -248,7 +273,7 @@ impl FsWatch {
             }
             self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
             out.dirs_changed = true;
-            out.finder_relevant = affected.iter().any(|p| !is_path_under_noise_dir(p));
+            out.finder_relevant = affected.iter().any(|p| !self.is_noise_event_path(p));
         }
         out
     }
@@ -292,7 +317,7 @@ impl FsWatch {
         }
         self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
         out.dirs_changed = true;
-        out.finder_relevant = changed_dirs.iter().any(|p| !is_path_under_noise_dir(p));
+        out.finder_relevant = changed_dirs.iter().any(|p| !self.is_noise_event_path(p));
         self.poll_interval = Self::back_off(poll_start);
         out
     }
