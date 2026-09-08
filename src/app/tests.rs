@@ -4723,6 +4723,119 @@ fn fs_watcher_does_not_deliver_events_from_target_or_node_modules_subtrees() {
 }
 
 #[test]
+fn fs_watcher_prunes_a_go_module_cache_below_the_workspace_root() {
+    // The whole reason the watcher's skip predicate takes a &Path rather
+    // than a bare file name: `go` cannot be blacklisted by name, so
+    // go/pkg/mod is matched as a component run, and that needs the path.
+    // Without it the module cache is watched like any other subdir.
+    let tmp = tempfile::tempdir().unwrap();
+    let cache_raw = tmp.path().join("go/pkg/mod/golang.org/x");
+    let src_raw = tmp.path().join("go/cmd");
+    std::fs::create_dir_all(&cache_raw).unwrap();
+    std::fs::create_dir_all(&src_raw).unwrap();
+    let cache = cache_raw.canonicalize().unwrap();
+    let src = src_raw.canonicalize().unwrap();
+
+    let (_debouncer, rx) = super::fs_watch::FsWatch::spawn_watcher(tmp.path())
+        .expect("watcher must start cleanly with a go module cache present");
+
+    for _ in 0..30 {
+        while rx.try_recv().is_ok() {}
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    for i in 0..50 {
+        std::fs::write(cache.join(format!("mod_{i}.go")), b"x").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mut noise_events: Vec<std::path::PathBuf> = Vec::new();
+    while let Ok(batch) = rx.try_recv() {
+        for ev in batch.unwrap_or_default() {
+            for path in &ev.event.paths {
+                if path.starts_with(&cache) {
+                    noise_events.push(path.clone());
+                }
+            }
+        }
+    }
+    assert!(
+        noise_events.is_empty(),
+        "writes under go/pkg/mod must not produce debouncer events; got {noise_events:?}"
+    );
+
+    // The sibling go/ source tree is NOT noise and must still deliver.
+    std::fs::write(src.join("main.go"), b"package main").unwrap();
+    let started = std::time::Instant::now();
+    let mut signal_events: Vec<std::path::PathBuf> = Vec::new();
+    while started.elapsed() < std::time::Duration::from_millis(1500) {
+        while let Ok(batch) = rx.try_recv() {
+            for ev in batch.unwrap_or_default() {
+                for path in &ev.event.paths {
+                    if path.starts_with(&src) {
+                        signal_events.push(path.clone());
+                    }
+                }
+            }
+        }
+        if !signal_events.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        !signal_events.is_empty(),
+        "writes under a real go/cmd source dir must still produce events"
+    );
+}
+
+#[test]
+fn fs_watcher_still_watches_a_workspace_whose_own_path_is_noise_named() {
+    // The noise rules describe what is INSIDE a workspace. The root's own
+    // ancestors are not part of it, so a checkout that happens to live
+    // under a `build/` (or `go/pkg/mod/`) ancestor must be watched
+    // normally. Matching the absolute path pruned every child and left the
+    // workspace with no watches at all.
+    let tmp = tempfile::tempdir().unwrap();
+    let root_raw = tmp.path().join("build/myapp");
+    let src_raw = root_raw.join("src");
+    std::fs::create_dir_all(&src_raw).unwrap();
+    let root = root_raw.canonicalize().unwrap();
+    let src = src_raw.canonicalize().unwrap();
+
+    let (_debouncer, rx) = super::fs_watch::FsWatch::spawn_watcher(&root)
+        .expect("watcher must start for a root under a noise-named ancestor");
+
+    for _ in 0..30 {
+        while rx.try_recv().is_ok() {}
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    std::fs::write(src.join("a.rs"), b"fn main() {}").unwrap();
+    let started = std::time::Instant::now();
+    let mut signal_events: Vec<std::path::PathBuf> = Vec::new();
+    while started.elapsed() < std::time::Duration::from_millis(1500) {
+        while let Ok(batch) = rx.try_recv() {
+            for ev in batch.unwrap_or_default() {
+                for path in &ev.event.paths {
+                    if path.starts_with(&src) {
+                        signal_events.push(path.clone());
+                    }
+                }
+            }
+        }
+        if !signal_events.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        !signal_events.is_empty(),
+        "a workspace under a build/ ancestor must still deliver its own events"
+    );
+}
+
+#[test]
 fn fs_watcher_prunes_noise_dirs_nested_below_the_workspace_root() {
     // Regression for the freeze when the workspace root is a *parent of
     // repos* (e.g. ~/Documents): there the noise dirs (node_modules/, .git/,
@@ -4825,7 +4938,7 @@ fn macos_watch_walk_stops_when_the_dir_budget_is_spent() {
 
     let mut targets: Vec<(std::path::PathBuf, notify::RecursiveMode)> = Vec::new();
     let mut budget = 50usize; // far fewer than the ~600 dirs present
-    super::fs_watch::collect_macos_watch_targets(tmp.path(), &mut targets, &mut budget);
+    super::fs_watch::collect_macos_watch_targets(tmp.path(), tmp.path(), &mut targets, &mut budget);
 
     assert_eq!(
         budget, 0,
@@ -4855,7 +4968,7 @@ fn macos_watch_targets_never_root_a_stream_above_a_noise_dir() {
 
     let mut targets: Vec<(std::path::PathBuf, notify::RecursiveMode)> = Vec::new();
     let mut budget = usize::MAX; // generous: this small tree is walked in full
-    super::fs_watch::collect_macos_watch_targets(tmp.path(), &mut targets, &mut budget);
+    super::fs_watch::collect_macos_watch_targets(tmp.path(), tmp.path(), &mut targets, &mut budget);
 
     // No target may contain a noise dir anywhere beneath it (which on macOS
     // would put that noise dir inside the target's recursive FSEvents stream).

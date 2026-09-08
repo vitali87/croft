@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 
 use crate::widgets::editor::EditorTabs;
-use crate::widgets::file_finder::is_noise_path;
+use crate::widgets::file_finder::{has_noise_path_run, is_noise_dir, is_path_under_noise_dir};
 use crate::widgets::file_tree::{FileTree, affected_dir_for_event};
 
 const FS_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -217,7 +217,7 @@ impl FsWatch {
                     // apart: `is_dir()` is already false once it is gone.
                     if mutates_content
                         && !removes_a_directory(&ev.event.kind)
-                        && !is_noise_path(path)
+                        && !is_path_under_noise_dir(path)
                         && !path.is_dir()
                     {
                         out.changed_files.insert(path.clone());
@@ -248,7 +248,7 @@ impl FsWatch {
             }
             self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
             out.dirs_changed = true;
-            out.finder_relevant = affected.iter().any(|p| !is_noise_path(p));
+            out.finder_relevant = affected.iter().any(|p| !is_path_under_noise_dir(p));
         }
         out
     }
@@ -292,7 +292,7 @@ impl FsWatch {
         }
         self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
         out.dirs_changed = true;
-        out.finder_relevant = changed_dirs.iter().any(|p| !is_noise_path(p));
+        out.finder_relevant = changed_dirs.iter().any(|p| !is_path_under_noise_dir(p));
         self.poll_interval = Self::back_off(poll_start);
         out
     }
@@ -418,7 +418,7 @@ impl FsWatch {
             // exceeds it gets watches on the subtrees discovered before the cap
             // and the adaptive poll covers the rest.
             let mut budget = WATCH_WALK_DIR_BUDGET / shares.max(1);
-            if collect_macos_watch_targets(root, &mut targets, &mut budget) {
+            if collect_macos_watch_targets(root, root, &mut targets, &mut budget) {
                 // Whole tree is noise-free (e.g. a small repo with no
                 // node_modules): one recursive watch covers it in a single
                 // stream, exactly as before.
@@ -449,9 +449,15 @@ impl FsWatch {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            // The run rule is measured relative to `root`: the workspace
+            // root's own ancestors are not part of the workspace, so a
+            // checkout that happens to live under e.g. `build/` or inside
+            // `go/pkg/mod` must not have its whole subtree pruned.
             let is_skippable = |path: &Path| -> bool {
                 let name = path.file_name().unwrap_or_default();
-                FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_path(path)
+                FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n)
+                    || is_noise_dir(name)
+                    || has_noise_path_run(path, root)
             };
             // Hard ceiling so a pathological tree can't spend forever
             // issuing inotify_add_watch syscalls on the init thread;
@@ -517,14 +523,19 @@ impl FsWatch {
     }
 }
 
-/// True for a directory name croft must never watch: a protected macOS dir
-/// (`Library`/`.Trash`, which trip Sonoma's App Management TCC class) or a
+/// True for a directory croft must never watch: a protected macOS dir
+/// (`Library`/`.Trash`, which trip Sonoma's App Management TCC class), a
 /// build/VCS noise dir (`node_modules`/`target`/`.git`/…) whose cargo/npm/git
-/// write storms the debouncer's FileIdMap loop cannot keep up with.
+/// write storms the debouncer's FileIdMap loop cannot keep up with, or one of
+/// the `go/pkg/mod` cache runs. The name rules read the entry's own name; the
+/// run rule is measured relative to `root`, because the workspace root's own
+/// ancestors are not part of the workspace.
 #[cfg(target_os = "macos")]
-fn is_skippable_path(path: &Path) -> bool {
+fn is_skippable_path(path: &Path, root: &Path) -> bool {
     let name = path.file_name().unwrap_or_default();
-    FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) || is_noise_path(path)
+    FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n)
+        || is_noise_dir(name)
+        || has_noise_path_run(path, root)
 }
 
 /// Walk `dir` and append the FSEvents watch targets that cover every
@@ -541,6 +552,7 @@ fn is_skippable_path(path: &Path) -> bool {
 #[cfg(target_os = "macos")]
 pub(super) fn collect_macos_watch_targets(
     dir: &Path,
+    root: &Path,
     targets: &mut Vec<(PathBuf, notify::RecursiveMode)>,
     budget: &mut usize,
 ) -> bool {
@@ -563,7 +575,7 @@ pub(super) fn collect_macos_watch_targets(
     let mut subdirs: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.filter_map(Result::ok) {
-            if is_skippable_path(&entry.path()) {
+            if is_skippable_path(&entry.path(), root) {
                 has_noise = true;
                 continue;
             }
@@ -579,7 +591,7 @@ pub(super) fn collect_macos_watch_targets(
     let child_clean: Vec<(PathBuf, bool)> = subdirs
         .into_iter()
         .map(|sd| {
-            let clean = collect_macos_watch_targets(&sd, targets, budget);
+            let clean = collect_macos_watch_targets(&sd, root, targets, budget);
             (sd, clean)
         })
         .collect();

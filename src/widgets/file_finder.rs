@@ -623,12 +623,18 @@ pub fn is_noise_dir(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|n| NOISE_DIR_NAMES.contains(&n))
 }
 
-/// The full noise test for a path: a noise component name anywhere in it,
-/// or one of the [`NOISE_PATH_RUNS`] cache trees. Prefer this over
-/// [`is_noise_dir`] wherever the whole path is in hand — the name-only
-/// check cannot see `go/pkg/mod`.
-pub fn is_noise_path(path: &Path) -> bool {
-    is_path_under_noise_dir(path) || NOISE_PATH_RUNS.iter().any(|r| has_component_run(path, r))
+/// True when `path` contains one of the [`NOISE_PATH_RUNS`] cache trees,
+/// measured RELATIVE TO `root`.
+///
+/// The relative part is load-bearing. The workspace root's OWN path is not
+/// part of the workspace, so matching the absolute path would prune the
+/// entire tree of anyone whose checkout happens to live under a matching
+/// ancestor — opening a dependency inside `~/go/pkg/mod/...` to read it
+/// would index zero files. Only components at or below the root can make an
+/// entry noise.
+pub fn has_noise_path_run(path: &Path, root: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    NOISE_PATH_RUNS.iter().any(|r| has_component_run(rel, r))
 }
 
 /// True when `path` sits inside (or names) one of the noise dirs the
@@ -744,6 +750,7 @@ pub fn build_multi_file_index(roots: &[PathBuf]) -> Vec<FileEntry> {
 fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<FileEntry> {
     let collected: Arc<Mutex<Vec<FileEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let root_buf = root.to_path_buf();
+    let filter_root = root.to_path_buf();
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
         .require_git(false)
@@ -761,10 +768,7 @@ fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<File
             if is_noise_dir(entry.file_name()) {
                 return false;
             }
-            if NOISE_PATH_RUNS
-                .iter()
-                .any(|r| has_component_run(entry.path(), r))
-            {
+            if has_noise_path_run(entry.path(), &filter_root) {
                 return false;
             }
             // Hard-skip macOS app-data containers so readdir does not
@@ -1802,37 +1806,77 @@ mod tests {
     }
 
     #[test]
-    fn is_noise_path_flags_dotnet_dart_and_go_module_caches() {
+    fn noise_rules_flag_dotnet_dart_and_go_module_caches() {
         // Root-cause guard for the second home-dir readlink storm: these
         // trees were absent from the ignore set, so opening /root walked
         // and watched all of them. Measured there: .nuget 1127 dirs,
         // .pub-cache 1271, go/pkg/mod 1357.
+        // Name-matched, from a $HOME workspace root.
         for p in [
             "/root/.nuget/packages/microsoft.codeanalysis.common/5.0.0/lib/x.dll",
             "/root/.pub-cache/hosted/pub.dev/args-2.4.2/lib/args.dart",
             "/root/.dart-tool/pub/bin/x",
             "/root/.dotnet/sdk/8.0.100/x.dll",
             "/root/.oh-my-zsh/plugins/git/git.plugin.zsh",
+        ] {
+            assert!(is_path_under_noise_dir(Path::new(p)), "{p}");
+        }
+        // Run-matched, measured relative to the workspace root.
+        for p in [
             "/root/go/pkg/mod/golang.org/x/tools@v0.28.0/go/analysis/x.go",
             "/root/go/pkg/sumdb/sum.golang.org/lookup/x",
         ] {
-            assert!(is_noise_path(Path::new(p)), "{p}");
+            assert!(has_noise_path_run(Path::new(p), Path::new("/root")), "{p}");
         }
     }
 
     #[test]
-    fn is_noise_path_keeps_a_real_go_source_tree() {
+    fn build_file_index_indexes_a_workspace_opened_inside_the_module_cache() {
+        // The root's own path is not part of the workspace: opening a
+        // checked-out dependency to read it must still index its files.
+        // Matching the absolute path pruned every entry at depth >= 1.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("go/pkg/mod/github.com/x/y@v1.0.0");
+        std::fs::create_dir_all(root.join("internal")).unwrap();
+        std::fs::write(root.join("main.go"), "x").unwrap();
+        std::fs::write(root.join("internal/a.go"), "x").unwrap();
+        let idx = build_file_index(&root);
+        let mut rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        rels.sort_unstable();
+        assert_eq!(rels, vec!["internal/a.go", "main.go"]);
+    }
+
+    #[test]
+    fn build_file_index_indexes_a_workspace_under_a_noise_named_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("build/myapp");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "x").unwrap();
+        let idx = build_file_index(&root);
+        let rels: Vec<&str> = idx.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn noise_rules_keep_a_real_go_source_tree() {
         // `go` alone is a legitimate source directory name, so only the
         // GOPATH cache runs are pruned. A project's own go/ must survive,
         // and so must a go/pkg that is not the module cache.
+        let root = Path::new("/Users/v/proj");
         for p in [
             "/Users/v/proj/go/main.go",
             "/Users/v/proj/go/pkg/handler/handler.go",
             "/Users/v/proj/src/mod/thing.rs",
             "/Users/v/proj/pkg/mod/thing.go",
         ] {
-            assert!(!is_noise_path(Path::new(p)), "{p}");
+            assert!(!has_noise_path_run(Path::new(p), root), "{p}");
+            assert!(!is_path_under_noise_dir(Path::new(p)), "{p}");
         }
+        // And the root's OWN path never makes its contents noise.
+        assert!(!has_noise_path_run(
+            Path::new("/home/u/go/pkg/mod/x@v1/main.go"),
+            Path::new("/home/u/go/pkg/mod/x@v1")
+        ));
     }
 
     #[test]
