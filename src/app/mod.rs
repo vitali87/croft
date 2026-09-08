@@ -1291,6 +1291,11 @@ enum MenuAction {
     /// Terminal pane right-click: collapse the pane at `idx` to a strip, or
     /// expand it again (#313).
     ToggleCollapseTerminal(usize),
+    /// Terminal pane right-click: copy the pane's selection to the clipboard.
+    /// Offered only while the pane HAS one, so the entry never copies nothing.
+    TerminalCopySelection,
+    /// Terminal pane right-click: paste the host clipboard into the pane.
+    TerminalPaste,
     /// Terminal pane right-click: enter quick-select hint mode on the pane.
     TerminalQuickSelect,
     /// Terminal pane right-click: enter copy mode (keyboard selection with
@@ -1411,6 +1416,8 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         // that chord really does toggle both ways. Advertising a shortcut
         // beside a label it cannot perform is worse than showing none.
         MenuAction::ToggleCollapseTerminal(_) => None,
+        MenuAction::TerminalCopySelection => Some("⌘C"),
+        MenuAction::TerminalPaste => Some("⌘V"),
         MenuAction::TerminalQuickSelect => Some("⌃⇧Space"),
         MenuAction::TerminalCopyMode => Some("⌃⇧Y"),
         MenuAction::TerminalCommandHistory => Some("⌃⇧H"),
@@ -29629,21 +29636,7 @@ impl App {
         // through to the shell unchanged, and Cmd+V — when not eaten by
         // the host terminal's menu shortcut — would do nothing useful.
         if is_clipboard_paste_key(key) {
-            match crate::clipboard::read_string() {
-                Some(text) if !text.is_empty() => {
-                    self.paste_terminal_input(text.as_bytes());
-                }
-                Some(_) => {
-                    self.status = String::from("Cmd+V: clipboard is empty");
-                }
-                None if self.drop_relay_active() => {
-                    self.request_remote_clipboard();
-                }
-                None => {
-                    self.status =
-                        String::from("Cmd+V: clipboard read failed (no pbpaste / NSPasteboard)");
-                }
-            }
+            self.paste_clipboard_into_terminal();
             return;
         }
         // Any other keystroke clears the selection so the user's input is
@@ -29694,6 +29687,32 @@ impl App {
         }
         copy_to_clipboard(&text);
         self.status = format!("Copied {} chars to clipboard", text.chars().count());
+    }
+
+    /// Paste the host clipboard into the terminal: the chord (Cmd+V /
+    /// Ctrl+V / Ctrl+Shift+V) and the pane menu's "Paste" both land here, so
+    /// bracketed paste, broadcast fan-out and the remote-clipboard fallback
+    /// behave identically whichever one the user reached for.
+    ///
+    /// The messages name the ACTION rather than the chord: the menu route has
+    /// no Cmd+V in it, and a status line quoting a key the user never pressed
+    /// reads as a bug report about the wrong thing.
+    fn paste_clipboard_into_terminal(&mut self) {
+        match crate::clipboard::read_string() {
+            Some(text) if !text.is_empty() => {
+                self.paste_terminal_input(text.as_bytes());
+            }
+            Some(_) => {
+                self.status = String::from("Paste: clipboard is empty");
+            }
+            None if self.drop_relay_active() => {
+                self.request_remote_clipboard();
+            }
+            None => {
+                self.status =
+                    String::from("Paste: clipboard read failed (no pbpaste / NSPasteboard)");
+            }
+        }
     }
 
     /// Start a mouse selection over a rendered ANSI log (#257).
@@ -38185,16 +38204,38 @@ impl App {
                     // Each of them is also a gesture on a grid the user
                     // cannot see while the pane is a strip.
                     let folded = self.terminals.get(idx).is_some_and(|t| t.collapsed);
-                    let mut items = vec![
-                        MenuEntry::Item {
-                            label: String::from("Rename Terminal"),
-                            action: MenuAction::RenameTerminal(idx),
-                        },
-                        MenuEntry::Item {
-                            label: String::from("Clear"),
-                            action: MenuAction::ClearTerminal(idx),
-                        },
-                    ];
+                    let mut items: Vec<MenuEntry> = Vec::new();
+                    // Copy and Paste lead the menu, as they do in VS Code's
+                    // terminal. Both act on the ACTIVE pane, so a folded one
+                    // offers neither: focus has already walked to an expanded
+                    // neighbour, and pasting into a grid the user cannot see
+                    // is worse than not offering the entry at all.
+                    if !folded {
+                        // Copy appears only while there is something to copy.
+                        // The menu model has no disabled state, and an entry
+                        // that silently copies nothing is worse than no entry.
+                        if self.terminals[idx]
+                            .selection()
+                            .is_some_and(|s| s.has_area())
+                        {
+                            items.push(MenuEntry::Item {
+                                label: String::from("Copy"),
+                                action: MenuAction::TerminalCopySelection,
+                            });
+                        }
+                        items.push(MenuEntry::Item {
+                            label: String::from("Paste"),
+                            action: MenuAction::TerminalPaste,
+                        });
+                    }
+                    items.push(MenuEntry::Item {
+                        label: String::from("Rename Terminal"),
+                        action: MenuAction::RenameTerminal(idx),
+                    });
+                    items.push(MenuEntry::Item {
+                        label: String::from("Clear"),
+                        action: MenuAction::ClearTerminal(idx),
+                    });
                     if !folded {
                         items.extend([
                             MenuEntry::Item {
@@ -42496,6 +42537,8 @@ impl App {
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
             MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
             MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
+            MenuAction::TerminalCopySelection => self.copy_terminal_selection(),
+            MenuAction::TerminalPaste => self.paste_clipboard_into_terminal(),
             MenuAction::TerminalQuickSelect => self.open_terminal_quick_select(),
             MenuAction::TerminalCopyMode => self.open_terminal_copy_mode(),
             MenuAction::TerminalCommandHistory => self.open_command_history(),

@@ -555,7 +555,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+K` `]` | Give every collapsed pane its width back, restoring the even split in one gesture |
 | Click a rail row | While maximized: hand that terminal the maximized pane (the highlight marks the active one), so you can shuffle between full-size terminals |
 | Wheel over the rail | Scroll the rail when there are more terminals than it has rows; switching panes always scrolls the new one back into view |
-| Right-click a terminal pane | Open the pane menu: **Rename Terminal**, **Clear**, **Quick Select**, **Copy Mode**, **Command History**, **Open Scrollback in Editor**, **Reopen Closed Terminal** (while one is in its undo window), **Maximize Terminal** (or **Restore Terminal Split**), **Collapse Terminal** (or **Expand Terminal**), **Broadcast Input** (and, while broadcasting, **Exclude from Broadcast**) |
+| Right-click a terminal pane | Open the pane menu: **Copy** (while the pane has a selection), **Paste**, **Rename Terminal**, **Clear**, **Quick Select**, **Copy Mode**, **Command History**, **Open Scrollback in Editor**, **Reopen Closed Terminal** (while one is in its undo window), **Maximize Terminal** (or **Restore Terminal Split**), **Collapse Terminal** (or **Expand Terminal**), **Broadcast Input** (and, while broadcasting, **Exclude from Broadcast**) |
 
 Collapse and maximize are orthogonal and compose: entering maximize ignores the collapse flags rather than clearing them, and leaving it puts the strips back. Collapse is per-session and deliberately not saved with the pane layout, so a workspace never reopens with half its terminals folded away.
 
