@@ -202,10 +202,18 @@ impl FsWatch {
     ///
     /// Both roots are tried because they can disagree: a watcher installed on
     /// a symlinked root reports CANONICAL paths while `watch_root` holds the
-    /// path as the user gave it. A path under neither is left to the whole-path
-    /// reading — the primary instance's poll walks every root's expanded rows
-    /// in a multi-root workspace (#147), so a secondary root's dirs arrive
-    /// here, and for those this is exactly the classification they had before.
+    /// path as the user gave it.
+    ///
+    /// A path under NEITHER falls back to the whole-path reading, and that
+    /// fallback is a KNOWN GAP rather than a correct answer. The primary
+    /// instance's poll walks every root's expanded rows in a multi-root
+    /// workspace (#147), so a secondary root's dirs reach this function
+    /// matching neither of the primary's roots: a secondary folder that
+    /// itself lives under a `build/` ancestor still never sets
+    /// `finder_relevant`. That is the classification those dirs already had,
+    /// so nothing regresses here, but closing it needs the owning root per
+    /// dir (`FileTree::root_paths`) rather than this instance's, which is a
+    /// wider change than the event path this commit is fixing.
     fn is_noise_event_path(&self, path: &Path) -> bool {
         let root = if path.starts_with(&self.watch_root) {
             &self.watch_root

@@ -603,8 +603,21 @@ const NOISE_DIR_NAMES: &[&str] = &[
 /// root and everything under it are covered.
 const NOISE_PATH_RUNS: &[&[&str]] = &[&["go", "pkg", "mod"], &["go", "pkg", "sumdb"]];
 
-/// True when `run` appears as consecutive `Normal` components of `path`.
-fn has_component_run(path: &Path, run: &[&str]) -> bool {
+/// Number of `Normal` components in `path` — its depth, ignoring the root
+/// prefix and any `.` / `..` the caller left in.
+fn normal_component_count(path: &Path) -> usize {
+    path.components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count()
+}
+
+/// True when `run` appears as consecutive `Normal` components of `path`
+/// ENDING deeper than `min_end` components in — that is, the run must reach
+/// below the first `min_end` components. `0` matches a run anywhere.
+///
+/// The depth bound is what lets a run straddle a workspace root: the head of
+/// the run may lie in the root's own path as long as its tail does not.
+fn has_component_run(path: &Path, run: &[&str], min_end: usize) -> bool {
     let comps: Vec<&std::ffi::OsStr> = path
         .components()
         .filter_map(|c| match c {
@@ -612,10 +625,11 @@ fn has_component_run(path: &Path, run: &[&str]) -> bool {
             _ => None,
         })
         .collect();
-    comps.windows(run.len()).any(|w| {
-        w.iter()
-            .zip(run)
-            .all(|(a, b)| *a == std::ffi::OsStr::new(b))
+    comps.windows(run.len()).enumerate().any(|(i, w)| {
+        i + run.len() > min_end
+            && w.iter()
+                .zip(run)
+                .all(|(a, b)| *a == std::ffi::OsStr::new(b))
     })
 }
 
@@ -624,17 +638,32 @@ pub fn is_noise_dir(name: &std::ffi::OsStr) -> bool {
 }
 
 /// True when `path` contains one of the [`NOISE_PATH_RUNS`] cache trees,
-/// measured RELATIVE TO `root`.
+/// measured RELATIVE TO `root`: the run must REACH BELOW the root.
 ///
 /// The relative part is load-bearing. The workspace root's OWN path is not
 /// part of the workspace, so matching the absolute path would prune the
 /// entire tree of anyone whose checkout happens to live under a matching
 /// ancestor — opening a dependency inside `~/go/pkg/mod/...` to read it
-/// would index zero files. Only components at or below the root can make an
-/// entry noise.
+/// would index zero files.
+///
+/// "Reaches below the root" rather than "lies below it", because a run can
+/// STRADDLE the root. A workspace opened at `~/go` — the ordinary GOPATH —
+/// keeps its cache at `pkg/mod`, a run whose first component is the root's
+/// own last one. Stripping the root off and matching what remained missed
+/// exactly that, re-admitting the tree this rule exists to prune.
 pub fn has_noise_path_run(path: &Path, root: &Path) -> bool {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    NOISE_PATH_RUNS.iter().any(|r| has_component_run(rel, r))
+    // Components at or above the root cannot make an entry noise on their
+    // own; they can only supply the head of a run whose tail is below it. A
+    // path outside the root has no root to be measured against, so every
+    // component of it counts, as it did before roots entered this rule.
+    let depth = if path.starts_with(root) {
+        normal_component_count(root)
+    } else {
+        0
+    };
+    NOISE_PATH_RUNS
+        .iter()
+        .any(|r| has_component_run(path, r, depth))
 }
 
 /// True when `path` is noise measured RELATIVE TO `root`: it carries a
@@ -1930,21 +1959,66 @@ mod tests {
         ));
     }
 
+    /// A cache run can STRADDLE the root, and both halves of the rule have
+    /// to hold at once.
+    #[test]
+    fn a_gopath_root_still_prunes_the_module_cache_below_it() {
+        // A workspace opened at `~/go` - the ordinary GOPATH - keeps its
+        // cache at `pkg/mod`, a run whose first component IS the root's own
+        // last one. Stripping the root and matching only what was left
+        // missed it, re-admitting the tree this rule exists to prune.
+        let gopath = Path::new("/home/u/go");
+        for p in [
+            "/home/u/go/pkg/mod/x@v1/a.go",
+            "/home/u/go/pkg/sumdb/lookup/y",
+        ] {
+            assert!(has_noise_path_run(Path::new(p), gopath), "{p}");
+        }
+        // The sibling source tree under that same root is not noise.
+        assert!(!has_noise_path_run(
+            Path::new("/home/u/go/src/app/main.go"),
+            gopath
+        ));
+        // And the other half, unchanged: opening a dependency INSIDE the
+        // cache indexes it, because there the whole run is the root's own
+        // path rather than anything below it.
+        assert!(!has_noise_path_run(
+            Path::new("/home/u/go/pkg/mod/x@v1/a.go"),
+            Path::new("/home/u/go/pkg/mod/x@v1")
+        ));
+    }
+
     #[test]
     fn has_component_run_matches_only_consecutive_whole_components() {
         assert!(has_component_run(
             Path::new("/a/go/pkg/mod/b"),
-            &["go", "pkg", "mod"]
+            &["go", "pkg", "mod"],
+            0
         ));
         // Non-consecutive: go/pkg/OTHER/mod must not match.
         assert!(!has_component_run(
             Path::new("/a/go/pkg/other/mod"),
-            &["go", "pkg", "mod"]
+            &["go", "pkg", "mod"],
+            0
         ));
         // Substring of a component must not match.
         assert!(!has_component_run(
             Path::new("/a/cargo/pkg/mod"),
-            &["go", "pkg", "mod"]
+            &["go", "pkg", "mod"],
+            0
+        ));
+        // The depth bound: the same run is ignored when it ends at or above
+        // `min_end`, which is how a run inside the ROOT'S own path is kept
+        // from making the workspace's contents noise.
+        assert!(!has_component_run(
+            Path::new("/a/go/pkg/mod/b"),
+            &["go", "pkg", "mod"],
+            4
+        ));
+        assert!(has_component_run(
+            Path::new("/a/go/pkg/mod/b"),
+            &["go", "pkg", "mod"],
+            3
         ));
     }
 
