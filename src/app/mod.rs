@@ -29687,12 +29687,14 @@ impl App {
     /// Copy the terminal pane's current selection to the user's clipboard.
     /// Selection stays visible so the user can verify what was copied.
     ///
-    /// A copy that finds NOTHING now says so (#538). Inside a program that
-    /// tracks the mouse — any full-screen TUI, Claude Code included — a plain
-    /// drag is the child's gesture and croft deliberately holds no selection
-    /// of its own (#474), so the old silent return left the user pressing copy
-    /// with nothing happening and no way to learn that Shift+drag is the
-    /// gesture that selects there.
+    /// A copy that finds NOTHING now says so (#538). Inside a program that has
+    /// ASKED for mouse tracking — Claude Code and most full-screen TUIs, but
+    /// not a program that never requested it — a plain drag is the child's
+    /// gesture and croft deliberately holds no selection of its own (#474), so
+    /// the old silent return left the user pressing copy with nothing
+    /// happening and no way to learn that Shift+drag selects there. The hint
+    /// is keyed on `mouse_reporting`, so a pane whose child is not tracking is
+    /// told to drag, which is what works there.
     fn copy_terminal_selection(&mut self) {
         if !self.terminal().selection().is_some_and(|s| s.has_area()) {
             self.status = String::from(if self.terminal().mouse_reporting() {
@@ -29743,21 +29745,30 @@ impl App {
     /// Push copied text to the LOCAL machine's clipboard over the drop relay.
     /// Returns whether the request was queued.
     ///
-    /// The payload goes in a file beside the log rather than into the request
-    /// line: a request is one TAB-SEPARATED LINE, while copied text carries
-    /// newlines and tabs of its own and can be megabytes of scrollback.
+    /// The payload goes in a file in the relay INBOX rather than into the
+    /// request line: a request is one TAB-SEPARATED LINE, while copied text
+    /// carries newlines and tabs of its own and can be megabytes of
+    /// scrollback. The line names only the request id — the pump derives
+    /// `<inbox>/<id>.txt` from the inbox it already owns, so no path from
+    /// this side is ever handed to a remote shell.
+    ///
+    /// An oversized copy is REFUSED here rather than truncated there. The pump
+    /// caps what it will read into the local machine's memory and drops
+    /// anything past it, and a selection that pastes back half-formed is worse
+    /// than falling through to the ordinary clipboard route and saying so.
     fn push_clipboard_via_relay(&mut self, text: &str) -> bool {
-        let (Some(log_path), Some(dir)) = (self.relay_log_path(), self.relay_dir()) else {
+        if text.len() > crate::remote::MAX_COPY_PAYLOAD_BYTES {
+            return false;
+        }
+        let (Some(log_path), Some(inbox)) = (self.relay_log_path(), self.relay_inbox_path()) else {
             return false;
         };
         self.ensure_relay_dir();
         let request_id = Self::relay_request_id("copy");
-        let payload = dir.join(format!("{request_id}.txt"));
-        if std::fs::write(&payload, text).is_err() {
+        if std::fs::write(inbox.join(format!("{request_id}.txt")), text).is_err() {
             return false;
         }
-        let line = format!("copy\t{request_id}\t{}\n", payload.display());
-        append_to_relay_log(&log_path, &line).is_ok()
+        append_to_relay_log(&log_path, &format!("copy\t{request_id}\n")).is_ok()
     }
 
     /// Paste the host clipboard into the terminal: the chord (Cmd+V /

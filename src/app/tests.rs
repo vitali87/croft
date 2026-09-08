@@ -18467,7 +18467,9 @@ fn cmd_c_inside_a_mouse_tracking_program_says_why_nothing_was_copied() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.show_terminal = true;
     app.focus_pane(Pane::Terminal);
-    // The child asks for click + drag tracking, as every full-screen TUI does.
+    // The child explicitly REQUESTS click and drag tracking (?1002 button-drag,
+    // ?1006 SGR), which is what makes the drag below the child's rather than
+    // croft's. A program that never asks still selects on a plain drag.
     app.terminals[0].feed_bytes_for_test(b"\x1b[?1002h\x1b[?1006h");
     assert!(
         app.terminals[0].mouse_reporting(),
@@ -18556,11 +18558,12 @@ fn copying_on_a_relay_session_pushes_the_text_to_the_local_clipboard() {
     // Opt in explicitly. The flag is inert under cfg(test) precisely so that
     // this test's CROFT_RELAY_KEY cannot reroute a concurrent test's copy.
     app.is_relay_session = true;
-    let log = with_relay_home(home.path(), || {
+    let (log, inbox_for_assert) = with_relay_home(home.path(), || {
         let log = app.relay_log_path().expect("relay log path derivable");
+        let inbox = app.relay_inbox_path().expect("relay inbox path derivable");
         app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
             .unwrap();
-        log
+        (log, inbox)
     });
 
     let written = std::fs::read_to_string(&log).expect("relay log was written");
@@ -18568,12 +18571,20 @@ fn copying_on_a_relay_session_pushes_the_text_to_the_local_clipboard() {
         written.starts_with("copy\t"),
         "a copy on a relay session must queue a copy request, got {written:?}"
     );
-    let payload_path = written
+    // The line carries an ID ONLY: a path on the wire would let anything that
+    // can write this log point the pump at a FIFO or outside the relay.
+    let request_id = written
         .trim_end()
         .split('\t')
-        .nth(2)
-        .expect("the request names the payload file");
-    let payload = std::fs::read_to_string(payload_path).expect("the payload file was written");
+        .nth(1)
+        .expect("the request carries an id");
+    assert_eq!(
+        written.trim_end().split('\t').count(),
+        2,
+        "no path belongs on the wire, got {written:?}"
+    );
+    let payload_path = inbox_for_assert.join(format!("{request_id}.txt"));
+    let payload = std::fs::read_to_string(&payload_path).expect("the payload file was written");
     assert_eq!(
         payload, expected,
         "the payload must be exactly what was selected"
