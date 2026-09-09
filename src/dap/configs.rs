@@ -40,6 +40,11 @@ pub struct DebugConfig {
     pub request: RequestKind,
     /// Which file declared it, for the picker's detail column.
     pub source: &'static str,
+    /// The configuration's `presentation` (#318), when it declares a usable
+    /// one. VS Code reads this on configurations as well as compounds and
+    /// sorts BOTH kinds in one list, so a config that asks for a group must
+    /// be able to sort against a compound that asks for the same one.
+    pub presentation: Option<Presentation>,
     raw: Map<String, Value>,
 }
 
@@ -129,10 +134,118 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
                 type_name,
                 request,
                 source,
+                presentation: parse_presentation(obj),
                 raw: obj.clone(),
             })
         })
         .collect()
+}
+
+/// A `presentation` block, as declared on a configuration OR a compound
+/// (#318). VS Code reads the same three keys in both places and sorts the two
+/// kinds together in one list, so croft parses it in both too.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Presentation {
+    /// Do not list this entry in the picker.
+    pub hidden: bool,
+    /// The name entries are grouped under. Groups sort against each other by
+    /// name; entries carrying one sort ahead of entries that do not.
+    pub group: Option<String>,
+    /// Position within the group, ascending. An entry with no numeric order
+    /// sorts after the ones that have it.
+    pub order: Option<i64>,
+}
+
+/// Read a `presentation` block, if the entry declares a usable one.
+///
+/// `None` for absent, non-object, or empty - each means "no preference", and
+/// the difference matters: VS Code sorts an entry that HAS a presentation
+/// ahead of one that has none, so inventing an empty block here would move
+/// rows that asked for nothing.
+pub fn parse_presentation(obj: &Map<String, Value>) -> Option<Presentation> {
+    let p = obj.get("presentation")?.as_object()?;
+    let hidden = p.get("hidden").and_then(Value::as_bool).unwrap_or(false);
+    let group = p
+        .get("group")
+        .and_then(Value::as_str)
+        .filter(|g| !g.is_empty())
+        .map(str::to_string);
+    // `as_i64` and not `as_f64`: VS Code compares orders with subtraction and
+    // its schema says integer. A non-number is the "no order" case, which is
+    // exactly what a fractional or string value degrades to.
+    let order = p.get("order").and_then(Value::as_i64);
+    if !hidden && group.is_none() && order.is_none() {
+        return None;
+    }
+    Some(Presentation {
+        hidden,
+        group,
+        order,
+    })
+}
+
+/// Filter out hidden entries and sort the rest the way VS Code's
+/// `getVisibleAndSorted` does (#318), so a launch.json ordered for VS Code
+/// reads the same here.
+///
+/// The comparator is transcribed from `debugUtils.ts` rather than invented,
+/// because every one of its rules is a decision croft would otherwise get
+/// subtly wrong:
+///
+/// - an entry WITH a `presentation` sorts ahead of one without, so adding
+///   `{"order": 1}` to a single entry lifts it above untouched neighbours;
+/// - within those, an entry with a `group` sorts ahead of one without;
+/// - groups compare by NAME, so grouping is alphabetical rather than
+///   first-seen;
+/// - inside a group, a numeric `order` sorts ahead of a missing one.
+///
+/// The sort is stable, matching JS, which is what keeps a workspace that
+/// declares no `presentation` at all in exactly its file order - the case
+/// that must not move.
+///
+/// One deliberate divergence: VS Code compares group names with
+/// `localeCompare`, which is locale-aware collation; croft compares them
+/// bytewise. The two agree on ASCII group names and can disagree on accented
+/// ones, and matching it properly would mean taking a collation dependency
+/// for the ordering of a picker.
+pub fn visible_and_sorted<T>(
+    items: Vec<T>,
+    presentation: impl Fn(&T) -> Option<&Presentation>,
+) -> Vec<T> {
+    let mut kept: Vec<T> = items
+        .into_iter()
+        .filter(|i| !presentation(i).is_some_and(|p| p.hidden))
+        .collect();
+    kept.sort_by(|a, b| {
+        use std::cmp::Ordering;
+        let (Some(first), Some(second)) = (presentation(a), presentation(b)) else {
+            return match (presentation(a), presentation(b)) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                _ => unreachable!("both-Some is handled by the outer let-else"),
+            };
+        };
+        match (&first.group, &second.group) {
+            (None, None) => compare_orders(first.order, second.order),
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(g1), Some(g2)) if g1 != g2 => g1.cmp(g2),
+            _ => compare_orders(first.order, second.order),
+        }
+    });
+    kept
+}
+
+/// `order` against `order`: a declared one wins over a missing one, and two
+/// missing ones tie (leaving the stable sort to keep file order).
+fn compare_orders(first: Option<i64>, second: Option<i64>) -> std::cmp::Ordering {
+    match (first, second) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(a), Some(b)) => a.cmp(&b),
+    }
 }
 
 /// A `compounds` entry: several configurations launched together under one
@@ -151,18 +264,17 @@ pub struct Compound {
     /// requests nothing, and parking a launch behind a task named `""` would
     /// invent work the file never asked for.
     pub pre_launch_task: Option<String>,
-    /// `presentation.hidden` (#318): the compound asks not to be listed.
+    /// The compound's `presentation` (#318), when it declares a usable one.
     ///
-    /// Split out of `unsupported_keys` because it needs no grouping concept
-    /// -- it is a filter on the picker's rows, which croft can honour today,
-    /// where `group` and `order` want an ordering the picker does not have.
-    /// A compound asking ONLY to be hidden is therefore fully served and
-    /// launches like any other; one that also asks for `group` or `order`
-    /// still records those as unsupported.
-    pub hidden: bool,
+    /// All three keys are honoured now: `hidden` filters the row, and
+    /// `group`/`order` place it via [`visible_and_sorted`], which sorts
+    /// compounds and configurations in ONE list the way VS Code does. Only
+    /// the malformed shapes still refuse, and they are listed in
+    /// `unsupported_keys`.
+    pub presentation: Option<Presentation>,
     /// Keys croft does not honour that this compound ACTUALLY ASKS FOR,
-    /// named with their parent so they can be found in the file:
-    /// `presentation.group`, `presentation.order`, and the malformed shapes
+    /// named with their parent so they can be found in the file. Since #318
+    /// honoured `group` and `order`, only the MALFORMED shapes remain:
     /// `presentation` (present but not an object) and `presentation.hidden`
     /// (present but not a boolean).
     ///
@@ -187,6 +299,22 @@ pub struct Compound {
     /// a `.vscode` compound to a `.croft` config of that name would debug a
     /// different program than the compound was written against.
     pub source: &'static str,
+}
+
+impl Compound {
+    /// Whether the compound asked not to be listed (#318).
+    pub fn hidden(&self) -> bool {
+        self.presentation.as_ref().is_some_and(|p| p.hidden)
+    }
+}
+
+impl DebugConfig {
+    /// Whether the configuration asked not to be listed (#318). Same question
+    /// as [`Compound::hidden`], and the picker's badge asks it of both kinds
+    /// so the count and the list cannot disagree.
+    pub fn hidden(&self) -> bool {
+        self.presentation.as_ref().is_some_and(|p| p.hidden)
+    }
 }
 
 /// Parse the `compounds` array of a launch.json body. Sibling key of
@@ -259,38 +387,25 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // ordering that does not exist. Testing the SUB-KEYS rather than
             // the parent means `{"hidden": true}` alone launches instead of
             // being refused for a capability it never asked for.
-            let presentation = obj.get("presentation").and_then(|v| v.as_object());
-            let hidden = presentation
-                .and_then(|p| p.get("hidden"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            // Named WITH the parent: "order" alone is a generic word, and a
-            // refusal telling the user to "remove that key" would read as
-            // deleting the whole `presentation` block -- taking a working
-            // `hidden` with it, which is the outcome this split exists to
-            // avoid. The path is what they can find in the file.
+            let presentation_obj = obj.get("presentation").and_then(|v| v.as_object());
+            let presentation = parse_presentation(obj);
+            // Only the MALFORMED shapes still refuse (#318). `group` and
+            // `order` are honoured now, so the loop that recorded them is
+            // gone; what remains cannot be honoured because it does not say
+            // anything croft could act on.
             //
             // A `presentation` that is present but NOT an object, or a
-            // `hidden` that is not a bool, keeps refusing: on main those
-            // shapes refused and the user found out, and silently launching
+            // `hidden` that is not a bool, keeps refusing: silently launching
             // a compound whose `{"hidden": "true"}` typo did nothing is a
-            // worse answer than the refusal it replaces.
+            // worse answer than the refusal it replaces. Each is named WITH
+            // its parent, because a refusal telling the user to "remove that
+            // key" would otherwise read as deleting the whole `presentation`
+            // block, taking a working `group` with it.
             let mut unsupported_keys: Vec<&'static str> = Vec::new();
-            if asks_for_something("presentation") && presentation.is_none() {
+            if asks_for_something("presentation") && presentation_obj.is_none() {
                 unsupported_keys.push("presentation");
             }
-            for (key, path) in [
-                ("group", "presentation.group"),
-                ("order", "presentation.order"),
-            ] {
-                if presentation
-                    .and_then(|p| p.get(key))
-                    .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
-                {
-                    unsupported_keys.push(path);
-                }
-            }
-            if presentation
+            if presentation_obj
                 .and_then(|p| p.get("hidden"))
                 .is_some_and(|v| !v.is_null() && !v.is_boolean())
             {
@@ -305,7 +420,7 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
                 configurations,
                 source,
                 pre_launch_task,
-                hidden,
+                presentation,
                 unsupported_keys,
             })
         })
@@ -1282,11 +1397,12 @@ mod tests {
                 { "name": "NulledTask", "configurations": ["A"], "preLaunchTask": null },
                 { "name": "EmptyTask", "configurations": ["A"], "preLaunchTask": "" },
                 { "name": "EmptyPresentation", "configurations": ["A"], "presentation": {} },
-                { "name": "RealPresentation", "configurations": ["A"], "presentation": { "order": 1 } }
+                { "name": "RealPresentation", "configurations": ["A"], "presentation": { "order": 1 } },
+                { "name": "Malformed", "configurations": ["A"], "presentation": 7 }
             ]
         }"#;
         let cs = parse_compounds(text, ".vscode/launch.json");
-        assert_eq!(cs.len(), 6, "precondition: every compound parsed");
+        assert_eq!(cs.len(), 7, "precondition: every compound parsed");
         let by = |n: &str| {
             cs.iter()
                 .find(|c| c.name == n)
@@ -1321,15 +1437,20 @@ mod tests {
             by("EmptyPresentation").unsupported_keys
         );
 
-        // The positive control: without it, six empties could equally mean the
-        // detection never records anything at all. `presentation.order`
-        // carries it now - `preLaunchTask` and `presentation.hidden` are both
-        // honoured (#318), so neither can serve as the control, and the list
-        // names the SUB-KEY because that is the granularity croft refuses at.
+        // The positive control: without it, six empties could equally mean
+        // the detection never records anything at all. Every honourable key
+        // is honoured now (#318), so the only shapes left to carry the
+        // control are the MALFORMED ones - a `presentation` that is not an
+        // object is the cheapest.
+        assert_eq!(
+            by("Malformed").unsupported_keys,
+            vec!["presentation"],
+            "and a shape croft cannot act on is still recorded"
+        );
         assert_eq!(
             by("RealPresentation").unsupported_keys,
-            vec!["presentation.order"],
-            "and a key that DOES ask for something is still recorded"
+            Vec::<&str>::new(),
+            "while a well-formed order is honoured rather than refused"
         );
     }
 
@@ -1371,13 +1492,17 @@ mod tests {
         assert_eq!(by("Nulled").pre_launch_task, None);
         assert_eq!(by("Empty").pre_launch_task, None);
 
-        // The positive control: `presentation.order` is still unhonoured, so
-        // the refusal path must still have something to fire on. `hidden` is
-        // honoured now (#318) and would make a vacuous control.
+        // `presentation.order` is HONOURED now (#318), so it must stop being
+        // a refusal reason - and it must be read, not merely tolerated.
+        assert!(
+            by("Presents").unsupported_keys.is_empty(),
+            "order is honoured now and must stop refusing: {:?}",
+            by("Presents").unsupported_keys
+        );
         assert_eq!(
-            by("Presents").unsupported_keys,
-            vec!["presentation.order"],
-            "presentation.order is still not honoured and must still refuse"
+            by("Presents").presentation.as_ref().and_then(|p| p.order),
+            Some(1),
+            "the order's VALUE is what sorting needs; tolerating the key cannot"
         );
         assert_eq!(by("Presents").pre_launch_task, None);
     }
@@ -1398,13 +1523,13 @@ mod tests {
         let cs = parse_compounds(text, "test");
         let by = |n: &str| cs.iter().find(|c| c.name == n).expect("compound present");
 
-        assert!(by("Hid").hidden, "hidden: true asks not to be listed");
+        assert!(by("Hid").hidden(), "hidden: true asks not to be listed");
         assert!(
-            !by("Shown").hidden,
+            !by("Shown").hidden(),
             "hidden: false is the default, spelled out"
         );
         assert!(
-            !by("Empty").hidden,
+            !by("Empty").hidden(),
             "an empty presentation asks for nothing"
         );
 
@@ -1420,11 +1545,25 @@ mod tests {
             "an empty presentation refuses nothing"
         );
 
-        // `group` and `order` still want a picker ordering croft does not
-        // have, so they keep refusing -- and `Both` shows the two halves are
-        // independent: honoured and refused at once.
-        assert_eq!(by("Grouped").unsupported_keys, vec!["presentation.group"]);
-        assert_eq!(by("Ordered").unsupported_keys, vec!["presentation.order"]);
+        // `group` and `order` are honoured now (#318): read, not refused.
+        assert!(
+            by("Grouped").unsupported_keys.is_empty(),
+            "group no longer refuses: {:?}",
+            by("Grouped").unsupported_keys
+        );
+        assert_eq!(
+            by("Grouped")
+                .presentation
+                .as_ref()
+                .and_then(|p| p.group.clone()),
+            Some(String::from("g")),
+            "and its VALUE is what places the row"
+        );
+        assert!(by("Ordered").unsupported_keys.is_empty());
+        assert_eq!(
+            by("Ordered").presentation.as_ref().and_then(|p| p.order),
+            Some(2)
+        );
         // A malformed shape must keep refusing. On main these refused and the
         // user found out; silently launching a compound whose typo'd
         // `{"hidden": "true"}` did nothing would be a regression dressed as
@@ -1441,7 +1580,10 @@ mod tests {
             "test",
         );
         let bad_by = |n: &str| bad.iter().find(|c| c.name == n).expect("present");
-        assert!(!bad_by("QuotedBool").hidden, "a quoted bool is not a bool");
+        assert!(
+            !bad_by("QuotedBool").hidden(),
+            "a quoted bool is not a bool"
+        );
         assert_eq!(
             bad_by("QuotedBool").unsupported_keys,
             vec!["presentation.hidden"],
@@ -1453,12 +1595,117 @@ mod tests {
             "a non-object presentation refuses under its own name"
         );
 
-        assert!(by("Both").hidden, "Both asks to be hidden");
-        assert_eq!(
-            by("Both").unsupported_keys,
-            vec!["presentation.order"],
-            "and is still refused for the half croft cannot do"
+        assert!(by("Both").hidden(), "Both asks to be hidden");
+        assert!(
+            by("Both").unsupported_keys.is_empty(),
+            "and both halves are honoured now, so nothing refuses: {:?}",
+            by("Both").unsupported_keys
         );
+    }
+
+    /// #318: the picker's order is VS Code's `getVisibleAndSorted`, which is a
+    /// transcription and not a guess. Each arm below is a rule croft would
+    /// plausibly have got wrong on its own.
+    #[test]
+    fn presentation_sorts_the_picker_the_way_vs_code_does() {
+        fn p(group: Option<&str>, order: Option<i64>) -> Option<Presentation> {
+            Some(Presentation {
+                hidden: false,
+                group: group.map(str::to_string),
+                order,
+            })
+        }
+        let items: Vec<(&str, Option<Presentation>)> = vec![
+            ("plain-first", None),
+            ("b-group", p(Some("b"), None)),
+            ("no-group-ord-2", p(None, Some(2))),
+            (
+                "hidden",
+                Some(Presentation {
+                    hidden: true,
+                    group: None,
+                    order: None,
+                }),
+            ),
+            ("a-group-ord-9", p(Some("a"), Some(9))),
+            ("plain-second", None),
+            ("a-group-ord-1", p(Some("a"), Some(1))),
+            ("a-group-no-ord", p(Some("a"), None)),
+            ("no-group-ord-1", p(None, Some(1))),
+        ];
+        let sorted: Vec<&str> = visible_and_sorted(items, |(_, p)| p.as_ref())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            sorted,
+            vec![
+                // grouped first, groups by name, order ascending within one,
+                // and a missing order last inside its group
+                "a-group-ord-1",
+                "a-group-ord-9",
+                "a-group-no-ord",
+                "b-group",
+                // a presentation WITHOUT a group still beats no presentation
+                "no-group-ord-1",
+                "no-group-ord-2",
+                // and entries that asked for nothing keep their file order
+                "plain-first",
+                "plain-second",
+            ],
+            "hidden is dropped, and every other rule is VS Code's"
+        );
+    }
+
+    /// The property that must not break: a launch.json that says nothing
+    /// about presentation is left exactly as written.
+    #[test]
+    fn a_workspace_with_no_presentation_keeps_its_file_order() {
+        let items: Vec<(&str, Option<Presentation>)> = vec![("z", None), ("a", None), ("m", None)];
+        let sorted: Vec<&str> = visible_and_sorted(items, |(_, p)| p.as_ref())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            sorted,
+            vec!["z", "a", "m"],
+            "sorting must be stable, or introducing the feature would silently \
+             reorder every existing workspace's picker"
+        );
+    }
+
+    /// A configuration carries `presentation` too, and sorts against
+    /// compounds in one list - VS Code puts both kinds through the same
+    /// comparator, so a config and a compound naming one group belong
+    /// together.
+    #[test]
+    fn a_configuration_reads_presentation_like_a_compound_does() {
+        let cfgs = parse_launch_json(
+            r#"{ "configurations": [
+                { "name": "Plain", "type": "node", "program": "a.js" },
+                { "name": "Grouped", "type": "node", "program": "b.js",
+                  "presentation": { "group": "servers", "order": 3 } },
+                { "name": "Hid", "type": "node", "program": "c.js",
+                  "presentation": { "hidden": true } }
+            ] }"#,
+            ".vscode/launch.json",
+        );
+        let by = |n: &str| {
+            cfgs.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} parsed"))
+                .clone()
+        };
+        assert_eq!(by("Plain").presentation, None, "no block asks for nothing");
+        assert_eq!(
+            by("Grouped").presentation,
+            Some(Presentation {
+                hidden: false,
+                group: Some(String::from("servers")),
+                order: Some(3),
+            })
+        );
+        assert!(by("Hid").presentation.is_some_and(|p| p.hidden));
     }
 
     /// A compound resolves to its members in the order written, so the picker

@@ -39148,7 +39148,8 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         ],
         "compounds": [
             { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" },
-            { "name": "Presented", "configurations": ["Server"], "presentation": { "order": 2 } }
+            { "name": "Presented", "configurations": ["Server"],
+              "presentation": { "hidden": "true" } }
         ]}"#,
     )
     .unwrap();
@@ -39191,11 +39192,11 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
     );
 
     // The guard that must stay GREEN: honouring one key must not be
-    // satisfiable by launching everything. `presentation.order` is still
-    // unhonoured, so a compound asking for it is still refused, and the
-    // refusal must name THAT key rather than one croft now runs -- and
-    // `hidden` is one of those now (#318), which is why the fixture uses
-    // `order` and the assertion below rejects the parent name.
+    // satisfiable by launching everything. Since #318 finished, `hidden`,
+    // `group` and `order` are all honoured, so the only shapes left to carry
+    // this guard are the MALFORMED ones. `{"hidden": "true"}` is the likely
+    // typo: a quoted bool croft cannot read, which must refuse rather than
+    // launch unhidden in silence.
     let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
     select(&mut fresh, "Presented");
     assert!(
@@ -39204,22 +39205,21 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         fresh.run_debug.feedback
     );
     // The message names the SUB-KEY, not `presentation` (#318). That is the
-    // point of the split: `hidden` is honoured now, so telling a user that
-    // "presentation" is unsupported would be wrong for half the key and
-    // would send them deleting a line that works.
+    // point of the split: a compound may declare a working `group` beside a
+    // malformed `hidden`, so telling the user that "presentation" is
+    // unsupported would send them deleting a line that works.
     assert!(
-        fresh.status.contains("presentation.order"),
-        "and names the key it cannot honour: {}",
+        fresh.status.contains("presentation.hidden"),
+        "and names the key it cannot read: {}",
         fresh.status
     );
-    // The BARE parent would overstate it -- `hidden` is honoured, so "sets
-    // presentation" would send a user deleting a line that works. The
-    // qualified path is what they can find in the file, so the check is
-    // that `presentation` never appears WITHOUT its sub-key.
+    // The BARE parent would overstate it, for the same reason. The qualified
+    // path is what they can find in the file, so the check is that
+    // `presentation` never appears WITHOUT its sub-key.
     assert!(
         !fresh
             .status
-            .replace("presentation.order", "")
+            .replace("presentation.hidden", "")
             .contains("presentation"),
         "the parent is named only as part of the qualified path: {}",
         fresh.status

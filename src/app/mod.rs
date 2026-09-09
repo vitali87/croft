@@ -20126,10 +20126,16 @@ impl App {
         // only entry is hidden advertises "1 debug entry" over a picker that
         // offers nothing. Same filter as `open_debug_config_picker`.
         let root = self.active_workspace_root();
-        self.run_debug.config_count = crate::dap::configs::discover_configs(&root).len()
+        // The same filter the picker applies, so the badge and the picker
+        // cannot disagree: a `presentation.hidden` entry of EITHER kind is
+        // absent from both (#318).
+        self.run_debug.config_count = crate::dap::configs::discover_configs(&root)
+            .iter()
+            .filter(|c| !c.hidden())
+            .count()
             + crate::dap::configs::discover_compounds(&root)
                 .iter()
-                .filter(|c| !c.hidden)
+                .filter(|c| !c.hidden())
                 .count();
         self.run_debug.selected_config = self.selected_debug_config.clone();
     }
@@ -20740,30 +20746,53 @@ impl App {
             id: String::from("active"),
             label: String::from("Debug active file — no configuration"),
         }];
-        rows.extend(self.debug_configs.iter().enumerate().map(|(i, c)| ListRow {
-            id: i.to_string(),
-            label: format!("{} — {} · {}", c.name, c.type_name, c.source),
-        }));
-        // Compounds are listed so a workspace's own launch.json is reflected
-        // honestly. Selecting one LAUNCHES it when it names a single
-        // configuration and carries no key croft cannot honour; otherwise it
-        // reports what is missing (#310) rather than launching a subset, which
-        // would debug something other than what was asked for.
+        // Configurations and compounds are ONE list to sort, which is what
+        // VS Code does: a config and a compound can name the same
+        // `presentation.group`, and sorting them separately would split that
+        // group in two no matter what the file asked for (#318).
+        //
+        // Every id is built BEFORE the sort, from `enumerate` over the full
+        // unsorted list, so `compound:{i}` and `{i}` keep naming the same
+        // entries however the rows move. Indexing the sorted sequence would
+        // launch a different configuration than the row says as soon as any
+        // entry declares a `presentation`.
+        let entries: Vec<(ListRow, Option<crate::dap::configs::Presentation>)> = self
+            .debug_configs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (
+                    ListRow {
+                        id: i.to_string(),
+                        label: format!("{} — {} · {}", c.name, c.type_name, c.source),
+                    },
+                    c.presentation.clone(),
+                )
+            })
+            // Compounds are listed so a workspace's own launch.json is
+            // reflected honestly. Selecting one LAUNCHES it when it names a
+            // single configuration and carries no key croft cannot honour;
+            // otherwise it reports what is missing (#310) rather than
+            // launching a subset, which would debug something other than what
+            // was asked for.
+            .chain(self.debug_compounds.iter().enumerate().map(|(i, c)| {
+                (
+                    ListRow {
+                        id: format!("compound:{i}"),
+                        label: format!(
+                            "{} — compound of {}",
+                            c.name,
+                            c.configurations.join(", ")
+                        ),
+                    },
+                    c.presentation.clone(),
+                )
+            }))
+            .collect();
         rows.extend(
-            self.debug_compounds
-                .iter()
-                .enumerate()
-                // `presentation.hidden` asks not to be listed (#318). The
-                // index still comes from `enumerate` over the FULL list, so
-                // `compound:{i}` keeps naming the same compound whether or
-                // not earlier rows were filtered -- indexing the filtered
-                // sequence would launch a different compound than the row
-                // says as soon as one is hidden.
-                .filter(|(_, c)| !c.hidden)
-                .map(|(i, c)| ListRow {
-                    id: format!("compound:{i}"),
-                    label: format!("{} — compound of {}", c.name, c.configurations.join(", ")),
-                }),
+            crate::dap::configs::visible_and_sorted(entries, |(_, p)| p.as_ref())
+                .into_iter()
+                .map(|(row, _)| row),
         );
         self.open_list_picker(
             ListPicker::new(ListPurpose::DebugConfig, "Debug Configuration", rows),
@@ -24325,12 +24354,16 @@ impl App {
                             Err(e) => self.debug_error(e),
                             // A one-member compound carrying keys croft does
                             // not honour is REFUSED rather than launched.
-                            // Since #318 that is `presentation` alone: the
-                            // compound's own `preLaunchTask` is run by the
-                            // branch below. Launching while ignoring what the
-                            // compound asked for is the "silently debug
-                            // something other than what was asked for" outcome
-                            // every guard here exists to prevent.
+                            // Since #318 completed, only MALFORMED shapes
+                            // remain: a `presentation` that is not an object,
+                            // or a `hidden` that is not a bool. Every key that
+                            // says something croft can act on is honoured -
+                            // `preLaunchTask` by the branch below, `hidden`,
+                            // `group` and `order` by the picker's sort.
+                            // Launching while ignoring what the compound asked
+                            // for is the "silently debug something other than
+                            // what was asked for" outcome every guard here
+                            // exists to prevent.
                             Ok(members)
                                 if members.len() == 1
                                     && !compound.unsupported_keys.is_empty() =>
@@ -24353,13 +24386,12 @@ impl App {
                                     "that key"
                                 };
                                 self.debug_error(format!(
-                                    "compound \"{}\" sets {}, which croft does not honour yet (#318) — remove {} to launch \"{}\" through the compound, or run \"{}\" directly and do the work {} asks for yourself",
+                                    "compound \"{}\" sets {}, which croft cannot read — fix {} to launch \"{}\" through the compound, or run \"{}\" directly",
                                     compound.name,
                                     keys,
                                     plural,
                                     members[0].name,
-                                    members[0].name,
-                                    plural
+                                    members[0].name
                                 ));
                             }
                             Ok(members) if members.len() == 1 => {

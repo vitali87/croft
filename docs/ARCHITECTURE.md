@@ -1116,6 +1116,16 @@ A per-agent ledger of the files an agent changed while you were looking elsewher
 
 **Concurrent writes are attributed, not guessed.** A write while two agents work is attributed to BOTH and flagged `shared`. A write with no agent working belongs to the user and never enters a lane.
 
+### dap/configs.rs
+
+Reads `launch.json` (`.croft` over `.vscode`), both its `configurations` and its `compounds`, and resolves a chosen entry into a DAP request.
+
+**`presentation` is honoured for configurations AND compounds, in one sorted list.** VS Code puts both kinds through the same comparator, so a config and a compound naming the same `presentation.group` belong together; sorting the two kinds separately would split that group no matter what the file asked for. `visible_and_sorted` is transcribed from VS Code's `getVisibleAndSorted` rather than invented, because each of its rules is one croft would otherwise get subtly wrong: an entry that HAS a `presentation` sorts ahead of one that has none, a grouped entry ahead of an ungrouped one, groups by name rather than first-seen, and a numeric `order` ahead of a missing one. The sort is stable, which is what leaves a workspace declaring no `presentation` in exactly its file order. One divergence, deliberate: VS Code compares group names with locale-aware `localeCompare` where croft compares bytewise, which agrees on ASCII and would otherwise cost a collation dependency for a picker's ordering.
+
+**Row ids are built before the sort.** `compound:{i}` and `{i}` index the UNSORTED lists, so a row keeps naming the same entry however the sort moves it; indexing the sorted sequence would launch a different configuration than the row says as soon as one entry declares a `presentation`.
+
+**A one-member compound refuses only what croft cannot READ.** `preLaunchTask`, `hidden`, `group` and `order` are all honoured; what remains in `unsupported_keys` is malformed shapes — a `presentation` that is not an object, a `hidden` that is not a bool. Those keep refusing because `{"hidden": "true"}` is a typo, and launching it unhidden with no signal is worse than the refusal. `stopAll` is absent at either value: it decides whether ending one session ends the others, which is meaningless for the single session a one-member compound launches (#310 owns the rest).
+
 ### dap/reaper.rs
 
 Sweeps orphaned vscode-js-debug processes left behind when croft crashes or force-quits without running `Drop` — both the server and its detached watchdog, which setsids into its own session and so survives a group-kill. It runs async at startup and after each session teardown.
