@@ -622,6 +622,10 @@ enum Cmd {
     SetExtraRoots {
         roots: Vec<PathBuf>,
     },
+    /// Pull whole-project diagnostics from every server that advertises
+    /// `workspaceDiagnostics` (#533). Carries nothing: the previous result
+    /// ids live with the client they were issued by.
+    RequestWorkspaceDiagnostics,
     RequestSemanticTokens {
         path: PathBuf,
         seq: u64,
@@ -867,6 +871,7 @@ pub struct LspManager {
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
     inlay_refresh: Arc<AtomicBool>,
+    diagnostic_refresh: Arc<AtomicBool>,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -923,6 +928,7 @@ impl LspManager {
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
         let semantic_refresh = Arc::new(AtomicBool::new(false));
         let inlay_refresh = Arc::new(AtomicBool::new(false));
+        let diagnostic_refresh = Arc::new(AtomicBool::new(false));
         let root = workspace_root.clone();
         // Load user-installed extensions (`~/.config/croft/extensions`) and merge
         // them with the bundled ones. The language table must be initialised
@@ -976,6 +982,7 @@ impl LspManager {
             capability_support.clone(),
             semantic_refresh.clone(),
             inlay_refresh.clone(),
+            diagnostic_refresh.clone(),
         ));
         Ok(Self {
             semantic_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1010,6 +1017,7 @@ impl LspManager {
             capability_support,
             semantic_refresh,
             inlay_refresh,
+            diagnostic_refresh,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -1258,6 +1266,26 @@ impl LspManager {
     /// app re-requests tokens for the visible editor(s) when this is true.
     pub fn take_semantic_refresh(&self) -> bool {
         self.semantic_refresh.swap(false, Ordering::Relaxed)
+    }
+
+    /// Returns and clears the "a server asked us to re-pull workspace
+    /// diagnostics" flag, set by any client that received
+    /// `workspace/diagnostic/refresh` (#533). Mirrors
+    /// [`take_semantic_refresh`](Self::take_semantic_refresh).
+    pub fn take_diagnostic_refresh(&self) -> bool {
+        self.diagnostic_refresh.swap(false, Ordering::Relaxed)
+    }
+
+    /// Pull whole-project diagnostics (LSP 3.17 `workspace/diagnostic`) from
+    /// every spawned server that advertises `workspaceDiagnostics` (#533).
+    ///
+    /// Fire-and-forget: reports land in [`drain_diagnostics`] as ordinary
+    /// per-file batches, keyed by the same server name the PUSH path uses, so
+    /// PROBLEMS shows a file no editor has open without a manual command.
+    /// A no-op when no server advertises the capability - the request is
+    /// never sent, so a server that pulls per document only is untouched.
+    pub fn request_workspace_diagnostics(&self) {
+        let _ = self.cmd_tx.send(Cmd::RequestWorkspaceDiagnostics);
     }
 
     pub fn request_definition(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -1741,6 +1769,15 @@ struct ManagedClient {
     /// not to warn - a forced non-test rebuild under `-D warnings` with no
     /// `allow` is clean, because the field is written in a real constructor.
     supports_workspace_diagnostics: bool,
+    /// The server's own `diagnosticProvider.identifier`, echoed back on every
+    /// pull (#533). A server that registered more than one diagnostic source
+    /// uses it to tell which one a previous result id belongs to, so sending
+    /// `None` where it published an identifier throws its incrementality away.
+    diagnostic_identifier: Option<String>,
+    /// Result ids from this server's last pull (#533), behind the same async
+    /// mutex the client is: a pull runs off the worker loop, so the cache has
+    /// to outlive the borrow that started it.
+    diagnostic_result_ids: Arc<TokioMutex<DiagnosticResultIds>>,
     supports_hover: bool,
     supports_definition: bool,
     supports_document_symbol: bool,
@@ -1805,6 +1842,9 @@ struct WorkerState {
     semantic_refresh: Arc<AtomicBool>,
     // Same contract for `workspace/inlayHint/refresh`.
     inlay_refresh: Arc<AtomicBool>,
+    // Same contract for `workspace/diagnostic/refresh` (#533); the app polls
+    // it and asks for a fresh workspace pull.
+    diagnostic_refresh: Arc<AtomicBool>,
     // Cloned into every spawned client's router so the server-pushed
     // `textDocument/publishDiagnostics` notifications reach the app.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
@@ -1851,6 +1891,12 @@ struct ResultSenders {
     progress: std_mpsc::Sender<ProgressUpdate>,
 }
 
+// Every flag and channel here is an independent worker input, the same shape
+// `LspClient::spawn` carries: bundling them behind one struct would add a
+// layer of indirection without making any call site clearer. `ResultSenders`
+// already bundles the part that grows per REQUEST KIND; these do not grow
+// that way.
+#[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     workspace_root: PathBuf,
     registry: ServerRegistry,
@@ -1859,6 +1905,7 @@ async fn worker_loop(
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
     inlay_refresh: Arc<AtomicBool>,
+    diagnostic_refresh: Arc<AtomicBool>,
 ) {
     let mut state = WorkerState {
         workspace_root,
@@ -1869,6 +1916,7 @@ async fn worker_loop(
         capability_support,
         semantic_refresh,
         inlay_refresh,
+        diagnostic_refresh,
         diagnostics_tx: tx.diagnostics.clone(),
         progress_tx: tx.progress.clone(),
     };
@@ -1928,6 +1976,7 @@ async fn worker_loop(
                 }
                 state.extra_roots = roots;
             }
+            Cmd::RequestWorkspaceDiagnostics => state.request_workspace_diagnostics(),
             Cmd::RequestSemanticTokens {
                 path,
                 seq,
@@ -2309,6 +2358,7 @@ impl WorkerState {
                     let caps = build_client_capabilities();
                     let refresh = self.semantic_refresh.clone();
                     let inlay_refresh = self.inlay_refresh.clone();
+                    let diagnostic_refresh = self.diagnostic_refresh.clone();
                     let diagnostics = self.diagnostics_tx.clone();
                     let progress = self.progress_tx.clone();
                     async move {
@@ -2319,6 +2369,7 @@ impl WorkerState {
                             &extra_path,
                             refresh,
                             inlay_refresh,
+                            diagnostic_refresh,
                             diagnostics,
                             progress,
                         )
@@ -2343,6 +2394,8 @@ impl WorkerState {
                             signature_help_supported(&caps.signature_help_provider);
                         let supports_workspace_diagnostics =
                             workspace_diagnostics_supported(&caps.diagnostic_provider);
+                        let diagnostic_identifier =
+                            diagnostic_identifier_of(&caps.diagnostic_provider);
                         let supports_hover = hover_supported(&caps.hover_provider);
                         let supports_definition = one_of_supported(&caps.definition_provider);
                         let supports_document_symbol =
@@ -2400,6 +2453,10 @@ impl WorkerState {
                             supports_completion: supports,
                             supports_signature_help,
                             supports_workspace_diagnostics,
+                            diagnostic_identifier,
+                            diagnostic_result_ids: Arc::new(TokioMutex::new(
+                                DiagnosticResultIds::default(),
+                            )),
                             supports_hover,
                             supports_definition,
                             supports_document_symbol,
@@ -2467,6 +2524,16 @@ impl WorkerState {
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
             }
+            // The first pull (#533). A server that answers workspace
+            // diagnostics reports on files no editor has opened, and firing
+            // here is what puts them in PROBLEMS without a manual command -
+            // there is no other moment that covers a workspace whose files
+            // are all still closed. Servers that do not advertise it drop out
+            // in `workspace_pull_targets`, so this stays silent for them.
+            spawn_workspace_pull(
+                workspace_pull_targets(spawned.iter()),
+                self.diagnostics_tx.clone(),
+            );
             self.clients.insert(key.clone(), spawned);
         }
         self.clients.get(&key).map(Vec::as_slice).unwrap_or(&[])
@@ -3617,6 +3684,16 @@ impl WorkerState {
                 unsupported: false,
             });
         });
+    }
+
+    /// Pull whole-project diagnostics from every spawned server that
+    /// advertises `workspaceDiagnostics` (#533). Fire-and-forget: the reports
+    /// land on the diagnostics channel the push path already feeds.
+    fn request_workspace_diagnostics(&self) {
+        spawn_workspace_pull(
+            workspace_pull_targets(self.clients.values().flatten()),
+            self.diagnostics_tx.clone(),
+        );
     }
 
     /// `workspace/symbol`: fan the query out to every running server that
@@ -5072,6 +5149,162 @@ impl DiagnosticResultIds {
     }
 }
 
+/// One server's share of a workspace pull (#533), gathered off the client
+/// list so the request itself can run without holding the worker loop.
+struct WorkspacePull {
+    name: String,
+    client: Arc<TokioMutex<LspClient>>,
+    identifier: Option<String>,
+    result_ids: Arc<TokioMutex<DiagnosticResultIds>>,
+}
+
+/// The servers among `clients` that answer `workspace/diagnostic` (#533).
+///
+/// The filter is the whole "a server that does not advertise it is untouched"
+/// guarantee: a server that pulls per document but not per workspace answers
+/// `-32601 Unhandled method`, so it must never be asked.
+fn workspace_pull_targets<'a>(
+    clients: impl Iterator<Item = &'a ManagedClient>,
+) -> Vec<WorkspacePull> {
+    clients
+        .filter(|c| c.supports_workspace_diagnostics)
+        .map(|c| WorkspacePull {
+            name: c.name.clone(),
+            client: c.client.clone(),
+            identifier: c.diagnostic_identifier.clone(),
+            result_ids: c.diagnostic_result_ids.clone(),
+        })
+        .collect()
+}
+
+/// Run a workspace pull against each target off the worker loop (#533).
+///
+/// Sequential per server, like `request_workspace_symbols`: each pull locks
+/// that client, and a whole-project analysis is the kind of request a server
+/// answers slowly, so the loop must not be holding the worker while it does.
+fn spawn_workspace_pull(targets: Vec<WorkspacePull>, tx: std_mpsc::Sender<DiagnosticsUpdate>) {
+    if targets.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for target in targets {
+            // The client lock is taken FIRST and held until the answer is
+            // recorded, so a server's pulls serialise end to end. Snapshotting
+            // the ids before it let two overlapping pulls (the spawn one and a
+            // refresh) take the SAME `previous` set: the second then sends ids
+            // the first had already replaced, and its older report could land
+            // after the newer one and win, since the app's store is
+            // last-write-wins per (file, server).
+            let mut client = target.client.lock().await;
+            let previous = target.result_ids.lock().await.previous();
+            log_file::log(&format!(
+                "lsp[{}] workspace/diagnostic pull, {} previous result id(s)",
+                target.name,
+                previous.len()
+            ));
+            let resp = client
+                .workspace_diagnostics(target.identifier.clone(), previous)
+                .await;
+            match resp {
+                Ok(result) => {
+                    let mut ids = target.result_ids.lock().await;
+                    let forwarded = apply_workspace_report(&target.name, result, &mut ids, &tx);
+                    log_file::log(&format!(
+                        "lsp[{}] workspace/diagnostic: {forwarded} file(s) reported, {} id(s) cached",
+                        target.name,
+                        ids.len()
+                    ));
+                }
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{}] workspace/diagnostic error: {e:#}",
+                        target.name
+                    ));
+                }
+            }
+            drop(client);
+        }
+    });
+}
+
+/// Fold one server's `workspace/diagnostic` answer into its result-id cache
+/// and the app-facing diagnostics stream, returning how many files it
+/// reported on (#533).
+///
+/// The reports go out on the same channel and under the same server name as
+/// the PUSH path, so PROBLEMS needs no third producer: the app already stores
+/// diagnostics per (file, server) and replaces a server's set wholesale. What
+/// a pull adds is files no editor has open, which that store already carries
+/// and `rebuild_problems` already walks.
+fn apply_workspace_report(
+    server: &str,
+    result: lsp_types::WorkspaceDiagnosticReportResult,
+    ids: &mut DiagnosticResultIds,
+    tx: &std_mpsc::Sender<DiagnosticsUpdate>,
+) -> usize {
+    let items = match result {
+        lsp_types::WorkspaceDiagnosticReportResult::Report(r) => r.items,
+        lsp_types::WorkspaceDiagnosticReportResult::Partial(p) => p.items,
+    };
+    let mut forwarded = 0;
+    for item in items {
+        match item {
+            // Unchanged is what `previousResultIds` bought: the server is
+            // saying the id we sent still describes the file, so there is
+            // nothing to re-process. Its reissued id still has to be recorded
+            // - the server may rotate it on every answer.
+            lsp_types::WorkspaceDocumentDiagnosticReport::Unchanged(u) => {
+                ids.record(
+                    u.uri.as_str(),
+                    Some(u.unchanged_document_diagnostic_report.result_id.as_str()),
+                );
+            }
+            lsp_types::WorkspaceDocumentDiagnosticReport::Full(f) => {
+                let report = f.full_document_diagnostic_report;
+                ids.record(f.uri.as_str(), report.result_id.as_deref());
+                // A URI that is not a file (a virtual or untitled document)
+                // has no row to show and no editor to paint.
+                let Ok(path) = f.uri.to_file_path() else {
+                    continue;
+                };
+                let diagnostics = report
+                    .items
+                    .iter()
+                    .map(crate::lsp::client::convert_diagnostic)
+                    .collect();
+                // An EMPTY list is the server saying this file is clear now,
+                // which is how a fixed file loses its rows - the app's store
+                // removes the server's entry on exactly that. Skipping empties
+                // would leave the last report's problems on screen forever.
+                let _ = tx.send(DiagnosticsUpdate {
+                    path,
+                    server: server.to_string(),
+                    diagnostics,
+                });
+                forwarded += 1;
+            }
+        }
+    }
+    forwarded
+}
+
+/// The server's `diagnosticProvider.identifier`, echoed back on every pull.
+///
+/// A server that registered several diagnostic sources uses it to tell which
+/// source a previous result id belongs to, so sending `None` where it
+/// published an identifier throws its incrementality away. Read from both
+/// capability variants for the same reason
+/// [`workspace_diagnostics_supported`] is.
+fn diagnostic_identifier_of(cap: &Option<DiagnosticServerCapabilities>) -> Option<String> {
+    match cap {
+        Some(DiagnosticServerCapabilities::Options(o)) => o.identifier.clone(),
+        Some(DiagnosticServerCapabilities::RegistrationOptions(r)) => {
+            r.diagnostic_options.identifier.clone()
+        }
+        None => None,
+    }
+}
+
 /// Whether the server answers `workspace/diagnostic`, the LSP 3.17 PULL of
 /// whole-project diagnostics (#533).
 ///
@@ -5595,6 +5828,18 @@ fn build_client_capabilities() -> ClientCapabilities {
                 }),
                 ..Default::default()
             }),
+            // LSP 3.17 PULL diagnostics (#533). A conforming server publishes
+            // `diagnosticProvider` only when the client declares this, so
+            // without it `workspace_diagnostics_supported` reads `None` on
+            // every server and the pull path can never engage - a gap that
+            // would read as "no server supports it" rather than "croft never
+            // asked". `relatedDocumentSupport` stays false: croft pulls per
+            // WORKSPACE, so it has no use for a per-document report that
+            // carries other files' diagnostics alongside.
+            diagnostic: Some(lsp_types::DiagnosticClientCapabilities {
+                dynamic_registration: Some(false),
+                related_document_support: Some(false),
+            }),
             ..Default::default()
         }),
         // Advertise that croft can re-pull tokens on a server's request. ty
@@ -5619,6 +5864,14 @@ fn build_client_capabilities() -> ClientCapabilities {
             // `workspace/workspaceFolders` and will send
             // `didChangeWorkspaceFolders` when the set changes.
             workspace_folders: Some(true),
+            // The other half of the pull contract (#533): a server sends
+            // `workspace/diagnostic/refresh` only when the client says it can
+            // handle one. Without it a project-wide change (a config reload, a
+            // dependency resolving) never reaches the pulled set, which then
+            // ages silently until something else forces a re-pull.
+            diagnostic: Some(lsp_types::DiagnosticWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
             ..Default::default()
         }),
         // Declare `window.workDoneProgress` so servers stream `$/progress`
@@ -6056,6 +6309,127 @@ mod tests {
             ws.workspace_folders,
             Some(true),
             "the workspaceFolders capability gates every folder-aware server feature"
+        );
+    }
+
+    #[test]
+    fn a_workspace_pull_forwards_full_reports_and_leaves_unchanged_files_alone() {
+        // The incrementality contract, end to end (#533). A Full report
+        // reaches PROBLEMS and leaves its result id behind; an Unchanged one
+        // is NOT re-processed but still records the id the server reissued;
+        // a Full report with no id forgets the file, so the next pull cannot
+        // send back an id the server never issued for this content.
+        let (tx, rx) = std_mpsc::channel();
+        let mut ids = DiagnosticResultIds::default();
+        let uri = |p: &str| Url::from_file_path(p).expect("an absolute path");
+        let wire = |message: &str| lsp_types::Diagnostic {
+            range: def_range(3, 1),
+            message: message.to_string(),
+            ..Default::default()
+        };
+        let report = lsp_types::WorkspaceDiagnosticReport {
+            items: vec![
+                lsp_types::WorkspaceDocumentDiagnosticReport::Full(
+                    lsp_types::WorkspaceFullDocumentDiagnosticReport {
+                        uri: uri("/ws/broken.toml"),
+                        version: None,
+                        full_document_diagnostic_report: lsp_types::FullDocumentDiagnosticReport {
+                            result_id: Some("id-broken".into()),
+                            items: vec![wire("unexpected key")],
+                        },
+                    },
+                ),
+                lsp_types::WorkspaceDocumentDiagnosticReport::Unchanged(
+                    lsp_types::WorkspaceUnchangedDocumentDiagnosticReport {
+                        uri: uri("/ws/steady.toml"),
+                        version: None,
+                        unchanged_document_diagnostic_report:
+                            lsp_types::UnchangedDocumentDiagnosticReport {
+                                result_id: "id-steady".into(),
+                            },
+                    },
+                ),
+                lsp_types::WorkspaceDocumentDiagnosticReport::Full(
+                    lsp_types::WorkspaceFullDocumentDiagnosticReport {
+                        uri: uri("/ws/fixed.toml"),
+                        version: None,
+                        full_document_diagnostic_report: lsp_types::FullDocumentDiagnosticReport {
+                            result_id: None,
+                            items: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+        };
+        let forwarded = apply_workspace_report("taplo", report.into(), &mut ids, &tx);
+        assert_eq!(forwarded, 2, "both Full reports are the server's new word");
+
+        let sent: Vec<DiagnosticsUpdate> = rx.try_iter().collect();
+        let paths: Vec<&Path> = sent.iter().map(|u| u.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            vec![Path::new("/ws/broken.toml"), Path::new("/ws/fixed.toml")],
+            "the Unchanged file must not be re-processed, and the CLEARED file must be: \
+             an empty batch is how the app drops a fixed file's rows"
+        );
+        assert_eq!(sent[0].server, "taplo");
+        assert_eq!(sent[0].diagnostics.len(), 1);
+        assert!(sent[1].diagnostics.is_empty());
+
+        let mut previous: Vec<(String, String)> = ids
+            .previous()
+            .into_iter()
+            .map(|p| (p.uri.to_string(), p.value))
+            .collect();
+        previous.sort();
+        assert_eq!(
+            previous,
+            vec![
+                (
+                    "file:///ws/broken.toml".to_string(),
+                    "id-broken".to_string()
+                ),
+                (
+                    "file:///ws/steady.toml".to_string(),
+                    "id-steady".to_string()
+                ),
+            ],
+            "the id-less report must leave nothing behind for /ws/fixed.toml"
+        );
+    }
+
+    #[test]
+    fn client_capabilities_advertise_pull_diagnostics() {
+        // The gate the whole of #533 stands on. Per LSP 3.17 a server
+        // publishes `diagnosticProvider` only when the client declares
+        // `textDocument.diagnostic`; without it a conforming server never
+        // advertises the capability, so `workspace_diagnostics_supported`
+        // reads `None` on every server and the pull path can never engage.
+        // The detection landed first (#536), where the gap would have looked
+        // like "no server supports it" rather than "we never asked".
+        let caps = build_client_capabilities();
+        let td = caps
+            .text_document
+            .as_ref()
+            .expect("text document capabilities must be set");
+        assert!(
+            td.diagnostic.is_some(),
+            "textDocument.diagnostic gates the server advertising diagnosticProvider at all"
+        );
+        // And the refresh half: a server sends `workspace/diagnostic/refresh`
+        // only when the client says it can handle one, so without this the
+        // re-pull after a project-wide change never arrives.
+        let ws = caps
+            .workspace
+            .as_ref()
+            .expect("workspace capabilities must be set");
+        assert_eq!(
+            ws.diagnostic
+                .as_ref()
+                .expect("workspace.diagnostic must be declared")
+                .refresh_support,
+            Some(true),
+            "refreshSupport is what lets a server ask for a re-pull"
         );
     }
 
@@ -7051,6 +7425,7 @@ mod tests {
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -7111,6 +7486,7 @@ mod tests {
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -7145,6 +7521,7 @@ mod tests {
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -7239,6 +7616,7 @@ mod tests {
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -7315,6 +7693,7 @@ mod tests {
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -7381,6 +7760,7 @@ mod tests {
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -7489,6 +7869,7 @@ while True:
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -7606,6 +7987,7 @@ while True:
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -7785,6 +8167,7 @@ while True:
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8028,6 +8411,7 @@ while True:
             capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
