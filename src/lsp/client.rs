@@ -1732,31 +1732,48 @@ mod tests {
         std::thread::sleep(crate::test_budget::spawn_budget(
             std::time::Duration::from_millis(200),
         ));
-        let exited = match child.try_wait() {
+        let probed = child.try_wait();
+        // Kill and reap on EVERY path, including the unexpected one: unwinding
+        // straight out of the match left the server running for the rest of
+        // the test binary.
+        let _ = child.kill();
+        let _ = child.wait();
+        let exited = match probed {
             Ok(None) => None,
             Ok(Some(status)) => Some(status),
             // Not an answer to the question asked, so it must not spend the
             // skip exit - that is the #545 shape all over again.
             Err(e) => panic!("try_wait on {}: {e}", config.command),
         };
-        let _ = child.kill();
-        let _ = child.wait();
-        match exited {
-            None => Ok(()),
-            Some(status) => {
-                let mut said = String::new();
-                if let Some(mut err) = child.stderr.take() {
+        let Some(status) = exited else {
+            return Ok(());
+        };
+        Err(match child.stderr.take() {
+            // Read on a thread with a deadline. A pipe reaches EOF only when
+            // EVERY write end closes, not when the direct child exits, so a
+            // launcher that forks and exits leaves its grandchild holding this
+            // one - and a plain `read_to_string` there hangs forever inside a
+            // test the CI workflow puts no `timeout-minutes` on. No configured
+            // server forks today; the helper is generic over `ServerConfig`.
+            Some(mut err) => {
+                let (tx, rx) = std_mpsc::channel();
+                std::thread::spawn(move || {
                     use std::io::Read;
+                    let mut said = String::new();
                     let _ = err.read_to_string(&mut said);
+                    let _ = tx.send(said);
+                });
+                match rx.recv_timeout(crate::test_budget::spawn_budget(
+                    std::time::Duration::from_millis(200),
+                )) {
+                    Ok(said) if !said.trim().is_empty() => {
+                        format!("exited {status} before the handshake: {}", said.trim())
+                    }
+                    _ => format!("exited {status} before the handshake"),
                 }
-                let said = said.trim();
-                Err(if said.is_empty() {
-                    format!("exited {status} before the handshake")
-                } else {
-                    format!("exited {status} before the handshake: {said}")
-                })
             }
-        }
+            None => format!("exited {status} before the handshake"),
+        })
     }
 
     #[test]
@@ -1802,7 +1819,17 @@ mod tests {
         let mut stub = ServerConfig::ruff();
         stub.name = "stub";
         stub.command = "sh".into();
-        stub.args = vec!["-c".into(), "sleep 5".into()];
+        // Derived, not a constant: the stub has to outlive the PROBE to reach
+        // the handshake at all. Hard-coding seconds couples this test to
+        // `spawn_budget`'s scaling factors, and raising either one silently
+        // turns the failure into "did not panic" - a message about the wrong
+        // thing entirely.
+        let outlives_the_probe =
+            crate::test_budget::spawn_budget(std::time::Duration::from_millis(200)) * 3;
+        stub.args = vec![
+            "-c".into(),
+            format!("sleep {}", outlives_the_probe.as_secs_f32().ceil()),
+        ];
         run_initialize_shutdown(stub);
     }
 
