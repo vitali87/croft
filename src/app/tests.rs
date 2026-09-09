@@ -35938,19 +35938,17 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
         .unwrap();
     app.list_picker.as_mut().unwrap().selected = idx;
     app.confirm_list_picker();
+    // The old refusal ALSO named the compound and set feedback, so neither
+    // of those separates it from a launch. Only the launch path says this.
     assert!(
-        !app.status.contains("#310"),
-        "the multi-session limit is gone, so the message must not cite it: {}",
+        app.status.contains("started no sessions") || app.status.starts_with("Debugging compound"),
+        "the compound went down the launch path rather than being refused: {}",
         app.status
     );
-    // The adapters are not installed in a test environment, so the launches
-    // fail; what this pins is that the COMPOUND path was taken for every
-    // member rather than the refusal, and the message names the compound.
     assert!(
-        app.status.contains("Full Stack") || app.run_debug.feedback.is_some(),
-        "the compound is named in what the user is told: {} / {:?}",
-        app.status,
-        app.run_debug.feedback
+        !app.status.contains("#310"),
+        "and does not cite a limit that is gone: {}",
+        app.status
     );
 
     // A compound naming a configuration no launch.json declares is a config
@@ -39073,9 +39071,19 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         .expect("the two-member compound is listed");
     app.list_picker.as_mut().unwrap().selected = multi;
     app.confirm_list_picker();
+    // Asserting the ABSENCE of the old message proves nothing - any refusal
+    // omits it, and so does an empty status. Pin the branch by what only the
+    // launch path says. No adapter is installed in a test environment, so
+    // every member fails to start and the compound reports that, which is
+    // still the compound PATH rather than the refusal it replaced.
+    assert!(
+        app.status.contains("started no sessions") || app.status.starts_with("Debugging compound"),
+        "the multi-member compound went down the launch path: {}",
+        app.status
+    );
     assert!(
         !app.status.contains("#310"),
-        "a multi-member compound no longer defers to the session limit: {}",
+        "and no longer defers to the session limit: {}",
         app.status
     );
 

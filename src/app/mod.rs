@@ -1472,10 +1472,29 @@ enum PendingLaunchStep {
     /// (#310). Separate from `Member` because the set has to be started
     /// together - running them through the single-member path would stop each
     /// previous one.
-    Members {
-        members: Vec<crate::dap::configs::DebugConfig>,
-        compound: String,
-    },
+    /// Boxed like its siblings: the doc above says they are boxed so none
+    /// dominates the enum's size, and a list plus a name inline would have
+    /// dominated it six times over.
+    Members(Box<CompoundLaunch>),
+}
+
+/// A compound's members and the name to report them under (#310).
+struct CompoundLaunch {
+    members: Vec<crate::dap::configs::DebugConfig>,
+    compound: String,
+}
+
+/// What became of one compound member (#310).
+#[derive(Clone, Copy, PartialEq)]
+enum MemberOutcome {
+    /// Started, and now in the running set.
+    Launched,
+    /// Not started: it declares a `preLaunchTask` of its own, and croft's
+    /// parking is one-at-a-time, so the task cannot be run as part of a set.
+    /// Launching regardless would debug whatever the last build left behind.
+    TaskUnrun,
+    /// Tried and failed; the reason was already reported against its name.
+    Failed,
 }
 
 /// Whether a launch replaces the running set or joins it (#310).
@@ -20239,12 +20258,39 @@ impl App {
         if self.debug_sessions.is_empty() {
             return false;
         }
-        let events = self
-            .debug_sessions
-            .focused_mut()
-            .map(|s| s.poll())
-            .unwrap_or_default();
-        let mut changed = !events.is_empty();
+        let mut changed_background = false;
+        // EVERY session is polled, not just the focused one (#310). `poll` is
+        // the protocol state machine, not a passive read: it is where
+        // `initialized` triggers the breakpoint push and `configurationDone`,
+        // and where js-debug's reverse requests are answered. An unpolled
+        // member never leaves the gate - its debuggee never runs, its
+        // breakpoints never bind, and a js-debug parent blocks forever on a
+        // reverse request nobody answered. It would be started, named in the
+        // status, and dead.
+        //
+        // Only the FOCUSED session's events drive the UI; a background
+        // member's are drained, and noticed only when they retire it.
+        let focused = self.debug_sessions.focused_index();
+        let mut events = Vec::new();
+        let mut background_ended: Vec<usize> = Vec::new();
+        for (index, session) in self.debug_sessions.iter_mut_indexed() {
+            let drained = session.poll();
+            if index == focused {
+                events = drained;
+                continue;
+            }
+            changed_background |= !drained.is_empty();
+            if drained.iter().any(|e| matches!(e, DapEvent::Terminated)) {
+                background_ended.push(index);
+            }
+        }
+        // Highest index first, so removing one does not move the next.
+        for index in background_ended.into_iter().rev() {
+            if let Some(mut gone) = self.debug_sessions.remove(index) {
+                gone.session.disconnect();
+            }
+        }
+        let mut changed = !events.is_empty() || changed_background;
         for ev in events {
             match ev {
                 // Route program output to the debug console (each embedded
@@ -20350,10 +20396,30 @@ impl App {
                 // only retires its detached watchdog on this handshake, never on
                 // a SIGKILL of the server, so the natural-exit path used to leak
                 // the watchdog by dropping straight to a kill.
-                if let Some(session) = self.debug_sessions.focused_mut() {
-                    session.disconnect();
+                // The session that ENDED, not the whole set (#310). Dropping
+                // the set reaches its siblings as a SIGKILL through the
+                // transport's drop - exactly the kill this handshake exists to
+                // avoid - and would make every compound behave as
+                // `stopAll: true`, which is neither VS Code's default nor what
+                // the file asked for.
+                let ended = self.debug_sessions.focused_index();
+                let ended_name = self
+                    .debug_sessions
+                    .focused_name()
+                    .unwrap_or("the session")
+                    .to_string();
+                if let Some(mut gone) = self.debug_sessions.remove(ended) {
+                    gone.session.disconnect();
                 }
-                self.debug_sessions.clear();
+                if !self.debug_sessions.is_empty() {
+                    // Siblings are still running, so the debugger is not torn
+                    // down: the view moves to one of them.
+                    self.status = format!(
+                        "{ended_name} ended — {} session(s) still running · Shift+F5 stops all",
+                        self.debug_sessions.len()
+                    );
+                    return true;
+                }
                 // The watchdog reparents to init the moment the server dies;
                 // sweep it (and any tree a crashed prior croft left behind)
                 // after a short grace so it has settled into the orphan state.
@@ -20834,7 +20900,7 @@ impl App {
     /// one-at-a-time mechanism, and a compound whose members each park would
     /// interleave unpredictably. Its task is skipped with a status saying so,
     /// which is honest, and #310 is where the general form belongs.
-    fn launch_member_into_set(&mut self, cfg: &crate::dap::configs::DebugConfig) {
+    fn launch_member_into_set(&mut self, cfg: &crate::dap::configs::DebugConfig) -> MemberOutcome {
         let root = self.active_workspace_root();
         let ctx = crate::dap::configs::SubstCtx {
             workspace_folder: root,
@@ -20844,16 +20910,19 @@ impl App {
             Ok(rc) => rc,
             Err(e) => {
                 self.debug_error(format!("config \"{}\": {e}", cfg.name));
-                return;
+                return MemberOutcome::Failed;
             }
         };
         if rc.pre_launch_task.is_some() {
-            self.status = format!(
-                "compound member \"{}\": its own preLaunchTask is skipped — a compound starts its members together",
-                cfg.name
-            );
+            // NOT launched. Running it anyway would debug whatever the last
+            // build left behind, which is exactly what the single-member path
+            // refuses to do for the same hazard - and a status message would
+            // not have helped, since the caller overwrites it before a frame
+            // is drawn. The caller collects the name and says so.
+            return MemberOutcome::TaskUnrun;
         }
         self.launch_resolved_into_set(rc);
+        MemberOutcome::Launched
     }
 
     /// Park a whole compound behind its own `preLaunchTask` (#310).
@@ -20885,7 +20954,7 @@ impl App {
         self.pending_debug_launch = Some(PendingDebugLaunch {
             pane,
             command,
-            step: PendingLaunchStep::Members { members, compound },
+            step: PendingLaunchStep::Members(Box::new(CompoundLaunch { members, compound })),
             started: std::time::Instant::now(),
         });
         self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
@@ -20915,17 +20984,27 @@ impl App {
         self.debug_stop();
         let total = members.len();
         let mut started = 0usize;
+        let mut unrun: Vec<String> = Vec::new();
         for cfg in members {
-            let before = self.debug_sessions.len();
-            self.launch_member_into_set(&cfg);
-            if self.debug_sessions.len() > before {
-                started += 1;
+            match self.launch_member_into_set(&cfg) {
+                MemberOutcome::Launched => started += 1,
+                MemberOutcome::TaskUnrun => unrun.push(cfg.name.clone()),
+                MemberOutcome::Failed => {}
             }
         }
         if started == 0 {
-            // Every member failed; `launch_member_into_set` has already said
-            // why for each, so this only names the compound.
-            self.debug_error(format!("compound \"{compound}\" started no sessions"));
+            // Nothing started. Each member has already said why, so this names
+            // the compound and, if that is the reason, the members croft
+            // declined to launch against a build it could not run.
+            let why = if unrun.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " — {} declares a preLaunchTask croft cannot run as part of a set, and starting it anyway would debug the last build",
+                    unrun.join(", ")
+                )
+            };
+            self.debug_error(format!("compound \"{compound}\" started no sessions{why}"));
             return;
         }
         // The FIRST member takes focus, not the last: a compound is usually
@@ -20939,8 +21018,16 @@ impl App {
         let running = self.debug_sessions.names().join(", ");
         self.run_debug.feedback = Some(if started == total {
             format!("Debugging compound {compound}: {running}")
-        } else {
+        } else if unrun.is_empty() {
             format!("Debugging compound {compound}: {running} ({started} of {total} started)")
+        } else {
+            // Named, not silent: the member is absent because croft would
+            // otherwise debug an unbuilt binary, and the user has to know
+            // which one to run themselves.
+            format!(
+                "Debugging compound {compound}: {running} ({started} of {total}; {} needs its preLaunchTask run first)",
+                unrun.join(", ")
+            )
         });
         self.run_debug.feedback_is_error = started != total;
         let focused = self
@@ -20951,6 +21038,9 @@ impl App {
         self.status = format!(
             "Debugging compound {compound} — {started} session(s), showing {focused} · Shift+F5 stops all"
         );
+        // Once for the compound, not once per member: each member's launch
+        // reveals the view too, and doing it per member clears the console
+        // and re-focuses the pane for every one of them.
         self.reveal_debug_view();
     }
 
@@ -20982,8 +21072,8 @@ impl App {
             // `preLaunchTask`s are skipped, with a status saying so per
             // member - parking is one-at-a-time and a set of parked members
             // would interleave.
-            PendingLaunchStep::Members { members, compound } => {
-                self.launch_compound_members(members, compound)
+            PendingLaunchStep::Members(launch) => {
+                self.launch_compound_members(launch.members, launch.compound)
             }
         }
     }
@@ -21623,7 +21713,11 @@ impl App {
                 .get(&path)
                 .map(|lines| self.editor.source_breakpoints(&path, lines))
                 .unwrap_or_default();
-            if let Some(session) = self.debug_sessions.focused_mut() {
+            // Every session, not the focused one (#310): breakpoints are
+            // global editor state, handed to every session at launch, so a
+            // breakpoint set mid-run in a shared file must bind in all of
+            // them or it binds in the server and not the client.
+            for session in self.debug_sessions.iter_mut() {
                 session.update_breakpoints(&path, &specs);
             }
         }
@@ -21696,7 +21790,8 @@ impl App {
             .get(&path)
             .map(|l| self.editor.source_breakpoints(&path, l))
             .unwrap_or_default();
-        if let Some(session) = self.debug_sessions.focused_mut() {
+        // Every session (#310); see `debug_toggle_breakpoint_line`.
+        for session in self.debug_sessions.iter_mut() {
             session.update_breakpoints(&path, &specs);
         }
     }
@@ -21766,7 +21861,8 @@ impl App {
             .get(&path)
             .map(|l| self.editor.source_breakpoints(&path, l))
             .unwrap_or_default();
-        if let Some(session) = self.debug_sessions.focused_mut() {
+        // Every session (#310); see `debug_toggle_breakpoint_line`.
+        for session in self.debug_sessions.iter_mut() {
             session.update_breakpoints(&path, &specs);
         }
     }
@@ -24549,9 +24645,13 @@ impl App {
                             // for is the "silently debug something other than
                             // what was asked for" outcome every guard here
                             // exists to prevent.
-                            Ok(members)
-                                if members.len() == 1 && !compound.unsupported_keys.is_empty() =>
-                            {
+                            // Asked of BOTH arities (#310). It sat on the
+                            // one-member arm because the other refused anyway;
+                            // now that both launch, a malformed key would be
+                            // refused at one member and ignored at two - the
+                            // "silently debug something other than what was
+                            // asked for" outcome this guard exists to prevent.
+                            Ok(members) if !compound.unsupported_keys.is_empty() => {
                                 // #318, NOT #310: this compound needs ONE
                                 // session, which croft runs. What it cannot do
                                 // is honour the key. Citing the multi-session

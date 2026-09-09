@@ -641,8 +641,17 @@ pub struct NamedSession<S = DapSession> {
     pub session: S,
 }
 
+/// The debug sessions in flight, one of them FOCUSED (#310).
+///
+/// croft was single-session by construction: `Option<DapSession>`, and every
+/// site that touched it meant "the session" because there could only be one.
+/// A compound needs several, so the UI reads the FOCUSED one - call stack,
+/// variables, stepping, status - while the protocol operations mean all of
+/// them: every adapter is polled, every session is stopped, every session
+/// takes a breakpoint.
+///
 /// Generic over the session type ONLY so the set's own rules - which session
-/// is focused after a push, a replace, a clear - can be tested without an
+/// is focused after a push, a replace, a removal - can be tested without an
 /// adapter to talk to. Production always uses the default.
 pub struct DebugSessions<S = DapSession> {
     sessions: Vec<NamedSession<S>>,
@@ -733,6 +742,41 @@ impl<S> DebugSessions<S> {
         self.sessions.iter().map(|s| s.name.clone()).collect()
     }
 
+    /// Take the session at `index` out of the set, clamping the focus.
+    ///
+    /// The caller disconnects it; this only removes it. One member of a
+    /// compound ending must NOT take the others with it - dropping the whole
+    /// set reaches the siblings as a `SIGKILL` through `DapTransport`'s drop,
+    /// which is precisely the graceful handshake js-debug needs to retire its
+    /// detached watchdog (#310).
+    pub fn remove(&mut self, index: usize) -> Option<NamedSession<S>> {
+        if index >= self.sessions.len() {
+            return None;
+        }
+        let gone = self.sessions.remove(index);
+        // Keep the focus on a session that exists, and prefer to stay where
+        // the user was looking: only shift when the one they were watching is
+        // the one that ended, or sat after it.
+        if self.focused > index || self.focused >= self.sessions.len() {
+            self.focused = self.focused.saturating_sub(1);
+        }
+        Some(gone)
+    }
+
+    /// Which session the UI is looking at, by index.
+    pub fn focused_index(&self) -> usize {
+        self.focused
+    }
+
+    /// Every session with its position, for the operations that mean all of
+    /// them but must still tell them apart.
+    pub fn iter_mut_indexed(&mut self) -> impl Iterator<Item = (usize, &mut S)> {
+        self.sessions
+            .iter_mut()
+            .enumerate()
+            .map(|(i, s)| (i, &mut s.session))
+    }
+
     /// Drop every session without disconnecting - the old `= None`.
     pub fn clear(&mut self) {
         self.sessions.clear();
@@ -747,18 +791,6 @@ impl<S> DebugSessions<S> {
 }
 
 /// One running debug session.
-/// The debug sessions in flight, one of them FOCUSED (#310).
-///
-/// croft was single-session by construction: `Option<DapSession>`, and every
-/// one of the ~40 sites that touched it meant "the session" because there
-/// could only be one. A compound launches several, so the model has to become
-/// a set before any of them can run - and the UI has to mean "the session the
-/// user is looking at" rather than "the only one".
-///
-/// This slice is the model alone. It holds at most one session, so behaviour
-/// is unchanged: `focused()` is the old `as_ref()`, `clear()` the old
-/// `= None`. What changes is that the SHAPE now admits more, and every call
-/// site has been made to say which session it means.
 pub struct DapSession {
     transport: DapTransport,
     /// vscode-js-debug child session. js-debug is multi-session: the `transport`
@@ -1372,6 +1404,52 @@ mod session_set_tests {
         // a cleared debugger still paints a call stack.
         set.replace_with("fresh", "x");
         assert_eq!(set.focused_name(), Some("fresh"));
+    }
+
+    /// One member ending must retire THAT member, not the set. Dropping the
+    /// set reaches its siblings as a kill rather than the graceful
+    /// disconnect, and turns every compound into stop-all.
+    #[test]
+    fn removing_one_session_leaves_the_others_and_keeps_the_focus_valid() {
+        let mut set: DebugSessions<&str> = DebugSessions::default();
+        set.replace_with("server", "s");
+        set.push("client", "c");
+        set.push("worker", "w");
+
+        set.focus(2);
+        // The one being watched ends: focus steps back rather than dangling.
+        assert_eq!(set.remove(2).map(|s| s.name), Some(String::from("worker")));
+        assert_eq!(set.names(), vec!["server", "client"]);
+        assert_eq!(set.focused_name(), Some("client"));
+
+        // One BEFORE the focused one ends: the user keeps watching the same
+        // session, which is now at a lower index.
+        set.focus(1);
+        assert_eq!(set.remove(0).map(|s| s.name), Some(String::from("server")));
+        assert_eq!(set.focused_name(), Some("client"), "still the same session");
+
+        assert!(set.remove(5).is_none(), "a missing index removes nothing");
+        assert_eq!(set.len(), 1);
+
+        set.remove(0);
+        assert!(set.is_empty() && set.focused().is_none());
+    }
+
+    /// Every session is reachable WITH its position, which is what lets the
+    /// poll drive all the adapters while only one of them drives the UI.
+    #[test]
+    fn every_session_is_reachable_with_its_index() {
+        let mut set: DebugSessions<u32> = DebugSessions::default();
+        set.replace_with("a", 10);
+        set.push("b", 20);
+        set.push("c", 30);
+        let seen: Vec<(usize, u32)> = set.iter_mut_indexed().map(|(i, s)| (i, *s)).collect();
+        assert_eq!(
+            seen,
+            vec![(0, 10), (1, 20), (2, 30)],
+            "all three with their positions - a poll that visited only the \
+             focused one would leave the rest at the gate, started and dead"
+        );
     }
 
     /// Stop means stop ALL. `iter_mut` is what the stop walks, so it has to
