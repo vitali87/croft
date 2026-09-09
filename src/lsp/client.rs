@@ -299,6 +299,50 @@ pub(crate) fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
     }
 }
 
+/// `initialize` sent as raw JSON, so croft can declare the workspace-level
+/// diagnostics capability under the name the SPEC gives it (#533).
+///
+/// `lsp-types` 0.95 names the field `diagnostic`, which serialises to
+/// `workspace.diagnostic`. LSP 3.17 names it `workspace.diagnostics` - the
+/// PLURAL is not a typo, it is the one capability the spec pluralises, and
+/// `vscode-languageserver-node` registers it as
+/// `CM.create('workspace.diagnostics.refreshSupport')`. A server that reads
+/// the spec name therefore never sees croft's `refreshSupport` and never
+/// sends `workspace/diagnostic/refresh`, which is a silent failure: the
+/// pulled set simply never refreshes.
+///
+/// async-lsp's typed `initialize` is a thin wrapper over
+/// `ServerSocket::request`, so sending the params as a `Value` costs nothing
+/// but the serialise step.
+enum RawInitialize {}
+
+impl lsp_types::request::Request for RawInitialize {
+    type Params = serde_json::Value;
+    type Result = lsp_types::InitializeResult;
+    const METHOD: &'static str = "initialize";
+}
+
+/// Declare the workspace diagnostics capability under BOTH names (#533).
+///
+/// The plural is what the spec and every client generated from its metamodel
+/// read; the singular is what `lsp-types` emits and what the Rust servers
+/// built on the same crate read. An unknown capability key is ignored by
+/// definition, so carrying both costs one duplicated object and covers both
+/// populations. Everything else in the params is untouched.
+fn with_spec_workspace_diagnostics(mut params: serde_json::Value) -> serde_json::Value {
+    let Some(workspace) = params
+        .get_mut("capabilities")
+        .and_then(|c| c.get_mut("workspace"))
+        .and_then(|w| w.as_object_mut())
+    else {
+        return params;
+    };
+    if let Some(diagnostic) = workspace.get("diagnostic").cloned() {
+        workspace.insert("diagnostics".to_string(), diagnostic);
+    }
+    params
+}
+
 pub struct LspClient {
     server: ServerSocket,
     capabilities: ServerCapabilities,
@@ -419,14 +463,16 @@ impl LspClient {
             }
         });
 
+        let params = serde_json::to_value(InitializeParams {
+            process_id: Some(std::process::id()),
+            capabilities: client_capabilities,
+            initialization_options: config.initialization_options.clone(),
+            workspace_folders: Some(workspace_folders),
+            ..InitializeParams::default()
+        })
+        .context("serialise initialize params")?;
         let init = server
-            .initialize(InitializeParams {
-                process_id: Some(std::process::id()),
-                capabilities: client_capabilities,
-                initialization_options: config.initialization_options.clone(),
-                workspace_folders: Some(workspace_folders),
-                ..InitializeParams::default()
-            })
+            .request::<RawInitialize>(with_spec_workspace_diagnostics(params))
             .await
             .context("lsp initialize")?;
         server
@@ -1330,6 +1376,54 @@ mod tests {
         assert!(
             !sem_flag.load(Ordering::Relaxed),
             "the semantic-token flag must stay untouched"
+        );
+    }
+
+    #[test]
+    fn initialize_declares_workspace_diagnostics_under_both_names() {
+        // LSP 3.17 names this capability `workspace.diagnostics`, PLURAL -
+        // the one place the spec pluralises one. `lsp-types` 0.95 emits the
+        // singular, so a spec-conformant server never sees croft's
+        // `refreshSupport` and never sends `workspace/diagnostic/refresh`.
+        // Nothing errors when that happens; the pulled set just never
+        // refreshes, which reads as a slow server (#533).
+        let params = serde_json::json!({
+            "capabilities": {
+                "workspace": {
+                    "diagnostic": { "refreshSupport": true },
+                    "workspaceFolders": true
+                }
+            }
+        });
+        let sent = with_spec_workspace_diagnostics(params);
+        assert_eq!(
+            sent["capabilities"]["workspace"]["diagnostics"]["refreshSupport"],
+            serde_json::json!(true),
+            "the spec name is what a conforming server reads"
+        );
+        assert_eq!(
+            sent["capabilities"]["workspace"]["diagnostic"]["refreshSupport"],
+            serde_json::json!(true),
+            "the lsp-types name stays for the Rust servers built on the same crate"
+        );
+        assert_eq!(
+            sent["capabilities"]["workspace"]["workspaceFolders"],
+            serde_json::json!(true),
+            "nothing else in the capabilities may move"
+        );
+    }
+
+    #[test]
+    fn capabilities_without_the_diagnostic_key_are_passed_through_untouched() {
+        // A server config that ends up with no workspace diagnostics block
+        // must not gain an empty one, and params with no capabilities at all
+        // (the shape a future caller could hand in) must not panic.
+        let bare = serde_json::json!({"capabilities": {"workspace": {"applyEdit": true}}});
+        let sent = with_spec_workspace_diagnostics(bare.clone());
+        assert_eq!(sent, bare);
+        assert_eq!(
+            with_spec_workspace_diagnostics(serde_json::json!({})),
+            serde_json::json!({})
         );
     }
 

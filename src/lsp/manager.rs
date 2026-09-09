@@ -5188,17 +5188,23 @@ fn spawn_workspace_pull(targets: Vec<WorkspacePull>, tx: std_mpsc::Sender<Diagno
     }
     tokio::spawn(async move {
         for target in targets {
+            // The client lock is taken FIRST and held until the answer is
+            // recorded, so a server's pulls serialise end to end. Snapshotting
+            // the ids before it let two overlapping pulls (the spawn one and a
+            // refresh) take the SAME `previous` set: the second then sends ids
+            // the first had already replaced, and its older report could land
+            // after the newer one and win, since the app's store is
+            // last-write-wins per (file, server).
+            let mut client = target.client.lock().await;
             let previous = target.result_ids.lock().await.previous();
             log_file::log(&format!(
                 "lsp[{}] workspace/diagnostic pull, {} previous result id(s)",
                 target.name,
                 previous.len()
             ));
-            let mut client = target.client.lock().await;
             let resp = client
                 .workspace_diagnostics(target.identifier.clone(), previous)
                 .await;
-            drop(client);
             match resp {
                 Ok(result) => {
                     let mut ids = target.result_ids.lock().await;
@@ -5216,6 +5222,7 @@ fn spawn_workspace_pull(targets: Vec<WorkspacePull>, tx: std_mpsc::Sender<Diagno
                     ));
                 }
             }
+            drop(client);
         }
     });
 }
