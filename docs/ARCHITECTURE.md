@@ -135,12 +135,12 @@ src/
 │   └── registry_index.rs the remote vetted index (extensions.croft.software): fetches index.json plus its signature and verifies ed25519 against a baked `INDEX_PUBLIC_KEY` BEFORE caching; stale-while-revalidate, disarmed when the key is all-zero
 ├── lsp/                 LSP client stack
 │   ├── mod.rs
-│   ├── client.rs             async-lsp client wrapper: routes diagnostics and `$/progress` to the status bar, acknowledges refresh requests into shared re-pull flags, declares `workspace.workspaceFolders` and answers the server→client folder request from the same list initialize carried
+│   ├── client.rs             async-lsp client wrapper: routes diagnostics (pushed and pulled) and `$/progress` to the status bar, acknowledges refresh requests into shared re-pull flags, declares `workspace.workspaceFolders` and answers the server→client folder request from the same list initialize carried
 │   ├── config.rs             per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls); the ServerConfig factories are the executable spec the bundled manifests reproduce, and Language is an open newtype so extensions can add one
 │   ├── install.rs            croft-managed server provisioning: lazy background installs into `~/.croft/servers` via three backends — npm, uv (rerouted to Termux `pkg` on Android), and Binary (per-platform release download, PATH-first)
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms)
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
-│   ├── manager.rs            LSP lifecycle: workspace pre-warm at startup, spawn, did_open / did_change / did_save, completion, documentSymbol, inlay hints and documentHighlight
+│   ├── manager.rs            LSP lifecycle: workspace pre-warm at startup, spawn, did_open / did_change / did_save, completion, documentSymbol, inlay hints, documentHighlight and whole-project pull diagnostics
 │   ├── manifest.rs           declarative `extension.toml` loader for the extension system: parses a manifest's `[[languages]]`, `[[language_servers]]`, `[[themes]]`, `[[debug_adapters]]`, `[[test_runners]]`, `[[mcp_servers]]`, `[[commands]]` and `[[viewers]]` blocks
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
@@ -729,6 +729,12 @@ LSP lifecycle: pre-warm, spawn, `did_open`, `did_change`, `did_save`, completion
 
 **`did_save`.** `Cmd+S` makes rust-analyzer re-run check-on-save, so PROBLEMS refreshes.
 
+**Pull diagnostics (LSP 3.17 `workspace/diagnostic`).** Servers that advertise `diagnosticProvider.workspaceDiagnostics` (taplo does; vtsls does not, which is why the `tsc --noEmit` fallback exists) are asked for the whole project's problems over the existing connection, once as they spawn and again whenever one sends `workspace/diagnostic/refresh`. Three things make it work rather than merely happen:
+
+- **croft has to ask to be told.** A conforming server publishes `diagnosticProvider` only when the client declares `textDocument.diagnostic`, and sends the refresh only when it declares `workspace.diagnostic.refreshSupport`. Undeclared, the capability reads as "no server supports this" rather than as a missing declaration.
+- **`previousResultIds` are what make it cheap.** Each server's last ids go back with the next pull, and files that have not moved come back as `Unchanged` and are not re-processed. A `Full` report with no id *forgets* the file: sending back an id the server never issued for the current content invites an `Unchanged` answer for a file that did change.
+- **The reports rejoin the push path.** They land on the same channel under the same server name, so the per-file, per-server store already replaces a server's set wholesale and `rebuild_problems` already walks files no editor has open. An empty report is the server clearing a fixed file, so it is forwarded rather than skipped.
+
 **Inlay hints.** A whole-document `textDocument/inlayHint` once per edit-batch, capability-gated, with labels normalised (parts joined, padding folded to spaces). The reply is seq-tagged so the app drops a batch computed against older text.
 
 **`documentHighlight`.** The occurrences of the symbol under a resting caret, fired by the app's 250ms idle tick. It is request-id and edit-seq gated, so a reply for a moved caret or edited text never paints.
@@ -837,7 +843,7 @@ The curated MCP catalog, the AVAILABLE tier of the Extensions panel. Bundled `CA
 
 ### lsp/client.rs
 
-The async-lsp client wrapper. Its router forwards diagnostics and work-done progress (`$/progress`, for example rust-analyzer's "Indexing…") to the status bar, and acknowledges workspace refresh requests (`semanticTokens/refresh`, `inlayHint/refresh`) into shared re-pull flags the app polls.
+The async-lsp client wrapper. Its router forwards diagnostics and work-done progress (`$/progress`, for example rust-analyzer's "Indexing…") to the status bar, and acknowledges workspace refresh requests (`semanticTokens/refresh`, `inlayHint/refresh`, `diagnostic/refresh`) into shared re-pull flags the app polls.
 
 **Workspace folders declared and answered from one list.** It declares the `workspace.workspaceFolders` capability, because without it a server may legally ignore the folders array in `initialize`. It answers the LSP 3.6 server→client `workspace/workspaceFolders` request with the same folder list `initialize` carried — one list serves both, so they can never disagree. `didChangeWorkspaceFolders` waits for a multi-root add/remove-folder lifecycle.
 

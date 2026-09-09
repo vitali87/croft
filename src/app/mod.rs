@@ -8888,6 +8888,25 @@ impl App {
         }
     }
 
+    /// Re-pull whole-project diagnostics when a server asked us to via
+    /// `workspace/diagnostic/refresh` (#533).
+    ///
+    /// Mirrors [`refresh_semantic_tokens_if_requested`], with one difference:
+    /// there is nothing to aim it at. A pull covers the whole workspace, not
+    /// the visible editors, which is the point - it is what puts problems from
+    /// files no editor has open into PROBLEMS. The manager filters to the
+    /// servers advertising `workspaceDiagnostics`, so a workspace whose
+    /// servers all PUSH never sends a request.
+    pub fn refresh_workspace_diagnostics_if_requested(&self) {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        if !lsp.take_diagnostic_refresh() {
+            return;
+        }
+        lsp.request_workspace_diagnostics();
+    }
+
     /// Fire an inlay-hint request for every visible editor's file at its
     /// current edit seq. Shared by the server-driven refresh and the palette
     /// toggle's re-enable path.
@@ -49655,6 +49674,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let explorer_panels_changed = app.sync_explorer_panels();
         app.refresh_semantic_tokens_if_requested();
         app.refresh_inlay_hints_if_requested();
+        app.refresh_workspace_diagnostics_if_requested();
         let lsp_changed = app.drain_lsp_completion();
         app.refresh_signature_help_if_moved();
         let sig_help_changed = app.drain_lsp_signature_help();

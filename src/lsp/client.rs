@@ -83,6 +83,10 @@ struct ClientState {
     // Same contract for `workspace/inlayHint/refresh`: the app polls and
     // clears it, then re-requests hints for the visible editor(s).
     inlay_refresh: Arc<AtomicBool>,
+    // Same contract for `workspace/diagnostic/refresh` (#533): a server that
+    // answers PULL diagnostics sends it when a project-wide change makes what
+    // it last reported stale, and the app re-pulls the whole workspace.
+    diagnostic_refresh: Arc<AtomicBool>,
     // Server-pushed `textDocument/publishDiagnostics` batches are normalised
     // and forwarded here; the manager owns the receiver and the app drains it.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
@@ -124,10 +128,12 @@ fn progress_token_key(token: &lsp_types::ProgressToken) -> String {
 }
 
 impl ClientState {
+    #[allow(clippy::too_many_arguments)]
     fn router(
         name: String,
         semantic_refresh: Arc<AtomicBool>,
         inlay_refresh: Arc<AtomicBool>,
+        diagnostic_refresh: Arc<AtomicBool>,
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
         progress_tx: std_mpsc::Sender<ProgressUpdate>,
         workspace_folders: Vec<WorkspaceFolder>,
@@ -136,6 +142,7 @@ impl ClientState {
             name,
             semantic_refresh,
             inlay_refresh,
+            diagnostic_refresh,
             diagnostics_tx,
             progress_tx,
             progress_titles: std::collections::HashMap::new(),
@@ -157,6 +164,19 @@ impl ClientState {
                 this.inlay_refresh.store(true, Ordering::Relaxed);
                 log_file::log(&format!(
                     "lsp[{}] inlayHint/refresh -> re-request queued",
+                    this.name
+                ));
+                std::future::ready(Ok(()))
+            })
+            // `workspace/diagnostic/refresh` (#533): the server's PULLED
+            // diagnostics went stale for reasons other than an edit, so it
+            // asks the client to re-pull the workspace. Acknowledge and raise
+            // the flag; declining with METHOD_NOT_FOUND would leave the panel
+            // showing the last answer indefinitely.
+            .request::<lsp_types::request::WorkspaceDiagnosticRefresh, _>(|this, _params| {
+                this.diagnostic_refresh.store(true, Ordering::Relaxed);
+                log_file::log(&format!(
+                    "lsp[{}] diagnostic/refresh -> workspace re-pull queued",
                     this.name
                 ));
                 std::future::ready(Ok(()))
@@ -262,7 +282,7 @@ impl ClientState {
 /// Normalise one LSP wire diagnostic into croft's `Diagnostic`. Severity
 /// defaults to `Error` when the server omits it (the LSP spec says the client
 /// may pick, and an unclassified problem is most safely shown as an error).
-fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
+pub(crate) fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
     let severity = match d.severity {
         Some(LspDiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
         Some(LspDiagnosticSeverity::INFORMATION) => DiagnosticSeverity::Information,
@@ -304,6 +324,7 @@ impl LspClient {
         extra_path: &[std::path::PathBuf],
         semantic_refresh: Arc<AtomicBool>,
         inlay_refresh: Arc<AtomicBool>,
+        diagnostic_refresh: Arc<AtomicBool>,
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
         progress_tx: std_mpsc::Sender<ProgressUpdate>,
     ) -> Result<Self> {
@@ -364,6 +385,7 @@ impl LspClient {
                     router_name,
                     semantic_refresh,
                     inlay_refresh,
+                    diagnostic_refresh,
                     diagnostics_tx,
                     progress_tx,
                     router_folders,
@@ -645,6 +667,35 @@ impl LspClient {
     /// `workspace/symbol`: server-side fuzzy query over every symbol in the
     /// project. Both response shapes (flat `SymbolInformation` and nested
     /// `WorkspaceSymbol`) are normalised by the manager.
+    /// LSP 3.17 `workspace/diagnostic`: PULL the whole project's diagnostics
+    /// over the existing connection (#533).
+    ///
+    /// `identifier` is echoed back from the server's own
+    /// `diagnosticProvider.identifier` - a server that registered several
+    /// diagnostic sources uses it to tell which one the previous result ids
+    /// belong to, so dropping it would invalidate its incrementality.
+    /// `previous_result_ids` is what makes the answer incremental: files that
+    /// have not moved come back as `Unchanged` instead of a full re-report.
+    ///
+    /// Only call this on a server whose capability says
+    /// `workspaceDiagnostics: true` - one that pulls per document but not per
+    /// workspace answers `-32601 Unhandled method`.
+    pub async fn workspace_diagnostics(
+        &mut self,
+        identifier: Option<String>,
+        previous_result_ids: Vec<lsp_types::PreviousResultId>,
+    ) -> Result<lsp_types::WorkspaceDiagnosticReportResult> {
+        self.server
+            .workspace_diagnostic(lsp_types::WorkspaceDiagnosticParams {
+                identifier,
+                previous_result_ids,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("workspace/diagnostic")
+    }
+
     pub async fn workspace_symbols(
         &mut self,
         query: String,
@@ -1227,6 +1278,7 @@ mod tests {
             "rust-analyzer".into(),
             flag.clone(),
             inlay_flag,
+            Arc::new(AtomicBool::new(false)),
             diag_tx,
             prog_tx,
             Vec::new(),
@@ -1259,6 +1311,7 @@ mod tests {
             "rust-analyzer".into(),
             sem_flag.clone(),
             flag.clone(),
+            Arc::new(AtomicBool::new(false)),
             diag_tx,
             prog_tx,
             Vec::new(),
@@ -1277,6 +1330,47 @@ mod tests {
         assert!(
             !sem_flag.load(Ordering::Relaxed),
             "the semantic-token flag must stay untouched"
+        );
+    }
+
+    #[test]
+    fn workspace_diagnostic_refresh_sets_the_repull_flag() {
+        use async_lsp::AnyRequest;
+        use tower::Service;
+        // LSP 3.17: a server that answers PULL diagnostics sends
+        // `workspace/diagnostic/refresh` when a project-wide change (a config
+        // reload, a dependency resolving) invalidates what it last reported.
+        // Declining it leaves the pulled set frozen until something else
+        // forces a re-pull, which reads as a stale PROBLEMS panel rather than
+        // as a missing handler (#533).
+        let sem_flag = Arc::new(AtomicBool::new(false));
+        let inlay_flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut router = ClientState::router(
+            "taplo".into(),
+            sem_flag.clone(),
+            inlay_flag.clone(),
+            flag.clone(),
+            diag_tx,
+            prog_tx,
+            Vec::new(),
+        );
+        let req: AnyRequest = serde_json::from_value(json!({
+            "id": 1,
+            "method": "workspace/diagnostic/refresh",
+            "params": null
+        }))
+        .expect("AnyRequest deserialization");
+        let _ = futures::executor::block_on(router.call(req));
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a workspace/diagnostic/refresh request must set the re-pull flag"
+        );
+        assert!(
+            !sem_flag.load(Ordering::Relaxed) && !inlay_flag.load(Ordering::Relaxed),
+            "the token and hint flags must stay untouched"
         );
     }
 
@@ -1334,6 +1428,7 @@ mod tests {
             "basedpyright".into(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             diag_tx,
             prog_tx,
             Vec::new(),
@@ -1359,6 +1454,7 @@ mod tests {
         let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut router = ClientState::router(
             "any".into(),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             diag_tx,
@@ -1395,6 +1491,7 @@ mod tests {
             "rust-analyzer".into(),
             sem_flag,
             inlay_flag,
+            Arc::new(AtomicBool::new(false)),
             diag_tx,
             prog_tx,
             vec![WorkspaceFolder {
@@ -1469,6 +1566,7 @@ mod tests {
                 &root,
                 ClientCapabilities::default(),
                 &[],
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 diag_tx,
