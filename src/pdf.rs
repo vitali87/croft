@@ -442,6 +442,70 @@ const MAX_PROBE_STDOUT: u64 = 1 << 20;
 /// pays the whole grace once, on a path that has already failed.
 const STDERR_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How the settle poll ended, recorded under `cfg(test)` only (#548).
+///
+/// This is what diagnosed #548, and it is kept for the next occurrence. Which
+/// exit the poll took is the whole diagnosis, and the old failure message
+/// could not say:
+///
+/// - ended on the QUIET RUN holding less than expected: the window closed
+///   while the writer was still going. Measured under load at 69 ms against
+///   the 60 ms run, holding only the first of two writes;
+/// - ended on the DEADLINE: the grace ran out with the buffer still growing,
+///   which is a different bug and a different fix.
+///
+/// Guessing between those two is what this exists to stop - and it earned its
+/// keep, since two plausible diagnoses were wrong before the numbers arrived.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct SettleOutcome {
+    waited: std::time::Duration,
+    on_quiet: bool,
+    bytes: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per THREAD, so tests running in parallel cannot read each other's.
+    static LAST_SETTLE: std::cell::Cell<Option<SettleOutcome>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One poll of the renderer's stderr buffer.
+const SETTLE_TICK: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// How many quiet ticks mean the renderer has stopped writing: twelve, 60 ms,
+/// which bridges the gaps measured between a renderer's own writes.
+///
+/// Pinned by `the_settle_rule_bridges_a_gap_shorter_than_the_quiet_run` with
+/// no clock involved, so cutting it fails a test rather than only showing up
+/// as half an error message on a loaded machine.
+const QUIET_RUN_TICKS: u32 = 12;
+
+#[cfg(test)]
+fn record_settle(outcome: SettleOutcome) {
+    LAST_SETTLE.with(|c| c.set(Some(outcome)));
+}
+
+/// How the settle poll on this thread last ended, for a failure message.
+/// `unix` too, because the only consumer is a `unix`-gated test.
+#[cfg(all(test, unix))]
+fn last_settle() -> String {
+    match LAST_SETTLE.with(std::cell::Cell::get) {
+        Some(o) => format!(
+            "settle ended on {} after {:?} holding {} byte(s)",
+            if o.on_quiet {
+                "the QUIET RUN"
+            } else {
+                "the DEADLINE"
+            },
+            o.waited,
+            o.bytes
+        ),
+        None => String::from("settle did not run"),
+    }
+}
+
 /// Test-only: the next `rasterize_page` call for exactly this (path, page)
 /// fails once, simulating a transient rasteriser failure (a spawn refused
 /// under load, an OOM-killed child). Keyed on the full path so parallel
@@ -595,9 +659,14 @@ fn run_pdftoppm(
 /// so the buffer is polled every 5 ms and read once it has been quiet for a
 /// run of ticks long enough to bridge a scheduling gap between two writes
 /// (a shorter run settled early and lost the second write), or once the
-/// grace is spent, whichever comes first: the run is strictly shorter than
-/// the grace, so a renderer whose stderr was complete at exit settles
-/// early and the deadline stays the independent backstop. An empty buffer
+/// grace is spent, whichever comes first. The two exits stay distinct
+/// because the CONSTANTS keep them apart - a 12-tick run is 60 ms against a
+/// 200 ms grace - where a clamp used to enforce it for any grace (#548). A
+/// caller passing a grace of 60 ms or less would make the quiet exit
+/// unreachable (55 ms for an empty buffer, which counts quiet from the first
+/// reading and so completes the run a tick sooner); none does. The 65 ms that
+/// used to be quoted here was main's threshold for when the CLAMP bound,
+/// which is a different question. An empty buffer
 /// counts as quiet, so a silent failure settles just as early. Bytes a
 /// descendant writes after that are not waited for; a reader still blocked
 /// on its copy of the pipe is left to finish on its own. The buffer is
@@ -607,26 +676,84 @@ fn settle_stderr(
     buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     grace: std::time::Duration,
 ) -> String {
-    let tick = std::time::Duration::from_millis(5);
-    let deadline = std::time::Instant::now() + grace;
-    // Twelve ticks (60 ms) bridges the gaps seen between a renderer's
-    // writes; capped below the grace so the two exits stay distinct (the
-    // cap only binds for a grace under 65 ms).
-    let ticks_in_grace = (grace.as_millis() / tick.as_millis()) as u32;
-    let quiet_run = 12.min(ticks_in_grace.saturating_sub(1)).max(1);
-    let mut seen = 0usize;
-    let mut quiet = 0u32;
-    loop {
+    let started = std::time::Instant::now();
+    let deadline = started + grace;
+    let (text, on_quiet) = settle_over(QUIET_RUN_TICKS, |tick| {
+        // The sleep belongs BEFORE the read, not after it. Sleeping after
+        // means the reading that settles the poll has already been taken, so
+        // the extra tick collects nothing and every quiet exit costs 5 ms
+        // more than the loop this replaced: measured at 13 polls and 13
+        // sleeps against that loop's 13 and 12. Reading on every 5 ms
+        // boundary from zero is what it did, tick for tick.
+        if tick > 0 {
+            std::thread::sleep(SETTLE_TICK);
+        }
         let text = buf
             .lock()
             .map(|b| String::from_utf8_lossy(&b).trim().to_string())
             .unwrap_or_default();
+        if std::time::Instant::now() >= deadline {
+            return Sample::Last(text);
+        }
+        Sample::More(text)
+    });
+    #[cfg(test)]
+    record_settle(SettleOutcome {
+        waited: started.elapsed(),
+        on_quiet,
+        bytes: text.len(),
+    });
+    // Read only under `cfg(test)`, by the recording above.
+    let _ = on_quiet;
+    text
+}
+
+/// What the poll saw on one tick, and whether another tick is allowed.
+enum Sample {
+    /// This reading, and there is time for another.
+    More(String),
+    /// This reading, and the budget is spent - stop whatever it says.
+    Last(String),
+}
+
+/// The settle decision, driven by TICKS rather than by a clock (#548).
+///
+/// Extracted so the rule can be tested without a wall clock: the caller
+/// supplies the readings and says when the budget is spent, and this decides
+/// when the buffer has stopped growing. Returns the text it settled on, and
+/// whether it settled because the buffer went quiet (rather than because the
+/// budget ran out).
+///
+/// The clock lived inside this loop before, which meant the ONLY way to test
+/// the rule was to race a real one - and the test that did so was the flake
+/// this issue is about. Worse, the wall-clock test could not pin
+/// `QUIET_RUN_TICKS` at all: the run was silently clamped to a function of the
+/// grace, so the constant could be cut in half and every test still passed.
+///
+/// TERMINATION IS THE CALLER'S: this loops until the buffer goes quiet or the
+/// sampler says `Last`, so a sampler that never says `Last` while the text
+/// keeps changing never returns. Production guarantees it with the deadline
+/// check; the test bounds its script.
+fn settle_over(quiet_run: u32, mut sample: impl FnMut(u32) -> Sample) -> (String, bool) {
+    let quiet_run = quiet_run.max(1);
+    let mut seen = 0usize;
+    let mut quiet = 0u32;
+    let mut tick = 0u32;
+    loop {
+        let (text, last) = match sample(tick) {
+            Sample::More(t) => (t, false),
+            Sample::Last(t) => (t, true),
+        };
         quiet = if text.len() == seen { quiet + 1 } else { 0 };
-        if quiet >= quiet_run || std::time::Instant::now() >= deadline {
-            return text;
+        if quiet >= quiet_run || last {
+            // `&& !last` matters on the tick where both fire: the recorded
+            // outcome exists to tell a quiet exit from a deadline one, so
+            // labelling the boundary as quiet mislabels precisely the case
+            // the record is for.
+            return (text, quiet >= quiet_run && !last);
         }
         seen = text.len();
-        std::thread::sleep(tick);
+        tick += 1;
     }
 }
 
@@ -783,8 +910,12 @@ mod tests {
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         let started = std::time::Instant::now();
-        let bytes = run_pdftoppm(&script, &pdf, 1, timeout)
-            .expect("the page was written; a lingering descendant is not a failure");
+        let bytes = run_pdftoppm(&script, &pdf, 1, timeout).unwrap_or_else(|e| {
+            // This failed once on CI and the `expect` said only that it should
+            // not have, which left nothing to tell a timeout apart from a
+            // missing page (#548). The error names which.
+            panic!("the page was written; a lingering descendant is not a failure: {e}")
+        });
         let elapsed = started.elapsed();
         assert_eq!(bytes, b"x");
         assert!(
@@ -834,55 +965,106 @@ mod tests {
         );
     }
 
-    /// A renderer whose stderr arrives in two bursts a scheduling gap apart,
-    /// the second from a helper that writes just after the renderer exits,
-    /// has both reported: the grace poll waits for a run of quiet ticks, not
-    /// for the first lull.
+    /// A renderer that fails has its stderr and its exit status in the
+    /// error, rather than sprayed over the TUI.
+    ///
+    /// It no longer asserts the SECOND of two bursts: whether a write landing
+    /// after the exit arrives inside the settle window is a race this test
+    /// cannot win on a loaded machine (#548). That property is asked of the
+    /// rule directly in
+    /// [`the_settle_rule_bridges_a_gap_shorter_than_the_quiet_run`].
     #[cfg(unix)]
     #[test]
-    fn a_failing_pdftoppm_has_both_stderr_bursts_reported() {
+    fn a_failing_pdftoppm_reports_the_stderr_it_sprayed() {
+        // End to end: a renderer that fails has its stderr in the error
+        // rather than on the user's TUI. What this canNOT assert is the
+        // second burst (#548): whether a write landing after the exit arrives
+        // inside the settle window is a race against scheduling, measured at
+        // 69 ms under load against a 60 ms window, and asserting it here made
+        // the test fail for the machine's reasons rather than croft's.
+        //
+        // The property itself is not dropped - it moved to
+        // `the_settle_rule_bridges_a_gap_shorter_than_the_quiet_run`, which
+        // asks it of the rule directly, in ticks, with no clock to lose to.
         let tmp = tempfile::tempdir().unwrap();
         let script = fake_pdftoppm(
             tmp.path(),
-            // Past the 30 ms exit-poll tick, so the second burst genuinely
-            // arrives after the exit is observed and the grace poll is what
-            // collects it; a shorter sleep lands before the exit is even seen
-            // and the test would pass with the grace poll gutted.
             r#"( sleep 0.05; echo "Syntax Error: second" >&2 ) & echo "Syntax Error: first" >&2; exit 1"#,
         );
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-        for _ in 0..5 {
-            let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
-                .expect_err("a non-zero exit is a failure");
-            let text = err.to_string();
-            assert!(
-                text.contains("Syntax Error: first") && text.contains("Syntax Error: second"),
-                "both bursts are reported: {text}"
-            );
-        }
+        // Once, not five times: the repeat existed to shake out the flaky
+        // second-burst assertion, and what is left is deterministic.
+        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+            .expect_err("a non-zero exit is a failure");
+        let text = err.to_string();
+        assert!(
+            text.contains("Syntax Error: first"),
+            "the renderer's spray reaches the error: {text}\n[#548] {}",
+            last_settle()
+        );
+        assert!(
+            text.contains("exited with"),
+            "and so does the exit status: {text}"
+        );
     }
 
-    /// The grace poll bridges a scheduling gap: a second line appended a
-    /// few ticks after the first, long after a one-tick poll would have
-    /// settled, is still collected. Pure threads, no spawned process, so
-    /// the constants are the poll's own and not a spawn wait.
+    /// The settle rule bridges a gap shorter than its quiet run and does not
+    /// wait for one longer, which is what `QUIET_RUN_TICKS` means.
+    ///
+    /// Scripted by TICK INDEX, with no threads and no clock: the readings are
+    /// stated rather than raced for, so the rule is what is under test and
+    /// the host's scheduling cannot decide the result.
     #[test]
-    fn the_grace_poll_collects_a_late_line_inside_its_quiet_run() {
-        use std::sync::{Arc, Mutex};
-        let buf = Arc::new(Mutex::new(b"Syntax Error: first\n".to_vec()));
-        let late = Arc::clone(&buf);
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            late.lock()
-                .unwrap()
-                .extend_from_slice(b"Syntax Error: second\n");
-        });
-        let text = settle_stderr(&buf, STDERR_SETTLE_GRACE);
-        writer.join().unwrap();
+    fn the_settle_rule_bridges_a_gap_shorter_than_the_quiet_run() {
+        // Ticks, not a clock (#548). The wall-clock version of this raced
+        // scheduling and was the flake; worse, it could not pin
+        // `QUIET_RUN_TICKS` at all, because the run was silently clamped to a
+        // function of the grace - the constant could be halved and every test
+        // still passed.
+        //
+        // A scripted buffer says exactly what arrived and when, so the
+        // question this asks is the real one: is the production run long
+        // enough to bridge the gap it exists to bridge?
+        // The gaps are ABSOLUTE on purpose. Deriving them from
+        // `QUIET_RUN_TICKS` reads better and pins nothing: the fixture then
+        // moves with the constant and holds for any value it takes, which a
+        // re-break caught - halving the constant left this test green.
+        // Written as numbers, the pair straddles the production run, so the
+        // constant cannot move far in either direction without this failing.
+        // Measured tolerance: this accepts a run of 10 through 14, and 12
+        // sits in the middle, so it is a bound with two ticks of slack rather
+        // than an exact pin.
+        let script = |gap: u32| {
+            move |tick: u32| {
+                let text = if tick < gap {
+                    String::from("Syntax Error: first")
+                } else {
+                    String::from("Syntax Error: first\nSyntax Error: second")
+                };
+                // Far past the gap, so the QUIET RUN decides and the deadline
+                // is never the reason.
+                if tick > gap + 60 {
+                    Sample::Last(text)
+                } else {
+                    Sample::More(text)
+                }
+            }
+        };
+
+        let (text, on_quiet) = settle_over(QUIET_RUN_TICKS, script(10));
         assert!(
-            text.contains("first") && text.contains("second"),
-            "a line landing inside the quiet run is collected: {text:?}"
+            text.contains("second") && on_quiet,
+            "a 10-tick gap is inside the production run and must be bridged, \
+             settling on the run rather than the deadline: {text:?}"
+        );
+
+        let (text, _) = settle_over(QUIET_RUN_TICKS, script(15));
+        assert!(
+            !text.contains("second"),
+            "a 15-tick gap is outside it and must NOT be waited for - without \
+             this half the pair above is satisfied by a rule that waits \
+             forever: {text:?}"
         );
     }
 
