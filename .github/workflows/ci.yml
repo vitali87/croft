@@ -218,16 +218,30 @@ jobs:
           #
           # A partial index failure must not decide whether the install runs:
           # apt resolves these two packages from the indexes it did fetch.
-          sudo apt-get update \
-            || echo "::warning::apt-get update reported errors; installing from the indexes it has"
+          # A transient mirror hiccup is what set #549 off in the first
+          # place, and the install below is what actually gates the step, so
+          # retry before giving up on the index refresh.
+          for attempt in 1 2 3; do
+            sudo apt-get update && break
+            echo "::warning::apt-get update failed (attempt $attempt)"
+            sleep 5
+          done
           sudo apt-get install -y --no-install-recommends zsh poppler-utils
           # Without this the step can only report that it RAN, not that it
-          # worked, and those are the same colour. The suite's own skip
-          # message names pdftoppm, so name it here too.
-          for tool in pdftoppm zsh; do
-            command -v "$tool" >/dev/null \
-              || { echo "::error::$tool is missing after the install step"; exit 1; }
-          done
+          # worked, and those are the same colour.
+          #
+          # Each tool is probed the way ITS CONSUMER resolves it, which is not
+          # the same question for the two of them. `pdf::which` walks PATH, so
+          # `command -v` is right (and stricter: it also wants the executable
+          # bit). The terminal tests take `/bin/zsh` by literal path and SKIP
+          # when it is missing, so a zsh present only elsewhere on PATH would
+          # pass a `command -v` probe and leave those tests silently
+          # uncovered - the same false green this step exists to remove, moved
+          # one level up. It holds today only because usrmerge symlinks /bin.
+          command -v pdftoppm >/dev/null \
+            || { echo "::error::pdftoppm is missing after the install step"; exit 1; }
+          [ -x /bin/zsh ] \
+            || { echo "::error::/bin/zsh is missing after the install step"; exit 1; }
           for d in /usr/share/zsh /usr/local/share/zsh; do
             if [ -d "$d" ]; then sudo chmod -R go-w "$d"; fi
           done
