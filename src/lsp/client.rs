@@ -1646,6 +1646,13 @@ mod tests {
     }
 
     fn run_initialize_shutdown(config: ServerConfig) {
+        if !server_runs_here(&config) {
+            eprintln!(
+                "SKIPPED: {} is on PATH but does not run on this machine",
+                config.name
+            );
+            return;
+        }
         let rt = LspRuntime::new().expect("runtime");
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonicalize tempdir");
@@ -1673,8 +1680,42 @@ mod tests {
         });
 
         if let Err(e) = result {
-            eprintln!("SKIPPED: {display_name} initialize/shutdown failed: {e}");
+            // The machine question was already answered above, so a failure
+            // here is croft's handshake, not this box (#545).
+            panic!("{display_name} runs on this machine, but the handshake failed: {e:#}");
         }
+    }
+
+    /// Whether this machine can actually RUN the server, asked BEFORE the
+    /// handshake (#545).
+    ///
+    /// Classifying the handshake ERROR instead does not work, and the
+    /// re-break proved it: feeding rust-analyzer malformed `initialize`
+    /// params makes it EXIT rather than reply, which arrives as
+    /// `ServiceStopped` - the same thing a rustup shim whose toolchain lacks
+    /// the component produces. The two states are indistinguishable after the
+    /// fact, so the environment question has to be settled first, and then any
+    /// handshake failure is a failure.
+    ///
+    /// A server that exits without being spoken to cannot serve croft here: a
+    /// real one blocks reading stdin. That is what separates "installed" from
+    /// "runnable", which `server_on_path` (a file that exists and is +x)
+    /// cannot see.
+    fn server_runs_here(config: &ServerConfig) -> bool {
+        let Ok(mut child) = std::process::Command::new(&config.command)
+            .args(&config.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        let waiting_for_input = matches!(child.try_wait(), Ok(None));
+        let _ = child.kill();
+        let _ = child.wait();
+        waiting_for_input
     }
 
     #[test]
