@@ -30,7 +30,11 @@ pub enum RequestKind {
 /// One configuration as read from a launch.json, unresolved: substitution
 /// variables still in place, every field kept in `raw`. Resolution happens at
 /// F5 time (in [`resolve`]) because `${file}` depends on the active editor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is intentionally not derived: `presentation.order` is a `f64`, which
+// is only `PartialEq` (floats break total equality), for the same reason
+// `ResolvedConfig` below drops it. Neither type is ever a map key, so
+// `PartialEq` is all the call sites and tests need.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DebugConfig {
     pub name: String,
     /// The `type` as written (`python`, `lldb`, `node`, …); mapped to an
@@ -144,7 +148,11 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
 /// A `presentation` block, as declared on a configuration OR a compound
 /// (#318). VS Code reads the same three keys in both places and sorts the two
 /// kinds together in one list, so croft parses it in both too.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+// `Eq` is intentionally not derived: `presentation.order` is a `f64`, which
+// is only `PartialEq` (floats break total equality), for the same reason
+// `ResolvedConfig` below drops it. Neither type is ever a map key, so
+// `PartialEq` is all the call sites and tests need.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Presentation {
     /// Do not list this entry in the picker.
     pub hidden: bool,
@@ -153,7 +161,11 @@ pub struct Presentation {
     pub group: Option<String>,
     /// Position within the group, ascending. An entry with no numeric order
     /// sorts after the ones that have it.
-    pub order: Option<i64>,
+    ///
+    /// `f64` rather than an integer because VS Code's schema says `number`
+    /// and its comparator subtracts one from the other, so `1.5` is a legal
+    /// position between two neighbours - not the typo that a non-number is.
+    pub order: Option<f64>,
 }
 
 /// Read a `presentation` block, if the entry declares a usable one.
@@ -170,10 +182,7 @@ pub fn parse_presentation(obj: &Map<String, Value>) -> Option<Presentation> {
         .and_then(Value::as_str)
         .filter(|g| !g.is_empty())
         .map(str::to_string);
-    // `as_i64` and not `as_f64`: VS Code compares orders with subtraction and
-    // its schema says integer. A non-number is the "no order" case, which is
-    // exactly what a fractional or string value degrades to.
-    let order = p.get("order").and_then(Value::as_i64);
+    let order = p.get("order").and_then(Value::as_f64);
     if !hidden && group.is_none() && order.is_none() {
         return None;
     }
@@ -182,6 +191,52 @@ pub fn parse_presentation(obj: &Map<String, Value>) -> Option<Presentation> {
         group,
         order,
     })
+}
+
+/// The malformed `presentation` shapes this entry declares, named with their
+/// parent so they can be found in the file (#318).
+///
+/// A value croft cannot read is a TYPO, and `{"order": "1"}` is the same
+/// mistake as `{"hidden": "true"}`: quoted where it should be bare. Dropping
+/// it silently would leave the user with a picker that ignores the ordering
+/// they wrote and nothing to explain why.
+///
+/// Only COMPOUNDS act on this. A configuration has no refusal path to hang it
+/// on - it launches directly rather than through a gate - so a config follows
+/// VS Code and ignores what it cannot read.
+pub fn malformed_presentation_keys(obj: &Map<String, Value>) -> Vec<&'static str> {
+    let Some(value) = obj.get("presentation") else {
+        return Vec::new();
+    };
+    if value.is_null() {
+        return Vec::new();
+    }
+    let Some(p) = value.as_object() else {
+        return vec!["presentation"];
+    };
+    let mut out = Vec::new();
+    for (key, path, well_formed) in [
+        (
+            "hidden",
+            "presentation.hidden",
+            Value::is_boolean as fn(&Value) -> bool,
+        ),
+        (
+            "group",
+            "presentation.group",
+            Value::is_string as fn(&Value) -> bool,
+        ),
+        (
+            "order",
+            "presentation.order",
+            Value::is_number as fn(&Value) -> bool,
+        ),
+    ] {
+        if p.get(key).is_some_and(|v| !v.is_null() && !well_formed(v)) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// Filter out hidden entries and sort the rest the way VS Code's
@@ -239,12 +294,14 @@ pub fn visible_and_sorted<T>(
 
 /// `order` against `order`: a declared one wins over a missing one, and two
 /// missing ones tie (leaving the stable sort to keep file order).
-fn compare_orders(first: Option<i64>, second: Option<i64>) -> std::cmp::Ordering {
+fn compare_orders(first: Option<f64>, second: Option<f64>) -> std::cmp::Ordering {
     match (first, second) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(a), Some(b)) => a.cmp(&b),
+        // JSON cannot carry a NaN, so the fallback is unreachable in practice
+        // and `Equal` leaves the stable sort to keep file order if it ever is.
+        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
     }
 }
 
@@ -252,7 +309,11 @@ fn compare_orders(first: Option<i64>, second: Option<i64>) -> std::cmp::Ordering
 /// name. Members are stored as written and resolved against the file's
 /// `configurations` at launch time, so a compound naming a configuration that
 /// is later renamed fails loudly rather than launching a subset.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is intentionally not derived: `presentation.order` is a `f64`, which
+// is only `PartialEq` (floats break total equality), for the same reason
+// `ResolvedConfig` below drops it. Neither type is ever a map key, so
+// `PartialEq` is all the call sites and tests need.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Compound {
     pub name: String,
     pub configurations: Vec<String>,
@@ -387,7 +448,6 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // ordering that does not exist. Testing the SUB-KEYS rather than
             // the parent means `{"hidden": true}` alone launches instead of
             // being refused for a capability it never asked for.
-            let presentation_obj = obj.get("presentation").and_then(|v| v.as_object());
             let presentation = parse_presentation(obj);
             // Only the MALFORMED shapes still refuse (#318). `group` and
             // `order` are honoured now, so the loop that recorded them is
@@ -401,16 +461,7 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // its parent, because a refusal telling the user to "remove that
             // key" would otherwise read as deleting the whole `presentation`
             // block, taking a working `group` with it.
-            let mut unsupported_keys: Vec<&'static str> = Vec::new();
-            if asks_for_something("presentation") && presentation_obj.is_none() {
-                unsupported_keys.push("presentation");
-            }
-            if presentation_obj
-                .and_then(|p| p.get("hidden"))
-                .is_some_and(|v| !v.is_null() && !v.is_boolean())
-            {
-                unsupported_keys.push("presentation.hidden");
-            }
+            let unsupported_keys: Vec<&'static str> = malformed_presentation_keys(obj);
             let pre_launch_task = asks_for_something("preLaunchTask")
                 .then(|| obj.get("preLaunchTask").and_then(|v| v.as_str()))
                 .flatten()
@@ -1501,7 +1552,7 @@ mod tests {
         );
         assert_eq!(
             by("Presents").presentation.as_ref().and_then(|p| p.order),
-            Some(1),
+            Some(1.0),
             "the order's VALUE is what sorting needs; tolerating the key cannot"
         );
         assert_eq!(by("Presents").pre_launch_task, None);
@@ -1562,7 +1613,7 @@ mod tests {
         assert!(by("Ordered").unsupported_keys.is_empty());
         assert_eq!(
             by("Ordered").presentation.as_ref().and_then(|p| p.order),
-            Some(2)
+            Some(2.0)
         );
         // A malformed shape must keep refusing. On main these refused and the
         // user found out; silently launching a compound whose typo'd
@@ -1603,12 +1654,71 @@ mod tests {
         );
     }
 
+    /// A value croft cannot READ is a typo, whichever key carries it (#318).
+    /// `{"order": "1"}` is the same mistake as `{"hidden": "true"}`, and
+    /// dropping it silently would leave a picker that ignores the ordering the
+    /// user wrote with nothing to explain why.
+    #[test]
+    fn a_malformed_presentation_value_refuses_whichever_key_it_is_on() {
+        let cs = parse_compounds(
+            r#"{
+              "compounds": [
+                { "name": "QuotedOrder", "configurations": ["A"],
+                  "presentation": { "order": "1" } },
+                { "name": "NumberGroup", "configurations": ["A"],
+                  "presentation": { "group": 7 } },
+                { "name": "FractionalOrder", "configurations": ["A"],
+                  "presentation": { "order": 1.5 } },
+                { "name": "NulledKeys", "configurations": ["A"],
+                  "presentation": { "group": null, "order": null } }
+              ]
+            }"#,
+            ".vscode/launch.json",
+        );
+        assert_eq!(cs.len(), 4, "precondition: every compound parsed");
+        let by = |n: &str| {
+            cs.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} parsed"))
+        };
+        assert_eq!(
+            by("QuotedOrder").unsupported_keys,
+            vec!["presentation.order"]
+        );
+        assert_eq!(
+            by("NumberGroup").unsupported_keys,
+            vec!["presentation.group"]
+        );
+        // A FRACTION is not a typo: VS Code's schema says `number` and its
+        // comparator subtracts, so 1.5 is a legal position between two
+        // neighbours and must be honoured rather than refused.
+        assert!(
+            by("FractionalOrder").unsupported_keys.is_empty(),
+            "a fractional order is a position, not a mistake: {:?}",
+            by("FractionalOrder").unsupported_keys
+        );
+        assert_eq!(
+            by("FractionalOrder")
+                .presentation
+                .as_ref()
+                .and_then(|p| p.order),
+            Some(1.5)
+        );
+        // Explicit nulls ask for nothing, which croft delivers by doing
+        // nothing - naming them would report a limitation that is not one.
+        assert!(
+            by("NulledKeys").unsupported_keys.is_empty(),
+            "null asks for nothing: {:?}",
+            by("NulledKeys").unsupported_keys
+        );
+    }
+
     /// #318: the picker's order is VS Code's `getVisibleAndSorted`, which is a
     /// transcription and not a guess. Each arm below is a rule croft would
     /// plausibly have got wrong on its own.
     #[test]
     fn presentation_sorts_the_picker_the_way_vs_code_does() {
-        fn p(group: Option<&str>, order: Option<i64>) -> Option<Presentation> {
+        fn p(group: Option<&str>, order: Option<f64>) -> Option<Presentation> {
             Some(Presentation {
                 hidden: false,
                 group: group.map(str::to_string),
@@ -1618,7 +1728,7 @@ mod tests {
         let items: Vec<(&str, Option<Presentation>)> = vec![
             ("plain-first", None),
             ("b-group", p(Some("b"), None)),
-            ("no-group-ord-2", p(None, Some(2))),
+            ("no-group-ord-2", p(None, Some(2.0))),
             (
                 "hidden",
                 Some(Presentation {
@@ -1627,11 +1737,11 @@ mod tests {
                     order: None,
                 }),
             ),
-            ("a-group-ord-9", p(Some("a"), Some(9))),
+            ("a-group-ord-9", p(Some("a"), Some(9.0))),
             ("plain-second", None),
-            ("a-group-ord-1", p(Some("a"), Some(1))),
+            ("a-group-ord-1", p(Some("a"), Some(1.0))),
             ("a-group-no-ord", p(Some("a"), None)),
-            ("no-group-ord-1", p(None, Some(1))),
+            ("no-group-ord-1", p(None, Some(1.0))),
         ];
         let sorted: Vec<&str> = visible_and_sorted(items, |(_, p)| p.as_ref())
             .into_iter()
@@ -1702,7 +1812,7 @@ mod tests {
             Some(Presentation {
                 hidden: false,
                 group: Some(String::from("servers")),
-                order: Some(3),
+                order: Some(3.0),
             })
         );
         assert!(by("Hid").presentation.is_some_and(|p| p.hidden));
