@@ -662,10 +662,11 @@ fn run_pdftoppm(
 /// grace is spent, whichever comes first. The two exits stay distinct
 /// because the CONSTANTS keep them apart - a 12-tick run is 60 ms against a
 /// 200 ms grace - where a clamp used to enforce it for any grace (#548). A
-/// caller passing a grace of 55 ms or less would make the quiet exit
-/// unreachable (50 ms for an empty buffer, which goes quiet a tick sooner);
-/// none does. The 65 ms that used to be quoted here was main's threshold for
-/// when the CLAMP bound, which is a different question. An empty buffer
+/// caller passing a grace of 60 ms or less would make the quiet exit
+/// unreachable (55 ms for an empty buffer, which counts quiet from the first
+/// reading and so completes the run a tick sooner); none does. The 65 ms that
+/// used to be quoted here was main's threshold for when the CLAMP bound,
+/// which is a different question. An empty buffer
 /// counts as quiet, so a silent failure settles just as early. Bytes a
 /// descendant writes after that are not waited for; a reader still blocked
 /// on its copy of the pipe is left to finish on its own. The buffer is
