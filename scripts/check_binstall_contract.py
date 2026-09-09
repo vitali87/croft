@@ -43,6 +43,26 @@ EXPECTED_TARGETS = {
 }
 
 
+def matrix_targets(text: str) -> set:
+    """The triples the build matrix actually names.
+
+    Searching the whole file for each triple answers a different question:
+    whether the NAME appears anywhere. It appears in the artifact-kind
+    assertion's case arms, and it would appear in a comment, so a target
+    dropped from the matrix left this check green while no release carried it
+    (#554). The matrix block is the corpus; a mention outside it is not a
+    build.
+    """
+    block = re.search(
+        r"^\s*matrix:\s*$(.*?)(?=^\s{0,6}\S)",
+        text,
+        re.M | re.S,
+    )
+    if not block:
+        fail("no build matrix in release.yml")
+    return set(re.findall(r"^\s*-\s*target:\s*(\S+)\s*$", block.group(1), re.M))
+
+
 def fail(msg: str) -> None:
     print(f"binstall contract: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -161,7 +181,8 @@ def main() -> None:
         fail("release.yml does not trigger on v* tags, but pkg-url assumes it")
 
     # 5. Every expected target is actually built.
-    missing = sorted(t for t in EXPECTED_TARGETS if t not in workflow)
+    built = matrix_targets(workflow)
+    missing = sorted(EXPECTED_TARGETS - built)
     if missing:
         fail("release.yml does not build " + ", ".join(missing))
 

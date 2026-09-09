@@ -98,6 +98,40 @@ class BinstallContract(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("aarch64-apple-darwin", r.stderr)
 
+    def test_a_dropped_target_is_caught_even_when_its_name_survives(self):
+        """The trap this check fell into (#554).
+
+        The artifact-kind assertion names every triple in a `case` arm, so a
+        target dropped from the MATRIX still appears in the file. Substring
+        searching the whole workflow then reports agreement while no release
+        carries that platform - a check that cannot fail, in the checker
+        written to stop exactly that.
+        """
+        tree = self.build_tree(
+            workflow_sub=("          - target: aarch64-apple-darwin\n", "")
+        )
+        workflow = tree / ".github" / "workflows" / "release.yml"
+        text = workflow.read_text()
+        # The name survives elsewhere, exactly as the real workflow has it.
+        self.assertNotIn("- target: aarch64-apple-darwin", text)
+        workflow.write_text(
+            text.replace(
+                "      - name: Package",
+                "      - name: Assert\n"
+                "        run: |\n"
+                "          case \"$T\" in\n"
+                "            aarch64-apple-darwin) echo mach-o ;;\n"
+                "          esac\n"
+                "      - name: Package",
+                1,
+            )
+        )
+        self.assertIn("aarch64-apple-darwin", workflow.read_text())
+
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("aarch64-apple-darwin", r.stderr)
+
     def test_losing_the_tag_trigger_is_caught(self):
         """pkg-url hard-codes the v-prefixed tag; without the trigger no
         release is ever produced at that URL."""

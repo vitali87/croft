@@ -98,15 +98,28 @@ jobs:
 
       - name: The artifact must exist and be the right kind of binary
         # A cross build that silently produced a host binary is the failure
-        # this catches: `file` names the architecture, so a mismatch here is
-        # a wrong artifact rather than a missing one.
+        # this catches, and catching it means reading the ARCHITECTURE `file`
+        # names, not only the container format. Matching `ELF 64-bit LSB` on
+        # both musl legs let an x86-64 binary pass as aarch64 - the comment
+        # claimed an assertion the check did not make, which is the same
+        # false green as the missing arm below (#551).
         run: |
+          set -euo pipefail
           bin="target/${{ matrix.target }}/release/croft"
-          test -x "$bin"
+          test -x "$bin" || { echo "::error::no artifact at $bin"; exit 1; }
           file "$bin"
+          # Exact triples, not suffixes: a typo in a matrix target then reaches
+          # the catch-all rather than silently matching `*-linux-musl`.
           case "${{ matrix.target }}" in
-            *-linux-musl) file "$bin" | grep -q 'ELF 64-bit LSB' ;;
-            *-apple-darwin) file "$bin" | grep -q 'Mach-O 64-bit' ;;
+            x86_64-unknown-linux-musl)  file "$bin" | grep -qE 'ELF 64-bit LSB.*x86-64' ;;
+            aarch64-unknown-linux-musl) file "$bin" | grep -qE 'ELF 64-bit LSB.*aarch64' ;;
+            x86_64-apple-darwin)        file "$bin" | grep -qE 'Mach-O 64-bit.*x86_64' ;;
+            aarch64-apple-darwin)       file "$bin" | grep -qE 'Mach-O 64-bit.*arm64' ;;
+            # A `case` with no match exits 0, so without this arm the whole
+            # assertion becomes a silent no-op for any target the list does
+            # not name - green step, unchecked artifact (#551). Adding a
+            # target now has to add its assertion.
+            *) echo "::error::no artifact-kind assertion for ${{ matrix.target }}"; exit 1 ;;
           esac
 
       - name: Package
