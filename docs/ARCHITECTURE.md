@@ -693,6 +693,10 @@ PDF rasteriser. It prefers `pdftoppm` (poppler) and falls back to macOS `sips`.
 
 **Where links go.** External URLs open with the OS opener behind an http/https/mailto allowlist. A document-supplied `file://` or custom scheme is a one-click app launch and is dropped. Internal GoTo targets flip the page.
 
+**The renderer's stderr is read from one place, without blocking (#553).** A reader thread published it chunk by chunk, which was right about the constraint — the pipe only reaches end of file once every holder of its write end is gone, and a descendant the renderer forked can hold it long after the renderer exited — but it made the answer depend on that thread being SCHEDULED. Measured on a loaded machine, the renderer's second line was still in the pipe when the poll gave up, so a failing render reported its generic first line and dropped the specific cause.
+
+The pipe is non-blocking now and drained by the same loop that waits for the exit. Everything the renderer itself wrote is in the pipe by the time it exits, so a drain-until-`WouldBlock` after the exit takes all of it with no window to lose. `WouldBlock` means "nothing more available", not "nothing more coming" — the distinction a blocking read cannot make, and the reason end-of-file was never usable here. The settle poll survives only for a DESCENDANT's late writes, which is generosity rather than the thing standing between the user and half an error.
+
 **Extraction is lazy.** Text-anchored links only, extracted on first click and re-extracted after a page flip.
 
 **FS-sync reload keeps your place in one rasterisation.** When pdflatex rebuilds the open file, the reader comes up on its current page in a single render: `open_pdf` consumes the editor's `pdf_restore_page` request, clamped to the fresh page count. Restoring the page with a *second* render after the open left a window where that render's transient failure silently snapped the reader to page 1. Now such a failure fails the whole open, and the failed-reload path keeps both the last good render and the place.
