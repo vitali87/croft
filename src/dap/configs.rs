@@ -312,7 +312,9 @@ fn compare_orders(first: Option<f64>, second: Option<f64>) -> std::cmp::Ordering
         // `total_cmp` rather than `partial_cmp` with a fallback: JSON cannot
         // carry a NaN, but a comparator that answered `Equal` for one would
         // break transitivity, which `sort_by` panics on. A total order has no
-        // such arm to get wrong.
+        // such arm to get wrong. It orders `-0.0` before `0.0` where VS Code's
+        // subtraction calls them equal; `"order": -0.0` is expressible and
+        // nothing else about the two differs.
         (Some(a), Some(b)) => a.total_cmp(&b),
     }
 }
@@ -352,11 +354,14 @@ pub struct Compound {
     /// `presentation` that is not an object, or a `hidden`, `group` or
     /// `order` that is not a bool, string or number respectively.
     ///
-    /// A key present but requesting nothing (`null`, `false`, `""`, and an
-    /// empty `presentation` object) is not recorded — croft delivers that
-    /// behaviour by doing nothing. A MALFORMED one is recorded rather than
-    /// ignored: `{"hidden": "true"}` is the likely typo here, and launching
-    /// it unhidden with no signal is worse than the refusal it replaces.
+    /// A `presentation` that is `null`, `false`, `""` or empty is not
+    /// recorded: the first three ask for nothing, and an empty block asks
+    /// only to be DECLARED, which the sort reads (it places such a row ahead
+    /// of one carrying no block, as VS Code does). Inside the block only
+    /// `null` is carved out, so `{"order": false}` IS recorded. A MALFORMED
+    /// value is recorded rather than ignored: `{"hidden": "true"}` is the
+    /// likely typo here, and launching it unhidden with no signal is worse
+    /// than the refusal it replaces.
     ///
     /// A mistyped KEY (`{"grup": "a"}`) is still ignored in silence, on
     /// purpose: enumerating unknown keys would refuse whatever VS Code adds
@@ -459,10 +464,11 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // naming it as a reason to refuse would report a limitation croft
             // no longer has. Its VALUE is captured instead - the key alone was
             // enough to refuse and is not enough to run anything.
-            // `presentation` is no longer refused wholesale (#318). Only the
-            // parts croft cannot deliver are: `hidden` is a row filter and is
-            // honoured below, while `group` and `order` want a picker
-            // ordering that does not exist. Testing the SUB-KEYS rather than
+            // `presentation` is no longer refused wholesale (#318): `hidden`
+            // is a row filter and `group`/`order` place the row, all three
+            // honoured by the picker's sort. Testing the SUB-KEYS rather than
+            // the parent is what lets `{"hidden": true}` alone launch instead
+            // of being refused for a capability it never asked for. Testing the SUB-KEYS rather than
             // the parent means `{"hidden": true}` alone launches instead of
             // being refused for a capability it never asked for.
             let presentation = parse_presentation(obj);

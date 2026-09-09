@@ -24376,9 +24376,13 @@ impl App {
                                 // launching branch below exists to stop making.
                                 //
                                 // The remedy names both ways out: fix the
-                                // value, or run the member directly and
-                                // accept that doing so skips the compound's
-                                // own preLaunchTask.
+                                // value, or run the member directly. Running
+                                // it directly DOES skip the compound's own
+                                // preLaunchTask, which the message leaves
+                                // unsaid on purpose - a test pins that the
+                                // status never mentions preLaunchTask, since
+                                // naming it here would read as advice to
+                                // accept the skip.
                                 // Up to three keys can be listed now, so
                                 // "a and b and c" would read as one run-on;
                                 // the last pair keeps the "and".
