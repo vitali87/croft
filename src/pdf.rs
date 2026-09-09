@@ -488,7 +488,9 @@ fn record_settle(outcome: SettleOutcome) {
 }
 
 /// How the settle poll on this thread last ended, for a failure message.
-#[cfg(test)]
+/// `unix` too: the only consumer is a test gated on it, and a non-unix test
+/// build would otherwise warn this dead.
+#[cfg(all(test, unix))]
 fn last_settle() -> String {
     match LAST_SETTLE.with(std::cell::Cell::get) {
         Some(o) => format!(
@@ -658,9 +660,11 @@ fn run_pdftoppm(
 /// so the buffer is polled every 5 ms and read once it has been quiet for a
 /// run of ticks long enough to bridge a scheduling gap between two writes
 /// (a shorter run settled early and lost the second write), or once the
-/// grace is spent, whichever comes first: the run is strictly shorter than
-/// the grace, so a renderer whose stderr was complete at exit settles
-/// early and the deadline stays the independent backstop. An empty buffer
+/// grace is spent, whichever comes first. The two exits stay distinct
+/// because the CONSTANTS keep them apart - a 12-tick run is 60 ms against a
+/// 200 ms grace - where a clamp used to enforce it for any grace (#548). A
+/// caller passing a grace under ~65 ms would make the quiet exit
+/// unreachable; none does. An empty buffer
 /// counts as quiet, so a silent failure settles just as early. Bytes a
 /// descendant writes after that are not waited for; a reader still blocked
 /// on its copy of the pipe is left to finish on its own. The buffer is
@@ -672,7 +676,16 @@ fn settle_stderr(
 ) -> String {
     let started = std::time::Instant::now();
     let deadline = started + grace;
-    let (text, on_quiet) = settle_over(QUIET_RUN_TICKS, |_| {
+    let (text, on_quiet) = settle_over(QUIET_RUN_TICKS, |tick| {
+        // The sleep belongs BEFORE the read, not after it. Sleeping after
+        // means the reading that settles the poll has already been taken, so
+        // the extra tick collects nothing and every quiet exit costs 5 ms
+        // more than the loop this replaced: measured at 13 polls and 13
+        // sleeps against that loop's 13 and 12. Reading at 5k ms is what it
+        // did, tick for tick.
+        if tick > 0 {
+            std::thread::sleep(SETTLE_TICK);
+        }
         let text = buf
             .lock()
             .map(|b| String::from_utf8_lossy(&b).trim().to_string())
@@ -680,7 +693,6 @@ fn settle_stderr(
         if std::time::Instant::now() >= deadline {
             return Sample::Last(text);
         }
-        std::thread::sleep(SETTLE_TICK);
         Sample::More(text)
     });
     #[cfg(test)]
@@ -689,6 +701,7 @@ fn settle_stderr(
         on_quiet,
         bytes: text.len(),
     });
+    // Read only under `cfg(test)`, by the recording above.
     let _ = on_quiet;
     text
 }
@@ -714,6 +727,11 @@ enum Sample {
 /// this issue is about. Worse, the wall-clock test could not pin
 /// `QUIET_RUN_TICKS` at all: the run was silently clamped to a function of the
 /// grace, so the constant could be cut in half and every test still passed.
+///
+/// TERMINATION IS THE CALLER'S: this loops until the buffer goes quiet or the
+/// sampler says `Last`, so a sampler that never says `Last` while the text
+/// keeps changing never returns. Production guarantees it with the deadline
+/// check; the test bounds its script.
 fn settle_over(quiet_run: u32, mut sample: impl FnMut(u32) -> Sample) -> (String, bool) {
     let quiet_run = quiet_run.max(1);
     let mut seen = 0usize;
@@ -941,10 +959,14 @@ mod tests {
         );
     }
 
-    /// A renderer whose stderr arrives in two bursts a scheduling gap apart,
-    /// the second from a helper that writes just after the renderer exits,
-    /// has both reported: the grace poll waits for a run of quiet ticks, not
-    /// for the first lull.
+    /// A renderer that fails has its stderr and its exit status in the
+    /// error, rather than sprayed over the TUI.
+    ///
+    /// It no longer asserts the SECOND of two bursts: whether a write landing
+    /// after the exit arrives inside the settle window is a race this test
+    /// cannot win on a loaded machine (#548). That property is asked of the
+    /// rule directly in
+    /// [`the_settle_rule_bridges_a_gap_shorter_than_the_quiet_run`].
     #[cfg(unix)]
     #[test]
     fn a_failing_pdftoppm_reports_the_stderr_it_sprayed() {
@@ -965,7 +987,9 @@ mod tests {
         );
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-        for _ in 0..5 {
+        // Once, not five times: the repeat existed to shake out the flaky
+        // second-burst assertion, and what is left is deterministic.
+        {
             let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
                 .expect_err("a non-zero exit is a failure");
             let text = err.to_string();
@@ -981,10 +1005,12 @@ mod tests {
         }
     }
 
-    /// The grace poll bridges a scheduling gap: a second line appended a
-    /// few ticks after the first, long after a one-tick poll would have
-    /// settled, is still collected. Pure threads, no spawned process, so
-    /// the constants are the poll's own and not a spawn wait.
+    /// The settle rule bridges a gap shorter than its quiet run and does not
+    /// wait for one longer, which is what `QUIET_RUN_TICKS` means.
+    ///
+    /// Scripted by TICK INDEX, with no threads and no clock: the readings are
+    /// stated rather than raced for, so the rule is what is under test and
+    /// the host's scheduling cannot decide the result.
     #[test]
     fn the_settle_rule_bridges_a_gap_shorter_than_the_quiet_run() {
         // Ticks, not a clock (#548). The wall-clock version of this raced
@@ -1001,7 +1027,10 @@ mod tests {
         // moves with the constant and holds for any value it takes, which a
         // re-break caught - halving the constant left this test green.
         // Written as numbers, the pair straddles the production run, so the
-        // constant cannot move in either direction without this failing.
+        // constant cannot move far in either direction without this failing.
+        // Measured tolerance: this accepts a run of 10 through 14, and 12
+        // sits in the middle, so it is a bound with two ticks of slack rather
+        // than an exact pin.
         let script = |gap: u32| {
             move |tick: u32| {
                 let text = if tick < gap {
