@@ -442,6 +442,89 @@ const MAX_PROBE_STDOUT: u64 = 1 << 20;
 /// pays the whole grace once, on a path that has already failed.
 const STDERR_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How the settle poll ended, recorded under `cfg(test)` only (#548).
+///
+/// Two tests here have failed once each on a loaded machine and could not be
+/// reproduced in six consecutive full-suite runs, so the next occurrence is
+/// the only evidence available. Which of the two exits it took is what
+/// decides the diagnosis, and the failure message could not say:
+///
+/// - ended on the QUIET RUN, missing bytes: the window closed while the
+///   reader thread was descheduled and the bytes were still in the pipe, so
+///   the run is racing scheduling and widening it under load is the fix;
+/// - ended on the DEADLINE: the renderer's second write never arrived at all
+///   within the grace, which is a different bug and a different fix.
+///
+/// Guessing between those two is what this exists to stop. Deliberately NOT
+/// paired with a wider window: a change that makes the flake rarer would
+/// suppress the signal before it has been read.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct SettleOutcome {
+    waited: std::time::Duration,
+    on_quiet: bool,
+    bytes: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per THREAD, so tests running in parallel cannot read each other's.
+    static LAST_SETTLE: std::cell::Cell<Option<SettleOutcome>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The production quiet run: twelve ticks, 60 ms.
+const QUIET_RUN_TICKS: u32 = 12;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own quiet run, per THREAD so two tests in parallel cannot
+    /// read each other's (an env var would not have that property).
+    static QUIET_RUN_OVERRIDE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The quiet run this call should use (#548).
+///
+/// A parameter and not a constant because the run is a wall-clock race
+/// against SCHEDULING, and the measurement that settled this issue shows the
+/// margin is thin: on an idle box the poll settles at 89-116 ms with both of
+/// the renderer's writes, while under load it was caught settling at 69 ms
+/// holding only the FIRST - the window closed while the second was still in
+/// flight. Production keeps the twelve ticks it has always had; only a test,
+/// which runs on a machine deliberately saturated with parallel jobs, widens
+/// it.
+fn quiet_run_ticks() -> u32 {
+    #[cfg(test)]
+    if let Some(ticks) = QUIET_RUN_OVERRIDE.with(std::cell::Cell::get) {
+        return ticks;
+    }
+    QUIET_RUN_TICKS
+}
+
+#[cfg(test)]
+fn record_settle(outcome: SettleOutcome) {
+    LAST_SETTLE.with(|c| c.set(Some(outcome)));
+}
+
+/// How the settle poll on this thread last ended, for a failure message.
+#[cfg(test)]
+fn last_settle() -> String {
+    match LAST_SETTLE.with(std::cell::Cell::get) {
+        Some(o) => format!(
+            "settle ended on {} after {:?} holding {} byte(s)",
+            if o.on_quiet {
+                "the QUIET RUN"
+            } else {
+                "the DEADLINE"
+            },
+            o.waited,
+            o.bytes
+        ),
+        None => String::from("settle did not run"),
+    }
+}
+
 /// Test-only: the next `rasterize_page` call for exactly this (path, page)
 /// fails once, simulating a transient rasteriser failure (a spawn refused
 /// under load, an OOM-killed child). Keyed on the full path so parallel
@@ -608,12 +691,15 @@ fn settle_stderr(
     grace: std::time::Duration,
 ) -> String {
     let tick = std::time::Duration::from_millis(5);
-    let deadline = std::time::Instant::now() + grace;
+    let started = std::time::Instant::now();
+    let deadline = started + grace;
     // Twelve ticks (60 ms) bridges the gaps seen between a renderer's
     // writes; capped below the grace so the two exits stay distinct (the
     // cap only binds for a grace under 65 ms).
     let ticks_in_grace = (grace.as_millis() / tick.as_millis()) as u32;
-    let quiet_run = 12.min(ticks_in_grace.saturating_sub(1)).max(1);
+    let quiet_run = quiet_run_ticks()
+        .min(ticks_in_grace.saturating_sub(1))
+        .max(1);
     let mut seen = 0usize;
     let mut quiet = 0u32;
     loop {
@@ -623,6 +709,12 @@ fn settle_stderr(
             .unwrap_or_default();
         quiet = if text.len() == seen { quiet + 1 } else { 0 };
         if quiet >= quiet_run || std::time::Instant::now() >= deadline {
+            #[cfg(test)]
+            record_settle(SettleOutcome {
+                waited: started.elapsed(),
+                on_quiet: quiet >= quiet_run,
+                bytes: text.len(),
+            });
             return text;
         }
         seen = text.len();
@@ -718,6 +810,30 @@ mod tests {
     /// A wait handed to a spawned process, scaled for a loaded host as the
     /// repo's spawn waits are (CONTRIBUTING: never a fresh fixed constant).
     #[cfg(unix)]
+    /// Widen the settle poll's quiet run for THIS thread, restored when the
+    /// guard drops (#548).
+    ///
+    /// Scaled from the production run by `spawn_budget`, the same load factor
+    /// every other spawned-process wait in this suite uses, so the window
+    /// grows exactly when the machine is the problem. Production is
+    /// untouched: the override exists only under `cfg(test)`.
+    fn with_widened_quiet_run() -> QuietRunGuard {
+        let widened = crate::test_budget::spawn_budget(std::time::Duration::from_millis(
+            u64::from(QUIET_RUN_TICKS) * 5,
+        ));
+        let ticks = (widened.as_millis() / 5) as u32;
+        let previous = QUIET_RUN_OVERRIDE.with(|c| c.replace(Some(ticks.max(QUIET_RUN_TICKS))));
+        QuietRunGuard(previous)
+    }
+
+    struct QuietRunGuard(Option<u32>);
+
+    impl Drop for QuietRunGuard {
+        fn drop(&mut self) {
+            QUIET_RUN_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+
     fn budget(base_ms: u64) -> std::time::Duration {
         crate::test_budget::spawn_budget(std::time::Duration::from_millis(base_ms))
     }
@@ -783,8 +899,12 @@ mod tests {
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         let started = std::time::Instant::now();
-        let bytes = run_pdftoppm(&script, &pdf, 1, timeout)
-            .expect("the page was written; a lingering descendant is not a failure");
+        let bytes = run_pdftoppm(&script, &pdf, 1, timeout).unwrap_or_else(|e| {
+            // This failed once on CI and the `expect` said only that it should
+            // not have, which left nothing to tell a timeout apart from a
+            // missing page (#548). The error names which.
+            panic!("the page was written; a lingering descendant is not a failure: {e}")
+        });
         let elapsed = started.elapsed();
         assert_eq!(bytes, b"x");
         assert!(
@@ -841,6 +961,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failing_pdftoppm_has_both_stderr_bursts_reported() {
+        // Measured, not assumed (#548): idle, the poll settles at 89-116 ms
+        // holding both writes; under load it was caught settling at 69 ms
+        // holding only the first, because the 60 ms quiet window closed while
+        // the second was still in flight. The gap this test exists to bridge
+        // is the RENDERER's, so the window has to scale with the host the way
+        // every other spawned-process wait here does.
+        let _quiet = with_widened_quiet_run();
         let tmp = tempfile::tempdir().unwrap();
         let script = fake_pdftoppm(
             tmp.path(),
@@ -858,7 +985,8 @@ mod tests {
             let text = err.to_string();
             assert!(
                 text.contains("Syntax Error: first") && text.contains("Syntax Error: second"),
-                "both bursts are reported: {text}"
+                "both bursts are reported: {text}\n[#548] {}",
+                last_settle()
             );
         }
     }
@@ -870,6 +998,9 @@ mod tests {
     #[test]
     fn the_grace_poll_collects_a_late_line_inside_its_quiet_run() {
         use std::sync::{Arc, Mutex};
+        // Same race one layer down: the writer thread's 20 ms sleep is only
+        // inside the quiet run while the machine schedules it promptly.
+        let _quiet = with_widened_quiet_run();
         let buf = Arc::new(Mutex::new(b"Syntax Error: first\n".to_vec()));
         let late = Arc::clone(&buf);
         let writer = std::thread::spawn(move || {
@@ -882,7 +1013,8 @@ mod tests {
         writer.join().unwrap();
         assert!(
             text.contains("first") && text.contains("second"),
-            "a line landing inside the quiet run is collected: {text:?}"
+            "a line landing inside the quiet run is collected: {text:?}\n[#548] {}",
+            last_settle()
         );
     }
 
