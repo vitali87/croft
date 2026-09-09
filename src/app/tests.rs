@@ -39148,7 +39148,8 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         ],
         "compounds": [
             { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" },
-            { "name": "Presented", "configurations": ["Server"], "presentation": { "order": 2 } }
+            { "name": "Presented", "configurations": ["Server"],
+              "presentation": { "hidden": "true" } }
         ]}"#,
     )
     .unwrap();
@@ -39191,11 +39192,11 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
     );
 
     // The guard that must stay GREEN: honouring one key must not be
-    // satisfiable by launching everything. `presentation.order` is still
-    // unhonoured, so a compound asking for it is still refused, and the
-    // refusal must name THAT key rather than one croft now runs -- and
-    // `hidden` is one of those now (#318), which is why the fixture uses
-    // `order` and the assertion below rejects the parent name.
+    // satisfiable by launching everything. Since #318 finished, `hidden`,
+    // `group` and `order` are all honoured, so the only shapes left to carry
+    // this guard are the MALFORMED ones. `{"hidden": "true"}` is the likely
+    // typo: a quoted bool croft cannot read, which must refuse rather than
+    // launch unhidden in silence.
     let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
     select(&mut fresh, "Presented");
     assert!(
@@ -39204,22 +39205,21 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         fresh.run_debug.feedback
     );
     // The message names the SUB-KEY, not `presentation` (#318). That is the
-    // point of the split: `hidden` is honoured now, so telling a user that
-    // "presentation" is unsupported would be wrong for half the key and
-    // would send them deleting a line that works.
+    // point of the split: a compound may declare a working `group` beside a
+    // malformed `hidden`, so telling the user that "presentation" is
+    // unsupported would send them deleting a line that works.
     assert!(
-        fresh.status.contains("presentation.order"),
-        "and names the key it cannot honour: {}",
+        fresh.status.contains("presentation.hidden"),
+        "and names the key it cannot read: {}",
         fresh.status
     );
-    // The BARE parent would overstate it -- `hidden` is honoured, so "sets
-    // presentation" would send a user deleting a line that works. The
-    // qualified path is what they can find in the file, so the check is
-    // that `presentation` never appears WITHOUT its sub-key.
+    // The BARE parent would overstate it, for the same reason. The qualified
+    // path is what they can find in the file, so the check is that
+    // `presentation` never appears WITHOUT its sub-key.
     assert!(
         !fresh
             .status
-            .replace("presentation.order", "")
+            .replace("presentation.hidden", "")
             .contains("presentation"),
         "the parent is named only as part of the qualified path: {}",
         fresh.status
@@ -43956,6 +43956,109 @@ fn the_config_row_does_not_count_a_hidden_compound() {
         "and the picker lists it: {:?}",
         picker.rows.iter().map(|r| &r.id).collect::<Vec<_>>()
     );
+}
+
+/// #318: a CONFIGURATION can ask to be hidden too, and the picker and its
+/// badge must agree about that the way they already do for a compound.
+/// Deleting the configuration half of the filter left the whole suite green.
+#[test]
+fn a_hidden_configuration_leaves_both_the_picker_and_the_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"{
+          "configurations": [
+            { "name": "Shown", "type": "lldb", "request": "launch", "program": "/bin/ls" },
+            { "name": "Hid", "type": "lldb", "request": "launch", "program": "/bin/ls",
+              "presentation": { "hidden": true } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.refresh_run_debug();
+    assert_eq!(
+        crate::dap::configs::discover_configs(tmp.path()).len(),
+        2,
+        "fixture: both configurations parse, so the count below isolates hiding"
+    );
+    assert_eq!(
+        app.run_debug.config_count, 1,
+        "the hidden configuration is not an entry the row offers"
+    );
+    app.open_debug_config_picker();
+    let labels: Vec<String> = app
+        .list_picker
+        .as_ref()
+        .expect("the picker opened")
+        .rows
+        .iter()
+        .map(|r| r.label.clone())
+        .collect();
+    assert!(
+        labels.iter().any(|l| l.starts_with("Shown")),
+        "the visible one is listed: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l.starts_with("Hid")),
+        "and the hidden one is not: {labels:?}"
+    );
+}
+
+/// #318: the row ids are built from the UNSORTED lists, so a row keeps naming
+/// the entry it says even after `presentation` reorders the picker. Indexing
+/// the sorted sequence instead would launch a different configuration than
+/// the row names, which is the trap the module doc calls out and which no
+/// test covered while only the hidden filter was exercised.
+#[test]
+fn a_reordering_presentation_leaves_every_row_naming_its_own_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    // "Last" is declared third and asks to be first, so a sorted-index bug
+    // cannot hide behind the entries happening to already be in order.
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"{
+          "configurations": [
+            { "name": "First", "type": "lldb", "request": "launch", "program": "/bin/ls" },
+            { "name": "Second", "type": "lldb", "request": "launch", "program": "/bin/ls" },
+            { "name": "Last", "type": "lldb", "request": "launch", "program": "/bin/ls",
+              "presentation": { "order": 1 } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_debug_config_picker();
+    let rows: Vec<(String, String)> = app
+        .list_picker
+        .as_ref()
+        .expect("the picker opened")
+        .rows
+        .iter()
+        .map(|r| (r.id.clone(), r.label.clone()))
+        .collect();
+    let configs = crate::dap::configs::discover_configs(tmp.path());
+    let ordered: Vec<&str> = rows
+        .iter()
+        .filter(|(id, _)| id != "active")
+        .map(|(_, label)| label.split(' ').next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        ordered,
+        vec!["Last", "First", "Second"],
+        "precondition: the presentation actually moved a row"
+    );
+    // The claim: every id still indexes the entry whose name the row shows.
+    for (id, label) in rows.iter().filter(|(id, _)| id != "active") {
+        let idx: usize = id.parse().expect("a configuration row's id is its index");
+        assert!(
+            label.starts_with(&configs[idx].name),
+            "row {id:?} says {label:?} but index {idx} is {:?}",
+            configs[idx].name
+        );
+    }
 }
 
 /// A compound asking `presentation.hidden` is not listed, and hiding one
