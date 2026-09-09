@@ -24354,10 +24354,11 @@ impl App {
                             Err(e) => self.debug_error(e),
                             // A one-member compound carrying keys croft does
                             // not honour is REFUSED rather than launched.
-                            // Since #318 completed, only MALFORMED shapes
-                            // remain: a `presentation` that is not an object,
-                            // or a `hidden` that is not a bool. Every key that
-                            // says something croft can act on is honoured -
+                            // Since #318 completed, only VALUES croft cannot
+                            // READ remain: a `presentation` that is not an
+                            // object, or a `hidden`/`group`/`order` that is
+                            // not a bool/string/number. Every key that says
+                            // something croft can act on is honoured -
                             // `preLaunchTask` by the branch below, `hidden`,
                             // `group` and `order` by the picker's sort.
                             // Launching while ignoring what the compound asked
@@ -24374,12 +24375,20 @@ impl App {
                                 // limit here would be the same false claim the
                                 // launching branch below exists to stop making.
                                 //
-                                // The remedy is stated with its cost: running
-                                // the member directly DOES skip a preLaunchTask,
-                                // which is the very outcome this refusal
-                                // prevents. Offering it silently would relocate
-                                // the bug onto the user.
-                                let keys = compound.unsupported_keys.join(" and ");
+                                // The remedy names both ways out: fix the
+                                // value, or run the member directly and
+                                // accept that doing so skips the compound's
+                                // own preLaunchTask.
+                                // Up to three keys can be listed now, so
+                                // "a and b and c" would read as one run-on;
+                                // the last pair keeps the "and".
+                                let keys = match compound.unsupported_keys.split_last() {
+                                    Some((last, [])) => (*last).to_string(),
+                                    Some((last, rest)) => {
+                                        format!("{} and {last}", rest.join(", "))
+                                    }
+                                    None => String::new(),
+                                };
                                 let plural = if compound.unsupported_keys.len() > 1 {
                                     "those keys"
                                 } else {

@@ -43958,6 +43958,109 @@ fn the_config_row_does_not_count_a_hidden_compound() {
     );
 }
 
+/// #318: a CONFIGURATION can ask to be hidden too, and the picker and its
+/// badge must agree about that the way they already do for a compound.
+/// Deleting the configuration half of the filter left the whole suite green.
+#[test]
+fn a_hidden_configuration_leaves_both_the_picker_and_the_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"{
+          "configurations": [
+            { "name": "Shown", "type": "lldb", "request": "launch", "program": "/bin/ls" },
+            { "name": "Hid", "type": "lldb", "request": "launch", "program": "/bin/ls",
+              "presentation": { "hidden": true } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.refresh_run_debug();
+    assert_eq!(
+        crate::dap::configs::discover_configs(tmp.path()).len(),
+        2,
+        "fixture: both configurations parse, so the count below isolates hiding"
+    );
+    assert_eq!(
+        app.run_debug.config_count, 1,
+        "the hidden configuration is not an entry the row offers"
+    );
+    app.open_debug_config_picker();
+    let labels: Vec<String> = app
+        .list_picker
+        .as_ref()
+        .expect("the picker opened")
+        .rows
+        .iter()
+        .map(|r| r.label.clone())
+        .collect();
+    assert!(
+        labels.iter().any(|l| l.starts_with("Shown")),
+        "the visible one is listed: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l.starts_with("Hid")),
+        "and the hidden one is not: {labels:?}"
+    );
+}
+
+/// #318: the row ids are built from the UNSORTED lists, so a row keeps naming
+/// the entry it says even after `presentation` reorders the picker. Indexing
+/// the sorted sequence instead would launch a different configuration than
+/// the row names, which is the trap the module doc calls out and which no
+/// test covered while only the hidden filter was exercised.
+#[test]
+fn a_reordering_presentation_leaves_every_row_naming_its_own_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    // "Last" is declared third and asks to be first, so a sorted-index bug
+    // cannot hide behind the entries happening to already be in order.
+    std::fs::write(
+        tmp.path().join(".croft/launch.json"),
+        r#"{
+          "configurations": [
+            { "name": "First", "type": "lldb", "request": "launch", "program": "/bin/ls" },
+            { "name": "Second", "type": "lldb", "request": "launch", "program": "/bin/ls" },
+            { "name": "Last", "type": "lldb", "request": "launch", "program": "/bin/ls",
+              "presentation": { "order": 1 } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_debug_config_picker();
+    let rows: Vec<(String, String)> = app
+        .list_picker
+        .as_ref()
+        .expect("the picker opened")
+        .rows
+        .iter()
+        .map(|r| (r.id.clone(), r.label.clone()))
+        .collect();
+    let configs = crate::dap::configs::discover_configs(tmp.path());
+    let ordered: Vec<&str> = rows
+        .iter()
+        .filter(|(id, _)| id != "active")
+        .map(|(_, label)| label.split(' ').next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        ordered,
+        vec!["Last", "First", "Second"],
+        "precondition: the presentation actually moved a row"
+    );
+    // The claim: every id still indexes the entry whose name the row shows.
+    for (id, label) in rows.iter().filter(|(id, _)| id != "active") {
+        let idx: usize = id.parse().expect("a configuration row's id is its index");
+        assert!(
+            label.starts_with(&configs[idx].name),
+            "row {id:?} says {label:?} but index {idx} is {:?}",
+            configs[idx].name
+        );
+    }
+}
+
 /// A compound asking `presentation.hidden` is not listed, and hiding one
 /// does not misdirect the rows that remain (#318).
 ///

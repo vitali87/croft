@@ -30,10 +30,11 @@ pub enum RequestKind {
 /// One configuration as read from a launch.json, unresolved: substitution
 /// variables still in place, every field kept in `raw`. Resolution happens at
 /// F5 time (in [`resolve`]) because `${file}` depends on the active editor.
-// `Eq` is intentionally not derived: `presentation.order` is a `f64`, which
-// is only `PartialEq` (floats break total equality), for the same reason
-// `ResolvedConfig` below drops it. Neither type is ever a map key, so
-// `PartialEq` is all the call sites and tests need.
+// `Eq` is intentionally not derived: `presentation.order` is a `f64`, and
+// floats break total equality. (`ResolvedConfig` below DOES derive `Eq` - it
+// carries no float - so it is not the precedent this looks like.) None of
+// these is ever a map key, so `PartialEq` is all the call sites and tests
+// need.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DebugConfig {
     pub name: String,
@@ -148,10 +149,11 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
 /// A `presentation` block, as declared on a configuration OR a compound
 /// (#318). VS Code reads the same three keys in both places and sorts the two
 /// kinds together in one list, so croft parses it in both too.
-// `Eq` is intentionally not derived: `presentation.order` is a `f64`, which
-// is only `PartialEq` (floats break total equality), for the same reason
-// `ResolvedConfig` below drops it. Neither type is ever a map key, so
-// `PartialEq` is all the call sites and tests need.
+// `Eq` is intentionally not derived: `presentation.order` is a `f64`, and
+// floats break total equality. (`ResolvedConfig` below DOES derive `Eq` - it
+// carries no float - so it is not the precedent this looks like.) None of
+// these is ever a map key, so `PartialEq` is all the call sites and tests
+// need.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Presentation {
     /// Do not list this entry in the picker.
@@ -168,12 +170,17 @@ pub struct Presentation {
     pub order: Option<f64>,
 }
 
-/// Read a `presentation` block, if the entry declares a usable one.
+/// Read a `presentation` block, if the entry declares one at all.
 ///
-/// `None` for absent, non-object, or empty - each means "no preference", and
-/// the difference matters: VS Code sorts an entry that HAS a presentation
-/// ahead of one that has none, so inventing an empty block here would move
-/// rows that asked for nothing.
+/// `None` only for ABSENT or unreadable. An empty block is still a block:
+/// VS Code's comparator tests the object itself for truthiness (`if
+/// (!first.presentation) … return 1`), so `{}` is truthy there and does sort
+/// ahead of an entry carrying no block. Returning `None` for it would place
+/// those rows differently than VS Code places them, which is the one thing a
+/// transcription must not do.
+///
+/// The INNER checks stay truthiness-based, matching the same comparator: an
+/// empty-string `group` is no group.
 pub fn parse_presentation(obj: &Map<String, Value>) -> Option<Presentation> {
     let p = obj.get("presentation")?.as_object()?;
     let hidden = p.get("hidden").and_then(Value::as_bool).unwrap_or(false);
@@ -183,9 +190,6 @@ pub fn parse_presentation(obj: &Map<String, Value>) -> Option<Presentation> {
         .filter(|g| !g.is_empty())
         .map(str::to_string);
     let order = p.get("order").and_then(Value::as_f64);
-    if !hidden && group.is_none() && order.is_none() {
-        return None;
-    }
     Some(Presentation {
         hidden,
         group,
@@ -208,7 +212,13 @@ pub fn malformed_presentation_keys(obj: &Map<String, Value>) -> Vec<&'static str
     let Some(value) = obj.get("presentation") else {
         return Vec::new();
     };
-    if value.is_null() {
+    // A key that REQUESTS NOTHING is honoured by doing nothing, and naming it
+    // in a refusal would report a limitation croft does not have. `null`,
+    // `false` and `""` are that shape; this list is the same one
+    // `asks_for_something` applies to the sibling keys, kept in step with it
+    // on purpose.
+    if value.is_null() || value == &Value::Bool(false) || value.as_str().is_some_and(str::is_empty)
+    {
         return Vec::new();
     }
     let Some(p) = value.as_object() else {
@@ -299,9 +309,11 @@ fn compare_orders(first: Option<f64>, second: Option<f64>) -> std::cmp::Ordering
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (Some(_), None) => std::cmp::Ordering::Less,
-        // JSON cannot carry a NaN, so the fallback is unreachable in practice
-        // and `Equal` leaves the stable sort to keep file order if it ever is.
-        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+        // `total_cmp` rather than `partial_cmp` with a fallback: JSON cannot
+        // carry a NaN, but a comparator that answered `Equal` for one would
+        // break transitivity, which `sort_by` panics on. A total order has no
+        // such arm to get wrong.
+        (Some(a), Some(b)) => a.total_cmp(&b),
     }
 }
 
@@ -309,10 +321,11 @@ fn compare_orders(first: Option<f64>, second: Option<f64>) -> std::cmp::Ordering
 /// name. Members are stored as written and resolved against the file's
 /// `configurations` at launch time, so a compound naming a configuration that
 /// is later renamed fails loudly rather than launching a subset.
-// `Eq` is intentionally not derived: `presentation.order` is a `f64`, which
-// is only `PartialEq` (floats break total equality), for the same reason
-// `ResolvedConfig` below drops it. Neither type is ever a map key, so
-// `PartialEq` is all the call sites and tests need.
+// `Eq` is intentionally not derived: `presentation.order` is a `f64`, and
+// floats break total equality. (`ResolvedConfig` below DOES derive `Eq` - it
+// carries no float - so it is not the precedent this looks like.) None of
+// these is ever a map key, so `PartialEq` is all the call sites and tests
+// need.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Compound {
     pub name: String,
@@ -335,15 +348,19 @@ pub struct Compound {
     pub presentation: Option<Presentation>,
     /// Keys croft does not honour that this compound ACTUALLY ASKS FOR,
     /// named with their parent so they can be found in the file. Since #318
-    /// honoured `group` and `order`, only the MALFORMED shapes remain:
-    /// `presentation` (present but not an object) and `presentation.hidden`
-    /// (present but not a boolean).
+    /// honoured all three, only VALUES croft cannot READ remain: a
+    /// `presentation` that is not an object, or a `hidden`, `group` or
+    /// `order` that is not a bool, string or number respectively.
     ///
-    /// A key present but requesting nothing (`null`, `""`, and an empty
-    /// `presentation` object) is not recorded — croft delivers that
+    /// A key present but requesting nothing (`null`, `false`, `""`, and an
+    /// empty `presentation` object) is not recorded — croft delivers that
     /// behaviour by doing nothing. A MALFORMED one is recorded rather than
     /// ignored: `{"hidden": "true"}` is the likely typo here, and launching
     /// it unhidden with no signal is worse than the refusal it replaces.
+    ///
+    /// A mistyped KEY (`{"grup": "a"}`) is still ignored in silence, on
+    /// purpose: enumerating unknown keys would refuse whatever VS Code adds
+    /// next.
     ///
     /// `stopAll` is deliberately absent at either value: it decides whether
     /// ending one session ends the others, which is meaningless for the
@@ -449,18 +466,14 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // the parent means `{"hidden": true}` alone launches instead of
             // being refused for a capability it never asked for.
             let presentation = parse_presentation(obj);
-            // Only the MALFORMED shapes still refuse (#318). `group` and
-            // `order` are honoured now, so the loop that recorded them is
-            // gone; what remains cannot be honoured because it does not say
-            // anything croft could act on.
-            //
-            // A `presentation` that is present but NOT an object, or a
-            // `hidden` that is not a bool, keeps refusing: silently launching
-            // a compound whose `{"hidden": "true"}` typo did nothing is a
-            // worse answer than the refusal it replaces. Each is named WITH
-            // its parent, because a refusal telling the user to "remove that
-            // key" would otherwise read as deleting the whole `presentation`
-            // block, taking a working `group` with it.
+            // Only values croft cannot READ still refuse (#318). All three
+            // keys are honoured, so what is left is a typo to fix rather than
+            // a feature croft lacks: silently launching a compound whose
+            // `{"hidden": "true"}` did nothing is a worse answer than the
+            // refusal. Each is named WITH its parent, because a refusal
+            // telling the user to "remove that key" would otherwise read as
+            // deleting the whole `presentation` block, taking a working
+            // `group` with it.
             let unsupported_keys: Vec<&'static str> = malformed_presentation_keys(obj);
             let pre_launch_task = asks_for_something("preLaunchTask")
                 .then(|| obj.get("preLaunchTask").and_then(|v| v.as_str()))
@@ -1559,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn presentation_hidden_is_honoured_while_group_and_order_are_not() {
+    fn presentation_keys_are_honoured_and_only_unreadable_values_refuse() {
         let text = r#"{
           "compounds": [
             { "name": "Hid",   "configurations": ["A"], "presentation": { "hidden": true } },
@@ -1764,6 +1777,87 @@ mod tests {
                 "plain-second",
             ],
             "hidden is dropped, and every other rule is VS Code's"
+        );
+    }
+
+    /// An empty `presentation` is still a `presentation`, and VS Code places
+    /// it accordingly: its comparator tests the OBJECT for truthiness, so
+    /// `{}` sorts ahead of an entry carrying no block at all. Reading it as
+    /// "no preference" would put those rows somewhere VS Code does not.
+    #[test]
+    fn an_empty_presentation_block_still_outranks_no_block() {
+        let cfgs = parse_launch_json(
+            r#"{ "configurations": [
+                { "name": "Bare", "type": "node", "program": "a.js" },
+                { "name": "EmptyBlock", "type": "node", "program": "b.js",
+                  "presentation": {} },
+                { "name": "OnlyShown", "type": "node", "program": "c.js",
+                  "presentation": { "hidden": false } }
+            ] }"#,
+            ".vscode/launch.json",
+        );
+        let by = |n: &str| {
+            cfgs.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} parsed"))
+                .clone()
+        };
+        assert_eq!(by("Bare").presentation, None, "no block is no block");
+        assert_eq!(
+            by("EmptyBlock").presentation,
+            Some(Presentation::default()),
+            "an empty block asks for nothing but is still declared"
+        );
+        assert_eq!(by("OnlyShown").presentation, Some(Presentation::default()));
+
+        let sorted: Vec<String> = visible_and_sorted(cfgs, |c| c.presentation.as_ref())
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            sorted,
+            vec!["EmptyBlock", "OnlyShown", "Bare"],
+            "both declared blocks sort ahead of the bare entry, in file order"
+        );
+    }
+
+    /// A key that REQUESTS NOTHING is honoured by doing nothing, so it must
+    /// not be named in a refusal - that would report a limitation croft does
+    /// not have. `false` and `""` are that shape, and both used to launch
+    /// before `presentation` gained its own reader.
+    #[test]
+    fn a_presentation_that_requests_nothing_is_not_a_refusal() {
+        let cs = parse_compounds(
+            r#"{
+              "compounds": [
+                { "name": "FalseBlock", "configurations": ["A"], "presentation": false },
+                { "name": "EmptyString", "configurations": ["A"], "presentation": "" },
+                { "name": "NulledBlock", "configurations": ["A"], "presentation": null },
+                { "name": "Truthy", "configurations": ["A"], "presentation": true }
+              ]
+            }"#,
+            ".vscode/launch.json",
+        );
+        assert_eq!(cs.len(), 4, "precondition: every compound parsed");
+        let by = |n: &str| {
+            cs.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} parsed"))
+        };
+        for name in ["FalseBlock", "EmptyString", "NulledBlock"] {
+            assert!(
+                by(name).unsupported_keys.is_empty(),
+                "{name} asks for nothing and must launch: {:?}",
+                by(name).unsupported_keys
+            );
+        }
+        // The control: a value that DOES claim to say something, and is still
+        // unreadable, must refuse - or the three above prove only that this
+        // function never records anything.
+        assert_eq!(
+            by("Truthy").unsupported_keys,
+            vec!["presentation"],
+            "a non-object that asks for something is unreadable"
         );
     }
 
