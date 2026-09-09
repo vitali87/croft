@@ -21001,7 +21001,7 @@ fn a_test_binary_that_finishes_after_a_workspace_change_is_discarded() {
         "the drain consumed the result"
     );
     assert!(
-        app.dap_session.is_none(),
+        app.debug_sessions.is_empty(),
         "no debugger may launch for a foreign workspace's binary"
     );
     assert!(
@@ -35926,11 +35926,11 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
         compound_row.id
     );
 
-    // Selecting a resolvable MULTI-MEMBER compound says why it cannot run yet,
-    // and names the issue rather than failing silently or launching one member.
-    // The arity matters: a one-member compound needs a single session and now
-    // launches (see `a_single_member_compound_launches_...`), so #310's
-    // deferral is about compounds that genuinely need several at once.
+    // Selecting a resolvable MULTI-MEMBER compound launches every member
+    // (#310). It used to defer and name the issue; the session model holds a
+    // set now, so the assertion inverts. What must NOT happen is a subset
+    // launch, which would debug something other than what was asked for, so
+    // the count is what this checks rather than mere success.
     let idx = picker
         .rows
         .iter()
@@ -35938,19 +35938,17 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
         .unwrap();
     app.list_picker.as_mut().unwrap().selected = idx;
     app.confirm_list_picker();
+    // The old refusal ALSO named the compound and set feedback, so neither
+    // of those separates it from a launch. Only the launch path says this.
     assert!(
-        app.run_debug.feedback_is_error,
-        "{:?}",
-        app.run_debug.feedback
-    );
-    assert!(
-        app.status.contains("#310"),
-        "the message points the user at the tracking issue: {}",
+        app.status.contains("started no sessions") || app.status.starts_with("Debugging compound"),
+        "the compound went down the launch path rather than being refused: {}",
         app.status
     );
     assert!(
-        app.dap_session.is_none(),
-        "and nothing was launched — a subset launch would debug the wrong thing"
+        !app.status.contains("#310"),
+        "and does not cite a limit that is gone: {}",
+        app.status
     );
 
     // A compound naming a configuration no launch.json declares is a config
@@ -39058,9 +39056,10 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         );
     }
 
-    // The guard that must stay GREEN: this fix must not be satisfiable by
-    // launching EVERY compound. A genuinely multi-session compound is still
-    // deferred, and still says so.
+    // The guard that used to hold this line: a multi-member compound was
+    // DEFERRED and named #310. It launches now, which is what #310 built, so
+    // the guard becomes the positive one - the same picker row starts every
+    // member rather than one of them.
     app.open_debug_config_picker();
     let multi = app
         .list_picker
@@ -39072,10 +39071,19 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         .expect("the two-member compound is listed");
     app.list_picker.as_mut().unwrap().selected = multi;
     app.confirm_list_picker();
+    // Asserting the ABSENCE of the old message proves nothing - any refusal
+    // omits it, and so does an empty status. Pin the branch by what only the
+    // launch path says. No adapter is installed in a test environment, so
+    // every member fails to start and the compound reports that, which is
+    // still the compound PATH rather than the refusal it replaced.
     assert!(
-        app.status.contains("#310"),
-        "a compound that really does need several sessions is still deferred, \
-         and still names the issue: {}",
+        app.status.contains("started no sessions") || app.status.starts_with("Debugging compound"),
+        "the multi-member compound went down the launch path: {}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("#310"),
+        "and no longer defers to the session limit: {}",
         app.status
     );
 
@@ -39084,7 +39092,7 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
     // an error that says which task is missing — the same contract a config's
     // own task gets, because the user cannot tell the two apart from outside.
     //
-    // On a FRESH app: the launches above leave a live `dap_session`, and
+    // On a FRESH app: the launches above leave a live session, and
     // `debug_error` does not clear one, so asserting `is_none()` on this app
     // would be answered by the earlier launch rather than by this path.
     let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
@@ -39116,7 +39124,7 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         "nothing parked behind a task that does not exist"
     );
     assert!(
-        fresh.dap_session.is_none(),
+        fresh.debug_sessions.is_empty(),
         "and nothing launched — starting the member anyway would debug stale \
          artifacts, which is what running the task exists to prevent"
     );
@@ -39187,7 +39195,7 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         app.status
     );
     assert!(
-        app.dap_session.is_none(),
+        app.debug_sessions.is_empty(),
         "nothing has been debugged yet — that is the whole point of the wait"
     );
 
@@ -39231,7 +39239,7 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         fresh.status
     );
     assert!(
-        fresh.pending_debug_launch.is_none() && fresh.dap_session.is_none(),
+        fresh.pending_debug_launch.is_none() && fresh.debug_sessions.is_empty(),
         "and nothing ran"
     );
 }
@@ -39323,7 +39331,7 @@ fn a_finished_compound_task_starts_its_member_and_chains_the_members_own_task() 
         "a non-zero task aborts the launch and says so: {}",
         app.status
     );
-    assert!(app.dap_session.is_none(), "and nothing was debugged");
+    assert!(app.debug_sessions.is_empty(), "and nothing was debugged");
 }
 
 /// #302: a dwell must not be ARMED while a structural suppression is already
