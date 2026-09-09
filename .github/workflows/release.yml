@@ -101,12 +101,18 @@ jobs:
         # this catches: `file` names the architecture, so a mismatch here is
         # a wrong artifact rather than a missing one.
         run: |
+          set -euo pipefail
           bin="target/${{ matrix.target }}/release/croft"
           test -x "$bin"
           file "$bin"
           case "${{ matrix.target }}" in
             *-linux-musl) file "$bin" | grep -q 'ELF 64-bit LSB' ;;
             *-apple-darwin) file "$bin" | grep -q 'Mach-O 64-bit' ;;
+            # A `case` with no match exits 0, so without this arm the whole
+            # assertion becomes a silent no-op for any target the list does
+            # not name - green step, unchecked artifact, confident comment
+            # above it (#551). Adding a target now has to add its assertion.
+            *) echo "::error::no artifact-kind assertion for ${{ matrix.target }}"; exit 1 ;;
           esac
 
       - name: Package
