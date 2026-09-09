@@ -810,6 +810,10 @@ mod tests {
     /// A wait handed to a spawned process, scaled for a loaded host as the
     /// repo's spawn waits are (CONTRIBUTING: never a fresh fixed constant).
     #[cfg(unix)]
+    fn budget(base_ms: u64) -> std::time::Duration {
+        crate::test_budget::spawn_budget(std::time::Duration::from_millis(base_ms))
+    }
+
     /// Widen the settle poll's quiet run for THIS thread, restored when the
     /// guard drops (#548).
     ///
@@ -832,10 +836,6 @@ mod tests {
         fn drop(&mut self) {
             QUIET_RUN_OVERRIDE.with(|c| c.set(self.0));
         }
-    }
-
-    fn budget(base_ms: u64) -> std::time::Duration {
-        crate::test_budget::spawn_budget(std::time::Duration::from_millis(base_ms))
     }
 
     /// A pdftoppm script that behaves as told: `sleep <secs>` to hang, or
