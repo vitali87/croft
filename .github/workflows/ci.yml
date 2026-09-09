@@ -207,7 +207,27 @@ jobs:
         # prompt from wedging every spawned zsh before its first prompt
         # (croft never calls compinit; the runner's own zsh startup does).
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh poppler-utils
+          set -euo pipefail
+          # `apt-get update && apt-get install` looked equivalent and was not
+          # (#549). A command on the LEFT of an `&&` is exempt from `set -e`
+          # by design, so when `update` failed on a THIRD-PARTY index the
+          # runner image ships and croft does not need (a Chrome repo hash
+          # mismatch), the install was skipped, this step still went green,
+          # and eight PDF tests failed minutes later with "these tests need a
+          # PDF rasteriser" on a PR that touches no PDF code.
+          #
+          # A partial index failure must not decide whether the install runs:
+          # apt resolves these two packages from the indexes it did fetch.
+          sudo apt-get update \
+            || echo "::warning::apt-get update reported errors; installing from the indexes it has"
+          sudo apt-get install -y --no-install-recommends zsh poppler-utils
+          # Without this the step can only report that it RAN, not that it
+          # worked, and those are the same colour. The suite's own skip
+          # message names pdftoppm, so name it here too.
+          for tool in pdftoppm zsh; do
+            command -v "$tool" >/dev/null \
+              || { echo "::error::$tool is missing after the install step"; exit 1; }
+          done
           for d in /usr/share/zsh /usr/local/share/zsh; do
             if [ -d "$d" ]; then sudo chmod -R go-w "$d"; fi
           done
