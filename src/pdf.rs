@@ -488,8 +488,7 @@ fn record_settle(outcome: SettleOutcome) {
 }
 
 /// How the settle poll on this thread last ended, for a failure message.
-/// `unix` too: the only consumer is a test gated on it, and a non-unix test
-/// build would otherwise warn this dead.
+/// `unix` too, because the only consumer is a `unix`-gated test.
 #[cfg(all(test, unix))]
 fn last_settle() -> String {
     match LAST_SETTLE.with(std::cell::Cell::get) {
@@ -663,8 +662,10 @@ fn run_pdftoppm(
 /// grace is spent, whichever comes first. The two exits stay distinct
 /// because the CONSTANTS keep them apart - a 12-tick run is 60 ms against a
 /// 200 ms grace - where a clamp used to enforce it for any grace (#548). A
-/// caller passing a grace under ~65 ms would make the quiet exit
-/// unreachable; none does. An empty buffer
+/// caller passing a grace of 55 ms or less would make the quiet exit
+/// unreachable (50 ms for an empty buffer, which goes quiet a tick sooner);
+/// none does. The 65 ms that used to be quoted here was main's threshold for
+/// when the CLAMP bound, which is a different question. An empty buffer
 /// counts as quiet, so a silent failure settles just as early. Bytes a
 /// descendant writes after that are not waited for; a reader still blocked
 /// on its copy of the pipe is left to finish on its own. The buffer is
@@ -681,8 +682,8 @@ fn settle_stderr(
         // means the reading that settles the poll has already been taken, so
         // the extra tick collects nothing and every quiet exit costs 5 ms
         // more than the loop this replaced: measured at 13 polls and 13
-        // sleeps against that loop's 13 and 12. Reading at 5k ms is what it
-        // did, tick for tick.
+        // sleeps against that loop's 13 and 12. Reading on every 5 ms
+        // boundary from zero is what it did, tick for tick.
         if tick > 0 {
             std::thread::sleep(SETTLE_TICK);
         }
@@ -744,7 +745,11 @@ fn settle_over(quiet_run: u32, mut sample: impl FnMut(u32) -> Sample) -> (String
         };
         quiet = if text.len() == seen { quiet + 1 } else { 0 };
         if quiet >= quiet_run || last {
-            return (text, quiet >= quiet_run);
+            // `&& !last` matters on the tick where both fire: the recorded
+            // outcome exists to tell a quiet exit from a deadline one, so
+            // labelling the boundary as quiet mislabels precisely the case
+            // the record is for.
+            return (text, quiet >= quiet_run && !last);
         }
         seen = text.len();
         tick += 1;
@@ -989,20 +994,18 @@ mod tests {
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         // Once, not five times: the repeat existed to shake out the flaky
         // second-burst assertion, and what is left is deterministic.
-        {
-            let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
-                .expect_err("a non-zero exit is a failure");
-            let text = err.to_string();
-            assert!(
-                text.contains("Syntax Error: first"),
-                "the renderer's spray reaches the error: {text}\n[#548] {}",
-                last_settle()
-            );
-            assert!(
-                text.contains("exited with"),
-                "and so does the exit status: {text}"
-            );
-        }
+        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+            .expect_err("a non-zero exit is a failure");
+        let text = err.to_string();
+        assert!(
+            text.contains("Syntax Error: first"),
+            "the renderer's spray reaches the error: {text}\n[#548] {}",
+            last_settle()
+        );
+        assert!(
+            text.contains("exited with"),
+            "and so does the exit status: {text}"
+        );
     }
 
     /// The settle rule bridges a gap shorter than its quiet run and does not
