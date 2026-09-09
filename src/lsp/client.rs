@@ -1646,16 +1646,18 @@ mod tests {
     }
 
     fn run_initialize_shutdown(config: ServerConfig) {
-        if !server_runs_here(&config) {
+        // The tempdir comes first because the probe has to run in the SAME
+        // working directory the real spawn will use; see `server_runs_here`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize tempdir");
+        if let Err(reason) = server_runs_here(&config, &root) {
             eprintln!(
-                "SKIPPED: {} is on PATH but does not run on this machine",
-                config.name
+                "SKIPPED: {} does not run on this machine: {reason}",
+                config.command
             );
             return;
         }
         let rt = LspRuntime::new().expect("runtime");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonicalize tempdir");
         let expected_name = config.name;
         let display_name = config.name;
 
@@ -1687,7 +1689,7 @@ mod tests {
     }
 
     /// Whether this machine can actually RUN the server, asked BEFORE the
-    /// handshake (#545).
+    /// handshake (#545). `Err` carries the reason, so the skip can say it.
     ///
     /// Classifying the handshake ERROR instead does not work, and the
     /// re-break proved it: feeding rust-analyzer malformed `initialize`
@@ -1701,21 +1703,107 @@ mod tests {
     /// real one blocks reading stdin. That is what separates "installed" from
     /// "runnable", which `server_on_path` (a file that exists and is +x)
     /// cannot see.
-    fn server_runs_here(config: &ServerConfig) -> bool {
-        let Ok(mut child) = std::process::Command::new(&config.command)
+    ///
+    /// `workspace_root` is not decoration. `LspClient::spawn` runs the server
+    /// with `current_dir(workspace_root)`, and for a rustup shim the cwd is
+    /// what SELECTS the toolchain: probing from the repo (whose
+    /// `rust-toolchain.toml` pins a channel carrying the `rust-analyzer`
+    /// component) while the real spawn runs in a tempdir (where the default
+    /// channel may not carry it) answers a different question and turns a
+    /// machine fact into a panic blaming croft. Reproduced on a box where
+    /// `RUSTUP_TOOLCHAIN` was not exported.
+    fn server_runs_here(config: &ServerConfig, workspace_root: &Path) -> Result<(), String> {
+        let mut child = std::process::Command::new(&config.command)
             .args(&config.args)
+            .current_dir(workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Kept rather than discarded: when the answer is "cannot run
+            // here", this is the only evidence of WHY, and the skip line is
+            // where it belongs.
+            .stderr(Stdio::piped())
             .spawn()
-        else {
-            return false;
+            .map_err(|e| format!("spawn failed: {e}"))?;
+        // Never a fresh constant: what decides whether a launch failure has
+        // printed and exited yet is suite contention, not this server
+        // (CONTRIBUTING, "Waiting on a spawned process in a test"). Node
+        // servers like basedpyright-langserver are exactly the case a fixed
+        // budget turns into a coin flip.
+        std::thread::sleep(crate::test_budget::spawn_budget(
+            std::time::Duration::from_millis(200),
+        ));
+        let exited = match child.try_wait() {
+            Ok(None) => None,
+            Ok(Some(status)) => Some(status),
+            // Not an answer to the question asked, so it must not spend the
+            // skip exit - that is the #545 shape all over again.
+            Err(e) => panic!("try_wait on {}: {e}", config.command),
         };
-        std::thread::sleep(std::time::Duration::from_millis(750));
-        let waiting_for_input = matches!(child.try_wait(), Ok(None));
         let _ = child.kill();
         let _ = child.wait();
-        waiting_for_input
+        match exited {
+            None => Ok(()),
+            Some(status) => {
+                let mut said = String::new();
+                if let Some(mut err) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err.read_to_string(&mut said);
+                }
+                let said = said.trim();
+                Err(if said.is_empty() {
+                    format!("exited {status} before the handshake")
+                } else {
+                    format!("exited {status} before the handshake: {said}")
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn the_probe_separates_a_process_that_stays_alive_from_one_that_exits() {
+        // The probe rests on the child's stdin staying an OPEN PIPE: a
+        // refactor that dropped or closed it would make every server see EOF
+        // and exit, every test would skip, and #545 would be back with
+        // nothing to see. Degenerate fixtures pin it without a server.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut blocks = ServerConfig::ruff();
+        blocks.command = "cat".into();
+        blocks.args = Vec::new();
+        assert!(
+            server_runs_here(&blocks, tmp.path()).is_ok(),
+            "a process that sits reading stdin is what a real server looks like"
+        );
+
+        let mut exits = blocks.clone();
+        exits.command = "true".into();
+        let reason = server_runs_here(&exits, tmp.path())
+            .expect_err("a process that exits at once cannot serve croft here");
+        assert!(
+            reason.contains("before the handshake"),
+            "the skip must be able to say why, got {reason:?}"
+        );
+
+        let mut missing = blocks.clone();
+        missing.command = "croft-no-such-language-server".into();
+        assert!(
+            server_runs_here(&missing, tmp.path())
+                .expect_err("a command that cannot be launched")
+                .contains("spawn failed"),
+            "a missing binary is the ordinary skip, not a panic"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "handshake failed")]
+    fn a_server_that_runs_but_never_answers_initialize_fails_the_test() {
+        // The whole point of #545: a process that passes the probe and then
+        // does not speak LSP must FAIL, not skip. On main this passes
+        // silently, which is the bug.
+        let mut stub = ServerConfig::ruff();
+        stub.name = "stub";
+        stub.command = "sh".into();
+        stub.args = vec!["-c".into(), "sleep 5".into()];
+        run_initialize_shutdown(stub);
     }
 
     #[test]
