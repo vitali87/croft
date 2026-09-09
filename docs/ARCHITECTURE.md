@@ -1126,6 +1126,18 @@ Reads `launch.json` (`.croft` over `.vscode`), both its `configurations` and its
 
 **A one-member compound refuses only what croft cannot READ.** `preLaunchTask`, `hidden`, `group` and `order` are all honoured; what remains in `unsupported_keys` is a value croft cannot read — a `presentation` that is not an object, or a `hidden`, `group` or `order` that is not a bool, string or number. A `presentation` that is `null`, `false`, `""` or empty is not recorded — the first three ask for nothing, and an empty block asks only to be declared, which the sort reads by placing it ahead of a row carrying no block at all. Inside the block only `null` is carved out. A mistyped KEY is ignored rather than refused, so whatever VS Code adds next is not rejected. Those keep refusing because `{"hidden": "true"}` is a typo, and launching it unhidden with no signal is worse than the refusal. `stopAll` is absent at either value: it decides whether ending one session ends the others, which is meaningless for the single session a one-member compound launches (#310 owns the rest).
 
+### dap/session.rs — the session set
+
+croft debugs several configurations at once (#310). `DebugSessions` holds them with one FOCUSED, and the distinction is the whole feature: the call stack, variables, stepping and the status line mean the focused session, while stopping and polling mean all of them.
+
+**A configuration launch REPLACES the set; a compound member JOINS it.** Starting a configuration has always terminated whatever was running, and that stays true — but the normal launch path opens by stopping the world, so calling it per member would leave only the last one alive. That asymmetry is why a compound has its own launch path rather than a loop over the single one.
+
+**A member that fails does not take its siblings down.** They are real processes, and killing them because a later member could not resolve would turn one failure into two. The error names the member; the survivors keep running and the status says how many of how many started.
+
+**Focus lands on the FIRST member**, since compounds are usually written server-first and landing the user in whichever happened to start last would put them in the wrong one.
+
+**A member's own `preLaunchTask` is skipped**, with a status saying so. Parking a launch behind a task is a one-at-a-time mechanism, and a set of parked members would interleave unpredictably; the compound's OWN task still runs, and parks the whole member list.
+
 ### dap/reaper.rs
 
 Sweeps orphaned vscode-js-debug processes left behind when croft crashes or force-quits without running `Drop` — both the server and its detached watchdog, which setsids into its own session and so survives a group-kill. It runs async at startup and after each session teardown.

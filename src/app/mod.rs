@@ -1460,6 +1460,17 @@ fn menu_entry_width(entry: &MenuEntry) -> usize {
 /// its member is considered at all, and the member may carry a task of its
 /// own - VS Code runs both - so that continuation re-enters the normal launch
 /// path rather than skipping to the adapter.
+/// Whether a launch replaces the running set or joins it (#310).
+///
+/// Starting a configuration has always terminated whatever was running, and
+/// that stays true; a compound MEMBER is the one caller that must not, or the
+/// second member would kill the first.
+#[derive(Clone, Copy)]
+enum LaunchSlot {
+    Replace,
+    Add,
+}
+
 enum PendingLaunchStep {
     /// The config's own task just finished: start it. Boxed like the other
     /// variant so neither dominates the enum's size - a resolved config is
@@ -1468,6 +1479,14 @@ enum PendingLaunchStep {
     /// A compound's task just finished: launch its member from the top, which
     /// parks again if the member has a `preLaunchTask` too.
     Member(Box<crate::dap::configs::DebugConfig>),
+    /// A MULTI-member compound's task just finished: launch every member
+    /// (#310). Separate from `Member` because the set has to be started
+    /// together - running them through the single-member path would stop each
+    /// previous one.
+    Members {
+        members: Vec<crate::dap::configs::DebugConfig>,
+        compound: String,
+    },
 }
 
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
@@ -3643,7 +3662,11 @@ pub struct App {
     /// Active debug session: a debugpy DAP launch. None when not debugging.
     /// Polled each frame by [`App::poll_dap`], which mirrors the paused location
     /// into `editor.stop_line`.
-    pub dap_session: Option<crate::dap::session::DapSession>,
+    /// The debug sessions in flight, one FOCUSED (#310). Was a bare
+    /// `Option`, which made "the session" the only thing a call site could
+    /// mean; a compound needs several, so every site now says whether it
+    /// means the focused one or all of them.
+    pub debug_sessions: crate::dap::session::DebugSessions,
     /// launch.json configurations discovered for the picker (#250); refreshed
     /// on every picker open so edits are picked up without a restart.
     debug_configs: Vec<crate::dap::configs::DebugConfig>,
@@ -4896,7 +4919,7 @@ impl App {
             mcp_started: None,
             mcp_busy_label: None,
             process_picker: None,
-            dap_session: None,
+            debug_sessions: Default::default(),
             debug_configs: Vec::new(),
             debug_compounds: Vec::new(),
             selected_debug_config: None,
@@ -18825,7 +18848,7 @@ impl App {
         // ready update's F9 re-exec keep their croft meaning everywhere.
         let terminal_owns_fkeys = self.focus == Pane::Terminal
             && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal)
-            && self.dap_session.is_none()
+            && self.debug_sessions.is_empty()
             && key.modifiers.is_empty();
         if matches!(key.code, KeyCode::F(5)) && !terminal_owns_fkeys {
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -18849,7 +18872,7 @@ impl App {
         // F6 pauses a running program (VS Code's Pause key) ONLY while a debug
         // session is live; with no session it falls through to its long-standing
         // role as croft's cycle-focus key.
-        if matches!(key.code, KeyCode::F(6)) && self.dap_session.is_some() {
+        if matches!(key.code, KeyCode::F(6)) && !self.debug_sessions.is_empty() {
             self.debug_pause();
             return Ok(());
         }
@@ -19874,7 +19897,7 @@ impl App {
     /// Shared by debug-at-cursor and Alt+click on the gutter play glyph.
     fn debug_named_test(&mut self, name: String) {
         use std::collections::BTreeMap;
-        if self.dap_session.is_some() {
+        if !self.debug_sessions.is_empty() {
             self.status = String::from("A debug session is already running (Shift+F5 stops it)");
             return;
         }
@@ -19913,7 +19936,7 @@ impl App {
                     breakpoints,
                 ) {
                     Ok(session) => {
-                        self.dap_session = Some(session);
+                        self.debug_sessions.replace_with(name.clone(), session);
                         self.run_debug.feedback = Some(format!("Debugging test {name}"));
                         self.run_debug.feedback_is_error = false;
                         self.status = self.with_failure_note(format!(
@@ -20011,7 +20034,7 @@ impl App {
     /// background build hands over the binary.
     fn launch_lldb_test_debug(&mut self, binary: &Path, name: &str) {
         use std::collections::BTreeMap;
-        if self.dap_session.is_some() {
+        if !self.debug_sessions.is_empty() {
             // The build took minutes and the user started another session
             // meanwhile: this launch is abandoned, so the breakpoint it
             // armed has nothing to clean up after it (#373).
@@ -20042,7 +20065,7 @@ impl App {
             breakpoints,
         ) {
             Ok(session) => {
-                self.dap_session = Some(session);
+                self.debug_sessions.replace_with(name, session);
                 self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
                 self.status = self.with_failure_note(format!(
@@ -20213,12 +20236,12 @@ impl App {
     /// the session down when the debuggee exits.
     pub fn poll_dap(&mut self) -> bool {
         use crate::dap::session::{DapEvent, SessionPhase};
-        if self.dap_session.is_none() {
+        if self.debug_sessions.is_empty() {
             return false;
         }
         let events = self
-            .dap_session
-            .as_mut()
+            .debug_sessions
+            .focused_mut()
             .map(|s| s.poll())
             .unwrap_or_default();
         let mut changed = !events.is_empty();
@@ -20277,8 +20300,8 @@ impl App {
                         PathBuf,
                         std::collections::BTreeSet<usize>,
                     > = self
-                        .dap_session
-                        .as_ref()
+                        .debug_sessions
+                        .focused()
                         .map(|s| s.unverified_breakpoints.clone().into_iter().collect())
                         .unwrap_or_default();
                     let total: usize = unverified.values().map(|s| s.len()).sum();
@@ -20292,13 +20315,13 @@ impl App {
                 _ => {}
             }
         }
-        let phase = self.dap_session.as_ref().map(|s| s.phase);
+        let phase = self.debug_sessions.focused().map(|s| s.phase);
         match phase {
             Some(SessionPhase::Stopped) => {
                 self.debug_ever_stopped = true;
                 let loc = self
-                    .dap_session
-                    .as_ref()
+                    .debug_sessions
+                    .focused()
                     .and_then(|s| s.current_location.clone());
                 if let Some(loc) = loc
                     && self.editor.stop_line.as_ref() != Some(&loc)
@@ -20327,10 +20350,10 @@ impl App {
                 // only retires its detached watchdog on this handshake, never on
                 // a SIGKILL of the server, so the natural-exit path used to leak
                 // the watchdog by dropping straight to a kill.
-                if let Some(session) = self.dap_session.as_mut() {
+                if let Some(session) = self.debug_sessions.focused_mut() {
                     session.disconnect();
                 }
-                self.dap_session = None;
+                self.debug_sessions.clear();
                 // The watchdog reparents to init the moment the server dies;
                 // sweep it (and any tree a crashed prior croft left behind)
                 // after a short grace so it has settled into the orphan state.
@@ -20398,7 +20421,7 @@ impl App {
     fn build_debug_view(&self) -> (bool, String, Vec<crate::widgets::run_debug::DebugRow>) {
         use crate::dap::session::SessionPhase;
         use crate::widgets::run_debug::{DebugRow, DebugRowKind};
-        let Some(session) = self.dap_session.as_ref() else {
+        let Some(session) = self.debug_sessions.focused() else {
             return (false, String::new(), Vec::new());
         };
         // Active for any live session: while Running the tree is empty but the
@@ -20509,8 +20532,8 @@ impl App {
                 .collect();
         }
         if let Some(session) = self
-            .dap_session
-            .as_mut()
+            .debug_sessions
+            .focused_mut()
             .filter(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
         {
             for expr in &self.watch_exprs {
@@ -20533,8 +20556,8 @@ impl App {
         }
         self.watch_exprs.push(expr.clone());
         if let Some(session) = self
-            .dap_session
-            .as_mut()
+            .debug_sessions
+            .focused_mut()
             .filter(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
         {
             session.evaluate(&expr, "watch");
@@ -20570,7 +20593,7 @@ impl App {
         if expr.is_empty() {
             return;
         }
-        match self.dap_session.as_mut() {
+        match self.debug_sessions.focused_mut() {
             Some(session) => session.evaluate(&expr, "repl"),
             None => self.debug_console_push(String::from("(no debug session)")),
         }
@@ -20581,7 +20604,7 @@ impl App {
     /// None (so the normal LSP hover proceeds).
     fn debug_hover_value(&self, line: usize, c: usize) -> Option<String> {
         use crate::dap::session::SessionPhase;
-        let session = self.dap_session.as_ref()?;
+        let session = self.debug_sessions.focused()?;
         if session.phase != SessionPhase::Stopped {
             return None;
         }
@@ -20604,7 +20627,7 @@ impl App {
         };
         match row.kind.clone() {
             DebugRowKind::Frame { id, .. } => {
-                if let Some(session) = self.dap_session.as_mut() {
+                if let Some(session) = self.debug_sessions.focused_mut() {
                     session.load_frame(id);
                 }
                 // Collapse expansions: variable refs are frame-scoped.
@@ -20619,7 +20642,7 @@ impl App {
                     self.debug_expanded.remove(&reference);
                 } else {
                     self.debug_expanded.insert(reference);
-                    if let Some(session) = self.dap_session.as_mut() {
+                    if let Some(session) = self.debug_sessions.focused_mut() {
                         session.expand_variable(reference);
                     }
                 }
@@ -20701,7 +20724,7 @@ impl App {
     /// F5: start debugging the active file, or resume if already paused.
     pub fn debug_start_or_continue(&mut self) {
         use crate::dap::session::SessionPhase;
-        if let Some(session) = self.dap_session.as_mut() {
+        if let Some(session) = self.debug_sessions.focused_mut() {
             if session.phase == SessionPhase::Stopped {
                 session.continue_execution();
                 self.editor.stop_line = None;
@@ -20800,6 +20823,137 @@ impl App {
         );
     }
 
+    /// Launch one member INTO the running set, leaving its siblings alone.
+    ///
+    /// `launch_debug_config` opens by stopping whatever is running, which is
+    /// right for a configuration the user picked and fatal for a compound's
+    /// second member. This is the same path with that first step removed and
+    /// the session added rather than substituted.
+    ///
+    /// A member with its own `preLaunchTask` is NOT parked here: parking is a
+    /// one-at-a-time mechanism, and a compound whose members each park would
+    /// interleave unpredictably. Its task is skipped with a status saying so,
+    /// which is honest, and #310 is where the general form belongs.
+    fn launch_member_into_set(&mut self, cfg: &crate::dap::configs::DebugConfig) {
+        let root = self.active_workspace_root();
+        let ctx = crate::dap::configs::SubstCtx {
+            workspace_folder: root,
+            file: self.editor.path.clone(),
+        };
+        let rc = match crate::dap::configs::resolve(cfg, &ctx) {
+            Ok(rc) => rc,
+            Err(e) => {
+                self.debug_error(format!("config \"{}\": {e}", cfg.name));
+                return;
+            }
+        };
+        if rc.pre_launch_task.is_some() {
+            self.status = format!(
+                "compound member \"{}\": its own preLaunchTask is skipped — a compound starts its members together",
+                cfg.name
+            );
+        }
+        self.launch_resolved_into_set(rc);
+    }
+
+    /// Park a whole compound behind its own `preLaunchTask` (#310).
+    ///
+    /// The single-member form parks one config; this parks the list, because
+    /// the members have to start together once the task exits 0. Running them
+    /// through the single-member path in turn would stop each previous one.
+    fn launch_after_compound_task_all(
+        &mut self,
+        task_label: &str,
+        members: Vec<crate::dap::configs::DebugConfig>,
+        compound: String,
+    ) {
+        self.debug_stop();
+        self.pending_debug_launch = None;
+        let root = self.active_workspace_root();
+        let tasks = crate::tasks::discover_tasks(&root);
+        let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
+            self.debug_error(format!(
+                "compound preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
+            ));
+            return;
+        };
+        let command = task.command.clone();
+        let Some(pane) = self.run_project_task(task) else {
+            // run_project_task already reported why the pane failed.
+            return;
+        };
+        self.pending_debug_launch = Some(PendingDebugLaunch {
+            pane,
+            command,
+            step: PendingLaunchStep::Members { members, compound },
+            started: std::time::Instant::now(),
+        });
+        self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
+        self.run_debug.feedback_is_error = false;
+        self.status = format!(
+            "compound preLaunchTask \"{task_label}\" running — its sessions start when it exits 0"
+        );
+    }
+
+    /// Launch every member of a compound, in declaration order (#310).
+    ///
+    /// The first member REPLACES whatever was running, matching what starting
+    /// any configuration has always done; the rest are pushed beside it. That
+    /// asymmetry is the point - `launch_debug_config` stops the world before
+    /// it starts, so calling it per member would leave only the last one
+    /// alive, which is the bug this path exists to avoid.
+    ///
+    /// A member that fails to start does not abort the ones already running:
+    /// they are real processes, and killing them because a later sibling
+    /// could not resolve would be a second failure caused by the first. The
+    /// error names the member, and the survivors stay.
+    fn launch_compound_members(
+        &mut self,
+        members: Vec<crate::dap::configs::DebugConfig>,
+        compound: String,
+    ) {
+        self.debug_stop();
+        let total = members.len();
+        let mut started = 0usize;
+        for cfg in members {
+            let before = self.debug_sessions.len();
+            self.launch_member_into_set(&cfg);
+            if self.debug_sessions.len() > before {
+                started += 1;
+            }
+        }
+        if started == 0 {
+            // Every member failed; `launch_member_into_set` has already said
+            // why for each, so this only names the compound.
+            self.debug_error(format!("compound \"{compound}\" started no sessions"));
+            return;
+        }
+        // The FIRST member takes focus, not the last: a compound is usually
+        // written server-first, and landing the user on whichever happened to
+        // start last would put them in the wrong one.
+        self.debug_sessions.focus(0);
+        // Name them. With one session "the debugger" was unambiguous; with
+        // several the user has to be told which are running and which one the
+        // call stack and variables belong to, or the view describes a session
+        // they cannot identify.
+        let running = self.debug_sessions.names().join(", ");
+        self.run_debug.feedback = Some(if started == total {
+            format!("Debugging compound {compound}: {running}")
+        } else {
+            format!("Debugging compound {compound}: {running} ({started} of {total} started)")
+        });
+        self.run_debug.feedback_is_error = started != total;
+        let focused = self
+            .debug_sessions
+            .focused_name()
+            .unwrap_or("?")
+            .to_string();
+        self.status = format!(
+            "Debugging compound {compound} — {started} session(s), showing {focused} · Shift+F5 stops all"
+        );
+        self.reveal_debug_view();
+    }
+
     /// Continue a parked launch whose `preLaunchTask` has finished.
     ///
     /// Split from the terminal sweep so it can be driven directly: reaching it
@@ -20822,6 +20976,15 @@ impl App {
             // the member's. Calling the resolved-launch path here would
             // silently skip the member's.
             PendingLaunchStep::Member(cfg) => self.launch_debug_config(&cfg),
+            // NOT back through the front door, unlike the single member above:
+            // `launch_debug_config` stops the world first, so the second
+            // member would kill the first (#310). The members' own
+            // `preLaunchTask`s are skipped, with a status saying so per
+            // member - parking is one-at-a-time and a set of parked members
+            // would interleave.
+            PendingLaunchStep::Members { members, compound } => {
+                self.launch_compound_members(members, compound)
+            }
         }
     }
 
@@ -20843,7 +21006,7 @@ impl App {
         task_label: &str,
         member: crate::dap::configs::DebugConfig,
     ) {
-        if self.dap_session.is_some() {
+        if !self.debug_sessions.is_empty() {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
@@ -20878,7 +21041,7 @@ impl App {
     /// behind its `preLaunchTask`.
     fn launch_debug_config(&mut self, cfg: &crate::dap::configs::DebugConfig) {
         use crate::dap::configs;
-        if self.dap_session.is_some() {
+        if !self.debug_sessions.is_empty() {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
@@ -21029,7 +21192,21 @@ impl App {
 
     /// Spawn the adapter for a resolved launch.json configuration and hand it
     /// the built launch/attach request.
-    fn launch_resolved_config(&mut self, mut rc: crate::dap::configs::ResolvedConfig) {
+    /// Launch a resolved config, replacing whatever was running.
+    fn launch_resolved_config(&mut self, rc: crate::dap::configs::ResolvedConfig) {
+        self.launch_resolved_in(rc, LaunchSlot::Replace);
+    }
+
+    /// Launch a resolved config BESIDE what is running, for a compound member.
+    fn launch_resolved_into_set(&mut self, rc: crate::dap::configs::ResolvedConfig) {
+        self.launch_resolved_in(rc, LaunchSlot::Add);
+    }
+
+    fn launch_resolved_in(
+        &mut self,
+        mut rc: crate::dap::configs::ResolvedConfig,
+        slot: LaunchSlot,
+    ) {
         use crate::dap::configs::{self, RequestKind};
         use crate::dap::session::AdapterKind;
         let breakpoints = self.collect_editor_breakpoints();
@@ -21141,7 +21318,10 @@ impl App {
         };
         match result {
             Ok(session) => {
-                self.dap_session = Some(session);
+                match slot {
+                    LaunchSlot::Replace => self.debug_sessions.replace_with(&name, session),
+                    LaunchSlot::Add => self.debug_sessions.push(&name, session),
+                }
                 let verb = match rc.request {
                     RequestKind::Launch => "Debugging",
                     RequestKind::Attach => "Attached:",
@@ -21224,11 +21404,11 @@ impl App {
             false,
         ) {
             Ok(session) => {
-                self.dap_session = Some(session);
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                self.debug_sessions.replace_with(name.clone(), session);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -21275,11 +21455,11 @@ impl App {
             false,
         ) {
             Ok(session) => {
-                self.dap_session = Some(session);
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                self.debug_sessions.replace_with(name.clone(), session);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -21339,11 +21519,11 @@ impl App {
             breakpoints,
         ) {
             Ok(session) => {
-                self.dap_session = Some(session);
                 let name = label_path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                self.debug_sessions.replace_with(name.clone(), session);
                 self.run_debug.feedback = Some(format!("Debugging {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -21443,7 +21623,7 @@ impl App {
                 .get(&path)
                 .map(|lines| self.editor.source_breakpoints(&path, lines))
                 .unwrap_or_default();
-            if let Some(session) = self.dap_session.as_mut() {
+            if let Some(session) = self.debug_sessions.focused_mut() {
                 session.update_breakpoints(&path, &specs);
             }
         }
@@ -21516,7 +21696,7 @@ impl App {
             .get(&path)
             .map(|l| self.editor.source_breakpoints(&path, l))
             .unwrap_or_default();
-        if let Some(session) = self.dap_session.as_mut() {
+        if let Some(session) = self.debug_sessions.focused_mut() {
             session.update_breakpoints(&path, &specs);
         }
     }
@@ -21586,14 +21766,14 @@ impl App {
             .get(&path)
             .map(|l| self.editor.source_breakpoints(&path, l))
             .unwrap_or_default();
-        if let Some(session) = self.dap_session.as_mut() {
+        if let Some(session) = self.debug_sessions.focused_mut() {
             session.update_breakpoints(&path, &specs);
         }
     }
 
     /// F10/F11/Shift+F11: step the paused thread (`next` / `stepIn` / `stepOut`).
     pub fn debug_step(&mut self, command: &str) {
-        if let Some(session) = self.dap_session.as_mut() {
+        if let Some(session) = self.debug_sessions.focused_mut() {
             session.step(command);
             self.editor.stop_line = None;
             self.clear_inline_values();
@@ -21604,7 +21784,7 @@ impl App {
     /// always kept on so unhandled exceptions still pause. No-op without a
     /// session.
     pub fn debug_toggle_raised_exceptions(&mut self) {
-        let Some(session) = self.dap_session.as_mut() else {
+        let Some(session) = self.debug_sessions.focused_mut() else {
             self.status = String::from("Start debugging first to set exception breakpoints");
             return;
         };
@@ -21623,7 +21803,7 @@ impl App {
 
     /// F6: interrupt a running program so it stops at the current line.
     pub fn debug_pause(&mut self) {
-        match self.dap_session.as_mut() {
+        match self.debug_sessions.focused_mut() {
             Some(session) => {
                 session.pause();
                 self.status = String::from("Pausing");
@@ -21635,7 +21815,7 @@ impl App {
     /// Restart: tear down the current session and relaunch the active file with
     /// the same breakpoints.
     pub fn debug_restart(&mut self) {
-        if self.dap_session.is_some() {
+        if !self.debug_sessions.is_empty() {
             self.debug_stop();
         }
         self.start_selected_debug();
@@ -21653,10 +21833,14 @@ impl App {
 
     /// Shift+F5: stop debugging and tear the session down.
     pub fn debug_stop(&mut self) {
-        if let Some(session) = self.dap_session.as_mut() {
+        // EVERY session, not the focused one (#310). A compound launches
+        // several; disconnecting only the one the user happens to be looking
+        // at would leave its siblings running with nothing on screen owning
+        // them, which is the orphaning the issue names.
+        for session in self.debug_sessions.iter_mut() {
             session.disconnect();
         }
-        self.dap_session = None;
+        self.debug_sessions.clear();
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in
@@ -24366,8 +24550,7 @@ impl App {
                             // what was asked for" outcome every guard here
                             // exists to prevent.
                             Ok(members)
-                                if members.len() == 1
-                                    && !compound.unsupported_keys.is_empty() =>
+                                if members.len() == 1 && !compound.unsupported_keys.is_empty() =>
                             {
                                 // #318, NOT #310: this compound needs ONE
                                 // session, which croft runs. What it cannot do
@@ -24422,10 +24605,24 @@ impl App {
                                     None => self.launch_debug_config(&cfg),
                                 }
                             }
-                            Ok(_) => self.debug_error(format!(
-                                "compound \"{}\" needs several debug sessions at once, which croft does not support yet (#310)",
-                                compound.name
-                            )),
+                            Ok(members) => {
+                                // Several sessions at once: what #310 built
+                                // the set for. Members start in DECLARATION
+                                // order, which is the order the file asked
+                                // for and the order a client-then-server
+                                // compound depends on.
+                                let label = compound.name.clone();
+                                // `resolve_compound` borrows from the config
+                                // list; the launch outlives that borrow, so
+                                // the members are owned from here on.
+                                let members: Vec<_> = members.into_iter().cloned().collect();
+                                match compound.pre_launch_task.clone() {
+                                    Some(task) => {
+                                        self.launch_after_compound_task_all(&task, members, label)
+                                    }
+                                    None => self.launch_compound_members(members, label),
+                                }
+                            }
                         }
                     }
                 } else if row.id == "active" {
@@ -40913,7 +41110,7 @@ impl App {
         if !self.inline_values_enabled {
             return;
         }
-        let Some(session) = self.dap_session.as_ref() else {
+        let Some(session) = self.debug_sessions.focused() else {
             return;
         };
         if session.phase != SessionPhase::Stopped {
