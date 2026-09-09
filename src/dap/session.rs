@@ -629,19 +629,6 @@ pub fn fold_breakpoint_reports(
     changed
 }
 
-/// One running debug session.
-/// The debug sessions in flight, one of them FOCUSED (#310).
-///
-/// croft was single-session by construction: `Option<DapSession>`, and every
-/// one of the ~40 sites that touched it meant "the session" because there
-/// could only be one. A compound launches several, so the model has to become
-/// a set before any of them can run - and the UI has to mean "the session the
-/// user is looking at" rather than "the only one".
-///
-/// This slice is the model alone. It holds at most one session, so behaviour
-/// is unchanged: `focused()` is the old `as_ref()`, `clear()` the old
-/// `= None`. What changes is that the SHAPE now admits more, and every call
-/// site has been made to say which session it means.
 /// A session and the name it was launched under.
 ///
 /// `DapSession` itself has no name: it is built by four different adapter
@@ -759,6 +746,19 @@ impl<S> DebugSessions<S> {
     }
 }
 
+/// One running debug session.
+/// The debug sessions in flight, one of them FOCUSED (#310).
+///
+/// croft was single-session by construction: `Option<DapSession>`, and every
+/// one of the ~40 sites that touched it meant "the session" because there
+/// could only be one. A compound launches several, so the model has to become
+/// a set before any of them can run - and the UI has to mean "the session the
+/// user is looking at" rather than "the only one".
+///
+/// This slice is the model alone. It holds at most one session, so behaviour
+/// is unchanged: `focused()` is the old `as_ref()`, `clear()` the old
+/// `= None`. What changes is that the SHAPE now admits more, and every call
+/// site has been made to say which session it means.
 pub struct DapSession {
     transport: DapTransport,
     /// vscode-js-debug child session. js-debug is multi-session: the `transport`
