@@ -3686,9 +3686,6 @@ impl WorkerState {
         });
     }
 
-    /// `workspace/symbol`: fan the query out to every running server that
-    /// advertises the capability (across every language and root — VS Code
-    /// merges all providers the same way) and send one merged reply.
     /// Pull whole-project diagnostics from every spawned server that
     /// advertises `workspaceDiagnostics` (#533). Fire-and-forget: the reports
     /// land on the diagnostics channel the push path already feeds.
@@ -3699,6 +3696,9 @@ impl WorkerState {
         );
     }
 
+    /// `workspace/symbol`: fan the query out to every running server that
+    /// advertises the capability (across every language and root — VS Code
+    /// merges all providers the same way) and send one merged reply.
     async fn request_workspace_symbols(
         &mut self,
         request_id: u64,

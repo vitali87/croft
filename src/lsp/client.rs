@@ -664,9 +664,6 @@ impl LspClient {
             .context("implementation")
     }
 
-    /// `workspace/symbol`: server-side fuzzy query over every symbol in the
-    /// project. Both response shapes (flat `SymbolInformation` and nested
-    /// `WorkspaceSymbol`) are normalised by the manager.
     /// LSP 3.17 `workspace/diagnostic`: PULL the whole project's diagnostics
     /// over the existing connection (#533).
     ///
@@ -696,6 +693,9 @@ impl LspClient {
             .context("workspace/diagnostic")
     }
 
+    /// `workspace/symbol`: server-side fuzzy query over every symbol in the
+    /// project. Both response shapes (flat `SymbolInformation` and nested
+    /// `WorkspaceSymbol`) are normalised by the manager.
     pub async fn workspace_symbols(
         &mut self,
         query: String,
