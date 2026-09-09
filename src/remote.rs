@@ -8,6 +8,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteTarget {
@@ -1139,6 +1140,9 @@ fn run_pump(
             Some(RelayRequest::Clipboard { id }) => {
                 handle_clipboard_request(&host, &socket, &inbox_dir, &id);
             }
+            Some(RelayRequest::Copy { id }) => {
+                handle_copy_request(&host, &socket, &inbox_dir, &id);
+            }
             Some(RelayRequest::Open { id, url }) => {
                 handle_open_request(&host, &socket, &inbox_dir, &id, &url);
             }
@@ -1251,12 +1255,113 @@ fn handle_clipboard_request(host: &str, socket: &Path, inbox_dir: &str, request_
     }
 }
 
+/// Bring a remote croft's copied text home and put it on this machine's
+/// clipboard. The reverse of [`handle_clipboard_request`], and the reason a
+/// copy on a remote box reaches the clipboard the user actually pastes from
+/// rather than the remote box's own (#538).
+///
+/// The payload file is removed in the same command that reads it: a copy is
+/// transient, and leaving them behind grows the relay dir for the life of the
+/// session. There is no inbox sentinel to write — nothing on the remote side
+/// is waiting on the answer.
+fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str) {
+    // The id indexes a file in the inbox this pump owns, and it is
+    // interpolated into a remote shell command, so it is checked before use:
+    // `shell_quote` stops injection but not a `../..` that walks out of the
+    // relay. Every id croft mints is `<kind>-<pid>-<seq>`.
+    if !copy_request_id_is_safe(request_id) {
+        return;
+    }
+    let quoted = shell_quote(&format!("{inbox_dir}/{request_id}.txt"));
+    // One byte past the cap, so "exactly the cap" and "there was more" are
+    // distinguishable and an oversized payload is DROPPED rather than pasted
+    // half-formed. `head` also bounds a FIFO or a character device, which
+    // `cat` would have streamed into local memory without end.
+    let limit = MAX_COPY_PAYLOAD_BYTES + 1;
+    let remote_cmd = format!("head -c {limit} {quoted}; rm -f {quoted}");
+    let Ok(mut child) = Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg(host)
+        .arg(&remote_cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let Some(mut out) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    // Read on a thread with a deadline: `output()` waits for EOF, and this
+    // pump is single-threaded and serves every other relay verb, so one
+    // payload that never ends would stop drops, opens and forwards too.
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        // Bounded locally as well as remotely: the cap must not depend on the
+        // remote box having a `head` that honours -c.
+        let _ = out.by_ref().take(limit as u64).read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let payload = match rx.recv_timeout(COPY_READ_TIMEOUT) {
+        Ok(bytes) => {
+            let _ = child.wait();
+            bytes
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+    };
+    if payload.is_empty() || payload.len() > MAX_COPY_PAYLOAD_BYTES {
+        return;
+    }
+    let _ = crate::clipboard::write_string(&String::from_utf8_lossy(&payload));
+}
+
+/// A copy payload the pump will bring home, capped because it lands in THIS
+/// machine's memory. Generous for any real selection of scrollback.
+pub(crate) const MAX_COPY_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long the pump waits for one copy payload. A FIFO, a stalled link or a
+/// wedged remote would otherwise block every other verb behind it.
+const COPY_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether `id` is one croft could have minted: `<kind>-<pid>-<seq>`. Used to
+/// keep a hostile log line from walking out of the inbox with `..`.
+fn copy_request_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 enum RelayRequest {
     Pull {
         id: String,
         src: String,
     },
     Clipboard {
+        id: String,
+    },
+    /// The remote croft copied text and wants it on THIS machine's clipboard,
+    /// which is the one the user pastes from (#538).
+    ///
+    /// Carries only the request id: the payload lives at `<inbox>/<id>.txt`,
+    /// derived by the pump from the inbox it already owns. Putting a PATH on
+    /// the wire would let anything able to write the remote log name a FIFO,
+    /// `/dev/zero`, or a file outside the relay entirely, and the pump reads
+    /// what it is given into THIS machine's memory.
+    Copy {
         id: String,
     },
     Open {
@@ -1296,6 +1401,7 @@ fn parse_relay_request(line: &str) -> Option<RelayRequest> {
             Some(RelayRequest::Pull { id, src })
         }
         "clipboard" => Some(RelayRequest::Clipboard { id }),
+        "copy" => Some(RelayRequest::Copy { id }),
         "open" => {
             let url = parts.next()?.to_string();
             if url.is_empty() {
@@ -3865,6 +3971,38 @@ Host !blocked *.internal
             Some(super::RelayRequest::Clipboard { id }) => assert_eq!(id, "clip-7"),
             _ => panic!("expected Clipboard variant"),
         }
+    }
+
+    #[test]
+    fn parse_relay_request_copy_carries_only_an_id() {
+        match super::parse_relay_request("copy\tcopy-7") {
+            Some(super::RelayRequest::Copy { id }) => assert_eq!(id, "copy-7"),
+            _ => panic!("expected Copy variant"),
+        }
+        // No id is no request, as for every other verb.
+        assert!(super::parse_relay_request("copy\t").is_none());
+    }
+
+    /// The pump derives a remote PATH from this id, so an id that could walk
+    /// out of the inbox is refused before it reaches a shell.
+    #[test]
+    fn a_copy_id_that_leaves_the_inbox_is_refused() {
+        for id in [
+            "../../../../etc/passwd",
+            "../outside",
+            "copy/7",
+            "copy 7",
+            "copy;rm -rf /",
+            "copy$(id)",
+            "",
+        ] {
+            assert!(
+                !super::copy_request_id_is_safe(id),
+                "{id:?} must not be accepted as a copy id"
+            );
+        }
+        // What croft actually mints stays acceptable.
+        assert!(super::copy_request_id_is_safe("copy-12345-0"));
     }
 
     #[test]
