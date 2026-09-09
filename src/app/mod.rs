@@ -1460,17 +1460,6 @@ fn menu_entry_width(entry: &MenuEntry) -> usize {
 /// its member is considered at all, and the member may carry a task of its
 /// own - VS Code runs both - so that continuation re-enters the normal launch
 /// path rather than skipping to the adapter.
-/// Whether a launch replaces the running set or joins it (#310).
-///
-/// Starting a configuration has always terminated whatever was running, and
-/// that stays true; a compound MEMBER is the one caller that must not, or the
-/// second member would kill the first.
-#[derive(Clone, Copy)]
-enum LaunchSlot {
-    Replace,
-    Add,
-}
-
 enum PendingLaunchStep {
     /// The config's own task just finished: start it. Boxed like the other
     /// variant so neither dominates the enum's size - a resolved config is
@@ -1487,6 +1476,17 @@ enum PendingLaunchStep {
         members: Vec<crate::dap::configs::DebugConfig>,
         compound: String,
     },
+}
+
+/// Whether a launch replaces the running set or joins it (#310).
+///
+/// Starting a configuration has always terminated whatever was running, and
+/// that stays true; a compound MEMBER is the one caller that must not, or the
+/// second member would kill the first.
+#[derive(Clone, Copy)]
+enum LaunchSlot {
+    Replace,
+    Add,
 }
 
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
