@@ -6396,8 +6396,9 @@ mod tests {
     ///
     /// Written to a temp dir and run under the test's own Python, so the test
     /// needs no server on PATH.
-    /// Returns `(script, receipt)`: the stub creates `receipt` the moment a
-    /// `workspace/diagnostic` request reaches it.
+    /// Returns `(script, receipt)`: the stub APPENDS one line to `receipt`
+    /// for every `workspace/diagnostic` request that reaches it, so a test can
+    /// assert both that a pull arrived and how many did.
     fn mute_pull_server_script(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let path = dir.join("mute_pull_server.py");
         let receipt = dir.join("pull-received");
@@ -6441,9 +6442,11 @@ while True:
             "definitionProvider": True,
         }}})
     elif method == "workspace/diagnostic":
-        # Signal receipt, so the test waits for the request to ARRIVE rather
-        # than guessing with a sleep, then never answer -- the bug.
-        open(sys.argv[1], "w").close()
+        # Record receipt (one line per request), so a test waits for the
+        # request to ARRIVE rather than guessing with a sleep, and can count
+        # how many arrived. Then never answer -- the bug.
+        with open(sys.argv[1], "a") as f:
+            f.write("pull\n")
     elif method == "shutdown":
         write({"jsonrpc": "2.0", "id": msg["id"], "result": None})
     elif "id" in msg:
@@ -6452,6 +6455,151 @@ while True:
         )
         .expect("write stub server");
         (path, receipt)
+    }
+
+    /// A `ManagedClient` wrapping `client`, advertising workspace diagnostics
+    /// and nothing else — the shape `workspace_pull_targets` filters over.
+    fn managed_client_for_pull_test(client: LspClient) -> ManagedClient {
+        ManagedClient {
+            name: String::from("mute-pull"),
+            client: Arc::new(TokioMutex::new(client)),
+            supports_workspace_diagnostics: true,
+            diagnostic_identifier: None,
+            diagnostic_result_ids: Arc::new(TokioMutex::new(DiagnosticResultIds::default())),
+            diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
+            supports_completion: false,
+            supports_signature_help: false,
+            supports_hover: false,
+            supports_definition: false,
+            supports_document_symbol: false,
+            supports_declaration: false,
+            supports_type_definition: false,
+            supports_implementation: false,
+            supports_references: false,
+            supports_document_highlight: false,
+            supports_linked_editing: false,
+            supports_selection_range: false,
+            supports_call_hierarchy: false,
+            supports_workspace_symbols: false,
+            supports_rename: false,
+            supports_prepare_rename: false,
+            supports_formatting: false,
+            on_type_triggers: None,
+            supports_range_formatting: false,
+            supports_code_action: false,
+            semantic_legend: None,
+            semantic_supports_range: false,
+            supports_inlay_hints: false,
+            supports_document_link: false,
+            supports_folding_range: false,
+            supports_document_color: false,
+        }
+    }
+
+    /// `workspace_pull_targets` must DROP a retired server, so the retirement
+    /// actually stops the next pull rather than only recording a flag (#533).
+    ///
+    /// This is the end of the leak fix: `workspace/diagnostic/refresh` is
+    /// server-driven and unrated, so without the filter a stalling server is
+    /// re-asked on every refresh and each abandoned request leaves another
+    /// entry in async-lsp's `outgoing` map that nothing can drain.
+    #[test]
+    fn a_retired_server_is_dropped_from_the_next_pull() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (script, receipt) = mute_pull_server_script(&root);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let config = ServerConfig {
+                name: "mute-pull",
+                command: python.to_string_lossy().into_owned(),
+                args: vec![
+                    script.to_string_lossy().into_owned(),
+                    receipt.to_string_lossy().into_owned(),
+                ],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            };
+            let (diag_tx, _diag_rx) = std_mpsc::channel();
+            let (prog_tx, _prog_rx) = std_mpsc::channel();
+            let client = LspClient::spawn(
+                &config,
+                &root,
+                build_client_capabilities(),
+                &[],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                diag_tx,
+                prog_tx,
+            )
+            .await
+            .expect("the stub server handshakes");
+
+            // A `ManagedClient` as `ensure_clients` builds one, which is what
+            // `workspace_pull_targets` actually filters over in production.
+            let managed = managed_client_for_pull_test(client);
+            assert_eq!(
+                workspace_pull_targets(std::iter::once(&managed)).len(),
+                1,
+                "a healthy server advertising the capability must be pulled"
+            );
+
+            let (tx, _rx) = std_mpsc::channel();
+            spawn_workspace_pull_within(
+                workspace_pull_targets(std::iter::once(&managed)),
+                tx.clone(),
+                std::time::Duration::from_millis(200),
+            );
+
+            // Wait for the retirement the timeout records.
+            let retired = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !managed.diagnostic_pull_stalled.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(retired.is_ok(), "the expired pull must retire the server");
+
+            let after_first = std::fs::read_to_string(&receipt).unwrap_or_default();
+            assert_eq!(
+                after_first.lines().count(),
+                1,
+                "the first pull must actually reach the server"
+            );
+
+            // The refresh path: a second pull for the same clients. The
+            // retired server must be filtered out, so the stub sees nothing
+            // more and no second un-reapable request is issued.
+            assert!(
+                workspace_pull_targets(std::iter::once(&managed)).is_empty(),
+                "a retired server must be dropped from later pulls, or every \
+                 refresh leaks another request that can never be reaped"
+            );
+            spawn_workspace_pull_within(
+                workspace_pull_targets(std::iter::once(&managed)),
+                tx,
+                std::time::Duration::from_millis(200),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let after_second = std::fs::read_to_string(&receipt).unwrap_or_default();
+            assert_eq!(
+                after_second.lines().count(),
+                1,
+                "a retired server must receive no further pulls"
+            );
+        });
     }
 
     /// An expired pull must free the result ids, leave the cache untouched,
@@ -6505,7 +6653,14 @@ while True:
             .await
             .expect("the stub server handshakes");
 
+            // SEEDED, so "the cache is untouched" is a claim that can fail:
+            // against an empty cache the assertion below would hold whatever
+            // the timeout path did to it.
             let result_ids = Arc::new(TokioMutex::new(DiagnosticResultIds::default()));
+            result_ids
+                .lock()
+                .await
+                .record("file:///seeded.py", Some("id-seeded"));
             let stalled = Arc::new(AtomicBool::new(false));
             let (tx, _rx) = std_mpsc::channel();
             spawn_workspace_pull_within(
@@ -6539,9 +6694,11 @@ while True:
             let ids = tokio::time::timeout(std::time::Duration::from_secs(5), result_ids.lock())
                 .await
                 .expect("an expired pull must release the result ids");
-            assert!(
-                ids.is_empty(),
-                "an expired pull must leave the result-id cache untouched"
+            assert_eq!(
+                ids.len(),
+                1,
+                "an expired pull must leave the result-id cache untouched, so \
+                 the next pull re-sends the same `previous` set"
             );
         });
     }
