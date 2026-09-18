@@ -1778,6 +1778,18 @@ struct ManagedClient {
     /// mutex the client is: a pull runs off the worker loop, so the cache has
     /// to outlive the borrow that started it.
     diagnostic_result_ids: Arc<TokioMutex<DiagnosticResultIds>>,
+    /// Set once this server has let a `workspace/diagnostic` request expire,
+    /// after which it is never pulled again for the life of the client.
+    ///
+    /// A request that times out cannot be cancelled: async-lsp assigns the id
+    /// and parks the response sender in the mainloop's `outgoing` map, which
+    /// is drained only by a response ARRIVING with that id (async-lsp 0.2.4
+    /// `lib.rs:604`). A server that never answers therefore leaves one entry
+    /// behind per request, forever. Since `workspace/diagnostic/refresh` is
+    /// server-driven and unrated, a server that refreshes and then stalls
+    /// would accrue one leak per refresh for the whole session. Asking it
+    /// once and then stopping bounds the damage at exactly one.
+    diagnostic_pull_stalled: Arc<AtomicBool>,
     supports_hover: bool,
     supports_definition: bool,
     supports_document_symbol: bool,
@@ -2457,6 +2469,7 @@ impl WorkerState {
                             diagnostic_result_ids: Arc::new(TokioMutex::new(
                                 DiagnosticResultIds::default(),
                             )),
+                            diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
                             supports_hover,
                             supports_definition,
                             supports_document_symbol,
@@ -5162,6 +5175,9 @@ struct WorkspacePull {
     client: Arc<TokioMutex<LspClient>>,
     identifier: Option<String>,
     result_ids: Arc<TokioMutex<DiagnosticResultIds>>,
+    /// Shared with the [`ManagedClient`], so a timeout recorded here is seen
+    /// by every later `workspace_pull_targets` call.
+    stalled: Arc<AtomicBool>,
 }
 
 /// The servers among `clients` that answer `workspace/diagnostic` (#533).
@@ -5174,11 +5190,15 @@ fn workspace_pull_targets<'a>(
 ) -> Vec<WorkspacePull> {
     clients
         .filter(|c| c.supports_workspace_diagnostics)
+        // A server that already let one pull expire is never asked again:
+        // see `diagnostic_pull_stalled`.
+        .filter(|c| !c.diagnostic_pull_stalled.load(Ordering::Relaxed))
         .map(|c| WorkspacePull {
             name: c.name.clone(),
             client: c.client.clone(),
             identifier: c.diagnostic_identifier.clone(),
             result_ids: c.diagnostic_result_ids.clone(),
+            stalled: c.diagnostic_pull_stalled.clone(),
         })
         .collect()
 }
@@ -5189,6 +5209,16 @@ fn workspace_pull_targets<'a>(
 /// that client, and a whole-project analysis is the kind of request a server
 /// answers slowly, so the loop must not be holding the worker while it does.
 fn spawn_workspace_pull(targets: Vec<WorkspacePull>, tx: std_mpsc::Sender<DiagnosticsUpdate>) {
+    spawn_workspace_pull_within(targets, tx, WORKSPACE_PULL_TIMEOUT);
+}
+
+/// [`spawn_workspace_pull`] with the ceiling passed in, so a test can watch
+/// the timeout path without waiting [`WORKSPACE_PULL_TIMEOUT`] for it.
+fn spawn_workspace_pull_within(
+    targets: Vec<WorkspacePull>,
+    tx: std_mpsc::Sender<DiagnosticsUpdate>,
+    ceiling: std::time::Duration,
+) {
     if targets.is_empty() {
         return;
     }
@@ -5210,6 +5240,10 @@ fn spawn_workspace_pull(targets: Vec<WorkspacePull>, tx: std_mpsc::Sender<Diagno
             // every later command including Go to Definition (#533
             // regression, 0.1.939). Cloning the socket keeps the request on
             // the same server while leaving the client free.
+            // Lock order: result ids BEFORE the client, never the reverse.
+            // The pull task is the only consumer of the ids, so nothing can
+            // hold them and want the client today — but reversing this without
+            // that still being true would deadlock.
             let mut ids = target.result_ids.lock().await;
             let previous = ids.previous();
             let server = {
@@ -5222,25 +5256,29 @@ fn spawn_workspace_pull(targets: Vec<WorkspacePull>, tx: std_mpsc::Sender<Diagno
                 previous.len()
             ));
             // Bounded, because a pull can go unanswered indefinitely: `ty`
-            // 0.0.73 advertises `workspaceDiagnostics` and then never
-            // replies. Without a ceiling each spawn and each refresh leaves
-            // another task parked on a response that will not come, and the
+            // advertises `workspaceDiagnostics` and then never replies
+            // (checked on 0.0.73 and again on 0.0.82). Without a ceiling the
+            // task stays parked on a response that will not come and the
             // result ids stay locked behind it, so the NEXT pull for that
-            // server never starts either. Giving up frees both; the panel
-            // keeps whatever the last successful pull reported, and the next
-            // refresh tries again.
+            // server never starts either. Giving up frees the task and the
+            // ids — but NOT the mainloop's `outgoing` entry, which only a
+            // response with that id can drain, so the abandoned request leaks
+            // one entry. That is why a timeout also retires the server from
+            // future pulls: one leak per client, not one per refresh.
             let resp = match tokio::time::timeout(
-                WORKSPACE_PULL_TIMEOUT,
+                ceiling,
                 LspClient::workspace_diagnostics_on(server, target.identifier.clone(), previous),
             )
             .await
             {
                 Ok(resp) => resp,
                 Err(_) => {
+                    target.stalled.store(true, Ordering::Relaxed);
                     log_file::log(&format!(
-                        "lsp[{}] workspace/diagnostic timed out after {}s, giving up on this pull",
+                        "lsp[{}] workspace/diagnostic timed out after {}s; \
+                         retiring it from workspace pulls for this session",
                         target.name,
-                        WORKSPACE_PULL_TIMEOUT.as_secs()
+                        ceiling.as_secs()
                     ));
                     continue;
                 }
@@ -6416,6 +6454,98 @@ while True:
         (path, receipt)
     }
 
+    /// An expired pull must free the result ids, leave the cache untouched,
+    /// and retire the server so it is never pulled again (#533).
+    ///
+    /// The retirement is what bounds the leak: a timed-out request cannot be
+    /// cancelled, so its entry in async-lsp's `outgoing` map is permanent.
+    /// Asking a stalled server once costs one entry; asking it on every
+    /// server-driven refresh would cost one per refresh, forever.
+    #[test]
+    fn an_expired_pull_frees_the_ids_and_retires_the_server() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (script, receipt) = mute_pull_server_script(&root);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let config = ServerConfig {
+                name: "mute-pull",
+                command: python.to_string_lossy().into_owned(),
+                args: vec![
+                    script.to_string_lossy().into_owned(),
+                    receipt.to_string_lossy().into_owned(),
+                ],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            };
+            let (diag_tx, _diag_rx) = std_mpsc::channel();
+            let (prog_tx, _prog_rx) = std_mpsc::channel();
+            let client = LspClient::spawn(
+                &config,
+                &root,
+                build_client_capabilities(),
+                &[],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                diag_tx,
+                prog_tx,
+            )
+            .await
+            .expect("the stub server handshakes");
+
+            let result_ids = Arc::new(TokioMutex::new(DiagnosticResultIds::default()));
+            let stalled = Arc::new(AtomicBool::new(false));
+            let (tx, _rx) = std_mpsc::channel();
+            spawn_workspace_pull_within(
+                vec![WorkspacePull {
+                    name: String::from("mute-pull"),
+                    client: Arc::new(TokioMutex::new(client)),
+                    identifier: None,
+                    result_ids: result_ids.clone(),
+                    stalled: stalled.clone(),
+                }],
+                tx,
+                std::time::Duration::from_millis(200),
+            );
+
+            // Wait for the retirement rather than for a fixed duration: the
+            // flag is the observable the production filter reads.
+            let retired = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !stalled.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                retired.is_ok(),
+                "an expired pull must retire the server, or every later \
+                 refresh leaks another un-reapable request"
+            );
+
+            // The ids are free again, and the timeout recorded nothing: the
+            // next pull re-sends the same `previous` set.
+            let ids = tokio::time::timeout(std::time::Duration::from_secs(5), result_ids.lock())
+                .await
+                .expect("an expired pull must release the result ids");
+            assert!(
+                ids.is_empty(),
+                "an expired pull must leave the result-id cache untouched"
+            );
+        });
+    }
+
     /// A server that accepts `workspace/diagnostic` and never answers it must
     /// not wedge every later request to that client (#533 regression).
     ///
@@ -6485,6 +6615,7 @@ while True:
                     client: client.clone(),
                     identifier: None,
                     result_ids: Arc::new(TokioMutex::new(DiagnosticResultIds::default())),
+                    stalled: Arc::new(AtomicBool::new(false)),
                 }],
                 tx,
             );
@@ -8655,65 +8786,5 @@ while True:
             "the site is the call expression from fromRanges"
         );
         runtime.handle().clone().block_on(state.shutdown_all());
-    }
-
-    /// A workspace pull that never gets an answer must not wedge the worker
-    /// loop (#533 regression, 0.1.939).
-    ///
-    /// The first pull fires from `ensure_clients` at spawn. It used to hold
-    /// the CLIENT lock across its await, and `open_doc` — which runs ON the
-    /// worker loop and takes that same lock BEFORE `docs.insert` — blocked
-    /// behind it against a server that accepts `workspace/diagnostic` and
-    /// never answers (ty 0.0.73 does exactly this). The file never reached
-    /// `docs`, so every later command queued forever and Go to Definition did
-    /// nothing, with no request even logged.
-    ///
-    /// The fix makes the pull's future independent of the client, so the lock
-    /// can be dropped before awaiting it. That independence is a TYPE
-    /// property, and this asserts it the only way that cannot rot: the future
-    /// is moved into a `'static` task while no guard exists. The old
-    /// `&mut self` signature could not satisfy this — its future borrows the
-    /// client, so it cannot outlive the guard it was created under, and this
-    /// stops compiling. A future `spawn_workspace_pull` that re-acquires the
-    /// client inside the await is caught by the runtime half below.
-    #[test]
-    fn a_workspace_pull_awaits_without_holding_the_client() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        runtime.block_on(async {
-            let (_mainloop, server) =
-                async_lsp::MainLoop::new_client(|_: async_lsp::ServerSocket| {
-                    tower::ServiceBuilder::new().service(async_lsp::router::Router::new(()))
-                });
-            let client: Arc<TokioMutex<()>> = Arc::new(TokioMutex::new(()));
-
-            // The socket is taken under the lock, as `spawn_workspace_pull`
-            // takes it; the guard then ends. The future built from it must
-            // still be sendable into a `'static` task — that is exactly what
-            // a client-borrowing signature cannot do.
-            let pull = {
-                let _guard = client.lock().await;
-                LspClient::workspace_diagnostics_on(server, None, Vec::new())
-            };
-            let task = tokio::spawn(async move {
-                let _ = pull.await;
-            });
-
-            // And the client is free for `open_doc` while that pull is in
-            // flight.
-            let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                let _ = client.lock().await;
-            })
-            .await;
-            assert!(
-                opened.is_ok(),
-                "the pull held the client across its await, so open_doc (and \
-                 every command behind it on the worker loop) blocked"
-            );
-            task.abort();
-        });
     }
 }
