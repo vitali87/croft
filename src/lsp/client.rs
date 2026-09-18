@@ -500,6 +500,19 @@ impl LspClient {
         &mut self.server
     }
 
+    /// A detached handle to the server, for a request whose answer must be
+    /// awaited WITHOUT holding this client's lock (#533 regression).
+    ///
+    /// `ServerSocket` is the sending half of the mainloop's channel, so a
+    /// clone talks to the same server and its responses are routed the same
+    /// way. A caller that awaits a slow request on the clone leaves the
+    /// `LspClient` itself free, which matters for any request the server may
+    /// never answer: holding the lock across such an await blocks every other
+    /// user of that client, including `open_doc` on the worker loop.
+    pub fn detached_server(&self) -> ServerSocket {
+        self.server.clone()
+    }
+
     pub fn did_open(
         &mut self,
         uri: Url,
@@ -728,7 +741,18 @@ impl LspClient {
         identifier: Option<String>,
         previous_result_ids: Vec<lsp_types::PreviousResultId>,
     ) -> Result<lsp_types::WorkspaceDiagnosticReportResult> {
-        self.server
+        let server = self.detached_server();
+        Self::workspace_diagnostics_on(server, identifier, previous_result_ids).await
+    }
+
+    /// The whole-project pull, issued on a socket the caller owns rather than
+    /// on `&mut self`, so the client lock can be released before the await.
+    pub async fn workspace_diagnostics_on(
+        mut server: ServerSocket,
+        identifier: Option<String>,
+        previous_result_ids: Vec<lsp_types::PreviousResultId>,
+    ) -> Result<lsp_types::WorkspaceDiagnosticReportResult> {
+        server
             .workspace_diagnostic(lsp_types::WorkspaceDiagnosticParams {
                 identifier,
                 previous_result_ids,

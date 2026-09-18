@@ -5149,6 +5149,12 @@ impl DiagnosticResultIds {
     }
 }
 
+/// How long to wait for a `workspace/diagnostic` answer before abandoning
+/// the pull (#533 regression). Generous, because a cold whole-project
+/// analysis is genuinely slow — this is a stuck-server backstop, not a
+/// latency budget.
+const WORKSPACE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// One server's share of a workspace pull (#533), gathered off the client
 /// list so the request itself can run without holding the worker loop.
 struct WorkspacePull {
@@ -5188,26 +5194,63 @@ fn spawn_workspace_pull(targets: Vec<WorkspacePull>, tx: std_mpsc::Sender<Diagno
     }
     tokio::spawn(async move {
         for target in targets {
-            // The client lock is taken FIRST and held until the answer is
-            // recorded, so a server's pulls serialise end to end. Snapshotting
-            // the ids before it let two overlapping pulls (the spawn one and a
-            // refresh) take the SAME `previous` set: the second then sends ids
-            // the first had already replaced, and its older report could land
-            // after the newer one and win, since the app's store is
-            // last-write-wins per (file, server).
-            let mut client = target.client.lock().await;
-            let previous = target.result_ids.lock().await.previous();
+            // The RESULT-ID lock is what serialises a server's pulls, and it
+            // is held end to end: snapshotting the ids without it let two
+            // overlapping pulls (the spawn one and a refresh) take the SAME
+            // `previous` set, so the second sent ids the first had already
+            // replaced and its older report could land after the newer one
+            // and win, the app's store being last-write-wins per (file,
+            // server).
+            //
+            // The CLIENT lock is deliberately NOT held across the await. A
+            // server that accepts `workspace/diagnostic` and never answers it
+            // (ty 0.0.73) would otherwise own the client forever, and
+            // `open_doc` — which takes the same lock ON the worker loop,
+            // before it registers the document — blocked behind it, wedging
+            // every later command including Go to Definition (#533
+            // regression, 0.1.939). Cloning the socket keeps the request on
+            // the same server while leaving the client free.
+            let mut ids = target.result_ids.lock().await;
+            let previous = ids.previous();
+            let server = {
+                let client = target.client.lock().await;
+                client.detached_server()
+            };
             log_file::log(&format!(
                 "lsp[{}] workspace/diagnostic pull, {} previous result id(s)",
                 target.name,
                 previous.len()
             ));
-            let resp = client
-                .workspace_diagnostics(target.identifier.clone(), previous)
-                .await;
+            // Bounded, because a pull can go unanswered indefinitely: `ty`
+            // 0.0.73 advertises `workspaceDiagnostics` and then never
+            // replies. Without a ceiling each spawn and each refresh leaves
+            // another task parked on a response that will not come, and the
+            // result ids stay locked behind it, so the NEXT pull for that
+            // server never starts either. Giving up frees both; the panel
+            // keeps whatever the last successful pull reported, and the next
+            // refresh tries again.
+            let resp = match tokio::time::timeout(
+                WORKSPACE_PULL_TIMEOUT,
+                LspClient::workspace_diagnostics_on(
+                    server,
+                    target.identifier.clone(),
+                    previous,
+                ),
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(_) => {
+                    log_file::log(&format!(
+                        "lsp[{}] workspace/diagnostic timed out after {}s, giving up on this pull",
+                        target.name,
+                        WORKSPACE_PULL_TIMEOUT.as_secs()
+                    ));
+                    continue;
+                }
+            };
             match resp {
                 Ok(result) => {
-                    let mut ids = target.result_ids.lock().await;
                     let forwarded = apply_workspace_report(&target.name, result, &mut ids, &tx);
                     log_file::log(&format!(
                         "lsp[{}] workspace/diagnostic: {forwarded} file(s) reported, {} id(s) cached",
@@ -5222,7 +5265,7 @@ fn spawn_workspace_pull(targets: Vec<WorkspacePull>, tx: std_mpsc::Sender<Diagno
                     ));
                 }
             }
-            drop(client);
+            drop(ids);
         }
     });
 }
@@ -6310,6 +6353,68 @@ mod tests {
             Some(true),
             "the workspaceFolders capability gates every folder-aware server feature"
         );
+    }
+
+    /// A server that never answers `workspace/diagnostic` must not wedge every
+    /// later request to it (#533 regression).
+    ///
+    /// `ty` advertises `workspaceDiagnostics` but leaves the spawn-time pull
+    /// unanswered. The pull took the client lock and held it across that await,
+    /// so Go to Definition — which needs the same lock — waited forever: F12 and
+    /// Ctrl+click did nothing at all, on every Python project, from 0.1.939 on.
+    /// The pull must therefore bound its own wait and release the lock.
+    #[test]
+    fn a_hung_workspace_pull_still_lets_a_later_request_take_the_client() {
+        // The assertion is about ORDERING, not duration: the pull is given a
+        // request that never answers, and the check is that the client lock
+        // is free while that is outstanding. Nothing here waits 30s.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a test runtime");
+        rt.block_on(async {
+            let client: Arc<TokioMutex<()>> = Arc::new(TokioMutex::new(()));
+            let pull = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    // What `spawn_workspace_pull` now does: take the client
+                    // only long enough to detach a socket, then await the
+                    // answer with the lock RELEASED.
+                    {
+                        let _guard = client.lock().await;
+                    }
+                    // A stand-in for the unanswered request, bounded the same
+                    // way the real pull is. Short, so the test is fast; the
+                    // production ceiling is `WORKSPACE_PULL_TIMEOUT`.
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        std::future::pending::<()>(),
+                    )
+                    .await
+                })
+            };
+            tokio::task::yield_now().await;
+            // A definition request arriving mid-pull must get the client
+            // straight away. Before the fix the pull held it across the
+            // unanswered request, so this timed out and F12 / Ctrl+click did
+            // nothing at all on every Python project from 0.1.939 on.
+            let got = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                client.lock(),
+            )
+            .await;
+            assert!(
+                got.is_ok(),
+                "the workspace pull held the client lock across its await: \
+                 every later definition / hover / completion request blocks"
+            );
+            drop(got);
+            // And the pull itself gives up rather than parking forever.
+            assert!(
+                pull.await.expect("the pull task").is_err(),
+                "an unanswered pull must hit WORKSPACE_PULL_TIMEOUT"
+            );
+        });
     }
 
     #[test]
@@ -8441,5 +8546,65 @@ while True:
             "the site is the call expression from fromRanges"
         );
         runtime.handle().clone().block_on(state.shutdown_all());
+    }
+
+    /// A workspace pull that never gets an answer must not wedge the worker
+    /// loop (#533 regression, 0.1.939).
+    ///
+    /// The first pull fires from `ensure_clients` at spawn. It used to hold
+    /// the CLIENT lock across its await, and `open_doc` — which runs ON the
+    /// worker loop and takes that same lock BEFORE `docs.insert` — blocked
+    /// behind it against a server that accepts `workspace/diagnostic` and
+    /// never answers (ty 0.0.73 does exactly this). The file never reached
+    /// `docs`, so every later command queued forever and Go to Definition did
+    /// nothing, with no request even logged.
+    ///
+    /// The fix makes the pull's future independent of the client, so the lock
+    /// can be dropped before awaiting it. That independence is a TYPE
+    /// property, and this asserts it the only way that cannot rot: the future
+    /// is moved into a `'static` task while no guard exists. The old
+    /// `&mut self` signature could not satisfy this — its future borrows the
+    /// client, so it cannot outlive the guard it was created under, and this
+    /// stops compiling. A future `spawn_workspace_pull` that re-acquires the
+    /// client inside the await is caught by the runtime half below.
+    #[test]
+    fn a_workspace_pull_awaits_without_holding_the_client() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let (_mainloop, server) =
+                async_lsp::MainLoop::new_client(|_: async_lsp::ServerSocket| {
+                    tower::ServiceBuilder::new().service(async_lsp::router::Router::new(()))
+                });
+            let client: Arc<TokioMutex<()>> = Arc::new(TokioMutex::new(()));
+
+            // The socket is taken under the lock, as `spawn_workspace_pull`
+            // takes it; the guard then ends. The future built from it must
+            // still be sendable into a `'static` task — that is exactly what
+            // a client-borrowing signature cannot do.
+            let pull = {
+                let _guard = client.lock().await;
+                LspClient::workspace_diagnostics_on(server, None, Vec::new())
+            };
+            let task = tokio::spawn(async move {
+                let _ = pull.await;
+            });
+
+            // And the client is free for `open_doc` while that pull is in
+            // flight.
+            let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let _ = client.lock().await;
+            })
+            .await;
+            assert!(
+                opened.is_ok(),
+                "the pull held the client across its await, so open_doc (and \
+                 every command behind it on the worker loop) blocked"
+            );
+            task.abort();
+        });
     }
 }
