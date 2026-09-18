@@ -5231,11 +5231,7 @@ fn spawn_workspace_pull(targets: Vec<WorkspacePull>, tx: std_mpsc::Sender<Diagno
             // refresh tries again.
             let resp = match tokio::time::timeout(
                 WORKSPACE_PULL_TIMEOUT,
-                LspClient::workspace_diagnostics_on(
-                    server,
-                    target.identifier.clone(),
-                    previous,
-                ),
+                LspClient::workspace_diagnostics_on(server, target.identifier.clone(), previous),
             )
             .await
             {
@@ -6355,64 +6351,149 @@ mod tests {
         );
     }
 
-    /// A server that never answers `workspace/diagnostic` must not wedge every
-    /// later request to it (#533 regression).
+    /// A stub language server that completes the LSP handshake, advertises
+    /// `workspaceDiagnostics`, and then NEVER answers a `workspace/diagnostic`
+    /// request — exactly what `ty` 0.0.73 does, and the shape that caused the
+    /// #533 regression. Everything else it answers normally.
     ///
-    /// `ty` advertises `workspaceDiagnostics` but leaves the spawn-time pull
-    /// unanswered. The pull took the client lock and held it across that await,
-    /// so Go to Definition — which needs the same lock — waited forever: F12 and
-    /// Ctrl+click did nothing at all, on every Python project, from 0.1.939 on.
-    /// The pull must therefore bound its own wait and release the lock.
+    /// Written to a temp dir and run under the test's own Python, so the test
+    /// needs no server on PATH.
+    fn mute_pull_server_script(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("mute_pull_server.py");
+        std::fs::write(
+            &path,
+            r#"
+import json, sys
+
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def write(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read()
+    if msg is None:
+        break
+    method = msg.get("method")
+    if method == "initialize":
+        write({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {
+            "diagnosticProvider": {
+                "interFileDependencies": True,
+                "workspaceDiagnostics": True,
+            },
+            "definitionProvider": True,
+        }}})
+    elif method == "workspace/diagnostic":
+        # The bug: accept and never answer.
+        pass
+    elif method == "shutdown":
+        write({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    elif "id" in msg:
+        write({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+"#,
+        )
+        .expect("write stub server");
+        path
+    }
+
+    /// A server that accepts `workspace/diagnostic` and never answers it must
+    /// not wedge every later request to that client (#533 regression).
+    ///
+    /// This drives the REAL [`spawn_workspace_pull`] against a real
+    /// [`LspClient`]. The pull previously held the client lock across the
+    /// unanswered await, and `open_doc` takes that same lock ON the worker
+    /// loop, so the loop stopped and Go to Definition did nothing at all from
+    /// 0.1.939 on. The assertion is that the client `Arc` is still lockable
+    /// while the pull is outstanding.
     #[test]
-    fn a_hung_workspace_pull_still_lets_a_later_request_take_the_client() {
-        // The assertion is about ORDERING, not duration: the pull is given a
-        // request that never answers, and the check is that the client lock
-        // is free while that is outstanding. Nothing here waits 30s.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
+    fn a_hung_workspace_pull_leaves_the_client_lockable() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let script = mute_pull_server_script(&root);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
             .build()
-            .expect("a test runtime");
-        rt.block_on(async {
-            let client: Arc<TokioMutex<()>> = Arc::new(TokioMutex::new(()));
-            let pull = {
-                let client = client.clone();
-                tokio::spawn(async move {
-                    // What `spawn_workspace_pull` now does: take the client
-                    // only long enough to detach a socket, then await the
-                    // answer with the lock RELEASED.
-                    {
-                        let _guard = client.lock().await;
-                    }
-                    // A stand-in for the unanswered request, bounded the same
-                    // way the real pull is. Short, so the test is fast; the
-                    // production ceiling is `WORKSPACE_PULL_TIMEOUT`.
-                    tokio::time::timeout(
-                        std::time::Duration::from_millis(200),
-                        std::future::pending::<()>(),
-                    )
-                    .await
-                })
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let config = ServerConfig {
+                name: "mute-pull",
+                command: python.to_string_lossy().into_owned(),
+                args: vec![script.to_string_lossy().into_owned()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
             };
-            tokio::task::yield_now().await;
-            // A definition request arriving mid-pull must get the client
-            // straight away. Before the fix the pull held it across the
-            // unanswered request, so this timed out and F12 / Ctrl+click did
-            // nothing at all on every Python project from 0.1.939 on.
-            let got = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                client.lock(),
+            let (diag_tx, _diag_rx) = std_mpsc::channel();
+            let (prog_tx, _prog_rx) = std_mpsc::channel();
+            let client = LspClient::spawn(
+                &config,
+                &root,
+                build_client_capabilities(),
+                &[],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                diag_tx,
+                prog_tx,
             )
-            .await;
+            .await
+            .expect("the stub server handshakes");
+
+            // Precondition: the stub really does advertise the capability, so
+            // `workspace_pull_targets` would select it in production. Without
+            // this the test could pass by pulling nothing at all.
             assert!(
-                got.is_ok(),
-                "the workspace pull held the client lock across its await: \
-                 every later definition / hover / completion request blocks"
+                workspace_diagnostics_supported(&client.capabilities().diagnostic_provider),
+                "the stub must advertise workspaceDiagnostics, or no pull is issued"
             );
-            drop(got);
-            // And the pull itself gives up rather than parking forever.
+
+            let client = Arc::new(TokioMutex::new(client));
+            let (tx, _rx) = std_mpsc::channel();
+            spawn_workspace_pull(
+                vec![WorkspacePull {
+                    name: String::from("mute-pull"),
+                    client: client.clone(),
+                    identifier: None,
+                    result_ids: Arc::new(TokioMutex::new(DiagnosticResultIds::default())),
+                }],
+                tx,
+            );
+
+            // Let the pull start and get as far as it is going to get.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            // What `open_doc` does on the worker loop. Before the fix this
+            // never returned, and with it went every queued command.
+            let opened =
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.lock()).await;
             assert!(
-                pull.await.expect("the pull task").is_err(),
-                "an unanswered pull must hit WORKSPACE_PULL_TIMEOUT"
+                opened.is_ok(),
+                "the workspace pull held the client across its unanswered \
+                 await: open_doc — and every command behind it on the worker \
+                 loop, Go to Definition included — blocks forever"
             );
         });
     }
@@ -7165,6 +7246,14 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The `python3` the stub server runs under, if there is one.
+    fn python_for_stub_server() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|entry| entry.join("python3"))
+            .find(|candidate| is_executable_file(candidate))
     }
 
     fn any_python_completion_server_on_path() -> bool {

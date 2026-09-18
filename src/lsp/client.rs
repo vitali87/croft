@@ -726,6 +726,13 @@ impl LspClient {
     /// LSP 3.17 `workspace/diagnostic`: PULL the whole project's diagnostics
     /// over the existing connection (#533).
     ///
+    /// Issued on a socket the CALLER owns rather than on `&mut self`, so the
+    /// client lock can be released before the await. That is not a
+    /// convenience: a server may accept this request and never answer it
+    /// (`ty` 0.0.73 does), and holding the client across such an await blocks
+    /// every other user of it — including `open_doc` on the worker loop, which
+    /// wedged Go to Definition outright (#533 regression, 0.1.939).
+    ///
     /// `identifier` is echoed back from the server's own
     /// `diagnosticProvider.identifier` - a server that registered several
     /// diagnostic sources uses it to tell which one the previous result ids
@@ -736,17 +743,6 @@ impl LspClient {
     /// Only call this on a server whose capability says
     /// `workspaceDiagnostics: true` - one that pulls per document but not per
     /// workspace answers `-32601 Unhandled method`.
-    pub async fn workspace_diagnostics(
-        &mut self,
-        identifier: Option<String>,
-        previous_result_ids: Vec<lsp_types::PreviousResultId>,
-    ) -> Result<lsp_types::WorkspaceDiagnosticReportResult> {
-        let server = self.detached_server();
-        Self::workspace_diagnostics_on(server, identifier, previous_result_ids).await
-    }
-
-    /// The whole-project pull, issued on a socket the caller owns rather than
-    /// on `&mut self`, so the client lock can be released before the await.
     pub async fn workspace_diagnostics_on(
         mut server: ServerSocket,
         identifier: Option<String>,
