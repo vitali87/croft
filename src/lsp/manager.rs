@@ -6358,8 +6358,11 @@ mod tests {
     ///
     /// Written to a temp dir and run under the test's own Python, so the test
     /// needs no server on PATH.
-    fn mute_pull_server_script(dir: &Path) -> std::path::PathBuf {
+    /// Returns `(script, receipt)`: the stub creates `receipt` the moment a
+    /// `workspace/diagnostic` request reaches it.
+    fn mute_pull_server_script(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let path = dir.join("mute_pull_server.py");
+        let receipt = dir.join("pull-received");
         std::fs::write(
             &path,
             r#"
@@ -6400,8 +6403,9 @@ while True:
             "definitionProvider": True,
         }}})
     elif method == "workspace/diagnostic":
-        # The bug: accept and never answer.
-        pass
+        # Signal receipt, so the test waits for the request to ARRIVE rather
+        # than guessing with a sleep, then never answer -- the bug.
+        open(sys.argv[1], "w").close()
     elif method == "shutdown":
         write({"jsonrpc": "2.0", "id": msg["id"], "result": None})
     elif "id" in msg:
@@ -6409,7 +6413,7 @@ while True:
 "#,
         )
         .expect("write stub server");
-        path
+        (path, receipt)
     }
 
     /// A server that accepts `workspace/diagnostic` and never answers it must
@@ -6429,7 +6433,7 @@ while True:
         };
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonicalize");
-        let script = mute_pull_server_script(&root);
+        let (script, receipt) = mute_pull_server_script(&root);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -6441,7 +6445,10 @@ while True:
             let config = ServerConfig {
                 name: "mute-pull",
                 command: python.to_string_lossy().into_owned(),
-                args: vec![script.to_string_lossy().into_owned()],
+                args: vec![
+                    script.to_string_lossy().into_owned(),
+                    receipt.to_string_lossy().into_owned(),
+                ],
                 language: Language::PYTHON,
                 initialization_options: None,
                 provision: None,
@@ -6482,8 +6489,21 @@ while True:
                 tx,
             );
 
-            // Let the pull start and get as far as it is going to get.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // Wait for the request to actually REACH the stub. A fixed sleep
+            // would let the test pass for the wrong reason: `tokio::spawn`
+            // need not have polled the pull future yet, and an unstarted pull
+            // trivially holds no lock.
+            let arrived = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !receipt.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                arrived.is_ok(),
+                "the stub never received workspace/diagnostic, so this test \
+                 would not exercise the lock at all"
+            );
 
             // What `open_doc` does on the worker loop. Before the fix this
             // never returned, and with it went every queued command.
