@@ -5245,6 +5245,19 @@ fn spawn_workspace_pull_within(
             // hold them and want the client today — but reversing this without
             // that still being true would deadlock.
             let mut ids = target.result_ids.lock().await;
+            // Re-check retirement HERE, not only in `workspace_pull_targets`.
+            // That filter reads the flag when the target list is built; this
+            // task may then have waited the full ceiling on the ids behind an
+            // earlier pull for the same server, which timed out and retired it
+            // meanwhile. Acting on the stale snapshot would send exactly the
+            // un-reapable request the retirement exists to prevent.
+            if target.stalled.load(Ordering::Relaxed) {
+                log_file::log(&format!(
+                    "lsp[{}] workspace/diagnostic skipped: retired while queued",
+                    target.name
+                ));
+                continue;
+            }
             let previous = ids.previous();
             let server = {
                 let client = target.client.lock().await;
@@ -6494,6 +6507,91 @@ while True:
             supports_folding_range: false,
             supports_document_color: false,
         }
+    }
+
+    /// A pull already QUEUED when the server is retired must issue nothing
+    /// (#533).
+    ///
+    /// `workspace_pull_targets` reads the retirement flag when it builds the
+    /// target list, so a second pull spawned before the first expires carries
+    /// a stale snapshot. It then waits the whole ceiling on the result-id lock
+    /// the first pull holds, and would wake and send exactly the un-reapable
+    /// request the retirement exists to prevent. Both targets are built up
+    /// front here, which is what makes the snapshot stale.
+    #[test]
+    fn a_pull_queued_before_retirement_issues_no_request() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (script, receipt) = mute_pull_server_script(&root);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let config = ServerConfig {
+                name: "mute-pull",
+                command: python.to_string_lossy().into_owned(),
+                args: vec![
+                    script.to_string_lossy().into_owned(),
+                    receipt.to_string_lossy().into_owned(),
+                ],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            };
+            let (diag_tx, _diag_rx) = std_mpsc::channel();
+            let (prog_tx, _prog_rx) = std_mpsc::channel();
+            let client = LspClient::spawn(
+                &config,
+                &root,
+                build_client_capabilities(),
+                &[],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                diag_tx,
+                prog_tx,
+            )
+            .await
+            .expect("the stub server handshakes");
+            let managed = managed_client_for_pull_test(client);
+
+            // Both target lists are built BEFORE either pull runs, so the
+            // second carries a snapshot taken while the server was healthy.
+            let first = workspace_pull_targets(std::iter::once(&managed));
+            let second = workspace_pull_targets(std::iter::once(&managed));
+            assert_eq!(second.len(), 1, "the second pull must start un-retired");
+
+            let (tx, _rx) = std_mpsc::channel();
+            spawn_workspace_pull_within(first, tx.clone(), std::time::Duration::from_millis(200));
+            spawn_workspace_pull_within(second, tx, std::time::Duration::from_millis(200));
+
+            let retired = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !managed.diagnostic_pull_stalled.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(retired.is_ok(), "the first pull must retire the server");
+
+            // Give the queued second pull time to wake and (wrongly) send.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let pulls = std::fs::read_to_string(&receipt).unwrap_or_default();
+            assert_eq!(
+                pulls.lines().count(),
+                1,
+                "a pull queued before retirement must issue no request: each \
+                 one leaves an entry in async-lsp's outgoing map that only a \
+                 response can drain, and this server never answers"
+            );
+        });
     }
 
     /// `workspace_pull_targets` must DROP a retired server, so the retirement
