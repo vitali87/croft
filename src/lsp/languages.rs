@@ -169,6 +169,16 @@ mod tests {
     fn bundled_root_markers_and_family() {
         assert_eq!(root_markers(Language::RUST), &["Cargo.toml"]);
         assert_eq!(root_markers(Language::GO), &["go.mod"]);
+        assert_eq!(
+            root_markers(Language::LUA),
+            &[
+                ".luarc.json",
+                ".luacheckrc",
+                ".stylua.toml",
+                "stylua.toml",
+                "selene.toml"
+            ]
+        );
         assert!(root_markers(Language::JSON).is_empty());
         // vtsls family: the React/JS ids collapse onto TypeScript; TypeScript
         // is its own family.
@@ -177,6 +187,7 @@ mod tests {
         assert_eq!(server_family(Language::JAVASCRIPT), Language::TYPESCRIPT);
         assert_eq!(server_family(Language::TYPESCRIPT), Language::TYPESCRIPT);
         assert_eq!(server_family(Language::RUST), Language::RUST);
+        assert_eq!(server_family(Language::LUA), Language::LUA);
     }
 
     const ZIG_MANIFEST: &str = r#"

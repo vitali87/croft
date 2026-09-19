@@ -25,6 +25,7 @@ impl Language {
     pub const CSS: Language = Language("css");
     pub const C: Language = Language("c");
     pub const CPP: Language = Language("cpp");
+    pub const LUA: Language = Language("lua");
 
     /// The language whose manifests map this file extension, or `None`.
     /// Data-driven: the mapping comes from every loaded extension's
@@ -234,6 +235,17 @@ impl ServerConfig {
             provision: None,
         }
     }
+
+    pub fn lua_language_server() -> Self {
+        Self {
+            name: "lua-language-server",
+            command: "lua-language-server".into(),
+            args: Vec::new(),
+            language: Language::LUA,
+            initialization_options: None,
+            provision: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +265,7 @@ mod tests {
         assert_eq!(Language::from_extension("rs"), Some(Language::RUST));
         assert_eq!(Language::from_extension("go"), Some(Language::GO));
         assert_eq!(Language::from_extension("yml"), Some(Language::YAML));
+        assert_eq!(Language::from_extension("lua"), Some(Language::LUA));
     }
 
     #[test]

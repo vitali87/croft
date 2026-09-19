@@ -344,6 +344,24 @@ const RUST_LOCALS_QUERY: &str = r#"
 (identifier) @local.reference
 "#;
 
+/// Overlay query for Lua: maps tree-sitter-lua's fine-grained captures
+/// (@conditional, @repeat, @field, @method, @parameter, @preproc) onto
+/// Croft's standard HIGHLIGHT_NAMES captures under the last-match-wins rule.
+const LUA_OVERLAY_QUERY: &str = r#"
+(if_statement [ "if" "elseif" "else" "then" "end" ] @keyword)
+(elseif_statement [ "elseif" "then" "end" ] @keyword)
+(else_statement [ "else" "end" ] @keyword)
+(while_statement [ "while" "do" "end" ] @keyword)
+(repeat_statement [ "repeat" "until" ] @keyword)
+(for_statement [ "for" "do" "end" ] @keyword)
+(parameters (identifier) @variable.parameter)
+(field name: (identifier) @property)
+(dot_index_expression field: (identifier) @property)
+(function_declaration name: (method_index_expression method: (identifier) @function.method))
+(function_call name: (method_index_expression method: (identifier) @function.method))
+(hash_bang_line) @comment
+"#;
+
 /// The active code-highlight palette. Seeded to the historical Base16-Ocean
 /// defaults so highlighting works before any theme is applied, then overwritten
 /// by `set_syntax_palette` on every theme switch. A process-wide `RwLock`
@@ -415,6 +433,7 @@ pub enum LangKind {
     Bash,
     C,
     Cpp,
+    Lua,
 }
 
 /// The bare tree-sitter grammar handle for `kind` — the parser the
@@ -439,6 +458,7 @@ pub fn language_for(kind: LangKind) -> tree_sitter::Language {
         LangKind::Bash => tree_sitter_bash::LANGUAGE.into(),
         LangKind::C => tree_sitter_c::LANGUAGE.into(),
         LangKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        LangKind::Lua => tree_sitter_lua::LANGUAGE.into(),
     }
 }
 
@@ -460,6 +480,7 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "sh" | "bash" | "zsh" => LangKind::Bash,
         "c" | "h" => LangKind::C,
         "cpp" | "cc" | "cxx" | "c++" | "C" | "hpp" | "hxx" | "h++" => LangKind::Cpp,
+        "lua" => LangKind::Lua,
         _ => return None,
     })
 }
@@ -689,6 +710,21 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             "",
         )
         .ok()?,
+        LangKind::Lua => {
+            let highlights = format!(
+                "{}\n{}",
+                tree_sitter_lua::HIGHLIGHTS_QUERY,
+                LUA_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_lua::LANGUAGE.into(),
+                "lua",
+                &highlights,
+                tree_sitter_lua::INJECTIONS_QUERY,
+                tree_sitter_lua::LOCALS_QUERY,
+            )
+            .ok()?
+        }
     };
     cfg.configure(HIGHLIGHT_NAMES);
     Some(cfg)
@@ -1885,5 +1921,23 @@ def f() -> Config:\n\
             "default-foreground spans must use the palette fg: {:?}",
             h[0]
         );
+    }
+
+    #[test]
+    fn lua_highlighting_captures_keywords_and_comments() {
+        let mut reg = LangRegistry::new();
+        let src = "local function greet(name)\n    -- comment\n    if name then\n        return 42\n    end\nend\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Lua, src.as_bytes(), &ls);
+        assert_eq!(h.len(), 7);
+        let lines: Vec<&str> = src.lines().collect();
+        assert!(span_at(&h[0], lines[0], "local").is_some());
+        assert!(span_at(&h[0], lines[0], "greet").is_some());
+        assert!(span_at(&h[1], lines[1], "-- comment").is_some());
+        assert!(span_at(&h[2], lines[2], "if").is_some());
+        assert!(span_at(&h[2], lines[2], "then").is_some());
+        assert!(span_at(&h[3], lines[3], "return").is_some());
+        assert!(span_at(&h[3], lines[3], "42").is_some());
+        assert_eq!(lang_for_extension("lua"), Some(LangKind::Lua));
     }
 }
