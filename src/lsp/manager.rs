@@ -1512,8 +1512,6 @@ impl LspManager {
         self.calls_rx.try_recv().ok()
     }
 
-    /// Whether the server for `lang` implements call hierarchy. `None` means
-    /// no server has reported yet. Drives the right-click menu rows.
     /// Whether any running server wants `willRenameFiles` (#610). When none
     /// does, an Explorer move runs at once instead of waiting on an answer
     /// that can only be empty.
@@ -1523,6 +1521,8 @@ impl LspManager {
             .is_ok_and(|s| s.will_rename.values().any(|w| *w))
     }
 
+    /// Whether the server for `lang` implements call hierarchy. `None` means
+    /// no server has reported yet. Drives the right-click menu rows.
     pub fn language_supports_call_hierarchy(&self, lang: Language) -> Option<bool> {
         self.capability_support
             .lock()
