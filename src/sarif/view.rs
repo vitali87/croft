@@ -11,6 +11,54 @@ use super::semantics::{self as sem, BaselineState, Kind, Level, SuppressionState
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+/// Which results the user fixed, per log, kept in croft's cache so the
+/// strike-through survives closing and reopening a log (#577). Keyed by
+/// the log's path, then `run:result`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FixedStore {
+    #[serde(default)]
+    pub logs: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl FixedStore {
+    pub fn path() -> PathBuf {
+        crate::app::croft_cache_dir().join("sarif-fixed.json")
+    }
+
+    pub fn load() -> FixedStore {
+        std::fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, text)
+    }
+
+    pub fn key(run: usize, result: usize) -> String {
+        format!("{run}:{result}")
+    }
+
+    pub fn is_fixed(&self, log: &std::path::Path, run: usize, result: usize) -> bool {
+        self.logs
+            .get(&log.display().to_string())
+            .is_some_and(|s| s.contains(&Self::key(run, result)))
+    }
+
+    pub fn mark(&mut self, log: &std::path::Path, run: usize, result: usize) {
+        self.logs
+            .entry(log.display().to_string())
+            .or_default()
+            .insert(Self::key(run, result));
+    }
+}
+
 /// Largest log the viewer loads into memory. SARIF from a monorepo scan runs
 /// to hundreds of megabytes; past this the JSON tree alone would dwarf it.
 pub const MAX_LOG_BYTES: u64 = 512 * 1024 * 1024;
@@ -44,6 +92,8 @@ pub struct Entry {
     pub line: i64,
     pub column: i64,
     pub tags: Vec<String>,
+    /// The user applied a fix for it or marked it fixed (#577).
+    pub fixed: bool,
 }
 
 /// A loaded log and where it came from.
@@ -68,14 +118,16 @@ pub enum DetailTab {
     Steps,
     Stacks,
     Raw,
+    Fix,
 }
 
 impl DetailTab {
-    const ORDER: [DetailTab; 4] = [
+    const ORDER: [DetailTab; 5] = [
         DetailTab::Info,
         DetailTab::Steps,
         DetailTab::Stacks,
         DetailTab::Raw,
+        DetailTab::Fix,
     ];
 
     pub fn step(self, forward: bool) -> DetailTab {
@@ -94,6 +146,7 @@ impl DetailTab {
             DetailTab::Steps => "Steps",
             DetailTab::Stacks => "Stacks",
             DetailTab::Raw => "Raw",
+            DetailTab::Fix => "Fix",
         }
     }
 }
@@ -268,6 +321,8 @@ pub struct SarifView {
     details_cache: Option<(usize, super::details::Details)>,
     /// The selected result's raw JSON, keyed by entry index.
     raw_cache: Option<(usize, Option<String>)>,
+    /// The selected result's fix previews, keyed by entry index.
+    fix_cache: Option<(usize, Vec<String>)>,
 }
 
 impl SarifView {
@@ -293,6 +348,7 @@ impl SarifView {
             detail_scroll: 0,
             details_cache: None,
             raw_cache: None,
+            fix_cache: None,
         }
     }
 
@@ -340,6 +396,61 @@ impl SarifView {
         self.raw_cache.as_ref().and_then(|(_, r)| r.as_deref())
     }
 
+    /// The Fix tab's lines for the selected result: each fix's description
+    /// and what it would change, computed once per selection against the
+    /// files on disk.
+    pub fn fix_preview(&mut self) -> Vec<String> {
+        let Some(idx) = self.selected_index_pub() else {
+            return Vec::new();
+        };
+        if self.fix_cache.as_ref().map(|(i, _)| *i) != Some(idx) {
+            let lines = (|| {
+                let e = self.entries.get(idx)?;
+                let loaded = self.logs.get(e.log)?;
+                let run = loaded.log.runs.get(e.run)?;
+                let result = run.results.as_ref()?.get(e.result)?;
+                if result.fixes.is_empty() {
+                    return Some(vec![String::from("This result offers no fix.")]);
+                }
+                let mut roots = Vec::new();
+                if let Some(dir) = loaded.path.parent() {
+                    roots.push(dir.to_path_buf());
+                }
+                if let Ok(cwd) = std::env::current_dir() {
+                    roots.push(cwd);
+                }
+                let resolver = super::resolve::Resolver {
+                    roots,
+                    ..Default::default()
+                };
+                let mut out = Vec::new();
+                for (i, fix) in result.fixes.iter().enumerate() {
+                    let what = fix
+                        .description
+                        .as_ref()
+                        .and_then(|m| m.text.clone())
+                        .unwrap_or_else(|| String::from("(no description)"));
+                    out.push(format!("Fix {}: {what}", i + 1));
+                    match super::fixes::apply_fix(run, fix, &resolver, &mut |p| {
+                        std::fs::read_to_string(p).ok()
+                    }) {
+                        Ok(edits) => out.extend(super::fixes::preview(&edits)),
+                        Err(why) => out.push(format!("cannot apply: {why}")),
+                    }
+                    out.push(String::new());
+                }
+                out.push(String::from("f applies fix 1 to the open buffer (unsaved)"));
+                Some(out)
+            })()
+            .unwrap_or_default();
+            self.fix_cache = Some((idx, lines));
+        }
+        self.fix_cache
+            .as_ref()
+            .map(|(_, l)| l.clone())
+            .unwrap_or_default()
+    }
+
     /// The locations `n`/`N` walk on the current tab: every step of every
     /// flow, every frame of every stack, or the result's own locations then
     /// its related ones.
@@ -359,7 +470,7 @@ impl SarifView {
                 .iter()
                 .flat_map(|s| s.frames.iter().filter_map(|f| f.location.clone()))
                 .collect(),
-            DetailTab::Info | DetailTab::Raw => d
+            DetailTab::Info | DetailTab::Raw | DetailTab::Fix => d
                 .locations
                 .iter()
                 .chain(d.related.iter())
@@ -423,6 +534,10 @@ impl SarifView {
         }];
         let entries = build_entries(&logs, &roots);
         let mut view = SarifView::new(logs, entries);
+        let fixed = FixedStore::load();
+        for e in &mut view.entries {
+            e.fixed = fixed.is_fixed(path, e.run, e.result);
+        }
         // Start on the first result rather than its group header, so the
         // details pane has something to show from the first frame.
         if matches!(view.rows().get(1), Some(Row::Item { .. })) {
@@ -767,6 +882,7 @@ fn entry_for(
         line: region.and_then(|r| r.start_line).unwrap_or(0),
         column: region.and_then(|r| r.start_column).unwrap_or(0),
         tags,
+        fixed: false,
     }
 }
 
@@ -821,6 +937,7 @@ mod tests {
             line,
             column: 1,
             tags: vec![],
+            fixed: false,
         }
     }
 

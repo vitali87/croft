@@ -224,7 +224,13 @@ pub fn render(
                 } else {
                     String::from("—")
                 };
-                let base = if selected { sel_style } else { text };
+                let base = if selected {
+                    sel_style
+                } else if e.fixed {
+                    dim.add_modifier(Modifier::CROSSED_OUT)
+                } else {
+                    text
+                };
                 buf.set_stringn(inner.x, y, "   ", list_w as usize, base);
                 let glyph_style = if selected {
                     sel_style
@@ -298,6 +304,11 @@ fn render_details(
     } else {
         None
     };
+    let fix_lines = if tab == DetailTab::Fix {
+        view.fix_preview()
+    } else {
+        Vec::new()
+    };
     let Some(d) = view.details() else {
         buf.set_stringn(x, top, "Select a result to see its details.", w, dim);
         return;
@@ -311,6 +322,7 @@ fn render_details(
         DetailTab::Steps,
         DetailTab::Stacks,
         DetailTab::Raw,
+        DetailTab::Fix,
     ] {
         let label = match t {
             DetailTab::Steps => format!(" Steps {steps} "),
@@ -490,6 +502,20 @@ fn render_details(
                     }
                     lines.push((format!("  {}  {loc}{module}", f.text), style));
                 }
+            }
+        }
+        DetailTab::Fix => {
+            for l in fix_lines {
+                let style = if l.starts_with("+ ") {
+                    Style::default().fg(Color::Rgb(0x5d, 0xbb, 0x85)).bg(bg)
+                } else if l.starts_with("- ") {
+                    Style::default().fg(Color::Rgb(0xf1, 0x4c, 0x4c)).bg(bg)
+                } else if l.starts_with("Fix ") {
+                    text.add_modifier(Modifier::BOLD)
+                } else {
+                    text
+                };
+                lines.push((l, style));
             }
         }
         DetailTab::Raw => match raw {

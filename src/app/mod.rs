@@ -7282,9 +7282,19 @@ impl App {
                     roots,
                     ..Default::default()
                 };
-                for run in &loaded.log.runs {
+                let log_index = view.logs.iter().position(|l| l.path == loaded.path);
+                for (run_i, run) in loaded.log.runs.iter().enumerate() {
                     let key = crate::sarif::diagnostics::source_key(run);
-                    for result in run.results.iter().flatten() {
+                    for (result_i, result) in run.results.iter().flatten().enumerate() {
+                        // A fixed result no longer squiggles.
+                        if view.entries.iter().any(|e| {
+                            Some(e.log) == log_index
+                                && e.run == run_i
+                                && e.result == result_i
+                                && e.fixed
+                        }) {
+                            continue;
+                        }
                         if let Some((target, d)) = crate::sarif::diagnostics::diagnostic_for(
                             run,
                             result,
@@ -45235,6 +45245,7 @@ impl App {
                 }
             }
             KeyCode::Char('x') => view.clear_filters(),
+            KeyCode::Char('f') => self.apply_sarif_fix(0),
             KeyCode::Char('d') => view.detail_tab = view.detail_tab.step(true),
             // Scroll the details pane half a page; the renderer clamps.
             KeyCode::Char(']') => {
@@ -45311,6 +45322,90 @@ impl App {
             Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
             Err(e) => format!("Open failed: {e}"),
         };
+    }
+
+    /// Apply fix `index` of the selected SARIF result (#577) to the open
+    /// buffer of each file it changes (the file on disk when none is open),
+    /// as one undoable edit that stays unsaved, then mark the result fixed.
+    fn apply_sarif_fix(&mut self, index: usize) {
+        let root = self.workspace_root().to_path_buf();
+        let Some((log_path, run_i, result_i, run, fix)) =
+            self.editor.sarif.as_ref().and_then(|v| {
+                let e = v.selected_entry()?;
+                let loaded = v.logs.get(e.log)?;
+                let run = loaded.log.runs.get(e.run)?.clone();
+                let fix = run
+                    .results
+                    .as_ref()?
+                    .get(e.result)?
+                    .fixes
+                    .get(index)?
+                    .clone();
+                Some((loaded.path.clone(), e.run, e.result, run, fix))
+            })
+        else {
+            self.status = String::from("This result offers no fix");
+            return;
+        };
+        let mut roots = vec![root];
+        if let Some(dir) = log_path.parent() {
+            roots.push(dir.to_path_buf());
+        }
+        let resolver = crate::sarif::resolve::Resolver {
+            roots,
+            ..Default::default()
+        };
+        let open_text = |p: &std::path::Path| -> Option<String> {
+            self.editor
+                .iter_tabs()
+                .find(|t| t.path.as_deref() == Some(p) && !t.has_non_text_view())
+                .map(|t| {
+                    let mut s = t.lines.join("\n");
+                    s.push('\n');
+                    s
+                })
+        };
+        let edits = match crate::sarif::fixes::apply_fix(&run, &fix, &resolver, &mut |p| {
+            open_text(p).or_else(|| std::fs::read_to_string(p).ok())
+        }) {
+            Ok(e) => e,
+            Err(why) => {
+                self.status = format!("Fix not applied: {why}");
+                return;
+            }
+        };
+        self.editor.pin_active();
+        for edit in &edits {
+            if let Err(e) = self.open_at(&edit.path, 0, 0) {
+                self.status = format!("Fix not applied: {e}");
+                return;
+            }
+            self.editor
+                .replace_all_lines(crate::widgets::editor::split_into_lines(&edit.after));
+        }
+        let mut store = crate::sarif::view::FixedStore::load();
+        store.mark(&log_path, run_i, result_i);
+        let _ = store.save();
+        for tab in self.editor.editors.iter_mut() {
+            if let Some(view) = tab.sarif.as_mut() {
+                for e in view.entries.iter_mut() {
+                    if view.logs.get(e.log).is_some_and(|l| l.path == log_path)
+                        && e.run == run_i
+                        && e.result == result_i
+                    {
+                        e.fixed = true;
+                    }
+                }
+            }
+        }
+        // Republish without the fixed result.
+        self.sarif_diag_signature.clear();
+        let what = fix
+            .description
+            .as_ref()
+            .and_then(|m| m.text.clone())
+            .unwrap_or_else(|| String::from("the fix"));
+        self.status = format!("Applied \"{what}\" to {} file(s), unsaved", edits.len());
     }
 
     /// Open a location from the selected result's details (a step, a frame, a

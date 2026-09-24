@@ -49901,3 +49901,82 @@ fn sarif_levels_map_to_editor_severities() {
         S::Information
     );
 }
+
+/// A log whose one result carries a fix for the line it reports.
+fn sarif_fix_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("q.rs"), "let q = format!(\"{}\", id);\n").unwrap();
+    let log = tmp.path().join("fix.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"lint"}},"columnKind":"unicodeCodePoints",
+          "results":[{"ruleId":"R9","level":"warning","message":{"text":"Unsanitised id."},
+            "locations":[{"physicalLocation":{"artifactLocation":{"uri":"q.rs"},"region":{"startLine":1,"startColumn":23}}}],
+            "fixes":[{"description":{"text":"Sanitise it"},"artifactChanges":[{"artifactLocation":{"uri":"q.rs"},
+              "replacements":[{"deletedRegion":{"startLine":1,"startColumn":23,"endColumn":25},"insertedContent":{"text":"clean(id)"}}]}]}]}]}]}"#,
+    )
+    .unwrap();
+    (tmp, log)
+}
+
+#[test]
+fn sarif_fix_tab_previews_and_f_applies_the_fix_as_an_unsaved_edit() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let (tmp, log) = sarif_fix_fixture();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_preview(&log).unwrap();
+        // The Fix tab is the fifth: Info, Steps, Stacks, Raw, Fix.
+        for _ in 0..4 {
+            app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+        }
+        let screen = draw_screen(&mut app);
+        assert!(
+            screen.contains("Sanitise it"),
+            "the fix's description:\n{screen}"
+        );
+        assert!(
+            screen.contains("+ let q = format!(\"{}\", clean(id));"),
+            "its preview:\n{screen}"
+        );
+        app.handle_sarif_key(key(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("q.rs").as_path()),
+            "the fixed file is open: {}",
+            app.status
+        );
+        assert_eq!(app.editor.lines[0], "let q = format!(\"{}\", clean(id));");
+        assert!(
+            app.editor.dirty,
+            "applied to the buffer, not saved behind the user's back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("q.rs")).unwrap(),
+            "let q = format!(\"{}\", id);\n",
+            "the disk is untouched"
+        );
+        // The result is marked fixed, and that survives reopening the log.
+        let viewer = (0..app.editor.tab_count())
+            .find(|&i| app.editor.tab_path(i).as_deref() == Some(log.as_path()))
+            .unwrap();
+        app.editor.select(viewer);
+        assert!(app.editor.sarif.as_ref().unwrap().entries[0].fixed);
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.editor.open(&log).unwrap();
+        assert!(
+            again.editor.sarif.as_ref().unwrap().entries[0].fixed,
+            "persisted"
+        );
+        // A fixed result no longer squiggles.
+        again.sync_sarif_diagnostics();
+        assert!(
+            again
+                .lsp_diagnostics
+                .get(&tmp.path().join("q.rs"))
+                .is_none_or(|m| m.values().all(|v| v.is_empty())),
+            "fixed results are withdrawn from the editor"
+        );
+    });
+}
