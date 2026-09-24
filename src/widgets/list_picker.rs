@@ -56,6 +56,12 @@ pub enum ListPurpose {
     /// Action on one participant: `id` is `grant:<id>` / `revoke:<id>` /
     /// `kick:<id>`, applied through the session host's control channel.
     SessionParticipantAction,
+    /// GitHub code scanning (#577): the rows are the repository's recent
+    /// analyses; `id` is the analysis id, opened as a SARIF log.
+    CodeScanningAnalysis,
+    /// Why a code scanning alert is dismissed: `id` is `<alert>:<reason>`,
+    /// the reason an index into `DismissReason::ALL`.
+    DismissAlert,
 }
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a

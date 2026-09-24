@@ -50354,3 +50354,156 @@ fn the_sarif_key_legend_names_the_fix_log_baseline_and_export_keys() {
         assert!(screen.contains(want), "{want} missing:\n{screen}");
     }
 }
+
+/// A stand-in `gh` answering from canned files: each rule maps a substring
+/// of the arguments to the file whose contents it prints.
+#[cfg(unix)]
+fn fake_gh(dir: &std::path::Path, rules: &[(&str, &str)]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let mut script = String::from(
+        "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/gh-calls.log\"\ncase \"$*\" in\n",
+    );
+    for (i, (pattern, body)) in rules.iter().enumerate() {
+        let file = dir.join(format!("gh-reply-{i}"));
+        std::fs::write(&file, body).unwrap();
+        script.push_str(&format!("  *'{pattern}'*) cat '{}' ;;\n", file.display()));
+    }
+    script.push_str("  *) echo '{\"message\":\"unexpected call\"}' >&2; exit 1 ;;\nesac\n");
+    let gh = dir.join("gh");
+    std::fs::write(&gh, script).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gh
+}
+
+#[cfg(unix)]
+#[test]
+fn a_code_scanning_analysis_opens_from_github_in_the_sarif_viewer() {
+    // #577: VS Code's SARIF viewer pulls a repository's code scanning
+    // analyses; croft lists them and opens the chosen one as a log.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let gh = fake_gh(
+            bin.path(),
+            &[
+                (
+                    "analyses?per_page=30",
+                    r#"[{"id":201,"ref":"refs/heads/main","commit_sha":"abc","error":"","category":"",
+                        "created_at":"2026-09-20T10:00:00Z","results_count":1,"tool":{"name":"CodeQL","version":"2.19.3"}}]"#,
+                ),
+                (
+                    "analyses/201",
+                    r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},
+                        "results":[{"ruleId":"rust/sql-injection","message":{"text":"From GitHub."}}]}]}"#,
+                ),
+            ],
+        );
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh;
+        app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+        let picker = app.list_picker.as_ref().expect("the analyses are offered");
+        assert_eq!(
+            picker.purpose,
+            crate::widgets::list_picker::ListPurpose::CodeScanningAnalysis
+        );
+        assert_eq!(picker.rows.len(), 1);
+        assert_eq!(picker.rows[0].id, "201");
+        assert!(
+            picker.rows[0].label.contains("CodeQL 2.19.3"),
+            "{}",
+            picker.rows[0].label
+        );
+        app.confirm_list_picker();
+        let view = app
+            .editor
+            .sarif
+            .as_ref()
+            .expect("the analysis opens in the viewer");
+        assert!(view.entries.iter().any(|e| e.message == "From GitHub."));
+        let calls = std::fs::read_to_string(bin.path().join("gh-calls.log")).unwrap();
+        assert!(calls.contains("Accept: application/sarif+json"), "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn code_scanning_reports_githubs_own_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let gh = fake_gh(bin.path(), &[]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.gh_program = gh;
+    app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    assert!(app.list_picker.is_none());
+    assert!(app.status.contains("unexpected call"), "{}", app.status);
+}
+
+#[cfg(unix)]
+#[test]
+fn x_dismisses_the_selected_results_code_scanning_alert_with_a_reason() {
+    // #577: VS Code's SARIF viewer dismisses GitHub alerts from the list.
+    // This result carries no alert number, so it is matched to the alerts
+    // list by rule, path and line.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/db.rs"), "a\nb\nc\n").unwrap();
+    let log = tmp.path().join("scan.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},"results":[
+            {"ruleId":"rust/sql-injection","message":{"text":"Tainted."},
+             "locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/db.rs"},"region":{"startLine":2}}}]}]}]}"#,
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let gh = fake_gh(
+        bin.path(),
+        &[
+            (
+                "code-scanning/alerts?per_page=100",
+                r#"[{"number":8,"state":"open","rule":{"id":"rust/sql-injection"},
+                     "most_recent_instance":{"location":{"path":"src/db.rs","start_line":2}}}]"#,
+            ),
+            ("PATCH", r#"{"number":8,"state":"dismissed"}"#),
+        ],
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.gh_program = gh;
+    app.editor.open(&log).unwrap();
+    app.editor.sarif.as_mut().unwrap().selected = 1;
+    app.handle_sarif_key(key(KeyCode::Char('X'), KeyModifiers::SHIFT));
+    let picker = app.list_picker.as_ref().expect("X asks why");
+    assert_eq!(
+        picker.purpose,
+        crate::widgets::list_picker::ListPurpose::DismissAlert
+    );
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["False positive", "Won't fix", "Used in tests"]);
+    // Pick "Won't fix", then give a comment.
+    app.list_picker.as_mut().unwrap().selected = 1;
+    app.confirm_list_picker();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(
+            crate::widgets::input_prompt::InputPurpose::DismissAlertComment {
+                number: 8,
+                reason: 1
+            }
+        )
+    ));
+    app.dismiss_code_scanning_alert(8, 1, "tracked elsewhere");
+    let calls = std::fs::read_to_string(bin.path().join("gh-calls.log")).unwrap();
+    assert!(
+        calls.contains("PATCH repos/{owner}/{repo}/code-scanning/alerts/8 -f state=dismissed -f dismissed_reason=won't fix -f dismissed_comment=tracked elsewhere"),
+        "{calls}"
+    );
+    assert!(app.status.contains("#8"), "{}", app.status);
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(
+        view.entries[0].suppression,
+        crate::sarif::semantics::SuppressionState::Suppressed,
+        "the dismissed result leaves the default list"
+    );
+}

@@ -290,7 +290,7 @@ pub fn render(
     let hint = if view.editing_query {
         " type to filter · terms AND · a|b OR · -x exclude · rule: file: level: tag: tool: msg: · Enter done · Esc clear "
     } else {
-        " ↑↓ move · Enter open · / filter · Tab view · f fix · o add log · b baseline · E export · s sort · 1-4 levels · u suppressed · a absent · x clear · ←→ fold · d/D details tab · [ ] scroll details · n/N next/prev step · L follow link "
+        " ↑↓ move · Enter open · / filter · Tab view · f fix · o add log · b baseline · E export · X dismiss alert · s sort · 1-4 levels · u suppressed · a absent · x clear · ←→ fold · d/D details tab · [ ] scroll details · n/N next/prev step · L follow link "
     };
     buf.set_stringn(
         inner.x,

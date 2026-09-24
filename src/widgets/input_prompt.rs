@@ -44,6 +44,12 @@ pub enum InputPurpose {
     SarifBaseline,
     /// Where to write the SARIF viewer's visible results as CSV (#577).
     SarifExport,
+    /// The optional comment for dismissing code scanning alert `number`
+    /// with reason `reason` (an index into `DismissReason::ALL`).
+    DismissAlertComment {
+        number: u64,
+        reason: usize,
+    },
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
     /// Submitting stores the query on the view and jumps to the first

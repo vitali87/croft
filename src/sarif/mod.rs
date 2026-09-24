@@ -18,6 +18,7 @@ pub mod baseline;
 pub mod details;
 pub mod diagnostics;
 pub mod fixes;
+pub mod github;
 pub mod load;
 pub mod model;
 pub mod region;
