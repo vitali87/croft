@@ -49439,6 +49439,69 @@ fn poll_until_shrinks(app: &mut App, from: usize) {
     }
 }
 
+/// A workspace whose tasks.json declares a `cleanup` task (#250).
+fn app_with_cleanup_task() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "cleanup", "type": "shell", "command": "true" }
+        ]}"#,
+    )
+    .unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    (tmp, app)
+}
+
+fn last_task_label(app: &App) -> Option<String> {
+    app.last_task.as_ref().map(|t| t.label.clone())
+}
+
+/// #250: a config's `postDebugTask` runs when the user stops the session.
+#[test]
+fn stopping_a_session_runs_its_post_debug_task_once() {
+    let (_tmp, mut app) = app_with_cleanup_task();
+    app.debug_sessions.push("A", stub_member(false));
+    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug_stop_by_user();
+    assert_eq!(last_task_label(&app).as_deref(), Some("cleanup"));
+    assert!(app.debug_post_tasks.is_empty(), "it runs once, not again");
+}
+
+/// With nothing running there is no session to clean up after: a launch
+/// that failed before a session started must not trigger the task.
+#[test]
+fn stopping_with_no_session_runs_no_post_debug_task() {
+    let (_tmp, mut app) = app_with_cleanup_task();
+    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug_stop_by_user();
+    assert_eq!(last_task_label(&app), None);
+}
+
+/// #250: a session that ends by itself runs the task too.
+#[test]
+fn a_session_ending_on_its_own_runs_its_post_debug_task() {
+    let (_tmp, mut app) = app_with_cleanup_task();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_post_tasks = vec![String::from("cleanup")];
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(last_task_label(&app).as_deref(), Some("cleanup"));
+}
+
+/// Replacing the set for a new launch is not the end of a debug run, so
+/// the internal stop leaves the task alone (VS Code runs it on stop and on
+/// termination, not on relaunch).
+#[test]
+fn the_internal_stop_before_a_relaunch_runs_no_post_debug_task() {
+    let (_tmp, mut app) = app_with_cleanup_task();
+    app.debug_sessions.push("A", stub_member(false));
+    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug_stop();
+    assert_eq!(last_task_label(&app), None);
+}
+
 #[test]
 fn stop_all_true_stops_the_set_when_a_background_member_ends() {
     // #567 item 4: `stopAll: true` was refused; it is honoured now.

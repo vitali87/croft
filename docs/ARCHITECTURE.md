@@ -1142,6 +1142,8 @@ croft debugs several configurations at once (#310). `DebugSessions` holds them w
 
 **A member's own `preLaunchTask` is skipped**, with a status saying so. Parking a launch behind a task is a one-at-a-time mechanism, and a set of parked members would interleave unpredictably; the compound's OWN task still runs, and parks the whole member list.
 
+**`postDebugTask` runs when the run ends, not when the set is replaced (#250).** Each launched configuration's `postDebugTask` is recorded (a compound's members contribute theirs, de-duplicated) and the list runs once, in launch order, when the user stops the run (Shift+F5, Debug: Stop Debugging) or its last session terminates, including a `stopAll` teardown. The internal `debug_stop` a new launch uses to replace the set does not run it, and neither does a user stop with nothing running, so a launch that failed before a session started triggers no cleanup. A label no tasks.json declares is reported in the status, the same contract as `preLaunchTask`.
+
 ### dap/reaper.rs
 
 Sweeps orphaned vscode-js-debug processes left behind when croft crashes or force-quits without running `Drop` — both the server and its detached watchdog, which setsids into its own session and so survives a group-kill. It runs async at startup and after each session teardown.
