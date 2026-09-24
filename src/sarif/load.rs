@@ -96,10 +96,9 @@ mod tests {
 
     #[test]
     fn schema_alone_identifies_210() {
-        let log = parse_log(
-            r#"{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[]}"#,
-        )
-        .unwrap();
+        let log =
+            parse_log(r#"{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[]}"#)
+                .unwrap();
         assert!(log.runs.is_empty());
     }
 

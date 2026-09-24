@@ -286,9 +286,15 @@ pub enum Segment {
     Text(String),
     /// `[text](n)`: a link to the location whose `id` is `n` in this result's
     /// `relatedLocations` (or `locations`).
-    LocationLink { text: String, id: i64 },
+    LocationLink {
+        text: String,
+        id: i64,
+    },
     /// `[text](uri)` for any other target.
-    UriLink { text: String, uri: String },
+    UriLink {
+        text: String,
+        uri: String,
+    },
 }
 
 /// Split message text into plain runs and embedded links. `\[` and `\]` are
@@ -536,7 +542,10 @@ mod tests {
     fn rule_reference_into_extension_by_guid_and_id() {
         let run = run(RULES);
         let r = result(r#"{"rule":{"id":"X9","toolComponent":{"guid":"G-1"}}}"#);
-        assert_eq!(rule_for(&run, &r).unwrap().name.as_deref(), Some("ext-rule"));
+        assert_eq!(
+            rule_for(&run, &r).unwrap().name.as_deref(),
+            Some("ext-rule")
+        );
     }
 
     #[test]
@@ -562,7 +571,10 @@ mod tests {
     #[test]
     fn rule_id_display_prefers_rule_id_then_reference_then_resolved() {
         let run = run(RULES);
-        assert_eq!(rule_id(&run, &result(r#"{"ruleId":"Q"}"#)).as_deref(), Some("Q"));
+        assert_eq!(
+            rule_id(&run, &result(r#"{"ruleId":"Q"}"#)).as_deref(),
+            Some("Q")
+        );
         assert_eq!(
             rule_id(&run, &result(r#"{"rule":{"id":"R"}}"#)).as_deref(),
             Some("R")
@@ -639,7 +651,10 @@ mod tests {
 
     #[test]
     fn segments_plain_text() {
-        assert_eq!(segments("just text"), vec![Segment::Text("just text".into())]);
+        assert_eq!(
+            segments("just text"),
+            vec![Segment::Text("just text".into())]
+        );
     }
 
     #[test]

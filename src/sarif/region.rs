@@ -85,9 +85,7 @@ impl<'a> Lines<'a> {
 
     /// Line `n` including its newline; the empty string past the end.
     fn full(&self, n: usize) -> &'a str {
-        self.spans
-            .get(n)
-            .map_or("", |&(s, _, e)| &self.text[s..e])
+        self.spans.get(n).map_or("", |&(s, _, e)| &self.text[s..e])
     }
 
     /// Byte offset of `pos` (column in chars) in the whole text.
@@ -144,8 +142,11 @@ fn line_col(lines: &Lines, line: i64, col: Option<i64>, kind: ColumnKind) -> (Po
     let col = match col {
         None => body.chars().count(),
         Some(c) => {
-            let (n, over) =
-                units_to_chars(lines.full(l), usize::try_from(c.max(1) - 1).unwrap_or(0), kind);
+            let (n, over) = units_to_chars(
+                lines.full(l),
+                usize::try_from(c.max(1) - 1).unwrap_or(0),
+                kind,
+            );
             let body_chars = body.chars().count();
             let full_chars = lines.full(l).chars().count();
             // A column may address the newline itself (to include it); one
@@ -154,7 +155,13 @@ fn line_col(lines: &Lines, line: i64, col: Option<i64>, kind: ColumnKind) -> (Po
                 clamped = true;
                 body_chars
             } else if n == full_chars && full_chars > body_chars {
-                return (Pos { line: l + 1, col: 0 }, clamped);
+                return (
+                    Pos {
+                        line: l + 1,
+                        col: 0,
+                    },
+                    clamped,
+                );
             } else {
                 n
             }
@@ -349,7 +356,10 @@ mod tests {
     #[test]
     fn example_1_line_column() {
         assert_eq!(
-            text_of(SPEC, r#"{"startLine":1,"startColumn":2,"endLine":1,"endColumn":4}"#),
+            text_of(
+                SPEC,
+                r#"{"startLine":1,"startColumn":2,"endLine":1,"endColumn":4}"#
+            ),
             "bc"
         );
     }
@@ -397,7 +407,10 @@ mod tests {
             ColumnKind::UnicodeCodePoints,
         )
         .unwrap();
-        assert_eq!((r.start, r.end), (Pos { line: 0, col: 1 }, Pos { line: 0, col: 1 }));
+        assert_eq!(
+            (r.start, r.end),
+            (Pos { line: 0, col: 1 }, Pos { line: 0, col: 1 })
+        );
     }
 
     #[test]
@@ -470,7 +483,10 @@ mod tests {
     fn leading_whitespace_is_not_skipped() {
         // VS Code pushes startColumn past indentation; the spec does not.
         assert_eq!(
-            text_of("    let x;\n", r#"{"startLine":1,"startColumn":1,"endColumn":5}"#),
+            text_of(
+                "    let x;\n",
+                r#"{"startLine":1,"startColumn":1,"endColumn":5}"#
+            ),
             "    "
         );
     }
@@ -506,7 +522,14 @@ mod tests {
     #[test]
     fn binary_only_region_has_no_text_range() {
         let lines = Lines::new(SPEC, &crlf());
-        assert!(text_range(&region(r#"{"byteOffset":4}"#), &lines, ColumnKind::Utf16CodeUnits).is_none());
+        assert!(
+            text_range(
+                &region(r#"{"byteOffset":4}"#),
+                &lines,
+                ColumnKind::Utf16CodeUnits
+            )
+            .is_none()
+        );
         assert_eq!(byte_range(&region(r#"{"byteOffset":4}"#)), Some((4, 0)));
         assert_eq!(
             byte_range(&region(r#"{"byteOffset":4,"byteLength":8}"#)),
@@ -523,9 +546,8 @@ mod tests {
         // inserted above it since.
         let text = "fn a() {}\n// new\n// new\n    bad();\n";
         let lines = Lines::new(text, &crlf());
-        let r = region(
-            r#"{"startLine":2,"startColumn":5,"endColumn":11,"snippet":{"text":"bad();"}}"#,
-        );
+        let r =
+            region(r#"{"startLine":2,"startColumn":5,"endColumn":11,"snippet":{"text":"bad();"}}"#);
         let moved = reanchor(&r, &lines, ColumnKind::UnicodeCodePoints).unwrap();
         assert_eq!(moved.start, Pos { line: 3, col: 4 });
         assert_eq!(slice(&lines, &moved), "bad();");
@@ -536,7 +558,8 @@ mod tests {
         let text = "x();\nfiller\nfiller\nfiller\nfiller\nfiller\nstated\nx();\n";
         let lines = Lines::new(text, &crlf());
         // Stated on line 7 ("stated"); the x() on line 8 is nearer than line 1.
-        let r = region(r#"{"startLine":7,"startColumn":1,"endColumn":5,"snippet":{"text":"x();"}}"#);
+        let r =
+            region(r#"{"startLine":7,"startColumn":1,"endColumn":5,"snippet":{"text":"x();"}}"#);
         let moved = reanchor(&r, &lines, ColumnKind::UnicodeCodePoints).unwrap();
         assert_eq!(moved.start.line, 7);
     }
@@ -544,7 +567,8 @@ mod tests {
     #[test]
     fn reanchor_is_none_when_already_matching_or_gone() {
         let lines = Lines::new("ok();\n", &crlf());
-        let here = region(r#"{"startLine":1,"startColumn":1,"endColumn":6,"snippet":{"text":"ok();"}}"#);
+        let here =
+            region(r#"{"startLine":1,"startColumn":1,"endColumn":6,"snippet":{"text":"ok();"}}"#);
         assert!(reanchor(&here, &lines, ColumnKind::UnicodeCodePoints).is_none());
         let gone = region(r#"{"startLine":1,"snippet":{"text":"missing"}}"#);
         assert!(reanchor(&gone, &lines, ColumnKind::UnicodeCodePoints).is_none());

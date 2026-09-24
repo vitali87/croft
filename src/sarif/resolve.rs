@@ -273,7 +273,11 @@ mod tests {
 
     #[test]
     fn nested_bases_concatenate() {
-        let e = expand(&run(BASES), &loc(r#"{"uri":"main.c","uriBaseId":"SRCROOT"}"#)).unwrap();
+        let e = expand(
+            &run(BASES),
+            &loc(r#"{"uri":"main.c","uriBaseId":"SRCROOT"}"#),
+        )
+        .unwrap();
         assert_eq!(e.uri, "file:///C:/Users/Mary/code/TheProject/src/main.c");
         assert!(e.absolute);
         assert_eq!(e.unresolved_base, None);
@@ -295,7 +299,11 @@ mod tests {
 
     #[test]
     fn unknown_base_is_reported_unresolved() {
-        let e = expand(&run(BASES), &loc(r#"{"uri":"x.c","uriBaseId":"%SRCROOT%"}"#)).unwrap();
+        let e = expand(
+            &run(BASES),
+            &loc(r#"{"uri":"x.c","uriBaseId":"%SRCROOT%"}"#),
+        )
+        .unwrap();
         assert_eq!(e.unresolved_base.as_deref(), Some("%SRCROOT%"));
     }
 
@@ -308,7 +316,11 @@ mod tests {
 
     #[test]
     fn absolute_uri_ignores_base() {
-        let e = expand(&run(BASES), &loc(r#"{"uri":"file:///etc/hosts","uriBaseId":"SRCROOT"}"#)).unwrap();
+        let e = expand(
+            &run(BASES),
+            &loc(r#"{"uri":"file:///etc/hosts","uriBaseId":"SRCROOT"}"#),
+        )
+        .unwrap();
         assert_eq!(e.uri, "file:///etc/hosts");
         assert!(e.absolute);
     }
@@ -327,7 +339,10 @@ mod tests {
             uri_to_path("file:///home/me/my%20proj/a.rs"),
             Some(PathBuf::from("/home/me/my proj/a.rs"))
         );
-        assert_eq!(uri_to_path("src/a%23b.rs"), Some(PathBuf::from("src/a#b.rs")));
+        assert_eq!(
+            uri_to_path("src/a%23b.rs"),
+            Some(PathBuf::from("src/a#b.rs"))
+        );
         assert_eq!(uri_to_path("https://example.com/a.rs"), None);
     }
 
@@ -344,14 +359,22 @@ mod tests {
     fn absolute_file_that_exists_is_used() {
         let r = resolver(&["/ws"]);
         let run = run("{}");
-        let got = r.resolve(&run, &loc(r#"{"uri":"file:///ws/a.rs"}"#), &disk(&["/ws/a.rs"]));
+        let got = r.resolve(
+            &run,
+            &loc(r#"{"uri":"file:///ws/a.rs"}"#),
+            &disk(&["/ws/a.rs"]),
+        );
         assert_eq!(got, Some(PathBuf::from("/ws/a.rs")));
     }
 
     #[test]
     fn relative_joins_workspace_root() {
         let r = resolver(&["/other", "/ws"]);
-        let got = r.resolve(&run("{}"), &loc(r#"{"uri":"src/a.rs"}"#), &disk(&["/ws/src/a.rs"]));
+        let got = r.resolve(
+            &run("{}"),
+            &loc(r#"{"uri":"src/a.rs"}"#),
+            &disk(&["/ws/src/a.rs"]),
+        );
         assert_eq!(got, Some(PathBuf::from("/ws/src/a.rs")));
     }
 
@@ -369,7 +392,8 @@ mod tests {
     #[test]
     fn user_base_override_wins() {
         let mut r = resolver(&["/ws"]);
-        r.base_overrides.insert("SRCROOT".into(), PathBuf::from("/mine/src"));
+        r.base_overrides
+            .insert("SRCROOT".into(), PathBuf::from("/mine/src"));
         let got = r.resolve(
             &run(BASES),
             &loc(r#"{"uri":"a.rs","uriBaseId":"SRCROOT"}"#),
@@ -381,7 +405,10 @@ mod tests {
     #[test]
     fn ci_absolute_path_maps_by_learned_prefix() {
         let mut r = resolver(&["/ws"]);
-        r.learn("file:///home/runner/work/app/app/src/a.rs", Path::new("/ws/src/a.rs"));
+        r.learn(
+            "file:///home/runner/work/app/app/src/a.rs",
+            Path::new("/ws/src/a.rs"),
+        );
         let got = r.resolve(
             &run("{}"),
             &loc(r#"{"uri":"file:///home/runner/work/app/app/lib/b.rs"}"#),
@@ -403,18 +430,27 @@ mod tests {
     #[test]
     fn unique_file_name_is_a_last_resort() {
         let mut r = resolver(&["/ws"]);
-        r.names.insert("only.rs".into(), vec![PathBuf::from("/ws/deep/only.rs")]);
+        r.names
+            .insert("only.rs".into(), vec![PathBuf::from("/ws/deep/only.rs")]);
         r.names.insert(
             "dup.rs".into(),
             vec![PathBuf::from("/ws/a/dup.rs"), PathBuf::from("/ws/b/dup.rs")],
         );
         let exists = disk(&["/ws/deep/only.rs", "/ws/a/dup.rs", "/ws/b/dup.rs"]);
         assert_eq!(
-            r.resolve(&run("{}"), &loc(r#"{"uri":"file:///elsewhere/only.rs"}"#), &exists),
+            r.resolve(
+                &run("{}"),
+                &loc(r#"{"uri":"file:///elsewhere/only.rs"}"#),
+                &exists
+            ),
             Some(PathBuf::from("/ws/deep/only.rs"))
         );
         assert_eq!(
-            r.resolve(&run("{}"), &loc(r#"{"uri":"file:///elsewhere/dup.rs"}"#), &exists),
+            r.resolve(
+                &run("{}"),
+                &loc(r#"{"uri":"file:///elsewhere/dup.rs"}"#),
+                &exists
+            ),
             None
         );
     }

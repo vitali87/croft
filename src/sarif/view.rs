@@ -11,6 +11,14 @@ use super::semantics::{self as sem, BaselineState, Kind, Level, SuppressionState
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+/// Largest log the viewer loads into memory. SARIF from a monorepo scan runs
+/// to hundreds of megabytes; past this the JSON tree alone would dwarf it.
+pub const MAX_LOG_BYTES: u64 = 512 * 1024 * 1024;
+
+pub fn extension_is_sarif(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("sarif")
+}
+
 /// One result, with everything the list, filters and sort need resolved up
 /// front so the projection never walks the log again.
 #[derive(Debug, Clone, PartialEq)]
@@ -199,6 +207,17 @@ pub struct SarifView {
     pub sort: (Column, bool),
     pub collapsed: HashSet<String>,
     pub selected: usize,
+    /// Keystrokes go to the filter box rather than the list.
+    pub editing_query: bool,
+    /// First list row painted (frame truth, kept by the renderer).
+    pub scroll: usize,
+    /// Screen row of the first list row and how many rows the list shows,
+    /// written by the renderer for mouse hit-testing.
+    pub rows_top: u16,
+    pub rows_visible: u16,
+    /// Screen columns the list occupies: `[list_x, list_x + list_width)`.
+    pub list_x: u16,
+    pub list_width: u16,
 }
 
 impl SarifView {
@@ -212,7 +231,51 @@ impl SarifView {
             sort: (Column::Line, true),
             collapsed: HashSet::new(),
             selected: 0,
+            editing_query: false,
+            scroll: 0,
+            rows_top: 0,
+            rows_visible: 0,
+            list_x: 0,
+            list_width: 0,
         }
+    }
+
+    /// A viewer over one log file. File names display relative to the log's
+    /// folder or the working directory when they sit under either.
+    pub fn open(path: &std::path::Path, log: SarifLog) -> SarifView {
+        let mut roots = Vec::new();
+        if let Some(dir) = path.parent() {
+            roots.push(dir.to_path_buf());
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            roots.push(cwd);
+        }
+        let logs = vec![LoadedLog {
+            path: path.to_path_buf(),
+            log,
+        }];
+        let entries = build_entries(&logs, &roots);
+        let mut view = SarifView::new(logs, entries);
+        // Start on the first result rather than its group header, so the
+        // details pane has something to show from the first frame.
+        if matches!(view.rows().get(1), Some(Row::Item { .. })) {
+            view.selected = 1;
+        }
+        view
+    }
+
+    /// Distinct tool names across every run, for the header.
+    pub fn tools(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for l in &self.logs {
+            for r in &l.log.runs {
+                let n = &r.tool.driver.name;
+                if !n.is_empty() && !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+        }
+        out
     }
 
     fn passes_chips(&self, e: &Entry, with_levels: bool) -> bool {
@@ -633,7 +696,12 @@ mod tests {
     fn query_terms_are_anded() {
         let v = sample();
         let q = parse_query("sql header");
-        let hits: Vec<_> = v.entries.iter().filter(|e| matches(&q, e)).map(|e| e.result).collect();
+        let hits: Vec<_> = v
+            .entries
+            .iter()
+            .filter(|e| matches(&q, e))
+            .map(|e| e.result)
+            .collect();
         assert_eq!(hits, vec![2]);
     }
 
@@ -641,7 +709,12 @@ mod tests {
     fn query_pipe_is_or() {
         let v = sample();
         let q = parse_query("header|unused");
-        let hits: Vec<_> = v.entries.iter().filter(|e| matches(&q, e)).map(|e| e.result).collect();
+        let hits: Vec<_> = v
+            .entries
+            .iter()
+            .filter(|e| matches(&q, e))
+            .map(|e| e.result)
+            .collect();
         assert_eq!(hits, vec![1, 2]);
     }
 
@@ -650,7 +723,11 @@ mod tests {
         let v = sample();
         let hit = |s: &str| -> Vec<usize> {
             let q = parse_query(s);
-            v.entries.iter().filter(|e| matches(&q, e)).map(|e| e.result).collect()
+            v.entries
+                .iter()
+                .filter(|e| matches(&q, e))
+                .map(|e| e.result)
+                .collect()
         };
         assert_eq!(hit("rule:r1 -file:b.rs"), vec![0]);
         assert_eq!(hit("level:note"), vec![3]);
@@ -673,7 +750,12 @@ mod tests {
     #[test]
     fn query_plain_text_searches_rule_file_and_message() {
         let v = sample();
-        let hit = |s: &str| v.entries.iter().filter(|e| matches(&parse_query(s), e)).count();
+        let hit = |s: &str| {
+            v.entries
+                .iter()
+                .filter(|e| matches(&parse_query(s), e))
+                .count()
+        };
         assert_eq!(hit("r2-name"), 1);
         assert_eq!(hit("b.rs"), 1);
         assert_eq!(hit("unwrap"), 1);
@@ -698,8 +780,14 @@ mod tests {
     fn default_filters_hide_absent_and_suppressed_only() {
         let f = Filters::default();
         assert!(f.hidden_baselines.contains(&BaselineState::Absent));
-        assert!(f.hidden_suppressions.contains(&SuppressionState::Suppressed));
-        assert!(!f.hidden_suppressions.contains(&SuppressionState::UnderReview));
+        assert!(
+            f.hidden_suppressions
+                .contains(&SuppressionState::Suppressed)
+        );
+        assert!(
+            !f.hidden_suppressions
+                .contains(&SuppressionState::UnderReview)
+        );
         assert!(f.hidden_levels.is_empty());
         assert!(f.hidden_kinds.is_empty());
     }
@@ -723,7 +811,12 @@ mod tests {
         v.entries[1].suppression = SuppressionState::Suppressed;
         assert_eq!(
             v.level_counts(),
-            [(Level::Error, 2), (Level::Warning, 0), (Level::Note, 1), (Level::None, 1)]
+            [
+                (Level::Error, 2),
+                (Level::Warning, 0),
+                (Level::Note, 1),
+                (Level::None, 1)
+            ]
         );
     }
 
@@ -757,8 +850,14 @@ mod tests {
     fn logs_tab_groups_by_log_file() {
         let mut v = sample();
         v.logs = vec![
-            LoadedLog { path: PathBuf::from("/x/one.sarif"), log: SarifLog::default() },
-            LoadedLog { path: PathBuf::from("/x/two.sarif"), log: SarifLog::default() },
+            LoadedLog {
+                path: PathBuf::from("/x/one.sarif"),
+                log: SarifLog::default(),
+            },
+            LoadedLog {
+                path: PathBuf::from("/x/two.sarif"),
+                log: SarifLog::default(),
+            },
         ];
         v.entries[4].log = 1;
         v.set_tab(Tab::Logs);
@@ -817,7 +916,10 @@ mod tests {
     #[test]
     fn build_entries_resolves_everything_the_list_needs() {
         let log = crate::sarif::load::parse_log(LOG).unwrap();
-        let logs = vec![LoadedLog { path: PathBuf::from("/ws/out.sarif"), log }];
+        let logs = vec![LoadedLog {
+            path: PathBuf::from("/ws/out.sarif"),
+            log,
+        }];
         let es = build_entries(&logs, &[PathBuf::from("/ws")]);
         assert_eq!(es.len(), 2);
         let e = &es[0];
@@ -833,7 +935,10 @@ mod tests {
         assert_eq!(e.uri, "file:///ws/src/db.js");
         assert_eq!(e.file, "src/db.js");
         assert_eq!((e.line, e.column), (42, 7));
-        assert_eq!(e.tags, vec!["security".to_string(), "external/cwe/cwe-089".to_string()]);
+        assert_eq!(
+            e.tags,
+            vec!["security".to_string(), "external/cwe/cwe-089".to_string()]
+        );
         let p = &es[1];
         assert_eq!(p.kind, Kind::Pass);
         assert_eq!(p.level, Level::None);
@@ -850,7 +955,13 @@ mod tests {
             ]}]}"#,
         )
         .unwrap();
-        let es = build_entries(&[LoadedLog { path: PathBuf::new(), log }], &[PathBuf::from("/ws")]);
+        let es = build_entries(
+            &[LoadedLog {
+                path: PathBuf::new(),
+                log,
+            }],
+            &[PathBuf::from("/ws")],
+        );
         assert_eq!(es[0].file, "/ci/x.c");
         assert_eq!(es[1].file, "rel/y.c");
     }
@@ -888,7 +999,13 @@ mod tests {
         v.toggle_fold();
         let rows = v.rows();
         assert_eq!(v.selected, 0);
-        assert!(matches!(&rows[0], Row::Group { collapsed: true, .. }));
+        assert!(matches!(
+            &rows[0],
+            Row::Group {
+                collapsed: true,
+                ..
+            }
+        ));
         assert_eq!(items(&rows), vec![4, 2]);
         v.toggle_fold();
         assert_eq!(items(&v.rows()), vec![1, 3, 0, 4, 2]);
