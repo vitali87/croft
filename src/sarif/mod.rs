@@ -10,8 +10,8 @@
 //!   objects: which rule a result points at, its effective level, whether it is
 //!   suppressed, and how its message text is assembled.
 
-// The viewer that consumes this lands in a follow-up; until then only the
-// tests reach most of it.
+// Parts of the model (fixes, stacks, the raw result) are read only by later
+// viewer features; the tests exercise them meanwhile.
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub mod details;
