@@ -482,6 +482,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_trim_final_newlines_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+=",
+                description: "Increment the number under the cursor",
+                handler: "is_increment_number_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+-",
+                description: "Decrement the number under the cursor",
+                handler: "is_decrement_number_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Opt+Shift+K",
                 description: "Toggle a bookmark on the cursor's line",
                 handler: "is_toggle_bookmark_key",

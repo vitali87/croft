@@ -26857,6 +26857,56 @@ fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
     assert!(applied, "the reply matching the newest request must apply");
 }
 
+// --- Increment / Decrement Number ------------------------------------------
+
+/// The Cmd+Opt+= / Cmd+Opt+- chords as crossterm decodes them (ALT|SUPER on
+/// macOS; Ctrl+Alt on Linux arrives as ALT|CONTROL, which the predicate
+/// accepts too).
+#[test]
+fn the_increment_chord_bumps_the_number_under_the_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "port = 8080");
+    app.editor.cursor_col = 8;
+    app.handle_key(key(
+        KeyCode::Char('='),
+        KeyModifiers::ALT | KeyModifiers::SUPER,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines, vec!["port = 8081"]);
+}
+
+#[test]
+fn the_decrement_chord_bumps_the_number_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "port = 8080");
+    app.editor.cursor_col = 8;
+    app.handle_key(key(
+        KeyCode::Char('-'),
+        KeyModifiers::ALT | KeyModifiers::CONTROL,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines, vec!["port = 8079"]);
+}
+
+/// A chord that finds nothing to bump must say so rather than looking like
+/// a dead key.
+#[test]
+fn the_increment_chord_explains_itself_when_there_is_no_number() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "let name = value;");
+    app.handle_key(key(
+        KeyCode::Char('='),
+        KeyModifiers::ALT | KeyModifiers::SUPER,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines, vec!["let name = value;"]);
+    assert!(
+        app.status.contains("No number"),
+        "status should explain the no-op, got {:?}",
+        app.status
+    );
+}
+
 // --- Bookmarks ------------------------------------------------------------
 
 #[test]

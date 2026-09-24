@@ -2015,6 +2015,9 @@ enum EditKind {
     /// Find-bar Replace / Replace All. Never coalesces, so each replace is
     /// its own undo step like VS Code.
     Replace,
+    /// Increment / decrement the number under the cursor (vim's Ctrl-A /
+    /// Ctrl-X). Its own step, so a run of bumps undoes one at a time.
+    BumpNumber,
     /// Expand an Emmet abbreviation into markup. Its own step, so one undo
     /// puts the abbreviation back.
     EmmetExpand,
@@ -9600,6 +9603,62 @@ impl Editor {
         true
     }
 
+    /// vim's `Ctrl-A` / `Ctrl-X` (`delta` of `+1` / `-1`), which Zed and the
+    /// VS Code increment extensions all copy: bump the number under the
+    /// cursor. When the cursor is not inside a number, the next one to its
+    /// right on the same line is used, so the caret rarely needs positioning
+    /// precisely. Returns false when the line holds no number at or after
+    /// the cursor, leaving the buffer and the undo stack untouched.
+    ///
+    /// Formatting is preserved rather than normalised, because the point is
+    /// to edit a literal in place: zero padding keeps its width (`007` ->
+    /// `008`), and a hex or binary literal keeps its prefix and digit case
+    /// (`0xFF` -> `0x100`, `0Xff` -> `0X100`). Width only grows when the
+    /// value needs the room.
+    pub fn bump_number(&mut self, delta: i64) -> bool {
+        let row = self.cursor_row;
+        let Some(line) = self.lines.get(row) else {
+            return false;
+        };
+        let caret = self.byte_index(row, self.cursor_col);
+        let Some(tok) = number_token_at_or_after(line, caret) else {
+            return false;
+        };
+        let Some(replacement) = tok.bumped(line, delta) else {
+            return false;
+        };
+        // A clamped bump (`0x00` down) finds a number but changes nothing;
+        // recording it would dirty a clean buffer and leave an undo step
+        // that undoes nothing.
+        if replacement == line[tok.start..tok.end] {
+            return true;
+        }
+
+        // A real edit from here on: pin a preview tab, or the next preview
+        // open reuses it and the bump is lost with it.
+        self.pin_on_edit();
+        self.push_undo(EditKind::BumpNumber);
+        // Never coalesce: a run of bumps must undo one at a time, the way
+        // holding Ctrl-A in vim does.
+        self.last_edit_kind = None;
+        let line = &mut self.lines[row];
+        line.replace_range(tok.start..tok.end, &replacement);
+        // vim leaves the caret on the number's last digit, which is what
+        // makes a repeated bump keep working on the same literal even as it
+        // grows a digit.
+        let end_byte = tok.start + replacement.len();
+        let last = line[..end_byte]
+            .char_indices()
+            .next_back()
+            .map_or(end_byte, |(i, _)| i);
+        self.cursor_col = line[..last].chars().count();
+        self.selection = None;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
     /// The Emmet dialect this buffer expands into, or `None` where the chord
     /// is not offered.
     fn emmet_profile(&self) -> Option<crate::emmet::Profile> {
@@ -11334,6 +11393,162 @@ fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Yaml) => "  ",
         _ => "    ",
     }
+}
+
+/// The base a numeric literal is written in. Octal is deliberately absent:
+/// vim reads a bare leading zero as octal, which silently turns `019` into
+/// an error and `010` into `011` meaning nine, and every modern editor that
+/// copied Ctrl-A dropped that behaviour with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NumberRadix {
+    Dec,
+    Hex,
+    Bin,
+}
+
+/// One numeric literal located on a line: the byte range it occupies and how
+/// to read it. `start` includes a `-` sign and a `0x` / `0b` prefix, so the
+/// range is exactly the text a bump replaces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct NumberToken {
+    start: usize,
+    end: usize,
+    radix: NumberRadix,
+}
+
+impl NumberToken {
+    /// The literal rewritten with `delta` added, preserving how it was
+    /// written. `None` when the result cannot be represented — an overflow,
+    /// or a negative hex/binary value, which is clamped rather than wrapped
+    /// (vim turns `0x0` into `0xffffffffffffffff`, which is never what the
+    /// keystroke meant).
+    fn bumped(&self, line: &str, delta: i64) -> Option<String> {
+        let text = &line[self.start..self.end];
+        match self.radix {
+            NumberRadix::Dec => {
+                let value: i64 = text.parse().ok()?;
+                let next = value.checked_add(delta)?;
+                // Zero padding is a fact about the literal, not about its
+                // value: `007` is a version segment or a port, and widening
+                // it on every bump would be wrong.
+                let digits = text.strip_prefix('-').unwrap_or(text).len();
+                let body = next.unsigned_abs();
+                let sign = if next < 0 { "-" } else { "" };
+                Some(format!("{sign}{body:0digits$}"))
+            }
+            NumberRadix::Hex | NumberRadix::Bin => {
+                let (prefix, digits) = text.split_at(2);
+                let radix = if self.radix == NumberRadix::Hex {
+                    16
+                } else {
+                    2
+                };
+                let value = u64::from_str_radix(digits, radix).ok()?;
+                let next = match value.checked_add_signed(delta) {
+                    Some(v) => v,
+                    // Underflow clamps at zero rather than wrapping: vim
+                    // turns `0x0` into `0xffffffffffffffff`, which is never
+                    // what the keystroke meant.
+                    None if delta < 0 => 0,
+                    None => return None,
+                };
+                let width = digits.len();
+                let body = match self.radix {
+                    NumberRadix::Bin => format!("{next:0width$b}"),
+                    // Digit case follows the literal: a file that writes
+                    // `0xFF` keeps writing uppercase.
+                    _ if digits.chars().any(|c| c.is_ascii_uppercase()) => {
+                        format!("{next:0width$X}")
+                    }
+                    _ => format!("{next:0width$x}"),
+                };
+                Some(format!("{prefix}{body}"))
+            }
+        }
+    }
+}
+
+/// The literal the cursor sits inside, or failing that the next one to its
+/// right on the same line — vim's rule, and the reason Ctrl-A is usable
+/// without placing the caret exactly.
+fn number_token_at_or_after(line: &str, caret: usize) -> Option<NumberToken> {
+    // Tokens come out left to right and never overlap, so the first one
+    // ending at or after the caret is the one under it, or the next one
+    // along when the caret is between literals.
+    number_tokens(line).into_iter().find(|t| t.end >= caret)
+}
+
+/// Every numeric literal on the line, left to right and non-overlapping.
+fn number_tokens(line: &str) -> Vec<NumberToken> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        // A digit that continues an identifier (`utf8`, `sha256`) is still a
+        // number to vim, and bumping it is usually what was meant. What must
+        // NOT happen is reading the `8` of `utf8` as the start of a fresh
+        // token when we are already inside one, which the scan below avoids
+        // by consuming each token whole.
+        if let Some(tok) = radix_prefixed_token(b, i) {
+            i = tok.end;
+            out.push(tok);
+            continue;
+        }
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            // A `-` directly before the digits is the sign, as in vim, but
+            // only when it is not itself preceded by a digit or an
+            // identifier character: in `a-5` the `-` is a sign, in `x1-5`
+            // it is a subtraction and `5` is positive.
+            let signed = start > 0
+                && b[start - 1] == b'-'
+                && !line[..start - 1]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_word_or_digit);
+            out.push(NumberToken {
+                start: if signed { start - 1 } else { start },
+                end: i,
+                radix: NumberRadix::Dec,
+            });
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `0x…` / `0b…` starting exactly at `i`, or None.
+fn radix_prefixed_token(b: &[u8], i: usize) -> Option<NumberToken> {
+    if b[i] != b'0' || i + 2 >= b.len() {
+        return None;
+    }
+    let (radix, valid): (NumberRadix, fn(u8) -> bool) = match b[i + 1] {
+        b'x' | b'X' => (NumberRadix::Hex, |c: u8| c.is_ascii_hexdigit()),
+        b'b' | b'B' => (NumberRadix::Bin, |c: u8| c == b'0' || c == b'1'),
+        _ => return None,
+    };
+    let mut j = i + 2;
+    while j < b.len() && valid(b[j]) {
+        j += 1;
+    }
+    if j == i + 2 {
+        return None;
+    }
+    Some(NumberToken {
+        start: i,
+        end: j,
+        radix,
+    })
+}
+
+/// Checked on the character, not the byte: before the `-` in `λ-5` sits a
+/// UTF-8 continuation byte, which no byte test reads as a letter.
+fn is_word_or_digit(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// The Emmet dialect for a buffer, or `None` where expansion is not offered,
@@ -26339,6 +26554,15 @@ mod tests {
         assert_eq!((e.cursor_row, e.cursor_col), (0, 3));
     }
 
+    // ---- Increment / Decrement Number (vim Ctrl-A / Ctrl-X) ----
+
+    fn num_editor(text: &str, col: usize) -> Editor {
+        let mut e = editor_with(text);
+        e.cursor_row = 0;
+        e.cursor_col = col;
+        e
+    }
+
     // ---- Emmet: Expand Abbreviation ----
 
     fn html_editor(text: &str, col: usize) -> Editor {
@@ -26347,6 +26571,230 @@ mod tests {
         e.cursor_row = e.lines.len() - 1;
         e.cursor_col = col;
         e
+    }
+
+    #[test]
+    fn increment_bumps_the_number_the_cursor_sits_in() {
+        let mut e = num_editor("port = 8080", 8); // on the '0' of 8080
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["port = 8081"]);
+    }
+
+    /// A bump is an edit like any other: it pins a preview tab, or the next
+    /// preview open reuses the tab and the edit is lost with it.
+    #[test]
+    fn a_bump_pins_a_preview_tab() {
+        let mut e = num_editor("port = 8080", 8);
+        e.preview = true;
+        assert!(e.bump_number(1));
+        assert!(!e.preview);
+        // A bump that finds no number edits nothing, so it pins nothing.
+        let mut e = num_editor("no digits", 0);
+        e.preview = true;
+        assert!(!e.bump_number(1));
+        assert!(e.preview);
+    }
+
+    #[test]
+    fn decrement_bumps_the_number_down() {
+        let mut e = num_editor("retries = 3", 10);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["retries = 2"]);
+    }
+
+    /// vim's rule, and the reason the chord is usable without aiming: a
+    /// caret before the number still finds it.
+    #[test]
+    fn a_caret_left_of_the_number_still_finds_it() {
+        let mut e = num_editor("port = 8080", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["port = 8081"]);
+    }
+
+    #[test]
+    fn the_nearest_number_to_the_right_wins_over_a_later_one() {
+        let mut e = num_editor("a 1 b 2", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["a 2 b 2"]);
+    }
+
+    /// The caret lands on the last digit, so holding the chord keeps
+    /// bumping the same literal even as it grows.
+    #[test]
+    fn repeated_bumps_stay_on_the_same_number_across_a_width_change() {
+        let mut e = num_editor("x = 9", 4);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 10"]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 11"]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 12"]);
+    }
+
+    #[test]
+    fn zero_padding_keeps_its_width() {
+        let mut e = num_editor("v1.0.007", 6);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["v1.0.008"]);
+    }
+
+    #[test]
+    fn zero_padding_widens_only_when_the_value_needs_the_room() {
+        let mut e = num_editor("099", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["100"]);
+    }
+
+    #[test]
+    fn hex_literals_keep_their_prefix_and_digit_case() {
+        let mut lower = num_editor("mask = 0xff", 9);
+        assert!(lower.bump_number(1));
+        assert_eq!(lower.lines, vec!["mask = 0x100"]);
+
+        let mut upper = num_editor("mask = 0xFF", 9);
+        assert!(upper.bump_number(1));
+        assert_eq!(upper.lines, vec!["mask = 0x100"]);
+
+        let mut wide = num_editor("mask = 0X00FF", 9);
+        assert!(wide.bump_number(1));
+        assert_eq!(wide.lines, vec!["mask = 0X0100"], "prefix case is kept");
+    }
+
+    #[test]
+    fn binary_literals_bump_in_base_two() {
+        let mut e = num_editor("flags = 0b0111", 10);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["flags = 0b1000"]);
+    }
+
+    /// vim wraps `0x0` round to `0xffffffffffffffff`, which is never what
+    /// the keystroke meant.
+    #[test]
+    fn a_hex_literal_clamps_at_zero_rather_than_wrapping() {
+        let mut e = num_editor("0x00", 3);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["0x00"]);
+    }
+
+    /// A clamped bump changes nothing, so it must not dirty a clean buffer
+    /// or leave an undo step that undoes nothing. It still reports true: a
+    /// number was found, and "no number here" would be the wrong message.
+    #[test]
+    fn a_clamped_bump_neither_dirties_the_buffer_nor_records_an_undo_step() {
+        let mut e = num_editor("mask = 0x00", 0);
+        assert!(!e.dirty);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["mask = 0x00"]);
+        assert!(!e.dirty, "an unchanged literal must not dirty the buffer");
+        assert!(e.undo_stack.is_empty(), "no undo step for a no-op");
+        // A bump that does change the literal still records both, so the
+        // two assertions above cannot pass vacuously.
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["mask = 0x01"]);
+        assert!(e.dirty);
+        assert_eq!(e.undo_stack.len(), 1);
+    }
+
+    /// vim ignores a leading `-` on hex and binary literals ("ignore leading
+    /// '-' for hex and octal and bin numbers" in `do_addsub`), treating them
+    /// as unsigned bit patterns: `-0x10` bumps to `-0x11`.
+    #[test]
+    fn a_minus_before_a_hex_literal_is_not_a_sign() {
+        let mut e = num_editor("x = -0x10", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = -0x11"]);
+    }
+
+    #[test]
+    fn a_decimal_can_cross_zero_into_negative() {
+        let mut e = num_editor("delta = 0", 8);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["delta = -1"]);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["delta = -2"]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["delta = -1"]);
+    }
+
+    /// A `-` that follows a digit or an identifier is a subtraction, not a
+    /// sign. Dates are the case that makes this matter: bumping the month
+    /// of `2026-09-21` must not turn it into `2026-08-21`.
+    #[test]
+    fn a_minus_after_a_digit_is_subtraction_not_a_sign() {
+        let mut e = num_editor("2026-09-21", 5);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["2026-10-21"]);
+    }
+
+    /// The identifier rule holds for non-ASCII identifiers too: the byte
+    /// before the `-` in `λ-5` is a UTF-8 continuation byte, not a letter,
+    /// so the check has to look at the character.
+    #[test]
+    fn a_minus_after_a_non_ascii_identifier_is_subtraction_not_a_sign() {
+        let mut e = num_editor("λ-5", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["λ-6"]);
+
+        let mut cjk = num_editor("变量-5", 0);
+        assert!(cjk.bump_number(1));
+        assert_eq!(cjk.lines, vec!["变量-6"]);
+
+        // Non-ASCII punctuation is not an identifier, so the sign stands.
+        let mut dash = num_editor("x—-5", 0);
+        assert!(dash.bump_number(1));
+        assert_eq!(dash.lines, vec!["x—-4"]);
+    }
+
+    #[test]
+    fn a_minus_after_a_space_is_a_sign() {
+        let mut e = num_editor("offset = -5", 10);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["offset = -4"]);
+    }
+
+    #[test]
+    fn a_line_with_no_number_is_left_alone_and_reports_it() {
+        let mut e = num_editor("let value = name;", 4);
+        assert!(!e.bump_number(1));
+        assert_eq!(e.lines, vec!["let value = name;"]);
+    }
+
+    /// A number entirely to the LEFT of the caret is not picked up: vim
+    /// searches forward, and grabbing backwards would edit a literal the
+    /// user has already moved past.
+    #[test]
+    fn a_number_behind_the_caret_is_not_picked_up() {
+        let mut e = num_editor("x = 5; y = name", 10);
+        assert!(!e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 5; y = name"]);
+    }
+
+    #[test]
+    fn each_bump_is_its_own_undo_step() {
+        let mut e = num_editor("x = 1", 4);
+        assert!(e.bump_number(1));
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 3"]);
+        e.undo();
+        assert_eq!(e.lines, vec!["x = 2"], "one bump undone, not both");
+        e.undo();
+        assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    #[test]
+    fn a_digit_inside_an_identifier_is_still_a_number() {
+        let mut e = num_editor("let sha256 = 1;", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["let sha257 = 1;"]);
+    }
+
+    /// Byte offsets and char columns are not the same thing once the line
+    /// holds multibyte text, and the caret is tracked in columns.
+    #[test]
+    fn a_multibyte_line_bumps_at_the_right_place() {
+        let mut e = num_editor("héllo — count 41", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["héllo — count 42"]);
     }
 
     #[test]
