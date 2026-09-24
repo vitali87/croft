@@ -108,6 +108,8 @@ pub enum Tab {
     Locations,
     Rules,
     Logs,
+    /// Each run's tool, invocations and notifications (#577).
+    Run,
 }
 
 /// The details pane's tabs (VS Code: Info, Analysis Steps, Stacks; croft
@@ -603,6 +605,77 @@ impl SarifView {
         }
     }
 
+    /// The Run tab (#577): for each log and run, the tool, every invocation
+    /// and the tool's own notifications (VS Code shows none of these).
+    pub fn run_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for loaded in &self.logs {
+            let name = loaded
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for (ri, run) in loaded.log.runs.iter().enumerate() {
+                out.push(format!("{name} \u{b7} run {}", ri + 1));
+                let d = &run.tool.driver;
+                let version = d
+                    .semantic_version
+                    .clone()
+                    .or_else(|| d.version.clone())
+                    .unwrap_or_default();
+                out.push(format!("  {} {version}", d.name).trim_end().to_string());
+                if let Some(uri) = &d.information_uri {
+                    out.push(format!("  {uri}"));
+                }
+                for ext in &run.tool.extensions {
+                    let v = ext
+                        .semantic_version
+                        .clone()
+                        .or_else(|| ext.version.clone())
+                        .unwrap_or_default();
+                    out.push(format!("  + {} {v}", ext.name).trim_end().to_string());
+                }
+                if let Some(id) = run.automation_details.as_ref().and_then(|a| a.id.clone()) {
+                    out.push(format!("  automation {id}"));
+                }
+                if run.invocations.is_empty() {
+                    out.push(String::from("  no invocation recorded"));
+                }
+                for inv in &run.invocations {
+                    if let Some(cmd) = &inv.command_line {
+                        out.push(format!("  $ {cmd}"));
+                    }
+                    let mut facts = Vec::new();
+                    if let Some(code) = inv.exit_code {
+                        facts.push(format!("exit {code}"));
+                    }
+                    match inv.execution_successful {
+                        Some(true) => facts.push(String::from("succeeded")),
+                        Some(false) => facts.push(String::from("failed")),
+                        None => {}
+                    }
+                    if let (Some(a), Some(b)) = (&inv.start_time_utc, &inv.end_time_utc) {
+                        facts.push(format!("{a} \u{2192} {b}"));
+                    }
+                    if !facts.is_empty() {
+                        out.push(format!("  {}", facts.join(" \u{b7} ")));
+                    }
+                    for n in inv
+                        .tool_execution_notifications
+                        .iter()
+                        .chain(inv.tool_configuration_notifications.iter())
+                    {
+                        let level = n.level.clone().unwrap_or_else(|| String::from("warning"));
+                        let text = n.message.text.clone().unwrap_or_default();
+                        out.push(format!("  {level}: {text}"));
+                    }
+                }
+                out.push(String::new());
+            }
+        }
+        out
+    }
+
     /// Distinct tool names across every run, for the header.
     pub fn tools(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -654,7 +727,7 @@ impl SarifView {
                     format!("{} · {}", e.rule_id, e.rule_name)
                 },
             ),
-            Tab::Logs => {
+            Tab::Logs | Tab::Run => {
                 let label = self
                     .logs
                     .get(e.log)

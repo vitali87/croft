@@ -50196,3 +50196,45 @@ fn a_second_log_joins_the_viewer_and_delete_closes_it_from_the_logs_tab() {
         app.status
     );
 }
+
+#[test]
+fn the_run_tab_shows_the_tool_its_invocation_and_notifications() {
+    // #577, beyond VS Code: run.tool, invocations and notifications.
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("run.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{
+          "tool":{"driver":{"name":"CodeQL","semanticVersion":"2.19.3","informationUri":"https://codeql.github.com"}},
+          "invocations":[{"commandLine":"codeql database analyze db --format=sarif-latest","executionSuccessful":true,"exitCode":0,
+            "startTimeUtc":"2026-09-24T10:00:00Z","endTimeUtc":"2026-09-24T10:03:12Z",
+            "toolExecutionNotifications":[{"level":"warning","message":{"text":"Skipped vendor/huge.js: too large"}}]}],
+          "results":[]}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    for _ in 0..3 {
+        app.handle_sarif_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    }
+    assert_eq!(
+        app.editor.sarif.as_ref().unwrap().tab,
+        crate::sarif::view::Tab::Run
+    );
+    let screen = draw_screen(&mut app);
+    for want in [
+        "CodeQL 2.19.3",
+        "https://codeql.github.com",
+        "codeql database analyze db --format=sarif-latest",
+        "exit 0",
+        "Skipped vendor/huge.js: too large",
+    ] {
+        assert!(screen.contains(want), "{want:?} on the Run tab:\n{screen}");
+    }
+    // Back round to Locations.
+    app.handle_sarif_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.sarif.as_ref().unwrap().tab,
+        crate::sarif::view::Tab::Locations
+    );
+}

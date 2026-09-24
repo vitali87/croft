@@ -45220,7 +45220,7 @@ impl App {
             KeyCode::Char('/') => view.editing_query = true,
             KeyCode::Esc => view.set_query(""),
             KeyCode::Tab | KeyCode::BackTab => {
-                let order = [Tab::Locations, Tab::Rules, Tab::Logs];
+                let order = [Tab::Locations, Tab::Rules, Tab::Logs, Tab::Run];
                 let i = order.iter().position(|t| *t == view.tab).unwrap_or(0);
                 let step = if key.code == KeyCode::BackTab { 2 } else { 1 };
                 view.set_tab(order[(i + step) % order.len()]);

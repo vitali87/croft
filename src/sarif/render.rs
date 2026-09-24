@@ -102,6 +102,7 @@ pub fn render(
         (Tab::Locations, "Locations"),
         (Tab::Rules, "Rules"),
         (Tab::Logs, "Logs"),
+        (Tab::Run, "Run"),
     ] {
         let style = if view.tab == tab {
             Style::default()
@@ -164,7 +165,13 @@ pub fn render(
     view.list_x = inner.x;
     view.list_width = list_w;
 
-    let rows = view.rows();
+    // The Run tab lists facts, not results: nothing to select or click.
+    let rows = if view.tab == Tab::Run {
+        view.rows_visible = 0;
+        Vec::new()
+    } else {
+        view.rows()
+    };
     if !rows.is_empty() {
         view.selected = view.selected.min(rows.len() - 1);
     }
@@ -178,7 +185,22 @@ pub fn render(
         .scroll
         .min(rows.len().saturating_sub(visible.min(rows.len())));
 
-    if rows.is_empty() {
+    if view.tab == Tab::Run {
+        for (i, line) in view.run_lines().into_iter().take(visible).enumerate() {
+            let style = if line.starts_with("  ") {
+                text
+            } else {
+                text.add_modifier(Modifier::BOLD)
+            };
+            buf.set_stringn(
+                inner.x + 1,
+                body_top + i as u16,
+                &line,
+                (list_w as usize).saturating_sub(1),
+                style,
+            );
+        }
+    } else if rows.is_empty() {
         let msg = if view.entries.is_empty() {
             " No results in this log."
         } else {
