@@ -49715,3 +49715,64 @@ tool = "go"
         "another extension's record stays"
     );
 }
+
+#[test]
+fn a_homebrew_install_is_offered_brew_upgrade_not_a_self_update() {
+    // #375: a binary inside Homebrew's Cellar must not be rebuilt or swapped
+    // by croft: the popup names `brew upgrade croft` and has no Update.
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.install_source = crate::update_check::InstallSource::Homebrew;
+        app.update_check = Some(crate::update_check::UpdateCheck::preloaded(Some(
+            "9.9.9".into(),
+        )));
+        assert!(app.poll_update_watch());
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buttons = app.update_toast.as_ref().unwrap().buttons.clone();
+        assert!(
+            !buttons
+                .iter()
+                .any(|(_, a)| matches!(a, super::UpdateToastAction::Update)),
+            "no Update button on a Homebrew install"
+        );
+        assert!(
+            buttons
+                .iter()
+                .any(|(_, a)| matches!(a, super::UpdateToastAction::Later)),
+            "Later still dismisses the offer"
+        );
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(
+            screen.contains("brew upgrade croft"),
+            "the popup names the command to run"
+        );
+        // Even a direct request cannot stage a build over the Cellar.
+        app.start_staged_update("9.9.9".into());
+        assert!(app.staged_install.is_none(), "nothing staged");
+        assert!(app.status.contains("brew upgrade croft"), "{}", app.status);
+    });
+}
+
+#[test]
+fn a_self_managed_install_still_offers_update() {
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(
+            app.install_source,
+            crate::update_check::InstallSource::SelfManaged,
+            "a test binary under target/ is not Homebrew-owned"
+        );
+    });
+}

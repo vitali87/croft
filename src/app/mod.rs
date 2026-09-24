@@ -3523,6 +3523,9 @@ pub struct App {
     /// The "vX available" popup, present from the offer landing until the
     /// user picks Update, Later, or (once staged) Relaunch.
     update_toast: Option<UpdateToast>,
+    /// Whether this binary may update itself, or belongs to a package
+    /// manager that must do it (#375). Read once at startup.
+    install_source: crate::update_check::InstallSource,
     /// A background `cargo install --root <cache>/staged` of the offered
     /// release. Reported through the same UpdateEvent lifecycle as the
     /// remote watcher; the binary on PATH is untouched until Relaunch.
@@ -4885,6 +4888,7 @@ impl App {
             self_install: None,
             update_check: None,
             update_toast: None,
+            install_source: crate::update_check::current_install_source(),
             staged_install: None,
             staged_status: UpdateStatus::Idle,
             update_status: UpdateStatus::Idle,
@@ -18031,10 +18035,15 @@ impl App {
         let staging = self.staged_status == UpdateStatus::InProgress && !ready;
         let accent = self.theme.accent();
         let btn_bg = self.theme.button();
+        let brew = self.install_source == crate::update_check::InstallSource::Homebrew;
         let actions: Vec<(String, UpdateToastAction)> = if ready {
             vec![(" Relaunch ".to_string(), UpdateToastAction::Relaunch)]
         } else if staging {
             Vec::new()
+        } else if brew {
+            // Homebrew upgrades it (#375); the popup can only name the
+            // command and be dismissed.
+            vec![(" Later ".to_string(), UpdateToastAction::Later)]
         } else {
             vec![
                 (" Update ".to_string(), UpdateToastAction::Update),
@@ -18047,6 +18056,11 @@ impl App {
             format!(
                 "{} building croft v{version} in the background",
                 self.update_spinner_glyph()
+            )
+        } else if brew {
+            format!(
+                "\u{27f3} croft v{version} is available - run `{}`",
+                crate::update_check::BREW_UPGRADE
             )
         } else {
             format!(
@@ -27359,6 +27373,15 @@ impl App {
     /// state machine takes it from here: spinner while cargo runs, then
     /// the popup and the status bar both offer Relaunch.
     fn start_staged_update(&mut self, version: String) {
+        // Homebrew owns a Cellar binary (#375): staging and swapping it
+        // would leave brew's records describing a file croft replaced.
+        if self.install_source == crate::update_check::InstallSource::Homebrew {
+            self.status = format!(
+                "croft v{version} is available - this install is managed by Homebrew: run `{}`",
+                crate::update_check::BREW_UPGRADE
+            );
+            return;
+        }
         self.staged_status = UpdateStatus::Idle;
         self.staged_install = Some(crate::update_check::StagedInstall::start(
             croft_cache_dir(),

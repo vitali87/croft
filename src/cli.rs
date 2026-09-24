@@ -386,12 +386,27 @@ pub enum CliCommand {
     },
 }
 
+/// `--build-info`'s text: version, commit and build time, plus how the
+/// binary was installed when a package manager owns it (#375).
+fn build_info_line(source: crate::update_check::InstallSource) -> String {
+    match source {
+        crate::update_check::InstallSource::Homebrew => format!(
+            "{}, installed with Homebrew)",
+            VERBOSE_VERSION.trim_end_matches(')')
+        ),
+        crate::update_check::InstallSource::SelfManaged => VERBOSE_VERSION.to_string(),
+    }
+}
+
 impl Cli {
     pub fn run(self) -> Result<()> {
         // `--build-info` is a pure query: answer and exit before any setup,
         // exactly as clap does for `--version`.
         if self.build_info {
-            println!("croft {VERBOSE_VERSION}");
+            println!(
+                "croft {}",
+                build_info_line(crate::update_check::current_install_source())
+            );
             return Ok(());
         }
         // Pure liveness probes answer before anything else runs: the remote
@@ -1596,6 +1611,17 @@ fn install_rust_target_if_missing(triple: &str) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// #375: `--build-info` says when a package manager owns the binary, so a
+    /// bug report shows which upgrade path the user has.
+    #[test]
+    fn build_info_names_a_homebrew_install() {
+        use crate::update_check::InstallSource;
+        let brew = build_info_line(InstallSource::Homebrew);
+        assert!(brew.starts_with(VERBOSE_VERSION.trim_end_matches(')')), "{brew}");
+        assert!(brew.ends_with(", installed with Homebrew)"), "{brew}");
+        assert_eq!(build_info_line(InstallSource::SelfManaged), VERBOSE_VERSION);
+    }
 
     /// #282: `--version` is a plain `x.y.z`. The regression this guards is a
     /// well-meaning one — re-adding provenance "so bug reports carry it" is
