@@ -3443,6 +3443,9 @@ pub struct App {
     /// showing the live buffer. `Some` at `Position::Working` is a real
     /// state: the scrubber is open and parked at the user's own edits.
     scrubber: Option<crate::scrubber::Scrubber>,
+    /// The SARIF location a Locate prompt is open for (#577): its URI and
+    /// the 1-based line and column to land on.
+    sarif_locate_pending: Option<(String, i64, i64)>,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -5054,6 +5057,7 @@ impl App {
             recorded_size: (0, 0),
             symbol_tab: None,
             scrubber: None,
+            sarif_locate_pending: None,
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
@@ -7280,6 +7284,7 @@ impl App {
                 }
                 let resolver = crate::sarif::resolve::Resolver {
                     roots,
+                    learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
                     ..Default::default()
                 };
                 let log_index = view.logs.iter().position(|l| l.path == loaded.path);
@@ -23306,6 +23311,10 @@ impl App {
             InputPurpose::NewWorktreeLane => {
                 self.close_input_prompt();
                 self.create_worktree_lane(&value);
+            }
+            InputPurpose::SarifLocate { .. } => {
+                self.close_input_prompt();
+                self.submit_sarif_locate(&value);
             }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
@@ -45300,6 +45309,7 @@ impl App {
             }
             let resolver = crate::sarif::resolve::Resolver {
                 roots,
+                learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
                 ..Default::default()
             };
             let found = resolver.resolve(run, artifact, &|p| p.is_file());
@@ -45312,7 +45322,15 @@ impl App {
             return;
         };
         let Some(path) = path else {
-            self.status = format!("Cannot find {uri} on this machine");
+            // VS Code's Locate…: ask where the file is.
+            let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
+            self.sarif_locate_pending = Some((uri.clone(), line + 1, column + 1));
+            self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
+                crate::widgets::input_prompt::InputPurpose::SarifLocate { uri: uri.clone() },
+                format!("Locate {name}"),
+                format!("path to {name} on this machine"),
+            ));
+            self.status = format!("Cannot find {uri} on this machine: where is it?");
             return;
         };
         self.editor.pin_active();
@@ -45368,6 +45386,63 @@ impl App {
         }
         out.sort_by(|a, b| (&a.2, a.3, a.4).cmp(&(&b.2, b.3, b.4)));
         out
+    }
+
+    /// The Locate prompt's answer (#577): the file must carry the name the
+    /// log gave it; its location teaches a prefix that is saved for this
+    /// workspace, so the log's other files from the same place resolve too.
+    pub fn submit_sarif_locate(&mut self, value: &str) {
+        let Some((uri, line, col)) = self.sarif_locate_pending.clone() else {
+            return;
+        };
+        let v = value.trim();
+        let typed = match v.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(rest),
+            None => PathBuf::from(v),
+        };
+        let path = if typed.is_absolute() {
+            typed
+        } else {
+            self.workspace_root().join(typed)
+        };
+        if !path.is_file() {
+            self.status = format!("{} is not a file", path.display());
+            return;
+        }
+        let want = uri.rsplit('/').next().unwrap_or("").to_string();
+        let want = crate::sarif::resolve::uri_to_path(&want)
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or(want);
+        let got = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if want != got {
+            self.status = format!("File names must match: \"{want}\" and \"{got}\"");
+            return;
+        }
+        self.sarif_locate_pending = None;
+        let root = self.workspace_root().to_path_buf();
+        if let Err(e) = crate::sarif::resolve::save_prefix(&root, &uri, &path) {
+            self.status = format!("Located, but the mapping was not saved: {e}");
+        }
+        self.editor.pin_active();
+        match self.open_at(
+            &path,
+            line.saturating_sub(1) as usize,
+            col.saturating_sub(1) as usize,
+        ) {
+            Ok(()) => {
+                // The learned prefix may change what resolves: republish.
+                self.sarif_diag_signature.clear();
+                self.status =
+                    format!("Located {got}; other files from the same place will resolve");
+            }
+            Err(e) => self.status = format!("Open failed: {e}"),
+        }
     }
 
     /// Jump to the next (or previous) SARIF result location from the
@@ -45471,6 +45546,7 @@ impl App {
         }
         let resolver = crate::sarif::resolve::Resolver {
             roots,
+            learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
             ..Default::default()
         };
         let open_text = |p: &std::path::Path| -> Option<String> {
@@ -45546,6 +45622,7 @@ impl App {
             }
             let resolver = crate::sarif::resolve::Resolver {
                 roots,
+                learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
                 ..Default::default()
             };
             let artifact = crate::sarif::model::ArtifactLocation {

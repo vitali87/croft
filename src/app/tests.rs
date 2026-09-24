@@ -50056,3 +50056,81 @@ fn moving_the_cursor_onto_a_result_selects_it_in_the_viewer() {
     let view = app.editor.editors[viewer].sarif.as_ref().unwrap();
     assert_eq!(view.selected_entry().unwrap().message, "second");
 }
+
+#[test]
+fn a_missing_file_asks_to_locate_it_and_the_mapping_is_learned_and_kept() {
+    // #577: VS Code's Locate… prompt, with the learned prefix remembered.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "a1\na2\n").unwrap();
+        std::fs::write(tmp.path().join("lib/b.rs"), "b1\nb2\nb3\n").unwrap();
+        let log = tmp.path().join("ci.sarif");
+        std::fs::write(
+            &log,
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ci"}},"results":[
+                {"message":{"text":"in a"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"file:///home/runner/work/app/src/a.rs"},"region":{"startLine":2}}}]},
+                {"message":{"text":"in b"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"file:///home/runner/work/app/lib/b.rs"},"region":{"startLine":3}}}]}
+            ]}]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_preview(&log).unwrap();
+        // The first result's file is not here: Enter asks where it is.
+        app.handle_sarif_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(
+                app.input_prompt.as_ref().map(|p| &p.purpose),
+                Some(crate::widgets::input_prompt::InputPurpose::SarifLocate { .. })
+            ),
+            "a Locate prompt: {}",
+            app.status
+        );
+        // Groups of equal size sort by path, so `lib/b.rs` is selected first.
+        assert_eq!(
+            app.editor
+                .sarif
+                .as_ref()
+                .unwrap()
+                .selected_entry()
+                .map(|e| e.message.clone())
+                .as_deref(),
+            Some("in b")
+        );
+        // A file with another name is refused.
+        app.submit_sarif_locate(&tmp.path().join("src/a.rs").display().to_string());
+        assert!(app.status.contains("names must match"), "{}", app.status);
+        // The right file opens, and the mapping is learned.
+        app.submit_sarif_locate(&tmp.path().join("lib/b.rs").display().to_string());
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("lib/b.rs").as_path())
+        );
+        assert_eq!(app.editor.cursor_row, 2);
+        // The other result now resolves on its own, in the next session too.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.editor.open_preview(&log).unwrap();
+        let rows = again.editor.sarif.as_ref().unwrap().rows();
+        let a_row = rows
+            .iter()
+            .position(|r| match r {
+                crate::sarif::view::Row::Item { entry } => {
+                    again.editor.sarif.as_ref().unwrap().entries[*entry].message == "in a"
+                }
+                _ => false,
+            })
+            .unwrap();
+        again.editor.sarif.as_mut().unwrap().selected = a_row;
+        again.handle_sarif_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            again.editor.path.as_deref(),
+            Some(tmp.path().join("src/a.rs").as_path()),
+            "resolved through the saved prefix: {}",
+            again.status
+        );
+        assert_eq!(again.editor.cursor_row, 1);
+    });
+}

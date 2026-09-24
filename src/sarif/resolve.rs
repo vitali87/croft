@@ -152,6 +152,45 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn prefixes_path() -> PathBuf {
+    crate::app::croft_cache_dir().join("sarif-locations.json")
+}
+
+/// Path prefixes learned for `workspace` (from Locate… and earlier matches),
+/// as the resolver's `learned` list. Empty when none were saved.
+pub fn saved_prefixes(workspace: &Path) -> Vec<(String, PathBuf)> {
+    let all: BTreeMap<String, Vec<(String, PathBuf)>> = std::fs::read_to_string(prefixes_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    all.get(&workspace.display().to_string())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Remember that `artifact_uri` lives at `local` for `workspace`, as the
+/// prefix pair [`Resolver::learn`] derives. Newest first, no duplicates.
+pub fn save_prefix(workspace: &Path, artifact_uri: &str, local: &Path) -> std::io::Result<()> {
+    let mut r = Resolver::default();
+    r.learn(artifact_uri, local);
+    let Some(pair) = r.learned.into_iter().next() else {
+        return Ok(());
+    };
+    let path = prefixes_path();
+    let mut all: BTreeMap<String, Vec<(String, PathBuf)>> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let list = all.entry(workspace.display().to_string()).or_default();
+    list.retain(|(from, _)| *from != pair.0);
+    list.insert(0, pair);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = serde_json::to_string_pretty(&all).map_err(std::io::Error::other)?;
+    std::fs::write(path, text)
+}
+
 /// The state resolution needs beyond the log itself.
 #[derive(Debug, Default, Clone)]
 pub struct Resolver {
