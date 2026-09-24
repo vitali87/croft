@@ -49715,3 +49715,118 @@ tool = "go"
         "another extension's record stays"
     );
 }
+
+#[test]
+fn the_demo_tour_runs_in_a_scratch_project_and_esc_cleans_up() {
+    // #377: the tour never runs in the user's workspace, and Esc leaves a
+    // normal croft with no scratch files behind.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let scratch = app.workspace_root().to_path_buf();
+        assert_ne!(scratch, tmp.path(), "not the user's workspace");
+        assert!(scratch.join(crate::tour::SCRATCH_MARKER).is_file());
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(scratch.join("src/main.rs").as_path())
+        );
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 36)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(
+            screen.contains("1/9"),
+            "the caption chip shows progress:\n{screen}"
+        );
+        // Enter advances the tour instead of typing into the file.
+        let lines = app.editor.lines.clone();
+        app.focus_pane(Pane::Editor);
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.tour.as_ref().unwrap().tour.index, 1);
+        assert_eq!(app.editor.lines, lines, "no newline typed into the sample");
+        app.close_all_modals_for_test();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.tour.is_none(), "Esc leaves the tour");
+        assert_eq!(
+            app.workspace_root(),
+            tmp.path(),
+            "back in the original workspace"
+        );
+        assert!(!scratch.exists(), "the sample project is gone");
+    });
+}
+
+#[test]
+fn walking_the_whole_tour_ends_it_and_cleans_up() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let scratch = app.workspace_root().to_path_buf();
+        let mut steps = 0;
+        while app.tour.is_some() && steps < 40 {
+            app.close_all_modals_for_test();
+            app.advance_tour();
+            steps += 1;
+        }
+        assert!(app.tour.is_none(), "the tour ends");
+        assert_eq!(steps, 9, "one advance per step");
+        assert_eq!(app.workspace_root(), tmp.path());
+        assert!(!scratch.exists());
+    });
+}
+
+#[test]
+fn the_welcome_tour_button_starts_the_tour_and_goes_away_once_done() {
+    // #377: shown until the first completed or skipped tour, persisted.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.config_dir = tmp.path().join("config");
+        app.tour_done = false;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let button = app.welcome_tour_button;
+        assert!(button.width > 0, "the welcome panel offers the tour");
+        left_click(&mut app, button.x + 1, button.y);
+        assert!(app.tour.is_some(), "clicking starts it: {}", app.status);
+        app.close_all_modals_for_test();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.tour_done, "a skipped tour counts as done");
+        let saved = crate::prefs::Prefs::load(&tmp.path().join("config").join("config.json"))
+            .unwrap_or_default();
+        assert!(saved.tour_done, "persisted in prefs");
+        // Back on the welcome screen, the button is gone.
+        while app.editor.tab_count() > 1 {
+            app.editor.close_active();
+        }
+        app.editor.close_active();
+        term.draw(|f| app.render(f)).unwrap();
+        assert_eq!(app.welcome_tour_button.width, 0, "not offered again");
+    });
+}
+
+#[test]
+fn take_the_tour_is_a_palette_command() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("help_take_the_tour"),
+        Some(Command::TakeTheTour)
+    );
+    assert_eq!(Command::TakeTheTour.title(), "Help: Take the Tour");
+}
