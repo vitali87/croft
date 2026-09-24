@@ -164,6 +164,8 @@ Each row's play glyph runs that test or suite (a green ▷ also marks test funct
 
 ## Live Run
 
+![Live Run: values, output, errors and coverage painted beside the code as you type](images/live-run.gif)
+
 `Cmd`/`Ctrl`+`K` `V` (or **Python: Toggle Live Run** in the palette) turns a Python file into a live notebook without cells. Every time you pause typing, croft runs the buffer, unsaved edits included, and paints what each line did beside it:
 
 ```text
