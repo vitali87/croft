@@ -639,6 +639,11 @@ pub fn fold_breakpoint_reports(
 pub struct NamedSession<S = DapSession> {
     pub name: String,
     pub session: S,
+    /// Events this session produced while it was NOT focused, kept for the
+    /// moment it is (#567). Only the focused session's events drive the UI;
+    /// dropping a background member's `stopped` left a breakpoint hit that
+    /// nothing showed, so the member looked hung. Replayed in order on focus.
+    pub backlog: Vec<DapEvent>,
 }
 
 /// The debug sessions in flight, one of them FOCUSED (#310).
@@ -709,6 +714,7 @@ impl<S> DebugSessions<S> {
         self.sessions.push(NamedSession {
             name: name.into(),
             session,
+            backlog: Vec::new(),
         });
         self.focused = 0;
     }
@@ -723,6 +729,7 @@ impl<S> DebugSessions<S> {
         self.sessions.push(NamedSession {
             name: name.into(),
             session,
+            backlog: Vec::new(),
         });
         self.focused = self.sessions.len() - 1;
     }
@@ -773,13 +780,26 @@ impl<S> DebugSessions<S> {
         self.focused
     }
 
-    /// Every session with its position, for the operations that mean all of
-    /// them but must still tell them apart.
-    pub fn iter_mut_indexed(&mut self) -> impl Iterator<Item = (usize, &mut S)> {
+    /// Every session with its position and name, for the poll that routes a
+    /// background member's events by who produced them (#567).
+    pub fn iter_named_mut_indexed(
+        &mut self,
+    ) -> impl Iterator<Item = (usize, &mut NamedSession<S>)> {
+        self.sessions.iter_mut().enumerate()
+    }
+
+    /// The focused session's queued background events, emptied: what it did
+    /// while the user was looking at another member, to replay now.
+    pub fn take_focused_backlog(&mut self) -> Vec<DapEvent> {
         self.sessions
-            .iter_mut()
-            .enumerate()
-            .map(|(i, s)| (i, &mut s.session))
+            .get_mut(self.focused)
+            .map(|s| std::mem::take(&mut s.backlog))
+            .unwrap_or_default()
+    }
+
+    /// The index of the session named `name`, if it is still in the set.
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.sessions.iter().position(|s| s.name == name)
     }
 
     /// Drop every session without disconnecting - the old `= None`.
@@ -1466,7 +1486,10 @@ mod session_set_tests {
         set.replace_with("a", 10);
         set.push("b", 20);
         set.push("c", 30);
-        let seen: Vec<(usize, u32)> = set.iter_mut_indexed().map(|(i, s)| (i, *s)).collect();
+        let seen: Vec<(usize, u32)> = set
+            .iter_named_mut_indexed()
+            .map(|(i, s)| (i, s.session))
+            .collect();
         assert_eq!(
             seen,
             vec![(0, 10), (1, 20), (2, 30)],
