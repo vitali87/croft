@@ -46,6 +46,7 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/dap-python/extension.toml"),
     include_str!("../../assets/extensions/dap-lldb/extension.toml"),
     include_str!("../../assets/extensions/dap-js/extension.toml"),
+    include_str!("../../assets/extensions/dap-go/extension.toml"),
     // Runner order is detection priority: cargo, then the JS runners, then
     // pytest — a mixed repo's root is usually the crate.
     include_str!("../../assets/extensions/test-cargo/extension.toml"),
@@ -210,6 +211,8 @@ pub enum AdapterKindDecl {
     Lldb,
     /// vscode-js-debug, launches a Node program over its TCP multi-session.
     JsDebug,
+    /// delve (`dlv dap`), launches a Go package or test over TCP (#264).
+    Delve,
 }
 
 /// One `[[test_runners]]` entry: a test runner contributed by an extension.

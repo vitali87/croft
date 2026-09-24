@@ -108,7 +108,7 @@ src/
 │   ├── perf_hud.rs      F8 performance HUD
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
 │   └── tests.rs         unit / integration tests
-├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python, 3.14+, no fallback) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug. Which file types each handles is a data-driven extension axis (see registry.rs)
+├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python, 3.14+, no fallback) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
 │   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter detached via setsid (so the debuggee can't tcsetpgrp-background and SIGTTIN-suspend croft, and so teardown can killpg the whole group), blocking reader thread frames stdout into an mpsc channel; Drop/kill signals the process group and reaps the child
 │   ├── session.rs            one debug launch session: the initialize → setBreakpoints → configurationDone → stopped state machine, event classifier, the stackTrace → scopes → variables chain, evaluate, breakpoints and logpoints, over one adapter-agnostic launch_with

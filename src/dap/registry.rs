@@ -25,6 +25,7 @@ fn kind_of(decl: AdapterKindDecl) -> AdapterKind {
         AdapterKindDecl::Debugpy => AdapterKind::Debugpy,
         AdapterKindDecl::Lldb => AdapterKind::LldbDap,
         AdapterKindDecl::JsDebug => AdapterKind::JsDebug,
+        AdapterKindDecl::Delve => AdapterKind::Delve,
     }
 }
 
@@ -125,6 +126,7 @@ mod tests {
         for ext in ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"] {
             assert_eq!(resolve(&s, &none, ext), Some(AdapterKind::JsDebug), "{ext}");
         }
+        assert_eq!(resolve(&s, &none, "go"), Some(AdapterKind::Delve));
         assert_eq!(resolve(&s, &none, "txt"), None);
         assert_eq!(resolve(&s, &none, ""), None);
     }

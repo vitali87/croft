@@ -21709,6 +21709,32 @@ impl App {
                     breakpoints,
                 )
             }
+            AdapterKind::Delve => {
+                if rc.request == RequestKind::Launch && rc.program.is_none() {
+                    self.debug_error(format!(
+                        "config \"{name}\": a go launch needs a \"program\" (a package directory or file)"
+                    ));
+                    return;
+                }
+                if rc.request == RequestKind::Attach && rc.process_id.is_none() {
+                    self.debug_error(format!(
+                        "config \"{name}\": a go attach needs a \"processId\""
+                    ));
+                    return;
+                }
+                match crate::dap::install::dlv_program() {
+                    Ok(dlv) => crate::dap::session::DapSession::launch_delve(
+                        &dlv,
+                        &cwd,
+                        configs::delve_request(&rc),
+                        breakpoints,
+                    ),
+                    Err(e) => {
+                        self.debug_error(format!("{e}"));
+                        return;
+                    }
+                }
+            }
             AdapterKind::JsDebug => {
                 if rc.request == RequestKind::Launch && rc.program.is_none() {
                     self.debug_error(format!(
@@ -21790,6 +21816,10 @@ impl App {
                 self.start_js_debug_session(&path);
                 return;
             }
+            Some(AdapterKind::Delve) => {
+                self.start_delve_debug_session(&path);
+                return;
+            }
             None => {
                 // An executable binary (e.g. a compiled `target/debug/app`) can
                 // be debugged directly by lldb-dap with no build step.
@@ -21855,6 +21885,41 @@ impl App {
     /// Provisions the js-debug server on first use, then drives the shared DAP
     /// session machinery (which transparently spawns the parent + child
     /// connections js-debug requires). TypeScript binds via source maps.
+    /// Debug the Go file at `path` under delve (#264): its package's `main`,
+    /// or its tests for a `_test.go` file. delve builds the package itself.
+    fn start_delve_debug_session(&mut self, path: &Path) {
+        let dlv = match crate::dap::install::dlv_program() {
+            Ok(d) => d,
+            Err(e) => {
+                self.debug_error(format!("{e}"));
+                return;
+            }
+        };
+        let breakpoints = self.collect_editor_breakpoints();
+        let cwd = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.roots.primary().to_path_buf());
+        let request = crate::dap::session::delve_zero_config_request(path);
+        match crate::dap::session::DapSession::launch_delve(&dlv, &cwd, request, breakpoints) {
+            Ok(session) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.debug_sessions.replace_with(name.clone(), session);
+                self.run_debug.feedback = Some(format!("Debugging {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("Debugging {name} — F5 continue · F10 step over · Shift+F5 stop");
+                self.reveal_debug_view();
+            }
+            Err(e) => {
+                self.debug_error(format!("Failed to start debugger: {e}"));
+            }
+        }
+    }
+
     fn start_js_debug_session(&mut self, path: &Path) {
         let node = match crate::dap::install::node_program() {
             Ok(n) => n,

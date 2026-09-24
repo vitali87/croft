@@ -191,6 +191,31 @@ pub enum AdapterKind {
     /// program under Node. Multi-session: a parent bootstraps and a child binds
     /// breakpoints (see [`start_debugging_request`]).
     JsDebug,
+    /// delve (`dlv dap` over TCP), launches a Go package or test (#264).
+    /// Single-session: breakpoints bind in the one connection, like debugpy.
+    Delve,
+}
+
+/// The zero-config delve `launch` for the Go file at `file` (#264): the file's
+/// package directory is the program, which delve builds itself. A `_test.go`
+/// file runs in delve's `test` mode (the package's tests); anything else in
+/// `debug` mode (the package's `main`).
+pub fn delve_zero_config_request(file: &Path) -> Value {
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let is_test = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("_test.go"));
+    json!({
+        "type": "request",
+        "command": "launch",
+        "arguments": {
+            "mode": if is_test { "test" } else { "debug" },
+            "program": dir.to_string_lossy(),
+            "cwd": dir.to_string_lossy(),
+            "stopOnEntry": false,
+        }
+    })
 }
 
 /// Build the lldb-dap `launch` request for a compiled `program` binary. Unlike
@@ -939,6 +964,25 @@ impl DapSession {
         ))
     }
 
+    /// Launch a delve session (#264): spawn `dlv dap --listen=<host:port>`,
+    /// connect over TCP, and send `start_request`. delve serves one session
+    /// per connection, so unlike js-debug there is no child to open later.
+    pub fn launch_delve(
+        dlv: &Path,
+        cwd: &Path,
+        start_request: Value,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> Result<DapSession> {
+        let host = "127.0.0.1";
+        let port = super::transport::free_port()?;
+        let args = vec![String::from("dap"), format!("--listen={host}:{port}")];
+        let transport =
+            DapTransport::connect_tcp_server(&dlv.to_string_lossy(), &args, cwd, host, port, None)?;
+        transport.send(initialize_request())?;
+        transport.send(start_request)?;
+        Ok(Self::new_with_transport(transport, breakpoints, None))
+    }
+
     /// Assemble a fresh session around its (parent) `transport`. `js_server` is
     /// set only for vscode-js-debug, marking the session multi-session and
     /// carrying the address its child connection reuses.
@@ -1497,6 +1541,63 @@ mod session_set_tests {
 
 #[cfg(test)]
 mod tests {
+    /// #264: zero-config Go debugging runs the file's package; a `_test.go`
+    /// file runs the package's tests instead.
+    #[test]
+    fn delve_zero_config_runs_the_package_or_its_tests() {
+        let main = delve_zero_config_request(Path::new("/w/cmd/app/main.go"));
+        assert_eq!(main["arguments"]["mode"], "debug");
+        assert_eq!(main["arguments"]["program"], "/w/cmd/app");
+        let test = delve_zero_config_request(Path::new("/w/pkg/util_test.go"));
+        assert_eq!(test["arguments"]["mode"], "test");
+        assert_eq!(test["arguments"]["program"], "/w/pkg");
+    }
+
+    /// End to end against a real delve: a breakpoint in a small Go program
+    /// binds, the program stops there, and the stop is reported at that line.
+    /// Needs Go and `dlv` (CROFT_TEST_DLV, or the usual discovery), so it is
+    /// ignored by default; run it with `--ignored`.
+    #[test]
+    #[ignore]
+    fn delve_stops_at_a_breakpoint_in_a_real_go_program() {
+        let dlv = std::env::var_os("CROFT_TEST_DLV")
+            .map(PathBuf::from)
+            .or_else(|| crate::dap::install::dlv_program().ok())
+            .expect("dlv");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module t\n\ngo 1.21\n").unwrap();
+        let main = tmp.path().join("main.go");
+        std::fs::write(
+            &main,
+            "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tx := 41\n\tx++\n\tfmt.Println(x)\n}\n",
+        )
+        .unwrap();
+        let main = main.canonicalize().unwrap();
+        let mut bps = BTreeMap::new();
+        bps.insert(main.clone(), vec![SourceBreakpoint::plain(7)]);
+        let mut s = DapSession::launch_delve(
+            &dlv,
+            main.parent().unwrap(),
+            delve_zero_config_request(&main),
+            bps,
+        )
+        .expect("delve starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while s.phase != SessionPhase::Stopped && std::time::Instant::now() < deadline {
+            s.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(s.phase, SessionPhase::Stopped, "delve never stopped");
+        while s.current_location.is_none() && std::time::Instant::now() < deadline {
+            s.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (file, line) = s.current_location.clone().expect("a stop location");
+        assert_eq!(line, 7);
+        assert_eq!(file.canonicalize().unwrap(), main);
+        s.disconnect();
+    }
+
     use super::*;
 
     #[test]

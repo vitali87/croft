@@ -225,6 +225,47 @@ fn download_to_file(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Where `dlv` is, for Go debugging (#264), in delve's own resolution order:
+/// `PATH`, then `$GOBIN`, then `$GOPATH/bin` (default `~/go/bin`), then
+/// croft's servers directory. Pure over its inputs so the order is testable.
+pub fn find_dlv(
+    path_env: Option<&std::ffi::OsStr>,
+    gobin: Option<&Path>,
+    gopath: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path_env
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    dirs.extend(gobin.map(Path::to_path_buf));
+    match gopath {
+        Some(gp) => dirs.push(gp.join("bin")),
+        None => dirs.extend(home.map(|h| h.join("go").join("bin"))),
+    }
+    dirs.extend(home.map(|h| h.join(".croft").join("servers").join("go")));
+    dirs.into_iter()
+        .map(|d| d.join("dlv"))
+        .find(|p| p.is_file())
+}
+
+/// `dlv` for this machine, or an error that says how to install it.
+pub fn dlv_program() -> Result<PathBuf> {
+    let gobin = std::env::var_os("GOBIN").map(PathBuf::from);
+    let gopath = std::env::var_os("GOPATH").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    find_dlv(
+        std::env::var_os("PATH").as_deref(),
+        gobin.as_deref(),
+        gopath.as_deref(),
+        home.as_deref(),
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "Go debugging needs delve: run `go install github.com/go-delve/delve/cmd/dlv@latest`"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +297,42 @@ mod tests {
     fn node_bin_dir_is_none_for_a_bare_command() {
         // A bare `node` (already on PATH) has no directory to inject.
         assert_eq!(node_bin_dir("node"), None);
+    }
+
+    /// #264: delve's own resolution order, PATH first; `~/go/bin` stands in
+    /// for an unset GOPATH, and croft's servers dir comes last.
+    #[test]
+    fn find_dlv_searches_path_then_gobin_then_gopath_then_croft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |rel: &str| {
+            let dir = tmp.path().join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("dlv"), "").unwrap();
+            dir
+        };
+        let on_path = mk("path");
+        let gobin = mk("gobin");
+        let home = tmp.path().join("home");
+        let home_go = mk("home/go/bin");
+        let croft = mk("home/.croft/servers/go");
+        let path_env = std::env::join_paths([on_path.clone()]).unwrap();
+        assert_eq!(
+            find_dlv(Some(&path_env), Some(&gobin), None, Some(&home)),
+            Some(on_path.join("dlv"))
+        );
+        assert_eq!(
+            find_dlv(None, Some(&gobin), None, Some(&home)),
+            Some(gobin.join("dlv"))
+        );
+        assert_eq!(
+            find_dlv(None, None, None, Some(&home)),
+            Some(home_go.join("dlv"))
+        );
+        std::fs::remove_file(home_go.join("dlv")).unwrap();
+        assert_eq!(
+            find_dlv(None, None, None, Some(&home)),
+            Some(croft.join("dlv"))
+        );
+        assert_eq!(find_dlv(None, None, None, None), None, "nowhere to look");
     }
 }
