@@ -21881,10 +21881,6 @@ impl App {
         }
     }
 
-    /// Launch a vscode-js-debug session for a `.js`/`.ts` file run under Node.
-    /// Provisions the js-debug server on first use, then drives the shared DAP
-    /// session machinery (which transparently spawns the parent + child
-    /// connections js-debug requires). TypeScript binds via source maps.
     /// Debug the Go file at `path` under delve (#264): its package's `main`,
     /// or its tests for a `_test.go` file. delve builds the package itself.
     fn start_delve_debug_session(&mut self, path: &Path) {
@@ -21920,6 +21916,10 @@ impl App {
         }
     }
 
+    /// Launch a vscode-js-debug session for a `.js`/`.ts` file run under Node.
+    /// Provisions the js-debug server on first use, then drives the shared DAP
+    /// session machinery (which transparently spawns the parent + child
+    /// connections js-debug requires). TypeScript binds via source maps.
     fn start_js_debug_session(&mut self, path: &Path) {
         let node = match crate::dap::install::node_program() {
             Ok(n) => n,
