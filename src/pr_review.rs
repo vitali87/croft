@@ -550,6 +550,12 @@ mod tests {
     }
 
     #[test]
+    fn the_viewed_key_names_the_repository_and_the_pr() {
+        let pr = parse_pr(PR).unwrap();
+        assert_eq!(review_key(&pr), "o/r#579");
+    }
+
+    #[test]
     fn malformed_json_is_an_error_not_a_panic() {
         assert!(parse_pr("not json").is_err());
         assert!(parse_pr("{}").is_err(), "a PR needs at least a number");
