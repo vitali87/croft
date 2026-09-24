@@ -127,6 +127,23 @@ pub enum DebugRowKind {
     },
     /// The trailing "+ Add Expression" affordance row of the WATCH section.
     WatchAdd,
+    /// A breakpoint (#250): `index` into [`RunDebugPanel::breakpoints`].
+    /// Clicking the row jumps to it; the `✕` removes it.
+    Breakpoint { index: usize },
+}
+
+/// One breakpoint as the BREAKPOINTS list shows it (#250), filled by the app
+/// from the editor's breakpoints on every refresh, running or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointItem {
+    pub path: PathBuf,
+    /// 1-based, as the editor stores breakpoint lines.
+    pub line: usize,
+    /// `file.rs:12`.
+    pub label: String,
+    /// `if <condition>` or `log <message>` for a conditional breakpoint or a
+    /// logpoint; `None` for a plain one.
+    pub detail: Option<String>,
 }
 
 /// One rendered line of the paused-state debug tree. The app builds these from
@@ -172,6 +189,12 @@ pub struct RunDebugPanel {
     /// Remove-`✕` hit cells for Watch rows painted this frame:
     /// `(y, x, nth watch row)`. Cleared at every tree render.
     watch_remove_rects: Vec<(u16, u16, usize)>,
+    /// Every breakpoint, for the BREAKPOINTS list (#250).
+    pub breakpoints: Vec<BreakpointItem>,
+    /// Painted breakpoint rows this frame: `(y, index)`, and their remove
+    /// `✕` cells `(y, x, index)`. Cleared at every render.
+    breakpoint_row_rects: Vec<(u16, usize)>,
+    breakpoint_remove_rects: Vec<(u16, u16, usize)>,
     pub debug_status: String,
     pub debug_rows: Vec<DebugRow>,
     pub debug_scroll: usize,
@@ -215,6 +238,9 @@ impl RunDebugPanel {
             last_config_area: Rect::default(),
             debug_active: false,
             watch_remove_rects: Vec::new(),
+            breakpoints: Vec::new(),
+            breakpoint_row_rects: Vec::new(),
+            breakpoint_remove_rects: Vec::new(),
             debug_status: String::new(),
             debug_rows: Vec::new(),
             debug_scroll: 0,
@@ -237,6 +263,72 @@ impl RunDebugPanel {
             .iter()
             .find(|&&(ry, rx, _)| ry == y && (x == rx || x == rx + 1))
             .map(|&(_, _, idx)| idx)
+    }
+
+    /// Map a click to a painted breakpoint (#250): the index into
+    /// `breakpoints`, and whether it landed on the remove `✕`.
+    pub fn breakpoint_at(&self, x: u16, y: u16) -> Option<(usize, bool)> {
+        if let Some(&(_, _, i)) = self
+            .breakpoint_remove_rects
+            .iter()
+            .find(|&&(ry, rx, _)| ry == y && (x == rx || x == rx + 1))
+        {
+            return Some((i, true));
+        }
+        self.breakpoint_row_rects
+            .iter()
+            .find(|&&(ry, _)| ry == y)
+            .map(|&(_, i)| (i, false))
+    }
+
+    /// Paint one breakpoint on row `y` between `x0` and `right`, recording
+    /// its click cells.
+    fn put_breakpoint(&mut self, buf: &mut Buffer, index: usize, x0: u16, y: u16, right: u16) {
+        let Some(bp) = self.breakpoints.get(index).cloned() else {
+            return;
+        };
+        let text_right = right.saturating_sub(3);
+        let mut x = put(
+            buf,
+            x0,
+            y,
+            text_right,
+            "\u{25cf} ",
+            Style::default().fg(self.theme.ui(Color::Rgb(0xe5, 0x14, 0x00))),
+        );
+        x = put(
+            buf,
+            x,
+            y,
+            text_right,
+            &bp.label,
+            Style::default().fg(self.theme.ui(DBG_NAME)),
+        );
+        if let Some(detail) = &bp.detail {
+            put(
+                buf,
+                x + 1,
+                y,
+                text_right,
+                detail,
+                Style::default()
+                    .fg(self.theme.ui(DBG_TYPE))
+                    .add_modifier(Modifier::ITALIC),
+            );
+        }
+        self.breakpoint_row_rects.push((y, index));
+        if right > x0 + 2 {
+            let rx = right - 2;
+            put(
+                buf,
+                rx,
+                y,
+                right,
+                "\u{2715}",
+                Style::default().fg(self.theme.ui(DBG_TYPE)),
+            );
+            self.breakpoint_remove_rects.push((y, rx, index));
+        }
     }
 
     /// Map a click at screen row `y` to the index of the debug row drawn there,
@@ -297,6 +389,8 @@ impl RunDebugPanel {
     /// `last_debug_rows_shown` for click mapping.
     fn render_debug_tree(&mut self, inner: Rect, buf: &mut Buffer) {
         self.watch_remove_rects.clear();
+        self.breakpoint_row_rects.clear();
+        self.breakpoint_remove_rects.clear();
         let right = inner.x + inner.width;
         let mut y = inner.y;
 
@@ -333,6 +427,9 @@ impl RunDebugPanel {
         self.last_debug_row_y0 = y;
 
         let mut shown = 0usize;
+        // Breakpoint rows paint after the loop: `put_breakpoint` needs
+        // `&mut self` while the loop holds `debug_rows`.
+        let mut breakpoint_rows: Vec<(usize, u16, u16, u16)> = Vec::new();
         for row in self
             .debug_rows
             .iter()
@@ -556,6 +653,10 @@ impl RunDebugPanel {
                         self.watch_remove_rects.push((row_y, rx, *index));
                     }
                 }
+                DebugRowKind::Breakpoint { index } => {
+                    let indent = (row.indent as u16) * 2;
+                    breakpoint_rows.push((*index, inner.x + indent, row_y, right));
+                }
                 DebugRowKind::WatchAdd => {
                     let indent = (row.indent as u16) * 2;
                     put(
@@ -571,6 +672,9 @@ impl RunDebugPanel {
                 }
             }
             shown += 1;
+        }
+        for (index, x, row_y, right) in breakpoint_rows {
+            self.put_breakpoint(buf, index, x, row_y, right);
         }
         self.last_debug_rows_shown = shown;
 
@@ -771,7 +875,9 @@ impl Widget for &mut RunDebugPanel {
         // retained console (rendered below the button) gets the lower region;
         // otherwise centre it like the resting state.
         let show_ended_console = self.session_ended && !self.console_tail.is_empty();
-        let top_pad = if show_ended_console {
+        self.breakpoint_row_rects.clear();
+        self.breakpoint_remove_rects.clear();
+        let top_pad = if show_ended_console || !self.breakpoints.is_empty() {
             0
         } else if inner.height > cluster {
             (inner.height - cluster) / 2
@@ -924,6 +1030,28 @@ impl Widget for &mut RunDebugPanel {
             };
             buf.set_string(inner.x + 1, next_y, msg.as_str(), style);
             next_y = next_y.saturating_add(1);
+        }
+        // BREAKPOINTS (#250): listed at rest too, so they can be found and
+        // cleared without starting a session.
+        if !self.breakpoints.is_empty() && next_y + 1 < inner.y + inner.height {
+            next_y = next_y.saturating_add(1);
+            buf.set_string(
+                inner.x + 1,
+                next_y,
+                "BREAKPOINTS",
+                Style::default()
+                    .fg(Color::Rgb(TITLE_FG_RGB.0, TITLE_FG_RGB.1, TITLE_FG_RGB.2))
+                    .add_modifier(Modifier::BOLD),
+            );
+            next_y = next_y.saturating_add(1);
+            let right = inner.x + inner.width;
+            for i in 0..self.breakpoints.len() {
+                if next_y >= inner.y + inner.height {
+                    break;
+                }
+                self.put_breakpoint(buf, i, inner.x + 2, next_y, right);
+                next_y = next_y.saturating_add(1);
+            }
         }
         // Retained console from the just-ended session: program output / errors
         // stay readable after the run instead of being wiped to the Run button.
@@ -1392,6 +1520,46 @@ mod tests {
             "button must remain laid out when the panel collapses the icon block"
         );
     }
+    /// #250: the BREAKPOINTS list shows at rest (no session) under the
+    /// button, and a click maps to the row or to its remove `✕`.
+    #[test]
+    fn idle_panel_lists_breakpoints_and_maps_row_and_remove_clicks() {
+        let mut panel = RunDebugPanel::new();
+        panel.breakpoints = vec![
+            BreakpointItem {
+                path: PathBuf::from("/w/a.rs"),
+                line: 3,
+                label: "a.rs:3".into(),
+                detail: None,
+            },
+            BreakpointItem {
+                path: PathBuf::from("/w/b.rs"),
+                line: 9,
+                label: "b.rs:9".into(),
+                detail: Some("if x > 1".into()),
+            },
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 44,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(dump.contains("BREAKPOINTS"), "header:\n{dump}");
+        assert!(dump.contains("a.rs:3"), "first row:\n{dump}");
+        assert!(dump.contains("b.rs:9 if x > 1"), "detail shown:\n{dump}");
+        assert_eq!(panel.breakpoint_row_rects.len(), 2);
+        let (y, idx) = panel.breakpoint_row_rects[1];
+        assert_eq!(idx, 1);
+        assert_eq!(panel.breakpoint_at(3, y), Some((1, false)), "a row click");
+        let (ry, rx, ridx) = panel.breakpoint_remove_rects[0];
+        assert_eq!(panel.breakpoint_at(rx, ry), Some((ridx, true)), "the ✕");
+        assert_eq!(panel.breakpoint_at(3, y + 10), None);
+    }
+
     #[test]
     fn watch_section_renders_states_and_maps_remove_clicks() {
         let mut panel = RunDebugPanel::new();

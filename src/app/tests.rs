@@ -49430,6 +49430,134 @@ fn stub_member(ends: bool) -> crate::dap::session::DapSession {
     .expect("sh spawns")
 }
 
+/// A workspace with two source files and breakpoints set in both (#250).
+fn app_with_breakpoints() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+    std::fs::write(&b, "x\ny\nz\nw\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .breakpoints
+        .entry(b.clone())
+        .or_default()
+        .insert(4);
+    app.editor
+        .breakpoints
+        .entry(a.clone())
+        .or_default()
+        .extend([3, 1]);
+    app.editor
+        .breakpoint_conditions
+        .entry(a.clone())
+        .or_default()
+        .insert(3, String::from("n > 2"));
+    app.editor
+        .breakpoint_logs
+        .entry(b.clone())
+        .or_default()
+        .insert(4, String::from("at {i}"));
+    (tmp, app, a, b)
+}
+
+#[test]
+fn breakpoint_items_list_every_breakpoint_by_file_then_line() {
+    let (_tmp, app, _a, _b) = app_with_breakpoints();
+    let items = app.breakpoint_items();
+    let shown: Vec<(String, Option<String>)> = items
+        .iter()
+        .map(|i| (i.label.clone(), i.detail.clone()))
+        .collect();
+    assert_eq!(
+        shown,
+        vec![
+            (String::from("a.rs:1"), None),
+            (String::from("a.rs:3"), Some(String::from("if n > 2"))),
+            (String::from("b.rs:4"), Some(String::from("log at {i}"))),
+        ]
+    );
+}
+
+/// The ✕ removes the breakpoint and the condition that went with it, so a
+/// breakpoint set again later on that line starts plain.
+#[test]
+fn removing_from_the_list_drops_the_breakpoint_and_its_condition() {
+    let (_tmp, mut app, a, _b) = app_with_breakpoints();
+    app.sync_breakpoint_list();
+    let idx = app
+        .run_debug
+        .breakpoints
+        .iter()
+        .position(|i| i.label == "a.rs:3")
+        .unwrap();
+    app.breakpoint_list_click(idx, true);
+    assert!(!app.editor.breakpoints[&a].contains(&3));
+    assert!(
+        app.editor.breakpoints[&a].contains(&1),
+        "only that one goes"
+    );
+    assert!(!app.editor.breakpoint_conditions[&a].contains_key(&3));
+    assert_eq!(app.run_debug.breakpoints.len(), 2, "the list follows");
+}
+
+#[test]
+fn clicking_a_breakpoint_opens_its_file_at_the_line() {
+    // Line 1 of a three-line file: a jump one row off lands on a different
+    // line, where the file's LAST line would be clamped back and hide it.
+    let (_tmp, mut app, a, _b) = app_with_breakpoints();
+    app.sync_breakpoint_list();
+    let idx = app
+        .run_debug
+        .breakpoints
+        .iter()
+        .position(|i| i.label == "a.rs:1")
+        .unwrap();
+    app.breakpoint_list_click(idx, false);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.cursor_row, 0, "line 1, 0-based");
+}
+
+/// While a session is shown the tree carries the list as its last section;
+/// a change swaps that section rather than stacking a second one.
+#[test]
+fn the_tree_breakpoint_section_follows_changes_without_duplicating() {
+    use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+    let (_tmp, mut app, a, _b) = app_with_breakpoints();
+    app.run_debug.debug_active = true;
+    app.run_debug.debug_rows = vec![DebugRow {
+        indent: 0,
+        kind: DebugRowKind::Header {
+            title: String::from("CALL STACK"),
+        },
+    }];
+    app.sync_breakpoint_list();
+    let count = |app: &App| {
+        (
+            app.run_debug
+                .debug_rows
+                .iter()
+                .filter(
+                    |r| matches!(&r.kind, DebugRowKind::Header { title } if title == "BREAKPOINTS"),
+                )
+                .count(),
+            app.run_debug
+                .debug_rows
+                .iter()
+                .filter(|r| matches!(r.kind, DebugRowKind::Breakpoint { .. }))
+                .count(),
+        )
+    };
+    assert_eq!(count(&app), (1, 3));
+    app.editor.breakpoints.get_mut(&a).unwrap().insert(2);
+    app.sync_breakpoint_list();
+    assert_eq!(count(&app), (1, 4), "one header, one more row");
+    assert!(matches!(
+        &app.run_debug.debug_rows[0].kind,
+        DebugRowKind::Header { title } if title == "CALL STACK"
+    ));
+}
+
 /// Poll until the set shrinks below `from` members or two seconds pass.
 fn poll_until_shrinks(app: &mut App, from: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
