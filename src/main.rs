@@ -8,6 +8,7 @@ mod build_matchers;
 mod cell_map;
 mod cli;
 mod clipboard;
+mod codeql_db;
 mod collab;
 mod collab_agent;
 mod command_history;
