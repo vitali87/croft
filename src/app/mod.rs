@@ -3717,6 +3717,10 @@ pub struct App {
     /// single-config launch (one session, no siblings) never reads a stale
     /// value in a way that matters.
     debug_stop_all: bool,
+    /// The `postDebugTask`s of the configurations launched into the current
+    /// run (#250), run once each when the run ends: the user stops it, or
+    /// the last session terminates. A new launch starts a fresh list.
+    debug_post_tasks: Vec<String>,
     /// The running compound's name, kept past launch so the report rebuilt
     /// when one member ends can still say which compound is live (#567).
     debug_compound: Option<String>,
@@ -4969,6 +4973,7 @@ impl App {
             selected_debug_config: None,
             selected_debug_compound: None,
             debug_stop_all: false,
+            debug_post_tasks: Vec::new(),
             debug_compound: None,
             pending_debug_launch: None,
             pending_test_debug: None,
@@ -19015,7 +19020,7 @@ impl App {
             {
                 self.open_attach_python_picker();
             } else if shift {
-                self.debug_stop();
+                self.debug_stop_by_user();
             } else {
                 self.debug_start_or_continue();
             }
@@ -20436,6 +20441,7 @@ impl App {
                 "{} ended — stopAll stopped the rest of the compound",
                 ended_names.join(", ")
             );
+            self.run_post_debug_tasks();
             return true;
         }
         if !ended_names.is_empty() && !self.debug_sessions.is_empty() {
@@ -20588,6 +20594,7 @@ impl App {
                 // Keep `debug_console` so its output stays visible after the run;
                 // the panel renders it until the next session starts.
                 self.run_debug.session_ended = true;
+                self.run_post_debug_tasks();
                 changed = true;
             }
             _ => {
@@ -21219,6 +21226,7 @@ impl App {
                 return MemberOutcome::Failed;
             }
         };
+        self.record_post_debug_task(&rc);
         if rc.pre_launch_task.is_some() {
             // NOT launched. Running it anyway would debug whatever the last
             // build left behind, which is exactly what the single-member path
@@ -21304,6 +21312,7 @@ impl App {
         stop_all: bool,
     ) {
         self.debug_stop();
+        self.debug_post_tasks.clear();
         // Set only here, once the old set is gone: a compound refused before
         // this point leaves the running set untouched, and must leave its
         // `stopAll` out of it too (#567).
@@ -21472,6 +21481,8 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        // A new run: the previous run's cleanup is not this one's.
+        self.debug_post_tasks.clear();
         let root = self.active_workspace_root();
         let ctx = configs::SubstCtx {
             workspace_folder: root.clone(),
@@ -21484,6 +21495,7 @@ impl App {
                 return;
             }
         };
+        self.record_post_debug_task(&rc);
         if let Some(task_label) = rc.pre_launch_task.clone() {
             let tasks = crate::tasks::discover_tasks(&root);
             let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
@@ -21771,6 +21783,8 @@ impl App {
         // Same as every other launch path: a parked older launch must not
         // fire later and replace this one (#567).
         self.pending_debug_launch = None;
+        // Zero-config "Debug active file" declares no postDebugTask.
+        self.debug_post_tasks.clear();
         let Some(path) = self.editor.path.clone() else {
             self.debug_error(String::from("Open a file to debug"));
             return;
@@ -22286,6 +22300,53 @@ impl App {
         self.run_debug.feedback_is_error = false;
         self.status =
             format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
+    }
+
+    /// Remember a launched configuration's `postDebugTask` for the end of
+    /// this run (#250). A compound's members may name the same one; it runs
+    /// once.
+    fn record_post_debug_task(&mut self, rc: &crate::dap::configs::ResolvedConfig) {
+        if let Some(task) = &rc.post_debug_task
+            && !self.debug_post_tasks.contains(task)
+        {
+            self.debug_post_tasks.push(task.clone());
+        }
+    }
+
+    /// Run the finished run's `postDebugTask`s, each once, in launch order.
+    /// A label no tasks.json declares is reported rather than skipped, the
+    /// same contract `preLaunchTask` has.
+    fn run_post_debug_tasks(&mut self) {
+        let labels = std::mem::take(&mut self.debug_post_tasks);
+        if labels.is_empty() {
+            return;
+        }
+        let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
+        for label in labels {
+            match tasks.iter().find(|t| t.label == label) {
+                Some(task) => {
+                    self.run_project_task(task.clone());
+                }
+                None => {
+                    self.status = format!(
+                        "postDebugTask \"{label}\" not found — Tasks: Run Task lists what the workspace declares"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Shift+F5 and Debug: Stop Debugging. The user ending the run is when a
+    /// `postDebugTask` runs (#250); the internal `debug_stop` a relaunch uses
+    /// to replace the set is not, so it lives here rather than in there.
+    fn debug_stop_by_user(&mut self) {
+        let was_running = !self.debug_sessions.is_empty();
+        self.debug_stop();
+        if was_running {
+            self.run_post_debug_tasks();
+        } else {
+            self.debug_post_tasks.clear();
+        }
     }
 
     /// Shift+F5: stop debugging and tear the session down.
@@ -35961,7 +36022,7 @@ impl App {
             },
             Cmd::StartDebugging => self.debug_start_or_continue(),
             Cmd::SelectDebugConfig => self.open_debug_config_picker(),
-            Cmd::StopDebugging => self.debug_stop(),
+            Cmd::StopDebugging => self.debug_stop_by_user(),
             Cmd::PauseDebugging => self.debug_pause(),
             Cmd::RestartDebugging => self.debug_restart(),
             Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),

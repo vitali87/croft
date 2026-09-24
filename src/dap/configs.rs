@@ -686,6 +686,9 @@ pub struct ResolvedConfig {
     pub env: BTreeMap<String, String>,
     pub cwd: Option<PathBuf>,
     pub pre_launch_task: Option<String>,
+    /// The task to run when this configuration's debug run ends (#250),
+    /// by the user stopping it or the debuggee finishing, not on relaunch.
+    pub post_debug_task: Option<String>,
     pub stop_on_entry: bool,
     pub port: Option<u16>,
     pub process_id: Option<i64>,
@@ -704,6 +707,7 @@ const MAPPED_KEYS: &[&str] = &[
     "envFile",
     "cwd",
     "preLaunchTask",
+    "postDebugTask",
     "stopOnEntry",
     "port",
     "processId",
@@ -781,6 +785,7 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         env,
         cwd: get_str("cwd").map(|c| absolute_in(&c, &ctx.workspace_folder)),
         pre_launch_task: get_str("preLaunchTask"),
+        post_debug_task: get_str("postDebugTask"),
         stop_on_entry: obj
             .get("stopOnEntry")
             .and_then(Value::as_bool)
@@ -1107,6 +1112,7 @@ mod tests {
                 "env": { "MODE": "dev", "RETRIES": 3 },
                 "cwd": "${workspaceFolder}",
                 "preLaunchTask": "build",
+                "postDebugTask": "cleanup",
                 "stopOnEntry": true,
                 "justMyCode": true,
                 "subProcess": "${workspaceFolderBasename}"
@@ -1119,6 +1125,9 @@ mod tests {
         assert_eq!(rc.env["RETRIES"], "3");
         assert_eq!(rc.cwd.as_deref(), Some(Path::new("/work/proj")));
         assert_eq!(rc.pre_launch_task.as_deref(), Some("build"));
+        // A mapped key, so croft runs it rather than handing it to the adapter.
+        assert_eq!(rc.post_debug_task.as_deref(), Some("cleanup"));
+        assert!(!rc.extra.contains_key("postDebugTask"));
         assert!(rc.stop_on_entry);
         // Unmapped fields survive, substituted, for verbatim passthrough.
         assert_eq!(rc.extra["justMyCode"], json!(true));
