@@ -64,6 +64,78 @@ pub fn view_args(number: u64) -> Vec<String> {
     ]
 }
 
+/// Split a whole-PR patch (`gh pr diff <n>`) into one section per file,
+/// keyed by the new-side path (the old one for a deleted file).
+pub fn split_diff_by_file(patch: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut current: Option<(String, String, String)> = None; // (a, b, text)
+    let flush = |cur: Option<(String, String, String)>, out: &mut BTreeMap<String, String>| {
+        if let Some((a, b, text)) = cur {
+            let deleted = text.lines().any(|l| l == "+++ /dev/null");
+            out.insert(if deleted { a } else { b }, text);
+        }
+    };
+    for line in patch.split_inclusive('\n') {
+        if let Some(rest) = line.trim_end_matches('\n').strip_prefix("diff --git a/") {
+            flush(current.take(), &mut out);
+            let (a, b) = rest.split_once(" b/").unwrap_or((rest, rest));
+            current = Some((a.to_string(), b.to_string(), String::new()));
+        }
+        if let Some((_, _, text)) = current.as_mut() {
+            text.push_str(line);
+        }
+    }
+    flush(current, &mut out);
+    out
+}
+
+/// `gh run view <run> [--job <job>] --log-failed`: the failing steps' log.
+pub fn log_args(run: u64, job: Option<u64>) -> Vec<String> {
+    let mut args = vec![String::from("run"), String::from("view"), run.to_string()];
+    if let Some(job) = job {
+        args.push(String::from("--job"));
+        args.push(job.to_string());
+    }
+    args.push(String::from("--log-failed"));
+    args
+}
+
+/// `owner/repo#number` from the PR's URL: the viewed-store key, so marks from
+/// two repositories with the same PR number never mix.
+pub fn review_key(pr: &PrInfo) -> String {
+    let path = pr
+        .url
+        .split("github.com/")
+        .nth(1)
+        .and_then(|rest| rest.split("/pull/").next())
+        .unwrap_or("");
+    format!("{path}#{}", pr.number)
+}
+
+/// A pull request number as a person types it: `579`, `#579`, or its URL.
+pub fn parse_pr_number(input: &str) -> Option<u64> {
+    let t = input.trim();
+    let digits = match t.split_once("/pull/") {
+        Some((_, rest)) => rest.split('/').next().unwrap_or(""),
+        None => t.strip_prefix('#').unwrap_or(t),
+    };
+    digits.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+static STARTUP_PR: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// `croft pr <n>` records the number here before the app starts.
+pub fn set_startup_pr(number: u64) {
+    if let Ok(mut slot) = STARTUP_PR.lock() {
+        *slot = Some(number);
+    }
+}
+
+/// The app takes it once, after its first frame.
+pub fn take_startup_pr() -> Option<u64> {
+    STARTUP_PR.lock().ok().and_then(|mut slot| slot.take())
+}
+
 /// Parse `gh pr view <n> --json PR_FIELDS`.
 pub fn parse_pr(json: &str) -> Result<PrInfo, String> {
     let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
@@ -428,6 +500,53 @@ mod tests {
         for field in ["files", "statusCheckRollup", "headRefOid", "author", "url"] {
             assert!(args[4].split(',').any(|f| f == field), "{field} requested");
         }
+    }
+
+    #[test]
+    fn a_whole_pr_patch_splits_per_file() {
+        let patch = "diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n";
+        let files = split_diff_by_file(patch);
+        assert_eq!(
+            files.keys().collect::<Vec<_>>(),
+            vec!["old.txt", "src/a.rs"]
+        );
+        assert!(files["src/a.rs"].starts_with("diff --git a/src/a.rs"));
+        assert!(files["src/a.rs"].contains("+y"));
+        assert!(!files["src/a.rs"].contains("gone"), "sections do not bleed");
+        assert!(files["old.txt"].contains("-gone"));
+    }
+
+    #[test]
+    fn failing_check_logs_come_from_gh_run_view() {
+        assert_eq!(
+            log_args(7, Some(8)),
+            vec!["run", "view", "7", "--job", "8", "--log-failed"]
+        );
+        assert_eq!(log_args(7, None), vec!["run", "view", "7", "--log-failed"]);
+    }
+
+    #[test]
+    fn pr_numbers_parse_as_typed_or_pasted() {
+        assert_eq!(parse_pr_number("579"), Some(579));
+        assert_eq!(parse_pr_number(" #579 "), Some(579));
+        assert_eq!(
+            parse_pr_number("https://github.com/o/r/pull/579"),
+            Some(579)
+        );
+        assert_eq!(
+            parse_pr_number("https://github.com/o/r/pull/579/files"),
+            Some(579)
+        );
+        assert_eq!(parse_pr_number("abc"), None);
+        assert_eq!(parse_pr_number(""), None);
+        assert_eq!(parse_pr_number("#0"), None, "no PR zero");
+    }
+
+    #[test]
+    fn the_startup_pr_is_taken_once() {
+        set_startup_pr(579);
+        assert_eq!(take_startup_pr(), Some(579));
+        assert_eq!(take_startup_pr(), None);
     }
 
     #[test]
