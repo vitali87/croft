@@ -26682,8 +26682,28 @@ impl App {
                     } else {
                         crate::output::OutputLevel::Error
                     },
-                    &format!("{}  [{mark}]  {}", r.host, r.output.replace('\n', " ")),
+                    &format!(
+                        "{}  [{mark}]  ({:.1}s)  {}",
+                        r.host,
+                        r.elapsed.as_secs_f64(),
+                        r.output.replace('\n', " ")
+                    ),
                 );
+                // A differing host lists the lines that differ from the
+                // reference, so the row says WHAT differs, not only that
+                // something does.
+                if mark == "DIFFERS"
+                    && let Some(reference) = reference.as_deref()
+                {
+                    let changed = crate::fleet::changed_lines(reference, &r.output);
+                    for (line, _) in r.output.lines().zip(changed).filter(|(_, c)| *c) {
+                        crate::output::push(
+                            crate::output::CHANNEL_FLEET,
+                            crate::output::OutputLevel::Info,
+                            &format!("    ≠ {line}"),
+                        );
+                    }
+                }
             }
             let summary = crate::fleet::summarise(&results, reference.as_deref());
             crate::output::push(
