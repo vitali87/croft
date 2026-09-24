@@ -63,6 +63,7 @@ mod release_notes;
 mod remote;
 mod remote_bulk;
 mod remote_connect;
+mod remote_prebuilt;
 mod review_threads;
 mod rewind;
 mod scrubber;
