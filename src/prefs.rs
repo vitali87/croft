@@ -68,6 +68,10 @@ pub struct ExplorerViewsPrefs {
     /// Rust-only `rust_dependencies` key parsing into this generalized field.
     #[serde(default = "default_true", alias = "rust_dependencies")]
     pub dependencies: bool,
+    /// The AGENT LANE view (#345): only drawn while a coding agent has
+    /// changed files, so on by default costs nothing until one has.
+    #[serde(default = "default_true")]
+    pub agent_lane: bool,
 }
 
 fn default_true() -> bool {
@@ -82,6 +86,7 @@ impl Default for ExplorerViewsPrefs {
             outline: true,
             timeline: true,
             dependencies: true,
+            agent_lane: true,
         }
     }
 }
