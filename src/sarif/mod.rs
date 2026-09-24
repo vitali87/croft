@@ -15,6 +15,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub mod details;
+pub mod diagnostics;
 pub mod load;
 pub mod model;
 pub mod region;

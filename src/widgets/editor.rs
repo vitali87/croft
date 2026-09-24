@@ -5268,6 +5268,12 @@ impl Editor {
         Ok(())
     }
 
+    /// The file's (mtime, length) when this tab last matched disk; `None` for
+    /// a buffer with no file behind it.
+    pub fn disk_stamp(&self) -> Option<(SystemTime, u64)> {
+        self.disk_stamp
+    }
+
     /// Open `path` in the SARIF results viewer (#577). Fails with the
     /// loader's explanation (position of a JSON error, an unsupported
     /// version) so the caller can fall back to text and say why.

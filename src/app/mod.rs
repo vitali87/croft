@@ -3280,6 +3280,12 @@ pub struct App {
     /// linted as well as their seq, because two split panes count edits
     /// separately and can share a seq while holding different text.
     markdown_lint_last_seen: std::collections::HashMap<PathBuf, (u64, Vec<String>)>,
+    /// The open SARIF logs (path, disk stamp) the published diagnostics were
+    /// built from (#577); a different set means publish again.
+    sarif_diag_signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+    /// Every (file, source key) SARIF diagnostics were published under, so a
+    /// closed log's results can be withdrawn exactly.
+    sarif_published: Vec<(PathBuf, String)>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -4862,6 +4868,8 @@ impl App {
             problems_open_set: std::collections::BTreeSet::new(),
             lsp_diagnostics: std::collections::HashMap::new(),
             markdown_lint_last_seen: std::collections::HashMap::new(),
+            sarif_diag_signature: Vec::new(),
+            sarif_published: Vec::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
@@ -7194,6 +7202,123 @@ impl App {
             self.refresh_problems_badge();
         }
         changed
+    }
+
+    /// Publish every open SARIF log's results as diagnostics (#577), and
+    /// withdraw what a closed log published. Recomputed only when the set of
+    /// open logs, or one of them on disk, changes; returns whether anything
+    /// did.
+    pub fn sync_sarif_diagnostics(&mut self) -> bool {
+        let inactive: Vec<&crate::widgets::editor::Editor> = self
+            .editor_layout
+            .inactive_groups()
+            .into_iter()
+            .flat_map(|g| g.editors.iter())
+            .collect();
+        let mut signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)> = self
+            .editor
+            .iter_tabs()
+            .chain(inactive)
+            .filter(|t| t.sarif.is_some())
+            .filter_map(|t| Some((t.path.clone()?, t.disk_stamp())))
+            .collect();
+        signature.sort();
+        signature.dedup_by(|a, b| a.0 == b.0);
+        if signature == self.sarif_diag_signature {
+            return false;
+        }
+        self.sarif_diag_signature = signature.clone();
+        // Withdraw everything published before, then publish afresh.
+        let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for (target, key) in std::mem::take(&mut self.sarif_published) {
+            if let Some(by_source) = self.lsp_diagnostics.get_mut(&target) {
+                by_source.remove(&key);
+                if by_source.is_empty() {
+                    self.lsp_diagnostics.remove(&target);
+                }
+            }
+            touched.insert(target);
+        }
+        let root = self.workspace_root().to_path_buf();
+        let mut file_lines: std::collections::HashMap<PathBuf, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut line_of = |p: &std::path::Path, n: usize| -> Option<String> {
+            file_lines
+                .entry(p.to_path_buf())
+                .or_insert_with(|| {
+                    std::fs::read_to_string(p)
+                        .map(|t| t.lines().map(str::to_string).collect())
+                        .unwrap_or_default()
+                })
+                .get(n)
+                .cloned()
+        };
+        let mut published: std::collections::HashMap<
+            (PathBuf, String),
+            Vec<crate::lsp::manager::Diagnostic>,
+        > = std::collections::HashMap::new();
+        let views: Vec<&crate::sarif::view::SarifView> = self
+            .editor
+            .iter_tabs()
+            .chain(
+                self.editor_layout
+                    .inactive_groups()
+                    .into_iter()
+                    .flat_map(|g| g.editors.iter()),
+            )
+            .filter_map(|t| t.sarif.as_ref())
+            .collect();
+        let mut seen_logs = std::collections::HashSet::new();
+        for view in views {
+            for loaded in &view.logs {
+                if !seen_logs.insert(loaded.path.clone()) {
+                    continue;
+                }
+                let mut roots = vec![root.clone()];
+                if let Some(dir) = loaded.path.parent() {
+                    roots.push(dir.to_path_buf());
+                }
+                let resolver = crate::sarif::resolve::Resolver {
+                    roots,
+                    ..Default::default()
+                };
+                for run in &loaded.log.runs {
+                    let key = crate::sarif::diagnostics::source_key(run);
+                    for result in run.results.iter().flatten() {
+                        if let Some((target, d)) = crate::sarif::diagnostics::diagnostic_for(
+                            run,
+                            result,
+                            &resolver,
+                            &mut line_of,
+                        ) {
+                            published.entry((target, key.clone())).or_default().push(d);
+                        }
+                    }
+                }
+            }
+        }
+        for ((target, key), diags) in published {
+            self.lsp_diagnostics
+                .entry(target.clone())
+                .or_default()
+                .insert(key.clone(), diags);
+            self.sarif_published.push((target.clone(), key));
+            touched.insert(target);
+        }
+        for path in touched {
+            let merged = self.merged_diagnostics(&path);
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                self.editor.apply_diagnostics(path.clone(), merged.clone());
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(path.as_path()) {
+                    group.apply_diagnostics(path.clone(), merged.clone());
+                }
+            }
+        }
+        self.rebuild_problems();
+        self.refresh_problems_badge();
+        true
     }
 
     /// The repository toplevel owning the workspace, from the git worker's
@@ -50709,6 +50834,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
         let markdown_lint_changed = app.sync_markdown_lint();
+        let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
@@ -50866,7 +50992,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || install_status_changed
             || blame_changed
             || dap_changed
-            || markdown_lint_changed;
+            || markdown_lint_changed
+            || sarif_diagnostics_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
                 || last_pty_redraw.elapsed() >= pty_min_interval);

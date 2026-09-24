@@ -49824,3 +49824,80 @@ fn sarif_message_link_opens_its_related_location() {
     );
     assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
 }
+
+#[test]
+fn an_open_sarif_log_publishes_its_results_as_diagnostics() {
+    // #577: results reach the editor through the ordinary diagnostics store
+    // under "SARIF: <tool>", so squiggles, hover and Problems all see them.
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    assert!(app.sync_sarif_diagnostics(), "publishing is a change");
+    let target = tmp.path().join("src/a.rs");
+    let by_source = app
+        .lsp_diagnostics
+        .get(&target)
+        .expect("the result's file has diagnostics");
+    let diags = by_source.get("SARIF: lint").expect("keyed by the tool");
+    assert_eq!(diags.len(), 1);
+    let d = &diags[0];
+    assert_eq!((d.start_line, d.start_char), (1, 8));
+    assert_eq!(d.end_line, 1);
+    assert_eq!(
+        d.end_char as usize,
+        "    let q = format!(\"{}\", id);".encode_utf16().count(),
+        "no endColumn: the range runs to the end of the start line"
+    );
+    assert_eq!(d.severity, crate::lsp::manager::DiagnosticSeverity::Error);
+    assert_eq!(d.message, "[R1] Query built from user input.");
+    assert!(
+        !app.sync_sarif_diagnostics(),
+        "an unchanged log is not a change"
+    );
+
+    // The file's own tab gets them as squiggles. The viewer is pinned first,
+    // as opening a result does, so the preview open does not replace it.
+    app.editor.pin_active();
+    app.editor.open_preview(&target).unwrap();
+    app.sync_sarif_diagnostics();
+    let merged = app.merged_diagnostics(&target);
+    assert!(merged.iter().any(|d| d.message.contains("[R1]")));
+}
+
+#[test]
+fn closing_the_sarif_tab_withdraws_its_diagnostics() {
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.sync_sarif_diagnostics();
+    let target = tmp.path().join("src/a.rs");
+    assert!(app.lsp_diagnostics.contains_key(&target));
+    // Replace the log's tab with an ordinary file: no SARIF view is open.
+    app.editor.open(&target).unwrap();
+    assert!(app.sync_sarif_diagnostics(), "withdrawing is a change");
+    assert!(
+        app.lsp_diagnostics
+            .get(&target)
+            .is_none_or(|m| !m.contains_key("SARIF: lint")),
+        "nothing left behind"
+    );
+}
+
+#[test]
+fn sarif_levels_map_to_editor_severities() {
+    use crate::lsp::manager::DiagnosticSeverity as S;
+    use crate::sarif::semantics::Level;
+    assert_eq!(crate::sarif::diagnostics::severity(Level::Error), S::Error);
+    assert_eq!(
+        crate::sarif::diagnostics::severity(Level::Warning),
+        S::Warning
+    );
+    assert_eq!(
+        crate::sarif::diagnostics::severity(Level::Note),
+        S::Information
+    );
+    assert_eq!(
+        crate::sarif::diagnostics::severity(Level::None),
+        S::Information
+    );
+}
