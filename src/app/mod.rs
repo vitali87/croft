@@ -35769,6 +35769,8 @@ impl App {
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
+            Cmd::SarifNextResult => self.step_sarif_result(true),
+            Cmd::SarifPreviousResult => self.step_sarif_result(false),
             Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
             Cmd::NavigateBack => self.nav_back(),
@@ -45324,6 +45326,122 @@ impl App {
         };
     }
 
+    /// Every located result of the first open SARIF viewer as
+    /// `(tab, entry, file, line, column)`, sorted by file then position.
+    /// Paths are worked out without touching the disk (a relative URI
+    /// against the workspace root, else the log's folder), so this is cheap
+    /// enough to run every tick.
+    fn sarif_targets(&self) -> Vec<(usize, usize, PathBuf, i64, i64)> {
+        let root = self.workspace_root().to_path_buf();
+        let Some((tab, view)) = self
+            .editor
+            .editors
+            .iter()
+            .enumerate()
+            .find_map(|(i, t)| t.sarif.as_ref().map(|v| (i, v)))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (i, e) in view.entries.iter().enumerate() {
+            if e.uri.is_empty() || e.line <= 0 {
+                continue;
+            }
+            let Some(p) = crate::sarif::resolve::uri_to_path(&e.uri) else {
+                continue;
+            };
+            let path = if p.is_absolute() {
+                p
+            } else {
+                let in_root = root.join(&p);
+                let log_dir = view
+                    .logs
+                    .get(e.log)
+                    .and_then(|l| l.path.parent())
+                    .map(|d| d.join(&p));
+                match log_dir {
+                    Some(d) if !in_root.exists() => d,
+                    _ => in_root,
+                }
+            };
+            out.push((tab, i, path, e.line, e.column.max(1)));
+        }
+        out.sort_by(|a, b| (&a.2, a.3, a.4).cmp(&(&b.2, b.3, b.4)));
+        out
+    }
+
+    /// Jump to the next (or previous) SARIF result location from the
+    /// cursor (#577), across files, wrapping at the ends.
+    fn step_sarif_result(&mut self, forward: bool) {
+        let targets = self.sarif_targets();
+        if targets.is_empty() {
+            self.status = String::from("No SARIF results with a location are open");
+            return;
+        }
+        let here = (
+            self.editor.path.clone().unwrap_or_default(),
+            self.editor.cursor_row as i64 + 1,
+            self.editor.cursor_col as i64 + 1,
+        );
+        let key = |t: &(usize, usize, PathBuf, i64, i64)| (t.2.clone(), t.3, t.4);
+        let pick = if forward {
+            targets.iter().position(|t| key(t) > here).unwrap_or(0)
+        } else {
+            targets
+                .iter()
+                .rposition(|t| key(t) < (here.0.clone(), here.1, here.2))
+                .unwrap_or(targets.len() - 1)
+        };
+        let (tab, entry, path, line, col) = targets[pick].clone();
+        let message = self.editor.editors[tab]
+            .sarif
+            .as_ref()
+            .and_then(|v| v.entries.get(entry))
+            .map(|e| e.message.clone())
+            .unwrap_or_default();
+        if let Some(view) = self.editor.editors[tab].sarif.as_mut()
+            && let Some(row) = view
+                .rows()
+                .iter()
+                .position(|r| *r == crate::sarif::view::Row::Item { entry })
+        {
+            view.selected = row;
+        }
+        if let Err(e) = self.open_at(&path, (line - 1) as usize, (col - 1) as usize) {
+            self.status = format!("Could not open {}: {e}", path.display());
+            return;
+        }
+        self.status = format!("SARIF {}/{}: {message}", pick + 1, targets.len());
+    }
+
+    /// Select, in an open SARIF viewer, the result on the cursor's line
+    /// (#577), the way VS Code's panel follows the editor.
+    pub fn sync_sarif_selection_to_cursor(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if self.editor.sarif.is_some() {
+            return;
+        }
+        let line = self.editor.cursor_row as i64 + 1;
+        let Some((tab, entry)) = self
+            .sarif_targets()
+            .into_iter()
+            .find(|t| t.2 == path && t.3 == line)
+            .map(|t| (t.0, t.1))
+        else {
+            return;
+        };
+        if let Some(view) = self.editor.editors[tab].sarif.as_mut()
+            && let Some(row) = view
+                .rows()
+                .iter()
+                .position(|r| *r == crate::sarif::view::Row::Item { entry })
+        {
+            view.selected = row;
+        }
+    }
+
     /// Apply fix `index` of the selected SARIF result (#577) to the open
     /// buffer of each file it changes (the file on disk when none is open),
     /// as one undoable edit that stays unsaved, then mark the result fixed.
@@ -50930,6 +51048,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_lsp();
         let markdown_lint_changed = app.sync_markdown_lint();
         let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
+        app.sync_sarif_selection_to_cursor();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();

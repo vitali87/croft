@@ -49980,3 +49980,79 @@ fn sarif_fix_tab_previews_and_f_applies_the_fix_as_an_unsaved_edit() {
         );
     });
 }
+
+/// Two results in one file and one in another, for navigation.
+fn sarif_nav_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "l1\nl2\nl3\nl4\nl5\nl6\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "m1\nm2\n").unwrap();
+    let log = tmp.path().join("nav.sarif");
+    let r = |uri: &str, line: u32, msg: &str| {
+        format!(
+            r#"{{"message":{{"text":"{msg}"}},"locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"{uri}"}},"region":{{"startLine":{line},"startColumn":1}}}}}}]}}"#
+        )
+    };
+    std::fs::write(
+        &log,
+        format!(
+            r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"lint"}}}},"results":[{},{},{}]}}]}}"#,
+            r("a.rs", 2, "first"),
+            r("a.rs", 5, "second"),
+            r("b.rs", 1, "third")
+        ),
+    )
+    .unwrap();
+    (tmp, log)
+}
+
+#[test]
+fn next_and_previous_sarif_result_walk_locations_across_files() {
+    let (tmp, log) = sarif_nav_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.editor.pin_active();
+    app.open_at(&tmp.path().join("a.rs"), 0, 0).unwrap();
+    use crate::widgets::command_palette::Command;
+    app.run_command(Command::SarifNextResult);
+    assert_eq!(
+        (app.editor.cursor_row, app.status.contains("first")),
+        (1, true),
+        "{}",
+        app.status
+    );
+    app.run_command(Command::SarifNextResult);
+    assert_eq!(app.editor.cursor_row, 4);
+    app.run_command(Command::SarifNextResult);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("b.rs").as_path()),
+        "on to the next file"
+    );
+    app.run_command(Command::SarifNextResult);
+    assert_eq!(
+        (app.editor.path.as_deref(), app.editor.cursor_row),
+        (Some(tmp.path().join("a.rs").as_path()), 1),
+        "wraps to the first"
+    );
+    app.run_command(Command::SarifPreviousResult);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("b.rs").as_path())
+    );
+    assert_eq!(Command::SarifNextResult.title(), "SARIF: Next Result");
+}
+
+#[test]
+fn moving_the_cursor_onto_a_result_selects_it_in_the_viewer() {
+    let (tmp, log) = sarif_nav_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.editor.pin_active();
+    app.open_at(&tmp.path().join("a.rs"), 4, 0).unwrap();
+    app.sync_sarif_selection_to_cursor();
+    let viewer = (0..app.editor.tab_count())
+        .find(|&i| app.editor.tab_path(i).as_deref() == Some(log.as_path()))
+        .unwrap();
+    let view = app.editor.editors[viewer].sarif.as_ref().unwrap();
+    assert_eq!(view.selected_entry().unwrap().message, "second");
+}
