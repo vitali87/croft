@@ -48,6 +48,7 @@ pub struct Run {
     pub automation_details: Option<RunAutomationDetails>,
     pub baseline_guid: Option<String>,
     pub column_kind: Option<String>,
+    pub newline_sequences: Option<Vec<String>>,
     pub default_encoding: Option<String>,
     pub default_source_language: Option<String>,
     pub version_control_provenance: Vec<VersionControlDetails>,

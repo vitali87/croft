@@ -2,6 +2,8 @@
 //!
 //! * [`model`] — the SARIF 2.1.0 object model, deserialised leniently.
 //! * [`load`] — parse a log, reject anything that is not 2.1.0, and explain why.
+//! * [`region`] — turn a SARIF region into a range in the local text.
+//! * [`resolve`] — turn an artifact location into a file on this machine.
 //! * [`semantics`] — the spec rules a viewer has to apply on top of the raw
 //!   objects: which rule a result points at, its effective level, whether it is
 //!   suppressed, and how its message text is assembled.
@@ -12,4 +14,6 @@
 
 pub mod load;
 pub mod model;
+pub mod region;
+pub mod resolve;
 pub mod semantics;
