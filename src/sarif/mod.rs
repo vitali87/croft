@@ -10,9 +10,9 @@
 //!   objects: which rule a result points at, its effective level, whether it is
 //!   suppressed, and how its message text is assembled.
 
-// The viewer tab that consumes this lands in the next change; until then
-// nothing outside the module calls it.
-#![allow(dead_code)]
+// Parts of the model (fixes, stacks, the raw result) are read only by later
+// viewer features; the tests exercise them meanwhile.
+#![cfg_attr(not(test), allow(dead_code))]
 
 pub mod load;
 pub mod model;
