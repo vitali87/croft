@@ -49718,6 +49718,9 @@ tool = "go"
 
 #[test]
 fn a_homebrew_install_is_offered_brew_upgrade_not_a_self_update() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // #375: a binary inside Homebrew's Cellar must not be rebuilt or swapped
     // by croft: the popup names `brew upgrade croft` and has no Update.
     let home = tempfile::tempdir().unwrap();
@@ -49764,6 +49767,9 @@ fn a_homebrew_install_is_offered_brew_upgrade_not_a_self_update() {
 
 #[test]
 fn a_self_managed_install_still_offers_update() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
