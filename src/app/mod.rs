@@ -1510,6 +1510,21 @@ enum LaunchSlot {
     Add,
 }
 
+/// The current user's processes, croft's own excluded, for the attach
+/// picker (#250). Empty when `ps` is unavailable.
+fn list_user_processes() -> Vec<(i64, String)> {
+    let out = std::process::Command::new("ps")
+        .args(["-x", "-o", "pid=,comm="])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => crate::dap::configs::parse_ps_processes(
+            &String::from_utf8_lossy(&o.stdout),
+            i64::from(std::process::id()),
+        ),
+        _ => Vec::new(),
+    }
+}
+
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
 /// task runs in a terminal pane, and the FinishedCommand sweep decides.
 struct PendingDebugLaunch {
@@ -3725,6 +3740,9 @@ pub struct App {
     /// (non-zero) when the matching command completes. Replaced by a newer
     /// F5, so only one launch can be pending.
     pending_debug_launch: Option<PendingDebugLaunch>,
+    /// An attach launch waiting for the user to pick its process (#250):
+    /// the resolved config and where it launches once `processId` is known.
+    pending_attach: Option<(crate::dap::configs::ResolvedConfig, LaunchSlot)>,
     /// In-flight background `cargo test --no-run` for debug-a-test: the
     /// receiver yields the picked binary (or the build error) and the test
     /// name rides along for the launch. Drained per tick; a second request
@@ -4971,6 +4989,7 @@ impl App {
             debug_stop_all: false,
             debug_compound: None,
             pending_debug_launch: None,
+            pending_attach: None,
             pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
             watch_exprs: Vec::new(),
@@ -21636,6 +21655,23 @@ impl App {
     ) {
         use crate::dap::configs::{self, RequestKind};
         use crate::dap::session::AdapterKind;
+        // The picker attaches by pid, which is lldb's attach; debugpy and
+        // js-debug attach by other means, and dropping the key silently would
+        // launch something the config did not ask for.
+        if rc.pick_process && rc.kind != AdapterKind::LldbDap {
+            self.debug_error(format!(
+                "config \"{}\": ${{command:pickProcess}} is supported for lldb attach only",
+                rc.name
+            ));
+            return;
+        }
+        // `${command:pickProcess}`: ask first, then come back here with the
+        // pid filled in (#250). Asked before the adapter lookup so the choice
+        // does not depend on it; a missing lldb-dap is reported on resume.
+        if rc.pick_process && rc.process_id.is_none() {
+            self.open_attach_process_picker(rc, slot);
+            return;
+        }
         let breakpoints = self.collect_editor_breakpoints();
         let cwd = rc
             .cwd
@@ -22286,6 +22322,45 @@ impl App {
         self.run_debug.feedback_is_error = false;
         self.status =
             format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
+    }
+
+    /// Open the process picker for a `${command:pickProcess}` attach (#250),
+    /// parking the resolved config until a process is chosen.
+    fn open_attach_process_picker(
+        &mut self,
+        rc: crate::dap::configs::ResolvedConfig,
+        slot: LaunchSlot,
+    ) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let processes = list_user_processes();
+        if processes.is_empty() {
+            self.debug_error(format!(
+                "config \"{}\": no processes found to attach to",
+                rc.name
+            ));
+            return;
+        }
+        let rows = processes
+            .into_iter()
+            .map(|(pid, comm)| ListRow {
+                id: pid.to_string(),
+                label: format!("{pid:>7}  {comm}"),
+            })
+            .collect();
+        let title = format!("Attach \"{}\" to process", rc.name);
+        self.pending_attach = Some((rc, slot));
+        self.list_picker = Some(ListPicker::new(ListPurpose::AttachProcess, title, rows));
+    }
+
+    /// The parked attach with its `processId` set to the chosen `pid`, taken
+    /// out so a second confirm cannot launch it twice.
+    fn take_pending_attach(
+        &mut self,
+        pid: i64,
+    ) -> Option<(crate::dap::configs::ResolvedConfig, LaunchSlot)> {
+        let (mut rc, slot) = self.pending_attach.take()?;
+        rc.process_id = Some(pid);
+        Some((rc, slot))
     }
 
     /// Shift+F5: stop debugging and tear the session down.
@@ -24961,6 +25036,16 @@ impl App {
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
                     self.run_project_task(task);
+                }
+            }
+            ListPurpose::AttachProcess => {
+                if let Some((rc, slot)) = row
+                    .id
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|pid| self.take_pending_attach(pid))
+                {
+                    self.launch_resolved_in(rc, slot);
                 }
             }
             ListPurpose::DebugConfig => {
