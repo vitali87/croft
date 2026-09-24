@@ -3437,6 +3437,13 @@ pub struct App {
     /// showing the live buffer. `Some` at `Position::Working` is a real
     /// state: the scrubber is open and parked at the user's own edits.
     scrubber: Option<crate::scrubber::Scrubber>,
+    /// The active file as it was at the scrubber's commit (#371): a separate
+    /// read-only editor painted in place of the live one, which is never
+    /// touched. `None` at the working tree.
+    pub scrub_view: Option<crate::widgets::editor::Editor>,
+    /// File text per (commit, workspace-relative path) for the scrubber;
+    /// `None` records that the file did not exist there.
+    scrub_cache: std::collections::HashMap<(String, String), Option<String>>,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -5046,6 +5053,8 @@ impl App {
             recorded_size: (0, 0),
             symbol_tab: None,
             scrubber: None,
+            scrub_view: None,
+            scrub_cache: std::collections::HashMap::new(),
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
@@ -16019,6 +16028,7 @@ impl App {
             // Lay the leaves out and paint each at its rect (depth-first order),
             // reporting the active group's rect so popups anchor there.
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
+            let paint_history = self.scrub_view.is_some();
             let active_idx = self.editor_layout.active_dfs_index();
             let focused_area = if self.editor_layout.is_split() {
                 let active_area = rects[active_idx];
@@ -16077,6 +16087,25 @@ impl App {
                 self.disable_minimap_image();
                 editor_area
             };
+            // The history scrubber's view stands in for the live editor's
+            // text (#371); the tab strip and breadcrumbs stay the live ones.
+            if paint_history
+                && let Some(view) = self.scrub_view.as_mut()
+                && self.editor.last_body.width > 0
+            {
+                view.theme = self.theme;
+                // The editor paints only the rows it has text for, so a
+                // shorter historical file would leave the live buffer's
+                // lower lines showing through: blank the body first.
+                let body = self.editor.last_body;
+                frame.render_widget(ratatui::widgets::Clear, body);
+                frame.render_widget(
+                    ratatui::widgets::Block::default()
+                        .style(Style::default().bg(self.theme.editor_bg())),
+                    body,
+                );
+                frame.render_widget(view, body);
+            }
             if self.focus == Pane::Editor
                 && self.completion_popup.is_some()
                 && let Some((cx, cy)) = self.editor.cursor_screen_pos()
@@ -18942,6 +18971,28 @@ impl App {
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && self.handle_scrubber_key(key.code)
         {
+            return Ok(());
+        }
+        // While a commit is on screen, keys that would edit the hidden live
+        // buffer are refused rather than typed blind into it (#371).
+        if self.scrub_view.is_some()
+            && self.focus == Pane::Editor
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            && matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Enter
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Tab
+            )
+        {
+            self.status = String::from(
+                "Looking at history - Esc returns to your working tree before editing",
+            );
             return Ok(());
         }
         if self.scm_menu.open && matches!(key.code, KeyCode::Esc) {
@@ -26291,6 +26342,7 @@ impl App {
         // first rather than HEAD, and stepping back from the working tree
         // lands on a commit the current branch may not even contain.
         let commits = crate::git::branch_history(self.workspace_root(), SCRUB_COMMIT_LIMIT);
+        self.scrub_view = None;
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
             return;
@@ -27126,6 +27178,7 @@ impl App {
                 // scrubber never replaced it, so there is nothing to put
                 // back and no path where unsaved edits could be lost.
                 self.scrubber = None;
+                self.scrub_view = None;
                 self.status = String::from("Left the history scrubber");
                 return true;
             }
@@ -27138,7 +27191,60 @@ impl App {
             Some(c) => format!("At {} — {}", c.short_hash, c.summary),
             None => String::from("At your working tree"),
         };
+        self.rebuild_scrub_view();
         true
+    }
+
+    /// Build the read-only view of the active file at the scrubber's commit
+    /// (#371), or drop it at the working tree. File text is cached per
+    /// (commit, path), so stepping back and forth after the first visit
+    /// costs no git process.
+    fn rebuild_scrub_view(&mut self) {
+        let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
+            self.scrub_view = None;
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            self.scrub_view = None;
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let Ok(rel) = path
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
+            self.scrub_view = None;
+            return;
+        };
+        let mut read = |rev: &str| -> Option<String> {
+            let key = (rev.to_string(), rel.clone());
+            self.scrub_cache
+                .entry(key)
+                .or_insert_with(|| crate::git::read_file_at_rev(&root, rev, &rel).ok())
+                .clone()
+        };
+        let text = read(&commit.hash);
+        let baseline = commit
+            .parents
+            .first()
+            .and_then(|p| read(p))
+            .map(|t| crate::widgets::editor::split_into_lines(&t))
+            .unwrap_or_default();
+        let mut view = match text {
+            Some(text) => crate::widgets::editor::Editor::historical(&path, &text, baseline),
+            None => crate::widgets::editor::Editor::historical(
+                &PathBuf::from("history.txt"),
+                &format!("({rel} did not exist at {})", commit.short_hash),
+                Vec::new(),
+            ),
+        };
+        // Look at the same stretch of the file the live buffer shows.
+        view.scroll = self.editor.scroll.min(view.lines.len().saturating_sub(1));
+        view.cursor_row = self
+            .editor
+            .cursor_row
+            .min(view.lines.len().saturating_sub(1));
+        self.scrub_view = Some(view);
     }
 
     pub fn poll_connect_dialog(&mut self) -> bool {

@@ -673,6 +673,25 @@ pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> 
     String::from_utf8(output.stdout).map_err(|_| format!("{rel_path} at HEAD is not UTF-8"))
 }
 
+/// The contents of `rel_path` (relative to `root`) at revision `rev`, via
+/// `git show <rev>:./<rel_path>`. The `./` makes the path relative to
+/// `root` rather than to the repository top, so a workspace opened in a
+/// subdirectory of a repo still reads the right file. `Err` when the file
+/// did not exist at that revision or is not UTF-8.
+pub fn read_file_at_rev(root: &Path, rev: &str, rel_path: &str) -> Result<String, String> {
+    let spec = format!("{rev}:./{rel_path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", &spec])
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    String::from_utf8(output.stdout).map_err(|_| format!("{rel_path} at {rev} is not UTF-8"))
+}
+
 /// Read one index stage of an unmerged path via `git show :N:<rel_path>`
 /// — 1 = common ancestor (base), 2 = ours, 3 = theirs. The merge
 /// editor's input source (#253). Errors when the stage does not exist

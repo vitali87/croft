@@ -49715,3 +49715,131 @@ tool = "go"
         "another extension's record stays"
     );
 }
+
+/// A repo whose `a.txt` grows by one line per commit: v1, then v1+v2, then
+/// v1+v2+v3.
+fn scrub_repo() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    let mut text = String::new();
+    for v in ["v1", "v2", "v3"] {
+        text.push_str(v);
+        text.push('\n');
+        std::fs::write(tmp.path().join("a.txt"), &text).unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", v]);
+    }
+    tmp
+}
+
+#[test]
+fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
+    // #371: at each position the editor shows the file at that commit, and
+    // the git gutter shows that commit's own change.
+    let repo = scrub_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("a.txt")).unwrap();
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    let view = app.scrub_view.as_mut().expect("a historical view at HEAD");
+    assert_eq!(view.lines, vec!["v1", "v2", "v3"]);
+    assert_eq!(
+        view.git_mark_at(2),
+        Some(crate::widgets::editor::GitMark::Added)
+    );
+    assert_eq!(view.git_mark_at(1), None, "unchanged in that commit");
+    assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
+    let view = app.scrub_view.as_mut().unwrap();
+    assert_eq!(view.lines, vec!["v1", "v2"]);
+    assert_eq!(
+        view.git_mark_at(1),
+        Some(crate::widgets::editor::GitMark::Added)
+    );
+    assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
+    let view = app.scrub_view.as_mut().unwrap();
+    assert_eq!(view.lines, vec!["v1"]);
+    assert_eq!(
+        view.git_mark_at(0),
+        Some(crate::widgets::editor::GitMark::Added),
+        "a root commit adds every line"
+    );
+    // Painted in place of the live buffer.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    assert!(
+        !screen.contains("v2"),
+        "only the root commit's text shows:\n{screen}"
+    );
+}
+
+#[test]
+fn leaving_the_scrubber_restores_the_live_buffer_with_its_unsaved_edits() {
+    let repo = scrub_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("a.txt")).unwrap();
+    app.editor.lines.push(String::from("UNSAVED LIVE EDIT"));
+    app.editor.dirty = true;
+    let live = app.editor.lines.clone();
+    app.scrub_history();
+    app.handle_scrubber_key(KeyCode::Left);
+    app.handle_scrubber_key(KeyCode::Left);
+    app.focus_pane(Pane::Editor);
+    // Typing while looking at history must not reach the hidden buffer.
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, live, "the live buffer took no keystroke");
+    assert!(app.status.contains("history"), "{}", app.status);
+    app.handle_scrubber_key(KeyCode::Esc);
+    assert!(app.scrub_view.is_none(), "the historical view is gone");
+    assert_eq!(app.editor.lines, live);
+    assert!(app.editor.dirty, "dirty state untouched");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+    }
+    assert!(
+        screen.contains("UNSAVED LIVE EDIT"),
+        "the live buffer is painted again"
+    );
+}
+
+#[test]
+fn a_file_that_did_not_exist_yet_says_so() {
+    let repo = scrub_repo();
+    std::fs::write(repo.path().join("new.txt"), "fresh\n").unwrap();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("new.txt")).unwrap();
+    app.scrub_history();
+    app.handle_scrubber_key(KeyCode::Left);
+    let view = app
+        .scrub_view
+        .as_ref()
+        .expect("a view even for a missing file");
+    assert!(view.lines[0].contains("did not exist"), "{:?}", view.lines);
+}
