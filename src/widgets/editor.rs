@@ -2922,6 +2922,9 @@ pub struct Editor {
     /// same-path reloads, so the FS-sync sweep cannot flip the tab back
     /// to a preview, and clears when the tab opens a different file.
     pub force_text: bool,
+    /// Notebook code cells (indices into `cells`) running or queued in the
+    /// notebook's kernel: the preview shows them as `In [*]` (#355).
+    pub notebook_running: Vec<usize>,
     /// Hit-test rect for the "previous change" arrow painted in the diff
     /// header. Empty when the tab isn't a diff or the header was clipped.
     /// `App` consults this on left-click to jump to the previous hunk.
@@ -3095,6 +3098,7 @@ impl Editor {
             merge: None,
             merge_edit_row: 0,
             force_text: false,
+            notebook_running: Vec::new(),
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
@@ -6114,12 +6118,13 @@ impl Editor {
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let scratch = std::env::temp_dir().join("croft-notebook-outputs");
-        let Some((lines, images)) = crate::notebook::render(
+        let Some((lines, images, runnables)) = crate::notebook::render(
             &text,
             self.theme,
             &mut self.registry,
             base.as_deref(),
             &scratch,
+            &self.notebook_running,
         ) else {
             return false;
         };
@@ -6132,7 +6137,7 @@ impl Editor {
             built_seq: self.edit_seq,
             images,
             anchor_rows: Vec::new(),
-            runnables: Vec::new(),
+            runnables,
             run_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: Rect::default(),

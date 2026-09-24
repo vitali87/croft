@@ -108,6 +108,10 @@ pub struct MdRunnable {
     /// the author wrote is worse than doing the odd thing they asked for,
     /// and the box makes the outcome legible either way.
     pub capture_timeout: Option<u64>,
+    /// A notebook code cell (#355): its index in the notebook's `cells`.
+    /// It runs in the notebook's kernel, not in a pane, so the other
+    /// fields above do not apply to it.
+    pub kernel_cell: Option<usize>,
 }
 
 /// The play glyph a runnable fence wears in place of its first bar.
@@ -805,6 +809,7 @@ impl Renderer<'_> {
                     capture_timeout: attrs
                         .iter()
                         .find_map(|a| a.strip_prefix("timeout=").and_then(|v| v.parse().ok())),
+                    kernel_cell: None,
                 }
             });
         let bar = Span::styled("\u{258e} ", Style::default().fg(self.theme.accent()));

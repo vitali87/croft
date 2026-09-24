@@ -47,7 +47,8 @@ src/
 ├── iterm2_inline.rs      inline-image baking pipeline and protocol dispatch (iTerm2 OSC 1337 / Kitty graphics / DEC sixel): wordmark, image and PDF previews, activity-bar icons, minimap
 ├── keymap.rs             user key bindings from `~/.config/croft/keybindings.json`: parses chord strings into normalized Chords mapped to palette Command ids, consulted ahead of the built-in chords; tolerant JSONC, reloads on save
 ├── launcher.rs           macOS `croft install-launcher`: builds a clickable Croft.app via `osacompile` (an AppleScript applet, so double-clicked documents arrive as `odoc` events), brands the plist with PlistBuddy, then ad-hoc `codesign` and `lsregister`
-├── notebook.rs           Jupyter rendered view: .ipynb parses into the SAME (lines, images) state the Markdown preview renders, so wrap, scroll, image overlays and Reopen as Text all reuse; no kernels, read-only truth about the file
+├── notebook.rs           Jupyter rendered view: .ipynb parses into the SAME (lines, images) state the Markdown preview renders, so wrap, scroll, image overlays and Reopen as Text all reuse; code cells run in a Jupyter kernel via notebook_kernel.rs
+├── notebook_kernel.rs    Jupyter kernels for notebook cells: jupyter_client bridge (assets/jupyter/bridge.py) over JSON lines, outputs folded into the .ipynb buffer
 ├── notifications.rs      notification sinks: the `notifications` config key, one delivery worker behind a bounded queue, pure request builders for ntfy and webhooks, plus `termux-notification` and `command` sinks
 ├── outline_syntax.rs     tree-sitter outline provider: extracts the OUTLINE panel's symbol tree straight from the buffer's syntax tree via per-language queries so the panel paints before a cold LSP answers; the LSP reply supersedes it
 ├── output.rs             in-process OUTPUT bus behind the panel group's OUTPUT tab: named channels, each a capped ring buffer of levelled lines, pushed to across the codebase and mirrored to `lsp.log`, with a generation counter for re-pulls
@@ -955,7 +956,7 @@ The Jupyter rendered view. An `.ipynb` file parses into the same `(lines, images
 
 **Dispatch.** The preview carries a `notebook` flag so the stale-rebuild and theme-switch paths route to this builder rather than the plain Markdown one.
 
-**No kernels.** The view is read-only truth about the file.
+**Kernels (#355, `notebook_kernel.rs`).** Each code cell is an `MdRunnable` with `kernel_cell` set, so the run glyph, its hit-testing and its row mapping are the runnable-docs machinery. `run_markdown_block` sends a kernel cell to the notebook's `NotebookRun`, not to a pane. The kernel runs behind `assets/jupyter/bridge.py`, a `jupyter_client` script croft talks to in JSON lines, so croft carries no ZMQ client. The bridge sends outputs in nbformat v4 shape. `NotebookRun::fold` writes them into the buffer by cell id (or by index when the file has no ids) as one edit per tick, re-serialised in nbformat's layout (one-space indent, sorted keys).
 
 ### outline.rs
 
