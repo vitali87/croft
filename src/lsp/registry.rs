@@ -19,6 +19,7 @@ const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-bash/extension.toml"),
     include_str!("../../assets/extensions/lsp-toml/extension.toml"),
     include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
+    include_str!("../../assets/extensions/lsp-lua/extension.toml"),
 ];
 
 pub struct ServerRegistry {
@@ -205,6 +206,10 @@ mod tests {
             &[ServerConfig::rust_analyzer()]
         );
         assert_eq!(r.for_language(Language::GO), &[ServerConfig::gopls()]);
+        assert_eq!(
+            r.for_language(Language::LUA),
+            &[ServerConfig::lua_language_server()]
+        );
     }
 
     #[test]

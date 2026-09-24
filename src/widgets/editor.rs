@@ -10906,6 +10906,7 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         | Some(LangKind::Yaml)
         | Some(LangKind::Toml)
         | Some(LangKind::Bash) => Some("#"),
+        Some(LangKind::Lua) => Some("--"),
         _ => None,
     }
 }
@@ -10925,6 +10926,7 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Cpp)
         | Some(LangKind::Css) => Some(("/*", "*/")),
         Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
+        Some(LangKind::Lua) => Some(("--[[", "]]")),
         // Python has no true block comment; VS Code's language config maps
         // Toggle Block Comment onto a triple-quoted string (`""" """`).
         Some(LangKind::Python) => Some(("\"\"\"", "\"\"\"")),
@@ -11526,6 +11528,7 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Bash) => "Shell Script",
         Some(LangKind::C) => "C",
         Some(LangKind::Cpp) => "C++",
+        Some(LangKind::Lua) => "Lua",
     }
 }
 
@@ -11551,6 +11554,7 @@ pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Bash) => "shellscript",
         Some(LangKind::C) => "c",
         Some(LangKind::Cpp) => "cpp",
+        Some(LangKind::Lua) => "lua",
     }
 }
 
@@ -11572,6 +11576,7 @@ pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
     LangKind::Bash,
     LangKind::C,
     LangKind::Cpp,
+    LangKind::Lua,
 ];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
@@ -11608,7 +11613,8 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
         | Some(LangKind::Tsx)
         | Some(LangKind::Json)
         | Some(LangKind::Go)
-        | Some(LangKind::Css) => matches!(last, '(' | '[' | '{'),
+        | Some(LangKind::Css)
+        | Some(LangKind::Lua) => matches!(last, '(' | '[' | '{'),
         _ => false,
     }
 }
@@ -11624,6 +11630,7 @@ fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Optio
             | Some(LangKind::Json)
             | Some(LangKind::Go)
             | Some(LangKind::Css)
+            | Some(LangKind::Lua)
     );
     if !bracket_aware {
         return false;
