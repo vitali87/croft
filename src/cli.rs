@@ -131,6 +131,21 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         solo: bool,
     },
+    /// Record a persistent session (started with `croft attach`) to an
+    /// asciicast v2 file that `asciinema play` and the agg GIF converter read.
+    /// The recorder watches read-only: it never resizes the session or types
+    /// into it. Stop with Ctrl-C or `croft record --stop`.
+    Record {
+        /// Workspace whose session to record (defaults to the current directory).
+        path: Option<PathBuf>,
+        /// Where to write the cast (defaults to `croft-session-<time>.cast` in
+        /// the workspace).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Stop the recording running for the workspace instead of starting one.
+        #[arg(long, default_value_t = false)]
+        stop: bool,
+    },
     /// List the running persistent croft sessions started with `croft attach`.
     Ls,
     /// Chart numbers, CSV/TSV, or JSON lines from stdin inline in the pane:
@@ -404,6 +419,9 @@ impl Cli {
                 }
             }
             Some(CliCommand::Attach { path, solo }) => crate::session::attach(path, solo),
+            Some(CliCommand::Record { path, out, stop }) => {
+                crate::session_record::record(path, out, stop)
+            }
             Some(CliCommand::Ls) => crate::session::list(),
             Some(CliCommand::Plot {
                 kind,

@@ -1317,8 +1317,13 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         // client inherits the control its ghost held, so a
                         // dropped transport never silently demotes the owner
                         // to read-only.
+                        // A 0x0 client is a pure observer (`croft record`,
+                        // #356): it never shrinks the PTY, and it never takes
+                        // control by default either, or a recorder attached
+                        // first would leave the next real client read-only.
+                        let pure_observer = cols == 0 && rows == 0;
                         let control = displaced.iter().any(|c| c.control)
-                            || !clients.iter().any(|c| c.control);
+                            || (!pure_observer && !clients.iter().any(|c| c.control));
                         if !refused {
                             clients.push(Client {
                                 id,
@@ -3203,6 +3208,78 @@ mod tests {
             "the wedged ghost must be evicted once its backlog passes the limit"
         );
         drop(ghost);
+    }
+
+    /// #356 end to end: `croft record`'s loop against a real host. What the
+    /// owner types, echoed by the PTY, lands in the cast under a valid
+    /// header sized to the owner's window, with the recorder's 0x0 ignored.
+    #[test]
+    fn croft_record_writes_the_sessions_output_to_a_cast() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let mut owner = TestClient::connect(&socket, "owner", 80, 24);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+
+        let cast = dir.path().join("out.cast");
+        let rec_socket = socket.clone();
+        let rec_cast = cast.clone();
+        let recorder = std::thread::spawn(move || {
+            let mut file = std::fs::File::create(&rec_cast).unwrap();
+            let until = std::time::Instant::now() + Duration::from_millis(1500);
+            crate::session_record::record_to(&rec_socket, &mut file, "ws", Some(until))
+        });
+        // Let the recorder attach before typing, then give the echo time.
+        std::thread::sleep(Duration::from_millis(300));
+        owner.send(&encode_frame(0, b"hello\n"));
+        recorder.join().unwrap().expect("record_to");
+
+        // For checking playback by hand (`agg`, `asciinema play`).
+        if let Some(keep) = std::env::var_os("CROFT_KEEP_CAST") {
+            std::fs::copy(&cast, keep).unwrap();
+        }
+        let text = std::fs::read_to_string(&cast).unwrap();
+        let mut lines = text.lines();
+        let header: serde_json::Value =
+            serde_json::from_str(lines.next().expect("a header")).unwrap();
+        assert_eq!(header["version"], 2);
+        assert_eq!(
+            (header["width"].as_u64(), header["height"].as_u64()),
+            (Some(80), Some(24))
+        );
+        let events: Vec<serde_json::Value> = lines
+            .map(|l| serde_json::from_str(l).expect("each event is JSON"))
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| e[1] == "o" && e[2].as_str().is_some_and(|d| d.contains("hello"))),
+            "the typed text is in the cast: {text}"
+        );
+    }
+
+    /// #356: a 0x0 client (a recorder) attaching first takes no control, so
+    /// the next real client still gets it.
+    #[test]
+    fn a_pure_observer_attaching_first_leaves_control_for_the_next_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut rec = TestClient::connect(&socket, "recorder", 0, 0);
+        let frames = rec.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let ps = roster(&frames).unwrap();
+        assert!(!ps[0].control, "a pure observer takes no control");
+
+        let mut real = TestClient::connect(&socket, "owner", 80, 24);
+        let frames = real.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let ps = roster(&frames).unwrap();
+        let owner = ps.iter().find(|p| p.name == "owner").unwrap();
+        assert!(owner.control, "the first real client still gets control");
     }
 
     #[test]

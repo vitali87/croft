@@ -68,6 +68,7 @@ mod rewind;
 mod scrubber;
 mod session;
 mod session_host;
+mod session_record;
 mod session_state;
 mod sheet;
 mod shell_integration;
