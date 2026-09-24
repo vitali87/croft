@@ -3378,6 +3378,12 @@ pub struct App {
     /// frame; `peek_target` is where Enter jumps.
     peek_popup: Option<crate::widgets::hover_popup::HoverPopup>,
     peek_target: Option<(PathBuf, u32, u32)>,
+    /// Peek References (#616): every reference and the one the popup shows.
+    /// Up / Down step through them; any close of the popup clears this.
+    peek_refs: Option<(Vec<(PathBuf, u32, u32)>, usize)>,
+    /// Set when the in-flight references request came from Peek References,
+    /// so its reply opens the popup instead of the picker.
+    references_want_peek: bool,
     declaration_request_id: Option<u64>,
     type_definition_request_id: Option<u64>,
     /// The `(active file, last-seen LSP edit seq)` the OUTLINE was last synced
@@ -5114,6 +5120,8 @@ impl App {
             peek_definition_request_id: None,
             peek_popup: None,
             peek_target: None,
+            peek_refs: None,
+            references_want_peek: false,
             outline_synced: None,
             declaration_request_id: None,
             type_definition_request_id: None,
@@ -9714,6 +9722,18 @@ impl App {
     /// The open buffer supplies the text when the target file is already open
     /// (unsaved edits visible); disk otherwise.
     fn open_peek_popup(&mut self, path: PathBuf, line: u32, col: u32) {
+        self.open_peek_popup_titled(path, line, col, None);
+    }
+
+    /// [`open_peek_popup`](Self::open_peek_popup) with an optional first
+    /// line above the location, e.g. "Reference 2 of 7" (#616).
+    fn open_peek_popup_titled(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        col: u32,
+        title: Option<String>,
+    ) {
         // Any open buffer wins over disk — the ACTIVE group's tabs plus
         // every inactive split leaf's — so unsaved edits show wherever the
         // target file happens to be open.
@@ -9741,7 +9761,8 @@ impl App {
         };
         let target = line as usize;
         let (start, excerpt) = peek_excerpt(&lines, target, 4, 12);
-        let mut body = vec![format!("{}:{}", self.status_path(&path), target + 1)];
+        let mut body: Vec<String> = title.into_iter().collect();
+        body.push(format!("{}:{}", self.status_path(&path), target + 1));
         let num_w = (start + excerpt.len()).to_string().len();
         for (i, text) in excerpt.iter().enumerate() {
             let n = start + i;
@@ -9764,6 +9785,43 @@ impl App {
     fn close_peek_popup(&mut self) {
         self.peek_popup = None;
         self.peek_target = None;
+        self.peek_refs = None;
+    }
+
+    /// Show the reference `peek_refs` points at in the peek popup (#616),
+    /// titled with its place in the list.
+    fn show_peeked_reference(&mut self) {
+        let Some((targets, idx)) = self.peek_refs.clone() else {
+            return;
+        };
+        let Some((path, line, col)) = targets.get(idx).cloned() else {
+            return;
+        };
+        let title = format!(
+            "Reference {} of {}  \u{2191}\u{2193} steps",
+            idx + 1,
+            targets.len()
+        );
+        self.open_peek_popup_titled(path, line, col, Some(title));
+        // Re-opening goes through the same path as a fresh peek, which
+        // leaves the reference list alone; restore it in case it was reset.
+        self.peek_refs = Some((targets, idx));
+    }
+
+    /// Step Peek References by `delta`, wrapping at either end.
+    fn step_peeked_reference(&mut self, delta: isize) {
+        if let Some((targets, idx)) = self.peek_refs.as_mut() {
+            let n = targets.len() as isize;
+            *idx = (*idx as isize + delta).rem_euclid(n) as usize;
+        }
+        self.show_peeked_reference();
+    }
+
+    /// Peek References (Alt+Shift+F12, #616): the references of the symbol
+    /// at the caret in the peek popup rather than a picker.
+    fn peek_references_at_cursor(&mut self) {
+        self.request_references_at_cursor();
+        self.references_want_peek = self.references_request_id.is_some();
     }
 
     pub fn drain_lsp_declaration(&mut self) -> bool {
@@ -9894,6 +9952,11 @@ impl App {
         if unsupported {
             self.status =
                 String::from("Go to References: not supported by this file's language server");
+            return true;
+        }
+        if std::mem::take(&mut self.references_want_peek) && !targets.is_empty() {
+            self.peek_refs = Some((targets, 0));
+            self.show_peeked_reference();
             return true;
         }
         match targets.len() {
@@ -18875,6 +18938,10 @@ impl App {
                 }
                 KeyCode::Esc => {
                     self.close_peek_popup();
+                    return Ok(());
+                }
+                KeyCode::Up | KeyCode::Down if self.peek_refs.is_some() => {
+                    self.step_peeked_reference(if key.code == KeyCode::Up { -1 } else { 1 });
                     return Ok(());
                 }
                 _ => self.close_peek_popup(),
@@ -28694,6 +28761,15 @@ impl App {
             }
             return;
         }
+        if is_peek_references_key(key) {
+            if self.editor.diff.is_none()
+                && self.editor.sheet.is_none()
+                && self.editor.image.is_none()
+            {
+                self.peek_references_at_cursor();
+            }
+            return;
+        }
         if is_go_to_references_key(key) {
             if self.editor.diff.is_none()
                 && self.editor.sheet.is_none()
@@ -35527,6 +35603,7 @@ impl App {
             },
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
+            Cmd::PeekReferences => self.peek_references_at_cursor(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -48239,6 +48316,17 @@ fn is_peek_definition_key(key: KeyEvent) -> bool {
 fn is_go_to_references_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(12))
         && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Editor-pane Peek References: `Alt+Shift+F12` (#616). Alt is croft's
+/// "peek" modifier on the F12 family (Alt+F12 peeks the definition), so
+/// this must be checked before Go to References, which ignores Alt.
+fn is_peek_references_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(12))
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && key.modifiers.contains(KeyModifiers::ALT)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SUPER)
 }

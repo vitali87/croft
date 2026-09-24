@@ -35878,6 +35878,52 @@ fn peek_popup_shows_the_target_then_enter_jumps_and_esc_closes() {
 }
 
 #[test]
+fn peek_references_steps_through_every_reference_with_up_and_down() {
+    // #616: the reply's references in the peek popup, "N of M" in the title,
+    // Up/Down wrapping through them, Enter jumping to the one shown.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn f() {}\nfn g() { f(); }\n").unwrap();
+    std::fs::write(&b, "fn h() {\n    f();\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.peek_refs = Some((vec![(a.clone(), 1, 9), (b.clone(), 1, 4)], 0));
+    app.show_peeked_reference();
+    let text = |app: &App| app.peek_popup.as_ref().expect("popup").lines.join("\n");
+    assert!(text(&app).starts_with("Reference 1 of 2"), "{}", text(&app));
+    assert!(text(&app).contains("a.rs:2"));
+
+    let press = |app: &mut App, code| {
+        app.handle_key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
+            .unwrap()
+    };
+    press(&mut app, KeyCode::Down);
+    assert!(
+        text(&app).starts_with("Reference 2 of 2"),
+        "Down steps, not dismisses"
+    );
+    assert!(text(&app).contains("b.rs:2"));
+    press(&mut app, KeyCode::Down);
+    assert!(text(&app).starts_with("Reference 1 of 2"), "and wraps");
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.peek_popup.is_none() && app.peek_refs.is_none());
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+#[test]
+fn alt_shift_f12_is_peek_references_not_go_to_references() {
+    let key_of = |m| crossterm::event::KeyEvent::new(KeyCode::F(12), m);
+    let peek = key_of(KeyModifiers::ALT | KeyModifiers::SHIFT);
+    assert!(is_peek_references_key(peek));
+    assert!(!is_peek_references_key(key_of(KeyModifiers::SHIFT)));
+    assert!(is_go_to_references_key(key_of(KeyModifiers::SHIFT)));
+}
+
+#[test]
 fn f12_family_chords_route_alt_to_peek() {
     let plain = crossterm::event::KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE);
     let alt = crossterm::event::KeyEvent::new(KeyCode::F(12), KeyModifiers::ALT);
