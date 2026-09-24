@@ -56,6 +56,9 @@ pub enum ListPurpose {
     /// Action on one participant: `id` is `grant:<id>` / `revoke:<id>` /
     /// `kick:<id>`, applied through the session host's control channel.
     SessionParticipantAction,
+    /// `"processId": "${command:pickProcess}"` (#250): the rows are the
+    /// user's processes; `id` is the pid the parked attach launches against.
+    AttachProcess,
 }
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a

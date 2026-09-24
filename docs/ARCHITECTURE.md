@@ -1142,6 +1142,8 @@ croft debugs several configurations at once (#310). `DebugSessions` holds them w
 
 **A member's own `preLaunchTask` is skipped**, with a status saying so. Parking a launch behind a task is a one-at-a-time mechanism, and a set of parked members would interleave unpredictably; the compound's OWN task still runs, and parks the whole member list.
 
+**`"processId": "${command:pickProcess}"` opens a process picker (#250).** It is not a substitution variable, so `resolve` takes it out before substitution would reject it and sets `pick_process`. The launch then parks the resolved config and lists the user's processes (`ps -x -o pid=,comm=`, croft's own pid excluded, since attaching to the editor would freeze it); the chosen pid fills `processId` and the launch resumes where it stopped. The picker is asked before the adapter lookup, so a missing lldb-dap is reported on resume. Only lldb attaches by pid here: on debugpy or js-debug the placeholder is refused with a message rather than dropped.
+
 ### dap/reaper.rs
 
 Sweeps orphaned vscode-js-debug processes left behind when croft crashes or force-quits without running `Drop` — both the server and its detached watchdog, which setsids into its own session and so survives a group-kill. It runs async at startup and after each session teardown.

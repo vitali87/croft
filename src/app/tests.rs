@@ -49430,6 +49430,89 @@ fn stub_member(ends: bool) -> crate::dap::session::DapSession {
     .expect("sh spawns")
 }
 
+fn resolved_attach(json: &str) -> crate::dap::configs::ResolvedConfig {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(tmp.path().join(".vscode/launch.json"), json).unwrap();
+    let cfg = crate::dap::configs::discover_configs(tmp.path())
+        .into_iter()
+        .next()
+        .expect("one config");
+    let ctx = crate::dap::configs::SubstCtx {
+        workspace_folder: tmp.path().to_path_buf(),
+        file: None,
+    };
+    crate::dap::configs::resolve(&cfg, &ctx).expect("resolves")
+}
+
+/// #250: an lldb attach whose `processId` is `${command:pickProcess}` opens
+/// a process picker instead of failing, and the chosen pid resumes it.
+#[test]
+fn a_pick_process_attach_opens_the_process_picker() {
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rc = resolved_attach(
+        r#"{ "configurations": [ { "name": "Attach", "type": "lldb", "request": "attach",
+             "processId": "${command:pickProcess}" } ] }"#,
+    );
+    app.launch_resolved_config(rc);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    assert!(matches!(picker.purpose, ListPurpose::AttachProcess));
+    assert!(
+        !picker.rows.is_empty(),
+        "this test process's siblings are listed"
+    );
+    assert!(
+        picker.rows.iter().all(|r| r.id.parse::<i64>().is_ok()),
+        "every row id is a pid"
+    );
+    assert!(
+        !picker
+            .rows
+            .iter()
+            .any(|r| r.id == std::process::id().to_string()),
+        "croft does not offer itself"
+    );
+    assert!(
+        app.debug_sessions.is_empty(),
+        "nothing launched before the pick"
+    );
+
+    let (rc, _) = app.take_pending_attach(4242).expect("the attach is parked");
+    assert_eq!(rc.process_id, Some(4242));
+    assert!(
+        app.take_pending_attach(4242).is_none(),
+        "taken once, not twice"
+    );
+}
+
+/// `pickProcess` on an adapter that does not attach by pid is refused with
+/// a message, not launched with the key silently dropped.
+#[test]
+fn pick_process_on_a_non_lldb_config_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rc = resolved_attach(
+        r#"{ "configurations": [ { "name": "Py", "type": "python", "request": "attach",
+             "processId": "${command:pickProcess}" } ] }"#,
+    );
+    app.launch_resolved_config(rc);
+    assert!(app.list_picker.is_none());
+    assert!(
+        app.status.contains("pickProcess")
+            || app
+                .run_debug
+                .feedback
+                .as_deref()
+                .unwrap_or("")
+                .contains("pickProcess"),
+        "status: {} / feedback: {:?}",
+        app.status,
+        app.run_debug.feedback
+    );
+}
+
 /// Poll until the set shrinks below `from` members or two seconds pass.
 fn poll_until_shrinks(app: &mut App, from: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
