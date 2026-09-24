@@ -1390,6 +1390,9 @@ fn dummy_activity_images() -> ActivityBarImages {
         testing_active: s(),
         testing_inactive: s(),
         testing_hovered: s(),
+        codeql_active: s(),
+        codeql_inactive: s(),
+        codeql_hovered: s(),
         settings_active: s(),
         settings_inactive: s(),
         settings_hovered: s(),
@@ -11618,6 +11621,9 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         testing_active: String::new(),
         testing_inactive: String::new(),
         testing_hovered: String::new(),
+        codeql_active: String::new(),
+        codeql_inactive: String::new(),
+        codeql_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
@@ -11680,6 +11686,9 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
         testing_active: String::new(),
         testing_inactive: String::new(),
         testing_hovered: String::new(),
+        codeql_active: String::new(),
+        codeql_inactive: String::new(),
+        codeql_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
@@ -14907,8 +14916,8 @@ fn activity_icons_stay_visible_beside_the_centered_shortcuts_modal() {
     term.draw(|f| app.render(f)).unwrap();
     let before = app.pending_activity_image_overlays().len();
     assert_eq!(
-        before, 11,
-        "precondition: seven view icons + the settings gear + the three layout toolbar icons emit"
+        before, 12,
+        "precondition: eight view icons + the settings gear + the three layout toolbar icons emit"
     );
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
@@ -14956,8 +14965,8 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
     );
     assert_eq!(
         app.pending_activity_image_overlays().len(),
-        11,
-        "seven view icons + the settings gear + the three layout toolbar icons emit"
+        12,
+        "eight view icons + the settings gear + the three layout toolbar icons emit"
     );
 }
 
@@ -25084,6 +25093,9 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
         testing_active: "TA".into(),
         testing_inactive: "TI".into(),
         testing_hovered: "TH".into(),
+        codeql_active: "CA".into(),
+        codeql_inactive: "CI".into(),
+        codeql_hovered: "CH".into(),
         settings_active: "GA".into(),
         settings_inactive: "GI".into(),
         settings_hovered: "GH".into(),
@@ -49713,5 +49725,112 @@ tool = "go"
     assert!(
         !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
         "another extension's record stays"
+    );
+}
+
+fn screen_lower(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+    let buf = term.backend().buffer();
+    let mut all = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            all.push_str(buf[(x, y)].symbol());
+        }
+        all.push('\n');
+    }
+    all.to_lowercase()
+}
+
+#[test]
+fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
+    // #578: VS Code's CodeQL extension adds a QL entry to the activity bar;
+    // croft's sits directly below Testing and opens the CodeQL side bar.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let ql = app.sidebar_areas.codeql_icon;
+    let testing = app.sidebar_areas.testing_icon;
+    assert!(ql.width > 0, "the QL icon lays out on a tall bar");
+    assert_eq!(ql.y, testing.y + testing.height, "directly below Testing");
+    left_click(&mut app, ql.x, ql.y);
+    assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = screen_lower(&term);
+    for section in [
+        "language",
+        "databases",
+        "queries",
+        "variant analysis",
+        "query history",
+        "ast viewer",
+        "method modeling",
+    ] {
+        assert!(
+            screen.contains(section),
+            "section {section:?} listed:\n{screen}"
+        );
+    }
+    // The Databases welcome offers VS Code's four ways to add one.
+    for action in [
+        "from a folder",
+        "from an archive",
+        "from a url",
+        "from github",
+    ] {
+        assert!(screen.contains(action), "{action:?} offered:\n{screen}");
+    }
+}
+
+#[test]
+fn codeql_view_label_round_trips_for_session_restore() {
+    assert_eq!(sidebar_view_label(SidebarView::CodeQL), "CodeQL");
+    assert_eq!(sidebar_view_from_label("CodeQL"), Some(SidebarView::CodeQL));
+}
+
+#[test]
+fn codeql_is_a_built_in_extensions_row_and_a_palette_command() {
+    let summaries = crate::lsp::manifest::summaries(crate::lsp::manifest::BUNDLED_MANIFESTS);
+    assert!(
+        summaries.iter().any(|s| s.id == "codeql"),
+        "a built-in CodeQL row in the Extensions panel"
+    );
+    use crate::widgets::command_palette::Command;
+    assert_eq!(Command::from_id("show_codeql"), Some(Command::ShowCodeQL));
+    assert_eq!(Command::ShowCodeQL.title(), "View: Show CodeQL");
+}
+
+#[test]
+fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Never write the developer's real ~/.config/croft from a test.
+    app.config_dir = tmp.path().join("config");
+    app.open_codeql_view();
+    assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+    app.set_extension_enabled("codeql", false);
+    assert_eq!(
+        app.sidebar_view,
+        SidebarView::Explorer,
+        "a disabled feature's view does not stay open"
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.sidebar_areas.codeql_icon.width, 0, "the icon is gone");
+    assert!(
+        app.sidebar_areas.settings_icon.width > 0,
+        "the gear still lays out"
+    );
+    app.open_codeql_view();
+    assert_ne!(
+        app.sidebar_view,
+        SidebarView::CodeQL,
+        "cannot open while disabled"
+    );
+    assert!(app.status.contains("disabled"), "{}", app.status);
+    app.set_extension_enabled("codeql", true);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.sidebar_areas.codeql_icon.width > 0,
+        "re-enabling restores it"
     );
 }
