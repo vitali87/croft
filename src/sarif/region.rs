@@ -233,6 +233,12 @@ pub fn byte_range(region: &Region) -> Option<(u64, u64)> {
     Some((offset, length))
 }
 
+/// A range as byte offsets into the text `lines` was built from.
+pub fn byte_span(lines: &Lines, range: &TextRange) -> (usize, usize) {
+    let a = lines.byte_of(range.start);
+    (a, lines.byte_of(range.end).max(a))
+}
+
 /// The text a range covers, for comparing against `region.snippet`.
 pub fn slice<'t>(lines: &Lines<'t>, range: &TextRange) -> &'t str {
     let a = lines.byte_of(range.start);

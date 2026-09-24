@@ -16,6 +16,7 @@
 
 pub mod details;
 pub mod diagnostics;
+pub mod fixes;
 pub mod load;
 pub mod model;
 pub mod region;
