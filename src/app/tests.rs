@@ -49559,3 +49559,140 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+/// A workspace with one source file and a SARIF log pointing into it.
+fn sarif_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/a.rs"),
+        "fn main() {\n    let q = format!(\"{}\", id);\n}\n",
+    )
+    .unwrap();
+    let log = tmp.path().join("results.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"lint","rules":[{"id":"R1","name":"Taint"}]}},
+            "results":[{"ruleId":"R1","level":"error","message":{"text":"Query built from user input."},
+            "locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/a.rs"},
+            "region":{"startLine":2,"startColumn":9}}}]}]}]}"#,
+    )
+    .unwrap();
+    (tmp, log)
+}
+
+fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+    let buf = term.backend().buffer();
+    let mut all = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            all.push_str(buf[(x, y)].symbol());
+        }
+        all.push('\n');
+    }
+    all
+}
+
+#[test]
+fn sarif_log_opens_as_the_results_viewer() {
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    let view = app
+        .editor
+        .sarif
+        .as_ref()
+        .expect(".sarif opens in the viewer");
+    assert_eq!(view.entries.len(), 1);
+    assert_eq!(view.entries[0].file, "src/a.rs");
+    assert!(
+        app.editor.has_non_text_view(),
+        "a save must not write the stub"
+    );
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = screen_text(&term);
+    assert!(
+        screen.contains("src/a.rs"),
+        "group header painted:\n{screen}"
+    );
+    assert!(
+        screen.contains("Query built from user input."),
+        "result row painted:\n{screen}"
+    );
+    assert!(screen.contains("Locations"), "tab strip painted:\n{screen}");
+    // The first result starts selected, so its details are already showing.
+    assert!(
+        screen.contains("R1 · Taint"),
+        "details pane shows the first result:\n{screen}"
+    );
+}
+
+#[test]
+fn sarif_enter_opens_the_location_and_keeps_the_viewer_tab() {
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    let tabs_before = app.editor.tab_count();
+    app.handle_sarif_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_sarif_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/a.rs").as_path()),
+        "the location opened: {}",
+        app.status
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 8));
+    assert_eq!(
+        app.editor.tab_count(),
+        tabs_before + 1,
+        "the viewer was pinned, not replaced by the preview open"
+    );
+}
+
+#[test]
+fn sarif_filter_typing_narrows_the_list() {
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    for c in "nomatch".chars() {
+        app.handle_sarif_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.query_text, "nomatch");
+    assert!(view.rows().is_empty());
+    // Esc leaves the filter box and clears it.
+    app.handle_sarif_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.query_text, "");
+    assert_eq!(view.rows().len(), 2);
+}
+
+#[test]
+fn sarif_that_does_not_load_opens_as_text_and_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("bad.sarif");
+    std::fs::write(&bad, "{\n  \"version\": \"2.1.0\",\n  oops\n}\n").unwrap();
+    let old = tmp.path().join("old.sarif");
+    std::fs::write(&old, r#"{"version":"1.0.0","runs":[]}"#).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.editor.open(&bad).unwrap();
+    assert!(app.editor.sarif.is_none());
+    assert_eq!(app.editor.lines[2], "  oops");
+    assert!(
+        app.editor.status.contains("invalid JSON at 3:"),
+        "status names the position: {}",
+        app.editor.status
+    );
+
+    app.editor.open(&old).unwrap();
+    assert!(app.editor.sarif.is_none());
+    assert!(
+        app.editor.status.contains("1.0.0"),
+        "status names the version: {}",
+        app.editor.status
+    );
+}
