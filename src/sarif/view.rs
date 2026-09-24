@@ -615,7 +615,7 @@ fn string_list(v: Option<&serde_json::Value>) -> Vec<String> {
 
 /// A file URI under a workspace root shows relative to it; any other file
 /// URI shows as its path; a relative reference shows as written.
-fn display_file(uri: &str, roots: &[PathBuf]) -> String {
+pub(crate) fn display_file(uri: &str, roots: &[PathBuf]) -> String {
     if uri.is_empty() {
         return String::new();
     }

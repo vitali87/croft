@@ -4,7 +4,9 @@
 //! property bags. The renderer only lays this out.
 
 use super::model::{Location, Message, Run, SarifResult};
-use super::semantics::{BaselineState, Kind, Level, Segment, SuppressionState};
+use super::resolve::expand;
+use super::semantics::{self as sem, BaselineState, Kind, Level, Segment, SuppressionState};
+use super::view::display_file;
 use std::path::{Path, PathBuf};
 
 /// A location as the pane shows it and as navigation needs it.
@@ -89,45 +91,203 @@ pub struct Details {
     pub stacks: Vec<StackView>,
 }
 
-pub fn details(_run: &Run, _result: &SarifResult, _roots: &[PathBuf]) -> Details {
+pub fn details(run: &Run, result: &SarifResult, roots: &[PathBuf]) -> Details {
+    let rule = sem::rule_for(run, result);
+    let component = sem::rule_component(run, result);
+    let text = sem::message_text(&result.message, rule, Some(component));
+    let pick = |m: &Option<crate::sarif::model::MultiformatMessageString>| {
+        m.as_ref()
+            .map(|m| m.markdown.clone().unwrap_or_else(|| m.text.clone()))
+    };
+    let description = rule
+        .and_then(|r| pick(&r.full_description).or_else(|| pick(&r.short_description)))
+        .unwrap_or_default();
+    let help = rule.and_then(|r| pick(&r.help)).unwrap_or_default();
+    let justification = result.suppressions.iter().flatten().find_map(|s| {
+        s.justification
+            .as_deref()
+            .filter(|j| !j.trim().is_empty())
+            .map(str::to_string)
+    });
+    let msg = |m: Option<&Message>| {
+        m.map(|m| sem::message_text(m, rule, Some(component)))
+            .unwrap_or_default()
+    };
+    let loc_ref = |l: &Location| loc_ref(run, l, roots, msg(l.message.as_ref()));
+    let mut properties = Vec::new();
+    if let Some(r) = rule {
+        push_props(&mut properties, &r.properties);
+    }
+    push_props(&mut properties, &result.properties);
+    let mut fingerprints: Vec<(String, String)> = result
+        .fingerprints
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    fingerprints.extend(
+        result
+            .partial_fingerprints
+            .iter()
+            .map(|(k, v)| (format!("{k} (partial)"), v.clone())),
+    );
+    let mut threads = Vec::new();
+    for (fi, flow) in result.code_flows.iter().enumerate() {
+        let several = flow.thread_flows.len() > 1;
+        for (ti, tf) in flow.thread_flows.iter().enumerate() {
+            let label = if several {
+                let id = tf.id.clone().unwrap_or_else(|| (ti + 1).to_string());
+                format!("Flow {} · thread {id}", fi + 1)
+            } else {
+                format!("Flow {}", fi + 1)
+            };
+            let message = msg(tf.message.as_ref().or(flow.message.as_ref()));
+            let steps = tf
+                .locations
+                .iter()
+                .map(|s| Step {
+                    depth: s.nesting_level.and_then(|n| usize::try_from(n).ok()).unwrap_or(0),
+                    message: msg(s.location.as_ref().and_then(|l| l.message.as_ref())),
+                    location: s.location.as_ref().map(&loc_ref),
+                    importance: s
+                        .importance
+                        .clone()
+                        .unwrap_or_else(|| "important".to_string()),
+                    kinds: s.kinds.clone(),
+                    state: s
+                        .state
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.text.clone()))
+                        .collect(),
+                })
+                .collect();
+            threads.push(Thread {
+                label,
+                message,
+                steps,
+            });
+        }
+    }
+    let stacks = result
+        .stacks
+        .iter()
+        .map(|s| StackView {
+            message: msg(s.message.as_ref()),
+            frames: s
+                .frames
+                .iter()
+                .map(|f| {
+                    let own = msg(f.location.as_ref().and_then(|l| l.message.as_ref()));
+                    let fqn = f
+                        .location
+                        .as_ref()
+                        .and_then(|l| l.logical_locations.first())
+                        .and_then(|ll| {
+                            ll.fully_qualified_name
+                                .clone()
+                                .or_else(|| ll.name.clone())
+                        })
+                        .unwrap_or_default();
+                    Frame {
+                        text: if own.is_empty() { fqn } else { own },
+                        location: f.location.as_ref().map(&loc_ref),
+                        module: f.module.clone().unwrap_or_default(),
+                        thread_id: f.thread_id,
+                        parameters: f.parameters.clone(),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
     Details {
-        rule_id: String::new(),
-        rule_name: String::new(),
-        help_uri: None,
-        description: String::new(),
-        help: String::new(),
-        message: Vec::new(),
-        level: Level::None,
-        kind: Kind::Fail,
-        baseline: BaselineState::Unspecified,
-        suppression: SuppressionState::Unknown,
-        justification: None,
-        locations: Vec::new(),
-        related: Vec::new(),
-        properties: Vec::new(),
-        fingerprints: Vec::new(),
-        guid: None,
-        rank: None,
-        occurrence_count: None,
-        threads: Vec::new(),
-        stacks: Vec::new(),
+        rule_id: sem::rule_id(run, result).unwrap_or_default(),
+        rule_name: rule.and_then(|r| r.name.clone()).unwrap_or_default(),
+        help_uri: rule.and_then(|r| r.help_uri.clone()),
+        description,
+        help,
+        message: sem::segments(&text),
+        level: sem::effective_level(result, rule),
+        kind: sem::result_kind(result),
+        baseline: sem::baseline_state(result),
+        suppression: sem::suppression_state(result),
+        justification,
+        locations: result.locations.iter().map(&loc_ref).collect(),
+        related: result.related_locations.iter().map(&loc_ref).collect(),
+        properties,
+        fingerprints,
+        guid: result.guid.clone(),
+        rank: result.rank,
+        occurrence_count: result.occurrence_count,
+        threads,
+        stacks,
+    }
+}
+
+fn loc_ref(run: &Run, l: &Location, roots: &[PathBuf], message: String) -> LocRef {
+    let physical = l.physical_location.as_ref();
+    let uri = physical
+        .and_then(|p| p.artifact_location.as_ref())
+        .and_then(|a| expand(run, a))
+        .map(|e| e.uri)
+        .unwrap_or_default();
+    let region = physical.and_then(|p| p.region.as_ref());
+    let label = if uri.is_empty() {
+        l.logical_locations
+            .first()
+            .and_then(|ll| ll.fully_qualified_name.clone().or_else(|| ll.name.clone()))
+            .unwrap_or_default()
+    } else {
+        display_file(&uri, roots)
+    };
+    LocRef {
+        id: l.id,
+        label,
+        uri,
+        line: region.and_then(|r| r.start_line).unwrap_or(0),
+        column: region.and_then(|r| r.start_column).unwrap_or(0),
+        message,
+    }
+}
+
+/// Flatten a property bag to `key = value` text: arrays join with commas,
+/// null shows as an em dash, nested objects as compact JSON.
+fn push_props(out: &mut Vec<(String, String)>, bag: &crate::sarif::model::PropertyBag) {
+    for (k, v) in bag {
+        let text = match v {
+            serde_json::Value::Null => "—".to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(a) => a
+                .iter()
+                .map(|x| match x {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            other => other.to_string(),
+        };
+        out.push((k.clone(), text));
     }
 }
 
 /// Where `[text](id)` in the message points: a related location with that
 /// id, else a primary location with it.
-pub fn link_target(_d: &Details, _id: i64) -> Option<&LocRef> {
-    None
+pub fn link_target(d: &Details, id: i64) -> Option<&LocRef> {
+    d.related
+        .iter()
+        .find(|l| l.id == Some(id))
+        .or_else(|| d.locations.iter().find(|l| l.id == Some(id)))
 }
 
 /// The result's JSON exactly as the log has it, pretty-printed. Read from the
 /// file on demand, so a large log is not kept twice in memory.
-pub fn raw_result_json(_path: &Path, _run: usize, _result: usize) -> Option<String> {
-    None
+pub fn raw_result_json(path: &Path, run: usize, result: usize) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let node = value.pointer(&format!("/runs/{run}/results/{result}"))?;
+    serde_json::to_string_pretty(node).ok()
 }
-
-#[allow(dead_code)]
-fn unused(_: &Location, _: &Message) {}
 
 #[cfg(test)]
 mod tests {
