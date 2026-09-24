@@ -50342,3 +50342,15 @@ fn e_exports_the_visible_sarif_results_to_a_csv_file() {
     );
     assert!(app.status.contains("1 result"), "{}", app.status);
 }
+
+#[test]
+fn the_sarif_key_legend_names_the_fix_log_baseline_and_export_keys() {
+    // #577: every viewer key is discoverable from its footer at a common width.
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    let screen = draw_screen(&mut app);
+    for want in ["f fix", "o add log", "b baseline", "E export"] {
+        assert!(screen.contains(want), "{want} missing:\n{screen}");
+    }
+}
