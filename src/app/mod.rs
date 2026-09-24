@@ -23183,6 +23183,10 @@ impl App {
                 self.close_input_prompt();
                 self.create_worktree_lane(&value);
             }
+            InputPurpose::PullRequestNumber => {
+                self.close_input_prompt();
+                self.submit_pr_number(&value);
+            }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
                 // the status line the run writes, so the user cannot see the
@@ -28700,6 +28704,10 @@ impl App {
         }
         if self.editor.archive.is_some() {
             self.handle_archive_key(key);
+            return;
+        }
+        if self.editor.pr_review.is_some() {
+            self.handle_pr_review_key(key);
             return;
         }
         // Image preview tabs are read-only. PDF tabs page with every
@@ -36007,6 +36015,14 @@ impl App {
                 ))
             }
             Cmd::NewWorktreeLane => self.open_new_lane_prompt(),
+            Cmd::ReviewPullRequest => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::PullRequestNumber,
+                    String::from("Review Pull Request"),
+                    String::from("number, #number, or the PR's URL"),
+                ));
+            }
             Cmd::DiffWorktreeLane => self.diff_worktree_lane(),
             Cmd::CloseWorktreeLane => self.close_worktree_lane(),
             Cmd::MarkAgentFileReviewed => {
@@ -45009,6 +45025,202 @@ impl App {
         sheet_follow_cursor(sheet, current, visible);
     }
 
+    fn pr_viewed_path() -> PathBuf {
+        croft_cache_dir().join("pr-viewed.json")
+    }
+
+    /// Open pull request `pr` for review in its own tab (#365), with the
+    /// viewed marks remembered for `key` (`owner/repo#n`).
+    pub fn open_pr_review(&mut self, pr: crate::pr_review::PrInfo, key: String) {
+        let store = crate::pr_review::ViewedStore::load(&Self::pr_viewed_path());
+        let viewed = store.viewed(&key);
+        let n = pr.number;
+        self.editor
+            .open_pr_review(crate::widgets::pr_review::PrReviewView::new(
+                pr, key, viewed,
+            ));
+        self.focus_pane(Pane::Editor);
+        self.status = format!("Reviewing PR #{n}");
+    }
+
+    /// The Review Pull Request prompt's answer.
+    fn submit_pr_number(&mut self, input: &str) {
+        match crate::pr_review::parse_pr_number(input) {
+            Some(n) => self.start_pr_review(n),
+            None => {
+                self.status = format!("{:?} is not a pull request number", input.trim());
+            }
+        }
+    }
+
+    /// Fetch pull request `number` with `gh` and open it for review.
+    fn start_pr_review(&mut self, number: u64) {
+        let root = self.workspace_root().to_path_buf();
+        let out = std::process::Command::new("gh")
+            .args(crate::pr_review::view_args(number))
+            .current_dir(&root)
+            .output();
+        let pr = match out {
+            Ok(o) if o.status.success() => {
+                crate::pr_review::parse_pr(&String::from_utf8_lossy(&o.stdout))
+            }
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(format!("could not run gh: {e}")),
+        };
+        match pr {
+            Ok(pr) => {
+                let key = crate::pr_review::review_key(&pr);
+                self.open_pr_review(pr, key);
+            }
+            Err(why) => self.status = format!("Could not load PR #{number}: {why}"),
+        }
+    }
+
+    /// PULL REQUEST tab keys (#365).
+    fn handle_pr_review_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.editor.pr_review.as_mut() else {
+            return;
+        };
+        let page = (view.rows_visible as isize).max(1);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => view.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => view.move_selection(-1),
+            KeyCode::PageDown => view.move_selection(page),
+            KeyCode::PageUp => view.move_selection(-page),
+            KeyCode::Home => view.selected = 0,
+            KeyCode::End => view.move_selection(isize::MAX / 2),
+            KeyCode::Char(' ') => {
+                let Some(path) = view.selected_file().map(|f| f.path.clone()) else {
+                    return;
+                };
+                let store_path = Self::pr_viewed_path();
+                let mut store = crate::pr_review::ViewedStore::load(&store_path);
+                let now = store.toggle(&view.key, &path);
+                if let Err(e) = store.save(&store_path) {
+                    self.status = format!("Could not save the viewed mark: {e}");
+                }
+                if now {
+                    view.viewed.insert(path);
+                } else {
+                    view.viewed.remove(&path);
+                }
+                view.move_selection(1);
+            }
+            KeyCode::Enter => {
+                if view.selected_check().is_some() {
+                    self.show_pr_check_log();
+                } else {
+                    self.open_pr_file_diff();
+                }
+            }
+            KeyCode::Char('l') => self.show_pr_check_log(),
+            KeyCode::Char('r') => {
+                let n = view.pr.number;
+                self.start_pr_review(n);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let n = view.pr.number;
+                self.editor.close_active();
+                self.status = format!("Left review of PR #{n}");
+            }
+            _ => {}
+        }
+    }
+
+    /// The selected file's section of the PR's patch, side by side. The
+    /// patch is fetched once per tab with `gh pr diff`.
+    fn open_pr_file_diff(&mut self) {
+        let root = self.workspace_root().to_path_buf();
+        let Some(view) = self.editor.pr_review.as_mut() else {
+            return;
+        };
+        let Some(path) = view.selected_file().map(|f| f.path.clone()) else {
+            return;
+        };
+        if view.diff.is_none() {
+            let out = std::process::Command::new("gh")
+                .args(["pr", "diff", &view.pr.number.to_string()])
+                .current_dir(&root)
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    view.diff = Some(crate::pr_review::split_diff_by_file(
+                        &String::from_utf8_lossy(&o.stdout),
+                    ));
+                }
+                Ok(o) => {
+                    self.status = format!(
+                        "gh pr diff failed: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                    return;
+                }
+                Err(e) => {
+                    self.status = format!("could not run gh: {e}");
+                    return;
+                }
+            }
+        }
+        let n = view.pr.number;
+        let Some(section) = view.diff.as_ref().and_then(|d| d.get(&path)).cloned() else {
+            self.status = format!("{path} has no textual diff (binary or too large)");
+            return;
+        };
+        let label = PathBuf::from(format!("PR #{n}: {path}"));
+        match self.editor.open_git_diff_side_by_side(&label, &section) {
+            Ok(()) => self.status = format!("PR #{n}: {path}"),
+            Err(e) => self.status = format!("Could not open the diff: {e}"),
+        }
+    }
+
+    /// Put the selected (or first failing) check's failing-step log in
+    /// OUTPUT > PR Checks.
+    fn show_pr_check_log(&mut self) {
+        let root = self.workspace_root().to_path_buf();
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
+        let check = view.selected_check().or_else(|| {
+            view.pr
+                .checks
+                .iter()
+                .find(|c| c.state == crate::pr_review::CheckState::Fail)
+        });
+        let Some(check) = check.cloned() else {
+            self.status = String::from("No failing check");
+            return;
+        };
+        let Some((run, job)) = check.url.as_deref().and_then(crate::pr_review::run_and_job) else {
+            self.status = format!(
+                "{} is not a GitHub Actions check; its page: {}",
+                check.name,
+                check.url.unwrap_or_default()
+            );
+            return;
+        };
+        let out = std::process::Command::new("gh")
+            .args(crate::pr_review::log_args(run, job))
+            .current_dir(&root)
+            .output();
+        let channel = "PR Checks";
+        match out {
+            Ok(o) => {
+                crate::output::clear(channel);
+                let text = String::from_utf8_lossy(if o.status.success() {
+                    &o.stdout
+                } else {
+                    &o.stderr
+                })
+                .into_owned();
+                for line in text.lines() {
+                    crate::output::push(channel, crate::output::OutputLevel::Info, line);
+                }
+                self.status = format!("{}: log in OUTPUT > {channel}", check.name);
+            }
+            Err(e) => self.status = format!("could not run gh: {e}"),
+        }
+    }
+
     /// Archive browser keys (#179): selection movement, Enter extracts
     /// the member to scratch and opens it through the normal dispatch,
     /// E prompts for an extraction folder.
@@ -49985,6 +50197,10 @@ pub fn run(
     app.start_update_watch_if_remote();
     app.start_drift_probe_if_local();
     app.start_update_check_if_local();
+    // `croft pr <n>` (#365): open the review once the app is up.
+    if let Some(n) = crate::pr_review::take_startup_pr() {
+        app.start_pr_review(n);
+    }
 
     enable_raw_mode().context("enable raw mode")?;
     // Sixel has no env var, so when neither iTerm2 nor Kitty was detected from

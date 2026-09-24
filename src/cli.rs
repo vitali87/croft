@@ -93,6 +93,12 @@ pub enum HookAction {
 
 #[derive(Subcommand, Debug)]
 pub enum CliCommand {
+    /// Review a pull request (#365): open croft on this repository with the
+    /// PR's changed files, checks and viewed marks in their own tab.
+    Pr {
+        /// The pull request number (`579`, `#579`, or its URL).
+        number: String,
+    },
     /// Set macOS Terminal.app's default profile font to a Nerd Font.
     SetupTerminal {
         /// PostScript name of the font (read from the .ttf with `fontTools` or `fc-scan`)
@@ -498,6 +504,15 @@ impl Cli {
                 }
                 crate::collab::ensure_relay(&socket)?;
                 crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
+            }
+            Some(CliCommand::Pr { number }) => {
+                let Some(n) = crate::pr_review::parse_pr_number(&number) else {
+                    eprintln!("croft pr: {number:?} is not a pull request number");
+                    std::process::exit(2);
+                };
+                crate::pr_review::set_startup_pr(n);
+                let cwd = std::env::current_dir()?;
+                crate::app::run(cwd, None, None, false, Vec::new())
             }
             Some(CliCommand::View { path, as_ext }) => {
                 // Printed and exited here rather than returned: an `Err` out
@@ -1596,6 +1611,16 @@ fn install_rust_target_if_missing(triple: &str) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn pr_takes_a_number_or_a_url() {
+        let cli = Cli::try_parse_from(["croft", "pr", "#579"]).unwrap();
+        assert!(matches!(cli.command, Some(CliCommand::Pr { ref number }) if number == "#579"));
+        assert!(
+            Cli::try_parse_from(["croft", "pr"]).is_err(),
+            "the number is required"
+        );
+    }
 
     /// #282: `--version` is a plain `x.y.z`. The regression this guards is a
     /// well-meaning one — re-adding provenance "so bug reports carry it" is

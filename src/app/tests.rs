@@ -49715,3 +49715,119 @@ tool = "go"
         "another extension's record stays"
     );
 }
+
+fn pr_screen(app: &mut App) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 32)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let mut s = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.push('\n');
+    }
+    s
+}
+
+#[test]
+fn a_pr_review_tab_lists_files_checks_and_a_summary() {
+    // #365: the PULL REQUEST tab shows every changed file with +n -m, the
+    // checks, and a summary line.
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        assert!(app.editor.pr_review.is_some(), "the PR tab is active");
+        let screen = pr_screen(&mut app);
+        for want in [
+            "PR #579",
+            "feat(sarif): model",
+            "src/sarif/view.rs",
+            "+1048",
+            "0 of 2 viewed",
+            "docs",
+        ] {
+            assert!(screen.contains(want), "{want:?} on screen:\n{screen}");
+        }
+    });
+}
+
+#[test]
+fn space_marks_a_file_viewed_and_it_persists() {
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        let view = app.editor.pr_review.as_ref().unwrap();
+        assert!(view.viewed.contains("src/sarif/view.rs"));
+        assert!(pr_screen(&mut app).contains("1 of 2 viewed"));
+        // A new session sees the mark.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        assert!(
+            again
+                .editor
+                .pr_review
+                .as_ref()
+                .unwrap()
+                .viewed
+                .contains("src/sarif/view.rs"),
+            "viewed marks persist"
+        );
+    });
+}
+
+#[test]
+fn enter_opens_the_files_diff_and_esc_leaves_review() {
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        let patch = "diff --git a/src/sarif/view.rs b/src/sarif/view.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/sarif/view.rs\n@@ -0,0 +1,2 @@\n+fn a() {}\n+fn b() {}\n";
+        app.editor.pr_review.as_mut().unwrap().diff =
+            Some(crate::pr_review::split_diff_by_file(patch));
+        let pr_tab = app.editor.active_index();
+        app.handle_pr_review_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.editor.diff.is_some(),
+            "a diff tab opened: {}",
+            app.status
+        );
+        assert_ne!(app.editor.active_index(), pr_tab, "in its own tab");
+        app.editor.select(pr_tab);
+        app.handle_pr_review_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            (0..app.editor.tab_count()).all(|i| {
+                app.editor.select(i);
+                app.editor.pr_review.is_none()
+            }),
+            "Esc leaves review: the PR tab is closed"
+        );
+    });
+}
+
+#[test]
+fn review_pull_request_is_a_palette_command_with_a_number_prompt() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("review_pull_request"),
+        Some(Command::ReviewPullRequest)
+    );
+    assert_eq!(
+        Command::ReviewPullRequest.title(),
+        "Source Control: Review Pull Request"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.submit_pr_number("not a number");
+    assert!(
+        app.status.contains("not a pull request number"),
+        "{}",
+        app.status
+    );
+}
