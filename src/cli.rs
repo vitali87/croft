@@ -1534,9 +1534,6 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    /// #282: `--version` is a plain `x.y.z`. The regression this guards is a
-    /// well-meaning one — re-adding provenance "so bug reports carry it" is
-    /// exactly how the hash got into the common path the first time.
     #[test]
     fn pr_takes_a_number_or_a_url() {
         let cli = Cli::try_parse_from(["croft", "pr", "#579"]).unwrap();
@@ -1547,6 +1544,9 @@ mod tests {
         );
     }
 
+    /// #282: `--version` is a plain `x.y.z`. The regression this guards is a
+    /// well-meaning one — re-adding provenance "so bug reports carry it" is
+    /// exactly how the hash got into the common path the first time.
     #[test]
     fn version_is_a_bare_semver_and_provenance_lives_behind_build_info() {
         // Assert on what clap RENDERS, not on the constant. The binding under

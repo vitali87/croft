@@ -45007,9 +45007,6 @@ impl App {
         sheet_follow_cursor(sheet, current, visible);
     }
 
-    /// Archive browser keys (#179): selection movement, Enter extracts
-    /// the member to scratch and opens it through the normal dispatch,
-    /// E prompts for an extraction folder.
     fn pr_viewed_path() -> PathBuf {
         croft_cache_dir().join("pr-viewed.json")
     }
@@ -45206,6 +45203,9 @@ impl App {
         }
     }
 
+    /// Archive browser keys (#179): selection movement, Enter extracts
+    /// the member to scratch and opens it through the normal dispatch,
+    /// E prompts for an extraction folder.
     fn handle_archive_key(&mut self, key: KeyEvent) {
         let Some(view) = self.editor.archive.as_mut() else {
             return;
