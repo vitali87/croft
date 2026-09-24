@@ -504,9 +504,6 @@ pub struct CallSite {
     pub character: u32,
 }
 
-/// The callers or callees of the symbol at one caret position
-/// (`prepareCallHierarchy` + `callHierarchy/incomingCalls|outgoingCalls`),
-/// tagged with the request id so stale replies drop.
 /// Which hierarchy a [`CallHierarchyResult`] answers: calls either way, or
 /// a type's supertypes / subtypes (#613), which share the picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -529,6 +526,10 @@ impl HierarchyKind {
     }
 }
 
+/// The callers or callees of the symbol at one caret position
+/// (`prepareCallHierarchy` + `callHierarchy/incomingCalls|outgoingCalls`),
+/// or the supertypes / subtypes of a type (#613), tagged with the request
+/// id so stale replies drop.
 #[derive(Debug)]
 pub struct CallHierarchyResult {
     pub request_id: u64,

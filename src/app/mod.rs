@@ -1592,6 +1592,9 @@ struct ExplorerClipboard {
     paths: Vec<PathBuf>,
 }
 
+/// A place Peek References can show: path, 0-based line, UTF-16 column.
+type PeekLocation = (PathBuf, u32, u32);
+
 /// An Explorer rename or move, held while the language servers are asked
 /// for their `willRenameFiles` edit (#610).
 #[derive(Clone, Debug)]
@@ -3380,7 +3383,7 @@ pub struct App {
     peek_target: Option<(PathBuf, u32, u32)>,
     /// Peek References (#616): every reference and the one the popup shows.
     /// Up / Down step through them; any close of the popup clears this.
-    peek_refs: Option<(Vec<(PathBuf, u32, u32)>, usize)>,
+    peek_refs: Option<(Vec<PeekLocation>, usize)>,
     /// Set when the in-flight references request came from Peek References,
     /// so its reply opens the popup instead of the picker.
     references_want_peek: bool,
