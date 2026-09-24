@@ -238,6 +238,32 @@ fn scan_with_pos(text: &str) -> Vec<(usize, PortHit)> {
     out
 }
 
+/// `lsof` arguments shared by both socket scans. `-b` keeps lsof off
+/// `stat`/`lstat`/`readlink`, which it otherwise calls on every mounted file
+/// system at startup and which stall on an unreachable NFS server; a TCP
+/// listener row needs none of them. `-w` drops the warnings `-b` then prints.
+const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
+
+/// A socket-poll helper command, detached into its own session. The poll runs
+/// every few seconds, and the kernel prints a hung-NFS notice ("nfs server
+/// X: not responding") on the controlling tty of the process waiting on the
+/// mount: with croft's tty inherited, that text lands on top of the UI. With
+/// no controlling tty the notice goes to the system log only.
+fn probe(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.stdin(std::process::Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and the only call in the
+    // pre-exec hook; the forked child is never a process-group leader, so
+    // the call always succeeds.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd
+}
+
 /// PIDs in `root`'s process subtree (inclusive), from one `ps` snapshot. Used
 /// to scope the socket poll to the shell's own children so we don't surface
 /// every system daemon listening on loopback. Empty on `ps` failure (the poll
@@ -245,7 +271,7 @@ fn scan_with_pos(text: &str) -> Vec<(usize, PortHit)> {
 fn descendant_pids(root: i32) -> HashSet<i32> {
     let mut subtree: HashSet<i32> = HashSet::new();
     subtree.insert(root);
-    let Ok(out) = Command::new("ps").args(["-axo", "pid=,ppid="]).output() else {
+    let Ok(out) = probe("ps").args(["-axo", "pid=,ppid="]).output() else {
         return subtree;
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -292,10 +318,7 @@ pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
 /// neither tool ran, so the caller can tell "nothing is listening" from "no
 /// evidence" and leave the registry alone rather than retiring live rows.
 pub fn poll_all_listening() -> Option<HashSet<u16>> {
-    let out = Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
-        .output()
-        .ok();
+    let out = probe("lsof").args(LSOF_LISTEN_ARGS).output().ok();
     if let Some(out) = out
         && (out.status.success() || !out.stdout.is_empty())
     {
@@ -306,7 +329,7 @@ pub fn poll_all_listening() -> Option<HashSet<u16>> {
                 .collect(),
         );
     }
-    let out = Command::new("ss").args(["-tlnH"]).output().ok()?;
+    let out = probe("ss").args(["-tlnH"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -327,8 +350,9 @@ fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
         .map(|p| p.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let out = Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", &pid_arg])
+    let out = probe("lsof")
+        .args(LSOF_LISTEN_ARGS)
+        .args(["-a", "-p", &pid_arg])
         .output()
         .ok()?;
     if !out.status.success() && out.stdout.is_empty() {
@@ -359,7 +383,7 @@ fn parse_lsof(text: &str) -> Vec<PortHit> {
 }
 
 fn poll_via_ss(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
-    let out = Command::new("ss").args(["-tlnpH"]).output().ok()?;
+    let out = probe("ss").args(["-tlnpH"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -431,6 +455,29 @@ fn loopback_port(addr: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A kernel notice about a hung NFS mount is printed on the controlling
+    /// tty of the process waiting on it. A socket probe runs every few
+    /// seconds, so it must own no tty: it leads its own session.
+    #[test]
+    fn a_socket_probe_runs_in_its_own_session() {
+        let out = probe("sh")
+            .args(["-c", "echo $$ $(ps -o sid= -p $$)"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let ids: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(ids.len(), 2, "{text:?}");
+        assert_eq!(ids[0], ids[1], "the probe is not its own session leader");
+    }
+
+    /// `-b` keeps lsof off stat/lstat/readlink, which stall on an
+    /// unreachable NFS mount; `-w` drops the warnings `-b` then prints.
+    #[test]
+    fn lsof_avoids_calls_that_block_on_a_dead_mount() {
+        assert!(LSOF_LISTEN_ARGS.contains(&"-b"), "{LSOF_LISTEN_ARGS:?}");
+        assert!(LSOF_LISTEN_ARGS.contains(&"-w"), "{LSOF_LISTEN_ARGS:?}");
+    }
 
     #[test]
     fn scans_a_vite_banner_url_with_port_and_path() {
