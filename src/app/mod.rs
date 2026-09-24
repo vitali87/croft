@@ -70,6 +70,8 @@ pub enum SidebarView {
     RunDebug,
     Extensions,
     Testing,
+    /// CodeQL (#578): databases, queries, query history, AST viewer.
+    CodeQL,
 }
 
 /// The toggleable sub-views stacked inside the Explorer side panel, mirroring
@@ -163,6 +165,7 @@ pub enum ActivityIcon {
     RunDebug,
     Extensions,
     Testing,
+    CodeQL,
     Settings,
 }
 
@@ -632,6 +635,21 @@ fn activity_testing_block(bar: Rect) -> Rect {
     }
 }
 
+/// The QL icon (#578), last of the view icons so disabling CodeQL moves no
+/// other icon.
+fn activity_codeql_y(bar: Rect) -> u16 {
+    activity_testing_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+}
+
+fn activity_codeql_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_codeql_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
 /// The settings gear, anchored to the BOTTOM of the activity bar (VS Code's
 /// "Manage" gear), asymmetric to the view icons stacked from the top. Returns
 /// an empty rect when the bar is too short to fit the gear below the last view
@@ -649,7 +667,7 @@ fn activity_settings_block(bar: Rect) -> Rect {
         .y
         .saturating_add(bar.height)
         .saturating_sub(ACTIVITY_ICON_HEIGHT + ACTIVITY_BOTTOM_INSET);
-    let last_view_bottom = activity_testing_y(bar) + ACTIVITY_ICON_HEIGHT;
+    let last_view_bottom = activity_codeql_y(bar) + ACTIVITY_ICON_HEIGHT;
     if y < last_view_bottom {
         return Rect::default();
     }
@@ -679,6 +697,9 @@ struct SidebarAreas {
     extensions_icon: Rect,
     /// Block occupied by the Testing (beaker) activity-bar icon, in absolute coords.
     testing_icon: Rect,
+    /// Block occupied by the CodeQL (QL) activity-bar icon; empty while the
+    /// built-in CodeQL extension is disabled.
+    codeql_icon: Rect,
     /// Block occupied by the settings gear, bottom-anchored on the activity
     /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
     /// clicking it opens the settings menu (Color Theme picker).
@@ -711,6 +732,9 @@ pub struct ActivityBarImages {
     testing_active: String,
     testing_inactive: String,
     testing_hovered: String,
+    codeql_active: String,
+    codeql_inactive: String,
+    codeql_hovered: String,
     /// The settings gear. `active` is shown while its menu is open so the
     /// button reads as pressed, mirroring the view icons' selected state;
     /// `hovered` brightens it while the pointer rests on it.
@@ -2451,6 +2475,8 @@ pub struct App {
     pub run_debug: RunDebugPanel,
     /// The Testing side panel: the suite tree with live pass/fail status.
     pub testing: crate::widgets::testing::TestingPanel,
+    /// The CodeQL side bar (#578).
+    pub codeql: crate::widgets::codeql::CodeqlPanel,
     /// Background `cargo test` worker feeding the Testing panel.
     test_worker: crate::testing::worker::TestWorker,
     /// The Extensions side panel: bundled + installed extensions with toggles.
@@ -4581,6 +4607,7 @@ impl App {
             graph_refetch_queued: false,
             run_debug,
             testing: crate::widgets::testing::TestingPanel::new(),
+            codeql: crate::widgets::codeql::CodeqlPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
             vscode_listed: Vec::new(),
@@ -5313,6 +5340,7 @@ impl App {
             Some((rda, rdi, rdh)),
             Some((exta, exti, exth)),
             Some((tsta, tsti, tsth)),
+            Some((cqa, cqi, cqh)),
             Some((gea, gei, geh)),
             Some((lso, lsoh, lsf, lsfh, lpo, lpoh, lpf, lpfh, lcu, lcuh)),
         ) = (
@@ -5323,6 +5351,7 @@ impl App {
             bake(ki::RUN_DEBUG_SRC_SVG, 0, ki::KITTY_ID_RUN_DEBUG_BAR),
             bake(ki::EXTENSIONS_SRC_SVG, 0, ki::KITTY_ID_EXTENSIONS),
             bake(ki::TESTING_SRC_SVG, 0, ki::KITTY_ID_TESTING),
+            bake(ki::CODEQL_SRC_SVG, 0, ki::KITTY_ID_CODEQL),
             bake(
                 ki::SETTINGS_GEAR_SRC_SVG,
                 gear_off_y_bias,
@@ -5352,6 +5381,9 @@ impl App {
                 testing_active: tsta,
                 testing_inactive: tsti,
                 testing_hovered: tsth,
+                codeql_active: cqa,
+                codeql_inactive: cqi,
+                codeql_hovered: cqh,
                 settings_active: gea,
                 settings_inactive: gei,
                 settings_hovered: geh,
@@ -5847,6 +5879,9 @@ impl App {
         let rdb_block = self.sidebar_areas.run_debug_icon;
         let ext_block = self.sidebar_areas.extensions_icon;
         let tst_block = self.sidebar_areas.testing_icon;
+        // Optional: absent while CodeQL is disabled, so not part of the
+        // all-or-nothing readiness below.
+        let cql_block = self.sidebar_areas.codeql_icon;
         // The activity bar is all-or-nothing: emit its icons only when every
         // block is laid out (a partial bar would look broken). When it's hidden
         // (Customize Layout / Zen) the blocks are zero-width and skipped, but
@@ -5911,6 +5946,13 @@ impl App {
         } else {
             &images.testing_inactive
         };
+        let cql_state = if self.sidebar_view == SidebarView::CodeQL {
+            &images.codeql_active
+        } else if hov == Some(ActivityIcon::CodeQL) {
+            &images.codeql_hovered
+        } else {
+            &images.codeql_inactive
+        };
         // The gear is bottom-anchored and may be absent on a short bar
         // (empty block). It reads "active" while its menu/picker is open.
         let set_block = self.sidebar_areas.settings_icon;
@@ -5953,6 +5995,9 @@ impl App {
                 (ext_block, ext_state.as_str()),
                 (tst_block, tst_state.as_str()),
             ]);
+            if cql_block.width > 0 {
+                blocks.push((cql_block, cql_state.as_str()));
+            }
             if set_block.width > 0 {
                 blocks.push((set_block, set_state.as_str()));
             }
@@ -7642,6 +7687,8 @@ impl App {
             Some(ActivityIcon::Extensions)
         } else if rect_contains(a.testing_icon, col, row) {
             Some(ActivityIcon::Testing)
+        } else if rect_contains(a.codeql_icon, col, row) {
+            Some(ActivityIcon::CodeQL)
         } else if rect_contains(a.settings_icon, col, row) {
             Some(ActivityIcon::Settings)
         } else {
@@ -7677,6 +7724,7 @@ impl App {
                 ActivityIcon::RunDebug => "Run and Debug",
                 ActivityIcon::Extensions => "Extensions",
                 ActivityIcon::Testing => "Testing",
+                ActivityIcon::CodeQL => "CodeQL",
                 ActivityIcon::Settings => "Manage",
             });
         }
@@ -7727,7 +7775,7 @@ impl App {
                     return Some(label);
                 }
             }
-            SidebarView::Testing => {}
+            SidebarView::Testing | SidebarView::CodeQL => {}
         }
         None
     }
@@ -13027,6 +13075,11 @@ impl App {
         let run_debug_block = activity_run_debug_block(area);
         let extensions_block = activity_extensions_block(area);
         let testing_block = activity_testing_block(area);
+        let codeql_block = if self.is_extension_enabled("codeql") {
+            activity_codeql_block(area)
+        } else {
+            Rect::default()
+        };
         let settings_block = activity_settings_block(area);
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
@@ -13035,6 +13088,7 @@ impl App {
         let run_debug_active = self.sidebar_view == SidebarView::RunDebug;
         let extensions_active = self.sidebar_view == SidebarView::Extensions;
         let testing_active = self.sidebar_view == SidebarView::Testing;
+        let codeql_active = self.sidebar_view == SidebarView::CodeQL;
         let settings_active = self.settings_menu_active();
         // Hover brightens the glyph (like active) but draws no selection pill,
         // mirroring the image path's hovered variant. Selected wins over hover.
@@ -13046,6 +13100,7 @@ impl App {
         let run_debug_hovered = hov == Some(ActivityIcon::RunDebug);
         let extensions_hovered = hov == Some(ActivityIcon::Extensions);
         let testing_hovered = hov == Some(ActivityIcon::Testing);
+        let codeql_hovered = hov == Some(ActivityIcon::CodeQL);
         let settings_hovered = hov == Some(ActivityIcon::Settings);
 
         // Same palette the baked icons use, so an image-less terminal renders
@@ -13186,6 +13241,15 @@ impl App {
                 testing_hovered,
             );
             render_count_badge(frame, testing_block, self.testing.failed_count());
+            if codeql_block.width > 0 {
+                render_glyph(
+                    frame,
+                    codeql_block,
+                    crate::icons::ACTIVITY_CODEQL,
+                    codeql_active,
+                    codeql_hovered,
+                );
+            }
             if settings_block.width > 0 {
                 render_glyph(
                     frame,
@@ -13204,6 +13268,7 @@ impl App {
         self.sidebar_areas.run_debug_icon = run_debug_block;
         self.sidebar_areas.extensions_icon = extensions_block;
         self.sidebar_areas.testing_icon = testing_block;
+        self.sidebar_areas.codeql_icon = codeql_block;
         self.sidebar_areas.settings_icon = settings_block;
     }
 
@@ -13279,6 +13344,10 @@ impl App {
                 self.focus_pane(Pane::Tree);
             }
             SidebarView::Testing => self.focus_pane(Pane::Tree),
+            SidebarView::CodeQL => {
+                self.codeql.theme = self.theme;
+                self.focus_pane(Pane::Tree);
+            }
         }
     }
 
@@ -15864,6 +15933,10 @@ impl App {
                 SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, usable_area),
                 SidebarView::Extensions => frame.render_widget(&mut self.extensions, usable_area),
                 SidebarView::Testing => frame.render_widget(&mut self.testing, usable_area),
+                SidebarView::CodeQL => {
+                    self.codeql.focused = self.focus == Pane::Tree;
+                    frame.render_widget(&mut self.codeql, usable_area)
+                }
             }
         }
         if !self.editor_layout.is_split() && self.editor.is_blank_initial() {
@@ -19308,6 +19381,7 @@ impl App {
                 SidebarView::RunDebug => self.handle_run_debug_key(key),
                 SidebarView::Extensions => self.handle_extensions_key(key),
                 SidebarView::Testing => self.handle_testing_key(key),
+                SidebarView::CodeQL => self.handle_codeql_key(key),
             },
             Pane::Editor => {
                 // A shared file is read-only until its bootstrap snapshot
@@ -19785,14 +19859,7 @@ impl App {
             return;
         }
         let now_enabled = self.disabled_extensions.contains(&id);
-        if now_enabled {
-            self.disabled_extensions.remove(&id);
-        } else {
-            self.disabled_extensions.insert(id.clone());
-        }
-        let _ =
-            crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
-        self.refresh_extensions();
+        self.set_extension_enabled(&id, now_enabled);
         self.status = format!(
             "{} extension '{id}'",
             if now_enabled { "Enabled" } else { "Disabled" }
@@ -20240,6 +20307,90 @@ impl App {
             return;
         }
         self.test_worker.discover();
+    }
+
+    /// Reveal the CodeQL view (#578): the QL icon and the palette. Refused,
+    /// with the reason, while the built-in CodeQL extension is disabled.
+    fn open_codeql_view(&mut self) {
+        if !self.is_extension_enabled("codeql") {
+            self.status = String::from(
+                "CodeQL is disabled - enable it in the Extensions view to show its side bar",
+            );
+            return;
+        }
+        self.show_tree = true;
+        self.set_sidebar_view(SidebarView::CodeQL);
+    }
+
+    /// CodeQL view keys: arrows move between headers and actions, Enter or
+    /// Space folds a section or runs an action, Esc returns to the Explorer.
+    fn handle_codeql_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
+            KeyCode::Up => self.codeql.move_selection(false),
+            KeyCode::Down => self.codeql.move_selection(true),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(hit) = self.codeql.selected_hit() {
+                    self.activate_codeql(hit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run what a CodeQL side-bar row offers. Sections fold; the language
+    /// list selects; the database, query and variant-analysis actions are
+    /// the parts of #578 that follow, and say so rather than do nothing.
+    fn activate_codeql(&mut self, hit: crate::widgets::codeql::Hit) {
+        use crate::widgets::codeql::{Action, Hit, LANGUAGES};
+        match hit {
+            Hit::Header(section) => self.codeql.toggle(section),
+            Hit::Action(Action::SelectLanguage(i)) => {
+                self.codeql.language = if self.codeql.language == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                };
+                self.status = match self.codeql.language {
+                    Some(i) => format!("CodeQL language: {}", LANGUAGES[i]),
+                    None => String::from("CodeQL language: all"),
+                };
+            }
+            Hit::Action(action) => {
+                let what = match action {
+                    Action::AddDatabaseFromFolder
+                    | Action::AddDatabaseFromArchive
+                    | Action::AddDatabaseFromUrl
+                    | Action::AddDatabaseFromGithub => "Adding CodeQL databases",
+                    Action::CreateQuery => "Creating CodeQL queries",
+                    Action::SetUpControllerRepository => "Variant analysis",
+                    Action::ViewAst => "The AST viewer",
+                    Action::SelectLanguage(_) => unreachable!("handled above"),
+                };
+                self.status = format!("{what} is not available yet (#578)");
+            }
+        }
+    }
+
+    /// Enable or disable an extension by id, persist the choice, and keep the
+    /// UI consistent with it: a disabled CodeQL takes its activity-bar icon
+    /// and its open side bar with it.
+    fn set_extension_enabled(&mut self, id: &str, enabled: bool) {
+        if enabled {
+            self.disabled_extensions.remove(id);
+        } else {
+            self.disabled_extensions.insert(id.to_string());
+        }
+        let _ =
+            crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
+        self.refresh_extensions();
+        if id == "codeql" {
+            if !enabled && self.sidebar_view == SidebarView::CodeQL {
+                self.set_sidebar_view(SidebarView::Explorer);
+            }
+            // The icon appears or disappears, so the baked bar redraws.
+            self.overlays.activity.mark_dirty();
+        }
     }
 
     /// Reveal the Testing view (the user-open gesture: activity icon, Cmd+K B,
@@ -27665,7 +27816,11 @@ impl App {
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
         }
-        if let Some(view) = sidebar_view_from_label(&state.sidebar_view) {
+        if let Some(view) = sidebar_view_from_label(&state.sidebar_view)
+            // A CodeQL view saved before the extension was disabled restores
+            // to the Explorer rather than to a side bar with no icon.
+            && (view != SidebarView::CodeQL || self.is_extension_enabled("codeql"))
+        {
             self.set_sidebar_view(view);
         }
         self.sidebar_width = state.sidebar_width;
@@ -35839,6 +35994,7 @@ impl App {
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
             Cmd::CompareExtensionsWithVscode => self.compare_extensions_with_vscode(),
             Cmd::ShowTesting => self.open_testing_view(),
+            Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
             Cmd::ToggleSideBar => self.toggle_side_bar(),
@@ -38542,6 +38698,7 @@ impl App {
             SidebarView::RunDebug => self.run_debug.last_area,
             SidebarView::Extensions => self.extensions.last_area,
             SidebarView::Testing => self.testing.last_area,
+            SidebarView::CodeQL => self.codeql.last_area,
         };
         // The COMMITS graph docks BELOW the change list in its own strip, so
         // `source_control.last_area` alone misses it; without this union the
@@ -39843,6 +40000,10 @@ impl App {
                     self.open_testing_view();
                     return;
                 }
+                if rect_contains(self.sidebar_areas.codeql_icon, m.column, m.row) {
+                    self.open_codeql_view();
+                    return;
+                }
                 if rect_contains(self.sidebar_areas.settings_icon, m.column, m.row) {
                     self.open_settings_menu();
                     return;
@@ -40102,6 +40263,14 @@ impl App {
                         } else if on_switch {
                             self.toggle_selected_extension();
                         }
+                    }
+                    return;
+                }
+                if in_tree && self.sidebar_view == SidebarView::CodeQL {
+                    self.focus_pane(Pane::Tree);
+                    if let Some((row, hit)) = self.codeql.hit_at(m.column, m.row) {
+                        self.codeql.selected = row;
+                        self.activate_codeql(hit);
                     }
                     return;
                 }
@@ -40762,6 +40931,7 @@ impl App {
                             SidebarView::RunDebug => {}
                             SidebarView::Extensions => {}
                             SidebarView::Testing => {}
+                            SidebarView::CodeQL => {}
                         },
                         Pane::Editor => {
                             self.editor.scroll_to_bar_y(m.row);
@@ -40921,7 +41091,8 @@ impl App {
                         | SidebarView::SourceControl
                         | SidebarView::RunDebug
                         | SidebarView::Extensions
-                        | SidebarView::Testing => {}
+                        | SidebarView::Testing
+                        | SidebarView::CodeQL => {}
                     }
                 } else if in_terminal {
                     self.terminal_mut().extend_selection_to(m.column, m.row);
@@ -41161,6 +41332,7 @@ impl App {
                         SidebarView::RunDebug => {}
                         SidebarView::Extensions => self.extensions.scroll_down(3),
                         SidebarView::Testing => self.testing.scroll_down(3),
+                        SidebarView::CodeQL => self.codeql.scroll_down(3),
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -41233,6 +41405,7 @@ impl App {
                         SidebarView::RunDebug => {}
                         SidebarView::Extensions => self.extensions.scroll_up(3),
                         SidebarView::Testing => self.testing.scroll_up(3),
+                        SidebarView::CodeQL => self.codeql.scroll_up(3),
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -49321,6 +49494,7 @@ fn sidebar_view_label(view: SidebarView) -> &'static str {
         SidebarView::RunDebug => "RunDebug",
         SidebarView::Extensions => "Extensions",
         SidebarView::Testing => "Testing",
+        SidebarView::CodeQL => "CodeQL",
     }
 }
 
@@ -49333,6 +49507,7 @@ fn sidebar_view_from_label(label: &str) -> Option<SidebarView> {
         "RunDebug" => Some(SidebarView::RunDebug),
         "Extensions" => Some(SidebarView::Extensions),
         "Testing" => Some(SidebarView::Testing),
+        "CodeQL" => Some(SidebarView::CodeQL),
         _ => None,
     }
 }

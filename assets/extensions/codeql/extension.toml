@@ -1,0 +1,8 @@
+# Bundled croft extension: CodeQL.
+# A built-in feature surfaced in the Extensions panel so it can be disabled
+# (not removed). Disabling hides the QL activity-bar icon and its side bar.
+id = "codeql"
+name = "CodeQL"
+description = "CodeQL databases, queries, query history and the AST viewer."
+builtin = true
+api_version = 1
