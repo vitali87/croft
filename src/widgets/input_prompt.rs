@@ -38,6 +38,8 @@ pub enum InputPurpose {
     SarifLocate {
         uri: String,
     },
+    /// Another SARIF log to merge into the open viewer (#577).
+    SarifAddLog,
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
     /// Submitting stores the query on the view and jumps to the first

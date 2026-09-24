@@ -50134,3 +50134,65 @@ fn a_missing_file_asks_to_locate_it_and_the_mapping_is_learned_and_kept() {
         assert_eq!(again.editor.cursor_row, 1);
     });
 }
+
+#[test]
+fn a_second_log_joins_the_viewer_and_delete_closes_it_from_the_logs_tab() {
+    // #577: VS Code merges several logs in one panel; its Logs tab closes one.
+    let (tmp, log) = sarif_fixture();
+    let second = tmp.path().join("second.sarif");
+    std::fs::write(
+        &second,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"other"}},"results":[
+            {"ruleId":"Z1","message":{"text":"From the second log."}}]}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('o'), KeyModifiers::NONE));
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(crate::widgets::input_prompt::InputPurpose::SarifAddLog)
+        ),
+        "o asks for a log"
+    );
+    app.submit_sarif_add_log(&second.display().to_string());
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.logs.len(), 2);
+    assert_eq!(view.entries.len(), 2);
+    assert!(
+        view.entries
+            .iter()
+            .any(|e| e.message == "From the second log.")
+    );
+    // Adding the same log again does nothing.
+    app.submit_sarif_add_log(&second.display().to_string());
+    assert_eq!(app.editor.sarif.as_ref().unwrap().logs.len(), 2);
+    // Logs tab: select the second log's group and close it.
+    app.handle_sarif_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    app.handle_sarif_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    let view = app.editor.sarif.as_mut().unwrap();
+    assert_eq!(view.tab, crate::sarif::view::Tab::Logs);
+    let rows = view.rows();
+    let second_header = rows
+        .iter()
+        .position(|r| matches!(r, crate::sarif::view::Row::Group { label, .. } if label == "second.sarif"))
+        .unwrap();
+    view.selected = second_header;
+    app.handle_sarif_key(key(KeyCode::Delete, KeyModifiers::NONE));
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.logs.len(), 1);
+    assert!(
+        view.entries
+            .iter()
+            .all(|e| e.message != "From the second log.")
+    );
+    // The last log is not closed this way: that is closing the tab.
+    app.handle_sarif_key(key(KeyCode::Delete, KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.sarif.as_ref().unwrap().logs.len(),
+        1,
+        "{}",
+        app.status
+    );
+}

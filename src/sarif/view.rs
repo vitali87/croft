@@ -546,6 +546,63 @@ impl SarifView {
         view
     }
 
+    /// Rebuild every entry from the open logs, keeping fixed marks, and
+    /// drop the per-selection caches that described the old list.
+    fn rebuild_entries(&mut self) {
+        let mut roots: Vec<PathBuf> = self
+            .logs
+            .iter()
+            .filter_map(|l| l.path.parent().map(|d| d.to_path_buf()))
+            .collect();
+        if let Ok(cwd) = std::env::current_dir() {
+            roots.push(cwd);
+        }
+        self.entries = build_entries(&self.logs, &roots);
+        let fixed = FixedStore::load();
+        for e in &mut self.entries {
+            if let Some(l) = self.logs.get(e.log) {
+                e.fixed = fixed.is_fixed(&l.path, e.run, e.result);
+            }
+        }
+        self.details_cache = None;
+        self.raw_cache = None;
+        self.fix_cache = None;
+        let len = self.rows().len();
+        self.selected = self.selected.min(len.saturating_sub(1));
+    }
+
+    /// Merge another log into this viewer. `false` when it is already open.
+    pub fn add_log(&mut self, path: &std::path::Path, log: SarifLog) -> bool {
+        if self.logs.iter().any(|l| l.path == path) {
+            return false;
+        }
+        self.logs.push(LoadedLog {
+            path: path.to_path_buf(),
+            log,
+        });
+        self.rebuild_entries();
+        true
+    }
+
+    /// Close log `index`. The last log stays: closing it is closing the tab.
+    pub fn remove_log(&mut self, index: usize) -> bool {
+        if self.logs.len() <= 1 || index >= self.logs.len() {
+            return false;
+        }
+        self.logs.remove(index);
+        self.rebuild_entries();
+        true
+    }
+
+    /// The log the selected row belongs to: a Logs-tab group header, or any
+    /// result.
+    pub fn selected_log(&self) -> Option<usize> {
+        match self.rows().get(self.selected)? {
+            Row::Item { entry } => self.entries.get(*entry).map(|e| e.log),
+            Row::Group { key, .. } => key.strip_prefix("l:").and_then(|n| n.parse().ok()),
+        }
+    }
+
     /// Distinct tool names across every run, for the header.
     pub fn tools(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();

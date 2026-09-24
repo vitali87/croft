@@ -23312,6 +23312,10 @@ impl App {
                 self.close_input_prompt();
                 self.create_worktree_lane(&value);
             }
+            InputPurpose::SarifAddLog => {
+                self.close_input_prompt();
+                self.submit_sarif_add_log(&value);
+            }
             InputPurpose::SarifLocate { .. } => {
                 self.close_input_prompt();
                 self.submit_sarif_locate(&value);
@@ -45257,6 +45261,26 @@ impl App {
             }
             KeyCode::Char('x') => view.clear_filters(),
             KeyCode::Char('f') => self.apply_sarif_fix(0),
+            KeyCode::Char('o') => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::SarifAddLog,
+                    String::from("Open SARIF Log"),
+                    String::from("path to a .sarif file to add to this view"),
+                ));
+            }
+            KeyCode::Delete | KeyCode::Backspace if view.tab == Tab::Logs => {
+                match view.selected_log() {
+                    Some(i) if view.remove_log(i) => {
+                        self.sarif_diag_signature.clear();
+                        self.status = String::from("Closed that log");
+                    }
+                    Some(_) => {
+                        self.status = String::from("The last log closes with its tab (Cmd+W)");
+                    }
+                    None => {}
+                }
+            }
             KeyCode::Char('d') => view.detail_tab = view.detail_tab.step(true),
             // Scroll the details pane half a page; the renderer clamps.
             KeyCode::Char(']') => {
@@ -45386,6 +45410,40 @@ impl App {
         }
         out.sort_by(|a, b| (&a.2, a.3, a.4).cmp(&(&b.2, b.3, b.4)));
         out
+    }
+
+    /// Merge another SARIF log into the open viewer (#577).
+    pub fn submit_sarif_add_log(&mut self, value: &str) {
+        let v = value.trim();
+        let path = if std::path::Path::new(v).is_absolute() {
+            PathBuf::from(v)
+        } else {
+            self.workspace_root().join(v)
+        };
+        let text = match std::fs::read(&path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        let log = match crate::sarif::load::parse_log(&text) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status = format!("{} was not added: {e}", path.display());
+                return;
+            }
+        };
+        let Some(view) = self.editor.sarif.as_mut() else {
+            return;
+        };
+        self.status = if view.add_log(&path, log) {
+            // A new log publishes its results too.
+            self.sarif_diag_signature.clear();
+            format!("Added {} · {} results", path.display(), view.entries.len())
+        } else {
+            format!("{} is already open here", path.display())
+        };
     }
 
     /// The Locate prompt's answer (#577): the file must carry the name the
