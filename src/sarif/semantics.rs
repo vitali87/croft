@@ -27,6 +27,15 @@ impl Level {
             _ => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Error => "error",
+            Level::Warning => "warning",
+            Level::Note => "note",
+            Level::None => "none",
+        }
+    }
 }
 
 /// §3.27.9 `kind`, after defaulting (absent means `fail`).

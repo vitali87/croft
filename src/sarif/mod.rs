@@ -17,3 +17,4 @@ pub mod model;
 pub mod region;
 pub mod resolve;
 pub mod semantics;
+pub mod view;
