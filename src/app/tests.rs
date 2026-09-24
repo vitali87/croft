@@ -50238,3 +50238,76 @@ fn the_run_tab_shows_the_tool_its_invocation_and_notifications() {
         crate::sarif::view::Tab::Locations
     );
 }
+
+#[test]
+fn a_baseline_log_marks_results_new_or_unchanged_and_lists_what_disappeared() {
+    // #577: logs without baselineState are compared against a chosen baseline.
+    let tmp = tempfile::tempdir().unwrap();
+    let result = |rule: &str, file: &str, line: i64| {
+        format!(
+            r#"{{"ruleId":"{rule}","message":{{"text":"{rule} here"}},"locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"{file}"}},"region":{{"startLine":{line}}}}}}}]}}"#
+        )
+    };
+    let write_log = |name: &str, results: Vec<String>| {
+        let p = tmp.path().join(name);
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"T"}}}},"results":[{}]}}]}}"#,
+                results.join(",")
+            ),
+        )
+        .unwrap();
+        p
+    };
+    for f in ["a.js", "c.js", "d.js"] {
+        std::fs::write(tmp.path().join(f), "one\ntwo\nthree\n").unwrap();
+    }
+    let now = write_log(
+        "now.sarif",
+        vec![result("kept", "a.js", 3), result("fresh", "d.js", 2)],
+    );
+    let before = write_log(
+        "before.sarif",
+        vec![result("kept", "a.js", 3), result("gone", "c.js", 1)],
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&now).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(crate::widgets::input_prompt::InputPurpose::SarifBaseline)
+        ),
+        "b asks for a baseline"
+    );
+    app.submit_sarif_baseline(&before.display().to_string());
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.baseline, Some(1));
+    let state = |rule: &str| {
+        view.entries
+            .iter()
+            .find(|e| e.rule_id == rule)
+            .map(|e| e.baseline)
+    };
+    use crate::sarif::semantics::BaselineState;
+    assert_eq!(state("kept"), Some(BaselineState::Unchanged));
+    assert_eq!(state("fresh"), Some(BaselineState::New));
+    assert_eq!(state("gone"), Some(BaselineState::Absent));
+    // The baseline contributes only what disappeared, never a second "kept".
+    assert_eq!(view.entries.len(), 3);
+    // What disappeared is not a problem in today's code.
+    app.sync_sarif_diagnostics();
+    let c = tmp.path().join("c.js");
+    assert!(
+        app.lsp_diagnostics
+            .get(&c)
+            .is_none_or(|m| m.values().all(Vec::is_empty)),
+        "absent results publish no diagnostics"
+    );
+    assert!(
+        app.lsp_diagnostics
+            .get(&tmp.path().join("d.js"))
+            .is_some_and(|m| m.values().any(|v| !v.is_empty()))
+    );
+}

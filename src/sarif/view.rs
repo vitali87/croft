@@ -8,7 +8,7 @@
 use super::model::{Run, SarifLog, SarifResult};
 use super::resolve::{expand, uri_to_path};
 use super::semantics::{self as sem, BaselineState, Kind, Level, SuppressionState};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Which results the user fixed, per log, kept in croft's cache so the
@@ -325,6 +325,9 @@ pub struct SarifView {
     raw_cache: Option<(usize, Option<String>)>,
     /// The selected result's fix previews, keyed by entry index.
     fix_cache: Option<(usize, Vec<String>)>,
+    /// Index into `logs` of the baseline the others are compared against;
+    /// only its absent results are listed.
+    pub baseline: Option<usize>,
 }
 
 impl SarifView {
@@ -351,6 +354,7 @@ impl SarifView {
             details_cache: None,
             raw_cache: None,
             fix_cache: None,
+            baseline: None,
         }
     }
 
@@ -560,6 +564,9 @@ impl SarifView {
             roots.push(cwd);
         }
         self.entries = build_entries(&self.logs, &roots);
+        if let Some(b) = self.baseline.filter(|b| *b < self.logs.len()) {
+            self.apply_baseline(b);
+        }
         let fixed = FixedStore::load();
         for e in &mut self.entries {
             if let Some(l) = self.logs.get(e.log) {
@@ -571,6 +578,64 @@ impl SarifView {
         self.fix_cache = None;
         let len = self.rows().len();
         self.selected = self.selected.min(len.saturating_sub(1));
+    }
+
+    /// Compare every other log against log `b`: results the producer left
+    /// without a `baselineState` take the computed one, and `b` itself
+    /// keeps only the results no other log still reports, as absent.
+    fn apply_baseline(&mut self, b: usize) {
+        let mut states = HashMap::new();
+        let mut absent: Option<HashSet<(usize, usize)>> = None;
+        for (li, loaded) in self.logs.iter().enumerate() {
+            if li == b {
+                continue;
+            }
+            let c = super::baseline::compare(&loaded.log, &self.logs[b].log);
+            let gone: HashSet<(usize, usize)> = c.absent.into_iter().collect();
+            absent = Some(match absent {
+                Some(prev) => prev.intersection(&gone).copied().collect(),
+                None => gone,
+            });
+            states.insert(li, c.current);
+        }
+        let absent = absent.unwrap_or_default();
+        self.entries.retain_mut(|e| {
+            if e.log == b {
+                e.baseline = BaselineState::Absent;
+                return absent.contains(&(e.run, e.result));
+            }
+            if e.baseline == BaselineState::Unspecified
+                && let Some(s) = states
+                    .get(&e.log)
+                    .and_then(|runs| runs.get(e.run))
+                    .and_then(|run| run.get(e.result))
+            {
+                e.baseline = *s;
+            }
+            true
+        });
+    }
+
+    /// Compare this viewer against `log` at `path` (opening it as a log if
+    /// it is not one already). `false` when it is the only log: a log is
+    /// never its own baseline.
+    pub fn set_baseline(&mut self, path: &std::path::Path, log: SarifLog) -> bool {
+        let index = match self.logs.iter().position(|l| l.path == path) {
+            Some(i) => i,
+            None => {
+                self.logs.push(LoadedLog {
+                    path: path.to_path_buf(),
+                    log,
+                });
+                self.logs.len() - 1
+            }
+        };
+        if self.logs.len() < 2 {
+            return false;
+        }
+        self.baseline = Some(index);
+        self.rebuild_entries();
+        true
     }
 
     /// Merge another log into this viewer. `false` when it is already open.
@@ -592,6 +657,11 @@ impl SarifView {
             return false;
         }
         self.logs.remove(index);
+        self.baseline = match self.baseline {
+            Some(b) if b == index => None,
+            Some(b) if b > index => Some(b - 1),
+            other => other,
+        };
         self.rebuild_entries();
         true
     }
@@ -734,6 +804,11 @@ impl SarifView {
                     .and_then(|l| l.path.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| format!("log {}", e.log + 1));
+                let label = if self.baseline == Some(e.log) {
+                    format!("{label} (baseline)")
+                } else {
+                    label
+                };
                 (format!("l:{}", e.log), label)
             }
         }

@@ -7274,8 +7274,9 @@ impl App {
             .collect();
         let mut seen_logs = std::collections::HashSet::new();
         for view in views {
-            for loaded in &view.logs {
-                if !seen_logs.insert(loaded.path.clone()) {
+            for (index, loaded) in view.logs.iter().enumerate() {
+                // What the baseline reported is history, not today's code.
+                if view.baseline == Some(index) || !seen_logs.insert(loaded.path.clone()) {
                     continue;
                 }
                 let mut roots = vec![root.clone()];
@@ -23315,6 +23316,10 @@ impl App {
             InputPurpose::SarifAddLog => {
                 self.close_input_prompt();
                 self.submit_sarif_add_log(&value);
+            }
+            InputPurpose::SarifBaseline => {
+                self.close_input_prompt();
+                self.submit_sarif_baseline(&value);
             }
             InputPurpose::SarifLocate { .. } => {
                 self.close_input_prompt();
@@ -45269,6 +45274,14 @@ impl App {
                     String::from("path to a .sarif file to add to this view"),
                 ));
             }
+            KeyCode::Char('b') => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::SarifBaseline,
+                    String::from("Compare with Baseline"),
+                    String::from("path to an earlier .sarif log of the same code"),
+                ));
+            }
             KeyCode::Delete | KeyCode::Backspace if view.tab == Tab::Logs => {
                 match view.selected_log() {
                     Some(i) if view.remove_log(i) => {
@@ -45410,6 +45423,51 @@ impl App {
         }
         out.sort_by(|a, b| (&a.2, a.3, a.4).cmp(&(&b.2, b.3, b.4)));
         out
+    }
+
+    /// Compare the open viewer against a baseline log (#577): results the
+    /// tool did not mark become new, unchanged or updated, and the
+    /// baseline's vanished results are listed as absent.
+    pub fn submit_sarif_baseline(&mut self, value: &str) {
+        let v = value.trim();
+        let path = if std::path::Path::new(v).is_absolute() {
+            PathBuf::from(v)
+        } else {
+            self.workspace_root().join(v)
+        };
+        let text = match std::fs::read(&path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        let log = match crate::sarif::load::parse_log(&text) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status = format!("{} is not a usable baseline: {e}", path.display());
+                return;
+            }
+        };
+        let Some(view) = self.editor.sarif.as_mut() else {
+            return;
+        };
+        self.status = if view.set_baseline(&path, log) {
+            // The baseline's own results stop publishing.
+            self.sarif_diag_signature.clear();
+            let count = |s| view.entries.iter().filter(|e| e.baseline == s).count();
+            use crate::sarif::semantics::BaselineState as B;
+            format!(
+                "Against {}: {} new, {} unchanged, {} updated, {} absent",
+                path.display(),
+                count(B::New),
+                count(B::Unchanged),
+                count(B::Updated),
+                count(B::Absent)
+            )
+        } else {
+            String::from("A log cannot be its own baseline")
+        };
     }
 
     /// Merge another SARIF log into the open viewer (#577).
