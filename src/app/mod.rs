@@ -2264,10 +2264,6 @@ pub enum BranchPurpose {
     Rebase,
 }
 
-/// The live ssh-pane workspace offer (#364): which pane's foreground became
-/// `ssh <host>`, the resolved config alias, and when the offer appeared (it
-/// expires on its own if neither accepted nor dismissed).
-#[derive(Clone, Debug, PartialEq, Eq)]
 /// A tour in progress (#377).
 pub struct TourRun {
     pub tour: crate::tour::Tour,
@@ -2275,6 +2271,10 @@ pub struct TourRun {
     pub previous_root: PathBuf,
 }
 
+/// The live ssh-pane workspace offer (#364): which pane's foreground became
+/// `ssh <host>`, the resolved config alias, and when the offer appeared (it
+/// expires on its own if neither accepted nor dismissed).
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SshOffer {
     pane: u64,
     host: String,
