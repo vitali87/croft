@@ -55,6 +55,7 @@ mod pair_host;
 mod pdf;
 mod plot;
 mod port_detect;
+mod pr_review;
 mod prefs;
 mod problem_matchers;
 mod provenance;
