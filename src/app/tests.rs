@@ -49559,3 +49559,123 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+const NOTEBOOK_355: &str = "{\n \"cells\": [\n  {\n   \"cell_type\": \"code\",\n   \"execution_count\": null,\n   \"id\": \"c1\",\n   \"metadata\": {},\n   \"outputs\": [],\n   \"source\": [\n    \"print(1+1)\"\n   ]\n  }\n ],\n \"metadata\": {\n  \"kernelspec\": {\n   \"display_name\": \"Python 3\",\n   \"language\": \"python\",\n   \"name\": \"python3\"\n  }\n },\n \"nbformat\": 4,\n \"nbformat_minor\": 5\n}\n";
+
+/// Click a notebook cell's run glyph where it is drawn.
+fn click_first_cell_glyph(
+    app: &mut App,
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    term.draw(|f| app.render(f)).unwrap();
+    let md = app
+        .editor
+        .markdown_preview
+        .as_ref()
+        .expect("notebook preview open");
+    let (x, y) = (
+        md.last_area.x,
+        md.last_area.y + (md.run_rows[0] - md.scroll as usize) as u16,
+    );
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+}
+
+/// A notebook cell's run glyph, end to end through the App with the test
+/// standing in for the kernel: the click sends the cell's code, the cell
+/// shows `In [*]` while it runs, and the kernel's output and count land in
+/// the buffer as an edit.
+#[test]
+fn clicking_a_cells_run_glyph_runs_it_and_writes_the_output_into_the_notebook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("t.ipynb");
+    // A previous run's output, which this run must replace.
+    let stale = NOTEBOOK_355.replace(
+        "\"outputs\": [],",
+        "\"outputs\": [{\"output_type\": \"stream\", \"name\": \"stdout\", \"text\": [\"stale\\n\"]}],",
+    );
+    assert_ne!(stale, NOTEBOOK_355);
+    std::fs::write(&path, stale).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (run, kernel, requests) = crate::notebook_kernel::NotebookRun::for_test();
+    app.notebook_kernels.insert(path.clone(), run);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    click_first_cell_glyph(&mut app, &mut term);
+
+    let sent: Vec<_> = requests.try_iter().collect();
+    let id = match sent.as_slice() {
+        [crate::notebook_kernel::Request::Execute { id, code }] => {
+            assert_eq!(code, "print(1+1)");
+            id.clone()
+        }
+        other => panic!("expected one execute, got {other:?}"),
+    };
+    assert_eq!(app.editor.notebook_running, vec![0]);
+    assert!(
+        !app.editor.lines.join("\n").contains("stale"),
+        "the run clears the old output"
+    );
+    term.draw(|f| app.render(f)).unwrap();
+    let md = app.editor.markdown_preview.as_ref().unwrap();
+    let frame = &md.lines[md.runnables[0].first_line];
+    assert_eq!(frame.spans[1].content.as_ref(), "In [*]:");
+
+    kernel
+        .send(crate::notebook_kernel::Event::Output {
+            id: id.clone(),
+            output: serde_json::json!({"output_type": "stream", "name": "stdout", "text": "2\n"}),
+        })
+        .unwrap();
+    kernel
+        .send(crate::notebook_kernel::Event::Done {
+            id,
+            execution_count: Some(1),
+            status: "ok".into(),
+        })
+        .unwrap();
+    assert!(app.poll_notebook_kernels());
+    let doc: serde_json::Value = serde_json::from_str(&app.editor.lines.join("\n")).unwrap();
+    assert_eq!(doc["cells"][0]["execution_count"], 1);
+    assert_eq!(doc["cells"][0]["outputs"][0]["text"][0], "2\n");
+    assert!(app.editor.notebook_running.is_empty());
+    assert!(app.editor.dirty, "outputs are an edit; Save writes them");
+}
+
+/// Acceptance for #355 against a real kernel: `print(1+1)` shows `2`, and
+/// after Save the file holds the output in the standard format. Set
+/// `CROFT_TEST_JUPYTER_PYTHON` to a venv python with ipykernel.
+#[test]
+#[ignore = "needs a Python with ipykernel; set CROFT_TEST_JUPYTER_PYTHON"]
+fn a_real_kernel_runs_a_cell_and_save_persists_the_output() {
+    let python = std::path::PathBuf::from(std::env::var("CROFT_TEST_JUPYTER_PYTHON").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let venv = python.parent().and_then(Path::parent).unwrap();
+    std::os::unix::fs::symlink(venv, tmp.path().join(".venv")).unwrap();
+    let path = tmp.path().join("t.ipynb");
+    std::fs::write(&path, NOTEBOOK_355).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    click_first_cell_glyph(&mut app, &mut term);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !app
+        .editor
+        .lines
+        .join("\n")
+        .contains("\"execution_count\": 1")
+    {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        app.poll_notebook_kernels();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    app.save();
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["cells"][0]["outputs"][0]["output_type"], "stream");
+    assert_eq!(saved["cells"][0]["outputs"][0]["text"][0], "2\n");
+}

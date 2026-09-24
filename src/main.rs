@@ -46,6 +46,7 @@ mod media;
 mod merge;
 mod merge_editor;
 mod notebook;
+mod notebook_kernel;
 mod notifications;
 mod outline_syntax;
 mod output;

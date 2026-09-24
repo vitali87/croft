@@ -3004,6 +3004,9 @@ pub struct App {
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
     view_listener: Option<std::os::unix::net::UnixListener>,
+    /// One Jupyter kernel per notebook that has run a cell (#355), by path.
+    /// Dropping one (the map entry going) shuts its kernel down.
+    notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -4789,6 +4792,7 @@ impl App {
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
             view_listener,
+            notebook_kernels: std::collections::HashMap::new(),
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -30762,7 +30766,89 @@ impl App {
         let Some(block) = md.runnables.get(idx).cloned() else {
             return;
         };
+        // A notebook cell runs in its kernel straight away, as in Jupyter:
+        // no pane, no confirm.
+        if let Some(cell) = block.kernel_cell {
+            let text = self.editor.lines.join("\n");
+            if let Some(cell) = crate::notebook_kernel::code_cell(&text, cell) {
+                self.run_notebook_cells(vec![cell]);
+            }
+            return;
+        }
         self.pending_run_block = Some(self.pending_run_block_for(idx, &block));
+    }
+
+    /// Send `cells` to the active notebook's kernel, starting it on the
+    /// first run. Each cell's old outputs are cleared now, in one edit,
+    /// so what the file shows is always this run's.
+    fn run_notebook_cells(&mut self, cells: Vec<crate::notebook_kernel::CellRef>) {
+        use crate::notebook_kernel::{CellEdit, KernelSession, NotebookRun, apply, kernel_name};
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if cells.is_empty() {
+            self.status = String::from("No code cells to run");
+            return;
+        }
+        let mut text = self.editor.lines.join("\n");
+        let root = self.workspace_root().to_path_buf();
+        let starting = !self.notebook_kernels.contains_key(&path);
+        let run = self
+            .notebook_kernels
+            .entry(path.clone())
+            .or_insert_with(|| {
+                let dir = path.parent().unwrap_or(&root);
+                NotebookRun::new(KernelSession::start(&root, dir, &kernel_name(&text)))
+            });
+        for cell in cells {
+            if let Some(next) = apply(&text, &cell, CellEdit::Begin) {
+                text = next;
+            }
+            run.execute(cell);
+        }
+        self.editor.notebook_running = run.running_indices();
+        self.editor
+            .replace_all_lines(text.split('\n').map(str::to_string).collect());
+        if starting {
+            self.status = String::from("Starting kernel…");
+        }
+    }
+
+    /// Fold what each kernel said into its notebook. A notebook that is not
+    /// the active tab keeps its events until it is.
+    fn poll_notebook_kernels(&mut self) -> bool {
+        let active = self.editor.path.clone();
+        let mut changed = false;
+        for (path, run) in self.notebook_kernels.iter_mut() {
+            if !run.collect() || active.as_ref() != Some(path) {
+                continue;
+            }
+            let text = self.editor.lines.join("\n");
+            let (next, notes) = run.fold(&text);
+            self.editor.notebook_running = run.running_indices();
+            if let Some(next) = next {
+                self.editor
+                    .replace_all_lines(next.split('\n').map(str::to_string).collect());
+            }
+            if let Some(note) = notes.last() {
+                self.status = note.clone();
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// Interrupt or restart the active notebook's kernel.
+    fn notebook_kernel_request(&mut self, request: crate::notebook_kernel::Request) {
+        let run = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| self.notebook_kernels.get(p));
+        match run {
+            Some(run) => run.send(request),
+            None => self.status = String::from("This notebook has no running kernel"),
+        }
     }
 
     /// Cmd+Enter in a Markdown SOURCE buffer (#353): the fence under the
@@ -35709,6 +35795,25 @@ impl App {
                 }
                 None => self.status = String::from("No file in the active tab"),
             },
+            Cmd::NotebookRunAll => {
+                let text = self.editor.lines.join("\n");
+                if self
+                    .editor
+                    .markdown_preview
+                    .as_ref()
+                    .is_some_and(|m| m.notebook)
+                {
+                    self.run_notebook_cells(crate::notebook_kernel::code_cells(&text));
+                } else {
+                    self.status = String::from("Run All works on a notebook's rendered view");
+                }
+            }
+            Cmd::NotebookInterrupt => {
+                self.notebook_kernel_request(crate::notebook_kernel::Request::Interrupt)
+            }
+            Cmd::NotebookRestart => {
+                self.notebook_kernel_request(crate::notebook_kernel::Request::Restart)
+            }
             Cmd::ReopenAsText => match self.editor.path.clone() {
                 // Merge editor (#253): back to the in-buffer marker flow.
                 // The Result buffer is deliberately discarded — it was
@@ -50441,6 +50546,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
+        let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
@@ -50569,6 +50675,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || remote_changed
             || pulls_changed
             || view_changed
+            || kernel_changed
             || ports_changed
             || session_presence_changed
             || session_typing_changed

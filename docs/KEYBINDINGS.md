@@ -421,6 +421,8 @@ Open as a rendered read-only document: headings, emphasis, lists, tables, and em
 
 Open as a rendered document (markdown cells, highlighted code with `In [n]` frames, outputs incl. inline images). `File: Reopen as Text` shows the raw JSON and sticks for the tab; `File: Reopen as Preview` returns to the render.
 
+Click a code cell's `▷` to run it in the notebook's kernel. The first run starts the kernel with a Python that has `jupyter_client` and `ipykernel`: the workspace's `.venv` or `venv`, then `$VIRTUAL_ENV`, then `python3`. The notebook's `metadata.kernelspec.name` picks the kernel, so any installed kernelspec works. A running or queued cell shows `In [*]`. Outputs (text, errors, images) stream into the cell as edits to the notebook, so `Cmd+S` saves them the way Jupyter does and `Cmd+Z` takes them back. The palette has `Notebook: Run All Cells`, `Notebook: Interrupt Kernel` (stops the running cell and keeps the kernel) and `Notebook: Restart Kernel`. Closing croft shuts the kernels down.
+
 **SVG (`.svg`)**
 
 Opens as a rendered preview (shapes, text via system fonts, embedded images). `File: Reopen as Text` switches the tab to the editable XML source — the choice sticks for that tab, external edits refresh whichever view the tab shows, and an SVG that fails to parse opens as its source directly.
