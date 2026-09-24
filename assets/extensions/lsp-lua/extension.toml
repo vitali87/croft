@@ -1,0 +1,19 @@
+# Bundled croft extension: Lua language support.
+# lua-language-server is expected on the user's toolchain PATH (e.g. via brew, apt, pkg, or mason).
+id = "lsp-lua"
+name = "Lua (lua-language-server)"
+description = "Lua language support via lua-language-server."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "lua"
+extensions = ["lua"]
+root_markers = [".luarc.json", ".luarc.jsonc", ".luacheckrc", ".stylua.toml", "stylua.toml", "selene.toml"]
+
+[[language_servers]]
+name = "lua-language-server"
+command = "lua-language-server"
+args = []
+language = "lua"
+priority = 0

@@ -68,6 +68,7 @@ tree-sitter-html = "0.23"
 tree-sitter-xml = "0.7"
 tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
+tree-sitter-lua = "0.5"
 
 # CommonMark parser behind the rendered Markdown preview (Cmd+Shift+V).
 # rustdoc / mdBook's engine; parser only, no HTML output needed.
