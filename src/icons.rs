@@ -59,6 +59,7 @@ pub const ACTIVITY_EXTENSIONS: char = '\u{eae6}';
 pub const ACTIVITY_TESTING: char = '\u{ea79}';
 /// CodeQL (#578). No codicon draws "QL", and the image path rasterises
 /// `assets/icons/ql.svg`; the glyph fallback is the letter itself.
+#[allow(dead_code)] // drawn once the activity bar gains the icon
 pub const ACTIVITY_CODEQL: char = 'Q';
 /// Codicon `replace-all` — the two-line "find & replace, all" glyph VS Code
 /// shows beside the Replace input in its Search sidebar. Verified on

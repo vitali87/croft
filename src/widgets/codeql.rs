@@ -4,6 +4,9 @@
 //! text and actions VS Code does, so the path from nothing to a first query
 //! reads the same in both editors.
 
+// The activity bar and side bar that use this land in the next change.
+#![allow(dead_code)]
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
