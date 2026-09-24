@@ -9929,14 +9929,14 @@ impl App {
         let Some(result) = result else {
             return false;
         };
-        let noun = if result.incoming {
-            "incoming calls"
-        } else {
-            "outgoing calls"
-        };
+        let noun = result.kind.noun();
         if result.unsupported {
-            self.status =
-                String::from("Call hierarchy: not supported by this file's language server");
+            let what = match result.kind {
+                crate::lsp::manager::HierarchyKind::Supertypes
+                | crate::lsp::manager::HierarchyKind::Subtypes => "Type hierarchy",
+                _ => "Call hierarchy",
+            };
+            self.status = format!("{what}: not supported by this file's language server");
             return true;
         }
         if result.sites.is_empty() {
@@ -10004,6 +10004,23 @@ impl App {
             return;
         };
         let id = lsp.request_call_hierarchy(path, line, character, incoming);
+        self.call_hierarchy_request_id = Some(id);
+    }
+
+    /// Request the supertypes or subtypes of the type at the cursor (#613).
+    /// Cmd+K Shift+U / Cmd+K Shift+D and the right-click menu rows.
+    fn request_type_hierarchy_at_cursor(&mut self, supertypes: bool) {
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("Type hierarchy: no language server for this file");
+            return;
+        };
+        let id = lsp.request_type_hierarchy(path, line, character, supertypes);
         self.call_hierarchy_request_id = Some(id);
     }
 
@@ -18380,6 +18397,17 @@ impl App {
             }
             // Cmd+K Shift+T: reopen the most recently closed terminal pane
             // (the browser reopen-tab convention under the Cmd+K leader).
+            // Cmd+K Shift+U / Shift+D: supertypes ("up") and subtypes
+            // ("down") of the type at the caret (#613). Case-insensitive for
+            // CSI-u hosts; must precede the plain U and D arms below.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'u') => {
+                self.request_type_hierarchy_at_cursor(true);
+                true
+            }
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'d') => {
+                self.request_type_hierarchy_at_cursor(false);
+                true
+            }
             // Must precede the case-insensitive T theme arm below.
             KeyCode::Char('T') if shifted && plain => {
                 self.undo_close_terminal();
@@ -36016,6 +36044,8 @@ impl App {
             Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
             Cmd::EditLogpoint => self.debug_edit_logpoint(),
             Cmd::ShowIncomingCalls => self.request_call_hierarchy_at_cursor(true),
+            Cmd::ShowSupertypes => self.request_type_hierarchy_at_cursor(true),
+            Cmd::ShowSubtypes => self.request_type_hierarchy_at_cursor(false),
             Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),

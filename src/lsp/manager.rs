@@ -507,13 +507,34 @@ pub struct CallSite {
 /// The callers or callees of the symbol at one caret position
 /// (`prepareCallHierarchy` + `callHierarchy/incomingCalls|outgoingCalls`),
 /// tagged with the request id so stale replies drop.
+/// Which hierarchy a [`CallHierarchyResult`] answers: calls either way, or
+/// a type's supertypes / subtypes (#613), which share the picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HierarchyKind {
+    IncomingCalls,
+    OutgoingCalls,
+    Supertypes,
+    Subtypes,
+}
+
+impl HierarchyKind {
+    /// How the status bar and picker name the rows.
+    pub fn noun(self) -> &'static str {
+        match self {
+            HierarchyKind::IncomingCalls => "incoming calls",
+            HierarchyKind::OutgoingCalls => "outgoing calls",
+            HierarchyKind::Supertypes => "supertypes",
+            HierarchyKind::Subtypes => "subtypes",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CallHierarchyResult {
     pub request_id: u64,
-    /// True for incoming calls (callers), false for outgoing (callees).
-    pub incoming: bool,
+    pub kind: HierarchyKind,
     pub sites: Vec<CallSite>,
-    /// True when no spawned server advertises `callHierarchyProvider`.
+    /// True when no spawned server advertises the provider.
     pub unsupported: bool,
 }
 
@@ -769,6 +790,13 @@ enum Cmd {
         character: u32,
         incoming: bool,
     },
+    RequestTypeHierarchy {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        supertypes: bool,
+    },
     RequestRename {
         request_id: u64,
         path: PathBuf,
@@ -850,6 +878,8 @@ struct LangCapabilitySupport {
     formatting: HashMap<Language, bool>,
     code_action: HashMap<Language, bool>,
     call_hierarchy: HashMap<Language, bool>,
+    /// Whether a server for the language answers type hierarchy (#613).
+    type_hierarchy: HashMap<Language, bool>,
     /// Whether a server for the language wants `willRenameFiles` (#610).
     will_rename: HashMap<Language, bool>,
     /// Concatenated on-type trigger characters per language (#254);
@@ -1512,6 +1542,38 @@ impl LspManager {
         self.calls_rx.try_recv().ok()
     }
 
+    /// Whether the server for `lang` answers type hierarchy (#613). `None`
+    /// means no server has reported yet.
+    pub fn language_supports_type_hierarchy(&self, lang: Language) -> Option<bool> {
+        self.capability_support
+            .lock()
+            .ok()?
+            .type_hierarchy
+            .get(&lang)
+            .copied()
+    }
+
+    /// The supertypes or subtypes of the type at a position (#613); the
+    /// reply arrives on the call-hierarchy drain with its [`HierarchyKind`].
+    pub fn request_type_hierarchy(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        supertypes: bool,
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestTypeHierarchy {
+            request_id: id,
+            path,
+            line,
+            character,
+            supertypes,
+        });
+        id
+    }
+
     /// Whether any running server wants `willRenameFiles` (#610). When none
     /// does, an Explorer move runs at once instead of waiting on an answer
     /// that can only be empty.
@@ -1862,6 +1924,7 @@ struct ManagedClient {
     supports_linked_editing: bool,
     supports_selection_range: bool,
     supports_call_hierarchy: bool,
+    supports_type_hierarchy: bool,
     supports_workspace_symbols: bool,
     supports_rename: bool,
     supports_prepare_rename: bool,
@@ -2270,6 +2333,24 @@ async fn worker_loop(
                     )
                     .await
             }
+            Cmd::RequestTypeHierarchy {
+                request_id,
+                path,
+                line,
+                character,
+                supertypes,
+            } => {
+                state
+                    .request_type_hierarchy(
+                        request_id,
+                        path,
+                        line,
+                        character,
+                        supertypes,
+                        &tx.call_hierarchy,
+                    )
+                    .await
+            }
             Cmd::RequestRename {
                 request_id,
                 path,
@@ -2498,6 +2579,7 @@ impl WorkerState {
                             selection_range_supported(&caps.selection_range_provider);
                         let supports_call_hierarchy =
                             call_hierarchy_supported(&caps.call_hierarchy_provider);
+                        let supports_type_hierarchy = client.supports_type_hierarchy();
                         let supports_workspace_symbols =
                             one_of_supported(&caps.workspace_symbol_provider);
                         let supports_rename = one_of_supported(&caps.rename_provider);
@@ -2565,6 +2647,7 @@ impl WorkerState {
                             supports_linked_editing,
                             supports_selection_range,
                             supports_call_hierarchy,
+                            supports_type_hierarchy,
                             supports_workspace_symbols,
                             supports_rename,
                             supports_prepare_rename,
@@ -2622,6 +2705,9 @@ impl WorkerState {
                 }
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
+                support
+                    .type_hierarchy
+                    .insert(lang, spawned.iter().any(|c| c.supports_type_hierarchy));
                 support
                     .will_rename
                     .insert(lang, spawned.iter().any(|c| c.will_rename.is_some()));
@@ -4122,6 +4208,11 @@ impl WorkerState {
         incoming: bool,
         tx: &std_mpsc::Sender<CallHierarchyResult>,
     ) {
+        let kind = if incoming {
+            HierarchyKind::IncomingCalls
+        } else {
+            HierarchyKind::OutgoingCalls
+        };
         let Some(doc) = self.docs.get(&path) else {
             return;
         };
@@ -4138,7 +4229,7 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(CallHierarchyResult {
                 request_id,
-                incoming,
+                kind,
                 sites: Vec::new(),
                 unsupported: true,
             });
@@ -4156,7 +4247,7 @@ impl WorkerState {
                     drop(client);
                     let _ = tx.send(CallHierarchyResult {
                         request_id,
-                        incoming,
+                        kind,
                         sites: Vec::new(),
                         unsupported: false,
                     });
@@ -4191,10 +4282,82 @@ impl WorkerState {
             drop(client);
             let _ = tx.send(CallHierarchyResult {
                 request_id,
-                incoming,
+                kind,
                 sites,
                 unsupported: false,
             });
+        });
+    }
+
+    /// Type hierarchy (#613): prepare, then supertypes or subtypes, replied
+    /// on the call-hierarchy channel so the app's picker serves both.
+    async fn request_type_hierarchy(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        supertypes: bool,
+        tx: &std_mpsc::Sender<CallHierarchyResult>,
+    ) {
+        let kind = if supertypes {
+            HierarchyKind::Supertypes
+        } else {
+            HierarchyKind::Subtypes
+        };
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_type_hierarchy)
+            .map(|c| (c.name.clone(), c.client.clone()));
+        let reply = move |sites: Vec<CallSite>, unsupported: bool| CallHierarchyResult {
+            request_id,
+            kind,
+            sites,
+            unsupported,
+        };
+        let Some((server_name, client_arc)) = picked else {
+            let _ = tx.send(reply(Vec::new(), true));
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let item = match client.prepare_type_hierarchy(uri, line, character).await {
+                Ok(Some(mut items)) if !items.is_empty() => items.remove(0),
+                Ok(_) => {
+                    drop(client);
+                    let _ = tx.send(reply(Vec::new(), false));
+                    return;
+                }
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] prepareTypeHierarchy error: {e:#}"
+                    ));
+                    return;
+                }
+            };
+            let sites = match client.type_hierarchy(item, supertypes).await {
+                Ok(Some(items)) => type_hierarchy_sites(items),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] {} error: {e:#}", kind.noun()));
+                    Vec::new()
+                }
+            };
+            drop(client);
+            let _ = tx.send(reply(sites, false));
         });
     }
 
@@ -5791,6 +5954,24 @@ fn outgoing_call_sites(calls: Vec<lsp_types::CallHierarchyOutgoingCall>) -> Vec<
         .collect()
 }
 
+/// Type-hierarchy items (#613) as picker rows, each landing on the type's
+/// name rather than the top of its range.
+fn type_hierarchy_sites(items: Vec<lsp_types::TypeHierarchyItem>) -> Vec<CallSite> {
+    items
+        .into_iter()
+        .filter_map(|t| {
+            let path = t.uri.to_file_path().ok()?;
+            let pos = t.selection_range.start;
+            Some(CallSite {
+                name: t.name,
+                path,
+                line: pos.line,
+                character: pos.character,
+            })
+        })
+        .collect()
+}
+
 /// Normalise `textDocument/documentHighlight` wire items into croft's own
 /// UTF-16-positioned occurrence spans. A missing kind defaults to a read
 /// tint, matching VS Code (Text and Read share `wordHighlightBackground`;
@@ -6020,6 +6201,9 @@ fn build_client_capabilities() -> ClientCapabilities {
             // servers that gate their providers on the client declaring
             // them (vtsls does for several) publish the capability.
             call_hierarchy: Some(lsp_types::CallHierarchyClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
+            type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities {
                 dynamic_registration: Some(false),
             }),
             document_highlight: Some(lsp_types::DocumentHighlightClientCapabilities {
@@ -6667,6 +6851,7 @@ while True:
             supports_linked_editing: false,
             supports_selection_range: false,
             supports_call_hierarchy: false,
+            supports_type_hierarchy: false,
             supports_workspace_symbols: false,
             supports_rename: false,
             supports_prepare_rename: false,
@@ -9207,7 +9392,7 @@ while True:
             .recv_timeout(Duration::from_secs(30))
             .expect("a call-hierarchy reply must reach the drain channel");
         assert_eq!(result.request_id, 9);
-        assert!(result.incoming);
+        assert_eq!(result.kind, HierarchyKind::IncomingCalls);
         assert!(!result.unsupported);
         assert_eq!(result.sites.len(), 1);
         assert_eq!(result.sites[0].name, "the_caller");
@@ -9215,6 +9400,128 @@ while True:
             (result.sites[0].line, result.sites[0].character),
             (7, 4),
             "the site is the call expression from fromRanges"
+        );
+        runtime.handle().clone().block_on(state.shutdown_all());
+    }
+
+    /// A fake server that advertises `typeHierarchyProvider` (a key
+    /// `lsp-types` 0.95 drops), answering prepare with one item and
+    /// `typeHierarchy/supertypes` with one parent.
+    const FAKE_LSP_TYPES: &str = r#"
+import json, sys
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+def item(name, uri, line):
+    r = {"start": {"line": line, "character": 6}, "end": {"line": line, "character": 6 + len(name)}}
+    return {"name": name, "kind": 5, "uri": uri, "range": r, "selectionRange": r}
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    if "id" in msg:
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "result": {"capabilities": {"typeHierarchyProvider": True}}})
+        elif method == "textDocument/prepareTypeHierarchy":
+            uri = msg["params"]["textDocument"]["uri"]
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": [item("Child", uri, 0)]})
+        elif method == "typeHierarchy/supertypes":
+            uri = msg["params"]["item"]["uri"]
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": [item("Base", uri, 3)]})
+        else:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    if method == "exit":
+        break
+"#;
+
+    /// The worker wire path for type hierarchy (#613): the capability read
+    /// from the raw initialize result, prepare + supertypes, and the reply.
+    #[test]
+    fn request_type_hierarchy_round_trips_through_a_supporting_server() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        std::fs::write(&file, "class Child(Base):\n    pass\n").expect("write demo");
+        let script = root.join("fake_types_lsp.py");
+        std::fs::write(&script, FAKE_LSP_TYPES).expect("write fake server");
+
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-types",
+                command: "python3".into(),
+                args: vec![script.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+
+        let (tx, rx) = std_mpsc::channel();
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state
+                .open_doc(file.clone(), String::from("class Child(Base):\n    pass\n"))
+                .await;
+            state
+                .request_type_hierarchy(9, file.clone(), 0, 6, true, &tx)
+                .await;
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a type-hierarchy reply must reach the drain channel");
+        assert_eq!(result.request_id, 9);
+        assert_eq!(result.kind, HierarchyKind::Supertypes);
+        assert!(!result.unsupported);
+        assert_eq!(result.sites.len(), 1);
+        assert_eq!(result.sites[0].name, "Base");
+        assert_eq!(
+            (result.sites[0].line, result.sites[0].character),
+            (3, 6),
+            "the site is the supertype's name, from selectionRange"
         );
         runtime.handle().clone().block_on(state.shutdown_all());
     }

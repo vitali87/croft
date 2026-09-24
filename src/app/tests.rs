@@ -893,6 +893,28 @@ fn cmd_k_h_chords_fire_call_hierarchy_requests() {
 }
 
 #[test]
+fn cmd_k_shift_u_and_d_fire_type_hierarchy_requests() {
+    // #613: Shift+U asks for supertypes, Shift+D for subtypes, and neither
+    // falls through to the plain U / D arms (close saved tabs, etc.).
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.py");
+    std::fs::write(&f, "class A:\n    pass\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('U'), KeyModifiers::SHIFT)));
+    let first = app.call_hierarchy_request_id.expect("supertypes armed");
+    // CSI-u hosts report Shift+D as a lowercase char with SHIFT.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('d'), KeyModifiers::SHIFT)));
+    let second = app.call_hierarchy_request_id.expect("subtypes armed");
+    assert!(second > first);
+    assert_eq!(
+        app.editor.tab_count(),
+        1,
+        "the tab survived: no close arm ran"
+    );
+}
+
+#[test]
 fn a_late_call_hierarchy_reply_does_not_clobber_an_open_menu() {
     // rust-analyzer can answer seconds later; if the user opened another
     // menu while waiting, the reply must be dropped, not replace what they

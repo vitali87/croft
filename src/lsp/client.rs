@@ -318,8 +318,19 @@ enum RawInitialize {}
 
 impl lsp_types::request::Request for RawInitialize {
     type Params = serde_json::Value;
-    type Result = lsp_types::InitializeResult;
+    // Raw, because `lsp-types` 0.95 has no `typeHierarchyProvider` field and
+    // would drop it (#613); the typed result is parsed from this value.
+    type Result = serde_json::Value;
     const METHOD: &'static str = "initialize";
+}
+
+/// Whether a raw `initialize` result advertises `typeHierarchyProvider`
+/// (#613): `true` or an options object, but not `false` or `null`.
+fn advertises_type_hierarchy(init: &serde_json::Value) -> bool {
+    match init.pointer("/capabilities/typeHierarchyProvider") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => false,
+        Some(_) => true,
+    }
 }
 
 /// Declare the workspace diagnostics capability under BOTH names (#533).
@@ -346,6 +357,8 @@ fn with_spec_workspace_diagnostics(mut params: serde_json::Value) -> serde_json:
 pub struct LspClient {
     server: ServerSocket,
     capabilities: ServerCapabilities,
+    /// See [`LspClient::supports_type_hierarchy`].
+    type_hierarchy: bool,
     name: String,
     // Holds the process so kill_on_drop only fires when this client is
     // dropped, not when spawn() returns. Without this the server is
@@ -475,6 +488,9 @@ impl LspClient {
             .request::<RawInitialize>(with_spec_workspace_diagnostics(params))
             .await
             .context("lsp initialize")?;
+        let type_hierarchy = advertises_type_hierarchy(&init);
+        let init: lsp_types::InitializeResult =
+            serde_json::from_value(init).context("parse initialize result")?;
         server
             .initialized(InitializedParams {})
             .context("lsp initialized notification")?;
@@ -482,6 +498,7 @@ impl LspClient {
         Ok(Self {
             server,
             capabilities: init.capabilities,
+            type_hierarchy,
             name,
             child,
             mainloop_task,
@@ -494,6 +511,12 @@ impl LspClient {
 
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
+    }
+
+    /// Whether the server advertised `typeHierarchyProvider` (#613), which
+    /// [`ServerCapabilities`] cannot carry in `lsp-types` 0.95.
+    pub fn supports_type_hierarchy(&self) -> bool {
+        self.type_hierarchy
     }
 
     pub fn server_mut(&mut self) -> &mut ServerSocket {
@@ -822,6 +845,53 @@ impl LspClient {
             })
             .await
             .context("prepareCallHierarchy")
+    }
+
+    /// `textDocument/prepareTypeHierarchy` (#613): resolve the type at a
+    /// position into the item the `typeHierarchy/*` requests take.
+    pub async fn prepare_type_hierarchy(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+        self.server
+            .prepare_type_hierarchy(lsp_types::TypeHierarchyPrepareParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("prepareTypeHierarchy")
+    }
+
+    /// `typeHierarchy/supertypes` or `typeHierarchy/subtypes` of `item`.
+    pub async fn type_hierarchy(
+        &mut self,
+        item: lsp_types::TypeHierarchyItem,
+        supertypes: bool,
+    ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+        if supertypes {
+            self.server
+                .supertypes(lsp_types::TypeHierarchySupertypesParams {
+                    item,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+                .context("typeHierarchy/supertypes")
+        } else {
+            self.server
+                .subtypes(lsp_types::TypeHierarchySubtypesParams {
+                    item,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+                .context("typeHierarchy/subtypes")
+        }
     }
 
     /// `callHierarchy/incomingCalls`: everyone who calls `item`.
@@ -1416,6 +1486,21 @@ mod tests {
             !sem_flag.load(Ordering::Relaxed),
             "the semantic-token flag must stay untouched"
         );
+    }
+
+    #[test]
+    fn type_hierarchy_is_read_from_the_raw_initialize_result() {
+        let caps = |v: serde_json::Value| serde_json::json!({ "capabilities": v });
+        assert!(advertises_type_hierarchy(&caps(
+            serde_json::json!({"typeHierarchyProvider": true})
+        )));
+        assert!(advertises_type_hierarchy(&caps(
+            serde_json::json!({"typeHierarchyProvider": {}})
+        )));
+        assert!(!advertises_type_hierarchy(&caps(
+            serde_json::json!({"typeHierarchyProvider": false})
+        )));
+        assert!(!advertises_type_hierarchy(&caps(serde_json::json!({}))));
     }
 
     #[test]
