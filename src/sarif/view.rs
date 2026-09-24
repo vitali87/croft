@@ -348,11 +348,15 @@ impl SarifView {
     /// group follow `sort`. A group with nothing visible is dropped.
     pub fn rows(&self) -> Vec<Row> {
         let mut groups: Vec<(String, String, Vec<usize>)> = Vec::new();
+        let mut by_key: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for i in self.visible() {
             let (key, label) = self.group_of(&self.entries[i]);
-            match groups.iter_mut().find(|g| g.0 == key) {
-                Some(g) => g.2.push(i),
-                None => groups.push((key, label, vec![i])),
+            match by_key.get(&key) {
+                Some(&g) => groups[g].2.push(i),
+                None => {
+                    by_key.insert(key.clone(), groups.len());
+                    groups.push((key, label, vec![i]));
+                }
             }
         }
         groups.sort_by(|a, b| {

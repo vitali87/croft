@@ -54,7 +54,24 @@ pub fn parse_log(text: &str) -> Result<SarifLog, LoadError> {
         obj.get("version").and_then(|v| v.as_str()),
         obj.get("$schema").and_then(|v| v.as_str()),
     )?;
+    let mut value = value;
+    drop_nulls(&mut value);
     serde_json::from_value(value).map_err(|e| LoadError::NotSarif(e.to_string()))
+}
+
+/// A `null` property means the property is absent, so drop every one
+/// before typed parsing: serde's `default` covers a missing key but not an
+/// explicit null. Array elements stay, so result indices keep matching the
+/// file.
+fn drop_nulls(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(m) => {
+            m.retain(|_, x| !x.is_null());
+            m.values_mut().for_each(drop_nulls);
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(drop_nulls),
+        _ => {}
+    }
 }
 
 /// `version` decides when present. Without it, a `$schema` URL naming
@@ -151,5 +168,21 @@ mod tests {
     fn a_utf8_bom_is_tolerated() {
         let log = parse_log("\u{feff}{\"version\":\"2.1.0\",\"runs\":[]}").unwrap();
         assert!(log.runs.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_null_reads_as_absent_anywhere_in_the_log() {
+        // A null property means the same as a missing one; one null in one
+        // result must not refuse the whole log.
+        let log = parse_log(
+            r#"{"version":"2.1.0","properties":null,"runs":[{"tool":{"driver":{"name":"t","rules":null,"version":null}},
+                "results":[{"ruleId":"R","message":{"text":"m","arguments":null},"properties":null,
+                "relatedLocations":null,"locations":[{"physicalLocation":{"artifactLocation":{"uri":"a.js","uriBaseId":null}}}]}]}]}"#,
+        )
+        .unwrap();
+        let r = &log.runs[0].results.as_ref().unwrap()[0];
+        assert_eq!(r.rule_id.as_deref(), Some("R"));
+        assert!(r.related_locations.is_empty());
+        assert!(log.runs[0].tool.driver.rules.is_empty());
     }
 }
