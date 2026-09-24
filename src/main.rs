@@ -82,6 +82,7 @@ mod termux;
 mod test_budget;
 mod testing;
 mod theme;
+mod tour;
 mod triggers;
 mod update_check;
 mod update_watch;

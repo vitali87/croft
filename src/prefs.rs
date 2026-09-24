@@ -187,6 +187,10 @@ pub struct Prefs {
     /// default), so disabling is opt-in and an older config still parses.
     #[serde(default)]
     pub disabled_extensions: BTreeSet<String>,
+    /// The first-launch tour was finished or skipped (#377): the welcome
+    /// panel stops offering it.
+    #[serde(default)]
+    pub tour_done: bool,
     /// MCP sidecar extension ids the user has consented to spawn (the first-run
     /// consent gate). croft never launches a sidecar process until its extension
     /// id is in this set.
@@ -406,6 +410,15 @@ pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String
     let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disabled_extensions = disabled.clone();
+    prefs.save(&path)
+}
+
+/// Record that the tour was finished or skipped (#377), under an explicit
+/// config dir so a test can point it at a scratch dir.
+pub fn save_tour_done_in(config_dir: &Path) -> Result<()> {
+    let path = config_dir.join("config.json");
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.tour_done = true;
     prefs.save(&path)
 }
 
