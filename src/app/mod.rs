@@ -23321,6 +23321,10 @@ impl App {
                 self.close_input_prompt();
                 self.submit_sarif_baseline(&value);
             }
+            InputPurpose::SarifExport => {
+                self.close_input_prompt();
+                self.submit_sarif_export(&value);
+            }
             InputPurpose::SarifLocate { .. } => {
                 self.close_input_prompt();
                 self.submit_sarif_locate(&value);
@@ -45282,6 +45286,17 @@ impl App {
                     String::from("path to an earlier .sarif log of the same code"),
                 ));
             }
+            KeyCode::Char('E') => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::SarifExport,
+                        String::from("Export Results as CSV"),
+                        String::from("file to write the visible results to"),
+                    )
+                    .with_value("sarif-results.csv"),
+                );
+            }
             KeyCode::Delete | KeyCode::Backspace if view.tab == Tab::Logs => {
                 match view.selected_log() {
                     Some(i) if view.remove_log(i) => {
@@ -45423,6 +45438,34 @@ impl App {
         }
         out.sort_by(|a, b| (&a.2, a.3, a.4).cmp(&(&b.2, b.3, b.4)));
         out
+    }
+
+    /// Write the SARIF viewer's visible results to a CSV file (#577),
+    /// relative to the workspace, creating its folder.
+    pub fn submit_sarif_export(&mut self, value: &str) {
+        let Some(view) = self.editor.sarif.as_ref() else {
+            return;
+        };
+        let csv = view.export_csv();
+        let count = csv.lines().count().saturating_sub(1);
+        let v = value.trim();
+        let path = if std::path::Path::new(v).is_absolute() {
+            PathBuf::from(v)
+        } else {
+            self.workspace_root().join(v)
+        };
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, csv));
+        self.status = match written {
+            Ok(()) => format!(
+                "Exported {count} result{} to {}",
+                if count == 1 { "" } else { "s" },
+                path.display()
+            ),
+            Err(e) => format!("{}: {e}", path.display()),
+        };
     }
 
     /// Compare the open viewer against a baseline log (#577): results the

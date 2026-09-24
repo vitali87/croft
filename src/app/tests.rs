@@ -50311,3 +50311,34 @@ fn a_baseline_log_marks_results_new_or_unchanged_and_lists_what_disappeared() {
             .is_some_and(|m| m.values().any(|v| !v.is_empty()))
     );
 }
+
+#[test]
+fn e_exports_the_visible_sarif_results_to_a_csv_file() {
+    // #577: the filtered list leaves the editor as a spreadsheet.
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+    let prompt = app.input_prompt.as_ref().expect("E asks where to write");
+    assert!(matches!(
+        prompt.purpose,
+        crate::widgets::input_prompt::InputPurpose::SarifExport
+    ));
+    assert_eq!(
+        prompt.value, "sarif-results.csv",
+        "a default name is offered"
+    );
+    app.submit_sarif_export("out/results.csv");
+    let written = std::fs::read_to_string(tmp.path().join("out/results.csv"))
+        .expect("written relative to the workspace, creating the folder");
+    assert!(
+        written.starts_with("rule,level,file,line,column,message"),
+        "{written}"
+    );
+    assert_eq!(
+        written.lines().count(),
+        2,
+        "one result plus the header: {written}"
+    );
+    assert!(app.status.contains("1 result"), "{}", app.status);
+}

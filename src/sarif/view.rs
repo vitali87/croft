@@ -768,6 +768,35 @@ impl SarifView {
             && !f.hidden_kinds.contains(&e.kind)
     }
 
+    /// The results the filters leave visible, as CSV (#577): one row each,
+    /// RFC 4180 quoting, labels as the list shows them.
+    pub fn export_csv(&self) -> String {
+        fn field(s: &str) -> String {
+            if s.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.to_string()
+            }
+        }
+        let mut out = String::from("rule,level,file,line,column,message,baseline,suppression\n");
+        for i in self.visible() {
+            let e = &self.entries[i];
+            let cells = [
+                field(&e.rule_id),
+                e.level.as_str().to_string(),
+                field(&e.file),
+                e.line.to_string(),
+                e.column.to_string(),
+                field(&e.message),
+                super::render::baseline_label(e.baseline).to_string(),
+                super::render::suppression_label(e.suppression).to_string(),
+            ];
+            out.push_str(&cells.join(","));
+            out.push('\n');
+        }
+        out
+    }
+
     /// Entries passing the chips and the keyword query.
     pub fn visible(&self) -> Vec<usize> {
         let q = parse_query(&self.query_text);
@@ -1181,6 +1210,34 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ── export ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn export_csv_lists_the_visible_results_with_quoting() {
+        let mut v = sample();
+        v.entries[0].message = String::from("SQL built from \"input\", unsafely");
+        v.filters.hidden_levels.insert(Level::Note);
+        let csv = v.export_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "rule,level,file,line,column,message,baseline,suppression"
+        );
+        // The note is filtered out; everything else is listed.
+        assert_eq!(lines.len(), 1 + 4, "{csv}");
+        assert!(!csv.contains("prefer ? over unwrap"));
+        assert!(
+            lines.contains(
+                &"R1,error,src/a.rs,30,1,\"SQL built from \"\"input\"\", unsafely\",no baseline,not suppressed"
+            ),
+            "{csv}"
+        );
+        assert!(
+            lines.contains(&"R4,none,,0,1,no location,no baseline,not suppressed"),
+            "{csv}"
+        );
     }
 
     // ── query grammar ───────────────────────────────────────────────────

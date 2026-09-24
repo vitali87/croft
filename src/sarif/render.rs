@@ -29,7 +29,7 @@ pub fn level_glyph(level: Level) -> &'static str {
     }
 }
 
-fn baseline_label(b: BaselineState) -> &'static str {
+pub(crate) fn baseline_label(b: BaselineState) -> &'static str {
     match b {
         BaselineState::New => "new",
         BaselineState::Unchanged => "unchanged",
@@ -39,7 +39,7 @@ fn baseline_label(b: BaselineState) -> &'static str {
     }
 }
 
-fn suppression_label(s: SuppressionState) -> &'static str {
+pub(crate) fn suppression_label(s: SuppressionState) -> &'static str {
     match s {
         SuppressionState::Unknown | SuppressionState::NotSuppressed => "not suppressed",
         SuppressionState::UnderReview => "suppression under review",
