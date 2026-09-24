@@ -26593,12 +26593,23 @@ impl App {
             self.status = String::from("Fleet run needs a command");
             return;
         }
-        let known: Vec<String> = crate::remote::discover_ssh_targets()
+        let mut known: Vec<String> = crate::remote::discover_ssh_targets()
             .into_iter()
             .map(|t| t.alias)
             .collect();
-        if known.is_empty() {
-            self.status = String::from("No hosts in ~/.ssh/config to run on");
+        let no_ssh_hosts = known.is_empty();
+        // `localhost` and running containers can be named explicitly; `*`
+        // still means the ssh hosts only (see `parse_request_with_groups`).
+        known.extend(crate::fleet::local_targets());
+        if no_ssh_hosts
+            && !crate::fleet::split_request(command).is_some_and(|(spec, _)| {
+                spec.split(',')
+                    .any(|n| crate::fleet::is_local_target(n.trim()))
+            })
+        {
+            self.status = String::from(
+                "No hosts in ~/.ssh/config to run on (localhost and docker:<container> work too)",
+            );
             return;
         }
         // The fleet must be NAMED. Defaulting to every configured host means

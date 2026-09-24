@@ -43177,21 +43177,25 @@ fn a_fleet_run_reports_through_the_channel_rather_than_blocking() {
             host: String::from("a"),
             output: String::from("5.15.0"),
             exit: Some(0),
+            elapsed: std::time::Duration::ZERO,
         },
         crate::fleet::HostResult {
             host: String::from("b"),
             output: String::from("5.15.0"),
             exit: Some(0),
+            elapsed: std::time::Duration::ZERO,
         },
         crate::fleet::HostResult {
             host: String::from("odd"),
             output: String::from("6.1.0"),
             exit: Some(0),
+            elapsed: std::time::Duration::ZERO,
         },
         crate::fleet::HostResult {
             host: String::from("down"),
             output: String::from("timed out"),
             exit: None,
+            elapsed: std::time::Duration::ZERO,
         },
     ];
     app.fleet_running = true;
