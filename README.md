@@ -71,6 +71,19 @@ grep "croft-aarch64-apple-darwin.tar.gz" SHA256SUMS | sha256sum -c -
 # macOS: grep "..." SHA256SUMS | shasum -a 256 -c -
 ```
 
+`SHA256SUMS` is itself signed with [Sigstore](https://www.sigstore.dev/) by the
+release workflow, keyless, so the signature proves the file came from this
+repository's `release.yml` run for that tag. Check it before trusting the sums
+(replace `v0.1.963` with the tag you downloaded):
+
+```bash
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "https://github.com/vitali87/croft/.github/workflows/release.yml@refs/tags/v0.1.963" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+```
+
 To build from source instead:
 
 ```bash
