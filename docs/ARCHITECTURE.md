@@ -745,6 +745,8 @@ LSP lifecycle: pre-warm, spawn, `did_open`, `did_change`, `did_save`, completion
 
 **Call hierarchy.** `prepareCallHierarchy` plus `incomingCalls`/`outgoingCalls`, one level per `Cmd+K H` / `Cmd+K Shift+H` invocation into the shared location picker. Incoming rows jump to the call expression, outgoing to the callee's definition.
 
+**File renames (`workspace/willRenameFiles`, `didRenameFiles`).** The client declares `workspace.fileOperations`, and each server's `willRename` / `didRename` filters compile into globsets at spawn (file scheme only, matched against the whole path, folder or file kind honoured). An Explorer rename, cut-paste or drag is planned first (destinations validated, same-named sources kept apart), then held while any matching server answers `willRenameFiles`, each bounded by a 60 second timeout; `Esc` skips the wait. The merged edit is applied at the files' old paths (open tabs in memory as one undo step, closed files on disk), the files move, tabs follow, and `didRenameFiles` reports the moves that happened. With no listening server the move is immediate: a worker-maintained flag avoids the round trip.
+
 ### problem_matchers.rs
 
 User-defined problem matchers, read from `~/.config/croft/matchers.json` and workspace `.croft/matchers.json` (palette "Preferences: Open Problem Matchers (JSON)", reloaded on save). They compile into `CompiledMatcher`s: single or multi-line regex sequences with named groups (file/line/col/severity/message/code, VS Code-style `loop` tails), `applies_to` command globs, and `severity_map`.

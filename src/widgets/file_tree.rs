@@ -1115,23 +1115,48 @@ mod android_trash {
 /// entry, and returns the new absolute path on success. A no-op rename
 /// (same name) returns Ok with the original path unchanged so the user
 /// can hit Enter on the prompt without typing.
+#[cfg(test)]
 pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
+    let target = rename_target(parent, old_path, new_name)?;
+    if target != old_path {
+        relocate(old_path, &target)?;
+    }
+    Ok(target)
+}
+
+/// The path [`rename_in`] would rename `old_path` to, validated but not
+/// performed, so the language servers can be asked about it first (#610).
+pub fn rename_target(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
     let trimmed = new_name.trim();
     if let Err(msg) = validate_new_name(trimmed) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     }
     let target = parent.join(trimmed);
-    if target == old_path {
-        return Ok(target);
+    if target != old_path && target.exists() {
+        return Err(already_exists(&target));
     }
-    if target.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} already exists", target.display()),
-        ));
-    }
-    std::fs::rename(old_path, &target)?;
     Ok(target)
+}
+
+fn already_exists(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("{} already exists", path.display()),
+    )
+}
+
+/// Move `source` to exactly `dest`, which must not exist yet. Falls back to
+/// copy-then-remove when `std::fs::rename` fails, as it does with `EXDEV`
+/// across filesystems.
+pub fn relocate(source: &Path, dest: &Path) -> std::io::Result<()> {
+    if dest.symlink_metadata().is_ok() {
+        return Err(already_exists(dest));
+    }
+    if std::fs::rename(source, dest).is_ok() {
+        return Ok(());
+    }
+    copy_recursive(source, dest)?;
+    remove_recursive(source)
 }
 
 /// Given a filesystem event path and the tree's workspace root, return the
@@ -1188,6 +1213,12 @@ pub fn affected_dir_for_event(
 /// macOS Finder de-duplicates pasted names. Returns the resolved path; the
 /// caller still has to perform the actual move/copy syscall.
 pub fn unique_destination_in(dest_dir: &Path, source: &Path) -> PathBuf {
+    unique_destination_avoiding(dest_dir, source, &[])
+}
+
+/// [`unique_destination_in`], also avoiding the paths in `taken`.
+fn unique_destination_avoiding(dest_dir: &Path, source: &Path, taken: &[PathBuf]) -> PathBuf {
+    let free = |p: &Path| !p.exists() && !taken.iter().any(|t| t == p);
     let stem = source
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1198,7 +1229,7 @@ pub fn unique_destination_in(dest_dir: &Path, source: &Path) -> PathBuf {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut candidate = dest_dir.join(&original_name);
-    if !candidate.exists() {
+    if free(&candidate) {
         return candidate;
     }
     for n in 1.. {
@@ -1213,7 +1244,7 @@ pub fn unique_destination_in(dest_dir: &Path, source: &Path) -> PathBuf {
             None => format!("{stem}{suffix}"),
         };
         candidate = dest_dir.join(name);
-        if !candidate.exists() {
+        if free(&candidate) {
             return candidate;
         }
     }
@@ -1238,19 +1269,22 @@ pub fn is_descendant_or_same(target: &Path, source: &Path) -> bool {
 /// filesystems and `std::fs::rename` returns `EXDEV`. Returns the final
 /// destination path on success.
 pub fn move_into(dest_dir: &Path, source: &Path) -> std::io::Result<PathBuf> {
+    let dest = move_target(dest_dir, source, &[])?;
+    relocate(source, &dest)?;
+    Ok(dest)
+}
+
+/// The path [`move_into`] would move `source` to, validated but not
+/// performed (#610). `taken` holds destinations already planned for other
+/// sources of the same gesture, which do not exist on disk yet.
+pub fn move_target(dest_dir: &Path, source: &Path, taken: &[PathBuf]) -> std::io::Result<PathBuf> {
     if is_descendant_or_same(dest_dir, source) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("cannot move {} into itself", source.display()),
         ));
     }
-    let dest = unique_destination_in(dest_dir, source);
-    if std::fs::rename(source, &dest).is_ok() {
-        return Ok(dest);
-    }
-    copy_recursive(source, &dest)?;
-    remove_recursive(source)?;
-    Ok(dest)
+    Ok(unique_destination_avoiding(dest_dir, source, taken))
 }
 
 /// Recursively copy `source` to `dest`. `dest` must not already exist.

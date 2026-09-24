@@ -242,6 +242,50 @@ pub(crate) enum QuickInputPosition {
 /// the exact cursors the request was fired for, so a reply (or a reuse
 /// attempt) after ANY caret movement is recognised as stale even though
 /// `edit_seq` did not move.
+/// An Explorer rename or move held until the language servers have answered
+/// `workspace/willRenameFiles`, so their edit lands before the files move
+/// (#610).
+struct PendingFileMove {
+    request_id: u64,
+    op: FileMove,
+}
+
+enum FileMove {
+    /// The Explorer rename prompt: `old` becomes `new` inside `parent`.
+    Rename {
+        parent: PathBuf,
+        old: PathBuf,
+        new: PathBuf,
+    },
+    /// A cut-paste or drag into `dest_dir`: each planned (source,
+    /// destination) pair, the sources that already failed validation, and
+    /// how many sources the gesture carried.
+    Move {
+        dest_dir: PathBuf,
+        planned: Vec<(PathBuf, PathBuf)>,
+        failed: Vec<String>,
+        total: usize,
+    },
+}
+
+impl FileMove {
+    fn renames(&self) -> Vec<crate::lsp::manager::FileRename> {
+        let pairs: Vec<(&PathBuf, &PathBuf)> = match self {
+            FileMove::Rename { old, new, .. } => vec![(old, new)],
+            FileMove::Move { planned, .. } => planned.iter().map(|(a, b)| (a, b)).collect(),
+        };
+        pairs
+            .into_iter()
+            .filter(|(old, new)| old != new)
+            .map(|(old, new)| crate::lsp::manager::FileRename {
+                old: old.clone(),
+                new: new.clone(),
+                is_dir: old.is_dir(),
+            })
+            .collect()
+    }
+}
+
 struct PendingSelectionRanges {
     id: u64,
     path: PathBuf,
@@ -3374,6 +3418,8 @@ pub struct App {
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
+    /// An Explorer rename or move waiting on `willRenameFiles` (#610).
+    pending_file_move: Option<PendingFileMove>,
     /// In-flight prepareRename (#254): (id, path, row, col, edit_seq) —
     /// the deferred rename prompt's context.
     prepare_rename_request: Option<(u64, PathBuf, usize, usize, u64)>,
@@ -5033,6 +5079,7 @@ impl App {
             signature_help_request_id: None,
             signature_help_anchor: None,
             rename_request_id: None,
+            pending_file_move: None,
             prepare_rename_request: None,
             format_request_id: None,
             format_request_selection: false,
@@ -18754,6 +18801,12 @@ impl App {
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         {
             self.dismiss_ssh_offer();
+            // Esc stops waiting on the language servers: the held rename
+            // or move goes ahead without their edit (#610).
+            if let Some(pending) = self.pending_file_move.take() {
+                self.finish_file_move(pending.op, &[]);
+                return Ok(());
+            }
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
@@ -45632,42 +45685,71 @@ impl App {
     }
 
     /// Shared implementation for explorer paste and drag-drop. `mode`
-    /// distinguishes a move (Cut/drag) from a copy (Copy/Alt-drag).
+    /// distinguishes a move (Cut/drag) from a copy (Copy/Alt-drag). A move
+    /// is planned here and performed by [`Self::begin_file_move`], which asks
+    /// the language servers first (#610).
     fn apply_paste_or_drop(&mut self, dest_dir: &Path, paths: &[PathBuf], mode: ExplorerClipMode) {
-        let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
-        affected.insert(dest_dir.to_path_buf());
+        if matches!(mode, ExplorerClipMode::Cut) {
+            let mut planned: Vec<(PathBuf, PathBuf)> = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
+            for src in paths {
+                let taken: Vec<PathBuf> = planned.iter().map(|(_, d)| d.clone()).collect();
+                match crate::widgets::file_tree::move_target(dest_dir, src, &taken) {
+                    Ok(dest) => planned.push((src.clone(), dest)),
+                    Err(e) => failed.push(format!("{}: {e}", src.display())),
+                }
+            }
+            let op = FileMove::Move {
+                dest_dir: dest_dir.to_path_buf(),
+                planned,
+                failed,
+                total: paths.len(),
+            };
+            if let Err(msg) = self.begin_file_move(op) {
+                self.status = msg;
+            }
+            return;
+        }
         let mut placed: Vec<PathBuf> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         for src in paths {
-            let result = match mode {
-                ExplorerClipMode::Cut => {
-                    let parent = src
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| self.tree.root.clone());
-                    affected.insert(parent);
-                    crate::widgets::file_tree::move_into(dest_dir, src)
-                }
-                ExplorerClipMode::Copy => crate::widgets::file_tree::copy_into(dest_dir, src),
-            };
-            match result {
-                Ok(p) => {
-                    if matches!(mode, ExplorerClipMode::Cut) && self.editor.matches_open_path(src) {
-                        self.editor.rename_open_path(src, &p);
-                        self.rename_review_boxes_path(src, &p);
-                    }
-                    placed.push(p);
-                }
+            match crate::widgets::file_tree::copy_into(dest_dir, src) {
+                Ok(p) => placed.push(p),
                 Err(e) => errors.push(format!("{}: {e}", src.display())),
             }
         }
-        for dir in &affected {
+        let affected = BTreeSet::from([dest_dir.to_path_buf()]);
+        self.show_placed_entries(
+            dest_dir,
+            &affected,
+            &placed,
+            &errors,
+            paths.len(),
+            "Copied",
+            "",
+        );
+    }
+
+    /// Refresh the folders a paste, drop or move touched, mark and select
+    /// what landed, and report it on the status line.
+    #[allow(clippy::too_many_arguments)]
+    fn show_placed_entries(
+        &mut self,
+        dest_dir: &Path,
+        affected: &BTreeSet<PathBuf>,
+        placed: &[PathBuf],
+        errors: &[String],
+        total: usize,
+        verb: &str,
+        note: &str,
+    ) {
+        for dir in affected {
             if let Some(idx) = self.tree.index_of_dir(dir) {
                 self.tree.refresh_children(idx);
             }
         }
         self.tree.marked.clear();
-        for p in &placed {
+        for p in placed {
             self.tree.marked.insert(p.clone());
         }
         if let Some(first) = placed.first()
@@ -45676,25 +45758,156 @@ impl App {
             self.tree.selected = idx;
             self.tree.anchor = idx;
         }
-        let verb = match mode {
-            ExplorerClipMode::Cut => "Moved",
-            ExplorerClipMode::Copy => "Copied",
-        };
-        if !errors.is_empty() {
-            self.status = format!(
-                "{verb} {}/{}; failed: {}",
+        self.status = if !errors.is_empty() {
+            format!(
+                "{verb} {}/{total}; failed: {}",
                 placed.len(),
-                paths.len(),
                 errors.join("; ")
-            );
+            )
         } else if placed.len() == 1 {
-            self.status = format!("{verb} 1 item to {}", self.status_path(dest_dir));
+            format!("{verb} 1 item to {}", self.status_path(dest_dir))
         } else {
-            self.status = format!(
+            format!(
                 "{verb} {} items to {}",
                 placed.len(),
                 self.status_path(dest_dir)
-            );
+            )
+        };
+        self.status.push_str(note);
+    }
+
+    /// Start an Explorer rename or move (#610). When a running language
+    /// server listens for `workspace/willRenameFiles`, the move is held until
+    /// its edit arrives (see [`Self::drain_will_rename_files`]); otherwise it
+    /// happens now. Refuses, with the message to show, while another one is
+    /// still held.
+    fn begin_file_move(&mut self, op: FileMove) -> std::result::Result<(), String> {
+        if self.pending_file_move.is_some() {
+            return Err(String::from(
+                "Still updating references for the last move (Esc to skip)",
+            ));
+        }
+        let files = op.renames();
+        if !files.is_empty()
+            && let Some(lsp) = self.lsp.as_mut()
+            && lsp.has_will_rename_listeners()
+        {
+            let request_id = lsp.request_will_rename_files(files);
+            self.pending_file_move = Some(PendingFileMove { request_id, op });
+            self.status = String::from("Updating references before the move (Esc to skip)");
+            return Ok(());
+        }
+        self.finish_file_move(op, &[]);
+        Ok(())
+    }
+
+    /// Perform a held rename or move once the servers have answered.
+    pub fn drain_will_rename_files(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut edits = None;
+        while let Some(result) = lsp.drain_will_rename_files() {
+            if self
+                .pending_file_move
+                .as_ref()
+                .is_some_and(|p| p.request_id == result.request_id)
+            {
+                edits = Some(result.edits);
+            }
+        }
+        let Some(edits) = edits else {
+            return false;
+        };
+        let Some(pending) = self.pending_file_move.take() else {
+            return false;
+        };
+        self.finish_file_move(pending.op, &edits);
+        true
+    }
+
+    /// Apply the servers' edit (at the files' old paths, before they move),
+    /// move the files, follow them in the tree and tabs, and tell the servers
+    /// with `workspace/didRenameFiles` which moves actually happened.
+    fn finish_file_move(
+        &mut self,
+        op: FileMove,
+        edits: &[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)],
+    ) {
+        let note = if edits.iter().all(|(_, e)| e.is_empty()) {
+            String::new()
+        } else {
+            match self.apply_rename_edits(edits) {
+                Ok((_, occ)) => format!(", {occ} reference(s) updated"),
+                Err(e) => format!(", updating references failed: {e}"),
+            }
+        };
+        let mut done: Vec<crate::lsp::manager::FileRename> = Vec::new();
+        match op {
+            FileMove::Rename { parent, old, new } => {
+                if old != new {
+                    let is_dir = old.is_dir();
+                    if let Err(e) = crate::widgets::file_tree::relocate(&old, &new) {
+                        self.status = format!("Rename failed: {e}{note}");
+                        return;
+                    }
+                    done.push(crate::lsp::manager::FileRename {
+                        old: old.clone(),
+                        new: new.clone(),
+                        is_dir,
+                    });
+                }
+                self.status = format!("Renamed to {}{note}", self.status_path(&new));
+                if let Some(idx) = self.tree.index_of_dir(&parent) {
+                    self.tree.refresh_children(idx);
+                    if let Some(new_idx) = self.tree.nodes.iter().position(|n| n.path == new) {
+                        self.tree.select(new_idx);
+                    }
+                }
+                self.editor.rename_open_path(&old, &new);
+                self.rename_review_boxes_path(&old, &new);
+                self.sync_open_file_poll_mtime();
+            }
+            FileMove::Move {
+                dest_dir,
+                planned,
+                mut failed,
+                total,
+            } => {
+                let mut affected = BTreeSet::from([dest_dir.clone()]);
+                let mut placed: Vec<PathBuf> = Vec::new();
+                for (src, dest) in planned {
+                    affected.insert(
+                        src.parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| self.tree.root.clone()),
+                    );
+                    let is_dir = src.is_dir();
+                    match crate::widgets::file_tree::relocate(&src, &dest) {
+                        Ok(()) => {
+                            if self.editor.matches_open_path(&src) {
+                                self.editor.rename_open_path(&src, &dest);
+                                self.rename_review_boxes_path(&src, &dest);
+                            }
+                            done.push(crate::lsp::manager::FileRename {
+                                old: src,
+                                new: dest.clone(),
+                                is_dir,
+                            });
+                            placed.push(dest);
+                        }
+                        Err(e) => failed.push(format!("{}: {e}", src.display())),
+                    }
+                }
+                self.show_placed_entries(
+                    &dest_dir, &affected, &placed, &failed, total, "Moved", &note,
+                );
+            }
+        }
+        if !done.is_empty()
+            && let Some(lsp) = self.lsp.as_mut()
+        {
+            lsp.notify_did_rename_files(done);
         }
     }
 
@@ -45843,27 +46056,24 @@ impl App {
             PromptKind::Rename(old_path) => {
                 let new_name = prompt.buffer.trim().to_string();
                 let parent = prompt.target_dir.clone();
-                match crate::widgets::file_tree::rename_in(&parent, &old_path, &new_name) {
-                    Ok(new_path) => {
-                        self.prompt = None;
-                        self.status = format!("Renamed to {}", self.status_path(&new_path));
-                        if let Some(idx) = self.tree.index_of_dir(&parent) {
-                            self.tree.refresh_children(idx);
-                            if let Some(new_idx) =
-                                self.tree.nodes.iter().position(|n| n.path == new_path)
-                            {
-                                self.tree.select(new_idx);
-                            }
-                        }
-                        self.editor.rename_open_path(&old_path, &new_path);
-                        self.rename_review_boxes_path(&old_path, &new_path);
-                        self.sync_open_file_poll_mtime();
-                    }
-                    Err(e) => {
+                let refusal =
+                    match crate::widgets::file_tree::rename_target(&parent, &old_path, &new_name) {
+                        Ok(new_path) => self
+                            .begin_file_move(FileMove::Rename {
+                                parent,
+                                old: old_path,
+                                new: new_path,
+                            })
+                            .err(),
+                        Err(e) => Some(e.to_string()),
+                    };
+                match refusal {
+                    Some(msg) => {
                         if let Some(p) = self.prompt.as_mut() {
-                            p.error = Some(e.to_string());
+                            p.error = Some(msg);
                         }
                     }
+                    None => self.prompt = None,
                 }
             }
             PromptKind::RenameSymbol { path, row, col } => {
@@ -50500,6 +50710,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let prepare_rename_changed = app.drain_lsp_prepare_rename();
         let occurrences_changed = app.drain_lsp_document_highlights();
         let rename_changed = app.drain_lsp_rename();
+        let file_move_changed = app.drain_will_rename_files();
         let format_changed = app.drain_lsp_format();
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
@@ -50602,6 +50813,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || prepare_rename_changed
             || occurrences_changed
             || rename_changed
+            || file_move_changed
             || format_changed
             || code_action_changed
             || semantic_changed

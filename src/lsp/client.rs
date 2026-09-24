@@ -343,6 +343,18 @@ fn with_spec_workspace_diagnostics(mut params: serde_json::Value) -> serde_json:
     params
 }
 
+fn rename_files_params(files: &[(Url, Url)]) -> lsp_types::RenameFilesParams {
+    lsp_types::RenameFilesParams {
+        files: files
+            .iter()
+            .map(|(old, new)| lsp_types::FileRename {
+                old_uri: old.to_string(),
+                new_uri: new.to_string(),
+            })
+            .collect(),
+    }
+}
+
 pub struct LspClient {
     server: ServerSocket,
     capabilities: ServerCapabilities,
@@ -562,6 +574,26 @@ impl LspClient {
                 text_document: TextDocumentIdentifier { uri },
             })
             .context("did_close")
+    }
+
+    /// `workspace/willRenameFiles` (#610): ask the server for the edit that
+    /// keeps its references intact (imports, `mod` declarations) when the
+    /// files move. Sent BEFORE the files are renamed on disk.
+    pub async fn will_rename_files(
+        &mut self,
+        files: &[(Url, Url)],
+    ) -> Result<Option<WorkspaceEdit>> {
+        self.server
+            .request::<lsp_types::request::WillRenameFiles>(rename_files_params(files))
+            .await
+            .context("will_rename_files")
+    }
+
+    /// `workspace/didRenameFiles` (#610): the files have moved on disk.
+    pub fn did_rename_files(&mut self, files: &[(Url, Url)]) -> Result<()> {
+        self.server
+            .notify::<lsp_types::notification::DidRenameFiles>(rename_files_params(files))
+            .context("did_rename_files")
     }
 
     pub async fn completion(

@@ -49559,3 +49559,128 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+fn will_rename_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let lib = root.join("lib.rs");
+    let foo = root.join("foo.rs");
+    std::fs::write(&lib, "mod foo;\n").unwrap();
+    std::fs::write(&foo, "pub fn f() {}\n").unwrap();
+    let app = App::new(root.clone()).unwrap();
+    app.lsp.as_ref().unwrap().set_will_rename_listeners(true);
+    (tmp, lib, foo, app)
+}
+
+fn mod_foo_to_bar(request_id: u64, lib: &Path) -> crate::lsp::manager::WillRenameFilesResult {
+    crate::lsp::manager::WillRenameFilesResult {
+        request_id,
+        edits: vec![(
+            lib.to_path_buf(),
+            vec![crate::widgets::editor::TextSpanEdit {
+                start: (0, 4),
+                end: (0, 7),
+                new_text: String::from("bar"),
+            }],
+        )],
+    }
+}
+
+/// #610: with a server listening for `willRenameFiles`, the Explorer rename
+/// waits for its answer, applies the edit to the files where they stand, and
+/// only then renames on disk, the open tab following the file.
+#[test]
+fn an_explorer_rename_waits_for_the_servers_edit_and_applies_it_first() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let bar = foo.with_file_name("bar.rs");
+    app.editor.open(&foo).unwrap();
+    app.prompt = Some(super::Prompt {
+        label: String::from("Rename foo.rs"),
+        buffer: String::from("bar.rs"),
+        kind: super::PromptKind::Rename(foo.clone()),
+        target_dir: foo.parent().unwrap().to_path_buf(),
+        error: None,
+    });
+    app.commit_prompt();
+    assert!(
+        app.prompt.is_none(),
+        "the prompt closes while the rename is held"
+    );
+    assert!(
+        foo.exists() && !bar.exists(),
+        "nothing moves before the answer"
+    );
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    assert!(!app.drain_will_rename_files(), "no answer yet");
+
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+    assert!(app.drain_will_rename_files());
+    assert!(!foo.exists() && bar.exists(), "the rename happened");
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), "mod bar;\n");
+    assert_eq!(app.editor.path.as_deref(), Some(bar.as_path()));
+    assert!(
+        app.status.ends_with(", 1 reference(s) updated"),
+        "{}",
+        app.status
+    );
+    assert!(app.pending_file_move.is_none());
+}
+
+/// #610: Esc stops waiting, the held move goes ahead without an edit, and a
+/// late answer is ignored rather than applied to files that already moved.
+#[test]
+fn esc_skips_the_wait_and_a_late_answer_is_dropped() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let dest = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    assert!(foo.exists(), "the move is held");
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !foo.exists() && dest.join("foo.rs").exists(),
+        "Esc moved it"
+    );
+    assert!(app.status.starts_with("Moved 1 item"), "{}", app.status);
+
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+    assert!(!app.drain_will_rename_files());
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), "mod foo;\n");
+}
+
+/// Planning a move before performing it must still give two same-named
+/// sources distinct destinations, as moving them one by one did.
+#[test]
+fn moving_two_same_named_files_keeps_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (a, b, dest) = (root.join("a"), root.join("b"), root.join("dest"));
+    for d in [&a, &b, &dest] {
+        std::fs::create_dir(d).unwrap();
+    }
+    std::fs::write(a.join("x.txt"), "from a").unwrap();
+    std::fs::write(b.join("x.txt"), "from b").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.apply_paste_or_drop(
+        &dest,
+        &[a.join("x.txt"), b.join("x.txt")],
+        ExplorerClipMode::Cut,
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("x.txt")).unwrap(),
+        "from a"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("x copy.txt")).unwrap(),
+        "from b"
+    );
+    assert_eq!(app.status, "Moved 2 items to dest");
+}

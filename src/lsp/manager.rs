@@ -258,6 +258,30 @@ pub struct RenameResult {
     pub edits: Option<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
 }
 
+/// One file or folder an Explorer rename or move is about to relocate
+/// (#610).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRename {
+    pub old: PathBuf,
+    pub new: PathBuf,
+    pub is_dir: bool,
+}
+
+/// The merged `workspace/willRenameFiles` answer of every server that asked
+/// to hear about the rename (#610). Always sent, even when no server asked,
+/// because the app defers the rename until it arrives.
+#[derive(Debug)]
+pub struct WillRenameFilesResult {
+    pub request_id: u64,
+    /// Per-file char-indexed spans to apply before the files move.
+    pub edits: Vec<(PathBuf, Vec<TextSpanEdit>)>,
+}
+
+/// How long a server may take to answer `willRenameFiles` before the rename
+/// goes ahead without its edit. VS Code's `files.participants.timeout`
+/// default.
+pub const WILL_RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A `textDocument/prepareRename` verdict (#254). Always answered — the
 /// rename prompt is waiting on it. `unsupported` routes the app to the
 /// plain word-under-cursor prompt; `error` carries the server's own
@@ -759,6 +783,16 @@ enum Cmd {
         character: u32,
         new_name: String,
     },
+    /// `workspace/willRenameFiles` to every server whose `fileOperations`
+    /// filters match (#610).
+    WillRenameFiles {
+        request_id: u64,
+        files: Vec<FileRename>,
+    },
+    /// `workspace/didRenameFiles` once the files have moved (#610).
+    DidRenameFiles {
+        files: Vec<FileRename>,
+    },
     RequestPrepareRename {
         request_id: u64,
         path: PathBuf,
@@ -856,6 +890,10 @@ pub struct LspManager {
     calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
+    will_rename_files_rx: std_mpsc::Receiver<WillRenameFilesResult>,
+    /// Lets a test answer a held Explorer rename in place of a server.
+    #[cfg(test)]
+    will_rename_files_tx: std_mpsc::Sender<WillRenameFilesResult>,
     prepare_rename_rx: std_mpsc::Receiver<PrepareRenameResult>,
     format_rx: std_mpsc::Receiver<FormatResult>,
     on_type_rx: std_mpsc::Receiver<FormatResult>,
@@ -872,6 +910,8 @@ pub struct LspManager {
     semantic_refresh: Arc<AtomicBool>,
     inlay_refresh: Arc<AtomicBool>,
     diagnostic_refresh: Arc<AtomicBool>,
+    /// Set while any running server listens for `willRenameFiles` (#610).
+    will_rename_listeners: Arc<AtomicBool>,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -912,6 +952,7 @@ impl LspManager {
         let (calls_tx, calls_rx) = std_mpsc::channel();
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
+        let (will_rename_files_tx, will_rename_files_rx) = std_mpsc::channel();
         let (prepare_rename_tx, prepare_rename_rx) = std_mpsc::channel();
         let (format_tx, format_rx) = std_mpsc::channel();
         let (on_type_tx, on_type_rx) = std_mpsc::channel();
@@ -929,6 +970,7 @@ impl LspManager {
         let semantic_refresh = Arc::new(AtomicBool::new(false));
         let inlay_refresh = Arc::new(AtomicBool::new(false));
         let diagnostic_refresh = Arc::new(AtomicBool::new(false));
+        let will_rename_listeners = Arc::new(AtomicBool::new(false));
         let root = workspace_root.clone();
         // Load user-installed extensions (`~/.config/croft/extensions`) and merge
         // them with the bundled ones. The language table must be initialised
@@ -966,6 +1008,7 @@ impl LspManager {
                 call_hierarchy: calls_tx,
                 workspace_symbols: ws_symbols_tx,
                 rename: rename_tx,
+                will_rename_files: will_rename_files_tx.clone(),
                 prepare_rename: prepare_rename_tx,
                 formatting: format_tx,
                 on_type_formatting: on_type_tx,
@@ -983,6 +1026,7 @@ impl LspManager {
             semantic_refresh.clone(),
             inlay_refresh.clone(),
             diagnostic_refresh.clone(),
+            will_rename_listeners.clone(),
         ));
         Ok(Self {
             semantic_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1002,6 +1046,9 @@ impl LspManager {
             calls_rx,
             ws_symbols_rx,
             rename_rx,
+            will_rename_files_rx,
+            #[cfg(test)]
+            will_rename_files_tx,
             prepare_rename_rx,
             format_rx,
             on_type_rx,
@@ -1018,6 +1065,7 @@ impl LspManager {
             semantic_refresh,
             inlay_refresh,
             diagnostic_refresh,
+            will_rename_listeners,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -1582,6 +1630,48 @@ impl LspManager {
         self.rename_rx.try_recv().ok()
     }
 
+    /// Ask the servers for the edit that follows `files` to their new paths
+    /// (#610). The answer always arrives via
+    /// [`Self::drain_will_rename_files`], empty when no server asked.
+    pub fn request_will_rename_files(&mut self, files: Vec<FileRename>) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        // Test-built Apps run no servers; a test answers through
+        // `answer_will_rename_files` instead of the worker's empty reply.
+        if !cfg!(test) {
+            let _ = self.cmd_tx.send(Cmd::WillRenameFiles {
+                request_id: id,
+                files,
+            });
+        }
+        id
+    }
+
+    #[cfg(test)]
+    pub fn set_will_rename_listeners(&self, any: bool) {
+        self.will_rename_listeners.store(any, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn answer_will_rename_files(&self, result: WillRenameFilesResult) {
+        let _ = self.will_rename_files_tx.send(result);
+    }
+
+    /// Whether any running server asked to hear `willRenameFiles` (#610).
+    /// When none did, an Explorer rename goes ahead without the round trip.
+    pub fn has_will_rename_listeners(&self) -> bool {
+        self.will_rename_listeners.load(Ordering::Relaxed)
+    }
+
+    pub fn drain_will_rename_files(&self) -> Option<WillRenameFilesResult> {
+        self.will_rename_files_rx.try_recv().ok()
+    }
+
+    /// Tell the servers `files` have moved on disk (#610).
+    pub fn notify_did_rename_files(&mut self, files: Vec<FileRename>) {
+        let _ = self.cmd_tx.send(Cmd::DidRenameFiles { files });
+    }
+
     pub fn request_formatting(&mut self, path: PathBuf, tab_size: u32, insert_spaces: bool) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
@@ -1804,6 +1894,10 @@ struct ManagedClient {
     supports_workspace_symbols: bool,
     supports_rename: bool,
     supports_prepare_rename: bool,
+    /// The server's `workspace.fileOperations.willRename` / `didRename`
+    /// filters (#610); `None` when it does not want to hear about renames.
+    will_rename_filters: Option<Arc<Vec<FileOpFilter>>>,
+    did_rename_filters: Option<Arc<Vec<FileOpFilter>>>,
     supports_formatting: bool,
     /// The server's on-type formatting trigger characters, when it
     /// advertises the provider (#254).
@@ -1857,6 +1951,10 @@ struct WorkerState {
     // Same contract for `workspace/diagnostic/refresh` (#533); the app polls
     // it and asks for a fresh workspace pull.
     diagnostic_refresh: Arc<AtomicBool>,
+    // Whether any running server asked for `willRenameFiles` (#610),
+    // recomputed whenever a server starts or retires; the app reads it to
+    // skip the round trip when nobody listens.
+    will_rename_listeners: Arc<AtomicBool>,
     // Cloned into every spawned client's router so the server-pushed
     // `textDocument/publishDiagnostics` notifications reach the app.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
@@ -1889,6 +1987,7 @@ struct ResultSenders {
     call_hierarchy: std_mpsc::Sender<CallHierarchyResult>,
     workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
     rename: std_mpsc::Sender<RenameResult>,
+    will_rename_files: std_mpsc::Sender<WillRenameFilesResult>,
     prepare_rename: std_mpsc::Sender<PrepareRenameResult>,
     formatting: std_mpsc::Sender<FormatResult>,
     on_type_formatting: std_mpsc::Sender<FormatResult>,
@@ -1918,6 +2017,7 @@ async fn worker_loop(
     semantic_refresh: Arc<AtomicBool>,
     inlay_refresh: Arc<AtomicBool>,
     diagnostic_refresh: Arc<AtomicBool>,
+    will_rename_listeners: Arc<AtomicBool>,
 ) {
     let mut state = WorkerState {
         workspace_root,
@@ -1929,6 +2029,7 @@ async fn worker_loop(
         semantic_refresh,
         inlay_refresh,
         diagnostic_refresh,
+        will_rename_listeners,
         diagnostics_tx: tx.diagnostics.clone(),
         progress_tx: tx.progress.clone(),
     };
@@ -1985,6 +2086,7 @@ async fn worker_loop(
                             }
                         }
                     }
+                    state.refresh_will_rename_listeners();
                 }
                 state.extra_roots = roots;
             }
@@ -2215,6 +2317,10 @@ async fn worker_loop(
                     .request_rename(request_id, path, line, character, new_name, &tx.rename)
                     .await
             }
+            Cmd::WillRenameFiles { request_id, files } => {
+                state.will_rename_files(request_id, files, &tx.will_rename_files)
+            }
+            Cmd::DidRenameFiles { files } => state.did_rename_files(&files),
             Cmd::RequestPrepareRename {
                 request_id,
                 path,
@@ -2319,6 +2425,15 @@ async fn worker_loop(
 }
 
 impl WorkerState {
+    fn refresh_will_rename_listeners(&self) {
+        let any = self
+            .clients
+            .values()
+            .flatten()
+            .any(|c| c.will_rename_filters.is_some());
+        self.will_rename_listeners.store(any, Ordering::Relaxed);
+    }
+
     /// Gracefully shut down every managed client concurrently. Each client's
     /// `shutdown` self-bounds its child-wait, so a single unresponsive server
     /// can't block the others. Clients are left in the map; their eventual Drop
@@ -2432,6 +2547,14 @@ impl WorkerState {
                         let supports_rename = one_of_supported(&caps.rename_provider);
                         let supports_prepare_rename =
                             prepare_rename_supported(&caps.rename_provider);
+                        let file_ops = caps
+                            .workspace
+                            .as_ref()
+                            .and_then(|w| w.file_operations.as_ref());
+                        let will_rename_filters =
+                            file_op_filters(file_ops.and_then(|f| f.will_rename.as_ref()));
+                        let did_rename_filters =
+                            file_op_filters(file_ops.and_then(|f| f.did_rename.as_ref()));
                         let supports_formatting =
                             one_of_supported(&caps.document_formatting_provider);
                         let on_type_triggers =
@@ -2484,6 +2607,8 @@ impl WorkerState {
                             supports_workspace_symbols,
                             supports_rename,
                             supports_prepare_rename,
+                            will_rename_filters,
+                            did_rename_filters,
                             supports_formatting,
                             on_type_triggers,
                             supports_range_formatting,
@@ -2548,6 +2673,7 @@ impl WorkerState {
                 self.diagnostics_tx.clone(),
             );
             self.clients.insert(key.clone(), spawned);
+            self.refresh_will_rename_listeners();
         }
         self.clients.get(&key).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -4372,6 +4498,115 @@ impl WorkerState {
         });
     }
 
+    /// The servers that want to hear about `files` under `pick`'s filters,
+    /// each with the subset its filters match (#610). A server is asked once
+    /// even when it serves several languages of one root, and only about
+    /// files inside its own root.
+    fn file_op_audience(
+        &self,
+        files: &[FileRename],
+        pick: impl Fn(&ManagedClient) -> Option<&Arc<Vec<FileOpFilter>>>,
+    ) -> Vec<(String, Arc<TokioMutex<LspClient>>, Vec<FileRename>)> {
+        let mut seen: Vec<(String, PathBuf)> = Vec::new();
+        let mut out = Vec::new();
+        let mut keys: Vec<&ClientKey> = self.clients.keys().collect();
+        keys.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.lsp_id().cmp(b.0.lsp_id())));
+        for key in keys {
+            let root = &key.1;
+            for c in &self.clients[key] {
+                let Some(filters) = pick(c) else {
+                    continue;
+                };
+                let id = (c.name.clone(), root.clone());
+                if seen.contains(&id) {
+                    continue;
+                }
+                let matched: Vec<FileRename> = files
+                    .iter()
+                    .filter(|f| {
+                        f.old.starts_with(root) && file_op_matches(filters, &f.old, f.is_dir)
+                    })
+                    .cloned()
+                    .collect();
+                if matched.is_empty() {
+                    continue;
+                }
+                seen.push(id);
+                out.push((c.name.clone(), c.client.clone(), matched));
+            }
+        }
+        out
+    }
+
+    /// `workspace/willRenameFiles` (#610): ask every interested server, wait
+    /// for all of them (each bounded by [`WILL_RENAME_TIMEOUT`]), and send one
+    /// merged answer. Always answers: the app holds the rename until it does.
+    fn will_rename_files(
+        &self,
+        request_id: u64,
+        files: Vec<FileRename>,
+        tx: &std_mpsc::Sender<WillRenameFilesResult>,
+    ) {
+        let audience = self.file_op_audience(&files, |c| c.will_rename_filters.as_ref());
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let asks = audience
+                .into_iter()
+                .map(|(name, client, matched)| async move {
+                    let Some(uris) = file_rename_uris(&matched) else {
+                        return Vec::new();
+                    };
+                    log_file::log(&format!(
+                        "lsp[{name}] willRenameFiles: {} file(s)",
+                        uris.len()
+                    ));
+                    let mut client = client.lock().await;
+                    let resp =
+                        tokio::time::timeout(WILL_RENAME_TIMEOUT, client.will_rename_files(&uris))
+                            .await;
+                    drop(client);
+                    match resp {
+                        Ok(Ok(Some(we))) => workspace_edits(&we),
+                        Ok(Ok(None)) => Vec::new(),
+                        Ok(Err(e)) => {
+                            log_file::log(&format!("lsp[{name}] willRenameFiles error: {e:#}"));
+                            Vec::new()
+                        }
+                        Err(_) => {
+                            log_file::log(&format!("lsp[{name}] willRenameFiles timed out"));
+                            Vec::new()
+                        }
+                    }
+                });
+            let answers = futures::future::join_all(asks).await;
+            let _ = tx.send(WillRenameFilesResult {
+                request_id,
+                edits: merge_file_edits(answers),
+            });
+        });
+    }
+
+    /// `workspace/didRenameFiles` (#610) to every server whose filters match.
+    fn did_rename_files(&self, files: &[FileRename]) {
+        for (name, client, matched) in
+            self.file_op_audience(files, |c| c.did_rename_filters.as_ref())
+        {
+            let Some(uris) = file_rename_uris(&matched) else {
+                continue;
+            };
+            log_file::log(&format!(
+                "lsp[{name}] didRenameFiles: {} file(s)",
+                uris.len()
+            ));
+            tokio::spawn(async move {
+                let mut client = client.lock().await;
+                if let Err(e) = client.did_rename_files(&uris) {
+                    log_file::log(&format!("lsp[{name}] didRenameFiles error: {e:#}"));
+                }
+            });
+        }
+    }
+
     /// Prepare-rename (#254): always answers, because the rename prompt
     /// is deferred on this verdict.
     async fn request_prepare_rename(
@@ -4664,6 +4899,92 @@ impl WorkerState {
             });
         });
     }
+}
+
+/// One compiled `FileOperationFilter` (#610).
+#[derive(Debug)]
+struct FileOpFilter {
+    glob: globset::GlobMatcher,
+    /// `Some(true)` for folders only, `Some(false)` for files only.
+    folders: Option<bool>,
+}
+
+/// Compile a server's `fileOperations` registration. Filters for a scheme
+/// other than `file` never match croft's paths and are dropped; a glob that
+/// does not compile is dropped too, and a registration left with no filter
+/// is `None`, so that server is never asked.
+fn file_op_filters(
+    reg: Option<&lsp_types::FileOperationRegistrationOptions>,
+) -> Option<Arc<Vec<FileOpFilter>>> {
+    let filters: Vec<FileOpFilter> = reg?
+        .filters
+        .iter()
+        .filter(|f| f.scheme.as_deref().is_none_or(|s| s == "file"))
+        .filter_map(|f| {
+            let ignore_case = f
+                .pattern
+                .options
+                .as_ref()
+                .and_then(|o| o.ignore_case)
+                .unwrap_or(false);
+            let glob = globset::GlobBuilder::new(&f.pattern.glob)
+                .literal_separator(true)
+                .case_insensitive(ignore_case)
+                .build()
+                .ok()?
+                .compile_matcher();
+            let folders = f
+                .pattern
+                .matches
+                .as_ref()
+                .map(|m| matches!(m, lsp_types::FileOperationPatternKind::Folder));
+            Some(FileOpFilter { glob, folders })
+        })
+        .collect();
+    (!filters.is_empty()).then(|| Arc::new(filters))
+}
+
+/// Whether any filter matches `path`, a file or folder by `is_dir`. The glob
+/// is matched against the whole path, as VS Code's client does.
+fn file_op_matches(filters: &[FileOpFilter], path: &Path, is_dir: bool) -> bool {
+    filters
+        .iter()
+        .any(|f| f.folders.is_none_or(|folders| folders == is_dir) && f.glob.is_match(path))
+}
+
+fn file_rename_uris(files: &[FileRename]) -> Option<Vec<(Url, Url)>> {
+    files
+        .iter()
+        .map(|f| {
+            Some((
+                Url::from_file_path(&f.old).ok()?,
+                Url::from_file_path(&f.new).ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// Merge several servers' edits into one list per file, dropping an edit a
+/// second server repeats verbatim so it is not applied twice.
+fn merge_file_edits(
+    answers: Vec<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
+) -> Vec<(PathBuf, Vec<TextSpanEdit>)> {
+    let mut out: Vec<(PathBuf, Vec<TextSpanEdit>)> = Vec::new();
+    for (path, edits) in answers.into_iter().flatten() {
+        let slot = match out.iter().position(|(p, _)| *p == path) {
+            Some(i) => &mut out[i].1,
+            None => {
+                out.push((path, Vec::new()));
+                &mut out.last_mut().expect("just pushed").1
+            }
+        };
+        for e in edits {
+            if !slot.contains(&e) {
+                slot.push(e);
+            }
+        }
+    }
+    out
 }
 
 /// Normalise a `WorkspaceEdit` into per-file char-indexed spans. Handles both
@@ -5962,6 +6283,13 @@ fn build_client_capabilities() -> ClientCapabilities {
             diagnostic: Some(lsp_types::DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),
+            // An Explorer rename or move asks `willRenameFiles` first and
+            // applies the edit, then reports `didRenameFiles` (#610).
+            file_operations: Some(lsp_types::WorkspaceFileOperationsClientCapabilities {
+                will_rename: Some(true),
+                did_rename: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         // Declare `window.workDoneProgress` so servers stream `$/progress`
@@ -6496,6 +6824,8 @@ while True:
             supports_workspace_symbols: false,
             supports_rename: false,
             supports_prepare_rename: false,
+            will_rename_filters: None,
+            did_rename_filters: None,
             supports_formatting: false,
             on_type_triggers: None,
             supports_range_formatting: false,
@@ -8026,6 +8356,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8087,6 +8418,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8122,6 +8454,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8217,6 +8550,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8294,6 +8628,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8361,6 +8696,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8470,6 +8806,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8588,6 +8925,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8768,6 +9106,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -9012,6 +9351,7 @@ while True:
             semantic_refresh: Arc::new(AtomicBool::new(false)),
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            will_rename_listeners: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -9041,5 +9381,193 @@ while True:
             "the site is the call expression from fromRanges"
         );
         runtime.handle().clone().block_on(state.shutdown_all());
+    }
+
+    fn file_op_registration(
+        filters: Vec<(
+            Option<&str>,
+            &str,
+            Option<lsp_types::FileOperationPatternKind>,
+            bool,
+        )>,
+    ) -> lsp_types::FileOperationRegistrationOptions {
+        lsp_types::FileOperationRegistrationOptions {
+            filters: filters
+                .into_iter()
+                .map(
+                    |(scheme, glob, matches, ignore_case)| lsp_types::FileOperationFilter {
+                        scheme: scheme.map(str::to_string),
+                        pattern: lsp_types::FileOperationPattern {
+                            glob: glob.to_string(),
+                            matches,
+                            options: ignore_case.then_some(
+                                lsp_types::FileOperationPatternOptions {
+                                    ignore_case: Some(true),
+                                },
+                            ),
+                        },
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    /// The `fileOperations` filters pick which renames a server hears about
+    /// (#610): the glob is matched against the whole path, `**/*.rs` never
+    /// crosses into another extension, a folder-only filter ignores files,
+    /// and a filter for another scheme is dropped.
+    #[test]
+    fn file_op_filters_match_by_glob_kind_and_scheme() {
+        use lsp_types::FileOperationPatternKind as Kind;
+        let reg = file_op_registration(vec![
+            (Some("file"), "**/*.rs", Some(Kind::File), false),
+            (Some("file"), "**/src", Some(Kind::Folder), false),
+        ]);
+        let filters = file_op_filters(Some(&reg)).expect("two filters");
+        assert!(file_op_matches(&filters, Path::new("/w/src/foo.rs"), false));
+        assert!(!file_op_matches(
+            &filters,
+            Path::new("/w/src/foo.py"),
+            false
+        ));
+        // `*.rs` is for files; a folder named `x.rs` is not one.
+        assert!(!file_op_matches(&filters, Path::new("/w/x.rs"), true));
+        assert!(file_op_matches(&filters, Path::new("/w/src"), true));
+        assert!(!file_op_matches(&filters, Path::new("/w/src"), false));
+
+        let other_scheme = file_op_registration(vec![(Some("untitled"), "**/*", None, false)]);
+        assert!(
+            file_op_filters(Some(&other_scheme)).is_none(),
+            "a server with only non-file filters is never asked"
+        );
+        assert!(file_op_filters(None).is_none());
+
+        let folded = file_op_registration(vec![(None, "**/*.RS", None, true)]);
+        let filters = file_op_filters(Some(&folded)).expect("one filter");
+        assert!(file_op_matches(&filters, Path::new("/w/a.rs"), false));
+        assert!(
+            file_op_matches(&filters, Path::new("/w/a.rs"), true),
+            "no kind matches both"
+        );
+    }
+
+    /// Two servers answering with the same edit must not apply it twice.
+    #[test]
+    fn merged_rename_edits_drop_a_repeated_edit() {
+        let edit = |t: &str| TextSpanEdit {
+            start: (0, 4),
+            end: (0, 7),
+            new_text: t.to_string(),
+        };
+        let a = PathBuf::from("/w/lib.rs");
+        let b = PathBuf::from("/w/main.rs");
+        let merged = merge_file_edits(vec![
+            vec![(a.clone(), vec![edit("bar")])],
+            vec![
+                (a.clone(), vec![edit("bar"), edit("baz")]),
+                (b.clone(), vec![edit("x")]),
+            ],
+        ]);
+        assert_eq!(
+            merged,
+            vec![(a, vec![edit("bar"), edit("baz")]), (b, vec![edit("x")])]
+        );
+    }
+
+    /// End to end against a real server (#610): rust-analyzer registers
+    /// `willRename` filters, and renaming `foo.rs` answers with the edit that
+    /// turns `mod foo;` into `mod bar;`.
+    #[test]
+    fn rust_analyzer_answers_will_rename_files_with_the_mod_edit() {
+        if std::process::Command::new("rust-analyzer")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIPPED: rust-analyzer does not run here");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"wr\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let lib = root.join("src/lib.rs");
+        std::fs::write(&lib, "mod foo;\n").unwrap();
+        let foo = root.join("src/foo.rs");
+        std::fs::write(&foo, "pub fn f() {}\n").unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let (diag_tx, _diag_rx) = std_mpsc::channel();
+            let (prog_tx, _prog_rx) = std_mpsc::channel();
+            let mut client = LspClient::spawn(
+                &ServerConfig::rust_analyzer(),
+                &root,
+                build_client_capabilities(),
+                &[],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                diag_tx,
+                prog_tx,
+            )
+            .await
+            .expect("rust-analyzer handshakes");
+            let filters = file_op_filters(
+                client
+                    .capabilities()
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| w.file_operations.as_ref())
+                    .and_then(|f| f.will_rename.as_ref()),
+            )
+            .expect("rust-analyzer registers willRename filters");
+            assert!(file_op_matches(&filters, &foo, false));
+
+            let lib_uri = Url::from_file_path(&lib).unwrap();
+            client
+                .did_open(lib_uri, "rust", 1, "mod foo;\n".into())
+                .expect("didOpen");
+            let files = file_rename_uris(&[FileRename {
+                old: foo.clone(),
+                new: root.join("src/bar.rs"),
+                is_dir: false,
+            }])
+            .unwrap();
+            // The answer is empty until the workspace has loaded.
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let edits = loop {
+                let edit = client
+                    .will_rename_files(&files)
+                    .await
+                    .expect("willRenameFiles");
+                let edits = edit.map(|e| workspace_edits(&e)).unwrap_or_default();
+                if !edits.is_empty() || Instant::now() > deadline {
+                    break edits;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            };
+            let _ = client.shutdown().await;
+            assert_eq!(
+                edits,
+                vec![(
+                    lib.clone(),
+                    vec![TextSpanEdit {
+                        start: (0, 4),
+                        end: (0, 7),
+                        new_text: "bar".into(),
+                    }]
+                )]
+            );
+        });
     }
 }
