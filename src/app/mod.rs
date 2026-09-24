@@ -1510,6 +1510,26 @@ enum LaunchSlot {
     Add,
 }
 
+/// The BREAKPOINTS section of the debug tree (#250): a header and one row per
+/// breakpoint, or nothing when there are none.
+fn breakpoint_section_rows(count: usize) -> Vec<crate::widgets::run_debug::DebugRow> {
+    use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut rows = vec![DebugRow {
+        indent: 0,
+        kind: DebugRowKind::Header {
+            title: String::from("BREAKPOINTS"),
+        },
+    }];
+    rows.extend((0..count).map(|index| DebugRow {
+        indent: 1,
+        kind: DebugRowKind::Breakpoint { index },
+    }));
+    rows
+}
+
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
 /// task runs in a terminal pane, and the FinishedCommand sweep decides.
 struct PendingDebugLaunch {
@@ -15861,7 +15881,13 @@ impl App {
                     }
                 }
                 SidebarView::Remote => frame.render_widget(&mut self.remote, usable_area),
-                SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, usable_area),
+                SidebarView::RunDebug => {
+                    // Breakpoints change from many places (F9, the gutter,
+                    // the condition and logpoint editors); syncing here keeps
+                    // the list current without a refresh at each of them.
+                    self.sync_breakpoint_list();
+                    frame.render_widget(&mut self.run_debug, usable_area)
+                }
                 SidebarView::Extensions => frame.render_widget(&mut self.extensions, usable_area),
                 SidebarView::Testing => frame.render_widget(&mut self.testing, usable_area),
             }
@@ -20656,7 +20682,11 @@ impl App {
                 .feedback
                 .clone()
                 .unwrap_or_else(|| String::from("Running"));
-            return (true, status, Vec::new());
+            return (
+                true,
+                status,
+                breakpoint_section_rows(self.breakpoint_items().len()),
+            );
         }
         let mut rows = Vec::new();
         rows.push(DebugRow {
@@ -20729,6 +20759,8 @@ impl App {
             indent: 1,
             kind: DebugRowKind::WatchAdd,
         });
+        // Last, so `sync_breakpoint_list` can swap it without a rebuild.
+        rows.extend(breakpoint_section_rows(self.breakpoint_items().len()));
         let status = self
             .run_debug
             .feedback
@@ -22286,6 +22318,113 @@ impl App {
         self.run_debug.feedback_is_error = false;
         self.status =
             format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
+    }
+
+    /// Every breakpoint for the BREAKPOINTS list (#250), by file then line,
+    /// with its condition or log message.
+    fn breakpoint_items(&self) -> Vec<crate::widgets::run_debug::BreakpointItem> {
+        let mut paths: Vec<&PathBuf> = self.editor.breakpoints.keys().collect();
+        paths.sort();
+        let mut items = Vec::new();
+        for path in paths {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            for &line in &self.editor.breakpoints[path] {
+                let condition = self
+                    .editor
+                    .breakpoint_conditions
+                    .get(path)
+                    .and_then(|m| m.get(&line));
+                let log = self
+                    .editor
+                    .breakpoint_logs
+                    .get(path)
+                    .and_then(|m| m.get(&line));
+                let detail = match (log, condition) {
+                    (Some(msg), _) => Some(format!("log {msg}")),
+                    (None, Some(cond)) => Some(format!("if {cond}")),
+                    (None, None) => None,
+                };
+                items.push(crate::widgets::run_debug::BreakpointItem {
+                    path: path.clone(),
+                    line,
+                    label: format!("{name}:{line}"),
+                    detail,
+                });
+            }
+        }
+        items
+    }
+
+    /// Bring the panel's BREAKPOINTS list up to date, and the tree's section
+    /// with it while a session is shown. A no-op when nothing changed.
+    fn sync_breakpoint_list(&mut self) {
+        use crate::widgets::run_debug::DebugRowKind;
+        let items = self.breakpoint_items();
+        if items == self.run_debug.breakpoints {
+            return;
+        }
+        let n = items.len();
+        self.run_debug.breakpoints = items;
+        if self.run_debug.debug_active {
+            let rows = &mut self.run_debug.debug_rows;
+            if let Some(pos) = rows.iter().position(
+                |r| matches!(&r.kind, DebugRowKind::Header { title } if title == "BREAKPOINTS"),
+            ) {
+                rows.truncate(pos);
+            }
+            rows.extend(breakpoint_section_rows(n));
+        }
+    }
+
+    /// A click in the BREAKPOINTS list: jump to the breakpoint, or remove it
+    /// when the click landed on its `✕`.
+    fn breakpoint_list_click(&mut self, index: usize, remove: bool) {
+        let Some(bp) = self.run_debug.breakpoints.get(index).cloned() else {
+            return;
+        };
+        if remove {
+            self.remove_breakpoint_at(&bp.path, bp.line);
+        } else if let Err(e) = self.open_at(&bp.path, bp.line.saturating_sub(1), 0) {
+            self.status = format!("Could not open {}: {e}", bp.path.display());
+        }
+        self.sync_breakpoint_list();
+    }
+
+    /// Remove the breakpoint at `path:line` (1-based) with its condition or
+    /// log message, and push the file's breakpoints to every live session so
+    /// it stops binding mid-run too, as F9 does.
+    fn remove_breakpoint_at(&mut self, path: &Path, line: usize) {
+        if let Some(lines) = self.editor.breakpoints.get_mut(path) {
+            lines.remove(&line);
+            if lines.is_empty() {
+                self.editor.breakpoints.remove(path);
+            }
+        }
+        if let Some(m) = self.editor.breakpoint_conditions.get_mut(path) {
+            m.remove(&line);
+        }
+        if let Some(m) = self.editor.breakpoint_logs.get_mut(path) {
+            m.remove(&line);
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(path)
+            .map(|lines| self.editor.source_breakpoints(path, lines))
+            .unwrap_or_default();
+        let owned = path.to_path_buf();
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(&owned, &specs);
+        }
+        self.status = format!(
+            "Breakpoint removed from {}:{line}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
     }
 
     /// Shift+F5: stop debugging and tear the session down.
@@ -40063,6 +40202,10 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::RunDebug {
                     self.focus_pane(Pane::Tree);
+                    if let Some((index, remove)) = self.run_debug.breakpoint_at(m.column, m.row) {
+                        self.breakpoint_list_click(index, remove);
+                        return;
+                    }
                     if self.run_debug.debug_active {
                         if let Some(widx) = self.run_debug.watch_remove_at(m.column, m.row) {
                             self.remove_watch_expression(widx);

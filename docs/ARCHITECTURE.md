@@ -1142,6 +1142,8 @@ croft debugs several configurations at once (#310). `DebugSessions` holds them w
 
 **A member's own `preLaunchTask` is skipped**, with a status saying so. Parking a launch behind a task is a one-at-a-time mechanism, and a set of parked members would interleave unpredictably; the compound's OWN task still runs, and parks the whole member list.
 
+**The BREAKPOINTS list (#250) is rebuilt at render, not refreshed at each change.** Breakpoints change from F9, the gutter, the condition and logpoint editors and the failure-breakpoint arming, so the Run and Debug panel's list is synced from the editor's maps just before the panel draws (`sync_breakpoint_list`, a no-op when nothing changed). At rest it sits under the Run button; while a session is shown it is the tree's LAST section, so a change swaps that section in place rather than rebuilding the tree. A row click opens the file at the line; its `✕` removes the breakpoint with its condition or log message and pushes the file's remaining breakpoints to every session, as F9 does.
+
 ### dap/reaper.rs
 
 Sweeps orphaned vscode-js-debug processes left behind when croft crashes or force-quits without running `Drop` — both the server and its detached watchdog, which setsids into its own session and so survives a group-kill. It runs async at startup and after each session teardown.
