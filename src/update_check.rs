@@ -418,7 +418,11 @@ mod tests {
             "/Users/me/Cellar/notes/croft",
             "/Users/me/code/croft/target/release/croft",
         ] {
-            assert_eq!(install_source(Path::new(p)), InstallSource::SelfManaged, "{p}");
+            assert_eq!(
+                install_source(Path::new(p)),
+                InstallSource::SelfManaged,
+                "{p}"
+            );
         }
     }
 

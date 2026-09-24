@@ -49729,8 +49729,7 @@ fn a_homebrew_install_is_offered_brew_upgrade_not_a_self_update() {
             "9.9.9".into(),
         )));
         assert!(app.poll_update_watch());
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let buttons = app.update_toast.as_ref().unwrap().buttons.clone();
         assert!(

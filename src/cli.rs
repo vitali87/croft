@@ -1618,7 +1618,10 @@ mod tests {
     fn build_info_names_a_homebrew_install() {
         use crate::update_check::InstallSource;
         let brew = build_info_line(InstallSource::Homebrew);
-        assert!(brew.starts_with(VERBOSE_VERSION.trim_end_matches(')')), "{brew}");
+        assert!(
+            brew.starts_with(VERBOSE_VERSION.trim_end_matches(')')),
+            "{brew}"
+        );
         assert!(brew.ends_with(", installed with Homebrew)"), "{brew}");
         assert_eq!(build_info_line(InstallSource::SelfManaged), VERBOSE_VERSION);
     }
