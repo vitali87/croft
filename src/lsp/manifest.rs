@@ -30,6 +30,7 @@ use crate::lsp::install::{ArchiveKind, Provision};
 pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/core-languages/extension.toml"),
     include_str!("../../assets/extensions/pdf/extension.toml"),
+    include_str!("../../assets/extensions/codeql/extension.toml"),
     include_str!("../../assets/extensions/csv/extension.toml"),
     include_str!("../../assets/extensions/vim/extension.toml"),
     include_str!("../../assets/extensions/lsp-python/extension.toml"),
