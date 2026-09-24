@@ -1510,6 +1510,13 @@ enum LaunchSlot {
     Add,
 }
 
+/// Where the session at `index` sits once every index in `removed` has been
+/// taken out of the set: `None` if it was removed itself, otherwise shifted
+/// down by one for each removal below it (#567).
+fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
+    (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
+}
+
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
 /// task runs in a terminal pane, and the FinishedCommand sweep decides.
 struct PendingDebugLaunch {
@@ -20422,7 +20429,9 @@ impl App {
         let mut events = self.debug_sessions.take_focused_backlog();
         let mut background_ended: Vec<usize> = Vec::new();
         let mut background_output: Vec<String> = Vec::new();
-        let mut background_stopped: Option<String> = None;
+        // By index, not name: a compound can list one configuration twice,
+        // so two members can share a name.
+        let mut background_stopped: Option<usize> = None;
         for (index, named) in self.debug_sessions.iter_named_mut_indexed() {
             let drained = named.session.poll();
             if index == focused {
@@ -20445,7 +20454,7 @@ impl App {
                     DapEvent::Output { .. } => {}
                     other => {
                         if matches!(other, DapEvent::Stopped { .. }) {
-                            background_stopped.get_or_insert_with(|| named.name.clone());
+                            background_stopped.get_or_insert(index);
                         }
                         named.backlog.push(other);
                         if named.backlog.len() > BACKLOG_CAP {
@@ -20461,6 +20470,10 @@ impl App {
         }
         // Highest index first, so removing one does not move the next.
         let mut ended_names = Vec::new();
+        // Where the stopped member sits once the ended ones are gone: gone
+        // itself if it also ended, else shifted down past every removal below.
+        let background_stopped =
+            background_stopped.and_then(|i| index_after_removals(i, &background_ended));
         for index in background_ended.into_iter().rev() {
             if let Some(mut gone) = self.debug_sessions.remove(index) {
                 gone.session.disconnect();
@@ -20484,8 +20497,8 @@ impl App {
         // If the member being looked at is still running, show the stopped
         // one, as VS Code does; otherwise say so rather than steal the view
         // from a stop the user is already inspecting.
-        if let Some(name) = background_stopped
-            && let Some(index) = self.debug_sessions.index_of(&name)
+        if let Some(index) = background_stopped
+            && let Some(name) = self.debug_sessions.names().get(index).cloned()
         {
             let focused_is_stopped = self
                 .debug_sessions

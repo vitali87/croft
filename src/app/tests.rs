@@ -49517,6 +49517,67 @@ fn a_background_stop_moves_the_view_to_the_stopped_member() {
     app.debug_stop();
 }
 
+const STOPPED_EVENT: &str =
+    r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#;
+
+/// A compound can list one configuration twice, so two members can share a
+/// name: the member that stopped is the one shown, not the first of that name.
+#[test]
+fn a_stop_shows_the_member_that_stopped_even_when_names_repeat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(false));
+    app.debug_sessions
+        .push("A", stub_emitting(&[STOPPED_EVENT]));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(2);
+    poll_until(&mut app, |a| a.debug_sessions.focused_index() != 2);
+    assert_eq!(
+        app.debug_sessions.focused_index(),
+        1,
+        "the second A stopped"
+    );
+    app.debug_stop();
+}
+
+/// A member ending in the same poll shifts the stopped member's position; the
+/// view still lands on the member that stopped.
+#[test]
+fn a_stop_lands_on_the_right_member_when_an_earlier_one_ends_alongside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Gone",
+        stub_emitting(&[r#"{"seq":1,"type":"event","event":"terminated"}"#]),
+    );
+    app.debug_sessions
+        .push("Stops", stub_emitting(&[STOPPED_EVENT]));
+    app.debug_sessions.push("Watched", stub_member(false));
+    app.debug_sessions.focus(2);
+    poll_until(&mut app, |a| {
+        a.debug_sessions.len() == 2 && a.debug_sessions.focused_name() == Some("Stops")
+    });
+    assert_eq!(app.debug_sessions.names(), vec!["Stops", "Watched"]);
+    assert_eq!(app.debug_sessions.focused_name(), Some("Stops"));
+    app.debug_stop();
+}
+
+/// The stopped member's position once members that ended in the same poll
+/// are removed: shifted past removals below it, untouched by those above,
+/// and gone if it ended itself.
+#[test]
+fn index_after_removals_shifts_past_lower_removals_only() {
+    assert_eq!(index_after_removals(2, &[]), Some(2));
+    assert_eq!(index_after_removals(2, &[0]), Some(1));
+    assert_eq!(index_after_removals(3, &[0, 1]), Some(1));
+    assert_eq!(
+        index_after_removals(1, &[2, 3]),
+        Some(1),
+        "removals above do not move it"
+    );
+    assert_eq!(index_after_removals(2, &[0, 2]), None, "it ended itself");
+}
+
 /// The switch command cycles the members, and says so when there is only one.
 #[test]
 fn switch_debug_session_cycles_the_members() {

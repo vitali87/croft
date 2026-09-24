@@ -797,11 +797,6 @@ impl<S> DebugSessions<S> {
             .unwrap_or_default()
     }
 
-    /// The index of the session named `name`, if it is still in the set.
-    pub fn index_of(&self, name: &str) -> Option<usize> {
-        self.sessions.iter().position(|s| s.name == name)
-    }
-
     /// Drop every session without disconnecting - the old `= None`.
     pub fn clear(&mut self) {
         self.sessions.clear();
