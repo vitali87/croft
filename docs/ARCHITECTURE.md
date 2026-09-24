@@ -743,6 +743,8 @@ LSP lifecycle: pre-warm, spawn, `did_open`, `did_change`, `did_save`, completion
 
 **`documentHighlight`.** The occurrences of the symbol under a resting caret, fired by the app's 250ms idle tick. It is request-id and edit-seq gated, so a reply for a moved caret or edited text never paints.
 
+**Symbol tabs.** `Cmd+K V` (palette "Open Symbol in Its Own Tab", OUTLINE right-click, `Alt+Enter` in the workspace symbol picker) opens a normal `Editor` tab that holds the whole file plus a `symbol_view: Option<SymbolView>` (`src/symbol_range.rs`). Render, caret, scroll, edge deletes and line moves are clipped to the view's `first..=last` lines, so every editor feature works unchanged. Each tick `App::sync_symbol_views` mirrors the text between all tabs of one path (the tab whose `mutation_seq` moved is the source; a line-level splice via `Editor::mirror_lines_from` keeps undo and carets) unless the file is live in a collab session, then `SymbolView::follow` shifts the range through the edit, re-derives the name from the Tree-sitter outline when the first line changed, and re-anchors by name when the range is lost; a symbol that is gone closes its tab. `find_tab_with_path` skips symbol tabs so opening a file never lands in one; session capture keeps only orphaned symbol tabs, as plain file tabs.
+
 **Call hierarchy.** `prepareCallHierarchy` plus `incomingCalls`/`outgoingCalls`, one level per `Cmd+K H` / `Cmd+K Shift+H` invocation into the shared location picker. Incoming rows jump to the call expression, outgoing to the callee's definition.
 
 ### problem_matchers.rs

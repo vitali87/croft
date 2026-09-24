@@ -2714,6 +2714,13 @@ pub struct Editor {
     /// and show a thumb-tack glyph in place of the close `\u{2715}`. A pinned
     /// tab is never the replaceable preview slot (pinning clears `preview`).
     pub pinned: bool,
+    /// Set on a symbol tab (#369): the tab holds the whole file, as a split
+    /// does, but shows, scrolls and edits only this symbol's lines.
+    pub symbol_view: Option<crate::symbol_range::SymbolView>,
+    /// The `edit_seq` at which the App last mirrored this buffer against its
+    /// symbol-tab siblings. `None` = not (yet) mirrored with them, so this
+    /// buffer is a copy that may predate them and never a mirror source.
+    pub mirror_seq: Option<u64>,
     undo_stack: Vec<Snapshot>,
     /// States popped off `undo_stack` by `undo`, awaiting `redo`. Cleared by any
     /// fresh edit (`push_undo`) so a new edit branches history like VS Code.
@@ -2976,6 +2983,8 @@ impl Editor {
             bookmark_shadow: None,
             bookmark_sync_paused: false,
             edit_seq: 0,
+            symbol_view: None,
+            mirror_seq: None,
             ruler_search_cache: None,
             ruler_starts_cache: None,
             collab_synced_seq: 0,
@@ -4621,6 +4630,10 @@ impl Editor {
             // file in the previous one's debug state. The same-path reload
             // keeps them — the next stop rebuilds them anyway.
             self.inline_values.clear();
+            // A symbol tab reused for another file is an ordinary tab of
+            // that file: its clip and mirror state described the old one.
+            self.symbol_view = None;
+            self.mirror_seq = None;
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -6757,6 +6770,9 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        if self.at_symbol_edge(false) {
+            return;
+        }
         self.pin_on_edit();
         self.push_undo(EditKind::Backspace);
         // Between an empty auto-close pair, backspace eats both sides —
@@ -6787,7 +6803,7 @@ impl Editor {
     /// Backspace body without snapshotting or re-highlighting. Callers that
     /// batch multiple edits (multi-cursor) snapshot once and recompute once.
     fn backspace_raw(&mut self) {
-        if self.delete_selection_inner() {
+        if self.delete_selection_inner() || self.at_symbol_edge(false) {
             return;
         }
         if self.cursor_col > 0 {
@@ -6808,6 +6824,9 @@ impl Editor {
     }
 
     pub fn delete_forward(&mut self) {
+        if self.at_symbol_edge(true) {
+            return;
+        }
         self.pin_on_edit();
         self.push_undo(EditKind::DeleteForward);
         self.delete_forward_raw();
@@ -6816,7 +6835,7 @@ impl Editor {
 
     /// Forward-delete body without snapshotting or re-highlighting.
     fn delete_forward_raw(&mut self) {
-        if self.delete_selection_inner() {
+        if self.delete_selection_inner() || self.at_symbol_edge(true) {
             return;
         }
         let row = self.cursor_row;
@@ -6830,6 +6849,24 @@ impl Editor {
             let next = self.lines.remove(row + 1);
             self.lines[row].push_str(&next);
             self.mark_buffer_changed();
+        }
+    }
+
+    /// On a symbol tab, true when a bare Backspace (`forward` false) or
+    /// Delete would join the symbol's first or last line with a line outside
+    /// the tab: the caret sits on the clip's first character or after its
+    /// last, with no selection to delete instead.
+    fn at_symbol_edge(&self, forward: bool) -> bool {
+        let Some((first, end)) = self.symbol_clip() else {
+            return false;
+        };
+        if self.selection.is_some_and(|s| s.has_area()) {
+            return false;
+        }
+        if forward {
+            self.cursor_row + 1 == end && self.cursor_col >= self.line_char_len(end - 1)
+        } else {
+            self.cursor_row == first && self.cursor_col == 0
         }
     }
 
@@ -8858,6 +8895,64 @@ impl Editor {
         self.recompute_highlights();
     }
 
+    /// Take a sibling's text as one undo step, replacing only the lines that
+    /// differ so a caret below the change moves with its line rather than
+    /// staying on a row number that now holds different text.
+    pub fn mirror_lines_from(&mut self, new_lines: &[String]) {
+        if self.lines == new_lines || new_lines.is_empty() {
+            return;
+        }
+        let prefix = self
+            .lines
+            .iter()
+            .zip(new_lines)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let room = self.lines.len().min(new_lines.len()) - prefix;
+        let suffix = self
+            .lines
+            .iter()
+            .rev()
+            .zip(new_lines.iter().rev())
+            .take(room)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let old_end = self.lines.len() - suffix;
+        let new_end = new_lines.len() - suffix;
+        self.pin_on_edit();
+        self.push_undo(EditKind::Replace);
+        self.clear_selection();
+        self.lines
+            .splice(prefix..old_end, new_lines[prefix..new_end].iter().cloned());
+        if self.cursor_row >= old_end {
+            self.cursor_row = self.cursor_row + new_end - old_end;
+        }
+        self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
+    /// Start a fresh tab from a sibling's unsaved text, without an undo step:
+    /// the tab never held the disk text as far as the user can tell, so
+    /// undo must not walk back to it.
+    pub fn seed_unsaved(&mut self, lines: Vec<String>, dirty: bool) {
+        self.lines = lines;
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.mark_buffer_changed();
+        self.dirty = dirty;
+        self.recompute_highlights();
+    }
+
+    /// Record that this buffer matches the file on disk: a sibling holding
+    /// the same text was just saved (or undone back to its saved state).
+    pub fn mark_clean_like_sibling(&mut self) {
+        self.dirty = false;
+        self.mark_synced_with_disk();
+    }
+
     fn lines_slice_text(&self, start: usize, count: usize) -> String {
         if count == 0 || start >= self.lines.len() {
             return String::new();
@@ -9009,7 +9104,9 @@ impl Editor {
     /// No-op when the block already touches the last line.
     pub fn move_lines_down(&mut self) {
         let (start, end) = self.selected_or_cursor_row_range();
-        if end + 1 >= self.lines.len() {
+        // A symbol tab's block stops at the symbol's last line.
+        let limit = self.symbol_clip().map_or(self.lines.len(), |(_, e)| e);
+        if end + 1 >= limit {
             return;
         }
         self.push_undo(EditKind::MoveLines);
@@ -9028,7 +9125,7 @@ impl Editor {
     /// when the block already touches the first line.
     pub fn move_lines_up(&mut self) {
         let (start, end) = self.selected_or_cursor_row_range();
-        if start == 0 {
+        if start <= self.symbol_clip().map_or(0, |(first, _)| first) {
             return;
         }
         self.push_undo(EditKind::MoveLines);
@@ -10266,20 +10363,79 @@ impl Editor {
         }
     }
 
+    /// A symbol tab's visible lines as `(first, end)`, `end` exclusive,
+    /// kept inside the buffer. `None` on an ordinary tab.
+    pub fn symbol_clip(&self) -> Option<(usize, usize)> {
+        let v = self.symbol_view.as_ref()?;
+        let end = (v.last + 1).min(self.lines.len()).max(1);
+        Some((v.first.min(end - 1), end))
+    }
+
+    /// The clip in the scrollbar's units: content rows above it, and rows
+    /// in it. Visual rows when wrapping, else lines plus comment-box rows.
+    fn clip_content_rows(&self, width: usize, wrap: bool) -> Option<(usize, usize)> {
+        let (first, end) = self.symbol_clip()?;
+        let rows = |a: usize, b: usize| -> usize {
+            if wrap {
+                (a..b).map(|l| self.group_visual_rows(l, width)).sum()
+            } else {
+                (b - a) + self.box_rows_between(a, b, width)
+            }
+        };
+        Some((rows(0, first), rows(first, end)))
+    }
+
+    /// Keep a symbol tab's caret, selections and viewport on its symbol's
+    /// lines. Positions above the clip snap to its first character, below
+    /// it to its last, so every motion that would leave the symbol stops at
+    /// its edge instead.
+    pub fn clamp_to_symbol_view(&mut self) {
+        let Some((first, end)) = self.symbol_clip() else {
+            return;
+        };
+        let last = end - 1;
+        let last_len = self.line_char_len(last);
+        let clamp = |p: (usize, usize)| -> (usize, usize) {
+            if p.0 < first {
+                (first, 0)
+            } else if p.0 > last {
+                (last, last_len)
+            } else {
+                p
+            }
+        };
+        (self.cursor_row, self.cursor_col) = clamp((self.cursor_row, self.cursor_col));
+        let clamp_sel = |sel: &mut EditorSelection| {
+            sel.anchor = clamp(sel.anchor);
+            sel.head = clamp(sel.head);
+        };
+        if let Some(sel) = self.selection.as_mut() {
+            clamp_sel(sel);
+        }
+        self.carets.iter_mut().for_each(clamp_sel);
+        if self.scroll < first || self.scroll > last {
+            self.scroll = self.scroll.clamp(first, last);
+            self.scroll_sub = 0;
+        }
+    }
+
     pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
         let viewport = self.text_rows();
         if self.wrap_enabled() {
             let width = self.visible_text_width();
-            let total = self.total_visual_rows(width);
+            let (base, total) = match self.clip_content_rows(width, true) {
+                Some(clip) => clip,
+                None => (0, self.total_visual_rows(width)),
+            };
             let Some(metrics) = scrollbar::vertical_metrics(
                 self.last_scrollbar,
                 total,
                 viewport,
-                self.top_visual_row(width),
+                self.top_visual_row(width).saturating_sub(base),
             ) else {
                 return false;
             };
-            self.wrap_set_top(scrollbar::scroll_for_y(metrics, y));
+            self.wrap_set_top(base + scrollbar::scroll_for_y(metrics, y));
             return true;
         }
         // Same content length the render sized the bar with: lines plus
@@ -10287,16 +10443,19 @@ impl Editor {
         // of a short file with a tall navigator comment dead (metrics said
         // "no overflow") and a long file's thumb run away from the pointer.
         let bw = self.visible_text_width();
-        let content = self.lines.len() + self.box_rows_between(0, self.lines.len(), bw);
+        let (base, content) = self.clip_content_rows(bw, false).unwrap_or((
+            0,
+            self.lines.len() + self.box_rows_between(0, self.lines.len(), bw),
+        ));
         let Some(metrics) = scrollbar::vertical_metrics(
             self.last_scrollbar,
             content,
             viewport,
-            self.nonwrap_top_content_row(),
+            self.nonwrap_top_content_row().saturating_sub(base),
         ) else {
             return false;
         };
-        self.nonwrap_set_top(scrollbar::scroll_for_y(metrics, y));
+        self.nonwrap_set_top(base + scrollbar::scroll_for_y(metrics, y));
         true
     }
 
@@ -11984,6 +12143,7 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
 
 impl Widget for &mut Editor {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        self.clamp_to_symbol_view();
         let block_style = if self.focused {
             Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
@@ -12169,9 +12329,16 @@ impl Widget for &mut Editor {
             let wide = inner.width.saturating_sub(gutter_width + 2) as usize;
             // Overflow at the wide width forces the vbar, which narrows the
             // column and only ever adds rows, so the decision is stable.
-            let vbar = self.total_visual_rows(wide) > text_height;
+            let vbar = match self.clip_content_rows(wide, true) {
+                Some((_, rows)) => rows > text_height,
+                None => self.total_visual_rows(wide) > text_height,
+            };
             let tw = if vbar { wide.saturating_sub(1) } else { wide };
-            let content_rows = self.total_visual_rows(tw);
+            // A symbol tab measures only its clip: `base` rows sit above it.
+            let (base, content_rows) = match self.clip_content_rows(tw, true) {
+                Some(clip) => clip,
+                None => (0, self.total_visual_rows(tw)),
+            };
 
             // Keep the cursor's visual row inside the viewport.
             if text_height > 0 {
@@ -12182,14 +12349,16 @@ impl Widget for &mut Editor {
                 } else if cursor_vrow >= top + text_height {
                     top = cursor_vrow + 1 - text_height;
                 }
-                top = top.min(content_rows.saturating_sub(text_height));
+                top = top
+                    .min(base + content_rows.saturating_sub(text_height))
+                    .max(base);
                 self.set_top_to_visual_row(top, tw);
             }
             let metrics = scrollbar::vertical_metrics(
                 scrollbar_area,
                 content_rows,
                 text_height,
-                self.top_visual_row(tw),
+                self.top_visual_row(tw).saturating_sub(base),
             );
             (tw as u16, metrics)
         } else {
@@ -12224,18 +12393,25 @@ impl Widget for &mut Editor {
                     }
                 }
             }
+            if let Some((first, end)) = self.symbol_clip() {
+                self.scroll = self.scroll.clamp(first, end - 1);
+            }
             if self.scroll != scroll_before {
                 self.scroll_sub = 0;
             }
             let bw = inner.width.saturating_sub(gutter_width + 3) as usize;
-            let box_rows = self.box_rows_between(0, self.lines.len(), bw);
+            let (base, content) = self.clip_content_rows(bw, false).unwrap_or((
+                0,
+                self.lines.len() + self.box_rows_between(0, self.lines.len(), bw),
+            ));
             let metrics = scrollbar::vertical_metrics(
                 scrollbar_area,
-                self.lines.len() + box_rows,
+                content,
                 text_height,
                 // Content-row top: lines above plus box rows above plus the
                 // rows scrolled into the top line's own box.
-                self.scroll + self.box_rows_between(0, self.scroll, bw) + self.scroll_sub,
+                (self.scroll + self.box_rows_between(0, self.scroll, bw) + self.scroll_sub)
+                    .saturating_sub(base),
             );
             let sw = u16::from(metrics.is_some());
             let tw = inner.width.saturating_sub(gutter_width + 2 + sw);
@@ -12297,11 +12473,13 @@ impl Widget for &mut Editor {
                 }
             }
         };
+        // A symbol tab stops painting at its symbol's last line.
+        let clip_end = self.symbol_clip().map_or(self.lines.len(), |(_, end)| end);
         if wrap {
             let tw = text_width as usize;
             let mut line = self.scroll;
             let mut skip = self.scroll_sub;
-            while line < self.lines.len() && visual_rows.len() < text_height {
+            while line < clip_end && visual_rows.len() < text_height {
                 if self.is_line_hidden(line) {
                     line += 1;
                     continue;
@@ -12333,7 +12511,7 @@ impl Widget for &mut Editor {
             // = rows into its comment box, so the viewport can start
             // mid-box exactly like the wrap path.
             let mut skip = self.scroll_sub;
-            while line < self.lines.len() && visual_rows.len() < text_height {
+            while line < clip_end && visual_rows.len() < text_height {
                 if !self.is_line_hidden(line) {
                     if skip == 0 && visual_rows.len() < text_height {
                         visual_rows.push(VisRow::Text {
@@ -14574,7 +14752,17 @@ impl EditorTabs {
     /// literal equality or by canonicalised equality (so symlink + relative
     /// path aliases dedupe to the same tab). Returns `None` if no tab is
     /// currently holding that file.
+    ///
+    /// A symbol tab (#369) is not "the file's tab": opening, previewing or
+    /// selecting a file must land on a tab showing all of it, so this skips
+    /// them. [`Self::find_any_tab_with_path`] includes them.
     pub fn find_tab_with_path(&self, target: &Path) -> Option<usize> {
+        self.find_tab_matching(target, |e| e.symbol_view.is_none())
+    }
+
+    /// Like [`Self::find_tab_with_path`], symbol tabs included: for closing
+    /// every tab of a file, or editing whichever buffer holds it.
+    pub fn find_any_tab_with_path(&self, target: &Path) -> Option<usize> {
         self.find_tab_matching(target, |_| true)
     }
 
@@ -14586,7 +14774,9 @@ impl EditorTabs {
         path: &Path,
         edits: &[TextSpanEdit],
     ) -> Option<usize> {
-        let idx = self.find_tab_with_path(path)?;
+        let idx = self
+            .find_tab_with_path(path)
+            .or_else(|| self.find_any_tab_with_path(path))?;
         Some(self.editors[idx].apply_span_edits(edits))
     }
 
@@ -14973,7 +15163,9 @@ impl EditorTabs {
         // editable view of it, so skip diffs here: Enter on a diff (or a
         // double-click) opens the real file beside the diff rather than just
         // re-selecting the diff tab.
-        if let Some(idx) = self.find_tab_matching(path, |e| e.diff.is_none()) {
+        if let Some(idx) =
+            self.find_tab_matching(path, |e| e.diff.is_none() && e.symbol_view.is_none())
+        {
             self.editors[idx].preview = false;
             self.select(idx);
             return Ok(());
@@ -15306,7 +15498,10 @@ pub(crate) fn disambiguated_tab_labels(editors: &[Editor]) -> Vec<String> {
     let mut groups: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     for (i, e) in editors.iter().enumerate() {
+        // A symbol tab's label already differs from its file's tab, and the
+        // two share a path, so no parent suffix could tell them apart.
         if e.diff.is_none()
+            && e.symbol_view.is_none()
             && let Some(name) = e.path.as_deref().and_then(|p| p.file_name())
         {
             groups
@@ -15450,6 +15645,9 @@ fn tab_label(e: &Editor) -> String {
     // the tab says which flavour of the file it is showing.
     let name = if e.merge.is_some() {
         format!("{name} (merge)")
+    } else if let Some(view) = e.symbol_view.as_ref() {
+        // A symbol tab (#369) leads with its symbol; the file says where.
+        format!("{} \u{b7} {name}", view.name)
     } else {
         name
     };

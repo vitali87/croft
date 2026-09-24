@@ -828,7 +828,7 @@ impl Command {
             Command::OpenWorkspaceOnSshHost => "",
             Command::ScrubHistory => "",
             Command::FleetRun => "",
-            Command::OpenAsSymbolTab => "",
+            Command::OpenAsSymbolTab => "Cmd+K V",
             Command::LoadReviewThreads => "",
             Command::ToggleSessionRecording => "",
             Command::NewWorktreeLane => "Cmd+K Shift+L",
