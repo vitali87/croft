@@ -49559,3 +49559,25 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+/// A test-built App never reads the developer's own settings layers: a
+/// preference in the real `config.json` (say, the TIMELINE hidden) must not
+/// steer app tests. Workspace layers under the test root still load.
+#[test]
+fn a_test_built_app_reads_no_user_settings_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    let user_dir = crate::prefs::config_dir();
+    let leaked: Vec<_> = app
+        .settings_chain
+        .iter()
+        .filter(|p| p.starts_with(&user_dir))
+        .collect();
+    assert!(leaked.is_empty(), "user layers read under test: {leaked:?}");
+    assert!(
+        app.settings_chain
+            .contains(&crate::config_layers::workspace_config_path(tmp.path())),
+        "the workspace layer must still load: {:?}",
+        app.settings_chain
+    );
+}

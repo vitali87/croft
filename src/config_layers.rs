@@ -124,11 +124,14 @@ pub fn user_local_config_path() -> PathBuf {
 /// Load the full merged view for a workspace (or just the user layers when
 /// `workspace_root` is `None`).
 pub fn load_merged(workspace_root: Option<&Path>) -> MergedConfig {
-    load_merged_from(
-        &crate::prefs::config_dir(),
-        workspace_root,
-        current_platform(),
-    )
+    // Under test the user layers point at a per-process dir nothing creates:
+    // the developer's real config.json must never steer app tests.
+    let user_dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("croft-test-config-{}", std::process::id()))
+    } else {
+        crate::prefs::config_dir()
+    };
+    load_merged_from(&user_dir, workspace_root, current_platform())
 }
 
 /// The platform key active on this build, matching the scope-block names.
