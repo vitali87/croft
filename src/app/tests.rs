@@ -49721,6 +49721,9 @@ tool = "go"
 
 #[test]
 fn provisioning_outcomes_are_logged_to_the_remote_output_channel() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // #364: a host that gets croft through provisioning says so in OUTPUT >
     // Remote, success and failure alike, with the reason on failure.
     let home = tempfile::tempdir().unwrap();
