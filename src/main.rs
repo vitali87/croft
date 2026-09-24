@@ -72,6 +72,7 @@ mod session_state;
 mod sheet;
 mod shell_integration;
 mod snippets;
+mod sarif;
 mod sqlite_view;
 mod svg;
 mod symbol_range;
