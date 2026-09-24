@@ -49732,6 +49732,9 @@ fn pr_screen(app: &mut App) -> String {
 
 #[test]
 fn a_pr_review_tab_lists_files_checks_and_a_summary() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // #365: the PULL REQUEST tab shows every changed file with +n -m, the
     // checks, and a summary line.
     let home = tempfile::tempdir().unwrap();
@@ -49756,6 +49759,9 @@ fn a_pr_review_tab_lists_files_checks_and_a_summary() {
 
 #[test]
 fn space_marks_a_file_viewed_and_it_persists() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
@@ -49783,6 +49789,9 @@ fn space_marks_a_file_viewed_and_it_persists() {
 
 #[test]
 fn enter_opens_the_files_diff_and_esc_leaves_review() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
