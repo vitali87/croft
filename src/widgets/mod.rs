@@ -1,5 +1,6 @@
 pub mod branch_picker;
 pub mod captures;
+pub mod codeql;
 pub mod command_palette;
 pub mod commit_graph;
 pub mod completion_popup;
