@@ -1116,21 +1116,28 @@ mod android_trash {
 /// (same name) returns Ok with the original path unchanged so the user
 /// can hit Enter on the prompt without typing.
 pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
+    let target = rename_target(parent, old_path, new_name)?;
+    if target != old_path {
+        std::fs::rename(old_path, &target)?;
+    }
+    Ok(target)
+}
+
+/// Where [`rename_in`] would put `old_path`, with the same validation and
+/// without touching the disk, so a caller can ask language servers about
+/// the rename before it happens (#610).
+pub fn rename_target(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
     let trimmed = new_name.trim();
     if let Err(msg) = validate_new_name(trimmed) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     }
     let target = parent.join(trimmed);
-    if target == old_path {
-        return Ok(target);
-    }
-    if target.exists() {
+    if target != old_path && target.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("{} already exists", target.display()),
         ));
     }
-    std::fs::rename(old_path, &target)?;
     Ok(target)
 }
 

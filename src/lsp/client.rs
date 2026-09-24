@@ -1044,6 +1044,25 @@ impl LspClient {
             .context("rename")
     }
 
+    /// `workspace/willRenameFiles` (#610): the edit a server wants applied
+    /// before `files` move, typically the imports that name them.
+    pub async fn will_rename_files(
+        &mut self,
+        files: Vec<lsp_types::FileRename>,
+    ) -> Result<Option<WorkspaceEdit>> {
+        self.server
+            .will_rename_files(lsp_types::RenameFilesParams { files })
+            .await
+            .context("willRenameFiles")
+    }
+
+    /// `workspace/didRenameFiles` (#610): tell the server the move happened.
+    pub fn did_rename_files(&mut self, files: Vec<lsp_types::FileRename>) -> Result<()> {
+        self.server
+            .did_rename_files(lsp_types::RenameFilesParams { files })
+            .context("didRenameFiles")
+    }
+
     /// `textDocument/prepareRename`: validate the position and get the
     /// exact renameable range / placeholder before prompting (#254). An
     /// `Err` carries the server's own refusal message — the fail-fast

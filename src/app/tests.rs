@@ -49621,3 +49621,85 @@ fn live_run_lands_a_real_run_on_the_tab() {
     );
     assert!(app.status.starts_with("Live Run: ok"), "{}", app.status);
 }
+
+// ---- Explorer moves ask the servers first (#610) ----
+
+#[test]
+fn a_file_move_applies_the_servers_edits_before_renaming() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("util.py"), "def f(): pass\n").unwrap();
+    std::fs::write(root.join("main.py"), "import util\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    let pending = PendingFileMove {
+        request_id: 7,
+        op: FileMove::Rename {
+            parent: root.clone(),
+            old: root.join("util.py"),
+            new_name: String::from("helpers.py"),
+        },
+        renames: vec![crate::lsp::manager::FileRenameOp {
+            old: root.join("util.py"),
+            new: root.join("helpers.py"),
+            is_dir: false,
+        }],
+        deadline: std::time::Instant::now(),
+    };
+    let edits = vec![(
+        root.join("main.py"),
+        vec![crate::widgets::editor::TextSpanEdit {
+            start: (0, 7),
+            end: (0, 11),
+            new_text: String::from("helpers"),
+        }],
+    )];
+    app.finish_file_move(pending, edits);
+    assert!(root.join("helpers.py").exists(), "the file moved");
+    assert!(!root.join("util.py").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("main.py")).unwrap(),
+        "import helpers\n",
+        "the import followed it"
+    );
+    assert!(
+        app.status.contains("references updated in 1 file"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn a_pending_move_goes_ahead_at_its_deadline_without_an_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "x").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.pending_file_move = Some(PendingFileMove {
+        request_id: u64::MAX,
+        op: FileMove::Rename {
+            parent: root.clone(),
+            old: root.join("a.txt"),
+            new_name: String::from("b.txt"),
+        },
+        renames: Vec::new(),
+        deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+    });
+    assert!(app.tick_file_moves());
+    assert!(app.pending_file_move.is_none());
+    assert!(
+        root.join("b.txt").exists(),
+        "a silent server cannot block the move"
+    );
+}
+
+#[test]
+fn rename_target_validates_without_touching_the_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = tmp.path().join("a.txt");
+    std::fs::write(&old, "x").unwrap();
+    std::fs::write(tmp.path().join("taken.txt"), "y").unwrap();
+    let target = crate::widgets::file_tree::rename_target(tmp.path(), &old, "b.txt").unwrap();
+    assert_eq!(target, tmp.path().join("b.txt"));
+    assert!(old.exists(), "nothing moved yet");
+    assert!(crate::widgets::file_tree::rename_target(tmp.path(), &old, "taken.txt").is_err());
+}

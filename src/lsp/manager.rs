@@ -258,6 +258,23 @@ pub struct RenameResult {
     pub edits: Option<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
 }
 
+/// One Explorer rename or move, as the servers see it (#610).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRenameOp {
+    pub old: PathBuf,
+    pub new: PathBuf,
+    pub is_dir: bool,
+}
+
+/// The servers' combined answer to `willRenameFiles` (#610). Always sent,
+/// so the pending move never waits on a server that is not interested.
+#[derive(Debug)]
+pub struct WillRenameFilesResult {
+    pub request_id: u64,
+    /// Per-file, char-indexed spans to apply before the move.
+    pub edits: Vec<(PathBuf, Vec<TextSpanEdit>)>,
+}
+
 /// A `textDocument/prepareRename` verdict (#254). Always answered — the
 /// rename prompt is waiting on it. `unsupported` routes the app to the
 /// plain word-under-cursor prompt; `error` carries the server's own
@@ -765,6 +782,13 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestWillRenameFiles {
+        request_id: u64,
+        renames: Vec<FileRenameOp>,
+    },
+    DidRenameFiles {
+        renames: Vec<FileRenameOp>,
+    },
     RequestFormatting {
         request_id: u64,
         path: PathBuf,
@@ -826,6 +850,8 @@ struct LangCapabilitySupport {
     formatting: HashMap<Language, bool>,
     code_action: HashMap<Language, bool>,
     call_hierarchy: HashMap<Language, bool>,
+    /// Whether a server for the language wants `willRenameFiles` (#610).
+    will_rename: HashMap<Language, bool>,
     /// Concatenated on-type trigger characters per language (#254);
     /// a missing entry means "not probed yet".
     on_type_triggers: HashMap<Language, String>,
@@ -857,6 +883,7 @@ pub struct LspManager {
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
     rename_rx: std_mpsc::Receiver<RenameResult>,
     prepare_rename_rx: std_mpsc::Receiver<PrepareRenameResult>,
+    will_rename_files_rx: std_mpsc::Receiver<WillRenameFilesResult>,
     format_rx: std_mpsc::Receiver<FormatResult>,
     on_type_rx: std_mpsc::Receiver<FormatResult>,
     code_action_rx: std_mpsc::Receiver<CodeActionResult>,
@@ -913,6 +940,7 @@ impl LspManager {
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
         let (rename_tx, rename_rx) = std_mpsc::channel();
         let (prepare_rename_tx, prepare_rename_rx) = std_mpsc::channel();
+        let (will_rename_files_tx, will_rename_files_rx) = std_mpsc::channel();
         let (format_tx, format_rx) = std_mpsc::channel();
         let (on_type_tx, on_type_rx) = std_mpsc::channel();
         let (code_action_tx, code_action_rx) = std_mpsc::channel();
@@ -967,6 +995,7 @@ impl LspManager {
                 workspace_symbols: ws_symbols_tx,
                 rename: rename_tx,
                 prepare_rename: prepare_rename_tx,
+                will_rename_files: will_rename_files_tx,
                 formatting: format_tx,
                 on_type_formatting: on_type_tx,
                 code_action: code_action_tx,
@@ -1003,6 +1032,7 @@ impl LspManager {
             ws_symbols_rx,
             rename_rx,
             prepare_rename_rx,
+            will_rename_files_rx,
             format_rx,
             on_type_rx,
             code_action_rx,
@@ -1484,6 +1514,15 @@ impl LspManager {
 
     /// Whether the server for `lang` implements call hierarchy. `None` means
     /// no server has reported yet. Drives the right-click menu rows.
+    /// Whether any running server wants `willRenameFiles` (#610). When none
+    /// does, an Explorer move runs at once instead of waiting on an answer
+    /// that can only be empty.
+    pub fn any_server_wants_file_renames(&self) -> bool {
+        self.capability_support
+            .lock()
+            .is_ok_and(|s| s.will_rename.values().any(|w| *w))
+    }
+
     pub fn language_supports_call_hierarchy(&self, lang: Language) -> Option<bool> {
         self.capability_support
             .lock()
@@ -1580,6 +1619,28 @@ impl LspManager {
 
     pub fn drain_rename(&self) -> Option<RenameResult> {
         self.rename_rx.try_recv().ok()
+    }
+
+    /// Ask every interested server for its edit before `renames` happen
+    /// (#610). Always answered, with no edits when no server cares, so the
+    /// caller can wait on it.
+    pub fn request_will_rename_files(&mut self, renames: Vec<FileRenameOp>) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestWillRenameFiles {
+            request_id: id,
+            renames,
+        });
+        id
+    }
+
+    pub fn drain_will_rename_files(&self) -> Option<WillRenameFilesResult> {
+        self.will_rename_files_rx.try_recv().ok()
+    }
+
+    /// Tell interested servers that `renames` happened (#610).
+    pub fn did_rename_files(&mut self, renames: Vec<FileRenameOp>) {
+        let _ = self.cmd_tx.send(Cmd::DidRenameFiles { renames });
     }
 
     pub fn request_formatting(&mut self, path: PathBuf, tab_size: u32, insert_spaces: bool) -> u64 {
@@ -1827,6 +1888,10 @@ struct ManagedClient {
     supports_document_link: bool,
     supports_folding_range: bool,
     supports_document_color: bool,
+    /// The paths this server wants `willRenameFiles` / `didRenameFiles`
+    /// for (#610); `None` when it does not advertise the operation.
+    will_rename: Option<Arc<crate::lsp::file_ops::FileOpFilters>>,
+    did_rename: Option<Arc<crate::lsp::file_ops::FileOpFilters>>,
 }
 
 /// Servers are keyed by language AND the file's project root, not language
@@ -1890,6 +1955,7 @@ struct ResultSenders {
     workspace_symbols: std_mpsc::Sender<WorkspaceSymbolsResult>,
     rename: std_mpsc::Sender<RenameResult>,
     prepare_rename: std_mpsc::Sender<PrepareRenameResult>,
+    will_rename_files: std_mpsc::Sender<WillRenameFilesResult>,
     formatting: std_mpsc::Sender<FormatResult>,
     on_type_formatting: std_mpsc::Sender<FormatResult>,
     code_action: std_mpsc::Sender<CodeActionResult>,
@@ -2215,6 +2281,11 @@ async fn worker_loop(
                     .request_rename(request_id, path, line, character, new_name, &tx.rename)
                     .await
             }
+            Cmd::RequestWillRenameFiles {
+                request_id,
+                renames,
+            } => state.request_will_rename_files(request_id, renames, &tx.will_rename_files),
+            Cmd::DidRenameFiles { renames } => state.did_rename_files(renames),
             Cmd::RequestPrepareRename {
                 request_id,
                 path,
@@ -2454,6 +2525,19 @@ impl WorkerState {
                             folding_range_supported(&caps.folding_range_provider);
                         let supports_document_color =
                             color_provider_supported(&caps.color_provider);
+                        let file_ops = caps
+                            .workspace
+                            .as_ref()
+                            .and_then(|w| w.file_operations.as_ref());
+                        let compile = |reg: Option<
+                            &lsp_types::FileOperationRegistrationOptions,
+                        >| {
+                            reg.map(|r| {
+                                Arc::new(crate::lsp::file_ops::FileOpFilters::from_registration(r))
+                            })
+                        };
+                        let will_rename = compile(file_ops.and_then(|f| f.will_rename.as_ref()));
+                        let did_rename = compile(file_ops.and_then(|f| f.did_rename.as_ref()));
                         log_file::log(&format!(
                             "lsp[{}] spawned, root={} supports_completion={supports} supports_signature_help={supports_signature_help} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
                             config.name,
@@ -2494,6 +2578,8 @@ impl WorkerState {
                             supports_document_link,
                             supports_folding_range,
                             supports_document_color,
+                            will_rename,
+                            did_rename,
                         });
                     }
                     Err(e) => {
@@ -2536,6 +2622,9 @@ impl WorkerState {
                 }
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
+                support
+                    .will_rename
+                    .insert(lang, spawned.iter().any(|c| c.will_rename.is_some()));
             }
             // The first pull (#533). A server that answers workspace
             // diagnostics reports on files no editor has opened, and firing
@@ -4372,6 +4461,79 @@ impl WorkerState {
         });
     }
 
+    /// The servers under a root that holds one of `renames` and whose
+    /// filters accept it, paired with the renames each one asked about.
+    fn file_op_clients(
+        &self,
+        renames: &[FileRenameOp],
+        pick: impl Fn(&ManagedClient) -> Option<&Arc<crate::lsp::file_ops::FileOpFilters>>,
+    ) -> Vec<(
+        String,
+        Arc<TokioMutex<LspClient>>,
+        Vec<lsp_types::FileRename>,
+    )> {
+        let mut out = Vec::new();
+        for ((_, root), clients) in &self.clients {
+            for c in clients {
+                let Some(filters) = pick(c) else {
+                    continue;
+                };
+                let files: Vec<lsp_types::FileRename> = renames
+                    .iter()
+                    .filter(|r| r.old.starts_with(root) && filters.matches(&r.old, r.is_dir))
+                    .filter_map(|r| {
+                        Some(lsp_types::FileRename {
+                            old_uri: Url::from_file_path(&r.old).ok()?.to_string(),
+                            new_uri: Url::from_file_path(&r.new).ok()?.to_string(),
+                        })
+                    })
+                    .collect();
+                if !files.is_empty() {
+                    out.push((c.name.clone(), c.client.clone(), files));
+                }
+            }
+        }
+        out
+    }
+
+    /// `willRenameFiles` fan-out (#610): every interested server, each with
+    /// a deadline so a stalled one cannot hold the Explorer move hostage.
+    fn request_will_rename_files(
+        &mut self,
+        request_id: u64,
+        renames: Vec<FileRenameOp>,
+        tx: &std_mpsc::Sender<WillRenameFilesResult>,
+    ) {
+        let targets = self.file_op_clients(&renames, |c| c.will_rename.as_ref());
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut edits = Vec::new();
+            for (name, client_arc, files) in targets {
+                let resp = tokio::time::timeout(WILL_RENAME_TIMEOUT, async {
+                    client_arc.lock().await.will_rename_files(files).await
+                })
+                .await;
+                match resp {
+                    Ok(Ok(Some(we))) => edits.extend(workspace_edits(&we)),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => log_file::log(&format!("lsp[{name}] willRenameFiles error: {e}")),
+                    Err(_) => log_file::log(&format!("lsp[{name}] willRenameFiles timed out")),
+                }
+            }
+            let _ = tx.send(WillRenameFilesResult { request_id, edits });
+        });
+    }
+
+    fn did_rename_files(&mut self, renames: Vec<FileRenameOp>) {
+        for (name, client_arc, files) in self.file_op_clients(&renames, |c| c.did_rename.as_ref()) {
+            tokio::spawn(async move {
+                if let Err(e) = client_arc.lock().await.did_rename_files(files) {
+                    log_file::log(&format!("lsp[{name}] didRenameFiles error: {e}"));
+                }
+            });
+        }
+    }
+
     /// Prepare-rename (#254): always answers, because the rename prompt
     /// is deferred on this verdict.
     async fn request_prepare_rename(
@@ -5168,6 +5330,11 @@ impl DiagnosticResultIds {
 /// latency budget.
 const WORKSPACE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long one server may take to answer `willRenameFiles` (#610) before
+/// the Explorer move goes ahead without its edit. VS Code waits about as
+/// long; a rename the user is watching must not hang on a slow server.
+const WILL_RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// One server's share of a workspace pull (#533), gathered off the client
 /// list so the request itself can run without holding the worker loop.
 struct WorkspacePull {
@@ -5962,6 +6129,13 @@ fn build_client_capabilities() -> ClientCapabilities {
             diagnostic: Some(lsp_types::DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),
+            // Explorer renames and moves ask the server for its edit first
+            // (#610), so imports follow the file.
+            file_operations: Some(lsp_types::WorkspaceFileOperationsClientCapabilities {
+                will_rename: Some(true),
+                did_rename: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         // Declare `window.workDoneProgress` so servers stream `$/progress`
@@ -6506,6 +6680,8 @@ while True:
             supports_document_link: false,
             supports_folding_range: false,
             supports_document_color: false,
+            will_rename: None,
+            did_rename: None,
         }
     }
 
