@@ -49559,3 +49559,71 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+/// An agent's edit proposal, end to end through the App: the hook's
+/// request opens the popup over everything, keys go to the popup and not
+/// to the editor under it, and the answer reaches the hook's connection.
+#[test]
+fn an_agent_edit_proposal_opens_the_popup_and_enter_answers_the_hook() {
+    use std::io::{BufRead, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "let x = 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = tmp.path().join("hook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.hook_listener = Some(listener);
+    assert!(!app.drain_hook_requests());
+    assert!(app.approval_ui.is_none());
+
+    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let req = crate::agent_hook::EditRequest {
+        agent: "claude-code".into(),
+        tool: "Edit".into(),
+        input: serde_json::json!({"file_path": file, "old_string": "1", "new_string": "2"}),
+        cwd: tmp.path().into(),
+    };
+    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    assert!(app.drain_hook_requests());
+    assert!(app.modal_overlay_open());
+    // A proposal the hook has stopped waiting for leaves with the popup.
+    app.approvals[0].arrived -= crate::agent_hook::ANSWER_WINDOW;
+    assert!(app.drain_hook_requests());
+    assert!(app.approval_ui.is_none() && app.approvals.is_empty());
+    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    assert!(app.drain_hook_requests());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let mut screen = String::new();
+    for y in 0..30 {
+        for x in 0..100 {
+            screen.push_str(term.backend().buffer()[(x, y)].symbol());
+        }
+    }
+    assert!(
+        screen.contains("claude-code wants to edit a.rs"),
+        "{screen}"
+    );
+    assert!(screen.contains("+ let x = 2;") && screen.contains("- let x = 1;"));
+
+    // Too soon after it appeared: the Enter is swallowed, not an approval.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.approval_ui.is_some());
+    app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.approval_ui.is_none() && app.approvals.is_empty());
+    let mut line = String::new();
+    std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::agent_hook::Decision>(line.trim()).unwrap(),
+        crate::agent_hook::Decision::Allow
+    );
+    // Approving answers the agent; croft itself does not write the file.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "let x = 1;\n");
+}
