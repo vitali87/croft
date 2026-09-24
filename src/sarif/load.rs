@@ -62,12 +62,17 @@ pub fn parse_log(text: &str) -> Result<SarifLog, LoadError> {
 /// A `null` property means the property is absent, so drop every one
 /// before typed parsing: serde's `default` covers a missing key but not an
 /// explicit null. Array elements stay, so result indices keep matching the
-/// file.
+/// file, and a property bag's contents stay, since there null is the
+/// producer's own value.
 fn drop_nulls(v: &mut serde_json::Value) {
     match v {
         serde_json::Value::Object(m) => {
             m.retain(|_, x| !x.is_null());
-            m.values_mut().for_each(drop_nulls);
+            for (k, x) in m.iter_mut() {
+                if k != "properties" {
+                    drop_nulls(x);
+                }
+            }
         }
         serde_json::Value::Array(a) => a.iter_mut().for_each(drop_nulls),
         _ => {}
@@ -184,5 +189,18 @@ mod tests {
         assert_eq!(r.rule_id.as_deref(), Some("R"));
         assert!(r.related_locations.is_empty());
         assert!(log.runs[0].tool.driver.rules.is_empty());
+    }
+
+    #[test]
+    fn a_null_inside_a_property_bag_is_kept_as_a_value() {
+        // Property bags hold the producer's own data, where null is a value.
+        let log = parse_log(
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"t"}},
+                "results":[{"message":{"text":"m"},"properties":{"note":null,"deep":{"x":null}}}]}]}"#,
+        )
+        .unwrap();
+        let props = &log.runs[0].results.as_ref().unwrap()[0].properties;
+        assert_eq!(props.get("note"), Some(&serde_json::Value::Null));
+        assert_eq!(props.get("deep"), Some(&serde_json::json!({"x": null})));
     }
 }
