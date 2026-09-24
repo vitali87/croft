@@ -49559,3 +49559,65 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+// ---- Live Run (Cmd+K V) ----
+
+#[test]
+fn live_run_refuses_a_file_that_is_not_python() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "hello\n");
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    assert!(app.live_run_files.is_empty(), "nothing is armed");
+    assert!(app.status.contains("Python"), "{}", app.status);
+}
+
+#[test]
+fn live_run_arms_only_the_active_file_and_disarming_clears_its_trailers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    let path = app.editor.path.clone().unwrap();
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    assert_eq!(
+        app.live_run_files.iter().collect::<Vec<_>>(),
+        vec![&path],
+        "exactly the active file is armed"
+    );
+    app.editor.live_run = Some(crate::live_run::View::default());
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    assert!(app.live_run_files.is_empty());
+    assert!(
+        app.editor.live_run.is_none(),
+        "a disarmed file keeps no trailers"
+    );
+}
+
+/// The whole loop against a real interpreter, when the machine has one:
+/// arm, tick until the run lands, and find its values on the tab.
+#[test]
+fn live_run_lands_a_real_run_on_the_tab() {
+    let has_python = std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_python {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "n = len('abc')\nprint(n * 2)\n");
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.editor.live_run.is_none() && std::time::Instant::now() < deadline {
+        app.tick_live_run();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let view = app.editor.live_run.as_ref().expect("the run landed");
+    assert_eq!(
+        view.note(0, "n = len('abc')").map(|n| n[0].0.as_str()),
+        Some("n = 3")
+    );
+    assert_eq!(
+        view.note(1, "print(n * 2)").map(|n| n[0].0.as_str()),
+        Some("\u{25b8} 6")
+    );
+    assert!(app.status.starts_with("Live Run: ok"), "{}", app.status);
+}

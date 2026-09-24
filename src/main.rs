@@ -34,6 +34,7 @@ mod iterm2;
 mod iterm2_inline;
 mod keymap;
 mod launcher;
+mod live_run;
 mod log_view;
 mod lsp;
 mod macros;

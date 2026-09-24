@@ -162,6 +162,30 @@ A **Testing** view (the beaker icon, or `Cmd`/`Ctrl`+`K` `B`) mirrors VS Code's 
 
 Each row's play glyph runs that test or suite (a green ▷ also marks test functions in the editor gutter, click it to run), clicking a test's name jumps to its source, Enter runs everything, and `Cmd`/`Ctrl`+`K` `Enter` runs the test under the editor caret. The beaker icon wears a red badge counting failures.
 
+## Live Run
+
+`Cmd`/`Ctrl`+`K` `V` (or **Python: Toggle Live Run** in the palette) turns a Python file into a live notebook without cells. Every time you pause typing, croft runs the buffer, unsaved edits included, and paints what each line did beside it:
+
+```text
+def fib(n):  n = 10
+    for i in range(n):  i = 0, 1, 2 … 9 ×10
+        a, b = b, a + b  a = 1, 1, 2 … 55 ×10  b = 1, 2, 3 … 89 ×10
+    return a  ↩ 55
+squares.append(k * k)  squares = [0], [0, 1], [0, 1, 4] … [0, 1, 4, 9, 16] ×5
+print("total is", total)  ▸ total is 30
+fib(10)  → 55
+ratio = total / (len(squares) - 5)  ✖ ZeroDivisionError: division by zero
+```
+
+* **Values**: what each assignment, loop variable, parameter, and in-place method call (`items.append(x)`) left behind. A line that runs many times shows the first values it took, then the last, then how many times it ran. Objects without their own `__repr__` show their fields (`Point(x=3, y=4)`).
+* **Output and results**: what a line printed (`▸`), what a `return` returned (`↩`), and the value of a bare expression (`→`), so a trailing `fib(10)` works like a REPL.
+* **Failures**: the exception lands on the line that raised it, in red. A run that goes past 3 seconds is interrupted and the line it was stuck on says so, in amber.
+* **Coverage**: line numbers go green for statements that ran and a muted red for statements that never did, so a branch you thought was taken shows up at a glance.
+
+The run uses the file's own directory as its working directory and `sys.path[0]`, with the nearest `.venv` / `venv` / `.env` interpreter inside the workspace (falling back to `python3`), so imports and relative paths behave as they would from a terminal. stdin is empty and nothing is written to `__pycache__`. Only a line whose text still matches the run shows a value, so an edited line goes bare until the next run lands rather than showing a stale answer. A stopped debugger's inline values take precedence over Live Run's on the same line.
+
+Live Run executes your code on every pause, so it is armed **per file**: toggling it on for one script never runs another, and nothing runs until you ask.
+
 ## Tasks
 
 Zero configuration: `Cmd`/`Ctrl`+`Shift`+`B` runs the project's build task, auto-detected from the manifests the repo already has (Makefile, justfile, package.json with the right lockfile runner, Cargo.toml, pyproject.toml, and `.vscode/tasks.json` when present). "Tasks: Run Task" in the palette lists everything discovered; each task runs in its own named terminal pane, and rerunning reuses that pane.

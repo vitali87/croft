@@ -3280,6 +3280,14 @@ pub struct App {
     /// linted as well as their seq, because two split panes count edits
     /// separately and can share a seq while holding different text.
     markdown_lint_last_seen: std::collections::HashMap<PathBuf, (u64, Vec<String>)>,
+    /// Live Run (`crate::live_run`): the files armed to run as they are
+    /// edited. Per file, never global, so no script runs unasked.
+    live_run_files: std::collections::HashSet<PathBuf>,
+    /// The buffer text last sent per armed file, so an unchanged buffer is
+    /// not re-run on every tick.
+    live_run_sent: std::collections::HashMap<PathBuf, Vec<String>>,
+    /// The background runner, spawned on the first toggle.
+    live_run_runner: Option<crate::live_run::Runner>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -4862,6 +4870,9 @@ impl App {
             problems_open_set: std::collections::BTreeSet::new(),
             lsp_diagnostics: std::collections::HashMap::new(),
             markdown_lint_last_seen: std::collections::HashMap::new(),
+            live_run_files: std::collections::HashSet::new(),
+            live_run_sent: std::collections::HashMap::new(),
+            live_run_runner: None,
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
@@ -18569,6 +18580,11 @@ impl App {
             // Cmd+K Z: toggle Zen Mode (VS Code's binding).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'z') => {
                 self.toggle_zen_mode();
+                true
+            }
+            // Cmd+K V: Live Run, "values" for the active Python file.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'v') => {
+                self.toggle_live_run();
                 true
             }
             // Cmd+K Cmd+F (SUPER/CTRL held on the second key): Format
@@ -35346,6 +35362,7 @@ impl App {
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
+            Cmd::ToggleLiveRun => self.toggle_live_run(),
             Cmd::ToggleProvenance => self.toggle_provenance(),
             Cmd::DiffToggleGroupBySeat => self.diff_toggle_group_by_seat(),
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
@@ -41581,6 +41598,122 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
         }
+    }
+
+    /// Arm or disarm Live Run for the active file (Cmd+K V).
+    pub(crate) fn toggle_live_run(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Live Run: save the buffer as a .py file first");
+            return;
+        };
+        if !crate::live_run::supports(&path) {
+            self.status = String::from("Live Run runs Python files (.py)");
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if self.live_run_files.remove(&path) {
+            self.live_run_sent.remove(&path);
+            self.for_each_tab_of(&path, |tab| tab.live_run = None);
+            self.status = format!("Live Run: off for {name}");
+            return;
+        }
+        self.live_run_files.insert(path);
+        self.live_run_runner
+            .get_or_insert_with(crate::live_run::Runner::spawn);
+        self.status = format!("Live Run: on for {name}, re-running on every pause in typing");
+    }
+
+    /// Apply `f` to every open tab of `path`, in every editor group.
+    fn for_each_tab_of(
+        &mut self,
+        path: &Path,
+        mut f: impl FnMut(&mut crate::widgets::editor::Editor),
+    ) {
+        for tab in self.editor.editors.iter_mut() {
+            if tab.path.as_deref() == Some(path) {
+                f(tab);
+            }
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for tab in group.editors.iter_mut() {
+                if tab.path.as_deref() == Some(path) {
+                    f(tab);
+                }
+            }
+        }
+    }
+
+    /// Live Run's per-tick work: land finished runs on their tabs, then send
+    /// the active buffer for a re-run once typing has paused. Returns true
+    /// when anything on screen changed.
+    pub fn tick_live_run(&mut self) -> bool {
+        if self.live_run_files.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut landed = Vec::new();
+        if let Some(runner) = &self.live_run_runner {
+            while let Some(done) = runner.try_recv() {
+                landed.push(done);
+            }
+        }
+        for done in landed {
+            // A run that lands after its file was disarmed is dropped: the
+            // user turned it off and must not see it come back.
+            if !self.live_run_files.contains(&done.path) {
+                continue;
+            }
+            let active = self.editor.path.as_deref() == Some(done.path.as_path());
+            match done.outcome {
+                Ok(report) => {
+                    if active {
+                        self.status = report.summary.clone();
+                    }
+                    let view = crate::live_run::View {
+                        lines: done.lines,
+                        report,
+                    };
+                    self.for_each_tab_of(&done.path, |tab| tab.live_run = Some(view.clone()));
+                }
+                Err(msg) => {
+                    if active {
+                        self.status = msg;
+                    }
+                }
+            }
+            changed = true;
+        }
+        let tab = &*self.editor;
+        let Some(path) = tab.path.clone() else {
+            return changed;
+        };
+        if !self.live_run_files.contains(&path)
+            || tab.has_non_text_view()
+            || tab
+                .last_edit_at
+                .is_some_and(|t| t.elapsed() < crate::live_run::DEBOUNCE)
+            || self.live_run_sent.get(&path) == Some(&tab.lines)
+        {
+            return changed;
+        }
+        let lines = tab.lines.clone();
+        let root = self.roots.primary().to_path_buf();
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let python = find_python_venv(&dir, &root)
+            .map(|(py, _)| py)
+            .unwrap_or_else(|| project_python(&root));
+        self.live_run_sent.insert(path.clone(), lines.clone());
+        if let Some(runner) = &self.live_run_runner {
+            runner.submit(crate::live_run::Job {
+                path,
+                lines,
+                python,
+            });
+        }
+        changed
     }
 
     fn toggle_render_whitespace(&mut self) {
@@ -50455,6 +50588,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
+        let live_run_changed = app.tick_live_run();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
@@ -50577,6 +50711,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || captures_changed
             || labels_changed
             || auto_save_changed
+            || live_run_changed
             || ws_symbols_changed
             || connect_changed
             || install_changed

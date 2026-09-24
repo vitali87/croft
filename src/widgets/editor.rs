@@ -2781,6 +2781,10 @@ pub struct Editor {
     /// stop from the VARIABLES data and cleared on resume/step/terminate.
     /// Painted like the blame trailer; the cursor-line blame yields to it.
     pub inline_values: std::collections::BTreeMap<usize, String>,
+    /// Live Run's latest report for this buffer (`crate::live_run`): value
+    /// trailers and line coverage, set by the app when a run lands. Each
+    /// line paints only while it still matches the text that ran.
+    pub live_run: Option<crate::live_run::View>,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -3060,6 +3064,7 @@ impl Editor {
             whitespace_mode: WhitespaceMode::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
+            live_run: None,
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -4621,6 +4626,8 @@ impl Editor {
             // file in the previous one's debug state. The same-path reload
             // keeps them — the next stop rebuilds them anyway.
             self.inline_values.clear();
+            // Live Run answered for the old file's text, same as above.
+            self.live_run = None;
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -7915,6 +7922,13 @@ impl Editor {
                 self.inline_values.insert(li, parts.join(", "));
             }
         }
+    }
+
+    /// Live Run's trailer for 0-based `line`, when the line still reads as
+    /// it did in the run that produced it.
+    fn live_note(&self, line: usize) -> Option<&crate::live_run::Note> {
+        let text = self.lines.get(line)?;
+        self.live_run.as_ref()?.note(line, text)
     }
 
     /// Column distance between indentation guides: the indent width for
@@ -12404,8 +12418,20 @@ impl Widget for &mut Editor {
                     line_idx + 1,
                     width = gutter_width as usize - 1
                 );
-                let gutter =
-                    Line::from(Span::styled(line_no, Style::default().fg(Color::DarkGray)));
+                // Live Run coverage tints the number: green for a statement
+                // that ran, a muted red for one that never did.
+                let number_fg = match self
+                    .live_run
+                    .as_ref()
+                    .and_then(|v| v.coverage(line_idx, &self.lines[line_idx]))
+                {
+                    Some(crate::live_run::Coverage::Ran) => self.theme.git_added(),
+                    Some(crate::live_run::Coverage::NeverRan) => {
+                        self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
+                    }
+                    None => Color::DarkGray,
+                };
+                let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
                 buf.set_line(inner.x, y, &gutter, gutter_width);
             } else {
                 buf.set_line(
@@ -13050,6 +13076,7 @@ impl Widget for &mut Editor {
                 && line_idx == self.cursor_row
                 && row_end >= line_len
                 && !self.inline_values.contains_key(&line_idx)
+                && self.live_note(line_idx).is_none()
                 && let Some(note) = self.current_line_blame_annotation()
             {
                 let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
@@ -13090,6 +13117,43 @@ impl Widget for &mut Editor {
                             .fg(self.theme.ignored_fg())
                             .add_modifier(Modifier::ITALIC),
                     );
+                }
+            }
+
+            // Live Run trailer: what this line did on the last run, painted
+            // where the debugger's values go and yielding to them, since a
+            // paused session is the more specific answer.
+            if row_end >= line_len
+                && !self.inline_values.contains_key(&line_idx)
+                && let Some(note) = self.live_note(line_idx)
+            {
+                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let mut x = text_x + text_cols as u16 + 2;
+                let right = inner.x + inner.width;
+                for (text, kind) in note {
+                    if x >= right {
+                        break;
+                    }
+                    let color = match kind {
+                        crate::live_run::Kind::Value => self.theme.ignored_fg(),
+                        crate::live_run::Kind::Output => {
+                            self.theme.ui(Color::Rgb(0x3b, 0x9e, 0xff))
+                        }
+                        crate::live_run::Kind::Error => self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+                        crate::live_run::Kind::Timeout => {
+                            self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))
+                        }
+                    };
+                    let avail = (right - x) as usize;
+                    let shown: String = text.chars().take(avail).collect();
+                    let width = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                    buf.set_string(
+                        x,
+                        y,
+                        &shown,
+                        Style::default().fg(color).add_modifier(Modifier::ITALIC),
+                    );
+                    x = x.saturating_add(width + 2);
                 }
             }
 
@@ -26385,6 +26449,63 @@ mod tests {
             " ",
             "an unannotated line gets no trailer"
         );
+    }
+
+    fn live_view(lines: &[&str], notes: &[(usize, &str)]) -> crate::live_run::View {
+        let mut report = crate::live_run::Report::default();
+        for &(line, text) in notes {
+            report
+                .notes
+                .insert(line, vec![(text.to_string(), crate::live_run::Kind::Value)]);
+            report.coverage.insert(line, crate::live_run::Coverage::Ran);
+        }
+        crate::live_run::View {
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+            report,
+        }
+    }
+
+    #[test]
+    fn render_paints_a_live_run_trailer_and_tints_the_line_number() {
+        let mut e = editor_with("x = f()\ny = 2");
+        e.live_run = Some(live_view(&["x = f()", "y = 2"], &[(0, "x = 7")]));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        let start = text_x + 7 + 2;
+        assert_eq!(buf[(start, y0)].symbol(), "x");
+        assert_eq!(buf[(start + 4, y0)].symbol(), "7");
+        let number_x = (e.last_inner.x..text_x)
+            .find(|&x| buf[(x, y0)].symbol() == "1")
+            .expect("line number painted");
+        assert_eq!(
+            buf[(number_x, y0)].fg,
+            e.theme.git_added(),
+            "a line that ran is green"
+        );
+    }
+
+    #[test]
+    fn a_live_run_trailer_hides_once_its_line_is_edited() {
+        let mut e = editor_with("x = f() + 1");
+        e.live_run = Some(live_view(&["x = f()"], &[(0, "x = 7")]));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            buf[(text_x + 11 + 2, e.last_inner.y)].symbol(),
+            " ",
+            "the value belongs to the text that ran, not this one"
+        );
+    }
+
+    #[test]
+    fn debugger_inline_values_outrank_the_live_run_trailer() {
+        let mut e = editor_with("x = f()");
+        e.live_run = Some(live_view(&["x = f()"], &[(0, "x = 7")]));
+        e.inline_values.insert(0, String::from("x = 9"));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(buf[(text_x + 7 + 2 + 4, e.last_inner.y)].symbol(), "9");
     }
 
     #[test]
