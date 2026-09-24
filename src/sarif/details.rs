@@ -145,7 +145,10 @@ pub fn details(run: &Run, result: &SarifResult, roots: &[PathBuf]) -> Details {
                 .locations
                 .iter()
                 .map(|s| Step {
-                    depth: s.nesting_level.and_then(|n| usize::try_from(n).ok()).unwrap_or(0),
+                    depth: s
+                        .nesting_level
+                        .and_then(|n| usize::try_from(n).ok())
+                        .unwrap_or(0),
                     message: msg(s.location.as_ref().and_then(|l| l.message.as_ref())),
                     location: s.location.as_ref().map(&loc_ref),
                     importance: s
@@ -181,11 +184,7 @@ pub fn details(run: &Run, result: &SarifResult, roots: &[PathBuf]) -> Details {
                         .location
                         .as_ref()
                         .and_then(|l| l.logical_locations.first())
-                        .and_then(|ll| {
-                            ll.fully_qualified_name
-                                .clone()
-                                .or_else(|| ll.name.clone())
-                        })
+                        .and_then(|ll| ll.fully_qualified_name.clone().or_else(|| ll.name.clone()))
                         .unwrap_or_default();
                     Frame {
                         text: if own.is_empty() { fqn } else { own },
@@ -278,15 +277,86 @@ pub fn link_target(d: &Details, id: i64) -> Option<&LocRef> {
         .or_else(|| d.locations.iter().find(|l| l.id == Some(id)))
 }
 
-/// The result's JSON exactly as the log has it, pretty-printed. Read from the
-/// file on demand, so a large log is not kept twice in memory.
+/// The result's JSON exactly as the log has it (key order included),
+/// re-indented. Read from the file on demand, so a large log is not kept
+/// twice in memory.
 pub fn raw_result_json(path: &Path, run: usize, result: usize) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct RawLog<'a> {
+        #[serde(borrow, default)]
+        runs: Vec<RawRun<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawRun<'a> {
+        #[serde(borrow, default)]
+        results: Option<Vec<&'a serde_json::value::RawValue>>,
+    }
     let bytes = std::fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let node = value.pointer(&format!("/runs/{run}/results/{result}"))?;
-    serde_json::to_string_pretty(node).ok()
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let log: RawLog = serde_json::from_str(text).ok()?;
+    let raw = log.runs.get(run)?.results.as_ref()?.get(result)?;
+    Some(pretty_preserving(raw.get()))
+}
+
+/// Re-indent JSON text two spaces per level without reordering anything:
+/// `serde_json::Value` sorts object keys, which would show a result in an
+/// order its log never had. String contents, escapes included, pass through.
+fn pretty_preserving(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() * 2);
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut chars = raw.chars().peekable();
+    let newline = |out: &mut String, depth: usize| {
+        out.push('\n');
+        out.push_str(&"  ".repeat(depth));
+    };
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' | '[' => {
+                out.push(c);
+                // An empty container stays on one line: `{}`, `[]`.
+                while chars.peek().is_some_and(|n| n.is_whitespace()) {
+                    chars.next();
+                }
+                if matches!(chars.peek(), Some('}') | Some(']')) {
+                    out.push(chars.next().unwrap());
+                } else {
+                    depth += 1;
+                    newline(&mut out, depth);
+                }
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                newline(&mut out, depth);
+                out.push(c);
+            }
+            ',' => {
+                out.push(c);
+                newline(&mut out, depth);
+            }
+            ':' => out.push_str(": "),
+            c if c.is_whitespace() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -356,7 +426,11 @@ mod tests {
         let t = link_target(&d, 1).unwrap();
         assert_eq!((t.label.as_str(), t.line, t.column), ("src/api.js", 12, 9));
         assert_eq!(link_target(&d, 2).unwrap().label, "src/x.js");
-        assert_eq!(link_target(&d, 0).unwrap().label, "src/db.js", "falls back to locations");
+        assert_eq!(
+            link_target(&d, 0).unwrap().label,
+            "src/db.js",
+            "falls back to locations"
+        );
         assert!(link_target(&d, 9).is_none());
     }
 
@@ -384,7 +458,12 @@ mod tests {
     #[test]
     fn properties_rule_then_result_rendered_as_text() {
         let d = d();
-        let get = |k: &str| d.properties.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+        let get = |k: &str| {
+            d.properties
+                .iter()
+                .find(|(a, _)| a == k)
+                .map(|(_, v)| v.clone())
+        };
         assert_eq!(get("tags").as_deref(), Some("security, cwe-089"));
         assert_eq!(get("security-severity").as_deref(), Some("8.8"));
         assert_eq!(get("github/alertNumber").as_deref(), Some("7"));
@@ -392,7 +471,11 @@ mod tests {
         assert_eq!(get("list").as_deref(), Some("a, b"));
         assert_eq!(get("flag").as_deref(), Some("true"));
         let tags_at = d.properties.iter().position(|(k, _)| k == "tags").unwrap();
-        let alert_at = d.properties.iter().position(|(k, _)| k == "github/alertNumber").unwrap();
+        let alert_at = d
+            .properties
+            .iter()
+            .position(|(k, _)| k == "github/alertNumber")
+            .unwrap();
         assert!(tags_at < alert_at, "rule properties come first");
     }
 
@@ -403,7 +486,10 @@ mod tests {
             d.fingerprints,
             vec![
                 ("b/v1".to_string(), "abc".to_string()),
-                ("primaryLocationLineHash (partial)".to_string(), "ff00".to_string())
+                (
+                    "primaryLocationLineHash (partial)".to_string(),
+                    "ff00".to_string()
+                )
             ]
         );
         assert_eq!(d.guid.as_deref(), Some("G-1"));
@@ -415,7 +501,10 @@ mod tests {
     fn every_code_flow_and_thread_flow() {
         let d = d();
         let labels: Vec<_> = d.threads.iter().map(|t| t.label.as_str()).collect();
-        assert_eq!(labels, vec!["Flow 1", "Flow 2 · thread t1", "Flow 2 · thread t2"]);
+        assert_eq!(
+            labels,
+            vec!["Flow 1", "Flow 2 · thread t1", "Flow 2 · thread t2"]
+        );
         let steps = &d.threads[0].steps;
         assert_eq!(steps.len(), 3);
         assert_eq!(d.threads[0].message, "taint path");
@@ -424,7 +513,10 @@ mod tests {
         assert_eq!(steps[0].location.as_ref().unwrap().line, 12);
         assert_eq!(steps[1].depth, 1);
         assert_eq!(steps[1].importance, "important", "the spec default");
-        assert_eq!(steps[1].state, vec![("q".to_string(), "tainted".to_string())]);
+        assert_eq!(
+            steps[1].state,
+            vec![("q".to_string(), "tainted".to_string())]
+        );
         assert_eq!(steps[1].message, "step");
         assert_eq!(steps[2].importance, "unimportant");
         assert!(steps[2].location.as_ref().unwrap().uri.is_empty());
@@ -443,6 +535,29 @@ mod tests {
         assert_eq!((loc.line, loc.column), (42, 7));
         assert_eq!(d.stacks[1].message, "second");
         assert_eq!(d.stacks[1].frames[0].text, "top");
+    }
+
+    #[test]
+    fn pretty_printing_keeps_key_order_and_string_contents() {
+        let raw = r#"{"z":1,"a":[true,{"k":"a, {b} [c]\"q\""}],"e":{}}"#;
+        assert_eq!(
+            pretty_preserving(raw),
+            "{\n  \"z\": 1,\n  \"a\": [\n    true,\n    {\n      \"k\": \"a, {b} [c]\\\"q\\\"\"\n    }\n  ],\n  \"e\": {}\n}"
+        );
+    }
+
+    #[test]
+    fn raw_json_keeps_the_logs_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.sarif");
+        std::fs::write(&p, LOG).unwrap();
+        let raw = raw_result_json(&p, 0, 0).unwrap();
+        let rule = raw.find("\"ruleId\"").unwrap();
+        let flows = raw.find("\"codeFlows\"").unwrap();
+        assert!(
+            rule < flows,
+            "ruleId is written before codeFlows in the log:\n{raw}"
+        );
     }
 
     #[test]

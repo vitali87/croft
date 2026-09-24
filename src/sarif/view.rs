@@ -60,6 +60,44 @@ pub enum Tab {
     Logs,
 }
 
+/// The details pane's tabs (VS Code: Info, Analysis Steps, Stacks; croft
+/// adds the result's raw JSON).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailTab {
+    Info,
+    Steps,
+    Stacks,
+    Raw,
+}
+
+impl DetailTab {
+    const ORDER: [DetailTab; 4] = [
+        DetailTab::Info,
+        DetailTab::Steps,
+        DetailTab::Stacks,
+        DetailTab::Raw,
+    ];
+
+    pub fn step(self, forward: bool) -> DetailTab {
+        let i = Self::ORDER.iter().position(|t| *t == self).unwrap_or(0);
+        let n = Self::ORDER.len();
+        Self::ORDER[if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        }]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DetailTab::Info => "Info",
+            DetailTab::Steps => "Steps",
+            DetailTab::Stacks => "Stacks",
+            DetailTab::Raw => "Raw",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Column {
     Line,
@@ -218,6 +256,18 @@ pub struct SarifView {
     /// Screen columns the list occupies: `[list_x, list_x + list_width)`.
     pub list_x: u16,
     pub list_width: u16,
+    pub detail_tab: DetailTab,
+    /// The step (Steps tab), frame (Stacks tab) or location (Info tab) last
+    /// opened with `n`/`N`; reset when the selected result changes.
+    pub nav_cursor: Option<usize>,
+    /// The message link last followed with `L`.
+    pub link_cursor: Option<usize>,
+    /// First details line painted.
+    pub detail_scroll: usize,
+    /// The selected result's resolved details, keyed by entry index.
+    details_cache: Option<(usize, super::details::Details)>,
+    /// The selected result's raw JSON, keyed by entry index.
+    raw_cache: Option<(usize, Option<String>)>,
 }
 
 impl SarifView {
@@ -237,7 +287,124 @@ impl SarifView {
             rows_visible: 0,
             list_x: 0,
             list_width: 0,
+            detail_tab: DetailTab::Info,
+            nav_cursor: None,
+            link_cursor: None,
+            detail_scroll: 0,
+            details_cache: None,
+            raw_cache: None,
         }
+    }
+
+    fn selected_index_pub(&self) -> Option<usize> {
+        match self.rows().get(self.selected)? {
+            Row::Item { entry } => Some(*entry),
+            Row::Group { .. } => None,
+        }
+    }
+
+    /// The selected result's details, resolved once per selection. Moving to
+    /// another result resets the step, frame and link cursors.
+    pub fn details(&mut self) -> Option<&super::details::Details> {
+        let idx = self.selected_index_pub()?;
+        if self.details_cache.as_ref().map(|(i, _)| *i) != Some(idx) {
+            let e = self.entries.get(idx)?;
+            let loaded = self.logs.get(e.log)?;
+            let run = loaded.log.runs.get(e.run)?;
+            let result = run.results.as_ref()?.get(e.result)?;
+            let mut roots = Vec::new();
+            if let Some(dir) = loaded.path.parent() {
+                roots.push(dir.to_path_buf());
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                roots.push(cwd);
+            }
+            let d = super::details::details(run, result, &roots);
+            self.details_cache = Some((idx, d));
+            self.nav_cursor = None;
+            self.link_cursor = None;
+            self.detail_scroll = 0;
+        }
+        self.details_cache.as_ref().map(|(_, d)| d)
+    }
+
+    /// The selected result's JSON as the log holds it, read on first use.
+    pub fn raw(&mut self) -> Option<&str> {
+        let idx = self.selected_index_pub()?;
+        if self.raw_cache.as_ref().map(|(i, _)| *i) != Some(idx) {
+            let e = self.entries.get(idx)?;
+            let path = self.logs.get(e.log)?.path.clone();
+            let raw = super::details::raw_result_json(&path, e.run, e.result);
+            self.raw_cache = Some((idx, raw));
+        }
+        self.raw_cache.as_ref().and_then(|(_, r)| r.as_deref())
+    }
+
+    /// The locations `n`/`N` walk on the current tab: every step of every
+    /// flow, every frame of every stack, or the result's own locations then
+    /// its related ones.
+    pub fn nav_targets(&mut self) -> Vec<super::details::LocRef> {
+        let tab = self.detail_tab;
+        let Some(d) = self.details() else {
+            return Vec::new();
+        };
+        match tab {
+            DetailTab::Steps => d
+                .threads
+                .iter()
+                .flat_map(|t| t.steps.iter().filter_map(|s| s.location.clone()))
+                .collect(),
+            DetailTab::Stacks => d
+                .stacks
+                .iter()
+                .flat_map(|s| s.frames.iter().filter_map(|f| f.location.clone()))
+                .collect(),
+            DetailTab::Info | DetailTab::Raw => d
+                .locations
+                .iter()
+                .chain(d.related.iter())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Advance the `n`/`N` cursor and return the location it lands on.
+    pub fn step_nav(&mut self, forward: bool) -> Option<super::details::LocRef> {
+        let targets = self.nav_targets();
+        if targets.is_empty() {
+            return None;
+        }
+        let last = targets.len() - 1;
+        let next = match (self.nav_cursor, forward) {
+            (None, true) => 0,
+            (None, false) => last,
+            (Some(i), true) => (i + 1).min(last),
+            (Some(i), false) => i.saturating_sub(1),
+        };
+        self.nav_cursor = Some(next);
+        targets.get(next).cloned()
+    }
+
+    /// Advance to the next `[text](id)` link in the message that resolves,
+    /// wrapping, and return where it points.
+    pub fn next_link(&mut self) -> Option<super::details::LocRef> {
+        let d = self.details()?.clone();
+        let links: Vec<_> = d
+            .message
+            .iter()
+            .filter_map(|s| match s {
+                super::semantics::Segment::LocationLink { id, .. } => {
+                    super::details::link_target(&d, *id).cloned()
+                }
+                _ => None,
+            })
+            .collect();
+        if links.is_empty() {
+            return None;
+        }
+        let next = self.link_cursor.map_or(0, |i| (i + 1) % links.len());
+        self.link_cursor = Some(next);
+        links.get(next).cloned()
     }
 
     /// A viewer over one log file. File names display relative to the log's

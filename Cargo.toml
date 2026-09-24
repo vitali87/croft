@@ -159,7 +159,9 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # 3.3.0 verified current on crates.io 2026-07-31.
 ureq3 = { package = "ureq", version = "3", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value`: the SARIF viewer's Raw tab shows a result's JSON in the key
+# order its log wrote, which `serde_json::Value` (sorted keys) cannot.
+serde_json = { version = "1", features = ["raw_value"] }
 # Text CRDT for multiplayer Phase D (independent viewports): tracks concurrent
 # edit positions so two participants can edit the same buffer without a central
 # authority. Operation-based, byte-offset model, app owns the text (croft keeps

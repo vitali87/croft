@@ -4,7 +4,7 @@
 //! mouse clicks hit the rows the user sees.
 
 use super::semantics::{BaselineState, Level, SuppressionState};
-use super::view::{Row, SarifView, Tab};
+use super::view::{DetailTab, Row, SarifView, Tab};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -245,13 +245,24 @@ pub fn render(
             buf.set_stringn(dx - 1, y, "│", 1, dim);
         }
         let dw = (inner.x + inner.width).saturating_sub(dx + 1) as usize;
-        render_details(view, dx + 1, body_top, dw, body_h, buf, text, dim, bg);
+        render_details(
+            view,
+            dx + 1,
+            body_top,
+            dw,
+            body_h,
+            buf,
+            text,
+            dim,
+            bg,
+            theme,
+        );
     }
 
     let hint = if view.editing_query {
         " type to filter · terms AND · a|b OR · -x exclude · rule: file: level: tag: tool: msg: · Enter done · Esc clear "
     } else {
-        " ↑↓ move · ←→ fold · Enter open · / filter · Tab view · s sort · 1-4 levels · u suppressed · a absent · x clear "
+        " ↑↓ move · ←→ fold · Enter open · / filter · Tab view · s sort · 1-4 levels · u suppressed · a absent · x clear · d/D details tab · [ ] scroll details · n/N next/prev step · L follow link "
     };
     buf.set_stringn(
         inner.x,
@@ -266,7 +277,7 @@ pub fn render(
 
 #[allow(clippy::too_many_arguments)]
 fn render_details(
-    view: &SarifView,
+    view: &mut SarifView,
     x: u16,
     top: u16,
     w: usize,
@@ -275,51 +286,229 @@ fn render_details(
     text: Style,
     dim: Style,
     bg: Color,
+    theme: crate::theme::Theme,
 ) {
-    if w < 10 {
+    if w < 10 || h < 2 {
         return;
     }
-    let Some(e) = view.selected_entry() else {
+    let tab = view.detail_tab;
+    let cursor = view.nav_cursor;
+    let raw = if tab == DetailTab::Raw {
+        view.raw().map(str::to_string)
+    } else {
+        None
+    };
+    let Some(d) = view.details() else {
         buf.set_stringn(x, top, "Select a result to see its details.", w, dim);
         return;
     };
-    let mut lines: Vec<(String, Style)> = Vec::new();
-    let rule = if e.rule_name.is_empty() {
-        e.rule_id.clone()
-    } else {
-        format!("{} · {}", e.rule_id, e.rule_name)
-    };
-    lines.push((rule, text.add_modifier(Modifier::BOLD)));
-    lines.push((
-        format!(
-            "{} · {} · {}",
-            e.level.as_str(),
-            baseline_label(e.baseline),
-            suppression_label(e.suppression)
-        ),
-        Style::default().fg(level_color(e.level)).bg(bg),
-    ));
-    lines.push((String::new(), text));
-    for wrapped in wrap(&e.message, w) {
-        lines.push((wrapped, text));
-    }
-    lines.push((String::new(), text));
-    if !e.file.is_empty() {
-        let at = if e.line > 0 {
-            format!("at {}:{}:{}", e.file, e.line, e.column.max(1))
-        } else {
-            format!("at {}", e.file)
+    let steps: usize = d.threads.iter().map(|t| t.steps.len()).sum();
+    let frames: usize = d.stacks.iter().map(|s| s.frames.len()).sum();
+    // Tab strip.
+    let mut tx = x;
+    for t in [
+        DetailTab::Info,
+        DetailTab::Steps,
+        DetailTab::Stacks,
+        DetailTab::Raw,
+    ] {
+        let label = match t {
+            DetailTab::Steps => format!(" Steps {steps} "),
+            DetailTab::Stacks => format!(" Stacks {frames} "),
+            other => format!(" {} ", other.label()),
         };
-        lines.push((at, text));
+        let style = if t == tab {
+            Style::default()
+                .fg(theme.accent_contrast_fg())
+                .bg(theme.accent())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            text
+        };
+        if (tx - x) as usize + label.chars().count() > w {
+            break;
+        }
+        buf.set_stringn(tx, top, &label, w, style);
+        tx += label.chars().count() as u16 + 1;
     }
-    if !e.tool.is_empty() {
-        lines.push((format!("tool {}", e.tool), dim));
+    let at = |l: &super::details::LocRef| -> String {
+        if l.line > 0 {
+            format!("{}:{}:{}", l.label, l.line, l.column.max(1))
+        } else {
+            l.label.clone()
+        }
+    };
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    let sel = Style::default()
+        .fg(theme.accent_contrast_fg())
+        .bg(theme.accent());
+    match tab {
+        DetailTab::Info => {
+            let rule = if d.rule_name.is_empty() {
+                d.rule_id.clone()
+            } else {
+                format!("{} · {}", d.rule_id, d.rule_name)
+            };
+            lines.push((rule, text.add_modifier(Modifier::BOLD)));
+            lines.push((
+                format!(
+                    "{} · {} · {}",
+                    d.level.as_str(),
+                    baseline_label(d.baseline),
+                    suppression_label(d.suppression)
+                ),
+                Style::default().fg(level_color(d.level)).bg(bg),
+            ));
+            if let Some(j) = &d.justification {
+                lines.push((format!("justification: {j}"), dim));
+            }
+            lines.push((String::new(), text));
+            let message: String = d
+                .message
+                .iter()
+                .map(|s| match s {
+                    super::semantics::Segment::Text(t) => t.clone(),
+                    super::semantics::Segment::LocationLink { text, .. } => format!("[{text}]"),
+                    super::semantics::Segment::UriLink { text, uri } => format!("{text} <{uri}>"),
+                })
+                .collect();
+            for l in wrap(&message, w) {
+                lines.push((l, text));
+            }
+            lines.push((String::new(), text));
+            for l in &d.locations {
+                lines.push((format!("at {}", at(l)), text));
+            }
+            for l in &d.related {
+                let id = l.id.map(|i| format!("[{i}] ")).unwrap_or_default();
+                let msg = if l.message.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", l.message)
+                };
+                lines.push((format!("↳ {id}{}{msg}", at(l)), text));
+            }
+            if !d.description.is_empty() {
+                lines.push((String::new(), text));
+                for l in wrap(&d.description, w) {
+                    lines.push((l, dim));
+                }
+            }
+            if !d.help.is_empty() {
+                lines.push((String::new(), text));
+                lines.push(("help".to_string(), text.add_modifier(Modifier::BOLD)));
+                for l in wrap(&d.help, w) {
+                    lines.push((l, text));
+                }
+            }
+            if let Some(u) = &d.help_uri {
+                lines.push((u.clone(), dim));
+            }
+            if !d.properties.is_empty() || !d.fingerprints.is_empty() {
+                lines.push((String::new(), text));
+            }
+            for (k, val) in d.properties.iter().chain(d.fingerprints.iter()) {
+                lines.push((format!("{k} = {val}"), dim));
+            }
+            if let Some(g) = &d.guid {
+                lines.push((format!("guid = {g}"), dim));
+            }
+            if let Some(r) = d.rank {
+                lines.push((format!("rank = {r}"), dim));
+            }
+            if let Some(n) = d.occurrence_count {
+                lines.push((format!("occurrences = {n}"), dim));
+            }
+        }
+        DetailTab::Steps => {
+            if d.threads.is_empty() {
+                lines.push(("No analysis steps in this result.".to_string(), dim));
+            }
+            let mut n = 0usize;
+            for t in &d.threads {
+                let head = if t.message.is_empty() {
+                    t.label.clone()
+                } else {
+                    format!("{} · {}", t.label, t.message)
+                };
+                lines.push((head, text.add_modifier(Modifier::BOLD)));
+                for s in &t.steps {
+                    let mark = match s.importance.as_str() {
+                        "essential" => "●",
+                        "unimportant" => "·",
+                        _ => "○",
+                    };
+                    let loc = s.location.as_ref().map(&at).unwrap_or_default();
+                    let state = if s.state.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "  [{}]",
+                            s.state
+                                .iter()
+                                .map(|(k, v)| format!("{k} = {v}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    let line = format!(
+                        "{:>3}. {}{mark} {}  {loc}{state}",
+                        n + 1,
+                        "  ".repeat(s.depth),
+                        s.message
+                    );
+                    let style = if cursor == Some(n) { sel } else { text };
+                    if s.location.is_some() {
+                        n += 1;
+                    }
+                    lines.push((line, style));
+                }
+            }
+        }
+        DetailTab::Stacks => {
+            if d.stacks.is_empty() {
+                lines.push(("No stacks in this result.".to_string(), dim));
+            }
+            let mut n = 0usize;
+            for (i, s) in d.stacks.iter().enumerate() {
+                let head = if s.message.is_empty() {
+                    format!("Stack {}", i + 1)
+                } else {
+                    s.message.clone()
+                };
+                lines.push((head, text.add_modifier(Modifier::BOLD)));
+                for f in &s.frames {
+                    let loc = f.location.as_ref().map(&at).unwrap_or_default();
+                    let module = if f.module.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({})", f.module)
+                    };
+                    let style = if cursor == Some(n) { sel } else { text };
+                    if f.location.is_some() {
+                        n += 1;
+                    }
+                    lines.push((format!("  {}  {loc}{module}", f.text), style));
+                }
+            }
+        }
+        DetailTab::Raw => match raw {
+            Some(json) => {
+                for l in json.lines() {
+                    lines.push((l.to_string(), text));
+                }
+            }
+            None => lines.push((
+                "The result could not be read back from the log.".to_string(),
+                dim,
+            )),
+        },
     }
-    if !e.tags.is_empty() {
-        lines.push((format!("tags {}", e.tags.join(", ")), dim));
-    }
-    for (i, (line, style)) in lines.into_iter().take(h as usize).enumerate() {
-        buf.set_stringn(x, top + i as u16, &line, w, style);
+    let rows = (h - 1) as usize;
+    let scroll = view.detail_scroll.min(lines.len().saturating_sub(rows));
+    view.detail_scroll = scroll;
+    for (i, (line, style)) in lines.into_iter().skip(scroll).take(rows).enumerate() {
+        buf.set_stringn(x, top + 1 + i as u16, &line, w, style);
     }
 }
 

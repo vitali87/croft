@@ -45110,6 +45110,28 @@ impl App {
                 }
             }
             KeyCode::Char('x') => view.clear_filters(),
+            KeyCode::Char('d') => view.detail_tab = view.detail_tab.step(true),
+            // Scroll the details pane half a page; the renderer clamps.
+            KeyCode::Char(']') => {
+                view.detail_scroll += (view.rows_visible as usize / 2).max(1);
+            }
+            KeyCode::Char('[') => {
+                view.detail_scroll = view
+                    .detail_scroll
+                    .saturating_sub((view.rows_visible as usize / 2).max(1));
+            }
+            KeyCode::Char('D') => view.detail_tab = view.detail_tab.step(false),
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let forward = key.code == KeyCode::Char('n');
+                match view.step_nav(forward) {
+                    Some(target) => self.open_sarif_loc(&target),
+                    None => self.status = String::from("Nothing to step through on this tab"),
+                }
+            }
+            KeyCode::Char('L') => match view.next_link() {
+                Some(target) => self.open_sarif_loc(&target),
+                None => self.status = String::from("This message has no location links"),
+            },
             KeyCode::Enter => {
                 if view.selected_entry().is_some() {
                     self.open_selected_sarif_result();
@@ -45155,6 +45177,56 @@ impl App {
             self.status = format!("Cannot find {uri} on this machine");
             return;
         };
+        self.editor.pin_active();
+        let opened = match kind {
+            ColumnKind::Utf16CodeUnits => self.open_at_utf16(&path, line as u32, column as u32),
+            ColumnKind::UnicodeCodePoints => self.open_at(&path, line as usize, column as usize),
+        };
+        self.status = match opened {
+            Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
+            Err(e) => format!("Open failed: {e}"),
+        };
+    }
+
+    /// Open a location from the selected result's details (a step, a frame, a
+    /// related location), resolving it the way the result's own location is
+    /// resolved and keeping the viewer tab.
+    fn open_sarif_loc(&mut self, target: &crate::sarif::details::LocRef) {
+        use crate::sarif::region::{ColumnKind, column_kind};
+        if target.uri.is_empty() {
+            self.status = format!("{} has no file to open", target.label);
+            return;
+        }
+        let root = self.workspace_root().to_path_buf();
+        let Some((path, kind)) = self.editor.sarif.as_ref().and_then(|v| {
+            let e = v.selected_entry()?;
+            let loaded = v.logs.get(e.log)?;
+            let run = loaded.log.runs.get(e.run)?;
+            let mut roots = vec![root.clone()];
+            if let Some(dir) = loaded.path.parent() {
+                roots.push(dir.to_path_buf());
+            }
+            let resolver = crate::sarif::resolve::Resolver {
+                roots,
+                ..Default::default()
+            };
+            let artifact = crate::sarif::model::ArtifactLocation {
+                uri: Some(target.uri.clone()),
+                ..Default::default()
+            };
+            Some((
+                resolver.resolve(run, &artifact, &|p| p.is_file()),
+                column_kind(run),
+            ))
+        }) else {
+            return;
+        };
+        let Some(path) = path else {
+            self.status = format!("Cannot find {} on this machine", target.uri);
+            return;
+        };
+        let line = target.line.max(1) - 1;
+        let column = target.column.max(1) - 1;
         self.editor.pin_active();
         let opened = match kind {
             ColumnKind::Utf16CodeUnits => self.open_at_utf16(&path, line as u32, column as u32),

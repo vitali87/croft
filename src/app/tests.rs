@@ -49696,3 +49696,131 @@ fn sarif_that_does_not_load_opens_as_text_and_says_why() {
         app.editor.status
     );
 }
+
+/// A log whose one result carries a two-step code flow, a stack and rule help.
+fn sarif_flow_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/api.rs"),
+        "fn a() {}\nlet input = read();\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/db.rs"),
+        "one\ntwo\nthree\nrun(input);\n",
+    )
+    .unwrap();
+    let log = tmp.path().join("flow.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"lint","rules":[{"id":"R1","name":"Taint",
+            "help":{"text":"Use parameters instead."},"properties":{"tags":["security"]}}]}},
+          "results":[{"ruleId":"R1","level":"error",
+            "message":{"text":"Tainted by [the input](1)."},
+            "locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/db.rs"},"region":{"startLine":4,"startColumn":1}}}],
+            "relatedLocations":[{"id":1,"physicalLocation":{"artifactLocation":{"uri":"src/api.rs"},"region":{"startLine":2,"startColumn":5}}}],
+            "codeFlows":[{"threadFlows":[{"locations":[
+              {"location":{"message":{"text":"source"},"physicalLocation":{"artifactLocation":{"uri":"src/api.rs"},"region":{"startLine":2,"startColumn":5}}}},
+              {"location":{"message":{"text":"sink"},"physicalLocation":{"artifactLocation":{"uri":"src/db.rs"},"region":{"startLine":4,"startColumn":5}}}}]}]}],
+            "stacks":[{"frames":[{"location":{"message":{"text":"frame zero"},"physicalLocation":{"artifactLocation":{"uri":"src/db.rs"},"region":{"startLine":3,"startColumn":2}}}}]}]
+          }]}]}"#,
+    )
+    .unwrap();
+    (tmp, log)
+}
+
+fn draw_screen(app: &mut App) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    screen_text(&term)
+}
+
+#[test]
+fn sarif_info_tab_shows_rule_help_tags_and_related_locations() {
+    let (tmp, log) = sarif_flow_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    let screen = draw_screen(&mut app);
+    assert!(
+        screen.contains("Use parameters instead."),
+        "rule help:\n{screen}"
+    );
+    assert!(screen.contains("security"), "tags:\n{screen}");
+    assert!(
+        screen.contains("src/api.rs:2:5"),
+        "related location:\n{screen}"
+    );
+}
+
+#[test]
+fn sarif_steps_tab_walks_the_code_flow_in_the_editor() {
+    let (tmp, log) = sarif_flow_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("Steps"), "{screen}");
+    assert!(
+        screen.contains("source") && screen.contains("sink"),
+        "{screen}"
+    );
+    app.handle_sarif_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/api.rs").as_path()),
+        "step 1 opened: {}",
+        app.status
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
+    // Back to the viewer tab and on to step 2.
+    let viewer = (0..app.editor.tab_count())
+        .find(|&i| app.editor.tab_path(i).as_deref() == Some(log.as_path()))
+        .expect("the viewer tab stayed open");
+    app.editor.select(viewer);
+    app.handle_sarif_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/db.rs").as_path())
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (3, 4));
+}
+
+#[test]
+fn sarif_stacks_and_raw_tabs() {
+    let (tmp, log) = sarif_flow_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+    app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("frame zero"), "stacks tab:\n{screen}");
+    assert!(
+        screen.contains("src/db.rs:3:2"),
+        "frame location with its column:\n{screen}"
+    );
+    app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("\"ruleId\": \"R1\""), "raw tab:\n{screen}");
+    app.handle_sarif_key(key(KeyCode::Char('D'), KeyModifiers::NONE));
+    let screen = draw_screen(&mut app);
+    assert!(
+        screen.contains("frame zero"),
+        "D goes back a tab:\n{screen}"
+    );
+}
+
+#[test]
+fn sarif_message_link_opens_its_related_location() {
+    let (tmp, log) = sarif_flow_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('L'), KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/api.rs").as_path()),
+        "[the input](1) followed: {}",
+        app.status
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
+}
