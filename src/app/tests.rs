@@ -49678,3 +49678,117 @@ fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
         "re-enabling restores it"
     );
 }
+
+fn make_codeql_db(root: &std::path::Path, name: &str, lang: &str) -> std::path::PathBuf {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("codeql-database.yml"),
+        format!("primaryLanguage: \"{lang}\"\n"),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn adding_a_codeql_database_from_a_folder_lists_and_persists_it() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #578: Databases > From a folder.
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = make_codeql_db(tmp.path(), "flask-db", "python");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Folder,
+            &db.display().to_string(),
+        );
+        assert!(
+            app.status.contains("Added CodeQL database flask-db"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.codeql.databases.len(), 1);
+        assert_eq!(app.codeql.current_db, Some(0));
+        // A new session lists it too.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.open_codeql_view();
+        assert_eq!(again.codeql.databases.len(), 1, "the list persists");
+        assert_eq!(
+            again.codeql.databases[0].language.as_deref(),
+            Some("python")
+        );
+    });
+}
+
+#[test]
+fn adding_a_codeql_database_from_an_archive_extracts_it_first() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use std::io::Write as _;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let zp = tmp.path().join("kafka-db.zip");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&zp).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.start_file("java/codeql-database.yml", opts).unwrap();
+        z.write_all(b"primaryLanguage: \"java\"\n").unwrap();
+        z.finish().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Archive,
+            &zp.display().to_string(),
+        );
+        assert_eq!(app.codeql.databases.len(), 1, "{}", app.status);
+        let entry = &app.codeql.databases[0];
+        assert_eq!(entry.language.as_deref(), Some("java"));
+        assert!(
+            entry.path.starts_with(home.path()),
+            "extracted under croft's cache, not beside the archive: {}",
+            entry.path.display()
+        );
+    });
+}
+
+#[test]
+fn a_folder_without_a_codeql_database_is_refused_and_selection_persists() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Folder,
+            &tmp.path().display().to_string(),
+        );
+        assert!(
+            app.status.contains("not a CodeQL database"),
+            "{}",
+            app.status
+        );
+        assert!(app.codeql.databases.is_empty());
+        let a = make_codeql_db(tmp.path(), "a-db", "python");
+        let b = make_codeql_db(tmp.path(), "b-db", "go");
+        for db in [&a, &b] {
+            app.submit_codeql_database(
+                crate::widgets::input_prompt::CodeqlDbSource::Folder,
+                &db.display().to_string(),
+            );
+        }
+        assert_eq!(app.codeql.current_db, Some(1));
+        app.activate_codeql(crate::widgets::codeql::Hit::Action(
+            crate::widgets::codeql::Action::SelectDatabase(0),
+        ));
+        assert_eq!(app.codeql.current_db, Some(0));
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.open_codeql_view();
+        assert_eq!(again.codeql.current_db, Some(0), "the selection persists");
+    });
+}

@@ -18,6 +18,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
+/// The four ways VS Code's Databases view adds a database (#578).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeqlDbSource {
+    Folder,
+    Archive,
+    Url,
+    Github,
+}
+
 /// Why an input prompt is open, so the App can route the submitted value
 /// to the right git operation. Variants carry whatever context the second
 /// step needs (e.g. the base ref a new branch forks from).
@@ -33,6 +42,10 @@ pub enum InputPurpose {
     NewWorktreeLane,
     /// The command to run across the fleet (#363).
     FleetCommand,
+    /// Where to add a CodeQL database from (#578).
+    CodeqlDatabase {
+        source: CodeqlDbSource,
+    },
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
     /// Submitting stores the query on the view and jumps to the first

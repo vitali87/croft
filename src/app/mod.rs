@@ -20319,6 +20319,7 @@ impl App {
             return;
         }
         self.show_tree = true;
+        self.refresh_codeql_databases();
         self.set_sidebar_view(SidebarView::CodeQL);
     }
 
@@ -20356,20 +20357,256 @@ impl App {
                     None => String::from("CodeQL language: all"),
                 };
             }
+            Hit::Action(Action::SelectDatabase(i)) => {
+                let path = Self::codeql_db_store_path();
+                let mut store = crate::codeql_db::DatabaseStore::load(&path);
+                if i < store.databases.len() {
+                    store.current = Some(i);
+                    let _ = store.save(&path);
+                    self.status = format!("Current CodeQL database: {}", store.databases[i].name);
+                }
+                self.refresh_codeql_databases();
+            }
+            Hit::Action(
+                action @ (Action::AddDatabaseFromFolder
+                | Action::AddDatabaseFromArchive
+                | Action::AddDatabaseFromUrl
+                | Action::AddDatabaseFromGithub),
+            ) => {
+                use crate::widgets::input_prompt::{CodeqlDbSource, InputPrompt, InputPurpose};
+                let (source, title, hint) = match action {
+                    Action::AddDatabaseFromFolder => (
+                        CodeqlDbSource::Folder,
+                        "Add CodeQL Database from Folder",
+                        "path to the database folder",
+                    ),
+                    Action::AddDatabaseFromArchive => (
+                        CodeqlDbSource::Archive,
+                        "Add CodeQL Database from Archive",
+                        "path to a .zip",
+                    ),
+                    Action::AddDatabaseFromUrl => (
+                        CodeqlDbSource::Url,
+                        "Add CodeQL Database from URL",
+                        "https://… .zip",
+                    ),
+                    _ => (
+                        CodeqlDbSource::Github,
+                        "Add CodeQL Database from GitHub",
+                        "owner/repo [language]",
+                    ),
+                };
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::CodeqlDatabase { source },
+                    String::from(title),
+                    String::from(hint),
+                ));
+            }
             Hit::Action(action) => {
                 let what = match action {
-                    Action::AddDatabaseFromFolder
-                    | Action::AddDatabaseFromArchive
-                    | Action::AddDatabaseFromUrl
-                    | Action::AddDatabaseFromGithub => "Adding CodeQL databases",
                     Action::CreateQuery => "Creating CodeQL queries",
                     Action::SetUpControllerRepository => "Variant analysis",
                     Action::ViewAst => "The AST viewer",
-                    Action::SelectLanguage(_) => unreachable!("handled above"),
+                    _ => unreachable!("handled above"),
                 };
                 self.status = format!("{what} is not available yet (#578)");
             }
         }
+    }
+
+    fn codeql_db_store_path() -> PathBuf {
+        croft_cache_dir().join("codeql-databases.json")
+    }
+
+    /// Where fetched or extracted databases live: croft's cache, never
+    /// beside the archive the user pointed at.
+    fn codeql_db_cache_dir() -> PathBuf {
+        croft_cache_dir().join("codeql").join("databases")
+    }
+
+    /// Mirror the saved database list into the side bar.
+    fn refresh_codeql_databases(&mut self) {
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        self.codeql.databases = store.databases;
+        self.codeql.current_db = store.current;
+    }
+
+    /// A path as typed: `~` expanded, relative to the workspace root.
+    fn typed_path(&self, value: &str) -> PathBuf {
+        let v = value.trim();
+        let p = match v.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(rest),
+            None => PathBuf::from(v),
+        };
+        if p.is_absolute() {
+            p
+        } else {
+            self.workspace_root().join(p)
+        }
+    }
+
+    /// Add a CodeQL database from `value` (#578): a folder, an archive, a
+    /// URL to a zip, or `owner/repo [language]` on GitHub.
+    pub fn submit_codeql_database(
+        &mut self,
+        source: crate::widgets::input_prompt::CodeqlDbSource,
+        value: &str,
+    ) {
+        use crate::widgets::input_prompt::CodeqlDbSource;
+        let found: Result<PathBuf, String> = match source {
+            CodeqlDbSource::Folder => {
+                let dir = self.typed_path(value);
+                crate::codeql_db::find_database_in(&dir).ok_or_else(|| {
+                    format!(
+                        "{} is not a CodeQL database (no codeql-database.yml)",
+                        dir.display()
+                    )
+                })
+            }
+            CodeqlDbSource::Archive => {
+                let zip = self.typed_path(value);
+                let stem = zip
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| String::from("database"));
+                self.extract_codeql_zip(&zip, &stem)
+            }
+            CodeqlDbSource::Url => self.download_codeql_zip_from_url(value.trim()),
+            CodeqlDbSource::Github => self.download_codeql_db_from_github(value.trim()),
+        };
+        let dir = match found {
+            Ok(d) => d,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        let path = Self::codeql_db_store_path();
+        let mut store = crate::codeql_db::DatabaseStore::load(&path);
+        match store.add(&dir) {
+            Ok(i) => {
+                if let Err(e) = store.save(&path) {
+                    self.status = format!("Could not save the database list: {e}");
+                    return;
+                }
+                let db = &store.databases[i];
+                self.status = format!(
+                    "Added CodeQL database {}{}",
+                    db.name,
+                    db.language
+                        .as_deref()
+                        .map(|l| format!(" ({l})"))
+                        .unwrap_or_default()
+                );
+                self.refresh_codeql_databases();
+            }
+            Err(why) => self.status = why,
+        }
+    }
+
+    fn extract_codeql_zip(&self, zip: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+        let dest = Self::codeql_db_cache_dir().join(name);
+        crate::codeql_db::extract_zip(zip, &dest)?;
+        crate::codeql_db::find_database_in(&dest)
+            .ok_or_else(|| format!("{} holds no CodeQL database", zip.display()))
+    }
+
+    fn download_codeql_zip_from_url(&self, url: &str) -> Result<PathBuf, String> {
+        if !url.starts_with("https://") {
+            return Err(String::from("A database URL must be https://"));
+        }
+        let resp = ureq::get(url)
+            .timeout(std::time::Duration::from_secs(300))
+            .call()
+            .map_err(|e| format!("Download failed: {e}"))?;
+        let name = url
+            .rsplit('/')
+            .next()
+            .unwrap_or("database")
+            .trim_end_matches(".zip")
+            .to_string();
+        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
+        if let Some(dir) = tmp.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        std::io::copy(&mut resp.into_reader(), &mut f).map_err(|e| e.to_string())?;
+        let out = self.extract_codeql_zip(&tmp, &name);
+        let _ = std::fs::remove_file(&tmp);
+        out
+    }
+
+    /// `owner/repo` or `owner/repo language`. With no language, the one
+    /// database GitHub has is used; several need the language named.
+    fn download_codeql_db_from_github(&self, value: &str) -> Result<PathBuf, String> {
+        let mut parts = value.split_whitespace();
+        let repo = parts
+            .next()
+            .map(|r| {
+                r.trim_start_matches("https://github.com/")
+                    .trim_end_matches('/')
+            })
+            .filter(|r| r.split('/').count() == 2)
+            .ok_or_else(|| {
+                String::from("Give the repository as owner/repo (and optionally a language)")
+            })?
+            .to_string();
+        let language = match parts.next() {
+            Some(l) => l.to_string(),
+            None => {
+                let out = std::process::Command::new("gh")
+                    .args([
+                        "api",
+                        &format!("/repos/{repo}/code-scanning/codeql/databases"),
+                        "--jq",
+                        ".[].language",
+                    ])
+                    .output()
+                    .map_err(|e| format!("could not run gh: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "{repo} has no CodeQL databases on GitHub: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                let langs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                match langs.as_slice() {
+                    [one] => one.clone(),
+                    [] => return Err(format!("{repo} has no CodeQL databases on GitHub")),
+                    many => {
+                        return Err(format!(
+                            "{repo} has databases for {}; add one with '{repo} <language>'",
+                            many.join(", ")
+                        ));
+                    }
+                }
+            }
+        };
+        let out = std::process::Command::new("gh")
+            .args(crate::codeql_db::github_database_args(&repo, &language))
+            .output()
+            .map_err(|e| format!("could not run gh: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "Download failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let name = format!("{}-{language}", repo.replace('/', "-"));
+        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
+        if let Some(dir) = tmp.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&tmp, &out.stdout).map_err(|e| e.to_string())?;
+        let result = self.extract_codeql_zip(&tmp, &name);
+        let _ = std::fs::remove_file(&tmp);
+        result
     }
 
     /// Enable or disable an extension by id, persist the choice, and keep the
@@ -23322,6 +23559,10 @@ impl App {
             InputPurpose::NewWorktreeLane => {
                 self.close_input_prompt();
                 self.create_worktree_lane(&value);
+            }
+            InputPurpose::CodeqlDatabase { source } => {
+                self.close_input_prompt();
+                self.submit_codeql_database(source, &value);
             }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
