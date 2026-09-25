@@ -1127,32 +1127,74 @@ fn run_pump(
     stdout: std::process::ChildStdout,
     stop: Arc<AtomicBool>,
 ) {
-    let reader = BufReader::new(stdout);
+    pump_requests(
+        BufReader::new(stdout),
+        &stop,
+        |id| ssh_exec(&host, &socket, &claim_command(&inbox_dir, id)),
+        |request| dispatch_relay_request(&host, &socket, &inbox_dir, request),
+    );
+}
+
+/// The remote command that claims request `id` for this pump (#648): a plain
+/// `mkdir` of the request's own inbox directory, with no `-p`, which exactly
+/// one caller can win. The remote croft never creates that directory, only
+/// removes it once the request resolves, so the claim goes with it.
+fn claim_command(inbox_dir: &str, id: &str) -> String {
+    format!("mkdir {}", shell_quote(&format!("{inbox_dir}/{id}")))
+}
+
+/// Read relay requests line by line and act on each one this pump claims.
+///
+/// Every local window attached to the same remote session runs its own pump,
+/// and every pump tails the same `requests.log`, so without a claim a single
+/// request is served once per window: one click on a forwarded port opened a
+/// browser tab per window (#648). `claim` must succeed for exactly one pump
+/// per request id. An `unforward` carries no usable id and cancelling a
+/// forward twice is harmless, so it is not claimed. An id croft could not
+/// have minted is dropped rather than claimed, since the claim creates a
+/// directory named after it.
+fn pump_requests(
+    reader: impl BufRead,
+    stop: &AtomicBool,
+    mut claim: impl FnMut(&str) -> bool,
+    mut act: impl FnMut(RelayRequest),
+) {
     for line in reader.lines() {
         if stop.load(Ordering::SeqCst) {
             break;
         }
         let Ok(line) = line else { break };
-        match parse_relay_request(&line) {
-            Some(RelayRequest::Pull { id, src }) => {
-                handle_pull_request(&host, &socket, &inbox_dir, &id, &src);
-            }
-            Some(RelayRequest::Clipboard { id }) => {
-                handle_clipboard_request(&host, &socket, &inbox_dir, &id);
-            }
-            Some(RelayRequest::Copy { id }) => {
-                handle_copy_request(&host, &socket, &inbox_dir, &id);
-            }
-            Some(RelayRequest::Open { id, url }) => {
-                handle_open_request(&host, &socket, &inbox_dir, &id, &url);
-            }
-            Some(RelayRequest::Forward { id, port, open }) => {
-                handle_forward_request(&host, &socket, &inbox_dir, &id, &port, open);
-            }
-            Some(RelayRequest::Unforward { local, remote }) => {
-                handle_unforward_request(&host, &socket, &local, &remote);
-            }
-            None => {}
+        let Some(request) = parse_relay_request(&line) else {
+            continue;
+        };
+        if let Some(id) = request.id()
+            && !(copy_request_id_is_safe(id) && claim(id))
+        {
+            continue;
+        }
+        act(request);
+    }
+}
+
+fn dispatch_relay_request(host: &str, socket: &Path, inbox_dir: &str, request: RelayRequest) {
+    match request {
+        RelayRequest::Pull { id, src } => {
+            handle_pull_request(host, socket, inbox_dir, &id, &src);
+        }
+        RelayRequest::Clipboard { id } => {
+            handle_clipboard_request(host, socket, inbox_dir, &id);
+        }
+        RelayRequest::Copy { id } => {
+            handle_copy_request(host, socket, inbox_dir, &id);
+        }
+        RelayRequest::Open { id, url } => {
+            handle_open_request(host, socket, inbox_dir, &id, &url);
+        }
+        RelayRequest::Forward { id, port, open } => {
+            handle_forward_request(host, socket, inbox_dir, &id, &port, open);
+        }
+        RelayRequest::Unforward { local, remote } => {
+            handle_unforward_request(host, socket, &local, &remote);
         }
     }
 }
@@ -1273,12 +1315,15 @@ fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
         return;
     }
     let quoted = shell_quote(&format!("{inbox_dir}/{request_id}.txt"));
+    // The claim directory (#648): nothing on the remote waits on a copy, so
+    // the pump that won it removes it.
+    let claim = shell_quote(&format!("{inbox_dir}/{request_id}"));
     // One byte past the cap, so "exactly the cap" and "there was more" are
     // distinguishable and an oversized payload is DROPPED rather than pasted
     // half-formed. `head` also bounds a FIFO or a character device, which
     // `cat` would have streamed into local memory without end.
     let limit = MAX_COPY_PAYLOAD_BYTES + 1;
-    let remote_cmd = format!("head -c {limit} {quoted}; rm -f {quoted}");
+    let remote_cmd = format!("head -c {limit} {quoted}; rm -f {quoted}; rmdir {claim} 2>/dev/null");
     let Ok(mut child) = Command::new("ssh")
         .arg("-S")
         .arg(socket)
@@ -1382,6 +1427,21 @@ enum RelayRequest {
         local: String,
         remote: String,
     },
+}
+
+impl RelayRequest {
+    /// The id a pump claims before acting; `None` for requests that are
+    /// safe to act on twice.
+    fn id(&self) -> Option<&str> {
+        match self {
+            RelayRequest::Pull { id, .. }
+            | RelayRequest::Clipboard { id }
+            | RelayRequest::Copy { id }
+            | RelayRequest::Open { id, .. }
+            | RelayRequest::Forward { id, .. } => Some(id),
+            RelayRequest::Unforward { .. } => None,
+        }
+    }
 }
 
 fn parse_relay_request(line: &str) -> Option<RelayRequest> {
@@ -4003,6 +4063,82 @@ Host !blocked *.internal
         }
         // What croft actually mints stays acceptable.
         assert!(super::copy_request_id_is_safe("copy-12345-0"));
+    }
+
+    /// #648: two local windows on one remote session each run a pump over the
+    /// same `requests.log`. Each request is acted on by exactly one of them,
+    /// the claim being a real `mkdir` of the request's inbox directory run by
+    /// `sh`; `unforward` is not claimed, and an id croft could not have minted
+    /// is neither claimed nor acted on.
+    #[test]
+    fn two_pumps_over_one_log_act_on_each_request_once() {
+        use std::sync::atomic::AtomicBool;
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        std::fs::create_dir(&inbox).unwrap();
+        let inbox_dir = inbox.display().to_string();
+        let log = [
+            "open\topen-41-0\thttps://example.com/",
+            "forward\tforward-41-1\t8080\t1",
+            "pull\tpull-41-2\t/tmp/x",
+            "copy\tcopy-41-3",
+            "clipboard\tclipboard-41-4",
+            "unforward\tunforward-41-5\t50000\t8080",
+            "open\t../escape\thttps://example.com/",
+        ]
+        .join("\n");
+        let run = |log: String, inbox_dir: String| {
+            std::thread::spawn(move || {
+                let mut acted = Vec::new();
+                super::pump_requests(
+                    std::io::Cursor::new(log),
+                    &AtomicBool::new(false),
+                    |id| {
+                        std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(super::claim_command(&inbox_dir, id))
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .is_ok_and(|s| s.success())
+                    },
+                    |request| {
+                        acted.push(
+                            request
+                                .id()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| String::from("unforward")),
+                        )
+                    },
+                );
+                acted
+            })
+        };
+        let a = run(log.clone(), inbox_dir.clone());
+        let b = run(log, inbox_dir);
+        let mut all: Vec<String> = a.join().unwrap();
+        all.extend(b.join().unwrap());
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                "clipboard-41-4",
+                "copy-41-3",
+                "forward-41-1",
+                "open-41-0",
+                "pull-41-2",
+                "unforward",
+                "unforward",
+            ],
+            "each claimed request once, unforward by both pumps, the unsafe id by neither"
+        );
+        assert!(
+            inbox.join("open-41-0").is_dir(),
+            "the claim is the request dir"
+        );
+        assert!(
+            !root.path().join("escape").exists(),
+            "an unsafe id creates nothing"
+        );
     }
 
     #[test]
