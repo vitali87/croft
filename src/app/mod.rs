@@ -1642,6 +1642,10 @@ fn header_query_for_status(query: &str) -> String {
 /// so a slow server's answer still lands when it can.
 const FILE_MOVE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2000);
 
+/// Numbers each App's scratch keybindings file under test (#612), so tests
+/// running in parallel never share one.
+static TEST_KEYBINDINGS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// How long a buffer must sit unedited before its code lenses are asked
 /// for (#608).
 const CODE_LENS_SETTLE: std::time::Duration = std::time::Duration::from_millis(600);
@@ -3369,6 +3373,11 @@ pub struct App {
     /// this frame as (pane index, the text Right arrow would type).
     term_suggest_enabled: bool,
     term_suggestion: Option<(usize, String)>,
+    /// The command whose new shortcut the next keystroke records (#612).
+    recording_shortcut: Option<crate::widgets::command_palette::Command>,
+    /// Where recorded shortcuts are written: the user's keybindings.json,
+    /// or under test a scratch file, so a test run never edits the real one.
+    keybindings_file: PathBuf,
     /// A Search Editor rerun in flight (#615): the tab it lands in, the
     /// header it ran, and where its hits arrive.
     search_editor_job: Option<(
@@ -4975,6 +4984,16 @@ impl App {
             function_breakpoints: Vec::new(),
             term_suggest_enabled: true,
             term_suggestion: None,
+            recording_shortcut: None,
+            keybindings_file: if cfg!(test) {
+                std::env::temp_dir().join(format!(
+                    "croft-test-keybindings-{}-{}.json",
+                    std::process::id(),
+                    TEST_KEYBINDINGS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ))
+            } else {
+                crate::keymap::keybindings_path()
+            },
             search_editor_job: None,
             code_lens_requested: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
@@ -18563,6 +18582,15 @@ impl App {
             }
             // Cmd+K Shift+T: reopen the most recently closed terminal pane
             // (the browser reopen-tab convention under the Cmd+K leader).
+            // Cmd+K Cmd+S (Cmd held on the second key): the Keyboard Shortcuts
+            // editor, VS Code's binding (#612). Before the plain S arm, which
+            // keeps Select for Compare.
+            KeyCode::Char(c)
+                if c.eq_ignore_ascii_case(&'s') && has_cmd(key.modifiers) && !shifted =>
+            {
+                self.open_keyboard_shortcuts();
+                true
+            }
             // Cmd+K Shift+F / Shift+R: open the search results as a Search
             // Editor, and re-run the active one (#615). Before the plain F
             // and R arms; Shift+R in the terminal keeps its own meaning.
@@ -19073,6 +19101,11 @@ impl App {
             }
         }
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+            return Ok(());
+        }
+        // Keyboard Shortcuts editor (#612): the next key is the new chord.
+        if let Some(cmd) = self.recording_shortcut.take() {
+            self.record_shortcut(cmd, key);
             return Ok(());
         }
         self.hover_popup = None;
@@ -25454,6 +25487,19 @@ impl App {
                     self.run_participant_action(verb, id);
                 }
             }
+            ListPurpose::KeyboardShortcuts => {
+                if let Some(cmd) = row
+                    .id
+                    .strip_prefix("kb:")
+                    .and_then(crate::widgets::command_palette::Command::from_id)
+                {
+                    self.recording_shortcut = Some(cmd);
+                    self.status = format!(
+                        "Press the new shortcut for \u{201c}{}\u{201d} (a function key or a chord with Cmd/Ctrl/Alt; Esc cancels)",
+                        cmd.title()
+                    );
+                }
+            }
             ListPurpose::Settings => {
                 match row.id.as_str() {
                     "toggle:format_on_save" => self.toggle_format_on_save(),
@@ -25470,6 +25516,12 @@ impl App {
                     "toggle:log_highlight" => self.toggle_log_highlight(),
                     "toggle:secret_redaction" => self.toggle_secret_redaction(),
                     "toggle:format_on_type" => self.toggle_format_on_type(),
+                    "toggle:code_lens" => self.toggle_code_lens(),
+                    "toggle:terminal_suggestions" => self.toggle_terminal_suggestions(),
+                    "cmd:keyboard_shortcuts" => {
+                        self.open_keyboard_shortcuts();
+                        return;
+                    }
                     "cmd:color_theme" => {
                         self.open_theme_picker();
                         return;
@@ -25672,6 +25724,23 @@ impl App {
             ListRow {
                 id: String::from("cmd:configure_snippets"),
                 label: String::from("Configure User Snippets"),
+            },
+            ListRow {
+                id: String::from("cmd:keyboard_shortcuts"),
+                label: String::from(
+                    "Keyboard Shortcuts\u{2026} (record a new chord for any command)",
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:code_lens"),
+                label: format!("Editor: CodeLens: {}", on_off(self.code_lens_enabled)),
+            },
+            ListRow {
+                id: String::from("toggle:terminal_suggestions"),
+                label: format!(
+                    "Terminal: Command Suggestions: {}",
+                    on_off(self.term_suggest_enabled)
+                ),
             },
         ];
         self.open_list_picker(
@@ -36454,6 +36523,7 @@ impl App {
             Cmd::OpenSearchEditor => self.open_search_editor(),
             Cmd::RebaseAbort => self.abort_rebase_todo(),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
+            Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
             Cmd::RerunSearchEditor => self.rerun_search_editor(),
             Cmd::DebugAddHitCountBreakpoint => self.debug_edit_hit_condition(),
             Cmd::DebugAddFunctionBreakpoint => self.debug_add_function_breakpoint(),
@@ -42083,6 +42153,69 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
         }
+    }
+
+    /// Preferences: Open Keyboard Shortcuts (#612, Cmd+K Cmd+S): every
+    /// command with its shortcut, searchable; choosing one records a new one.
+    pub(crate) fn open_keyboard_shortcuts(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = crate::widgets::command_palette::ALL_COMMANDS
+            .iter()
+            .map(|&cmd| {
+                let shown = match self.keymap.chord_for(cmd) {
+                    Some(user) => format!("{user}  (yours)"),
+                    None if !cmd.keybinding_hint().is_empty() => cmd.keybinding_hint().to_string(),
+                    None => String::from("\u{2014}"),
+                };
+                ListRow {
+                    id: format!("kb:{}", cmd.id()),
+                    label: format!("{}  \u{00b7}  {shown}", cmd.title()),
+                }
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::KeyboardShortcuts, "Keyboard Shortcuts", rows),
+            "No commands",
+        );
+    }
+
+    /// Bind `cmd` to the chord `key` in keybindings.json (#612) and reload.
+    /// Plain typing cannot be a shortcut (it would stop being typing), so
+    /// only function keys and Cmd/Ctrl/Alt chords are accepted, the same rule
+    /// the keymap itself applies.
+    fn record_shortcut(&mut self, cmd: crate::widgets::command_palette::Command, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.status = String::from("Shortcut unchanged");
+            return;
+        }
+        if !is_rebindable_chord(key) {
+            self.status = String::from(
+                "A shortcut needs a function key or Cmd/Ctrl/Alt; press Keyboard Shortcuts again to retry",
+            );
+            return;
+        }
+        let chord = crate::keymap::Chord::from_event(key).to_config_string();
+        let previous = self.keymap.command_for(key).filter(|c| *c != cmd);
+        let path = self.keybindings_file.clone();
+        let src = std::fs::read_to_string(&path).ok();
+        let text = crate::keymap::rebind_text(src.as_deref(), cmd.id(), &chord);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&path, text) {
+            self.status = format!("Could not write {}: {e}", path.display());
+            return;
+        }
+        let (map, _) = crate::keymap::Keymap::load_with_warnings(&path);
+        self.keymap = map;
+        self.status = match previous {
+            Some(p) => format!(
+                "{chord} now runs \u{201c}{}\u{201d} (it ran \u{201c}{}\u{201d})",
+                cmd.title(),
+                p.title()
+            ),
+            None => format!("{chord} now runs \u{201c}{}\u{201d}", cmd.title()),
+        };
     }
 
     /// Paint the history suggestion after the focused terminal's typed line

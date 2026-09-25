@@ -50071,3 +50071,50 @@ fn a_plain_view_request_has_no_probe_field_on_the_wire() {
     .unwrap();
     assert!(probe.contains("\"probe\":true"));
 }
+
+// ---- Keyboard Shortcuts editor (#612) ----
+
+#[test]
+fn recording_a_shortcut_writes_it_and_takes_effect_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keybindings_file = tmp.path().join("keybindings.json");
+    app.open_keyboard_shortcuts();
+    let cmd = crate::widgets::command_palette::Command::ToggleLiveRun;
+    app.recording_shortcut = Some(cmd);
+    // Plain typing is refused and ends the recording.
+    app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.status.contains("needs a function key"),
+        "{}",
+        app.status
+    );
+    assert!(!app.keybindings_file.exists());
+    app.recording_shortcut = Some(cmd);
+    app.handle_key(key(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(
+        app.status.starts_with("ctrl+alt+j now runs"),
+        "{}",
+        app.status
+    );
+    let written = std::fs::read_to_string(&app.keybindings_file).unwrap();
+    assert!(written.contains("\"toggle_live_run\""), "{written}");
+    assert_eq!(app.keymap.chord_for(cmd).as_deref(), Some("ctrl+alt+j"));
+}
+
+#[test]
+fn escape_leaves_the_shortcut_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keybindings_file = tmp.path().join("keybindings.json");
+    app.recording_shortcut = Some(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, "Shortcut unchanged");
+    assert!(!app.keybindings_file.exists());
+}

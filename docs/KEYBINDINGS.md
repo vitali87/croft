@@ -78,6 +78,7 @@ Per platform:
 | `Cmd+K` `Shift+H` | Show outgoing calls: everything the function at the caret calls, each entry jumping to the callee's definition |
 | `Cmd+K` `Shift+U` | Show supertypes: the classes, traits or interfaces the type at the caret extends or implements (LSP type hierarchy; clangd, gopls, jdtls and others) |
 | `Cmd+K` `Shift+D` | Show subtypes: the types that extend or implement the one at the caret |
+| `Cmd+K` `Cmd+S` | Keyboard Shortcuts editor: every command with its shortcut (yours or the default), searchable. Choose one and press the new chord; croft writes it to `keybindings.json` (keeping your comments) and it works at once. Also in Settings |
 | `Cmd+K` `Shift+F` | Open the Search sidebar's query and results as a Search Editor tab (VS Code's `.code-search` layout). Several can stay open at once; `Enter` or `F12` on a result line opens the match |
 | `Cmd+K` `Shift+R` | Search Editor: Rerun. Search again for whatever the tab's `# Query:` header now says (flags, includes and excludes too), in the background |
 | `Cmd+K` `Shift+E` | Run the code lens on the caret line (a menu when there are several). Code lenses are the language server's clickable actions at the end of a symbol's line, such as rust-analyzer's "▶ Run Test" and "⚙ Debug"; click one to run it. "Editor: Toggle CodeLens" in the palette hides them |

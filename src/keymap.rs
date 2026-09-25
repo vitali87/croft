@@ -145,6 +145,45 @@ impl Chord {
         Some(t)
     }
 
+    /// The config spelling [`Chord::parse`] reads back (#612): modifiers in a
+    /// fixed order, then the key, e.g. `ctrl+alt+j`, `cmd+shift+p`, `f6`.
+    pub fn to_config_string(self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.mods.contains(KeyModifiers::CONTROL) {
+            parts.push(String::from("ctrl"));
+        }
+        if self.mods.contains(KeyModifiers::ALT) {
+            parts.push(String::from("alt"));
+        }
+        if self.mods.contains(KeyModifiers::SHIFT) {
+            parts.push(String::from("shift"));
+        }
+        if self.mods.contains(KeyModifiers::SUPER) {
+            parts.push(String::from("cmd"));
+        }
+        parts.push(match self.code {
+            KeyCode::F(n) => format!("f{n}"),
+            KeyCode::Char(' ') => String::from("space"),
+            KeyCode::Char(c) => c.to_ascii_lowercase().to_string(),
+            KeyCode::Enter => String::from("enter"),
+            KeyCode::Tab => String::from("tab"),
+            KeyCode::Esc => String::from("esc"),
+            KeyCode::Up => String::from("up"),
+            KeyCode::Down => String::from("down"),
+            KeyCode::Left => String::from("left"),
+            KeyCode::Right => String::from("right"),
+            KeyCode::Backspace => String::from("backspace"),
+            KeyCode::Delete => String::from("delete"),
+            KeyCode::Home => String::from("home"),
+            KeyCode::End => String::from("end"),
+            KeyCode::PageUp => String::from("pageup"),
+            KeyCode::PageDown => String::from("pagedown"),
+            KeyCode::Insert => String::from("insert"),
+            other => format!("{other:?}").to_ascii_lowercase(),
+        });
+        parts.join("+")
+    }
+
     /// Parse a config string like `"cmd+shift+p"`, `"ctrl+/"`, `"f2"`. Returns
     /// `None` on an unrecognized token so one bad line is skipped, not fatal.
     pub fn parse(s: &str) -> Option<Chord> {
@@ -726,6 +765,66 @@ impl Keymap {
     pub fn command_for(&self, key: KeyEvent) -> Option<Command> {
         self.bindings.get(&Chord::from_event(key)).copied()
     }
+
+    /// The user's chord for `cmd`, when `keybindings.json` binds one (#612).
+    /// Several chords can name one command; the lowest-sorting spelling is
+    /// returned so the display does not flicker between them.
+    pub fn chord_for(&self, cmd: Command) -> Option<String> {
+        self.bindings
+            .iter()
+            .filter(|(_, c)| **c == cmd)
+            .map(|(chord, _)| chord.to_config_string())
+            .min()
+    }
+}
+
+/// `keybindings.json` with `command` bound to `chord` (#612): the command's
+/// earlier one-line key entries removed and the new entry added last, where
+/// it wins over any other command's use of the same chord. Edited line by
+/// line so the user's comments and layout survive; `src` of `None` (no file
+/// yet) starts a fresh one. Falls back to a structured rewrite when the line
+/// edit would not parse.
+pub fn rebind_text(src: Option<&str>, command: &str, chord: &str) -> String {
+    let entry = format!("{{\"key\": \"{chord}\", \"command\": \"{command}\"}}");
+    let Some(src) = src.filter(|s| !s.trim().is_empty()) else {
+        return format!("[\n  {entry}\n]\n");
+    };
+    let quoted = format!("\"{command}\"");
+    let names_command = |line: &str| {
+        let t = line.trim();
+        t.starts_with('{')
+            && (t.ends_with('}') || t.ends_with("},"))
+            && t.contains("\"command\"")
+            && t.contains(&quoted)
+            && !t.contains("\"gesture\"")
+    };
+    let kept: Vec<&str> = src.lines().filter(|l| !names_command(l)).collect();
+    let mut text = kept.join("\n");
+    let parsed_ok = |t: &str| {
+        serde_json::from_str::<serde_json::Value>(&strip_line_comments(t))
+            .is_ok_and(|v| v.is_array())
+    };
+    if let Some(close) = text.rfind(']') {
+        // What precedes the new entry decides the comma: an element needs
+        // one, an opening bracket or a trailing comma does not.
+        let before = strip_line_comments(&text[..close]);
+        let needs_comma = before.trim_end().ends_with('}');
+        let insert = format!("{}  {entry}\n", if needs_comma { ",\n" } else { "\n" });
+        let head = text[..close].trim_end().to_string();
+        text = format!("{head}{insert}{}", &text[close..]);
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        if parsed_ok(&text) {
+            return text;
+        }
+    }
+    // Structured fallback: comments are lost, the bindings are not.
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_str(&strip_line_comments(src)).unwrap_or_default();
+    rows.retain(|r| r.get("command").and_then(|c| c.as_str()) != Some(command));
+    rows.push(serde_json::json!({ "key": chord, "command": command }));
+    serde_json::to_string_pretty(&rows).unwrap_or_default() + "\n"
 }
 
 pub fn keybindings_path() -> PathBuf {
@@ -748,6 +847,55 @@ pub const TEMPLATE: &str = r#"// croft keyboard shortcuts. Rebind any palette co
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_chord_round_trips_through_its_config_spelling() {
+        use super::*;
+        for spec in ["ctrl+alt+j", "cmd+shift+p", "f6", "alt+space", "ctrl+/"] {
+            let chord = Chord::parse(spec).unwrap();
+            assert_eq!(
+                Chord::parse(&chord.to_config_string()),
+                Some(chord),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebinding_keeps_comments_and_replaces_the_commands_old_entry() {
+        use super::*;
+        let src = "// my bindings\n[\n  {\"key\": \"alt+j\", \"command\": \"toggle_live_run\"},\n  // keep me\n  {\"key\": \"f7\", \"command\": \"toggle_word_wrap\"}\n]\n";
+        let out = rebind_text(Some(src), "toggle_live_run", "ctrl+alt+l");
+        assert!(
+            out.contains("// my bindings") && out.contains("// keep me"),
+            "{out}"
+        );
+        assert!(!out.contains("alt+j"), "the old chord is gone: {out}");
+        let map = Keymap::from_json(&out);
+        let key = |spec: &str| {
+            let c = Chord::parse(spec).unwrap();
+            KeyEvent::new(c.code, c.mods)
+        };
+        assert_eq!(
+            map.command_for(key("ctrl+alt+l")),
+            Some(Command::ToggleLiveRun)
+        );
+        assert_eq!(map.command_for(key("f7")), Some(Command::ToggleWordWrap));
+    }
+
+    #[test]
+    fn rebinding_starts_a_file_when_there_is_none() {
+        use super::*;
+        let out = rebind_text(None, "toggle_live_run", "f8");
+        let map = Keymap::from_json(&out);
+        assert_eq!(map.chord_for(Command::ToggleLiveRun).as_deref(), Some("f8"));
+        let empty = rebind_text(Some("[]\n"), "toggle_live_run", "f8");
+        assert_eq!(
+            Keymap::from_json(&empty)
+                .chord_for(Command::ToggleLiveRun)
+                .as_deref(),
+            Some("f8")
+        );
+    }
 
     #[test]
     fn a_bare_double_click_is_reserved_wherever_word_selection_lives() {
