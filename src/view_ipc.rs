@@ -53,6 +53,12 @@ pub static SOCK_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewRequest {
     pub path: Vec<u8>,
+    /// Ask only whether `path` is open in a tab, opening nothing (#620):
+    /// `croft edit --wait` polls with this until the user closes the tab.
+    /// Omitted from the wire when false, so a request from this build reads
+    /// the same to an older croft.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probe: bool,
 }
 
 /// The server's answer. `Err` carries a message the client prints verbatim,
@@ -69,6 +75,15 @@ impl ViewRequest {
         use std::os::unix::ffi::OsStrExt;
         Self {
             path: path.as_os_str().as_bytes().to_vec(),
+            probe: false,
+        }
+    }
+
+    /// "Is `path` still open?" (#620).
+    pub fn probe(path: &Path) -> Self {
+        Self {
+            probe: true,
+            ..Self::new(path)
         }
     }
 
@@ -620,6 +635,36 @@ fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> anyhow::Result<Vec<u8>>
         );
     }
     Ok(buf)
+}
+
+/// The reply to a probe whose file is no longer open in any tab (#620).
+pub const PROBE_CLOSED: &str = "closed";
+
+/// How often `croft edit --wait` asks whether its tab is still open.
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `croft edit [--wait] <path>` (#620): open `path` in the hosting croft
+/// like `croft view`, and with `wait` return only once its tab is closed,
+/// which is what `$GIT_SEQUENCE_EDITOR` and `$EDITOR` callers expect. A
+/// croft that goes away counts as closed: git then carries on with the file
+/// as it was last saved, rather than hanging forever.
+pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::Result<()> {
+    run(target, None, cache_dir)?;
+    if !wait {
+        return Ok(());
+    }
+    let Some(socket) = std::env::var_os(SOCK_ENV).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let path = resolve(&std::env::current_dir()?, Path::new(target));
+    let probe = ViewRequest::probe(&path);
+    loop {
+        std::thread::sleep(WAIT_POLL);
+        match send(Path::new(&socket), &probe) {
+            Ok(ViewReply::Ok) => continue,
+            Ok(ViewReply::Err { .. }) | Err(_) => return Ok(()),
+        }
+    }
 }
 
 /// `croft view <path>` / `croft view -`.

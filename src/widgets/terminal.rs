@@ -1323,6 +1323,14 @@ pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::path::Path>) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // `git rebase -i` opens its plan in this croft (#620), unless the user
+    // chose their own sequence editor, which always wins.
+    if view_sock.is_some()
+        && std::env::var_os("GIT_SEQUENCE_EDITOR").is_none()
+        && let Ok(exe) = std::env::current_exe()
+    {
+        cmd.env("GIT_SEQUENCE_EDITOR", sequence_editor_command(&exe));
+    }
     match view_sock {
         Some(path) => cmd.env(crate::view_ipc::SOCK_ENV, path),
         // CLEARED, not merely not-added. `CommandBuilder::new` seeds itself
@@ -1335,6 +1343,13 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
         // plainly").
         None => cmd.env_remove(crate::view_ipc::SOCK_ENV),
     }
+}
+
+/// The `GIT_SEQUENCE_EDITOR` value naming this croft (#620). git runs it
+/// through the shell, so the binary's path is single-quoted.
+pub(crate) fn sequence_editor_command(exe: &std::path::Path) -> String {
+    let quoted = exe.to_string_lossy().replace('\'', r"'\''");
+    format!("'{quoted}' edit --wait")
 }
 
 impl PtyTerminal {

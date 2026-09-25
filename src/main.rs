@@ -61,6 +61,7 @@ mod problem_matchers;
 mod provenance;
 mod quick_select;
 mod quickfix;
+mod rebase_todo;
 mod release_notes;
 mod remote;
 mod remote_bulk;

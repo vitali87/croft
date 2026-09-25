@@ -152,6 +152,10 @@ Inside that diff, single keys act on the change hunk under the cursor: `S` stage
 
 Below the change list, a **COMMITS** section draws the repo-wide commit graph (VS Code's built-in Source Control Graph, in the tig / lazygit idiom): colour-cycled box-drawing rails trace every branch and merge across local branches and tags, each row showing its ref badges (HEAD's branch bold, tags gold), subject, and age. Clicking a commit opens its full patch — header, message, diffstat, diff — in a read-only editor tab, and the graph refreshes itself whenever HEAD moves.
 
+## Interactive rebase
+
+`git rebase -i` run in a croft terminal opens its plan (`git-rebase-todo`) as a croft tab, because croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait` in every pane it spawns (a sequence editor you set yourself always wins). In that tab a single key sets the caret commit's action: `p` pick, `r` reword, `e` edit, `s` squash, `f` fixup, `d` drop (with vim mode on, those keys stay vim's). `Alt`+`Up` / `Down` reorder commits. Save and close the tab and git carries on; **Rebase: Abort** in the palette empties the plan, which makes git abort. `croft edit --wait <file>` works for any tool that wants an editor it can wait on.
+
 ## Local history
 
 croft snapshots each file as you save it, and the Explorer's TIMELINE lists those snapshots next to the git commits (VS Code's Timeline model). Diff any past version against the working file or restore it — including versions you never committed.

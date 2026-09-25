@@ -14061,6 +14061,7 @@ impl App {
         // buffer is far larger than any legal reply, which is why it is set
         // rather than tested.
         let reply = match crate::view_ipc::read_request(&stream, deadline) {
+            Ok(req) if req.probe => self.probe_view_path(&req.to_path()),
             Ok(req) => self.apply_view_request(&req.to_path()),
             Err(e) => crate::view_ipc::ViewReply::Err {
                 message: format!("unreadable request: {e}"),
@@ -29005,6 +29006,10 @@ impl App {
             }
             return;
         }
+        // Rebase todo (#620): single-key actions on commit lines.
+        if self.rebase_todo_key(key) {
+            return;
+        }
         // Search Editor (#615): Enter or F12 on a result row opens the match;
         // anywhere else both keep their usual meaning.
         if (key.code == KeyCode::Enter && key.modifiers.is_empty() || is_go_to_definition_key(key))
@@ -32335,7 +32340,11 @@ impl App {
                 // it, not to find it filed behind the pane they typed in.
                 self.focus_pane(Pane::Editor);
                 self.sync_open_file_poll_mtime();
-                self.status = format!("Opened {}", path.display());
+                self.status = if crate::rebase_todo::is_todo(path) {
+                    String::from(crate::rebase_todo::HINT)
+                } else {
+                    format!("Opened {}", path.display())
+                };
                 ViewReply::Ok
             }
             Err(e) => ViewReply::Err {
@@ -36425,6 +36434,7 @@ impl App {
             Cmd::ShowSupertypes => self.request_type_hierarchy_at_cursor(true),
             Cmd::ToggleCodeLens => self.toggle_code_lens(),
             Cmd::OpenSearchEditor => self.open_search_editor(),
+            Cmd::RebaseAbort => self.abort_rebase_todo(),
             Cmd::RerunSearchEditor => self.rerun_search_editor(),
             Cmd::DebugAddHitCountBreakpoint => self.debug_edit_hit_condition(),
             Cmd::DebugAddFunctionBreakpoint => self.debug_add_function_breakpoint(),
@@ -42054,6 +42064,100 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
         }
+    }
+
+    /// Answer `croft edit --wait`'s poll (#620): whether `path` is still open
+    /// in any tab of any group. Opens nothing.
+    fn probe_view_path(&self, path: &Path) -> crate::view_ipc::ViewReply {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let is_it = |p: &Path| p == path || p.canonicalize().is_ok_and(|c| c == canon);
+        let open = self
+            .editor
+            .editors
+            .iter()
+            .chain(
+                self.editor_layout
+                    .inactive_groups()
+                    .into_iter()
+                    .flat_map(|g| g.editors.iter()),
+            )
+            .any(|t| t.path.as_deref().is_some_and(is_it));
+        if open {
+            crate::view_ipc::ViewReply::Ok
+        } else {
+            crate::view_ipc::ViewReply::Err {
+                message: String::from(crate::view_ipc::PROBE_CLOSED),
+            }
+        }
+    }
+
+    /// In a `git-rebase-todo` tab (#620), a plain p/r/e/s/f/d on a commit
+    /// line sets its action and moves to the next line. Off in vim mode,
+    /// where those letters are vim commands. Returns whether it acted.
+    fn rebase_todo_key(&mut self, key: KeyEvent) -> bool {
+        let KeyCode::Char(c) = key.code else {
+            return false;
+        };
+        if !key.modifiers.is_empty()
+            || self.vim.enabled
+            || !self
+                .editor
+                .path
+                .as_deref()
+                .is_some_and(crate::rebase_todo::is_todo)
+        {
+            return false;
+        }
+        let Some(action) = crate::rebase_todo::action_for_key(c) else {
+            return false;
+        };
+        let row = self.editor.cursor_row;
+        let Some(line) = self.editor.lines.get(row).cloned() else {
+            return false;
+        };
+        let Some(new_line) = crate::rebase_todo::set_action(&line, action) else {
+            return false;
+        };
+        self.editor
+            .apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
+                start: (row, 0),
+                end: (row, line.chars().count()),
+                new_text: new_line,
+            }]);
+        self.editor.cursor_row = (row + 1).min(self.editor.lines.len().saturating_sub(1));
+        self.editor.cursor_col = 0;
+        self.status = String::from(crate::rebase_todo::HINT);
+        true
+    }
+
+    /// Rebase: Abort (#620): empty the plan, save it and close its tab, which
+    /// git reads as "abort the rebase".
+    fn abort_rebase_todo(&mut self) {
+        if !self
+            .editor
+            .path
+            .as_deref()
+            .is_some_and(crate::rebase_todo::is_todo)
+        {
+            self.status = String::from("Rebase: Abort works in a git-rebase-todo tab");
+            return;
+        }
+        let end = self.editor.lines.len().saturating_sub(1);
+        let end_col = self
+            .editor
+            .lines
+            .last()
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
+        self.editor
+            .apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
+                start: (0, 0),
+                end: (end, end_col),
+                new_text: String::new(),
+            }]);
+        self.save();
+        self.run_command(crate::widgets::command_palette::Command::CloseEditor);
+        self.status = String::from("Rebase aborted");
     }
 
     /// Search: Open Results in Editor (#615, Cmd+K Shift+F): the sidebar's

@@ -49992,3 +49992,82 @@ fn a_search_editor_reruns_its_header_and_opens_results() {
     );
     assert_eq!(app.editor.cursor_row, 1, "the match's line, 0-based");
 }
+
+// ---- Interactive rebase in croft (#620) ----
+
+#[test]
+fn rebase_todo_keys_set_the_action_and_step_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "git-rebase-todo",
+        "pick aaa111 first\npick bbb222 second\n# comment\n",
+    );
+    app.editor.cursor_row = 1;
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('f'),
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines[1], "fixup bbb222 second");
+    assert_eq!(app.editor.cursor_row, 2, "the caret moves to the next line");
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('d'),
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.editor.lines[2], "d# comment",
+        "a comment line types normally"
+    );
+}
+
+#[test]
+fn rebase_keys_type_normally_outside_a_todo_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "pick aaa111 first\n");
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('s'),
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines[0], "spick aaa111 first");
+}
+
+#[test]
+fn a_probe_reports_whether_the_file_is_still_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", "pick a b\n");
+    let path = app.editor.path.clone().unwrap();
+    assert_eq!(app.probe_view_path(&path), crate::view_ipc::ViewReply::Ok);
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    assert!(matches!(
+        app.probe_view_path(&path),
+        crate::view_ipc::ViewReply::Err { .. }
+    ));
+}
+
+#[test]
+fn the_sequence_editor_command_quotes_the_binary_path() {
+    assert_eq!(
+        crate::widgets::terminal::sequence_editor_command(std::path::Path::new(
+            "/opt/my croft/croft"
+        )),
+        "'/opt/my croft/croft' edit --wait"
+    );
+}
+
+#[test]
+fn a_plain_view_request_has_no_probe_field_on_the_wire() {
+    // An older croft must read this build's `croft view` unchanged.
+    let json = serde_json::to_string(&crate::view_ipc::ViewRequest::new(std::path::Path::new(
+        "/a",
+    )))
+    .unwrap();
+    assert!(!json.contains("probe"), "{json}");
+    let probe = serde_json::to_string(&crate::view_ipc::ViewRequest::probe(std::path::Path::new(
+        "/a",
+    )))
+    .unwrap();
+    assert!(probe.contains("\"probe\":true"));
+}

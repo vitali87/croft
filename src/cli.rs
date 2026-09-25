@@ -281,6 +281,18 @@ pub enum CliCommand {
         #[arg(long = "as")]
         as_ext: Option<String>,
     },
+    /// Open a file for editing in the croft that hosts this pane (#620).
+    ///
+    /// Like `croft view`, plus `--wait`: return only once the tab is
+    /// closed. croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait`, so
+    /// `git rebase -i` opens its plan here.
+    Edit {
+        /// File to open.
+        path: std::ffi::OsString,
+        /// Block until the file's tab is closed.
+        #[arg(long, default_value_t = false)]
+        wait: bool,
+    },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
     /// binaries for (x86_64 / aarch64 musl). After this finishes, the
@@ -481,6 +493,13 @@ impl Cli {
                 if let Err(e) =
                     crate::view_ipc::run(&path, as_ext.as_deref(), &crate::app::croft_cache_dir())
                 {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            Some(CliCommand::Edit { path, wait }) => {
+                if let Err(e) = crate::view_ipc::edit(&path, wait, &crate::app::croft_cache_dir()) {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
