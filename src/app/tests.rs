@@ -51009,3 +51009,50 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+/// #678: Claude Code (or tmux, nvim) copying a selection through OSC 52 in
+/// a croft pane must land where croft's own copy lands. Dropping it broke
+/// copy on a remote box, where OSC 52 is the program's only clipboard.
+#[test]
+fn a_pane_program_osc52_copy_reaches_the_clipboard_on_the_drain_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    crate::clipboard::test_clip::mock_write("before");
+    // "Y29waWVk" is "copied"; the empty store first is a program clearing
+    // the clipboard at startup and must not wipe it.
+    let script =
+        "read x; printf '\\033]52;c;\\007'; read y; printf '\\033]52;c;Y29waWVk\\007'; sleep 30";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals[0].write_input(b"\n");
+    // The empty store has no visible output to wait on, so give it the
+    // same budget the real copy gets and require that nothing changed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        app.drain_terminal_bells();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        crate::clipboard::test_clip::mock_read().as_deref(),
+        Some("before"),
+        "an empty OSC 52 store must not wipe the clipboard"
+    );
+    app.terminals[0].write_input(b"\n");
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane's OSC 52 copy to reach the clipboard",
+        || {
+            app.drain_terminal_bells();
+            crate::clipboard::test_clip::mock_read().as_deref() == Some("copied")
+        },
+    );
+    assert!(
+        app.status.starts_with("Copied 6 chars"),
+        "the copy is reported like croft's own, status: {}",
+        app.status
+    );
+}

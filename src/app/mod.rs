@@ -33781,7 +33781,12 @@ impl App {
         // A preLaunchTask completing settles the parked debug launch (#250);
         // recorded here and acted on after the sweep (launching mutates self).
         let mut settled_launch: Option<Option<i32>> = None;
+        // The newest OSC 52 copy any pane's program made this tick (#678).
+        let mut copied: Option<String> = None;
         for t in &self.terminals {
+            if let Some(text) = t.take_clipboard_store() {
+                copied = Some(text);
+            }
             // Keep every pane on the current trigger set, wherever it was
             // created (a ptr-eq no-op when already current).
             t.set_triggers(self.triggers.clone());
@@ -33929,6 +33934,16 @@ impl App {
         for c in captured {
             self.captures.push(c);
         }
+        // A program in a pane copied through OSC 52 (Claude Code, tmux,
+        // nvim): send it where a paste comes from, exactly as croft's own
+        // selection copy does, so a remote session copies to the user's
+        // machine and not to a box with no clipboard (#678). An empty store
+        // is a program clearing the clipboard at startup, not a copy the
+        // user made, so it never wipes what they copied.
+        let copied = copied.filter(|text| !text.is_empty());
+        if let Some(text) = &copied {
+            self.deliver_copied_text(text);
+        }
         if let Some(msg) = trigger_note {
             self.status = msg;
             return true;
@@ -33945,7 +33960,7 @@ impl App {
             return true;
         }
         let Some(label) = rang else {
-            return false;
+            return copied.is_some();
         };
         self.status = format!("Bell in terminal: {label}");
         true
