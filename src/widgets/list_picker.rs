@@ -56,6 +56,9 @@ pub enum ListPurpose {
     /// `profile:` for the default, or an action (`new`, `workspace`,
     /// `workspace-clear`).
     Profiles,
+    /// Review: Submit Review (#366): the verdict, `id` = `COMMENT`,
+    /// `APPROVE` or `REQUEST_CHANGES`.
+    ReviewVerdict,
     /// Multiplayer session roster (Session: Participants): the rows are the
     /// clients attached to this session's host; `id` is the participant id.
     /// Enter opens the per-participant action picker.

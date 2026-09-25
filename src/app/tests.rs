@@ -50274,3 +50274,117 @@ fn an_edit_makes_a_suggestion_stale_and_esc_dismisses_one() {
     .unwrap();
     assert!(app.editor.live_ghost().is_none(), "typing makes it stale");
 }
+
+/// #366's write side end to end against a fake `gh`: threads load with
+/// their GraphQL resolution, a reply and a resolve go to GitHub off the
+/// frame loop, and a pending comment is submitted with the chosen verdict.
+#[test]
+fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(&args)
+            .status();
+    }
+    let f = root.join("a.rs");
+    std::fs::write(&f, "fn a() {}\nfn b() {}\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-m", "init", "--quiet"]] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(&args)
+            .status();
+    }
+    let log = tmp.path().join("gh.log");
+    let stdin = tmp.path().join("gh.stdin");
+    let gh = tmp.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  "pr view"*) echo 7 ;;
+  "pr diff"*) printf 'diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,1 +1,2 @@\n fn a() {{}}\n+fn b() {{}}\n' ;;
+  *graphql*reviewThreads*) echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_1","isResolved":false,"comments":{{"nodes":[{{"databaseId":5}}]}}}}]}}}}}}}}}}' ;;
+  *graphql*) echo '{{}}' ;;
+  *"/comments --paginate"*) echo '[{{"id":5,"path":"a.rs","line":1,"user":{{"login":"ada"}},"body":"why?"}}]' ;;
+  *reviews*) cat > '{stdin}'; echo '{{}}' ;;
+  *) echo '{{}}' ;;
+esac
+"#,
+            log = log.display(),
+            stdin = stdin.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut app = App::new(root.clone()).unwrap();
+    app.review_gh = gh.display().to_string();
+    app.editor.open_pinned(&f).unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "git to find the repository",
+        || {
+            app.git.drain_into(None);
+            app.git.status().repo_root.is_some()
+        },
+    );
+
+    app.load_review_threads();
+    let threads = app.review_boxes.as_ref().map(|(_, t)| t.clone()).unwrap();
+    assert_eq!(threads.len(), 1);
+    assert!(!threads[0].resolved);
+    assert_eq!(app.review_nodes.get(&5).map(String::as_str), Some("PRRT_1"));
+
+    let wait_for = |app: &mut App, what: &str, done: &dyn Fn(&App) -> bool| {
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), what, || {
+            app.drain_review_ops();
+            done(app)
+        });
+    };
+
+    app.editor.cursor_row = 0;
+    app.toggle_review_thread_resolved();
+    wait_for(&mut app, "the resolve", &|a| {
+        a.review_boxes.as_ref().is_some_and(|(_, t)| t[0].resolved)
+    });
+
+    assert!(app.reply_to_review_thread(5, "done"));
+    wait_for(&mut app, "the reply", &|a| {
+        a.review_boxes
+            .as_ref()
+            .is_some_and(|(_, t)| t[0].body.ends_with("you: done"))
+    });
+
+    app.editor.cursor_row = 1;
+    app.open_review_comment_prompt();
+    let rel = app.prompt.as_ref().unwrap().target_dir.clone();
+    app.prompt = None;
+    app.add_pending_review_comment("add a test", rel);
+    app.review_verdict = Some(crate::review_threads::ReviewEvent::RequestChanges);
+    app.submit_review(String::from("Close."));
+    wait_for(&mut app, "the review", &|a| a.review_pending.is_empty());
+
+    let sent: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stdin).unwrap()).unwrap();
+    assert_eq!(sent["event"], "REQUEST_CHANGES");
+    assert_eq!(sent["comments"][0]["path"], "a.rs");
+    assert_eq!(sent["comments"][0]["line"], 2);
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains("pulls/7/comments/5/replies -f body=done"),
+        "{calls}"
+    );
+    assert!(calls.contains("resolveReviewThread"), "{calls}");
+}

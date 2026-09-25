@@ -71,6 +71,7 @@ mod release_notes;
 mod remote;
 mod remote_bulk;
 mod remote_connect;
+mod review_ops;
 mod review_threads;
 mod rewind;
 mod scrubber;

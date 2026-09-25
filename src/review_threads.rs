@@ -70,7 +70,172 @@ pub fn parse_threads(json: &str) -> Vec<Thread> {
     let Some(items) = value.as_array() else {
         return Vec::new();
     };
-    items.iter().filter_map(thread_from).collect()
+    // A reply is its own comment object carrying `in_reply_to_id`; it joins
+    // its root's box as a further paragraph, so a conversation reads as one
+    // thread and a reply posts to the root it belongs to.
+    let mut roots: Vec<Thread> = Vec::new();
+    let mut replies: Vec<(u64, String, String)> = Vec::new();
+    for v in items {
+        match v.get("in_reply_to_id").and_then(serde_json::Value::as_u64) {
+            Some(root) => {
+                if let Some(t) = thread_from(v) {
+                    replies.push((root, t.author, t.body));
+                }
+            }
+            None => roots.extend(thread_from(v)),
+        }
+    }
+    for (root, author, body) in replies {
+        if let Some(t) = roots.iter_mut().find(|t| t.id == root) {
+            t.body.push_str(&format!("\n\n{author}: {body}"));
+        }
+    }
+    roots
+}
+
+/// Resolution state and GraphQL node id per thread, keyed by the thread's
+/// first comment's REST id, from [`THREADS_QUERY`]'s output.
+pub fn parse_thread_states(json: &str) -> std::collections::HashMap<u64, (String, bool)> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return out;
+    };
+    let nodes = v
+        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+        .and_then(serde_json::Value::as_array);
+    for n in nodes.into_iter().flatten() {
+        let id = n.get("id").and_then(serde_json::Value::as_str);
+        let resolved = n.get("isResolved").and_then(serde_json::Value::as_bool);
+        let first = n
+            .pointer("/comments/nodes/0/databaseId")
+            .and_then(serde_json::Value::as_u64);
+        if let (Some(id), Some(resolved), Some(first)) = (id, resolved, first) {
+            out.insert(first, (id.to_string(), resolved));
+        }
+    }
+    out
+}
+
+/// GraphQL for each review thread's node id, resolution and first comment.
+/// Takes `$owner`, `$repo` and `$number`.
+pub const THREADS_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}";
+
+/// The GraphQL mutation that resolves (or unresolves) thread `$id`.
+pub fn resolve_mutation(resolve: bool) -> &'static str {
+    if resolve {
+        "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+    } else {
+        "mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+    }
+}
+
+/// A comment written in croft and not yet submitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingComment {
+    /// Repo-relative path, forward slashes.
+    pub path: String,
+    /// 0-based buffer line.
+    pub line: usize,
+    pub body: String,
+}
+
+/// The verdict a review is submitted with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewEvent {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl ReviewEvent {
+    pub fn api_name(self) -> &'static str {
+        match self {
+            Self::Comment => "COMMENT",
+            Self::Approve => "APPROVE",
+            Self::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+}
+
+/// The new-file line numbers (1-based) a review may comment on in `path`,
+/// read from the PR's unified diff: the added and context lines of its
+/// hunks. GitHub refuses a whole review if one comment falls outside them.
+pub fn commentable_lines(diff: &str, path: &str) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    let mut in_file = false;
+    let mut line = 0usize;
+    for l in diff.lines() {
+        if let Some(rest) = l.strip_prefix("+++ ") {
+            in_file = rest.strip_prefix("b/").unwrap_or(rest) == path;
+            continue;
+        }
+        if l.starts_with("diff --git ") {
+            in_file = false;
+            continue;
+        }
+        if !in_file {
+            continue;
+        }
+        if let Some(h) = l.strip_prefix("@@ ") {
+            // `@@ -a,b +c,d @@`: new-side hunk starts at c.
+            line = h
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix('+'))
+                .and_then(|t| t.split(',').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            continue;
+        }
+        if line == 0 {
+            continue;
+        }
+        match l.chars().next() {
+            Some('+') | Some(' ') => {
+                out.insert(line);
+                line += 1;
+            }
+            Some('-') | Some('\\') => {}
+            _ => {
+                out.insert(line);
+                line += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The body of `POST /pulls/N/reviews`. Pending comments on lines the diff
+/// covers go inline; the rest are listed in the summary with their place,
+/// so nothing written is lost and GitHub doesn't refuse the review.
+pub fn review_payload(
+    event: ReviewEvent,
+    summary: &str,
+    pending: &[PendingComment],
+    commentable: &dyn Fn(&str, usize) -> bool,
+) -> serde_json::Value {
+    let (inline, off): (Vec<&PendingComment>, Vec<&PendingComment>) = pending
+        .iter()
+        .partition(|c| commentable(&c.path, c.line + 1));
+    let mut body = summary.trim().to_string();
+    if !off.is_empty() {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str("Comments on lines outside the diff:\n");
+        for c in &off {
+            body.push_str(&format!("\n- `{}:{}`: {}", c.path, c.line + 1, c.body));
+        }
+    }
+    serde_json::json!({
+        "event": event.api_name(),
+        "body": body,
+        "comments": inline.iter().map(|c| serde_json::json!({
+            "path": c.path,
+            "line": c.line + 1,
+            "side": "RIGHT",
+            "body": c.body,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// One comment object to a [`Thread`].
@@ -220,6 +385,68 @@ mod tests {
             threads[1].title_for(usize::MAX).contains("bob"),
             "and name its author"
         );
+    }
+
+    #[test]
+    fn replies_join_their_root_thread() {
+        let json = r#"[
+          {"id":1,"path":"a.rs","line":3,"user":{"login":"ada"},"body":"why?"},
+          {"id":2,"path":"a.rs","line":3,"in_reply_to_id":1,"user":{"login":"bob"},"body":"because"},
+          {"id":3,"path":"a.rs","line":9,"user":{"login":"cy"},"body":"typo"}
+        ]"#;
+        let t = parse_threads(json);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].body, "why?\n\nbob: because");
+    }
+
+    #[test]
+    fn thread_states_come_from_graphql_keyed_by_first_comment() {
+        let json = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+          {"id":"PRRT_a","isResolved":true,"comments":{"nodes":[{"databaseId":11}]}},
+          {"id":"PRRT_b","isResolved":false,"comments":{"nodes":[{"databaseId":12}]}}
+        ]}}}}}"#;
+        let s = parse_thread_states(json);
+        assert_eq!(s.get(&11), Some(&(String::from("PRRT_a"), true)));
+        assert_eq!(s.get(&12).map(|x| x.1), Some(false));
+    }
+
+    #[test]
+    fn commentable_lines_are_the_new_side_of_the_files_hunks() {
+        let diff = "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,3 +1,4 @@\n a\n-b\n+c\n+d\n e\n@@ -20,2 +21,2 @@ fn f()\n x\n+y\ndiff --git a/z.rs b/z.rs\n--- a/z.rs\n+++ b/z.rs\n@@ -1 +1 @@\n+q\n";
+        let mut got: Vec<usize> = commentable_lines(diff, "x.rs").into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3, 4, 21, 22]);
+        assert_eq!(commentable_lines(diff, "z.rs").len(), 1);
+        assert!(commentable_lines(diff, "nope.rs").is_empty());
+    }
+
+    #[test]
+    fn off_diff_comments_move_into_the_summary() {
+        let pending = vec![
+            PendingComment {
+                path: "a.rs".into(),
+                line: 4,
+                body: "inline".into(),
+            },
+            PendingComment {
+                path: "a.rs".into(),
+                line: 99,
+                body: "far away".into(),
+            },
+        ];
+        let v = review_payload(
+            ReviewEvent::RequestChanges,
+            "Looks close.",
+            &pending,
+            &|_, l| l == 5,
+        );
+        assert_eq!(v["event"], "REQUEST_CHANGES");
+        assert_eq!(v["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(v["comments"][0]["line"], 5);
+        assert_eq!(v["comments"][0]["side"], "RIGHT");
+        let body = v["body"].as_str().unwrap();
+        assert!(body.starts_with("Looks close."));
+        assert!(body.contains("`a.rs:100`: far away"), "{body}");
     }
 
     /// A REAL payload from the REST endpoint, trimmed but not reshaped.

@@ -62,6 +62,7 @@ src/
 ├── remote.rs             remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offer: `ssh_destination` parses a pane's foreground argv using ssh's own flag grammar
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
+├── review_ops.rs         the write side of review (#366): reply, resolve, submit a review, as `gh` jobs off the frame loop
 ├── review_threads.rs     GitHub review threads as the editor's comment boxes, behind "Review: Load PR Comments for This File"; distinguishes a thread's current `line` from `original_line`
 ├── scrubber.rs           moving through a branch's history, the cursor behind "Source Control: Scrub History"; the working tree is a `Position::Working` in the cursor, so leaving restores the live buffer exactly
 ├── session.rs            local session persistence: `croft attach` / `croft ls` run croft under the session host so terminals/LSP/DAP survive closing the window; legacy dtach sessions keep reattaching, and `ls` skips the collab relay socket
@@ -417,6 +418,8 @@ GitHub review threads rendered as the editor's comment boxes, behind "Review: Lo
 **The core difficulty.** GitHub anchors a comment to the diff line it was written against, and NULLS that `line` once the branch moves under it, while keeping `original_line`. The two mean different things — where the comment is NOW versus where it WAS — so rendering an outdated thread at `original_line` silently attaches someone's objection to whatever code now occupies that number, which after a rebase is routinely a different function.
 
 **Verified against the live API, not a model of it.** An outdated comment really does arrive as `line: null` with `original_line` set. The REST comments endpoint carries NO resolution state at all: `isResolved` lives only on GraphQL's `reviewThreads`, a different query keyed on threads rather than comments, so `resolved` here is filled by a caller that has merged it in, and defaults to unresolved otherwise. And `position` / `original_position` are DIFF offsets, not file lines.
+
+**Writing back (#366).** Replies (`in_reply_to_id`) fold into their root's box, and a reply typed in a thread's box posts to that root. The loader also runs the GraphQL `reviewThreads` query, which supplies `isResolved` and the node id that Resolve / Unresolve need. Review comments written in croft stay pending, and are drawn as boxes, until Review: Submit Review sends them with a verdict. GitHub refuses the whole review if one comment sits outside the diff, so the submit reads `gh pr diff` first and moves any such comment into the summary with its `path:line`.
 
 **Marking outdated threads.** An outdated thread is anchored but MARKED, in the title rather than only in a colour, since a reviewer skims titles and a colour is what a screenshot or a colour-blind reader loses.
 

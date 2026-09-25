@@ -2305,6 +2305,8 @@ enum PromptKind {
     DataBreakpoint,
     /// Profiles: New Profile (#618): the new profile's name.
     NewProfile,
+    ReviewComment,
+    ReviewSummary,
     /// Rename the terminal pane at `idx`. The buffer is pre-filled with its
     /// current label; on commit the name overrides the auto label.
     RenameTerminal(usize),
@@ -3575,6 +3577,17 @@ pub struct App {
     /// goes stale the moment the user edits, and the box it was protecting
     /// becomes invisible again.
     review_boxes: Option<(PathBuf, Vec<crate::review_threads::Thread>)>,
+    /// Writing reviews (#366): comments not yet submitted, the PR they are
+    /// for as (repo root, number), each thread's GraphQL node id, the chosen
+    /// verdict while its summary is typed, the `gh` to run, and where
+    /// finished jobs report.
+    review_pending: Vec<crate::review_threads::PendingComment>,
+    review_pr: Option<(PathBuf, String)>,
+    review_nodes: std::collections::HashMap<u64, String>,
+    review_verdict: Option<crate::review_threads::ReviewEvent>,
+    review_gh: String,
+    review_tx: std::sync::mpsc::Sender<crate::review_ops::Outcome>,
+    review_rx: std::sync::mpsc::Receiver<crate::review_ops::Outcome>,
     /// An open asciicast recording (#356): the writer, the file it appends
     /// to, and when it started. `None` when nothing is being recorded.
     recording: Option<(
@@ -4623,6 +4636,7 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
+        let (review_tx, review_rx) = std::sync::mpsc::channel();
         if !cfg!(test) {
             crate::i18n::init(loaded_prefs.locale.as_deref());
         }
@@ -5239,6 +5253,13 @@ impl App {
             code_action_pending_resolve: false,
             pending_code_actions: Vec::new(),
             review_boxes: None,
+            review_pending: Vec::new(),
+            review_pr: None,
+            review_nodes: std::collections::HashMap::new(),
+            review_verdict: None,
+            review_gh: String::from("gh"),
+            review_tx,
+            review_rx,
             recording: None,
             recorded_size: (0, 0),
             symbol_tab: None,
@@ -16278,6 +16299,33 @@ impl App {
                     }
                 }));
             }
+            // Pending review comments (#366) on this file, until submitted.
+            if !self.review_pending.is_empty()
+                && let Some((root, _)) = &self.review_pr
+                && let Some(rel) = self.editor.path.as_deref().and_then(|p| {
+                    let top = self.git_worker_for_root(root).status().repo_root.clone()?;
+                    p.strip_prefix(&top).ok().map(|r| {
+                        r.components()
+                            .map(|c| c.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    })
+                })
+            {
+                let lines = self.editor.lines.len();
+                for (i, c) in self.review_pending.iter().enumerate() {
+                    if c.path == rel {
+                        self.editor
+                            .comment_boxes
+                            .push(crate::widgets::editor::CommentBox {
+                                id: Self::PENDING_REVIEW_ID + i as u64,
+                                line: c.line.min(lines.saturating_sub(1)),
+                                author: String::from("you \u{b7} pending"),
+                                body: c.body.clone(),
+                            });
+                    }
+                }
+            }
             // A focused box that vanished (ignored elsewhere, cleared, or
             // re-anchored away) releases the keyboard back to the buffer.
             if let Some(focus) = &self.editor.comment_focus
@@ -18604,6 +18652,28 @@ impl App {
                     ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
                 "Enter to create it from your current settings, keybindings and snippets, Esc to cancel",
+            ),
+            PromptKind::ReviewComment => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to add it to your pending review, Esc to cancel",
+            ),
+            PromptKind::ReviewSummary => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to submit the review (the summary may be empty), Esc to cancel",
             ),
         };
         frame.render_widget(
@@ -24540,6 +24610,14 @@ impl App {
         if reply.is_empty() {
             return;
         }
+        if self.reply_to_review_thread(focus.id, &reply) {
+            return;
+        }
+        if Self::pending_review_index(focus.id).is_some() {
+            self.status =
+                String::from("A pending comment has no thread yet; submit the review first");
+            return;
+        }
         let Some(host) = &self.pair_host else {
             self.status =
                 String::from("Navigator is not active (run croft pair in this workspace)");
@@ -24583,6 +24661,204 @@ impl App {
         }
     }
 
+    /// Box ids for pending comments count down from the top of the id
+    /// space, clear of navigator notes (from 1) and GitHub ids (~4e9).
+    const PENDING_REVIEW_ID: u64 = u64::MAX - 1_000_000;
+
+    /// The pending comment a box id names, as an index.
+    fn pending_review_index(id: u64) -> Option<usize> {
+        id.checked_sub(Self::PENDING_REVIEW_ID).map(|i| i as usize)
+    }
+
+    /// Review: Add Comment on This Line (#366).
+    fn open_review_comment_prompt(&mut self) {
+        let Some((_, _, rel, _)) = self.review_context() else {
+            return;
+        };
+        self.prompt = Some(Prompt {
+            label: format!("Comment on {rel}:{}", self.editor.cursor_row + 1),
+            buffer: String::new(),
+            kind: PromptKind::ReviewComment,
+            // Carries the repo-relative path, so the comment lands on the
+            // file it was asked about.
+            target_dir: PathBuf::from(rel),
+            error: None,
+        });
+    }
+
+    fn add_pending_review_comment(&mut self, body: &str, rel: PathBuf) {
+        if body.is_empty() {
+            return;
+        }
+        self.review_pending
+            .push(crate::review_threads::PendingComment {
+                path: rel.to_string_lossy().into_owned(),
+                line: self.editor.cursor_row,
+                body: body.to_string(),
+            });
+        self.status = format!(
+            "{} pending comment(s): Review: Submit Review sends them",
+            self.review_pending.len()
+        );
+    }
+
+    /// Review: Submit Review: pick the verdict, then type the summary.
+    fn open_review_submit(&mut self) {
+        if self.review_context().is_none() {
+            return;
+        }
+        let rows = [
+            ("COMMENT", "Comment"),
+            ("APPROVE", "Approve"),
+            ("REQUEST_CHANGES", "Request Changes"),
+        ]
+        .into_iter()
+        .map(|(id, label)| crate::widgets::list_picker::ListRow {
+            id: id.to_string(),
+            label: format!("{label} ({} pending comment(s))", self.review_pending.len()),
+        })
+        .collect();
+        self.open_list_picker(
+            crate::widgets::list_picker::ListPicker::new(
+                crate::widgets::list_picker::ListPurpose::ReviewVerdict,
+                "Submit Review",
+                rows,
+            ),
+            "",
+        );
+    }
+
+    fn submit_review(&mut self, summary: String) {
+        use crate::review_threads::ReviewEvent;
+        let event = self.review_verdict.take().unwrap_or(ReviewEvent::Comment);
+        let Some((root, number)) = self.review_pr.clone() else {
+            return;
+        };
+        if event == ReviewEvent::Comment && summary.is_empty() && self.review_pending.is_empty() {
+            self.status = String::from("Nothing to submit: add a comment or a summary");
+            return;
+        }
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::Submit {
+                number,
+                event,
+                summary,
+                pending: self.review_pending.clone(),
+            },
+            self.review_tx.clone(),
+        );
+        self.status = String::from("Submitting review…");
+    }
+
+    /// Review: Resolve or Unresolve Thread: the focused box, else the next
+    /// one from the caret.
+    fn toggle_review_thread_resolved(&mut self) {
+        let id = self
+            .editor
+            .comment_focus
+            .as_ref()
+            .map(|f| f.id)
+            .or_else(|| self.next_comment_from_caret().map(|(id, _)| id));
+        let Some(thread) = id.and_then(|id| {
+            self.review_boxes
+                .as_ref()
+                .and_then(|(_, ts)| ts.iter().find(|t| t.id == id).cloned())
+        }) else {
+            self.status = String::from("No review thread here");
+            return;
+        };
+        let (Some(node), Some((root, _))) = (
+            self.review_nodes.get(&thread.id).cloned(),
+            self.review_pr.clone(),
+        ) else {
+            self.status =
+                String::from("GitHub didn't report this thread's id; reload the comments");
+            return;
+        };
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::Resolve {
+                thread: thread.id,
+                node,
+                resolve: !thread.resolved,
+            },
+            self.review_tx.clone(),
+        );
+    }
+
+    /// A reply typed into a review thread's box goes to GitHub. Returns
+    /// false when the focused box is not a review thread.
+    fn reply_to_review_thread(&mut self, id: u64, text: &str) -> bool {
+        let is_thread = self
+            .review_boxes
+            .as_ref()
+            .is_some_and(|(_, ts)| ts.iter().any(|t| t.id == id));
+        if !is_thread {
+            return false;
+        }
+        let Some((root, number)) = self.review_pr.clone() else {
+            return false;
+        };
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::Reply {
+                number,
+                thread: id,
+                text: text.to_string(),
+            },
+            self.review_tx.clone(),
+        );
+        self.editor.comment_focus = None;
+        self.status = String::from("Replying…");
+        true
+    }
+
+    /// Apply finished review jobs.
+    pub fn drain_review_ops(&mut self) -> bool {
+        use crate::review_ops::Outcome;
+        let mut changed = false;
+        while let Ok(out) = self.review_rx.try_recv() {
+            changed = true;
+            match out {
+                Outcome::Replied { thread, text } => {
+                    if let Some((_, ts)) = &mut self.review_boxes
+                        && let Some(t) = ts.iter_mut().find(|t| t.id == thread)
+                    {
+                        t.body.push_str(&format!("\n\nyou: {text}"));
+                    }
+                    self.status = String::from("Reply posted");
+                }
+                Outcome::Resolved { thread, resolved } => {
+                    if let Some((_, ts)) = &mut self.review_boxes
+                        && let Some(t) = ts.iter_mut().find(|t| t.id == thread)
+                    {
+                        t.resolved = resolved;
+                    }
+                    self.status = String::from(if resolved {
+                        "Thread resolved"
+                    } else {
+                        "Thread reopened"
+                    });
+                }
+                Outcome::Submitted { inline, folded } => {
+                    self.review_pending.clear();
+                    self.status = match folded {
+                        0 => format!("Review submitted with {inline} comment(s)"),
+                        n => format!(
+                            "Review submitted: {inline} inline, {n} outside the diff moved into the summary"
+                        ),
+                    };
+                }
+                Outcome::Failed(e) => self.status = e,
+            }
+        }
+        changed
+    }
+
     /// Follow the open file to its new path so its review boxes survive a
     /// rename or an explorer cut/paste (#366).
     ///
@@ -24621,6 +24897,11 @@ impl App {
         // bare id.
         if let Some((_, threads)) = &mut self.review_boxes {
             threads.retain(|t| t.id != id);
+        }
+        if let Some(i) = Self::pending_review_index(id)
+            && i < self.review_pending.len()
+        {
+            self.review_pending.remove(i);
         }
         if self
             .editor
@@ -25583,6 +25864,21 @@ impl App {
                 if let Some((verb, id)) = parse_participant_action(&row.id) {
                     self.run_participant_action(verb, id);
                 }
+            }
+            ListPurpose::ReviewVerdict => {
+                use crate::review_threads::ReviewEvent;
+                self.review_verdict = Some(match row.id.as_str() {
+                    "APPROVE" => ReviewEvent::Approve,
+                    "REQUEST_CHANGES" => ReviewEvent::RequestChanges,
+                    _ => ReviewEvent::Comment,
+                });
+                self.prompt = Some(Prompt {
+                    label: String::from("Review summary"),
+                    buffer: String::new(),
+                    kind: PromptKind::ReviewSummary,
+                    target_dir: self.tree.root.clone(),
+                    error: None,
+                });
             }
             ListPurpose::Profiles => match row.id.as_str() {
                 "new" => {
@@ -27094,17 +27390,13 @@ impl App {
         }
     }
 
-    /// Load this PR's review threads onto the open file as comment boxes
-    /// (#366).
-    ///
-    /// Only threads for THIS file. A review's comments span the whole PR,
-    /// and hanging another file's objections off this buffer's line numbers
-    /// would put them against unrelated code — the same failure as placing
-    /// an outdated thread silently, arriving through the other axis.
-    fn load_review_threads(&mut self) {
+    /// The open file's review context (#366): (repo root the `gh` calls run
+    /// in, the file, its repo-relative path, the branch's PR number), or
+    /// `None` with the reason in the status bar.
+    fn review_context(&mut self) -> Option<(PathBuf, PathBuf, String, String)> {
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Open a file from the PR first");
-            return;
+            return None;
         };
         // The root that OWNS the open file, not the primary. In a
         // multi-root workspace the two differ, and using the primary runs
@@ -27119,14 +27411,14 @@ impl App {
         // a new place.
         let Some(repo_root) = self.git_worker_for_root(&root).status().repo_root.clone() else {
             self.status = String::from("This folder is not inside a git repository");
-            return;
+            return None;
         };
         let Ok(rel) = path.strip_prefix(&repo_root) else {
             self.status = format!(
                 "{} is outside the repository, so it has no review comments",
                 path.display()
             );
-            return;
+            return None;
         };
         // Forward slashes: the API always uses them, and on Windows a
         // `to_string_lossy` here yields backslashes that match nothing.
@@ -27135,7 +27427,7 @@ impl App {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        let out = std::process::Command::new("gh")
+        let out = std::process::Command::new(&self.review_gh)
             .args(["pr", "view", "--json", "number", "--jq", ".number"])
             .current_dir(&root)
             .output();
@@ -27143,10 +27435,25 @@ impl App {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             _ => {
                 self.status = String::from("No PR for this branch — check it out first");
-                return;
+                return None;
             }
         };
-        let api = std::process::Command::new("gh")
+        self.review_pr = Some((root.clone(), number.clone()));
+        Some((root, path, rel, number))
+    }
+
+    /// Load this PR's review threads onto the open file as comment boxes
+    /// (#366).
+    ///
+    /// Only threads for THIS file. A review's comments span the whole PR,
+    /// and hanging another file's objections off this buffer's line numbers
+    /// would put them against unrelated code — the same failure as placing
+    /// an outdated thread silently, arriving through the other axis.
+    fn load_review_threads(&mut self) {
+        let Some((root, path, rel, number)) = self.review_context() else {
+            return;
+        };
+        let api = std::process::Command::new(&self.review_gh)
             .args([
                 "api",
                 &format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments"),
@@ -27171,11 +27478,41 @@ impl App {
                 return;
             }
         };
-        let threads: Vec<crate::review_threads::Thread> =
+        let mut threads: Vec<crate::review_threads::Thread> =
             crate::review_threads::parse_threads(&json)
                 .into_iter()
                 .filter(|t| t.path == rel)
                 .collect();
+        // Resolution and the node id Resolve needs live only in GraphQL.
+        // Best effort: without it every thread reads as unresolved, the safe
+        // default, and Resolve says why it can't act.
+        let states = std::process::Command::new(&self.review_gh)
+            .args([
+                "api",
+                "graphql",
+                "-F",
+                "owner={owner}",
+                "-F",
+                "repo={repo}",
+                "-F",
+                &format!("number={number}"),
+                "-f",
+                &format!("query={}", crate::review_threads::THREADS_QUERY),
+            ])
+            .current_dir(&root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                crate::review_threads::parse_thread_states(&String::from_utf8_lossy(&o.stdout))
+            })
+            .unwrap_or_default();
+        for t in &mut threads {
+            if let Some((node, resolved)) = states.get(&t.id) {
+                t.resolved = *resolved;
+                self.review_nodes.insert(t.id, node.clone());
+            }
+        }
         if threads.is_empty() {
             self.status = format!("No review comments on {rel}");
             return;
@@ -36697,6 +37034,14 @@ impl App {
             Cmd::ScrubHistory => self.scrub_history(),
             Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
             Cmd::LoadReviewThreads => self.load_review_threads(),
+            Cmd::ReviewAddComment => self.open_review_comment_prompt(),
+            Cmd::ReviewSubmit => self.open_review_submit(),
+            Cmd::ReviewToggleResolved => self.toggle_review_thread_resolved(),
+            Cmd::ReviewDiscardPending => {
+                let n = self.review_pending.len();
+                self.review_pending.clear();
+                self.status = format!("Discarded {n} pending comment(s)");
+            }
             Cmd::ToggleSessionRecording => self.toggle_session_recording(),
             Cmd::FleetRun => {
                 self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
@@ -47785,6 +48130,16 @@ impl App {
                 self.prompt = None;
                 self.commit_data_breakpoint(&name);
             }
+            PromptKind::ReviewComment => {
+                let (body, rel) = (prompt.buffer.trim().to_string(), prompt.target_dir.clone());
+                self.prompt = None;
+                self.add_pending_review_comment(&body, rel);
+            }
+            PromptKind::ReviewSummary => {
+                let summary = prompt.buffer.trim().to_string();
+                self.prompt = None;
+                self.submit_review(summary);
+            }
             PromptKind::NewProfile => {
                 let name = prompt.buffer.trim().to_string();
                 match crate::profiles::create_from_current(&name) {
@@ -52377,8 +52732,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let auto_save_changed = app.tick_auto_save();
         let live_run_changed = app.tick_live_run() | app.sync_markdown_scroll();
         app.tick_code_lens();
-        let code_lens_changed =
-            app.drain_lsp_code_lens() | app.drain_search_editor() | app.tick_inline_complete();
+        let code_lens_changed = app.drain_lsp_code_lens()
+            | app.drain_search_editor()
+            | app.tick_inline_complete()
+            | app.drain_review_ops();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
