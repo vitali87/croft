@@ -2531,6 +2531,7 @@ impl PtyTerminal {
     /// text from the newest OSC 133;B cell on the cursor's row. `None`
     /// whenever the shell does not own the pane: no prompt mark, a command
     /// running, a full-screen program, or the cursor off the prompt row.
+    #[allow(dead_code)] // used from the next layer of this change
     pub fn prompt_input(&self) -> Option<String> {
         let term = self.term.lock();
         if term.mode().contains(TermMode::ALT_SCREEN) {
@@ -2867,6 +2868,7 @@ impl PtyTerminal {
 
     /// The host-screen cell the cursor is drawn in, when the view is at the
     /// live bottom (not scrolled back) and the pane has been drawn.
+    #[allow(dead_code)] // used from the next layer of this change
     pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
         let inner = self.last_inner;
         let term = self.term.lock();
