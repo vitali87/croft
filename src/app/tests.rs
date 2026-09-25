@@ -43760,6 +43760,73 @@ fn an_orphaned_symbol_tab_with_unsaved_edits_survives_its_symbol() {
     assert!(app.status.contains("whole file"), "{}", app.status);
 }
 
+/// #369: a tab that turned into a whole-file tab keeps the keys typed
+/// right after, in the same burst, while another symbol tab of its file is
+/// still open to mirror against.
+#[test]
+fn a_kept_orphan_keeps_the_next_keys_beside_a_sibling_symbol_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.select(0);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    let whole = |app: &App| {
+        app.editor
+            .editors
+            .iter()
+            .position(|e| e.symbol_view.is_none())
+    };
+    app.editor.close_tab(whole(&app).expect("the file tab"));
+    assert_eq!(app.editor.editors.len(), 2, "two symbol tabs are left");
+    let b = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.symbol_view.as_ref().is_some_and(|v| v.name == "b"))
+        .expect("the b tab");
+    app.editor.select(b);
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    let kept = whole(&app).expect("the b tab became a file tab");
+    assert_eq!(
+        app.editor.editors[kept].path.as_deref(),
+        Some(file.as_path())
+    );
+    assert!(
+        app.editor.editors[kept].lines.iter().any(|l| l == "x"),
+        "{:?}",
+        app.editor.editors[kept].lines
+    );
+}
+
+/// #369: a clean symbol tab whose symbol goes closes even with no file
+/// tab open: it holds nothing the disk does not.
+#[test]
+fn a_clean_orphaned_symbol_tab_closes_when_its_symbol_goes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.close_tab(0);
+    assert!(app.editor.symbol_view.is_some() && !app.editor.dirty);
+    std::fs::write(&file, "fn a() {\n    1\n}\n").unwrap();
+    app.editor.reload_if_clean().unwrap().unwrap();
+    app.sync_symbol_views();
+    assert!(
+        app.editor.editors.iter().all(|e| e.path.is_none()),
+        "{}",
+        app.status
+    );
+    assert!(app.status.contains("that symbol is gone"), "{}", app.status);
+}
+
 /// #369: going to a file lands on the tab that shows ALL of it.
 ///
 /// A symbol tab has the file's path, and the tab lookups behind opening,

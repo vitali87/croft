@@ -26258,7 +26258,8 @@ impl App {
     /// saving any of them clears the dirty dot on all. A file that is live in
     /// a collab session is left to the session, which converges its panes
     /// already. Then each symbol tab follows the edit so its clip stays on
-    /// its symbol, and closes once the symbol is gone.
+    /// its symbol, and closes once the symbol is gone (or, holding unsaved
+    /// text no whole-file tab holds, turns into a tab of the whole file).
     pub(crate) fn sync_symbol_views(&mut self) -> bool {
         let paths = self.symbol_view_paths();
         if paths.is_empty() {
@@ -26359,7 +26360,8 @@ impl App {
     }
 
     /// Move every symbol tab's clip with the edits since its last look, and
-    /// close the tabs whose symbol is gone.
+    /// close the tabs whose symbol is gone, except an orphan with unsaved
+    /// text, which turns into a tab of the whole file.
     fn follow_symbol_views(&mut self) -> bool {
         let mut changed = false;
         let mut notes: Vec<String> = Vec::new();
@@ -26415,6 +26417,9 @@ impl App {
         // instead of closing, or its edits, in and out of the clip, would
         // be lost with it.
         let mut kept_paths: Vec<PathBuf> = Vec::new();
+        // Said last, so the status (the last note) names the kept edits
+        // even when a sibling tab of the same symbol closed beside it.
+        let mut kept_notes: Vec<String> = Vec::new();
         let mut keep = |ed: &mut crate::widgets::editor::Editor,
                         whole_file_open: &dyn Fn(&Path) -> bool|
          -> bool {
@@ -26431,7 +26436,10 @@ impl App {
             if orphan {
                 kept_paths.extend(ed.path.clone());
                 ed.leave_symbol_view();
-                notes.push(format!(
+                // Mirrored in this pass: it is in step with its siblings,
+                // so its next edit is the source, not overwritten by them.
+                ed.mirror_seq = Some(ed.edit_seq);
+                kept_notes.push(format!(
                     "{name} is gone; its tab now shows the whole file with the unsaved edits"
                 ));
             } else {
@@ -26439,12 +26447,17 @@ impl App {
             }
             orphan
         };
-        let whole_file_tabs: Vec<PathBuf> = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
-            .flat_map(|g| g.editors.iter())
-            .filter(|e| e.symbol_view.is_none() && !e.has_non_text_view())
-            .filter_map(|e| e.path.clone())
-            .collect();
+        let any_gone = !gone_here.is_empty() || gone_inactive.iter().any(|g| !g.is_empty());
+        let whole_file_tabs: Vec<PathBuf> = if any_gone {
+            std::iter::once(&self.editor)
+                .chain(self.editor_layout.inactive_groups())
+                .flat_map(|g| g.editors.iter())
+                .filter(|e| e.symbol_view.is_none() && !e.has_non_text_view())
+                .filter_map(|e| e.path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let whole_file_open = |p: &Path| whole_file_tabs.iter().any(|w| w == p);
         let gone_here: Vec<usize> = gone_here
             .into_iter()
@@ -26458,6 +26471,7 @@ impl App {
         {
             gone_inactive[g].retain(|&i| !keep(&mut group.editors[i], &whole_file_open));
         }
+        notes.extend(kept_notes);
         for &i in gone_here.iter().rev() {
             self.editor.close_tab(i);
         }
