@@ -61,6 +61,8 @@ pub enum Action {
     SelectLanguage(usize),
     /// Make the listed database at this index the current one.
     SelectDatabase(usize),
+    /// Open the results of the query history entry at this index.
+    OpenHistory(usize),
 }
 
 /// The languages CodeQL analyses, as VS Code's Language view lists them.
@@ -107,6 +109,8 @@ pub struct CodeqlPanel {
     /// The databases the user added, and which one queries run against.
     pub databases: Vec<crate::codeql_db::DbEntry>,
     pub current_db: Option<usize>,
+    /// Query history labels, newest first (#578).
+    pub history: Vec<String>,
 }
 
 impl CodeqlPanel {
@@ -183,6 +187,11 @@ impl CodeqlPanel {
                         Action::SetUpControllerRepository,
                         "Set up controller repository".to_string(),
                     ));
+                }
+                Section::QueryHistory if !self.history.is_empty() => {
+                    for (i, label) in self.history.iter().enumerate() {
+                        out.push(Line::Action(Action::OpenHistory(i), label.clone()));
+                    }
                 }
                 Section::QueryHistory => {
                     out.push(Line::Text("You have no query history items at the"));
@@ -435,5 +444,28 @@ mod tests {
             p.lines()
                 .contains(&Line::Action(Action::SelectLanguage(6), "● Python".into()))
         );
+    }
+
+    #[test]
+    fn query_history_lists_each_run_to_open_and_keeps_its_welcome_when_empty() {
+        let mut p = CodeqlPanel::new();
+        assert!(
+            p.lines()
+                .contains(&Line::Text("You have no query history items at the"))
+        );
+        p.history = vec![
+            String::from("\u{2713} a.ql \u{b7} app \u{b7} 3s"),
+            String::from("\u{2717} b.ql \u{b7} app \u{b7} failed: x"),
+        ];
+        let lines = p.lines();
+        assert!(!lines.contains(&Line::Text("You have no query history items at the")));
+        assert!(lines.contains(&Line::Action(
+            Action::OpenHistory(0),
+            "\u{2713} a.ql \u{b7} app \u{b7} 3s".into()
+        )));
+        assert!(lines.contains(&Line::Action(
+            Action::OpenHistory(1),
+            "\u{2717} b.ql \u{b7} app \u{b7} failed: x".into()
+        )));
     }
 }

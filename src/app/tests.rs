@@ -49792,3 +49792,175 @@ fn a_folder_without_a_codeql_database_is_refused_and_selection_persists() {
         assert_eq!(again.codeql.current_db, Some(0), "the selection persists");
     });
 }
+
+/// A stand-in `codeql`: logs its arguments, writes `body` to the path its
+/// `--output=` names, and exits with `code` (printing `err` on stderr).
+#[cfg(unix)]
+fn fake_codeql(dir: &std::path::Path, body: &str, code: i32, err: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let reply = dir.join("codeql-reply");
+    std::fs::write(&reply, body).unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{log}'\nfor a in \"$@\"; do case \"$a\" in --output=*) cp '{reply}' \"${{a#--output=}}\" ;; esac; done\n[ -n '{err}' ] && echo '{err}' >&2\nexit {code}\n",
+        log = dir.join("codeql-calls.log").display(),
+        reply = reply.display(),
+    );
+    let bin = dir.join("codeql");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// Drain the query run until it lands, or fail after a few seconds.
+fn wait_for_codeql(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.codeql_run.is_some() {
+        app.drain_codeql_run();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query run never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A workspace with `q.ql` open and database "app" current.
+fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
+    let db = tmp.join("dbs/app");
+    std::fs::create_dir_all(&db).unwrap();
+    let store = crate::codeql_db::DatabaseStore {
+        databases: vec![crate::codeql_db::DbEntry {
+            name: String::from("app"),
+            path: db,
+            language: Some(String::from("rust")),
+        }],
+        current: Some(0),
+    };
+    store.save(&App::codeql_db_store_path()).unwrap();
+    let q = tmp.join("q.ql");
+    std::fs::write(&q, source).unwrap();
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.editor.open(&q).unwrap();
+    app
+}
+
+#[cfg(unix)]
+#[test]
+fn a_problem_query_runs_on_the_current_database_and_opens_as_sarif() {
+    // #578: VS Code's "Run Query on Selected Database"; alerts open in the
+    // SARIF viewer and the run is kept in the query history.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(
+            tmp.path(),
+            "/**\n * @kind problem\n */\nimport rust\nselect 1",
+        );
+        app.codeql_program = fake_codeql(
+            bin.path(),
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},"results":[{"ruleId":"q","message":{"text":"From codeql."}}]}]}"#,
+            0,
+            "",
+        );
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        assert!(app.status.contains("Running q.ql on app"), "{}", app.status);
+        assert_eq!(app.codeql.history.len(), 1);
+        assert!(
+            app.codeql.history[0].contains("running"),
+            "{:?}",
+            app.codeql.history
+        );
+        wait_for_codeql(&mut app);
+        // The alerts open as a .sarif file, which the SARIF viewer claims.
+        let opened = app.editor.path.clone().expect("the results open");
+        assert_eq!(opened.extension().and_then(|e| e.to_str()), Some("sarif"));
+        assert!(
+            std::fs::read_to_string(&opened)
+                .unwrap()
+                .contains("From codeql.")
+        );
+        assert!(
+            app.codeql.history[0].starts_with("\u{2713} q.ql \u{b7} app"),
+            "{:?}",
+            app.codeql.history
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(calls.starts_with("database analyze "), "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_query_run_is_recorded_with_codeqls_own_words() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "import rust\nselect 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 2, "ERROR: could not resolve module rust");
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        assert_eq!(
+            app.codeql.history[0],
+            "\u{2717} q.ql \u{b7} app \u{b7} failed: ERROR: could not resolve module rust"
+        );
+        assert!(
+            app.status.contains("could not resolve module"),
+            "{}",
+            app.status
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(
+            calls.starts_with("query run "),
+            "a table query runs as a query: {calls}"
+        );
+    });
+}
+
+#[test]
+fn running_a_query_needs_an_open_ql_file_and_a_database() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&tmp.path().join("a.rs")).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        assert!(app.status.contains("Open a .ql query"), "{}", app.status);
+        std::fs::write(tmp.path().join("q.ql"), "select 1").unwrap();
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        assert!(
+            app.status.contains("Add a CodeQL database"),
+            "{}",
+            app.status
+        );
+        assert!(app.codeql_run.is_none());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_query_history_entry_reopens_its_results() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        let results = app.editor.path.clone().unwrap();
+        assert_eq!(results.extension().and_then(|e| e.to_str()), Some("csv"));
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        app.activate_codeql(crate::widgets::codeql::Hit::Action(
+            crate::widgets::codeql::Action::OpenHistory(0),
+        ));
+        assert_eq!(app.editor.path.as_deref(), Some(results.as_path()));
+    });
+}

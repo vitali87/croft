@@ -2836,6 +2836,14 @@ pub struct App {
     /// main loop; rebuilds the Extensions panel once if the verified cache
     /// changed. `None` once consumed (or on a disarmed build, immediately).
     ext_index_refresh: Option<std::sync::mpsc::Receiver<bool>>,
+    /// The `codeql` executable; tests point it at a stand-in (#578).
+    codeql_program: PathBuf,
+    /// The query run in flight: its outcome arrives here, and when it
+    /// started (#578).
+    codeql_run: Option<(
+        std::sync::mpsc::Receiver<crate::codeql_query::RunStatus>,
+        std::time::Instant,
+    )>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -4764,6 +4772,8 @@ impl App {
             graph_scrollbar_drag: false,
             welcome,
             ext_index_refresh,
+            codeql_program: PathBuf::from("codeql"),
+            codeql_run: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -20320,6 +20330,7 @@ impl App {
         }
         self.show_tree = true;
         self.refresh_codeql_databases();
+        self.refresh_codeql_history();
         self.set_sidebar_view(SidebarView::CodeQL);
     }
 
@@ -20402,6 +20413,27 @@ impl App {
                     String::from(hint),
                 ));
             }
+            Hit::Action(Action::OpenHistory(i)) => {
+                let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+                let Some(entry) = history.entries.get(i) else {
+                    return;
+                };
+                match &entry.status {
+                    crate::codeql_query::RunStatus::Succeeded => {
+                        let output = entry.output.clone();
+                        match self.editor.open(&output) {
+                            Ok(()) => self.sync_open_file_poll_mtime(),
+                            Err(e) => self.status = format!("{}: {e}", output.display()),
+                        }
+                    }
+                    crate::codeql_query::RunStatus::Failed(why) => {
+                        self.status = format!("That run failed: {why}");
+                    }
+                    crate::codeql_query::RunStatus::Running => {
+                        self.status = String::from("That query is still running");
+                    }
+                }
+            }
             Hit::Action(action) => {
                 let what = match action {
                     Action::CreateQuery => "Creating CodeQL queries",
@@ -20422,6 +20454,153 @@ impl App {
     /// beside the archive the user pointed at.
     fn codeql_db_cache_dir() -> PathBuf {
         croft_cache_dir().join("codeql").join("databases")
+    }
+
+    fn codeql_history_path() -> PathBuf {
+        croft_cache_dir().join("codeql-history.json")
+    }
+
+    /// Mirror the saved query history into the side bar.
+    fn refresh_codeql_history(&mut self) {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        self.codeql.history = history.entries.iter().map(|e| e.label()).collect();
+    }
+
+    /// Run the open `.ql` file on the current database (#578): alerts
+    /// through `database analyze` into SARIF, anything else through
+    /// `query run` into a table decoded as CSV. The run happens on a worker
+    /// thread; [`Self::drain_codeql_run`] collects it.
+    fn run_codeql_query(&mut self) {
+        use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
+        let query = match self.editor.path.clone() {
+            Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
+            _ => {
+                self.status = String::from("Open a .ql query to run it");
+                return;
+            }
+        };
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
+            self.status = String::from("Add a CodeQL database and select it first");
+            return;
+        };
+        // The buffer, not the disk: an unsaved edit is what the user means.
+        let source = self.editor.lines.join("\n");
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stem = query
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dir = croft_cache_dir()
+            .join("codeql")
+            .join("results")
+            .join(format!("{started}-{stem}"));
+        let kind = cq::output_for(&source);
+        let output = dir.join(match kind {
+            Output::Sarif => "results.sarif",
+            Output::Table => "results.csv",
+        });
+        let mut history = History::load(&Self::codeql_history_path());
+        history.push(HistoryEntry {
+            query: query.clone(),
+            database: db.name.clone(),
+            started,
+            seconds: 0,
+            status: RunStatus::Running,
+            output: output.clone(),
+        });
+        let _ = history.save(&Self::codeql_history_path());
+        self.refresh_codeql_history();
+        let name = query
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let run = |args: Vec<String>| -> Result<(), String> {
+                let out = std::process::Command::new(&program)
+                    .args(&args)
+                    .output()
+                    .map_err(|e| format!("could not run codeql: {e}"))?;
+                if out.status.success() {
+                    return Ok(());
+                }
+                let err = String::from_utf8_lossy(&out.stderr);
+                Err(err
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("codeql failed")
+                    .to_string())
+            };
+            let outcome = std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))
+                .and_then(|()| match kind {
+                    Output::Sarif => run(cq::analyze_args(&query, &db.path, &output)),
+                    Output::Table => {
+                        let bqrs = dir.join("results.bqrs");
+                        run(cq::run_args(&query, &db.path, &bqrs))
+                            .and_then(|()| run(cq::decode_args(&bqrs, &output)))
+                    }
+                });
+            let _ = tx.send(match outcome {
+                Ok(()) => RunStatus::Succeeded,
+                Err(e) => RunStatus::Failed(e),
+            });
+        });
+        self.codeql_run = Some((rx, std::time::Instant::now()));
+        self.status = format!("Running {name} on {}\u{2026}", db.name);
+    }
+
+    /// Collect a finished query run (#578): record how it went in the
+    /// history, and open its results when it succeeded.
+    pub fn drain_codeql_run(&mut self) -> bool {
+        use crate::codeql_query::{History, RunStatus};
+        let Some((rx, since)) = self.codeql_run.as_ref() else {
+            return false;
+        };
+        let status = match rx.try_recv() {
+            Ok(s) => s,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                RunStatus::Failed(String::from("the query run stopped unexpectedly"))
+            }
+        };
+        let seconds = since.elapsed().as_secs();
+        self.codeql_run = None;
+        let mut history = History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.first_mut() else {
+            return true;
+        };
+        entry.status = status.clone();
+        entry.seconds = seconds;
+        let output = entry.output.clone();
+        let name = entry
+            .query
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _ = history.save(&Self::codeql_history_path());
+        self.refresh_codeql_history();
+        match status {
+            RunStatus::Failed(why) => self.status = format!("{name} failed: {why}"),
+            _ => match self.editor.open(&output) {
+                Ok(()) => {
+                    self.sync_open_file_poll_mtime();
+                    self.status = format!("{name} finished in {seconds}s");
+                }
+                Err(e) => self.status = format!("{}: {e}", output.display()),
+            },
+        }
+        true
     }
 
     /// Mirror the saved database list into the side bar.
@@ -36235,6 +36414,7 @@ impl App {
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
             Cmd::CompareExtensionsWithVscode => self.compare_extensions_with_vscode(),
             Cmd::ShowTesting => self.open_testing_view(),
+            Cmd::CodeqlRunQuery => self.run_codeql_query(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
@@ -50852,6 +51032,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
+        let codeql_changed = app.drain_codeql_run();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
@@ -50980,6 +51161,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || blink_changed
             || spinner_changed
             || ext_index_changed
+            || codeql_changed
             || search_changed
             || log_index_changed
             || remote_changed
