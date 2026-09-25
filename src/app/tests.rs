@@ -50527,3 +50527,52 @@ fn the_info_tab_lists_the_results_taxa() {
     let screen = draw_screen(&mut app);
     assert!(screen.contains("CWE CWE-89: SqlInjection"), "{screen}");
 }
+
+#[cfg(unix)]
+#[test]
+fn code_scanning_offers_the_current_branchs_analyses_and_falls_back_to_all() {
+    // #577: like VS Code's viewer, the analyses of the branch being worked
+    // on come first; a branch with none shows the repository's.
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let one = |id: u64, git_ref: &str| {
+        format!(
+            r#"[{{"id":{id},"ref":"{git_ref}","commit_sha":"c","error":"","category":"","created_at":"2026-09-20T10:00:00Z","results_count":0,"tool":{{"name":"CodeQL"}}}}]"#
+        )
+    };
+    let on_branch = one(301, "refs/heads/feat/x");
+    let everything = one(300, "refs/heads/main");
+    let gh = fake_gh(
+        bin.path(),
+        &[
+            ("ref=refs%2Fheads%2Ffeat%2Fx", &on_branch),
+            ("ref=refs%2Fheads%2Fempty", "[]"),
+            ("analyses?per_page=30", &everything),
+        ],
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.gh_program = gh;
+    app.source_control.status.branch = Some(String::from("feat/x"));
+    app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    let picker = app.list_picker.take().expect("offered");
+    assert_eq!(
+        picker
+            .rows
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["301"]
+    );
+    assert!(picker.title.contains("feat/x"), "{}", picker.title);
+    app.source_control.status.branch = Some(String::from("empty"));
+    app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    let picker = app.list_picker.take().expect("offered");
+    assert_eq!(
+        picker
+            .rows
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["300"]
+    );
+}

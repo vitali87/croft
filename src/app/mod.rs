@@ -45499,20 +45499,37 @@ impl App {
             .unwrap_or_else(|| String::from("gh failed")))
     }
 
-    /// List the repository's recent code scanning analyses to open one
-    /// (#577).
+    /// List recent code scanning analyses to open one (#577): the current
+    /// branch's when it has any, else the repository's.
     fn open_code_scanning_picker(&mut self) {
         use crate::sarif::github;
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
-        let analyses = match self
-            .run_gh(&github::analyses_args(None))
-            .and_then(|json| github::parse_analyses(&json))
-        {
-            Ok(a) => a,
-            Err(e) => {
-                self.status = format!("Code scanning: {e}");
-                return;
+        let fetch = |app: &Self, git_ref: Option<&str>| {
+            app.run_gh(&github::analyses_args(git_ref))
+                .and_then(|json| github::parse_analyses(&json))
+        };
+        let branch = self.source_control.status.branch.clone();
+        let on_branch = match &branch {
+            Some(b) => match fetch(self, Some(&format!("refs/heads/{b}"))) {
+                Ok(a) => a,
+                Err(e) => {
+                    self.status = format!("Code scanning: {e}");
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
+        let (analyses, title) = if on_branch.is_empty() {
+            match fetch(self, None) {
+                Ok(a) => (a, String::from("Open Code Scanning Analysis")),
+                Err(e) => {
+                    self.status = format!("Code scanning: {e}");
+                    return;
+                }
             }
+        } else {
+            let b = branch.unwrap_or_default();
+            (on_branch, format!("Open Code Scanning Analysis \u{b7} {b}"))
         };
         let rows = analyses
             .iter()
@@ -45522,11 +45539,7 @@ impl App {
             })
             .collect();
         self.open_list_picker(
-            ListPicker::new(
-                ListPurpose::CodeScanningAnalysis,
-                "Open Code Scanning Analysis",
-                rows,
-            ),
+            ListPicker::new(ListPurpose::CodeScanningAnalysis, title, rows),
             "This repository has no code scanning analyses",
         );
     }
