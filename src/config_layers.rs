@@ -38,6 +38,8 @@ pub enum LayerKind {
     Default,
     User,
     UserLocal,
+    /// The active profile's settings (#618).
+    Profile,
     VsCodeWorkspace,
     Workspace,
     WorkspaceLocal,
@@ -49,6 +51,7 @@ impl LayerKind {
             LayerKind::Default => "default",
             LayerKind::User => "user",
             LayerKind::UserLocal => "user-local",
+            LayerKind::Profile => "profile",
             LayerKind::VsCodeWorkspace => ".vscode",
             LayerKind::Workspace => "workspace",
             LayerKind::WorkspaceLocal => "workspace-local",
@@ -105,6 +108,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "copy_on_select",
     "disable_log_highlight",
     "explorer_views",
+    "profile",
 ];
 
 /// Path of the workspace layer files under a root.
@@ -163,6 +167,23 @@ pub fn load_merged_from(
         (LayerKind::User, user_dir.join("config.json")),
         (LayerKind::UserLocal, user_dir.join("config.local.json")),
     ];
+    let mut warnings = Vec::new();
+    // The active profile (#618) is whatever the user or workspace layers
+    // name last; its settings go between the two. The name is checked
+    // before it becomes a path, since a repo can set it.
+    let profile = active_profile_name(user_dir, workspace_root, platform);
+    if !profile.is_empty() {
+        if crate::profiles::valid_name(&profile) {
+            layers.push((
+                LayerKind::Profile,
+                crate::profiles::dir(user_dir, &profile).join("config.json"),
+            ));
+        } else {
+            warnings.push(format!(
+                "profile \"{profile}\" is not a valid profile name and was ignored"
+            ));
+        }
+    }
     if let Some(root) = workspace_root {
         layers.push((
             LayerKind::VsCodeWorkspace,
@@ -172,7 +193,6 @@ pub fn load_merged_from(
         layers.push((LayerKind::WorkspaceLocal, workspace_local_config_path(root)));
     }
 
-    let mut warnings = Vec::new();
     let mut chain = Vec::new();
     let mut merged = Map::new();
     let mut provenance = BTreeMap::new();
@@ -187,6 +207,13 @@ pub fn load_merged_from(
         };
         let Some(doc) = doc else { continue };
         for (key, value) in doc {
+            if kind == LayerKind::Profile && key == "profile" {
+                warnings.push(format!(
+                    "{}: a profile cannot choose another profile; \"profile\" was ignored",
+                    path.display()
+                ));
+                continue;
+            }
             if kind.is_workspace() && !WORKSPACE_ALLOWED_KEYS.contains(&key.as_str()) {
                 warnings.push(format!(
                     "{}: \"{key}\" is user-config only and was ignored (workspace layers may set: appearance and editor toggles)",
@@ -206,6 +233,32 @@ pub fn load_merged_from(
         chain,
         warnings,
     }
+}
+
+/// The `profile` the user and workspace layers name, the last one winning,
+/// read quietly (the full merge reports any problem with those files).
+fn active_profile_name(user_dir: &Path, workspace_root: Option<&Path>, platform: &str) -> String {
+    let mut files = vec![
+        user_dir.join("config.json"),
+        user_dir.join("config.local.json"),
+    ];
+    if let Some(root) = workspace_root {
+        files.push(workspace_config_path(root));
+        files.push(workspace_local_config_path(root));
+    }
+    let mut name = String::new();
+    for path in files {
+        let (mut quiet, mut chain) = (Vec::new(), Vec::new());
+        let doc = load_layer_document(&path, platform, &mut Vec::new(), &mut chain, &mut quiet);
+        if let Some(v) = doc
+            .as_ref()
+            .and_then(|d| d.get("profile"))
+            .and_then(|v| v.as_str())
+        {
+            name = v.to_string();
+        }
+    }
+    name
 }
 
 /// Largest layer file croft will read: layers are hand-written settings, so
@@ -532,6 +585,66 @@ mod tests {
         std::fs::create_dir_all(&user).unwrap();
         std::fs::create_dir_all(&root).unwrap();
         (tmp, user, root)
+    }
+
+    #[test]
+    fn the_active_profiles_settings_sit_between_user_and_workspace() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("config.json"),
+            r#"{"profile":"Python","theme":"dark","auto_save":true}"#,
+        );
+        write(
+            &user.join("profiles/Python/config.json"),
+            r#"{"theme":"nord","format_on_save":true,"profile":"Other"}"#,
+        );
+        write(
+            &root.join(".croft/config.json"),
+            r#"{"format_on_save":false}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert_eq!(m.prefs.profile, "Python");
+        assert_eq!(m.prefs.theme, "nord", "the profile overrides the user");
+        assert_eq!(layer_of(&m.provenance, "theme"), LayerKind::Profile);
+        assert!(
+            m.prefs.auto_save,
+            "user settings the profile leaves alone stay"
+        );
+        assert!(
+            !m.prefs.format_on_save,
+            "the workspace overrides the profile"
+        );
+        assert!(
+            m.chain.contains(&user.join("profiles/Python/config.json")),
+            "a save to the profile re-merges"
+        );
+        assert!(
+            m.warnings.iter().any(|w| w.contains("profile")),
+            "a profile cannot pick another profile: {:?}",
+            m.warnings
+        );
+    }
+
+    #[test]
+    fn a_workspace_can_pick_the_profile_but_not_escape_the_profiles_folder() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("profiles/Writing/config.json"),
+            r#"{"theme":"light"}"#,
+        );
+        write(&root.join(".croft/config.json"), r#"{"profile":"Writing"}"#);
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert_eq!(m.prefs.profile, "Writing");
+        assert_eq!(m.prefs.theme, "light");
+        write(&user.join("evil/config.json"), r#"{"theme":"dracula"}"#);
+        write(&root.join(".croft/config.json"), r#"{"profile":"../evil"}"#);
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert_ne!(m.prefs.theme, "dracula", "no layer outside profiles/");
+        assert!(
+            m.warnings.iter().any(|w| w.contains("../evil")),
+            "{:?}",
+            m.warnings
+        );
     }
 
     #[test]

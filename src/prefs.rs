@@ -271,6 +271,10 @@ pub struct Prefs {
     /// matching VS Code.
     #[serde(default)]
     pub copy_on_select: bool,
+    /// The active profile (#618): the name of a folder under
+    /// `profiles/` whose settings sit over these. Empty means none.
+    #[serde(default)]
+    pub profile: String,
     /// Opt-out for tailspin highlighting in the rendered log view (#466):
     /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
     /// are coloured on lines that carry no colour of their own. Stored as
