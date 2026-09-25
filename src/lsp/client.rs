@@ -1114,6 +1114,29 @@ impl LspClient {
             .context("rename")
     }
 
+    /// `textDocument/codeLens` (#608).
+    pub async fn code_lens(&mut self, uri: Url) -> Result<Option<Vec<lsp_types::CodeLens>>> {
+        self.server
+            .code_lens(lsp_types::CodeLensParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("codeLens")
+    }
+
+    /// `codeLens/resolve` (#608): fill in a lens's command.
+    pub async fn code_lens_resolve(
+        &mut self,
+        lens: lsp_types::CodeLens,
+    ) -> Result<lsp_types::CodeLens> {
+        self.server
+            .code_lens_resolve(lens)
+            .await
+            .context("codeLens/resolve")
+    }
+
     /// `workspace/willRenameFiles` (#610): the edit a server wants applied
     /// before `files` move, typically the imports that name them.
     pub async fn will_rename_files(

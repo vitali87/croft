@@ -1281,6 +1281,8 @@ enum MenuAction {
     SetQuickInputPosition(QuickInputPosition),
     /// Customize Layout: toggle Zen Mode (hide all chrome / restore).
     ToggleZenMode,
+    /// Run the active editor's code lens at this index (#608).
+    RunCodeLens(usize),
     /// Terminal pane right-click: rename the pane at `idx`.
     RenameTerminal(usize),
     /// Terminal pane right-click: clear the pane at `idx`'s screen + scrollback.
@@ -1622,6 +1624,10 @@ struct PendingFileMove {
 /// ahead without their edit. Just past the manager's per-server timeout,
 /// so a slow server's answer still lands when it can.
 const FILE_MOVE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// How long a buffer must sit unedited before its code lenses are asked
+/// for (#608).
+const CODE_LENS_SETTLE: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// Accumulated type-to-jump state for the Explorer. `prefix` lowercase
 /// only; `last` is the instant of the most recent keystroke.
@@ -3323,6 +3329,10 @@ pub struct App {
     /// panes: (path, whether the preview led, source line), so a still
     /// viewport costs nothing per tick.
     md_scroll_synced: Option<(PathBuf, bool, usize)>,
+    /// Code lenses on or off (#608, `Editor: Toggle CodeLens`), and the
+    /// edit seq last requested per path, so a still buffer asks once.
+    code_lens_enabled: bool,
+    code_lens_requested: std::collections::HashMap<PathBuf, u64>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -4918,6 +4928,8 @@ impl App {
             live_run_sent: std::collections::HashMap::new(),
             live_run_runner: None,
             md_scroll_synced: None,
+            code_lens_enabled: true,
+            code_lens_requested: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
@@ -18468,6 +18480,12 @@ impl App {
             }
             // Cmd+K Shift+T: reopen the most recently closed terminal pane
             // (the browser reopen-tab convention under the Cmd+K leader).
+            // Cmd+K Shift+E: run the caret line's code lens (#608). Must
+            // precede the plain E (reveal in Explorer) arm below.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'e') => {
+                self.run_code_lens_at_cursor();
+                true
+            }
             // Cmd+K Shift+U / Shift+D: supertypes ("up") and subtypes
             // ("down") of the type at the caret (#613). Case-insensitive for
             // CSI-u hosts; must precede the plain U and D arms below.
@@ -36130,6 +36148,8 @@ impl App {
             Cmd::EditLogpoint => self.debug_edit_logpoint(),
             Cmd::ShowIncomingCalls => self.request_call_hierarchy_at_cursor(true),
             Cmd::ShowSupertypes => self.request_type_hierarchy_at_cursor(true),
+            Cmd::ToggleCodeLens => self.toggle_code_lens(),
+            Cmd::RunCodeLens => self.run_code_lens_at_cursor(),
             Cmd::ShowSubtypes => self.request_type_hierarchy_at_cursor(false),
             Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
@@ -39573,6 +39593,12 @@ impl App {
                 // placement there serves nobody. A stale span cannot
                 // mis-fire — `resolve_conflict_at` re-validates the row
                 // against the live conflict set.
+                // A code lens (#608) is a button, not text: run it.
+                if in_editor && let Some(idx) = self.editor.code_lens_at(m.column, m.row) {
+                    self.focus_pane(Pane::Editor);
+                    self.run_code_lens(idx);
+                    return;
+                }
                 if in_editor && self.editor.diff.is_none() {
                     let hit = self
                         .editor
@@ -41747,6 +41773,160 @@ impl App {
         }
     }
 
+    /// Ask for the active file's code lenses once its edits have settled
+    /// (#608). Lenses cost a server real work (rust-analyzer resolves each
+    /// one), so this waits out [`CODE_LENS_SETTLE`] rather than riding every
+    /// edit the way inlay hints do.
+    pub fn tick_code_lens(&mut self) {
+        if !self.code_lens_enabled {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(&seq) = self.lsp_last_seen.get(&path) else {
+            return;
+        };
+        if self.code_lens_requested.get(&path) == Some(&seq)
+            || self
+                .editor
+                .last_edit_at
+                .is_some_and(|t| t.elapsed() < CODE_LENS_SETTLE)
+        {
+            return;
+        }
+        if let Some(lsp) = self.lsp.as_ref() {
+            lsp.request_code_lens(path.clone(), seq);
+            self.code_lens_requested.insert(path, seq);
+        }
+    }
+
+    /// Land code-lens replies on every tab showing the file (#608). A reply
+    /// for an older seq is dropped; the tab keeps its lenses, each shown only
+    /// while its own line is unchanged.
+    pub fn drain_lsp_code_lens(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_code_lens() {
+            updates.push(u);
+        }
+        let mut changed = false;
+        for u in updates {
+            if !self.code_lens_enabled || self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            self.for_each_tab_of(&u.path, |tab| {
+                tab.code_lenses = u
+                    .lenses
+                    .iter()
+                    .filter_map(|l| {
+                        let line = l.line as usize;
+                        Some(crate::code_lens::EditorLens {
+                            line,
+                            line_text: tab.lines.get(line)?.clone(),
+                            title: l.title.clone(),
+                            command: l.command.clone(),
+                            arguments: l.arguments.clone(),
+                            server_side: l.server_side,
+                        })
+                    })
+                    .collect();
+            });
+            changed = true;
+        }
+        changed
+    }
+
+    /// Run the active editor's code lens at `idx` (#608).
+    pub(crate) fn run_code_lens(&mut self, idx: usize) {
+        let Some(lens) = self.editor.code_lenses.get(idx).cloned() else {
+            return;
+        };
+        match crate::code_lens::action_for(&lens) {
+            crate::code_lens::LensAction::ShowLocations(targets) => {
+                if targets.len() == 1 {
+                    let (path, line, col) = targets.into_iter().next().expect("len 1");
+                    self.go_to_definition(path, line, col);
+                } else {
+                    self.open_location_picker(targets, "references");
+                }
+            }
+            crate::code_lens::LensAction::RunInTerminal { label, command } => {
+                self.run_project_task(crate::tasks::Task {
+                    label,
+                    command,
+                    source: String::from("code lens"),
+                    is_build: false,
+                    is_default: false,
+                    problem_matcher: None,
+                });
+            }
+            crate::code_lens::LensAction::DebugAt(line) => {
+                self.editor.cursor_row = line.min(self.editor.lines.len().saturating_sub(1));
+                self.editor.cursor_col = 0;
+                self.debug_test_at_cursor();
+            }
+            crate::code_lens::LensAction::ServerCommand { command, arguments } => {
+                if let (Some(lsp), Some(path)) = (self.lsp.as_mut(), self.editor.path.clone()) {
+                    lsp.execute_command(path, command, arguments);
+                    self.status = format!("Ran \u{201c}{}\u{201d}", lens.title);
+                }
+            }
+            crate::code_lens::LensAction::Unsupported(why) => {
+                self.status = format!("Code lens: {why}");
+            }
+        }
+    }
+
+    /// The caret line's code lenses from the keyboard (Cmd+K Shift+E): one
+    /// runs at once, several open a menu to pick from (#608).
+    fn run_code_lens_at_cursor(&mut self) {
+        let lenses = self.editor.lenses_on_line(self.editor.cursor_row);
+        match lenses.as_slice() {
+            [] => self.status = String::from("No code lens on this line"),
+            [one] => self.run_code_lens(*one),
+            many => {
+                let items: Vec<(String, MenuAction)> = many
+                    .iter()
+                    .map(|&i| {
+                        (
+                            self.editor.code_lenses[i].title.clone(),
+                            MenuAction::RunCodeLens(i),
+                        )
+                    })
+                    .collect();
+                let origin = self.editor.cursor_screen_pos().unwrap_or((
+                    self.editor.last_full_area.x + 1,
+                    self.editor.last_full_area.y + 1,
+                ));
+                let root = self.tree.root.clone();
+                self.context_menu = Some(ContextMenu::flat(origin, items, root));
+            }
+        }
+    }
+
+    /// Editor: Toggle CodeLens (#608).
+    fn toggle_code_lens(&mut self) {
+        self.code_lens_enabled = !self.code_lens_enabled;
+        self.code_lens_requested.clear();
+        if !self.code_lens_enabled {
+            for tab in self.editor.editors.iter_mut() {
+                tab.code_lenses.clear();
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                for tab in group.editors.iter_mut() {
+                    tab.code_lenses.clear();
+                }
+            }
+        }
+        self.status = format!(
+            "CodeLens: {}",
+            if self.code_lens_enabled { "on" } else { "off" }
+        );
+    }
+
     /// Scroll sync between split panes (#619): when the focused pane shows a
     /// Markdown file and another pane shows the same file the other way
     /// (source beside preview), the other one follows. Returns true when it
@@ -43695,6 +43875,7 @@ impl App {
                 self.open_customize_layout_menu_on(&MenuAction::SetQuickInputPosition(pos));
             }
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
+            MenuAction::RunCodeLens(idx) => self.run_code_lens(idx),
             MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
             MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
             MenuAction::TerminalCopySelection => self.copy_terminal_selection(),
@@ -50944,6 +51125,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
         let live_run_changed = app.tick_live_run() | app.sync_markdown_scroll();
+        app.tick_code_lens();
+        let code_lens_changed = app.drain_lsp_code_lens();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
@@ -51067,6 +51250,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || labels_changed
             || auto_save_changed
             || live_run_changed
+            || code_lens_changed
             || ws_symbols_changed
             || connect_changed
             || install_changed

@@ -2509,6 +2509,12 @@ pub struct Editor {
     /// frame: `(screen y, x range, header row, resolution)`. Cleared at
     /// render start so the hit test always describes the painted frame.
     pub merge_action_spans: Vec<(u16, std::ops::Range<u16>, usize, crate::merge::Resolution)>,
+    /// The language server's code lenses for this buffer (#608), painted at
+    /// the end of their line while it still reads as it did when they came.
+    pub code_lenses: Vec<crate::code_lens::EditorLens>,
+    /// Clickable lens spans painted this frame: `(screen y, x range, index
+    /// into code_lenses)`. Cleared at render start, like the merge spans.
+    pub code_lens_spans: Vec<(u16, std::ops::Range<u16>, usize)>,
     /// Per-source-line git blame for the current file, index 0 = line 1. Set
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
@@ -2993,6 +2999,8 @@ impl Editor {
             auto_pair_at: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
+            code_lenses: Vec::new(),
+            code_lens_spans: Vec::new(),
             conflicts_seq: u64::MAX,
             blame_lines: None,
             blame_for: None,
@@ -4628,6 +4636,7 @@ impl Editor {
             self.inline_values.clear();
             // Live Run answered for the old file's text, same as above.
             self.live_run = None;
+            self.code_lenses.clear();
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -7942,6 +7951,28 @@ impl Editor {
                 self.inline_values.insert(li, parts.join(", "));
             }
         }
+    }
+
+    /// Indices of the code lenses on 0-based `line` whose line still reads
+    /// as it did when they arrived (#608).
+    pub fn lenses_on_line(&self, line: usize) -> Vec<usize> {
+        let Some(text) = self.lines.get(line) else {
+            return Vec::new();
+        };
+        self.code_lenses
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.line == line && &l.line_text == text)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The code lens painted under screen cell `(col, row)` this frame.
+    pub fn code_lens_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.code_lens_spans
+            .iter()
+            .find(|(y, xs, _)| *y == row && xs.contains(&col))
+            .map(|(_, _, idx)| *idx)
     }
 
     /// Live Run's trailer for 0-based `line`, when the line still reads as
@@ -12039,6 +12070,7 @@ impl Widget for &mut Editor {
         self.last_scrollbar = Rect::default();
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
+        self.code_lens_spans.clear();
         // Every rect this frame publishes is cleared up front, so a frame
         // that paints nothing leaves nothing behind for the mouse path to
         // hit-test against. `render_log` sets its own when it paints; the
@@ -13104,6 +13136,7 @@ impl Widget for &mut Editor {
                 && row_end >= line_len
                 && !self.inline_values.contains_key(&line_idx)
                 && self.live_note(line_idx).is_none()
+                && self.lenses_on_line(line_idx).is_empty()
                 && let Some(note) = self.current_line_blame_annotation()
             {
                 let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
@@ -13144,6 +13177,44 @@ impl Widget for &mut Editor {
                             .fg(self.theme.ignored_fg())
                             .add_modifier(Modifier::ITALIC),
                     );
+                }
+            }
+
+            // Code lenses (#608): the server's "3 references | Run" at the end
+            // of the symbol's line, clickable, yielding to the debugger's and
+            // Live Run's trailers, which describe this very run.
+            if row_end >= line_len
+                && !self.inline_values.contains_key(&line_idx)
+                && self.live_note(line_idx).is_none()
+            {
+                let lenses = self.lenses_on_line(line_idx);
+                if !lenses.is_empty() {
+                    let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                    let mut x = text_x + text_cols as u16 + 2;
+                    let right = inner.x + inner.width;
+                    let style = Style::default()
+                        .fg(self.theme.ignored_fg())
+                        .add_modifier(Modifier::UNDERLINED);
+                    for (n, idx) in lenses.into_iter().enumerate() {
+                        if n > 0 && x + 3 < right {
+                            buf.set_string(
+                                x,
+                                y,
+                                " | ",
+                                Style::default().fg(self.theme.ignored_fg()),
+                            );
+                            x += 3;
+                        }
+                        if x >= right {
+                            break;
+                        }
+                        let title = &self.code_lenses[idx].title;
+                        let shown: String = title.chars().take((right - x) as usize).collect();
+                        let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                        buf.set_string(x, y, &shown, style);
+                        self.code_lens_spans.push((y, x..x + w, idx));
+                        x += w;
+                    }
                 }
             }
 

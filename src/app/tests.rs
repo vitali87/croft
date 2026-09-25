@@ -49813,3 +49813,90 @@ fn a_split_preview_follows_the_source_pane_scroll() {
         "a still viewport costs nothing"
     );
 }
+
+// ---- Code lenses (#608) ----
+
+fn lens_at(line: usize, text: &str, title: &str, command: &str) -> crate::code_lens::EditorLens {
+    crate::code_lens::EditorLens {
+        line,
+        line_text: text.to_string(),
+        title: title.to_string(),
+        command: Some(command.to_string()),
+        arguments: Vec::new(),
+        server_side: false,
+    }
+}
+
+#[test]
+fn clicking_a_painted_code_lens_runs_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}\n");
+    app.editor.code_lenses = vec![lens_at(
+        0,
+        "fn main() {}",
+        "Frobnicate",
+        "vendor.frobnicate",
+    )];
+    let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(
+        &mut *app.editor as &mut crate::widgets::editor::Editor,
+        area,
+        &mut buf,
+    );
+    let (y, xs, idx) = app
+        .editor
+        .code_lens_spans
+        .first()
+        .cloned()
+        .expect("lens painted");
+    assert_eq!(idx, 0);
+    let painted: String = xs
+        .clone()
+        .map(|x| buf[(x, y)].symbol().to_string())
+        .collect();
+    assert_eq!(painted, "Frobnicate");
+    assert_eq!(app.editor.code_lens_at(xs.start, y), Some(0));
+    app.run_code_lens(0);
+    assert!(
+        app.status
+            .contains("vendor.frobnicate is not a command croft runs"),
+        "an unmappable lens says why: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_code_lens_hides_once_its_line_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}\n");
+    app.editor.code_lenses = vec![lens_at(0, "fn main() {}", "Run", "x")];
+    assert_eq!(app.editor.lenses_on_line(0), vec![0]);
+    app.editor.lines[0] = String::from("fn main() { edited }");
+    assert!(
+        app.editor.lenses_on_line(0).is_empty(),
+        "stale lens is not shown"
+    );
+}
+
+#[test]
+fn cmd_k_shift_e_runs_the_caret_lines_only_lens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}\n");
+    app.editor.code_lenses = vec![lens_at(
+        0,
+        "fn main() {}",
+        "Frobnicate",
+        "vendor.frobnicate",
+    )];
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('E'), KeyModifiers::SHIFT)));
+    assert!(app.status.starts_with("Code lens:"), "{}", app.status);
+    app.editor
+        .code_lenses
+        .push(lens_at(0, "fn main() {}", "Other", "vendor.other"));
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('e'), KeyModifiers::SHIFT)));
+    assert!(
+        app.context_menu.is_some(),
+        "two lenses open a menu to pick from"
+    );
+}
