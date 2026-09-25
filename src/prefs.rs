@@ -271,6 +271,10 @@ pub struct Prefs {
     /// matching VS Code.
     #[serde(default)]
     pub copy_on_select: bool,
+    /// The UI language (#621), e.g. `de` or `pt_BR`: croft reads
+    /// `locale/<language>.json` from its config folder. Empty follows `LANG`.
+    #[serde(default)]
+    pub locale: String,
     /// Opt-out for tailspin highlighting in the rendered log view (#466):
     /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
     /// are coloured on lines that carry no colour of their own. Stored as

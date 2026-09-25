@@ -5097,6 +5097,11 @@ impl App {
             occ_observed_at: std::time::Instant::now(),
             nav: NavHistory::default(),
         };
+        // #621: the UI language, before anything is drawn. Never under test:
+        // the real config folder's catalogs must not steer app tests.
+        if !cfg!(test) {
+            app.apply_locale(&loaded_prefs.locale);
+        }
         // Initialise the per-pane focus/gradient flags to match the starting
         // pane (Tree) and persisted theme. Without this, the explorer boots
         // focused-but-not-gradient: the Black-theme gradient border only
@@ -36328,6 +36333,7 @@ impl App {
                 .open_config_file_in_editor(crate::prefs::config_path(), ConfigFileSeed::Settings),
             Cmd::OpenWorkspaceSettingsJson => self.open_workspace_settings(false),
             Cmd::OpenWorkspaceSettingsLocalJson => self.open_workspace_settings(true),
+            Cmd::ExportUiStrings => self.export_ui_strings(),
             Cmd::OpenKeybindingsJson => self.open_config_file_in_editor(
                 crate::keymap::keybindings_path(),
                 ConfigFileSeed::Keybindings,
@@ -42223,6 +42229,36 @@ impl App {
         };
     }
 
+    /// Load the UI language's string catalog (#621): the `locale` setting,
+    /// else `LANG`.
+    pub fn apply_locale(&mut self, pref: &str) {
+        let lang = crate::i18n::language(pref, std::env::var("LANG").ok().as_deref());
+        crate::i18n::set(crate::i18n::load(&self.config_dir, &lang));
+    }
+
+    /// Write every translatable UI string, in English, to
+    /// `locale/template.json` and open it (#621).
+    fn export_ui_strings(&mut self) {
+        let path = self.config_dir.join("locale").join("template.json");
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, crate::i18n::template()));
+        if let Err(e) = written {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        match self.editor.open(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = String::from(
+                    "Translate the values, save as locale/<language>.json, and set \"locale\"",
+                );
+            }
+            Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
+    }
+
     /// Apply a merged settings view to the live session. Mirrors what the
     /// individual toggles do, minus their persistence (the values already
     /// live in config files) and minus their status chatter.
@@ -42239,6 +42275,7 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        self.apply_locale(&p.locale);
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;

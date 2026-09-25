@@ -49979,3 +49979,31 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+#[test]
+fn the_ui_language_comes_from_a_catalog_in_the_config_folder() {
+    // #621: a translated palette, and a template for translators.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cfg.path().join("locale")).unwrap();
+    std::fs::write(
+        cfg.path().join("locale/de.json"),
+        r#"{"command.quick_open": "Gehe zu Datei"}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = cfg.path().to_path_buf();
+    app.apply_locale("de");
+    let item = crate::widgets::command_palette::PaletteItem::Builtin(
+        crate::widgets::command_palette::Command::QuickOpen,
+    );
+    assert_eq!(item.title(), "Gehe zu Datei");
+    app.run_command(crate::widgets::command_palette::Command::ExportUiStrings);
+    let template = cfg.path().join("locale/template.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&template).unwrap()).unwrap();
+    assert_eq!(v["command.quick_open"], serde_json::json!("Go to File"));
+    assert_eq!(app.editor.path.as_deref(), Some(template.as_path()));
+    app.apply_locale("en");
+    assert_eq!(item.title(), "Go to File", "English has no catalog file");
+}
