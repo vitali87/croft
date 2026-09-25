@@ -386,9 +386,11 @@ export class Term {
   resize(cols, rows) {
     const fit = (g) => Array.from({ length: rows }, (_, y) =>
       Array.from({ length: cols }, (_, x) => (g[y] && g[y][x]) || blank()));
+    // Which screen is showing has to be read before the grids are replaced.
+    const onAlt = this.grid === this.alt;
     this.primary = fit(this.primary);
     this.alt = fit(this.alt);
-    this.grid = this.grid === this.alt ? this.alt : this.primary;
+    this.grid = onAlt ? this.alt : this.primary;
     this.cols = cols; this.rows = rows;
     this.top = 0; this.bottom = rows - 1;
     this.cx = Math.min(this.cx, cols - 1); this.cy = Math.min(this.cy, rows - 1);

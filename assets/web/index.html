@@ -109,9 +109,14 @@ function syncImages() {
   }
 }
 
+// Counters for diagnosing a page that shows nothing: did bytes arrive, and
+// were frames drawn?
+const stats = (window.croftStats = { bytes: 0, messages: 0, frames: 0 });
+
 let scheduled = false;
 function frame() {
   scheduled = false;
+  stats.frames++;
   if (lastCursor !== null) term.dirty.add(lastCursor);
   for (const y of term.dirty) if (y < rows) drawRow(y);
   term.dirty.clear();
@@ -144,6 +149,8 @@ ws.onmessage = (ev) => {
     if (msg.t === "exit") say("The session ended.");
     return;
   }
+  stats.messages++;
+  stats.bytes += ev.data.byteLength;
   term.write(new Uint8Array(ev.data));
   for (const r of term.takeReplies()) send(r);
   if (term.title) document.title = term.title;

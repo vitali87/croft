@@ -102,3 +102,13 @@ test("keys encode as croft reads them", () => {
   assert.equal(k("F", { metaKey: true, shiftKey: true }), "\x1b[102;10u");
   assert.equal(k("Shift"), null, "a bare modifier sends nothing");
 });
+
+test("a resize keeps whichever screen is showing", () => {
+  const t = new Term(10, 3);
+  t.write(enc("shell\x1b[?1049h\x1b[Hcroft"));
+  t.resize(12, 4);
+  assert.equal(t.rowText(0).trim(), "croft", "still on the alternate screen after a resize");
+  assert.equal(t.grid, t.alt);
+  t.write(enc("\x1b[?1049l"));
+  assert.equal(t.rowText(0).trim(), "shell");
+});
