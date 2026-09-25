@@ -73,8 +73,6 @@ mod session_host;
 mod session_state;
 mod sheet;
 mod shell_integration;
-// Used from the next layer of this change.
-#[allow(dead_code)]
 mod shortcuts;
 mod snippets;
 mod sqlite_view;
