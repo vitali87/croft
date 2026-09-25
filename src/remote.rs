@@ -1157,7 +1157,16 @@ fn run_pump(
             break;
         }
         let Ok(line) = line else { break };
-        match parse_relay_request(&line) {
+        let request = parse_relay_request(&line);
+        // Two local windows attached to one session tail the same log. The
+        // first to claim a request handles it; without this every window
+        // ran every open, forward and pull, one browser tab each (#648).
+        if let Some(id) = request.as_ref().and_then(RelayRequest::id)
+            && !ssh_exec(&host, &socket, &claim_command(&inbox_dir, id))
+        {
+            continue;
+        }
+        match request {
             Some(RelayRequest::Pull { id, src }) => {
                 handle_pull_request(&host, &socket, &inbox_dir, &id, &src);
             }
@@ -1408,6 +1417,21 @@ enum RelayRequest {
     },
 }
 
+impl RelayRequest {
+    /// The id a pump claims before acting. `Unforward` has none: each pump
+    /// tears down only a tunnel it holds, so every pump may see it.
+    fn id(&self) -> Option<&str> {
+        match self {
+            Self::Pull { id, .. }
+            | Self::Clipboard { id }
+            | Self::Copy { id }
+            | Self::Open { id, .. }
+            | Self::Forward { id, .. } => Some(id),
+            Self::Unforward { .. } => None,
+        }
+    }
+}
+
 fn parse_relay_request(line: &str) -> Option<RelayRequest> {
     let line = line.trim();
     let mut parts = line.split('\t');
@@ -1625,6 +1649,17 @@ fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The remote command that claims request `id` for this pump: `mkdir` is
+/// atomic, so of several pumps exactly one succeeds.
+fn claim_command(inbox_dir: &str, id: &str) -> String {
+    let claims = format!("{inbox_dir}/.claims");
+    format!(
+        "mkdir -p {} && mkdir {}",
+        shell_quote(&claims),
+        shell_quote(&format!("{claims}/{id}"))
+    )
 }
 
 /// Hand `url` to the local platform opener (`open` on macOS, `xdg-open` on
@@ -4160,6 +4195,32 @@ Host !blocked *.internal
         assert!(
             ensure_call < cargo_install,
             "the C toolchain must be ensured before `cargo install` runs"
+        );
+    }
+
+    #[test]
+    fn a_relay_request_is_claimed_by_exactly_one_pump() {
+        // `mkdir` without -p on the id: the second pump's mkdir fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox").display().to_string();
+        let run = |cmd: String| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(run(claim_command(&inbox, "open-1-2")));
+        assert!(
+            !run(claim_command(&inbox, "open-1-2")),
+            "a second claim loses"
+        );
+        assert!(run(claim_command(&inbox, "open-1-3")));
+        assert_eq!(
+            super::parse_relay_request("open\topen-1\thttps://x/")
+                .and_then(|r| r.id().map(str::to_string)),
+            Some(String::from("open-1"))
         );
     }
 
