@@ -117,6 +117,10 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Debug: Restart | `Shift`+`Cmd`+`F5` | Restart the active debug session |
 | Debug: Add Conditional Breakpoint | `Shift`+`F9` | Add or edit a conditional breakpoint at the cursor |
 | Debug: Add Logpoint | `Shift`+`Alt`+`F9` | Add or edit a logpoint at the cursor: the adapter prints the message (`{expr}` interpolates) instead of pausing |
+| Debug: Edit Hit Count | `Ctrl`+`Shift`+`F9` | Add or edit a hit count on the cursor line's breakpoint (`5`, `>= 5`, `% 2`, as the adapter understands it); blank clears it |
+| Debug: Add Function Breakpoint | `Ctrl`+`F9` | Break when the named function is called; naming one already set removes it |
+| Debug: Break on Value Change | `Ctrl`+`Alt`+`F9` | While paused, break when the named variable of the current frame changes (a data breakpoint) |
+| Debug: Run to Cursor | `Ctrl`+`F10` | While paused, resume and stop at the cursor's line once, through a temporary breakpoint |
 | Debug: Toggle Break on Raised Exceptions | `Alt`+`F9` | Break on raised (not just uncaught) exceptions |
 | Debug: Attach to Python Process | `Ctrl`+`F5` | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
@@ -454,12 +458,16 @@ Pick a configuration with "Debug: Select and Start Debugging" or the config row 
 | `Shift+F9` | Add or edit a conditional breakpoint on the cursor's line |
 | `Shift+Alt+F9` | Add or edit a logpoint on the cursor's line (amber diamond; prints instead of pausing) |
 | `Alt+F9` | Toggle break on raised (not just uncaught) exceptions |
+| `Ctrl+Shift+F9` | Add or edit a hit count on the cursor line's breakpoint (red diamond) |
+| `Ctrl+F9` | Add or remove a function breakpoint by name |
+| `Ctrl+Alt+F9` | Break when a variable of the paused frame changes |
 | `F10` | Step over |
+| `Ctrl+F10` | Run to the cursor's line (while paused) |
 | `F11` / `Shift+F11` | Step into / out |
 
 A bare `F5` / `F9` / `F10` / `F11` pressed while the **terminal pane** is focused and no debug session is live is forwarded to the app running in the shell (process-compose's `F10` Quit, htop's `F9` kill) instead of being claimed by the debugger. Modified chords keep their debug meaning everywhere, and `F9` still re-execs into a landed croft update.
 
-Right-clicking the editor **gutter** (the glyph margin / line-number column) opens a breakpoint menu on the clicked line, mirroring VS Code's glyph-margin menu: **Add Breakpoint** / **Remove Breakpoint** and **Add Conditional Breakpoint** / **Edit Condition** (the cursor does not move).
+Right-clicking the editor **gutter** (the glyph margin / line-number column) opens a breakpoint menu on the clicked line, mirroring VS Code's glyph-margin menu: **Add Breakpoint** / **Remove Breakpoint** and **Add Conditional Breakpoint** / **Edit Condition** and **Add Hit Count** / **Edit Hit Count** (the cursor does not move). Right-clicking a variable in the VARIABLES section offers **Break on Value Change**, and right-clicking the editor text while paused offers **Run to Cursor** on the clicked line.
 
 When paused, the Run and Debug panel shows the **call stack** (click a frame to inspect it) and an expandable **variables** tree, plus a **debug console** of program output with a `❯` **REPL prompt** that evaluates expressions in the selected frame. Hovering a variable in the editor shows its current value.
 

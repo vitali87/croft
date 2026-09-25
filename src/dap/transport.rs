@@ -380,6 +380,60 @@ fn reader_loop<R: Read>(source: R, tx: Sender<Value>) {
     }
 }
 
+/// The far end of [`DapTransport::fake`]: what the session sent, and a way to
+/// deliver adapter messages to it.
+#[cfg(test)]
+pub struct FakeWire {
+    written: std::sync::Arc<Mutex<Vec<u8>>>,
+    pub adapter: Sender<Value>,
+}
+
+#[cfg(test)]
+impl FakeWire {
+    /// Every message the session has sent so far, decoded, oldest first.
+    pub fn sent(&self) -> Vec<Value> {
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&self.written.lock().unwrap());
+        std::iter::from_fn(|| decoder.next_message()).collect()
+    }
+
+    /// Forget what was sent, so a test reads only what follows.
+    pub fn clear(&self) {
+        self.written.lock().unwrap().clear();
+    }
+}
+
+#[cfg(test)]
+struct SharedBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Write for SharedBuf {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl DapTransport {
+    /// A transport with no adapter behind it, for driving a session in tests.
+    pub fn fake() -> (DapTransport, FakeWire) {
+        let written = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (adapter, incoming) = std::sync::mpsc::channel();
+        let transport = DapTransport {
+            child: None,
+            writer: Mutex::new(Box::new(SharedBuf(written.clone()))),
+            seq: AtomicI64::new(1),
+            incoming,
+        };
+        (transport, FakeWire { written, adapter })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

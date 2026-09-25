@@ -100,9 +100,11 @@ pub enum DebugRowKind {
     /// A scope container row ("Locals", "Globals").
     Scope { name: String },
     /// A variable. `reference > 0` means expandable; `value`/`type_name` are
-    /// coloured by type.
+    /// coloured by type. `container` is the `variablesReference` of the scope
+    /// or variable it sits in, which a data breakpoint request names (#611).
     Variable {
         reference: i64,
+        container: i64,
         expandable: bool,
         expanded: bool,
         name: String,
@@ -997,6 +999,7 @@ mod tests {
                 indent: 2,
                 kind: DebugRowKind::Variable {
                     reference: 0,
+                    container: 1,
                     expandable: false,
                     expanded: false,
                     name: "x".into(),
@@ -1008,6 +1011,7 @@ mod tests {
                 indent: 2,
                 kind: DebugRowKind::Variable {
                     reference: 9,
+                    container: 1,
                     expandable: true,
                     expanded: false,
                     name: "obj".into(),

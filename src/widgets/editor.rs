@@ -2421,6 +2421,11 @@ pub struct Editor {
     /// true. Rendered with a distinct gutter glyph.
     pub breakpoint_conditions:
         std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
+    /// Optional hit count per breakpoint line (path -> line -> expression in
+    /// the adapter's syntax, e.g. `5` or `>= 5`): the breakpoint only pauses
+    /// once it has been hit that often. Drawn like a conditional breakpoint.
+    pub breakpoint_hit_conditions:
+        std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
     /// Optional log message per breakpoint line (path -> line -> message): a
     /// logpoint. The adapter interpolates `{expr}` holes and prints instead
     /// of pausing. Rendered as an amber diamond in the gutter.
@@ -2971,6 +2976,7 @@ impl Editor {
             stop_line: None,
             unverified_breakpoints: std::collections::HashMap::new(),
             breakpoint_conditions: std::collections::HashMap::new(),
+            breakpoint_hit_conditions: std::collections::HashMap::new(),
             breakpoint_logs: std::collections::HashMap::new(),
             bookmarks: std::collections::HashMap::new(),
             bookmark_shadow: None,
@@ -3142,6 +3148,12 @@ impl Editor {
                 logs.remove(&line);
                 if logs.is_empty() {
                     self.breakpoint_logs.remove(&path);
+                }
+            }
+            if let Some(hits) = self.breakpoint_hit_conditions.get_mut(&path) {
+                hits.remove(&line);
+                if hits.is_empty() {
+                    self.breakpoint_hit_conditions.remove(&path);
                 }
             }
             false
@@ -3470,7 +3482,7 @@ impl Editor {
     }
 
     /// Breakpoints for `path` as DAP `SourceBreakpoint`s, attaching any stored
-    /// per-line condition and log message. `lines` is the path's breakpoint
+    /// per-line condition, hit count and log message. `lines` is the path's breakpoint
     /// set (passed in to avoid a second lookup at the call site).
     pub fn source_breakpoints(
         &self,
@@ -3478,12 +3490,14 @@ impl Editor {
         lines: &std::collections::BTreeSet<usize>,
     ) -> Vec<crate::dap::session::SourceBreakpoint> {
         let conds = self.breakpoint_conditions.get(path);
+        let hits = self.breakpoint_hit_conditions.get(path);
         let logs = self.breakpoint_logs.get(path);
         lines
             .iter()
             .map(|&l| crate::dap::session::SourceBreakpoint {
                 line: l as u32,
                 condition: conds.and_then(|c| c.get(&l)).cloned(),
+                hit_condition: hits.and_then(|h| h.get(&l)).cloned(),
                 log_message: logs.and_then(|m| m.get(&l)).cloned(),
             })
             .collect()
@@ -12449,7 +12463,11 @@ impl Widget for &mut Editor {
                 let is_conditional = self
                     .breakpoint_conditions
                     .get(path)
-                    .is_some_and(|c| c.contains_key(&here));
+                    .is_some_and(|c| c.contains_key(&here))
+                    || self
+                        .breakpoint_hit_conditions
+                        .get(path)
+                        .is_some_and(|h| h.contains_key(&here));
                 let is_logpoint = self
                     .breakpoint_logs
                     .get(path)
@@ -12464,7 +12482,7 @@ impl Widget for &mut Editor {
                     sign_taken = true;
                 } else if is_bp {
                     // Hollow dimmed ring when the adapter could not bind it; a
-                    // red diamond for a conditional breakpoint; an amber one
+                    // red diamond for a conditional or hit-count breakpoint; an amber one
                     // for a logpoint; a solid red dot for a plain, live one.
                     let (glyph, color) = if is_unverified {
                         ("○", self.theme.ui(Color::Rgb(0x99, 0x99, 0x99)))
@@ -16243,6 +16261,10 @@ mod tests {
             .entry(path.clone())
             .or_default()
             .insert(2, String::from("x > 1"));
+        e.breakpoint_hit_conditions
+            .entry(path.clone())
+            .or_default()
+            .insert(2, String::from("5"));
         e.toggle_breakpoint_line(2); // remove
         e.toggle_breakpoint_line(2); // re-add: a PLAIN breakpoint
         let lines = e.breakpoints.get(&path).cloned().unwrap();
@@ -16255,6 +16277,10 @@ mod tests {
         assert_eq!(
             specs[0].condition, None,
             "a re-added breakpoint must be unconditional"
+        );
+        assert_eq!(
+            specs[0].hit_condition, None,
+            "a re-added breakpoint must pause on its first hit"
         );
     }
 
@@ -16824,6 +16850,43 @@ mod tests {
             Color::Rgb(0xe5, 0xc0, 0x7b),
             "the logpoint diamond is amber, distinct from the conditional's red"
         );
+    }
+
+    #[test]
+    fn source_breakpoints_attach_hit_counts() {
+        let mut e = Editor::new();
+        let p = PathBuf::from("/x/a.py");
+        let lines: std::collections::BTreeSet<usize> = [3, 5].into();
+        e.breakpoint_hit_conditions
+            .entry(p.clone())
+            .or_default()
+            .insert(5, String::from(">= 4"));
+        let specs = e.source_breakpoints(&p, &lines);
+        assert_eq!(specs[0].hit_condition, None);
+        assert_eq!(specs[1].hit_condition.as_deref(), Some(">= 4"));
+    }
+
+    #[test]
+    fn a_hit_count_breakpoint_wears_the_conditional_diamond() {
+        let mut e = editor_with("a\nb\nc");
+        let p = PathBuf::from("/x/hc.py");
+        e.path = Some(p.clone());
+        e.breakpoints.entry(p.clone()).or_default().insert(2);
+        e.breakpoint_hit_conditions
+            .entry(p)
+            .or_default()
+            .insert(2, String::from("5"));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let cell = &buf[(e.last_inner.x, e.last_inner.y + 1)];
+        assert_eq!(cell.symbol(), "◆");
+        assert_eq!(cell.fg, Color::Rgb(0xe5, 0x1c, 0x23));
     }
 
     #[test]

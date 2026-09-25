@@ -49559,3 +49559,369 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+/// A fake debug session (no adapter) seated in `app` and paused, so the
+/// debugger actions have a stopped thread to act on. The wire shows what the
+/// session sends from here on.
+fn seat_paused_fake_session(app: &mut App) -> crate::dap::transport::FakeWire {
+    let (session, wire) = crate::dap::session::DapSession::fake(Default::default());
+    app.debug_sessions.push("fake", session);
+    wire.adapter
+        .send(serde_json::json!({"type": "event", "event": "stopped",
+                                 "body": {"threadId": 1, "reason": "breakpoint"}}))
+        .unwrap();
+    app.poll_dap();
+    wire.clear();
+    wire
+}
+
+fn sent_of(wire: &crate::dap::transport::FakeWire, command: &str) -> Vec<serde_json::Value> {
+    wire.sent()
+        .into_iter()
+        .filter(|m| m["command"] == command)
+        .collect()
+}
+
+/// Ctrl+Shift+F9 opens the hit-count popup on the cursor line; committing it
+/// creates the breakpoint and sends its `hitCondition` to a live session.
+#[test]
+fn ctrl_shift_f9_attaches_a_hit_count_and_sends_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("prog.py");
+    std::fs::write(&f, "l1\nl2\nl3\nl4\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_row = 2;
+    let wire = seat_paused_fake_session(&mut app);
+    app.debug_sessions
+        .focused_mut()
+        .unwrap()
+        .capabilities
+        .hit_conditional_breakpoints = true;
+    app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    let prompt = app.prompt.as_ref().expect("a hit-count popup");
+    assert!(matches!(
+        prompt.kind,
+        PromptKind::BreakpointHitCount { line: 3, .. }
+    ));
+    for c in ">= 2".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.breakpoint_lines(&f), vec![3u32]);
+    let sent = sent_of(&wire, "setBreakpoints");
+    let bp = &sent.last().expect("the file's set is sent")["arguments"]["breakpoints"][0];
+    assert_eq!(bp["line"], 3);
+    assert_eq!(bp["hitCondition"], ">= 2");
+}
+
+/// The gutter menu offers "Add Hit Count" for the clicked line, with its
+/// chord, and the popup targets that line.
+#[test]
+fn the_gutter_menu_offers_a_hit_count_for_the_clicked_line() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("prog.py");
+    std::fs::write(&f, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let gutter_col = app.editor.last_inner.x;
+    let row = app.editor.last_inner.y + 2; // 1-based line 3
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        gutter_col,
+        row,
+    ));
+    let menu = app.context_menu.as_ref().unwrap();
+    let idx = menu
+        .items
+        .iter()
+        .position(|e| menu_label(e) == "Add Hit Count")
+        .expect("menu must offer Add Hit Count");
+    assert_eq!(
+        shortcut_for(&MenuAction::EditHitCountAt { line: 3 }),
+        Some("⌃⇧F9")
+    );
+    app.context_menu.as_mut().unwrap().selected = idx;
+    app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(PromptKind::BreakpointHitCount { line: 3, .. })
+    ));
+}
+
+/// Ctrl+F9 prompts for a function name; submitting adds it and sends the
+/// set, submitting it again removes it. An adapter without support is named
+/// in the status.
+#[test]
+fn ctrl_f9_adds_then_removes_a_function_breakpoint() {
+    use crate::widgets::input_prompt::InputPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let wire = seat_paused_fake_session(&mut app);
+    app.debug_sessions
+        .focused_mut()
+        .unwrap()
+        .capabilities
+        .function_breakpoints = true;
+    for expected in [serde_json::json!([{"name": "main"}]), serde_json::json!([])] {
+        app.handle_key(key(KeyCode::F(9), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(&InputPurpose::FunctionBreakpoint)
+        );
+        for c in "main".chars() {
+            app.input_prompt.as_mut().unwrap().push_char(c);
+        }
+        app.submit_input_prompt();
+        let sent = sent_of(&wire, "setFunctionBreakpoints");
+        assert_eq!(sent.last().unwrap()["arguments"]["breakpoints"], expected);
+    }
+    assert!(app.function_breakpoints.is_empty());
+    app.debug_sessions
+        .focused_mut()
+        .unwrap()
+        .capabilities
+        .function_breakpoints = false;
+    app.toggle_function_breakpoint("run");
+    assert_eq!(app.function_breakpoints, vec![String::from("run")]);
+    assert!(
+        app.status.contains("does not support function breakpoints"),
+        "{}",
+        app.status
+    );
+}
+
+/// A session started after a function breakpoint was added is handed it, and
+/// sends it on `initialized`.
+#[test]
+fn a_new_debug_session_is_handed_the_function_breakpoints() {
+    let (session, wire) = crate::dap::session::DapSession::fake(Default::default());
+    let mut session = with_function_breakpoints(session, &[String::from("main")]);
+    wire.adapter
+        .send(
+            serde_json::json!({"type": "response", "command": "initialize", "success": true,
+                                 "body": {"supportsFunctionBreakpoints": true}}),
+        )
+        .unwrap();
+    wire.adapter
+        .send(serde_json::json!({"type": "event", "event": "initialized"}))
+        .unwrap();
+    session.poll();
+    let sent = sent_of(&wire, "setFunctionBreakpoints");
+    assert_eq!(
+        sent.first().expect("sent on initialized")["arguments"]["breakpoints"],
+        serde_json::json!([{"name": "main"}])
+    );
+}
+
+/// Ctrl+F10 resumes a paused session to the cursor line through a temporary
+/// breakpoint; without a paused session it says so and sends nothing.
+#[test]
+fn ctrl_f10_runs_to_the_cursor_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("prog.py");
+    std::fs::write(&f, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_row = 4;
+    app.handle_key(key(KeyCode::F(10), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(
+        app.status.contains("needs a paused debug session"),
+        "{}",
+        app.status
+    );
+    let wire = seat_paused_fake_session(&mut app);
+    app.handle_key(key(KeyCode::F(10), KeyModifiers::CONTROL))
+        .unwrap();
+    let set = sent_of(&wire, "setBreakpoints");
+    assert_eq!(set.len(), 1);
+    assert_eq!(
+        set[0]["arguments"]["breakpoints"],
+        serde_json::json!([{"line": 5}])
+    );
+    assert!(!sent_of(&wire, "continue").is_empty());
+    assert!(sent_of(&wire, "next").is_empty(), "Ctrl+F10 is not a step");
+    assert!(
+        app.editor.breakpoint_lines(&f).is_empty(),
+        "the temporary breakpoint is not the user's"
+    );
+}
+
+/// The editor body menu offers Run to Cursor on the clicked line only while
+/// the session is paused.
+#[test]
+fn the_editor_body_menu_offers_run_to_cursor_while_paused() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("prog.py");
+    std::fs::write(&f, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let text_x = app.editor.last_inner.x + app.editor.last_gutter_width + 1;
+    let row = app.editor.last_inner.y + 3; // 1-based line 4
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), text_x, row));
+    let labels = menu_labels(&app.context_menu.as_ref().unwrap().items);
+    assert!(
+        labels.contains(&"Go to Definition"),
+        "the body menu: {labels:?}"
+    );
+    assert!(!labels.contains(&"Run to Cursor"), "{labels:?}");
+    app.context_menu = None;
+    let wire = seat_paused_fake_session(&mut app);
+    // A paused session can change the chrome; click where the text is now.
+    term.draw(|frame| app.render(frame)).unwrap();
+    let text_x = app.editor.last_inner.x + app.editor.last_gutter_width + 1;
+    let row = app.editor.last_inner.y + 3;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), text_x, row));
+    let menu = app.context_menu.as_ref().expect("a menu on the text");
+    let idx = menu
+        .items
+        .iter()
+        .position(|e| menu_label(e) == "Run to Cursor")
+        .unwrap_or_else(|| panic!("Run to Cursor while paused: {:?}", menu_labels(&menu.items)));
+    app.context_menu.as_mut().unwrap().selected = idx;
+    app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let set = sent_of(&wire, "setBreakpoints");
+    assert_eq!(
+        set[0]["arguments"]["breakpoints"],
+        serde_json::json!([{"line": 4}])
+    );
+}
+
+/// Paused-frame variables for the data breakpoint tests: `x` in Locals
+/// (ref 11), `y` in Globals (ref 12).
+fn load_two_scopes(app: &mut App) {
+    use crate::dap::session::{Scope, Variable};
+    let s = app.debug_sessions.focused_mut().unwrap();
+    s.capabilities.data_breakpoints = true;
+    s.scopes = vec![
+        Scope {
+            name: String::from("Locals"),
+            variables_ref: 11,
+        },
+        Scope {
+            name: String::from("Globals"),
+            variables_ref: 12,
+        },
+    ];
+    let var = |name: &str| Variable {
+        name: name.to_string(),
+        value: String::from("1"),
+        type_name: String::from("int"),
+        variables_ref: 0,
+    };
+    s.variables.insert(11, vec![var("x")]);
+    s.variables.insert(12, vec![var("y")]);
+}
+
+/// Right-clicking a VARIABLES row offers Break on Value Change; choosing it
+/// asks the adapter about that variable in its own container, and the answer
+/// sets the data breakpoint.
+#[test]
+fn right_click_on_a_variable_breaks_on_its_value_change() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let wire = seat_paused_fake_session(&mut app);
+    load_two_scopes(&mut app);
+    app.set_sidebar_view(SidebarView::RunDebug);
+    app.refresh_debug_panel();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let idx = app
+        .run_debug
+        .debug_rows
+        .iter()
+        .position(|r| {
+            matches!(&r.kind, crate::widgets::run_debug::DebugRowKind::Variable { name, .. } if name == "y")
+        })
+        .expect("a row for y");
+    let y = app.run_debug.last_debug_row_y0 + (idx - app.run_debug.debug_scroll) as u16;
+    let x = app.run_debug.last_area.x + 4;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y));
+    let menu = app.context_menu.as_ref().expect("a variable menu");
+    assert_eq!(menu_labels(&menu.items), vec!["Break on Value Change"]);
+    app.context_menu.as_mut().unwrap().selected = 0;
+    app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let ask = sent_of(&wire, "dataBreakpointInfo");
+    assert_eq!(
+        ask[0]["arguments"],
+        serde_json::json!({"variablesReference": 12, "name": "y"})
+    );
+    wire.adapter
+        .send(
+            serde_json::json!({"type": "response", "command": "dataBreakpointInfo",
+                                 "success": true, "request_seq": ask[0]["seq"],
+                                 "body": {"dataId": "12:y", "description": "y",
+                                          "accessTypes": ["read", "write"]}}),
+        )
+        .unwrap();
+    app.poll_dap();
+    assert_eq!(app.status, "Breaks when y changes");
+    let set = sent_of(&wire, "setDataBreakpoints");
+    assert_eq!(
+        set.last().unwrap()["arguments"]["breakpoints"],
+        serde_json::json!([{"dataId": "12:y", "accessType": "write"}])
+    );
+}
+
+/// Ctrl+Alt+F9 prompts for a variable name and resolves it in the paused
+/// frame's scopes; a name the frame lacks is refused in the status.
+#[test]
+fn ctrl_alt_f9_breaks_on_a_named_variable_of_the_paused_frame() {
+    use crate::widgets::input_prompt::InputPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(
+        app.input_prompt.is_none(),
+        "no prompt without a paused session"
+    );
+    let wire = seat_paused_fake_session(&mut app);
+    load_two_scopes(&mut app);
+    for (name, asked) in [("x", true), ("nope", false)] {
+        app.handle_key(key(
+            KeyCode::F(9),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .unwrap();
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(&InputPurpose::DataBreakpoint)
+        );
+        for c in name.chars() {
+            app.input_prompt.as_mut().unwrap().push_char(c);
+        }
+        app.submit_input_prompt();
+        let ask = sent_of(&wire, "dataBreakpointInfo");
+        if asked {
+            assert_eq!(
+                ask[0]["arguments"],
+                serde_json::json!({"variablesReference": 11, "name": "x"})
+            );
+        } else {
+            assert_eq!(ask.len(), 1, "nothing is asked for an unknown name");
+            assert_eq!(app.status, "No variable named nope in the paused frame");
+        }
+    }
+}

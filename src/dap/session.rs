@@ -65,6 +65,15 @@ pub enum DapEvent {
         /// so a watch row can render `<not available>` instead of the error.
         success: bool,
     },
+    /// A `dataBreakpointInfo` request resolved for the variable `name`.
+    /// `data_id` is `None` when the variable cannot carry a data breakpoint;
+    /// `description` then says why.
+    DataBreakpointInfo {
+        name: String,
+        data_id: Option<String>,
+        description: String,
+        access_types: Vec<String>,
+    },
 }
 
 /// One breakpoint's binding status as reported by the adapter: the source file,
@@ -336,13 +345,16 @@ pub fn start_debugging_request(msg: &Value) -> Option<StartDebuggingRequest> {
 }
 
 /// A breakpoint to set on a source line, with an optional `condition` (a boolean
-/// expression the adapter evaluates; the breakpoint only pauses when it's true)
-/// and an optional `log_message` (a logpoint: the adapter interpolates and
-/// prints the text instead of pausing). The two are independent DAP fields.
+/// expression the adapter evaluates; the breakpoint only pauses when it's true),
+/// an optional `hit_condition` (how many hits to ignore, in the adapter's own
+/// syntax, e.g. `5` or `>= 5`), and an optional `log_message` (a logpoint: the
+/// adapter interpolates and prints the text instead of pausing). All three are
+/// independent DAP fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceBreakpoint {
     pub line: u32,
     pub condition: Option<String>,
+    pub hit_condition: Option<String>,
     pub log_message: Option<String>,
 }
 
@@ -351,9 +363,86 @@ impl SourceBreakpoint {
         Self {
             line,
             condition: None,
+            hit_condition: None,
             log_message: None,
         }
     }
+}
+
+/// What the adapter said it supports in its `initialize` response. croft sends
+/// function breakpoints, data breakpoints and hit counts only to an adapter
+/// that claims them (#611).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdapterCapabilities {
+    pub function_breakpoints: bool,
+    pub data_breakpoints: bool,
+    pub hit_conditional_breakpoints: bool,
+}
+
+/// Read the capabilities out of an `initialize` response. Absent flags mean
+/// unsupported, as the protocol defines. Pure.
+pub fn parse_capabilities(msg: &Value) -> AdapterCapabilities {
+    let flag = |key: &str| {
+        msg.get("body")
+            .and_then(|b| b.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    AdapterCapabilities {
+        function_breakpoints: flag("supportsFunctionBreakpoints"),
+        data_breakpoints: flag("supportsDataBreakpoints"),
+        hit_conditional_breakpoints: flag("supportsHitConditionalBreakpoints"),
+    }
+}
+
+/// Build a `setFunctionBreakpoints` request: break when any function in
+/// `names` is entered. The list replaces the adapter's whole set.
+pub fn set_function_breakpoints_request(names: &[String]) -> Value {
+    let bps: Vec<Value> = names.iter().map(|n| json!({ "name": n })).collect();
+    json!({
+        "type": "request",
+        "command": "setFunctionBreakpoints",
+        "arguments": { "breakpoints": bps }
+    })
+}
+
+/// A data breakpoint: pause when the variable behind `data_id` changes.
+/// `name` is the variable's name, for messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataBreakpoint {
+    pub data_id: String,
+    pub name: String,
+    pub access_type: Option<String>,
+}
+
+/// Build a `dataBreakpointInfo` request: can the variable `name`, a child of
+/// `variables_reference`, carry a data breakpoint, and under which id.
+pub fn data_breakpoint_info_request(variables_reference: i64, name: &str) -> Value {
+    json!({
+        "type": "request",
+        "command": "dataBreakpointInfo",
+        "arguments": { "variablesReference": variables_reference, "name": name }
+    })
+}
+
+/// Build a `setDataBreakpoints` request. The list replaces the adapter's
+/// whole set.
+pub fn set_data_breakpoints_request(breakpoints: &[DataBreakpoint]) -> Value {
+    let bps: Vec<Value> = breakpoints
+        .iter()
+        .map(|b| {
+            let mut bp = json!({ "dataId": b.data_id });
+            if let Some(a) = &b.access_type {
+                bp["accessType"] = json!(a);
+            }
+            bp
+        })
+        .collect();
+    json!({
+        "type": "request",
+        "command": "setDataBreakpoints",
+        "arguments": { "breakpoints": bps }
+    })
 }
 
 /// Build a `setBreakpoints` request body for one source file, carrying any
@@ -365,6 +454,9 @@ pub fn set_breakpoints_request(path: &Path, breakpoints: &[SourceBreakpoint]) ->
             let mut bp = json!({ "line": b.line });
             if let Some(c) = &b.condition {
                 bp["condition"] = json!(c);
+            }
+            if let Some(h) = &b.hit_condition {
+                bp["hitCondition"] = json!(h);
             }
             if let Some(m) = &b.log_message {
                 bp["logMessage"] = json!(m);
@@ -793,6 +885,11 @@ impl<S> DebugSessions<S> {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut S> {
         self.sessions.iter_mut().map(|s| &mut s.session)
     }
+
+    /// Every session, read-only.
+    pub fn iter(&self) -> impl Iterator<Item = &S> {
+        self.sessions.iter().map(|s| &s.session)
+    }
 }
 
 /// One running debug session.
@@ -845,6 +942,18 @@ pub struct DapSession {
     /// Most recently seen thread id (from `thread`/`stopped` events). Used to
     /// target `pause` while the program is running and `stopped_thread` is None.
     known_thread: Option<i64>,
+    /// What the adapter claimed in its `initialize` response (#611).
+    pub capabilities: AdapterCapabilities,
+    /// Function names to break on, pushed on `initialized` (#611).
+    function_breakpoints: Vec<String>,
+    /// This run's data breakpoints (#611). Variable ids are only good for one
+    /// run, so these end with the session.
+    pub data_breakpoints: Vec<DataBreakpoint>,
+    /// In-flight `dataBreakpointInfo` requests: request `seq` -> variable name.
+    pending_data_info: std::collections::HashMap<i64, String>,
+    /// A Run to Cursor in progress: the file and line of its temporary
+    /// breakpoint, removed at the next stop or exit (#611).
+    run_to: Option<(PathBuf, u32)>,
 }
 
 impl DapSession {
@@ -942,6 +1051,16 @@ impl DapSession {
     /// Assemble a fresh session around its (parent) `transport`. `js_server` is
     /// set only for vscode-js-debug, marking the session multi-session and
     /// carrying the address its child connection reuses.
+    /// A session with no adapter behind it: the returned wire shows what it
+    /// sends and feeds it what an adapter would answer.
+    #[cfg(test)]
+    pub fn fake(
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> (DapSession, crate::dap::transport::FakeWire) {
+        let (transport, wire) = DapTransport::fake();
+        (Self::new_with_transport(transport, breakpoints, None), wire)
+    }
+
     fn new_with_transport(
         transport: DapTransport,
         breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
@@ -964,6 +1083,11 @@ impl DapSession {
             pending_evals: std::collections::HashMap::new(),
             exception_filters: vec![String::from("uncaught")],
             known_thread: None,
+            capabilities: AdapterCapabilities::default(),
+            function_breakpoints: Vec::new(),
+            data_breakpoints: Vec::new(),
+            pending_data_info: std::collections::HashMap::new(),
+            run_to: None,
         }
     }
 
@@ -1145,6 +1269,43 @@ impl DapSession {
                         out.push(DapEvent::InspectionUpdated);
                     }
                 }
+                Some("initialize") => {
+                    self.capabilities = parse_capabilities(&msg);
+                }
+                Some("dataBreakpointInfo") => {
+                    let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                    if let Some(name) = req_seq.and_then(|s| self.pending_data_info.remove(&s)) {
+                        let body = msg.get("body");
+                        let text = |key: &str| {
+                            body.and_then(|b| b.get(key))
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        };
+                        let access_types = body
+                            .and_then(|b| b.get("accessTypes"))
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        out.push(DapEvent::DataBreakpointInfo {
+                            name,
+                            data_id: text("dataId"),
+                            description: text("description")
+                                .or_else(|| text("message"))
+                                .or_else(|| {
+                                    msg.get("message")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string)
+                                })
+                                .unwrap_or_default(),
+                            access_types,
+                        });
+                    }
+                }
                 Some("evaluate") => {
                     let req_seq = msg.get("request_seq").and_then(Value::as_i64);
                     if let Some((context, expression)) =
@@ -1213,11 +1374,15 @@ impl DapSession {
                 // to the child once it exists, and to the parent before that.
                 self.push_breakpoints();
                 let t = self.active();
+                if self.capabilities.function_breakpoints && !self.function_breakpoints.is_empty() {
+                    let _ = t.send(set_function_breakpoints_request(&self.function_breakpoints));
+                }
                 let _ = t.send(set_exception_breakpoints_request(&self.exception_filters));
                 let _ = t.send(configuration_done_request());
                 self.phase = SessionPhase::Running;
             }
             DapEvent::Stopped { thread_id, .. } => {
+                self.end_run_to_cursor();
                 self.stopped_thread = Some(*thread_id);
                 self.known_thread = Some(*thread_id);
                 self.phase = SessionPhase::Stopped;
@@ -1235,6 +1400,7 @@ impl DapSession {
                 // the session down. Only the child's exit (or a stdio adapter /
                 // parent with no child) actually ends the run.
                 if from_child || self.child.is_none() {
+                    self.end_run_to_cursor();
                     self.phase = SessionPhase::Terminated;
                     self.current_location = None;
                     self.clear_inspection();
@@ -1243,7 +1409,8 @@ impl DapSession {
             DapEvent::Output { .. } => {}
             DapEvent::BreakpointsUpdated
             | DapEvent::InspectionUpdated
-            | DapEvent::Evaluated { .. } => {}
+            | DapEvent::Evaluated { .. }
+            | DapEvent::DataBreakpointInfo { .. } => {}
         }
         // Suppress the parent's own `terminated` for js-debug while a child is
         // still live (the parent can wind down its bootstrap connection first).
@@ -1274,9 +1441,114 @@ impl DapSession {
     /// Push every stashed breakpoint set to the active connection (called on
     /// `initialized`).
     fn push_breakpoints(&mut self) {
-        let t = self.active();
-        for (path, lines) in &self.breakpoints {
-            let _ = t.send(set_breakpoints_request(path, lines));
+        for path in self.breakpoints.keys() {
+            self.send_file_breakpoints(path);
+        }
+    }
+
+    /// Send `path`'s whole breakpoint set as the adapter should see it: hit
+    /// counts dropped when it does not support them, and a pending Run to
+    /// Cursor's temporary breakpoint added.
+    fn send_file_breakpoints(&self, path: &Path) {
+        let mut bps: Vec<SourceBreakpoint> =
+            self.breakpoints.get(path).cloned().unwrap_or_default();
+        if !self.capabilities.hit_conditional_breakpoints {
+            for bp in &mut bps {
+                bp.hit_condition = None;
+            }
+        }
+        if let Some((_, line)) = self.run_to.as_ref().filter(|(p, _)| p == path)
+            && !bps.iter().any(|b| b.line == *line)
+        {
+            bps.push(SourceBreakpoint::plain(*line));
+        }
+        let _ = self.active().send(set_breakpoints_request(path, &bps));
+    }
+
+    /// Replace the function breakpoints. Sent now when the session is past
+    /// `initialized` and the adapter supports them, otherwise kept for the
+    /// `initialized` push. False when the adapter is known not to support
+    /// them.
+    pub fn set_function_breakpoints(&mut self, names: Vec<String>) -> bool {
+        self.function_breakpoints = names;
+        if self.phase == SessionPhase::Initializing {
+            return true;
+        }
+        if !self.capabilities.function_breakpoints {
+            return false;
+        }
+        let _ = self
+            .active()
+            .send(set_function_breakpoints_request(&self.function_breakpoints));
+        true
+    }
+
+    /// Ask whether the variable `name` under `variables_reference` can carry a
+    /// data breakpoint. The answer arrives as [`DapEvent::DataBreakpointInfo`].
+    /// False when the adapter does not support data breakpoints.
+    pub fn request_data_breakpoint_info(&mut self, variables_reference: i64, name: &str) -> bool {
+        if !self.capabilities.data_breakpoints {
+            return false;
+        }
+        if let Ok(seq) = self
+            .active()
+            .send(data_breakpoint_info_request(variables_reference, name))
+        {
+            self.pending_data_info.insert(seq, name.to_string());
+        }
+        true
+    }
+
+    /// Add the data breakpoint on `data_id`, or remove it when it is already
+    /// set, and send the new set. True when it was added.
+    pub fn toggle_data_breakpoint(
+        &mut self,
+        data_id: String,
+        name: String,
+        access_type: Option<String>,
+    ) -> bool {
+        let added = if let Some(i) = self
+            .data_breakpoints
+            .iter()
+            .position(|b| b.data_id == data_id)
+        {
+            self.data_breakpoints.remove(i);
+            false
+        } else {
+            self.data_breakpoints.push(DataBreakpoint {
+                data_id,
+                name,
+                access_type,
+            });
+            true
+        };
+        let _ = self
+            .active()
+            .send(set_data_breakpoints_request(&self.data_breakpoints));
+        added
+    }
+
+    /// Run to Cursor: set a temporary breakpoint on `line` of `path` and
+    /// resume. The temporary breakpoint goes at the next stop or exit,
+    /// whichever breakpoint caused it. False unless stopped.
+    pub fn run_to_cursor(&mut self, path: &Path, line: u32) -> bool {
+        if self.stopped_thread.is_none() || self.phase != SessionPhase::Stopped {
+            return false;
+        }
+        if let Some((old, _)) = self.run_to.replace((path.to_path_buf(), line))
+            && old != path
+        {
+            self.send_file_breakpoints(&old);
+        }
+        self.send_file_breakpoints(path);
+        self.continue_execution();
+        true
+    }
+
+    /// Drop a pending Run to Cursor's temporary breakpoint.
+    fn end_run_to_cursor(&mut self) {
+        if let Some((path, _)) = self.run_to.take() {
+            self.send_file_breakpoints(&path);
         }
     }
 
@@ -1292,9 +1564,11 @@ impl DapSession {
     /// `setBreakpoints` at any time), so toggling a breakpoint while paused or
     /// running takes effect without a restart.
     pub fn update_breakpoints(&mut self, path: &Path, breakpoints: &[SourceBreakpoint]) {
-        let _ = self
-            .active()
-            .send(set_breakpoints_request(path, breakpoints));
+        // Kept, so a later push (a js-debug child's `initialized`, the end of
+        // a Run to Cursor) sends the current set rather than the launch one.
+        self.breakpoints
+            .insert(path.to_path_buf(), breakpoints.to_vec());
+        self.send_file_breakpoints(path);
     }
 
     /// Step over (`next`), into (`stepIn`), or out (`stepOut`).
@@ -1498,6 +1772,275 @@ mod session_set_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_session(
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> (DapSession, crate::dap::transport::FakeWire) {
+        DapSession::fake(breakpoints)
+    }
+
+    /// Feed `msgs` as if the adapter sent them, and drain them.
+    fn deliver(
+        session: &mut DapSession,
+        wire: &crate::dap::transport::FakeWire,
+        msgs: &[Value],
+    ) -> Vec<DapEvent> {
+        for m in msgs {
+            wire.adapter.send(m.clone()).unwrap();
+        }
+        session.poll()
+    }
+
+    fn sent_commands(wire: &crate::dap::transport::FakeWire) -> Vec<String> {
+        wire.sent()
+            .iter()
+            .filter_map(|m| m["command"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn lines_sent_for(wire: &crate::dap::transport::FakeWire, command: &str) -> Vec<Vec<u64>> {
+        wire.sent()
+            .iter()
+            .filter(|m| m["command"] == command)
+            .map(|m| {
+                m["arguments"]["breakpoints"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|b| b["line"].as_u64())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn stopped() -> Value {
+        json!({"type": "event", "event": "stopped", "body": {"threadId": 1, "reason": "breakpoint"}})
+    }
+
+    #[test]
+    fn capabilities_come_from_the_initialize_response() {
+        let caps = parse_capabilities(&json!({
+            "type": "response", "command": "initialize", "success": true,
+            "body": {
+                "supportsFunctionBreakpoints": true,
+                "supportsDataBreakpoints": false,
+                "supportsHitConditionalBreakpoints": true
+            }
+        }));
+        assert_eq!(
+            caps,
+            AdapterCapabilities {
+                function_breakpoints: true,
+                data_breakpoints: false,
+                hit_conditional_breakpoints: true,
+            }
+        );
+        assert_eq!(
+            parse_capabilities(&json!({"type": "response"})),
+            AdapterCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn function_breakpoints_go_out_on_initialized_only_when_supported() {
+        for supported in [true, false] {
+            let (mut session, wire) = fake_session(BTreeMap::new());
+            assert!(session.set_function_breakpoints(vec![String::from("main")]));
+            deliver(
+                &mut session,
+                &wire,
+                &[
+                    json!({"type": "response", "command": "initialize", "success": true,
+                           "body": {"supportsFunctionBreakpoints": supported}}),
+                    json!({"type": "event", "event": "initialized"}),
+                ],
+            );
+            let fbp: Vec<Value> = wire
+                .sent()
+                .into_iter()
+                .filter(|m| m["command"] == "setFunctionBreakpoints")
+                .collect();
+            if supported {
+                assert_eq!(fbp.len(), 1);
+                assert_eq!(
+                    fbp[0]["arguments"]["breakpoints"],
+                    json!([{"name": "main"}])
+                );
+                let cmds = sent_commands(&wire);
+                let at = |c: &str| cmds.iter().position(|x| x == c).unwrap();
+                assert!(at("setFunctionBreakpoints") < at("configurationDone"));
+            } else {
+                assert!(
+                    fbp.is_empty(),
+                    "an adapter without support is not sent them"
+                );
+                assert!(!session.set_function_breakpoints(vec![String::from("run")]));
+            }
+        }
+    }
+
+    #[test]
+    fn a_hit_count_reaches_only_an_adapter_that_supports_it() {
+        let path = PathBuf::from("/a/b.py");
+        let bp = SourceBreakpoint {
+            hit_condition: Some(String::from(">= 3")),
+            ..SourceBreakpoint::plain(4)
+        };
+        let (mut session, wire) = fake_session(BTreeMap::new());
+        session.update_breakpoints(&path, std::slice::from_ref(&bp));
+        let sent = wire.sent();
+        assert!(
+            sent[0]["arguments"]["breakpoints"][0]
+                .get("hitCondition")
+                .is_none()
+        );
+        wire.clear();
+        session.capabilities.hit_conditional_breakpoints = true;
+        session.update_breakpoints(&path, &[bp]);
+        assert_eq!(
+            wire.sent()[0]["arguments"]["breakpoints"][0]["hitCondition"],
+            ">= 3"
+        );
+    }
+
+    #[test]
+    fn a_data_breakpoint_is_asked_about_then_toggled() {
+        let (mut session, wire) = fake_session(BTreeMap::new());
+        assert!(!session.request_data_breakpoint_info(7, "x"));
+        assert!(
+            wire.sent().is_empty(),
+            "nothing is asked of an adapter without support"
+        );
+        session.capabilities.data_breakpoints = true;
+        assert!(session.request_data_breakpoint_info(7, "x"));
+        let ask = wire.sent().pop().unwrap();
+        assert_eq!(ask["command"], "dataBreakpointInfo");
+        assert_eq!(
+            ask["arguments"],
+            json!({"variablesReference": 7, "name": "x"})
+        );
+        let events = deliver(
+            &mut session,
+            &wire,
+            &[
+                json!({"type": "response", "command": "dataBreakpointInfo", "success": true,
+                     "request_seq": ask["seq"],
+                     "body": {"dataId": "7:x", "description": "x", "accessTypes": ["write"]}}),
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![DapEvent::DataBreakpointInfo {
+                name: String::from("x"),
+                data_id: Some(String::from("7:x")),
+                description: String::from("x"),
+                access_types: vec![String::from("write")],
+            }]
+        );
+        wire.clear();
+        assert!(session.toggle_data_breakpoint(
+            String::from("7:x"),
+            String::from("x"),
+            Some(String::from("write"))
+        ));
+        assert_eq!(
+            wire.sent()[0]["arguments"]["breakpoints"],
+            json!([{"dataId": "7:x", "accessType": "write"}])
+        );
+        wire.clear();
+        assert!(!session.toggle_data_breakpoint(String::from("7:x"), String::from("x"), None));
+        assert_eq!(wire.sent()[0]["arguments"]["breakpoints"], json!([]));
+    }
+
+    #[test]
+    fn a_variable_that_cannot_carry_a_data_breakpoint_says_why() {
+        let (mut session, wire) = fake_session(BTreeMap::new());
+        session.capabilities.data_breakpoints = true;
+        session.request_data_breakpoint_info(7, "f");
+        let seq = wire.sent().pop().unwrap()["seq"].clone();
+        let events = deliver(
+            &mut session,
+            &wire,
+            &[
+                json!({"type": "response", "command": "dataBreakpointInfo", "success": true,
+                     "request_seq": seq,
+                     "body": {"dataId": null, "description": "functions cannot be watched"}}),
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![DapEvent::DataBreakpointInfo {
+                name: String::from("f"),
+                data_id: None,
+                description: String::from("functions cannot be watched"),
+                access_types: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn run_to_cursor_adds_a_temporary_line_and_drops_it_at_the_next_stop() {
+        let path = PathBuf::from("/a/b.py");
+        let mut bps = BTreeMap::new();
+        bps.insert(path.clone(), vec![SourceBreakpoint::plain(3)]);
+        let (mut session, wire) = fake_session(bps);
+        assert!(
+            !session.run_to_cursor(&path, 9),
+            "only a paused session runs to a line"
+        );
+        deliver(&mut session, &wire, &[stopped()]);
+        // The stash follows mid-session edits, so the temporary line joins the
+        // current set, not the one the session launched with.
+        session.update_breakpoints(&path, &[SourceBreakpoint::plain(5)]);
+        wire.clear();
+        assert!(session.run_to_cursor(&path, 9));
+        assert_eq!(lines_sent_for(&wire, "setBreakpoints"), vec![vec![5, 9]]);
+        let cmds = sent_commands(&wire);
+        assert_eq!(cmds.last().map(String::as_str), Some("continue"));
+        wire.clear();
+        deliver(&mut session, &wire, &[stopped()]);
+        assert_eq!(lines_sent_for(&wire, "setBreakpoints"), vec![vec![5]]);
+        wire.clear();
+        deliver(&mut session, &wire, &[stopped()]);
+        assert!(
+            lines_sent_for(&wire, "setBreakpoints").is_empty(),
+            "restored once"
+        );
+    }
+
+    #[test]
+    fn run_to_cursor_on_a_breakpoint_line_sends_it_once_and_the_exit_restores() {
+        let path = PathBuf::from("/a/b.py");
+        let mut bps = BTreeMap::new();
+        bps.insert(path.clone(), vec![SourceBreakpoint::plain(3)]);
+        let (mut session, wire) = fake_session(bps);
+        deliver(&mut session, &wire, &[stopped()]);
+        wire.clear();
+        assert!(session.run_to_cursor(&path, 3));
+        assert_eq!(lines_sent_for(&wire, "setBreakpoints"), vec![vec![3]]);
+        let other = PathBuf::from("/a/c.py");
+        deliver(&mut session, &wire, &[stopped()]);
+        wire.clear();
+        assert!(session.run_to_cursor(&other, 2));
+        deliver(
+            &mut session,
+            &wire,
+            &[json!({"type": "event", "event": "terminated"})],
+        );
+        let restored: Vec<Value> = wire
+            .sent()
+            .into_iter()
+            .filter(|m| m["command"] == "setBreakpoints")
+            .collect();
+        assert_eq!(
+            restored.last().unwrap()["arguments"]["source"]["path"],
+            "/a/c.py"
+        );
+        assert_eq!(
+            restored.last().unwrap()["arguments"]["breakpoints"],
+            json!([])
+        );
+    }
 
     #[test]
     fn inline_locals_prefer_local_scopes_and_fall_back_to_the_first() {
@@ -1849,6 +2392,7 @@ mod tests {
                 SourceBreakpoint {
                     line: 7,
                     condition: Some(String::from("i > 3")),
+                    hit_condition: None,
                     log_message: None,
                 },
             ],
@@ -1874,11 +2418,13 @@ mod tests {
                 SourceBreakpoint {
                     line: 4,
                     condition: None,
+                    hit_condition: None,
                     log_message: Some(String::from("x is {x}")),
                 },
                 SourceBreakpoint {
                     line: 9,
                     condition: Some(String::from("n > 0")),
+                    hit_condition: Some(String::from(">= 3")),
                     log_message: Some(String::from("n={n}")),
                 },
                 SourceBreakpoint::plain(11),
@@ -1889,6 +2435,8 @@ mod tests {
         assert!(bps[0].get("condition").is_none());
         assert_eq!(bps[1]["condition"], "n > 0");
         assert_eq!(bps[1]["logMessage"], "n={n}");
+        assert_eq!(bps[1]["hitCondition"], ">= 3");
+        assert!(bps[0].get("hitCondition").is_none());
         assert!(bps[2].get("logMessage").is_none());
     }
 

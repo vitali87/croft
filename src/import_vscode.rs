@@ -280,6 +280,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.debug.pause", "pause_debugging"),
     ("workbench.action.debug.stepOver", "step_over"),
     ("editor.debug.action.toggleBreakpoint", "toggle_breakpoint"),
+    ("editor.debug.action.runToCursor", "run_to_cursor"),
+    (
+        "workbench.debug.viewlet.action.addFunctionBreakpointAction",
+        "add_function_breakpoint",
+    ),
     ("undo", "undo"),
     ("redo", "redo"),
     ("references-view.showCallHierarchy", "show_incoming_calls"),

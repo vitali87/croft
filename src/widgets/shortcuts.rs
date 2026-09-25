@@ -837,8 +837,28 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Ctrl+Shift+F9",
+                description: "Add or edit a hit count: the breakpoint pauses only on that hit (5, >= 5)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+F9",
+                description: "Add or remove a function breakpoint by name",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Alt+F9",
+                description: "Break when a variable of the paused frame changes (or stop doing so)",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "F10",
                 description: "Step over",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+F10",
+                description: "Run to Cursor: resume until the cursor's line",
                 handler: "",
             },
             ShortcutEntry {

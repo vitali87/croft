@@ -54,6 +54,12 @@ pub enum InputPurpose {
     /// Add a debugger watch expression (#112): submitting appends it to the
     /// App's watch list and re-evaluates at the current stop.
     AddWatch,
+    /// Add a function breakpoint (#611): submitting an existing name removes
+    /// it instead.
+    FunctionBreakpoint,
+    /// Break on Value Change (#611): the typed name is looked up among the
+    /// paused frame's variables.
+    DataBreakpoint,
     /// First-run consent for an extension-contributed viewer (#485 review):
     /// the same gate a sidecar passes, since both spawn a program from a
     /// manifest. Carries the viewer's key and the file, so allowing resumes
