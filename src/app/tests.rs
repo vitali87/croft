@@ -50161,3 +50161,116 @@ fn a_new_profile_prompt_refuses_an_unsafe_name_in_place() {
         p.error
     );
 }
+
+// ---- Inline AI suggestions (#607) ----
+
+/// A one-shot fake `/v1/messages`: answers the first request with `text`
+/// and hands back the raw request it read.
+fn fake_messages_endpoint(text: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        // Headers, then as much body as Content-Length says.
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let s = String::from_utf8_lossy(&buf).to_string();
+            if let Some(h) = s.find("\r\n\r\n") {
+                let len = s[..h]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= h + 4 + len {
+                    break;
+                }
+            }
+        }
+        let body = serde_json::json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}).to_string();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+    });
+    (url, rx)
+}
+
+#[test]
+fn an_inline_suggestion_appears_after_a_pause_and_tab_takes_it() {
+    let (url, requests) = fake_messages_endpoint("1 + 1;");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "let x = \n");
+    app.inline_config = Some(crate::inline_complete::Config {
+        backend: crate::inline_complete::Backend::Claude {
+            base_url: url,
+            api_key: String::from("test-key"),
+        },
+        model: String::from("claude-opus-5"),
+    });
+    app.inline_worker = Some(crate::inline_complete::Worker::spawn());
+    app.inline_enabled = true;
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 8;
+    app.editor.last_edit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.editor.live_ghost().is_none() && std::time::Instant::now() < deadline {
+        app.tick_inline_complete();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(app.editor.live_ghost(), Some("1 + 1;"));
+    let req = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(req.contains("x-api-key: test-key"), "{req}");
+    assert!(req.contains("anthropic-version: 2023-06-01"));
+    assert!(
+        req.contains("let x = <CURSOR>"),
+        "the caret is marked: {req}"
+    );
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines[0], "let x = 1 + 1;");
+    assert!(app.editor.live_ghost().is_none());
+}
+
+#[test]
+fn an_edit_makes_a_suggestion_stale_and_esc_dismisses_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "let x = \n");
+    app.editor.cursor_col = 8;
+    let seq = app.editor.edit_seq;
+    app.editor.ghost = Some((0, 8, seq, String::from("1;")));
+    assert!(app.editor.live_ghost().is_some());
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert!(app.editor.ghost.is_none(), "Esc dismisses");
+    app.editor.ghost = Some((0, 8, seq, String::from("1;")));
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('2'),
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert!(app.editor.live_ghost().is_none(), "typing makes it stale");
+}

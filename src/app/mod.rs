@@ -3377,6 +3377,15 @@ pub struct App {
     term_suggestion: Option<(usize, String)>,
     /// The command whose new shortcut the next keystroke records (#612).
     recording_shortcut: Option<crate::widgets::command_palette::Command>,
+    /// Inline AI suggestions (#607): off until the user turns them on, since
+    /// they send code to a model. The worker, the backend it was started
+    /// for, the request in flight (id plus what it answers for), and the
+    /// last request's key so a still caret asks once.
+    inline_enabled: bool,
+    inline_worker: Option<crate::inline_complete::Worker>,
+    inline_config: Option<crate::inline_complete::Config>,
+    inline_job: Option<(u64, PathBuf, u64, usize, usize)>,
+    inline_next_id: u64,
     /// Where recorded shortcuts are written: the user's keybindings.json,
     /// or under test a scratch file, so a test run never edits the real one.
     keybindings_file: PathBuf,
@@ -4993,6 +5002,11 @@ impl App {
             term_suggest_enabled: true,
             term_suggestion: None,
             recording_shortcut: None,
+            inline_enabled: false,
+            inline_worker: None,
+            inline_config: None,
+            inline_job: None,
+            inline_next_id: 0,
             keybindings_file: if cfg!(test) {
                 std::env::temp_dir().join(format!(
                     "croft-test-keybindings-{}-{}.json",
@@ -18626,6 +18640,11 @@ impl App {
                 self.rerun_search_editor();
                 true
             }
+            // Cmd+K Shift+G: inline AI suggestions on / off (#607).
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'g') => {
+                self.toggle_inline_suggestions();
+                true
+            }
             // Cmd+K Shift+E: run the caret line's code lens (#608). Must
             // precede the plain E (reveal in Explorer) arm below.
             KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'e') => {
@@ -29145,6 +29164,10 @@ impl App {
         if self.rebase_todo_key(key) {
             return;
         }
+        // Inline suggestion (#607): Tab accepts, Esc dismisses.
+        if self.inline_suggestion_key(key) {
+            return;
+        }
         // Search Editor (#615): Enter or F12 on a result row opens the match;
         // anywhere else both keep their usual meaning.
         if (key.code == KeyCode::Enter && key.modifiers.is_empty() || is_go_to_definition_key(key))
@@ -36583,6 +36606,7 @@ impl App {
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
             Cmd::SwitchProfile => self.open_profiles(),
+            Cmd::ToggleInlineSuggestions => self.toggle_inline_suggestions(),
             Cmd::RerunSearchEditor => self.rerun_search_editor(),
             Cmd::DebugAddHitCountBreakpoint => self.debug_edit_hit_condition(),
             Cmd::DebugAddFunctionBreakpoint => self.debug_add_function_breakpoint(),
@@ -42327,6 +42351,144 @@ impl App {
             ),
             None => format!("{chord} now runs \u{201c}{}\u{201d}", cmd.title()),
         };
+    }
+
+    /// Editor: Toggle Inline Suggestions (#607, Cmd+K Shift+G). Turning it on
+    /// resolves the backend first and says plainly when there is none.
+    fn toggle_inline_suggestions(&mut self) {
+        if self.inline_enabled {
+            self.inline_enabled = false;
+            self.editor.ghost = None;
+            self.inline_job = None;
+            self.status = String::from("Inline suggestions: off");
+            return;
+        }
+        let local =
+            crate::session::read_pair_record(&crate::session::pair_record_path(&self.tree.root))
+                .filter(|r| r.provider.as_deref() == Some("ollama"))
+                .map(|r| {
+                    (
+                        r.base_url
+                            .unwrap_or_else(|| String::from("http://localhost:11434")),
+                        r.model,
+                    )
+                });
+        match crate::inline_complete::resolve(local, |k| std::env::var(k).ok()) {
+            Ok(config) => {
+                self.status = format!(
+                    "Inline suggestions: on ({}); Tab accepts, Esc dismisses",
+                    config.model
+                );
+                self.inline_config = Some(config);
+                self.inline_worker
+                    .get_or_insert_with(crate::inline_complete::Worker::spawn);
+                self.inline_enabled = true;
+            }
+            Err(why) => self.status = format!("Inline suggestions need a model: {why}"),
+        }
+    }
+
+    /// Ask for a suggestion once typing has paused with the caret at the end
+    /// of a non-blank line, and land answers that still apply (#607).
+    pub fn tick_inline_complete(&mut self) -> bool {
+        if !self.inline_enabled {
+            return false;
+        }
+        let mut changed = false;
+        if let Some(worker) = &self.inline_worker {
+            while let Some(done) = worker.try_recv() {
+                let Some((id, path, seq, row, col)) = self.inline_job.clone() else {
+                    continue;
+                };
+                if done.id != id {
+                    continue;
+                }
+                self.inline_job = None;
+                let still = self.editor.path.as_ref() == Some(&path)
+                    && self.editor.edit_seq == seq
+                    && self.editor.cursor_row == row
+                    && self.editor.cursor_col == col;
+                match done.result {
+                    Ok(Some(text)) if still => {
+                        self.editor.ghost = Some((row, col, seq, text));
+                        changed = true;
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.status = format!("Inline suggestion: {e}"),
+                }
+            }
+        }
+        let ed = &*self.editor;
+        let Some(path) = ed.path.clone() else {
+            return changed;
+        };
+        let row = ed.cursor_row;
+        let col = ed.cursor_col;
+        let seq = ed.edit_seq;
+        let at_line_end = ed
+            .lines
+            .get(row)
+            .is_some_and(|l| !l.trim().is_empty() && l.chars().skip(col).all(char::is_whitespace));
+        let settled = ed
+            .last_edit_at
+            .is_some_and(|t| t.elapsed() >= crate::inline_complete::DEBOUNCE);
+        let already = ed
+            .ghost
+            .as_ref()
+            .is_some_and(|g| (g.0, g.1, g.2) == (row, col, seq))
+            || self
+                .inline_job
+                .as_ref()
+                .is_some_and(|j| j.1 == path && (j.2, j.3, j.4) == (seq, row, col));
+        if self.focus != Pane::Editor
+            || !at_line_end
+            || !settled
+            || already
+            || ed.selection.is_some()
+            || ed.has_non_text_view()
+            || self.completion_popup.is_some()
+        {
+            return changed;
+        }
+        let (Some(worker), Some(config)) = (&self.inline_worker, &self.inline_config) else {
+            return changed;
+        };
+        let id = self.inline_next_id;
+        self.inline_next_id += 1;
+        worker.submit(crate::inline_complete::Job {
+            id,
+            config: config.clone(),
+            prompt: crate::inline_complete::prompt(&ed.lines, row, col),
+        });
+        self.inline_job = Some((id, path, seq, row, col));
+        changed
+    }
+
+    /// Tab takes a live suggestion (#607), recorded as the navigator's
+    /// writing; Esc drops it. Returns whether the key was used.
+    fn inline_suggestion_key(&mut self, key: KeyEvent) -> bool {
+        if !key.modifiers.is_empty()
+            || self.completion_popup.is_some()
+            || self.editor.snippet_active()
+        {
+            return false;
+        }
+        let Some(text) = self.editor.live_ghost().map(str::to_string) else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Tab => {
+                self.editor.ghost = None;
+                self.editor
+                    .insert_str_as(&text, crate::provenance::Seat::Navigator);
+                true
+            }
+            KeyCode::Esc => {
+                self.editor.ghost = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Paint the history suggestion after the focused terminal's typed line
@@ -51974,7 +52136,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let auto_save_changed = app.tick_auto_save();
         let live_run_changed = app.tick_live_run() | app.sync_markdown_scroll();
         app.tick_code_lens();
-        let code_lens_changed = app.drain_lsp_code_lens() | app.drain_search_editor();
+        let code_lens_changed =
+            app.drain_lsp_code_lens() | app.drain_search_editor() | app.tick_inline_complete();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();

@@ -2520,6 +2520,10 @@ pub struct Editor {
     /// Clickable lens spans painted this frame: `(screen y, x range, index
     /// into code_lenses)`. Cleared at render start, like the merge spans.
     pub code_lens_spans: Vec<(u16, std::ops::Range<u16>, usize)>,
+    /// An inline AI suggestion (#607): `(row, col, edit_seq, text)`, painted
+    /// as ghost text at the caret while the caret, the buffer and the row
+    /// are all still where the suggestion was asked for.
+    pub ghost: Option<(usize, usize, u64, String)>,
     /// Per-source-line git blame for the current file, index 0 = line 1. Set
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
@@ -3007,6 +3011,7 @@ impl Editor {
             merge_action_spans: Vec::new(),
             code_lenses: Vec::new(),
             code_lens_spans: Vec::new(),
+            ghost: None,
             conflicts_seq: u64::MAX,
             blame_lines: None,
             blame_for: None,
@@ -4645,6 +4650,7 @@ impl Editor {
             // Live Run answered for the old file's text, same as above.
             self.live_run = None;
             self.code_lenses.clear();
+            self.ghost = None;
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -7959,6 +7965,14 @@ impl Editor {
                 self.inline_values.insert(li, parts.join(", "));
             }
         }
+    }
+
+    /// The inline suggestion (#607) when it still applies: the caret where it
+    /// was asked for and no edit since.
+    pub fn live_ghost(&self) -> Option<&str> {
+        let (row, col, seq, text) = self.ghost.as_ref()?;
+        (*row == self.cursor_row && *col == self.cursor_col && *seq == self.edit_seq)
+            .then_some(text.as_str())
     }
 
     /// Indices of the code lenses on 0-based `line` whose line still reads
@@ -13151,6 +13165,7 @@ impl Widget for &mut Editor {
                 && !self.inline_values.contains_key(&line_idx)
                 && self.live_note(line_idx).is_none()
                 && self.lenses_on_line(line_idx).is_empty()
+                && self.live_ghost().is_none()
                 && let Some(note) = self.current_line_blame_annotation()
             {
                 let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
@@ -13194,10 +13209,47 @@ impl Widget for &mut Editor {
                 }
             }
 
+            // Inline suggestion (#607): the first line as ghost text right at
+            // the caret (suggestions are only asked for at a line's end), with
+            // a count of the lines that come with it. It owns the line's tail,
+            // so the trailers below stand aside.
+            let ghost_here = self.focused
+                && line_idx == self.cursor_row
+                && row_end >= line_len
+                && self.live_ghost().is_some();
+            if ghost_here && let Some(text) = self.live_ghost() {
+                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let x = text_x + text_cols as u16;
+                let right = inner.x + inner.width;
+                if x < right {
+                    let mut lines = text.split('\n');
+                    let first = lines.next().unwrap_or("");
+                    let more = lines.count();
+                    let shown = if more > 0 {
+                        format!(
+                            "{first}  (+{more} line{})",
+                            if more == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        first.to_string()
+                    };
+                    let clipped: String = shown.chars().take((right - x) as usize).collect();
+                    buf.set_string(
+                        x,
+                        y,
+                        &clipped,
+                        Style::default()
+                            .fg(self.theme.ignored_fg())
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
+            }
+
             // Code lenses (#608): the server's "3 references | Run" at the end
             // of the symbol's line, clickable, yielding to the debugger's and
             // Live Run's trailers, which describe this very run.
             if row_end >= line_len
+                && !ghost_here
                 && !self.inline_values.contains_key(&line_idx)
                 && self.live_note(line_idx).is_none()
             {
@@ -13236,6 +13288,7 @@ impl Widget for &mut Editor {
             // where the debugger's values go and yielding to them, since a
             // paused session is the more specific answer.
             if row_end >= line_len
+                && !ghost_here
                 && !self.inline_values.contains_key(&line_idx)
                 && let Some(note) = self.live_note(line_idx)
             {
