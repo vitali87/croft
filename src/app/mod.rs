@@ -23507,11 +23507,11 @@ impl App {
         // under it) is told here, in croft's own status line, never over
         // its screen (#626, #652). Only when that set changes: a client
         // resizing churns the roster, and must not re-raise the notice.
-        let own = env!("CARGO_PKG_VERSION");
-        let stale = crate::session_host::stale_client_notice(&roster, own).filter(|n| {
-            crate::session_host::stale_client_notice(&self.session_participants, own).as_ref()
-                != Some(n)
-        });
+        let stale = crate::session_host::stale_client_notice_on_change(
+            &self.session_participants,
+            &roster,
+            env!("CARGO_PKG_VERSION"),
+        );
         self.session_participants = roster;
         // before == 0 is the initial self-only read; not worth announcing.
         if after > before && before > 0 {

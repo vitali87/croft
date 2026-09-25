@@ -141,13 +141,15 @@ pub struct Participant {
 /// does a newer one: the first-attach banner already covered it, and
 /// reattaching would not help.
 pub fn stale_client_notice(roster: &[Participant], own: &str) -> Option<String> {
-    let mut older: Vec<&str> = roster
+    let mut older: Vec<(Vec<u64>, &str)> = roster
         .iter()
         .map(|p| p.version.as_str())
         .filter(|v| version_is_older(v, own))
+        .filter_map(|v| Some((parse_version(v)?, v)))
         .collect();
     older.sort_unstable();
     older.dedup();
+    let older: Vec<&str> = older.into_iter().map(|(_, v)| v).collect();
     (!older.is_empty()).then(|| {
         format!(
             "Session updated to croft {own}; a client still runs {}. Detach and reattach it to update",
@@ -156,11 +158,29 @@ pub fn stale_client_notice(roster: &[Participant], own: &str) -> Option<String> 
     })
 }
 
+/// The stale-client notice to raise when the roster goes from `prev` to
+/// `next`: `None` unless the notice itself changed. A client resizing
+/// churns the roster every few hundred milliseconds, and must not re-stamp
+/// the status line over whatever the user is reading.
+pub fn stale_client_notice_on_change(
+    prev: &[Participant],
+    next: &[Participant],
+    own: &str,
+) -> Option<String> {
+    let notice = stale_client_notice(next, own)?;
+    (stale_client_notice(prev, own).as_ref() != Some(&notice)).then_some(notice)
+}
+
+/// A dotted version as numeric components, or `None` when any component
+/// is not a number (empty, or a pre-release suffix).
+fn parse_version(v: &str) -> Option<Vec<u64>> {
+    v.split('.').map(|c| c.parse().ok()).collect()
+}
+
 /// True when dotted version `v` sorts strictly below `own`, compared
 /// numerically per component. An empty or unparsable `v` is never older.
 fn version_is_older(v: &str, own: &str) -> bool {
-    let parse = |s: &str| -> Option<Vec<u64>> { s.split('.').map(|c| c.parse().ok()).collect() };
-    match (parse(v), parse(own)) {
+    match (parse_version(v), parse_version(own)) {
         (Some(v), Some(own)) => v < own,
         _ => false,
     }
@@ -4323,10 +4343,43 @@ mod tests {
         // Numeric, not lexical: 0.1.99 < 0.1.959 and 0.1.1000 > 0.1.959.
         assert!(stale_client_notice(&[p("0.1.99")], "0.1.959").is_some());
         assert_eq!(stale_client_notice(&[p("0.1.1000")], "0.1.959"), None);
+        // Listed oldest first, by number rather than by string.
+        let n =
+            stale_client_notice(&[p("0.1.900"), p("0.1.1000"), p("0.1.99")], "0.1.1001").unwrap();
+        assert!(n.contains("still runs 0.1.99, 0.1.900, 0.1.1000."), "{n}");
         // A roster written by an older host carries no version field.
         let old: Vec<Participant> =
             serde_json::from_str(r#"[{"id":1,"name":"x","cols":80,"rows":24,"control":true}]"#)
                 .unwrap();
         assert_eq!(old[0].version, "");
+    }
+
+    #[test]
+    fn the_stale_notice_is_raised_once_not_on_every_roster_churn() {
+        let p = |id: u64, version: &str, cols: u16| Participant {
+            id,
+            name: String::from("x"),
+            cols,
+            rows: 24,
+            control: true,
+            version: version.into(),
+        };
+        let own = "0.1.959";
+        let old = [p(1, "0.1.900", 80)];
+        // First sight of an old client: raised.
+        assert!(stale_client_notice_on_change(&[], &old, own).is_some());
+        // The same client resizing: the notice is unchanged, not re-raised.
+        assert_eq!(
+            stale_client_notice_on_change(&old, &[p(1, "0.1.900", 120)], own),
+            None
+        );
+        // A second, different old version changes the notice: raised again.
+        let two = [p(1, "0.1.900", 80), p(2, "0.1.901", 80)];
+        assert!(stale_client_notice_on_change(&old, &two, own).is_some());
+        // The old client reattached on the current version: nothing to say.
+        assert_eq!(
+            stale_client_notice_on_change(&old, &[p(1, own, 80)], own),
+            None
+        );
     }
 }
