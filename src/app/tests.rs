@@ -49979,3 +49979,84 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+#[test]
+fn the_ui_language_comes_from_a_catalog_in_the_config_folder() {
+    // #621: a translated palette, and a template for translators.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cfg.path().join("locale")).unwrap();
+    std::fs::write(
+        cfg.path().join("locale/de.json"),
+        r#"{"command.quick_open": "Gehe zu Datei"}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = cfg.path().to_path_buf();
+    app.apply_locale("de");
+    let item = crate::widgets::command_palette::PaletteItem::Builtin(
+        crate::widgets::command_palette::Command::QuickOpen,
+    );
+    assert_eq!(item.title(), "Gehe zu Datei");
+    app.run_command(crate::widgets::command_palette::Command::ExportUiStrings);
+    let template = cfg.path().join("locale/template.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&template).unwrap()).unwrap();
+    assert_eq!(v["command.quick_open"], serde_json::json!("Go to File"));
+    assert_eq!(app.editor.path.as_deref(), Some(template.as_path()));
+    app.apply_locale("en");
+    assert_eq!(item.title(), "Go to File", "English has no catalog file");
+}
+
+#[test]
+fn screen_reader_mode_announces_the_line_under_the_caret_and_its_diagnostic() {
+    // #621: opt-in, saved, and silent while off.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "one\ntwo\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = cfg.path().to_path_buf();
+    app.editor.open(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.status = String::from("untouched");
+    assert!(!app.announce_focus(), "off by default");
+    assert_eq!(app.status, "untouched");
+    app.run_command(crate::widgets::command_palette::Command::ToggleScreenReaderMode);
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["screen_reader"], serde_json::json!(true));
+    assert!(app.announce_focus());
+    assert_eq!(app.status, "a.rs, line 1: one");
+    assert!(!app.announce_focus(), "nothing new");
+    app.editor.cursor_row = 1;
+    app.editor.apply_diagnostics(
+        tmp.path().join("a.rs"),
+        vec![crate::lsp::manager::Diagnostic {
+            start_line: 1,
+            start_char: 0,
+            end_line: 1,
+            end_char: 3,
+            severity: crate::lsp::manager::DiagnosticSeverity::Error,
+            message: String::from("bad two"),
+        }],
+    );
+    assert!(app.announce_focus());
+    assert_eq!(app.status, "Line 2: two. error: bad two");
+}
+
+#[test]
+fn screen_reader_mode_never_blinks_the_cursor_off() {
+    // #621: a screen reader follows the real cursor, so it stays drawn.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = tmp.path().to_path_buf();
+    app.cursor_blink.hide_for_test();
+    assert!(
+        !app.cursor_visible_phase(),
+        "staging: the hidden half of the blink"
+    );
+    app.run_command(crate::widgets::command_palette::Command::ToggleScreenReaderMode);
+    app.cursor_blink.hide_for_test();
+    assert!(app.cursor_visible_phase());
+}

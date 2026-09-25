@@ -3296,6 +3296,10 @@ pub struct App {
     /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
     /// once the worker sends a CompletionResult back.
     pub completion_popup: Option<crate::widgets::completion_popup::CompletionPopup>,
+    /// Screen reader mode (#621).
+    screen_reader: bool,
+    /// What the screen reader was last told about.
+    a11y_focus: Option<crate::a11y::Focus>,
     /// Most recent completion request id; later responses with a stale
     /// id are dropped so a slow earlier response cannot clobber a fresh
     /// one (e.g. user already moved past the original trigger).
@@ -4874,6 +4878,8 @@ impl App {
             markdown_lint_last_seen: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
+            screen_reader: loaded_prefs.screen_reader,
+            a11y_focus: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
             vim: crate::vim::VimState::new(),
@@ -5097,6 +5103,11 @@ impl App {
             occ_observed_at: std::time::Instant::now(),
             nav: NavHistory::default(),
         };
+        // #621: the UI language, before anything is drawn. Never under test:
+        // the real config folder's catalogs must not steer app tests.
+        if !cfg!(test) {
+            app.apply_locale(&loaded_prefs.locale);
+        }
         // Initialise the per-pane focus/gradient flags to match the starting
         // pane (Tree) and persisted theme. Without this, the explorer boots
         // focused-but-not-gradient: the Black-theme gradient border only
@@ -6247,7 +6258,9 @@ impl App {
     /// support, which iTerm2 / Terminal.app may have disabled in user
     /// preferences.
     fn cursor_visible_phase(&self) -> bool {
-        self.cursor_blink.visible_phase()
+        // A screen reader follows the real cursor: it must never blink off
+        // (#621).
+        self.screen_reader || self.cursor_blink.visible_phase()
     }
 
     /// Re-query git status, but no more than once every ~400ms to avoid
@@ -36328,6 +36341,8 @@ impl App {
                 .open_config_file_in_editor(crate::prefs::config_path(), ConfigFileSeed::Settings),
             Cmd::OpenWorkspaceSettingsJson => self.open_workspace_settings(false),
             Cmd::OpenWorkspaceSettingsLocalJson => self.open_workspace_settings(true),
+            Cmd::ExportUiStrings => self.export_ui_strings(),
+            Cmd::ToggleScreenReaderMode => self.toggle_screen_reader(),
             Cmd::OpenKeybindingsJson => self.open_config_file_in_editor(
                 crate::keymap::keybindings_path(),
                 ConfigFileSeed::Keybindings,
@@ -42223,6 +42238,105 @@ impl App {
         };
     }
 
+    /// Flip screen reader mode and save it (#621).
+    fn toggle_screen_reader(&mut self) {
+        self.screen_reader = !self.screen_reader;
+        self.a11y_focus = None;
+        if let Err(e) = crate::prefs::save_screen_reader_in(&self.config_dir, self.screen_reader) {
+            crate::output::push(
+                "Settings",
+                crate::output::OutputLevel::Warn,
+                &format!("screen reader mode not saved: {e}"),
+            );
+        }
+        self.status = String::from(if self.screen_reader {
+            "Screen reader mode on"
+        } else {
+            "Screen reader mode off"
+        });
+    }
+
+    /// Put what changed under the reader into the status line (#621);
+    /// `true` when it announced something.
+    pub fn announce_focus(&mut self) -> bool {
+        use crate::lsp::manager::DiagnosticSeverity as S;
+        if !self.screen_reader || self.focus != Pane::Editor {
+            return false;
+        }
+        let row = self.editor.cursor_row;
+        let rank = |s: &S| match s {
+            S::Error => 0,
+            S::Warning => 1,
+            S::Information => 2,
+            S::Hint => 3,
+        };
+        let diagnostic = self
+            .editor
+            .diagnostics_in_line_range(row as u32, row as u32)
+            .into_iter()
+            .min_by_key(|d| rank(&d.severity))
+            .map(|d| {
+                let kind = match d.severity {
+                    S::Error => "error",
+                    S::Warning => "warning",
+                    S::Information => "info",
+                    S::Hint => "hint",
+                };
+                format!("{kind}: {}", d.message)
+            });
+        let now = crate::a11y::Focus {
+            file: self
+                .editor
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| String::from("untitled")),
+            line: row + 1,
+            text: self.editor.lines.get(row).cloned().unwrap_or_default(),
+            diagnostic,
+        };
+        let said = crate::a11y::announce(self.a11y_focus.as_ref(), &now);
+        self.a11y_focus = Some(now);
+        match said {
+            Some(s) => {
+                self.status = s;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Load the UI language's string catalog (#621): the `locale` setting,
+    /// else `LANG`.
+    pub fn apply_locale(&mut self, pref: &str) {
+        let lang = crate::i18n::language(pref, std::env::var("LANG").ok().as_deref());
+        crate::i18n::set(crate::i18n::load(&self.config_dir, &lang));
+    }
+
+    /// Write every translatable UI string, in English, to
+    /// `locale/template.json` and open it (#621).
+    fn export_ui_strings(&mut self) {
+        let path = self.config_dir.join("locale").join("template.json");
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, crate::i18n::template()));
+        if let Err(e) = written {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        match self.editor.open(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = String::from(
+                    "Translate the values, save as locale/<language>.json, and set \"locale\"",
+                );
+            }
+            Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
+    }
+
     /// Apply a merged settings view to the live session. Mirrors what the
     /// individual toggles do, minus their persistence (the values already
     /// live in config files) and minus their status chatter.
@@ -42239,6 +42353,7 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        self.apply_locale(&p.locale);
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
@@ -50666,6 +50781,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
+        let announced = app.announce_focus();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
@@ -50794,6 +50910,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || blink_changed
             || spinner_changed
             || ext_index_changed
+            || announced
             || search_changed
             || log_index_changed
             || remote_changed

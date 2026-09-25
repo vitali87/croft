@@ -15,6 +15,12 @@ impl CursorBlink {
         self.anchor = Instant::now();
     }
 
+    /// Test-only: move into the hidden half of the blink.
+    #[cfg(test)]
+    pub fn hide_for_test(&mut self) {
+        self.anchor = Instant::now() - Duration::from_millis(600);
+    }
+
     pub fn visible_phase(&self) -> bool {
         const HALF: Duration = Duration::from_millis(530);
         let elapsed = self.anchor.elapsed();
