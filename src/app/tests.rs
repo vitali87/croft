@@ -49559,3 +49559,128 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+/// Coverage (#263) through the App, from a report arriving the way the
+/// worker's drain delivers it: the active file's lines are marked in the
+/// gutter lane, the status readout carries its percentage, an edit dims
+/// the marks, a missing tool offers its install, and Clear hands the lane
+/// back.
+#[test]
+fn a_coverage_report_marks_the_gutter_and_dims_after_an_edit() {
+    use crate::testing::coverage::{Coverage, LineCov};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("f.rs");
+    std::fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.testing.on_coverage(Ok(Coverage::from_lcov(
+        "SF:f.rs\nDA:1,3\nDA:2,0\nend_of_record\n",
+        &root,
+    )));
+    assert!(app.sync_coverage());
+    let lens = app
+        .editor
+        .coverage
+        .clone()
+        .expect("the open file is covered");
+    assert_eq!(lens.lines.get(&0), Some(&LineCov::Covered));
+    assert_eq!(lens.lines.get(&1), Some(&LineCov::Uncovered));
+    assert!(!lens.stale);
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let bar_x = app.editor.last_inner.x + app.editor.last_gutter_width;
+    let y = app.editor.last_inner.y;
+    let buf = term.backend().buffer();
+    assert_eq!(buf[(bar_x, y)].symbol(), "\u{258c}");
+    assert_ne!(
+        buf[(bar_x, y)].fg,
+        buf[(bar_x, y + 1)].fg,
+        "covered and uncovered differ"
+    );
+    let status_row: String = (0..120).map(|x| buf[(x, 29)].symbol()).collect();
+    assert!(status_row.contains("50% covered"), "{status_row}");
+
+    app.editor.insert_char('x');
+    app.sync_coverage();
+    assert!(
+        app.editor.coverage.as_ref().unwrap().stale,
+        "an edit dims the marks"
+    );
+
+    app.testing
+        .on_coverage(Err(crate::testing::worker::CoverageError::Missing {
+            tool: "cargo-llvm-cov",
+            install: String::from("cargo install cargo-llvm-cov"),
+        }));
+    app.sync_coverage();
+    assert!(app.status.contains("cargo-llvm-cov"), "{}", app.status);
+    assert_eq!(
+        app.coverage_install.as_deref(),
+        Some("cargo install cargo-llvm-cov")
+    );
+
+    app.run_command(crate::widgets::command_palette::Command::CoverageClear);
+    assert!(app.editor.coverage.is_none() && app.testing.coverage.is_none());
+}
+
+/// Acceptance for #263 against real pytest-cov: "Run All Tests with
+/// Coverage" on a pytest project marks the tested file's lines, uncovered
+/// branch-free lines red, and reports a percentage. Set
+/// `CROFT_TEST_PYTEST_COV_PYTHON` to a venv python with pytest and
+/// pytest-cov; the test links that venv in as the project's `.venv`.
+#[test]
+#[ignore = "needs pytest and pytest-cov; set CROFT_TEST_PYTEST_COV_PYTHON"]
+fn a_real_pytest_cov_run_marks_the_covered_file() {
+    use crate::testing::coverage::LineCov;
+    let python = std::path::PathBuf::from(std::env::var("CROFT_TEST_PYTEST_COV_PYTHON").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::os::unix::fs::symlink(
+        python.parent().and_then(Path::parent).unwrap(),
+        root.join(".venv"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"t\"\nversion = \"0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("calc.py"),
+        "def add(a, b):\n    return a + b\n\n\ndef unused():\n    return 0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("test_calc.py"),
+        "from calc import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("calc.py")).unwrap();
+    app.run_all_tests_with_coverage();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while app.editor.coverage.is_none() {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        let _ = app.test_worker.drain(&mut app.testing);
+        app.sync_coverage();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let lens = app.editor.coverage.clone().unwrap();
+    assert_eq!(
+        lens.lines.get(&1),
+        Some(&LineCov::Covered),
+        "`return a + b` ran"
+    );
+    assert_eq!(
+        lens.lines.get(&5),
+        Some(&LineCov::Uncovered),
+        "`return 0` never ran"
+    );
+    assert!(
+        lens.percent.is_some_and(|p| p > 0.0 && p < 100.0),
+        "{:?}",
+        lens.percent
+    );
+}

@@ -67,6 +67,10 @@ pub struct TestingPanel {
     /// A run just ended red; consumed once by the app (#358), so a failing
     /// run notifies once, not once per test.
     failed_run: bool,
+    /// The last coverage run's report (#263).
+    pub coverage: Option<crate::testing::coverage::Coverage>,
+    coverage_error: Option<crate::testing::worker::CoverageError>,
+    coverage_fresh: bool,
     /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
     /// a long compile shows movement instead of a static "Discovering tests".
     progress: Option<String>,
@@ -101,6 +105,9 @@ impl TestingPanel {
             last_run_ok: None,
             run_reported_failed: false,
             failed_run: false,
+            coverage: None,
+            coverage_error: None,
+            coverage_fresh: false,
             progress: None,
             refused: false,
             prerun: Vec::new(),
@@ -268,6 +275,33 @@ impl TestingPanel {
     /// error or a runner that died, when the tally is meaningless.
     pub fn run_reported_failed(&self) -> bool {
         self.run_reported_failed
+    }
+
+    /// A coverage run's report arrived (#263): keep it for the explorer
+    /// percentages, the gutter and the status bar, or keep why there is
+    /// none for the app to offer the install.
+    pub fn on_coverage(
+        &mut self,
+        result: Result<crate::testing::coverage::Coverage, crate::testing::worker::CoverageError>,
+    ) {
+        match result {
+            Ok(coverage) => {
+                self.coverage = Some(coverage);
+                self.coverage_error = None;
+                self.coverage_fresh = true;
+            }
+            Err(e) => self.coverage_error = Some(e),
+        }
+    }
+
+    /// Consume the "a new coverage report arrived" latch.
+    pub fn take_coverage_fresh(&mut self) -> bool {
+        std::mem::take(&mut self.coverage_fresh)
+    }
+
+    /// Consume why the last coverage run produced nothing.
+    pub fn take_coverage_error(&mut self) -> Option<crate::testing::worker::CoverageError> {
+        self.coverage_error.take()
     }
 
     /// The worker refused a queued request because no enabled runner claims

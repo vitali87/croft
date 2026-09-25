@@ -3004,6 +3004,12 @@ pub struct App {
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
     view_listener: Option<std::os::unix::net::UnixListener>,
+    /// When the shown coverage report was taken, the file its editor lens
+    /// was built for, and the install command a missing coverage tool
+    /// needs (#263).
+    coverage_at: Option<std::time::SystemTime>,
+    coverage_lens_path: Option<PathBuf>,
+    coverage_install: Option<String>,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -4789,6 +4795,9 @@ impl App {
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
             view_listener,
+            coverage_at: None,
+            coverage_lens_path: None,
+            coverage_install: None,
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -16764,9 +16773,19 @@ impl App {
         // controls and commentary stop sharing a costume; the clickable ones
         // take a hover fill under the pointer (spans are built after `rx` is
         // known, below, so hover can be computed against this frame's rects).
+        // The active file's coverage rides the Ln/Col readout (#263): that
+        // segment is not a click target, so the clickable ones keep their
+        // indices.
+        let coverage = self
+            .editor
+            .coverage
+            .as_ref()
+            .and_then(|l| l.percent)
+            .map(|p| format!(" \u{b7} {p:.0}% covered"))
+            .unwrap_or_default();
         let mut seg_texts: Vec<String> = vec![
             format!(
-                " Ln {}, Col {} ",
+                " Ln {}, Col {}{coverage} ",
                 self.editor.cursor_row + 1,
                 self.editor.cursor_col + 1
             ),
@@ -19945,6 +19964,105 @@ impl App {
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
+        }
+    }
+
+    /// Run everything with the runner's coverage tool (#263). Results
+    /// stream into the tree as usual; the report lands in the editor's
+    /// gutter, the status bar and the Testing summary.
+    fn run_all_tests_with_coverage(&mut self) {
+        if self.testing.is_busy() || !self.testing_runner_available() {
+            return;
+        }
+        self.test_worker.run_coverage();
+        self.set_sidebar_view(SidebarView::Testing);
+        self.status = String::from("Running tests with coverage");
+    }
+
+    /// Fold a finished coverage run into the editor, and keep the active
+    /// file's lens current: rebuilt when the report or the file changes,
+    /// dimmed once the file is edited or rewritten after the run.
+    fn sync_coverage(&mut self) -> bool {
+        use crate::testing::worker::CoverageError;
+        let mut changed = false;
+        match self.testing.take_coverage_error() {
+            Some(CoverageError::Missing { tool, install }) => {
+                self.status = format!(
+                    "Coverage needs {tool}: run \"Testing: Install Coverage Tool\" ({install})"
+                );
+                self.coverage_install = Some(install);
+                changed = true;
+            }
+            Some(CoverageError::NoReport) => {
+                self.status = String::from("The coverage run wrote no report");
+                changed = true;
+            }
+            None => {}
+        }
+        let fresh = self.testing.take_coverage_fresh();
+        if fresh {
+            self.coverage_at = Some(std::time::SystemTime::now());
+            if let Some(pct) = self.testing.coverage.as_ref().and_then(|c| c.percent()) {
+                self.status = format!("Coverage: {pct:.0}% of lines");
+            }
+        }
+        let path = self.editor.path.clone();
+        if fresh || path != self.coverage_lens_path {
+            self.coverage_lens_path = path.clone();
+            let stale = path
+                .as_ref()
+                .is_some_and(|p| self.file_changed_since_coverage(p));
+            self.editor.coverage = match (self.testing.coverage.as_ref(), path.as_ref()) {
+                (Some(c), Some(p)) => c.lens(p, stale),
+                _ => None,
+            };
+            changed = true;
+        }
+        if self.editor.dirty
+            && let Some(lens) = self.editor.coverage.as_mut()
+            && !lens.stale
+        {
+            lens.stale = true;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The file on disk is newer than the coverage run.
+    fn file_changed_since_coverage(&self, path: &Path) -> bool {
+        let Some(at) = self.coverage_at else {
+            return false;
+        };
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|m| m > at)
+    }
+
+    /// Drop the coverage report and give the gutter lane back to git.
+    fn clear_coverage(&mut self) {
+        self.testing.coverage = None;
+        self.editor.coverage = None;
+        self.coverage_at = None;
+        self.status = String::from("Coverage cleared");
+    }
+
+    /// Install the runner's coverage tool in a terminal pane, where its
+    /// output and any prompt are visible.
+    fn install_coverage_tool(&mut self) {
+        let Some(command) = self.coverage_install.clone() else {
+            self.status = String::from("No coverage tool is missing");
+            return;
+        };
+        match crate::widgets::terminal::PtyTerminal::new(&self.active_test_root) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(String::from("coverage install")));
+                term.write_input(format!("{command}\r").as_bytes());
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                self.status = format!("Installing: {command}");
+            }
+            Err(e) => self.status = format!("Could not open a terminal: {e}"),
         }
     }
 
@@ -35709,6 +35827,9 @@ impl App {
                 }
                 None => self.status = String::from("No file in the active tab"),
             },
+            Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
+            Cmd::CoverageClear => self.clear_coverage(),
+            Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
             Cmd::ReopenAsText => match self.editor.path.clone() {
                 // Merge editor (#253): back to the in-buffer marker flow.
                 // The Result buffer is deliberately discarded — it was
@@ -50521,6 +50642,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         }
         // One notification per red run (#358), from the latch the panel
         // sets when a run ends, never per test case.
+        let coverage_changed = app.sync_coverage();
         if app.testing.take_failed_run() {
             let (passed, failed, _) = app.testing.counts();
             app.notifier.emit(
@@ -50561,6 +50683,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || mcp_changed
             || pair_changed
             || tests_changed
+            || coverage_changed
             || blink_changed
             || spinner_changed
             || ext_index_changed
