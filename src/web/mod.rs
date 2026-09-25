@@ -25,6 +25,10 @@ use anyhow::{Context, Result};
 
 use crate::session_host::{Control, Frame, FrameReader, encode_bytes_frame, encode_control_frame};
 
+/// The page and its emulator (#342), in the binary: one binary, no CDN.
+const INDEX_HTML: &str = include_str!("../../assets/web/index.html");
+const TERM_JS: &str = include_str!("../../assets/web/term.js");
+
 /// Where `croft web` listens unless `--bind` says otherwise.
 pub const DEFAULT_PORT: u16 = 7681;
 
@@ -49,7 +53,7 @@ pub fn run(workspace: &Path, bind: Option<SocketAddr>) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
     let local = listener.local_addr()?;
     println!(
-        "croft web: the session for {} at ws://{local}/?token={token}",
+        "croft web: the session for {} at http://{local}/?token={token}",
         root.display()
     );
     serve(listener, socket, token);
@@ -99,9 +103,9 @@ fn handle(
     let request = ws::read_request(&mut tcp)?;
     tcp.set_read_timeout(None)?;
     let Some(key) = request.websocket_key().map(str::to_string) else {
-        return tcp.write_all(
-            ws::refusal("426 Upgrade Required", "croft web speaks WebSocket\n").as_bytes(),
-        );
+        // The page itself is served to anyone who can reach the port: it
+        // holds no session data, and the socket it opens needs the token.
+        return tcp.write_all(&page(&request.target));
     };
     if request.query("token") != Some(token) {
         return tcp.write_all(ws::refusal("403 Forbidden", "wrong or missing token\n").as_bytes());
@@ -119,6 +123,21 @@ fn handle(
     };
     tcp.write_all(ws::upgrade_response(&key).as_bytes())?;
     bridge(tcp, unix)
+}
+
+/// A plain GET: the page, its emulator, or nothing.
+fn page(target: &str) -> Vec<u8> {
+    let path = target.split('?').next().unwrap_or("/");
+    let (kind, body) = match path {
+        "/" | "/index.html" => ("text/html; charset=utf-8", INDEX_HTML),
+        "/term.js" => ("text/javascript; charset=utf-8", TERM_JS),
+        _ => return ws::refusal("404 Not Found", "not found\n").into_bytes(),
+    };
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
 
 /// Relay between one WebSocket and one session-host connection until either
@@ -427,5 +446,55 @@ mod tests {
                 "the browser stayed on the roster: {term_roster}"
             );
         }
+    }
+
+    #[test]
+    fn the_page_and_its_emulator_are_served_and_fit_the_budget() {
+        let index = String::from_utf8(page("/?token=abc")).unwrap();
+        assert!(index.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/html"));
+        assert!(index.contains("from \"./term.js\""));
+        let js = String::from_utf8(page("/term.js")).unwrap();
+        assert!(js.contains("Content-Type: text/javascript") && js.contains("export class Term"));
+        assert!(
+            String::from_utf8(page("/secrets"))
+                .unwrap()
+                .starts_with("HTTP/1.1 404")
+        );
+        // No external requests: nothing is fetched from another origin.
+        for text in [INDEX_HTML, TERM_JS] {
+            assert!(
+                !text.contains("https://") && !text.contains("http://"),
+                "an external URL"
+            );
+        }
+        assert!(
+            INDEX_HTML.len() + TERM_JS.len() < 300 * 1024,
+            "the page weighs over 300 KB"
+        );
+    }
+
+    /// The emulator's own tests (`assets/web/term.test.mjs`), run under node
+    /// when it is installed.
+    #[test]
+    fn the_page_emulator_passes_its_tests() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/web");
+        let Ok(out) = std::process::Command::new("node")
+            .args(["--test", "term.test.mjs"])
+            .current_dir(&dir)
+            .output()
+        else {
+            eprintln!("SKIPPED: node is not installed");
+            return;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            text.contains("# fail 0") && !text.contains("# pass 0"),
+            "{text}"
+        );
     }
 }
