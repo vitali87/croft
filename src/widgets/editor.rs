@@ -4651,10 +4651,7 @@ impl Editor {
             self.inline_values.clear();
             // A symbol tab reused for another file is an ordinary tab of
             // that file: its clip and mirror state described the old one.
-            self.symbol_view = None;
-            self.mirror_seq = None;
-            self.mirrored_step = None;
-            self.mirror_caret = None;
+            self.leave_symbol_view();
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -10421,6 +10418,16 @@ impl Editor {
         } else {
             self.nonwrap_set_top(self.nonwrap_top_content_row().saturating_add(n));
         }
+    }
+
+    /// Turn a symbol tab into an ordinary tab of its whole file: the
+    /// buffer already holds the whole file, so only the clip and the
+    /// mirror state go.
+    pub fn leave_symbol_view(&mut self) {
+        self.symbol_view = None;
+        self.mirror_seq = None;
+        self.mirrored_step = None;
+        self.mirror_caret = None;
     }
 
     /// A symbol tab's visible lines as `(first, end)`, `end` exclusive,

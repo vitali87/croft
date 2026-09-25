@@ -26396,10 +26396,7 @@ impl App {
                     notes.push(format!("{old} is now {}", view.name));
                     false
                 }
-                crate::symbol_range::ViewUpdate::Gone => {
-                    notes.push(format!("Closed the {} tab: that symbol is gone", view.name));
-                    true
-                }
+                crate::symbol_range::ViewUpdate::Gone => true,
             }
         };
         let gone_here: Vec<usize> = (0..self.editor.editors.len())
@@ -26412,6 +26409,54 @@ impl App {
                     .filter(|&i| follow(&mut group.editors[i]))
                     .collect(),
             );
+        }
+        // A gone symbol tab holding unsaved text that no tab of the whole
+        // file also holds (its file tab was closed) becomes that file tab
+        // instead of closing, or its edits, in and out of the clip, would
+        // be lost with it.
+        let mut kept_paths: Vec<PathBuf> = Vec::new();
+        let mut keep = |ed: &mut crate::widgets::editor::Editor,
+                        whole_file_open: &dyn Fn(&Path) -> bool|
+         -> bool {
+            let name = ed
+                .symbol_view
+                .as_ref()
+                .map(|v| v.name.clone())
+                .unwrap_or_default();
+            let orphan = ed.dirty
+                && ed
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| !whole_file_open(p) && !kept_paths.iter().any(|k| k == p));
+            if orphan {
+                kept_paths.extend(ed.path.clone());
+                ed.leave_symbol_view();
+                notes.push(format!(
+                    "{name} is gone; its tab now shows the whole file with the unsaved edits"
+                ));
+            } else {
+                notes.push(format!("Closed the {name} tab: that symbol is gone"));
+            }
+            orphan
+        };
+        let whole_file_tabs: Vec<PathBuf> = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| e.symbol_view.is_none() && !e.has_non_text_view())
+            .filter_map(|e| e.path.clone())
+            .collect();
+        let whole_file_open = |p: &Path| whole_file_tabs.iter().any(|w| w == p);
+        let gone_here: Vec<usize> = gone_here
+            .into_iter()
+            .filter(|&i| !keep(&mut self.editor.editors[i], &whole_file_open))
+            .collect();
+        for (g, group) in self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .enumerate()
+        {
+            gone_inactive[g].retain(|&i| !keep(&mut group.editors[i], &whole_file_open));
         }
         for &i in gone_here.iter().rev() {
             self.editor.close_tab(i);
@@ -41685,7 +41730,9 @@ impl App {
         // second would read the first as an external change. Settle them
         // before the sweep (which may close a symbol tab, so before any tab
         // index is taken) and mark the rest clean after it. A file live in a
-        // collab session is not mirrored, so each of its tabs saves itself.
+        // collab session is not mirrored, so each of its tabs saves itself:
+        // on the owner the second write then meets the first one's stamp and
+        // reports a disk conflict, as two split panes of a live file do.
         let settled = self.sync_symbol_views();
         let mirrored: Vec<PathBuf> = self
             .symbol_view_paths()

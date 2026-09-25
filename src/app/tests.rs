@@ -43702,6 +43702,64 @@ fn session_capture_keeps_one_tab_for_orphaned_symbol_tabs_of_a_file() {
     assert_eq!(state.tabs[0].path, file);
 }
 
+/// #369: deleting a symbol tab's whole symbol closes the tab while a tab of
+/// the whole file still holds the text.
+#[test]
+fn a_symbol_tab_whose_symbol_is_gone_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    assert_eq!(app.editor.editors.len(), 2);
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert_eq!(app.editor.editors.len(), 1, "{}", app.status);
+    assert!(app.status.contains("that symbol is gone"), "{}", app.status);
+    assert!(app.editor.symbol_view.is_none());
+}
+
+/// #369: a symbol tab left as the only tab of its file keeps its unsaved
+/// edits when its symbol is deleted: it becomes a tab of the whole file
+/// instead of closing and taking them with it.
+#[test]
+fn an_orphaned_symbol_tab_with_unsaved_edits_survives_its_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    // An edit outside the symbol, made in the file tab and mirrored in.
+    app.editor.select(0);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('9'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    app.editor.close_tab(0);
+    assert!(
+        app.editor.symbol_view.is_some(),
+        "only the symbol tab is left"
+    );
+    assert!(app.editor.dirty);
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert_eq!(app.editor.editors.len(), 1, "the tab stays: {}", app.status);
+    assert!(
+        app.editor.symbol_view.is_none(),
+        "it shows the whole file now"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
+    assert_eq!(
+        app.editor.lines[1], "    19",
+        "the out-of-clip edit survives"
+    );
+    assert!(app.editor.dirty);
+    assert!(app.status.contains("whole file"), "{}", app.status);
+}
+
 /// #369: going to a file lands on the tab that shows ALL of it.
 ///
 /// A symbol tab has the file's path, and the tab lookups behind opening,
