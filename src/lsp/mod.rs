@@ -3,6 +3,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod client;
+pub mod code_lens;
 pub mod config;
 pub mod install;
 pub mod languages;
