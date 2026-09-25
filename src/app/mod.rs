@@ -2264,6 +2264,13 @@ pub enum BranchPurpose {
     Rebase,
 }
 
+/// A tour in progress (#377).
+pub struct TourRun {
+    pub tour: crate::tour::Tour,
+    pub scratch: PathBuf,
+    pub previous_root: PathBuf,
+}
+
 /// The live ssh-pane workspace offer (#364): which pane's foreground became
 /// `ssh <host>`, the resolved config alias, and when the offer appeared (it
 /// expires on its own if neither accepted nor dismissed).
@@ -3437,6 +3444,14 @@ pub struct App {
     /// showing the live buffer. `Some` at `Position::Working` is a real
     /// state: the scrubber is open and parked at the user's own edits.
     scrubber: Option<crate::scrubber::Scrubber>,
+    /// The running `croft demo` tour (#377), with its scratch project and
+    /// the workspace to return to.
+    pub tour: Option<TourRun>,
+    /// The tour was finished or skipped once (#377), so the welcome panel
+    /// no longer offers it.
+    pub tour_done: bool,
+    /// The welcome panel's Take the Tour button, from the last frame.
+    pub welcome_tour_button: Rect,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -5046,6 +5061,9 @@ impl App {
             recorded_size: (0, 0),
             symbol_tab: None,
             scrubber: None,
+            tour: None,
+            tour_done: loaded_prefs.tour_done,
+            welcome_tour_button: Rect::default(),
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
@@ -12542,6 +12560,33 @@ impl App {
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
+        self.render_welcome_panel(frame, outer_area);
+        // The first-launch tour (#377), until it has been taken or skipped.
+        if !self.tour_done && self.tour.is_none() && outer_area.height > 6 {
+            let label = " Take the Tour ";
+            let w = label.chars().count() as u16;
+            if outer_area.width > w + 4 {
+                let rect = Rect {
+                    x: outer_area.x + (outer_area.width - w) / 2,
+                    y: outer_area.y + outer_area.height - 3,
+                    width: w,
+                    height: 1,
+                };
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(label).style(
+                        Style::default()
+                            .fg(self.theme.accent_contrast_fg())
+                            .bg(self.theme.accent())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    rect,
+                );
+                self.welcome_tour_button = rect;
+            }
+        }
+    }
+
+    fn render_welcome_panel(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
         // In iTerm2 image mode we let the iTerm session bg (forced to
         // sRGB(EDITOR_BG_RGB) by `SetColors=bg=srgb:…` at startup) show
         // through the welcome cells via SGR 49 (default bg). The OSC-1337
@@ -15581,6 +15626,8 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
+        // Set again by the welcome panel when it paints the button.
+        self.welcome_tour_button = Rect::default();
         let size = frame.area();
         self.last_frame_area = size;
         // Redaction reveal is app state; each pane paints from its own copy.
@@ -16960,6 +17007,7 @@ impl App {
         }
         self.render_port_toast(frame);
         self.render_update_toast(frame);
+        self.render_tour_caption(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
         self.render_prompt(frame);
@@ -18942,6 +18990,21 @@ impl App {
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && self.handle_scrubber_key(key.code)
         {
+            return Ok(());
+        }
+        // The tour (#377): with no picker or palette open, Enter moves on and
+        // Esc leaves. Below the modal guards, so a picker a step opened keeps
+        // its own Enter and Esc.
+        if self.tour.is_some()
+            && key.kind == KeyEventKind::Press
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Enter | KeyCode::Esc)
+        {
+            if key.code == KeyCode::Enter {
+                self.advance_tour();
+            } else {
+                self.finish_tour();
+            }
             return Ok(());
         }
         if self.scm_menu.open && matches!(key.code, KeyCode::Esc) {
@@ -26276,6 +26339,163 @@ impl App {
             // adding it to ~/.ssh/config is the action available.
             Err(why) => self.status = why,
         }
+    }
+
+    /// Start the guided tour (#377) in a fresh scratch project, never the
+    /// user's workspace, and perform its first step.
+    pub fn start_demo(&mut self) {
+        let tour = match crate::tour::Tour::parse(crate::tour::TOUR_JSON) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("The tour could not start: {e}");
+                return;
+            }
+        };
+        let scratch = match crate::tour::create_scratch(&croft_cache_dir().join("demo")) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("The tour could not create its sample project: {e}");
+                return;
+            }
+        };
+        let previous_root = self.workspace_root().to_path_buf();
+        self.change_workspace_root(scratch.clone());
+        let first = tour.current().map(|s| s.action.clone());
+        self.tour = Some(TourRun {
+            tour,
+            scratch,
+            previous_root,
+        });
+        if let Some(action) = first {
+            self.perform_tour_action(action);
+        }
+    }
+
+    /// Perform the next tour step, or finish after the last one.
+    pub fn advance_tour(&mut self) {
+        let Some(run) = self.tour.as_mut() else {
+            return;
+        };
+        match run.tour.advance().map(|s| s.action.clone()) {
+            Some(action) => self.perform_tour_action(action),
+            None => self.finish_tour(),
+        }
+    }
+
+    /// Leave the tour: back to the workspace it started from, and the
+    /// scratch project deleted.
+    pub fn finish_tour(&mut self) {
+        let Some(run) = self.tour.take() else {
+            return;
+        };
+        // Finished or skipped, the welcome panel stops offering it.
+        self.tour_done = true;
+        let _ = crate::prefs::save_tour_done_in(&self.config_dir);
+        self.change_workspace_root(run.previous_root);
+        self.status = match crate::tour::remove_scratch(&run.scratch) {
+            Ok(()) => String::from("Tour finished"),
+            Err(e) => format!("Tour finished, but its sample project was not removed: {e}"),
+        };
+    }
+
+    fn perform_tour_action(&mut self, action: crate::tour::TourAction) {
+        use crate::tour::TourAction as A;
+        let Some(scratch) = self.tour.as_ref().map(|r| r.scratch.clone()) else {
+            return;
+        };
+        match action {
+            A::Open(rel) => {
+                if let Err(e) = self.open_at(&scratch.join(rel), 0, 0) {
+                    self.status = format!("Tour: {e}");
+                }
+            }
+            A::QuickOpen => self.open_file_finder(),
+            A::SplitEditor => self.split_editor(),
+            A::Terminal => {
+                if !self.show_terminal {
+                    self.toggle_terminal();
+                }
+                self.focus_pane(Pane::Terminal);
+            }
+            A::Run(cmd) => {
+                if !self.show_terminal {
+                    self.toggle_terminal();
+                }
+                if let Some(term) = self.terminals.get_mut(self.active_terminal) {
+                    term.write_input(format!("{cmd}\r").as_bytes());
+                }
+            }
+            A::JumpToError => {
+                let lines = self
+                    .terminals
+                    .get(self.active_terminal)
+                    .map(|t| t.visible_lines().0)
+                    .unwrap_or_default();
+                match crate::tour::first_error_ref(&lines) {
+                    Some((file, line)) => {
+                        let path = if std::path::Path::new(&file).is_absolute() {
+                            PathBuf::from(file)
+                        } else {
+                            scratch.join(file)
+                        };
+                        let _ = self.open_at(&path, line.saturating_sub(1), 0);
+                    }
+                    // The command may still be running: open where the
+                    // sample's mistake is, which is what it would find.
+                    None => {
+                        let _ = self.open_at(&scratch.join("app.py"), 3, 0);
+                    }
+                }
+            }
+            A::CommandPalette => self.open_command_palette(),
+            A::ThemePicker => self.open_theme_picker(),
+            A::Done => {}
+        }
+    }
+
+    /// The caption chip (#377): step, caption and keys, above the status bar.
+    fn render_tour_caption(&mut self, frame: &mut ratatui::Frame) {
+        let Some(run) = self.tour.as_ref() else {
+            return;
+        };
+        let Some(step) = run.tour.current() else {
+            return;
+        };
+        let area = frame.area();
+        if area.width < 20 || area.height < 4 {
+            return;
+        }
+        let text = format!(
+            " {}  {}   Enter next \u{b7} Esc leave ",
+            run.tour.progress(),
+            step.caption
+        );
+        let width = (text.chars().count() as u16 + 2).min(area.width - 2);
+        let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + area.height - status_h - 2,
+            width,
+            height: 1,
+        };
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(text).style(
+                Style::default()
+                    .fg(self.theme.accent_contrast_fg())
+                    .bg(self.theme.accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rect,
+        );
+    }
+
+    /// Close every picker and palette a tour step may have opened.
+    #[cfg(test)]
+    pub fn close_all_modals_for_test(&mut self) {
+        self.command_palette = None;
+        self.file_finder = None;
+        self.context_menu = None;
     }
 
     /// Open the history scrubber over the current branch (#371).
@@ -35648,6 +35868,7 @@ impl App {
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
+            Cmd::TakeTheTour => self.start_demo(),
             Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
             Cmd::NavigateBack => self.nav_back(),
@@ -39855,6 +40076,10 @@ impl App {
                 }
                 if rect_contains(self.sidebar_areas.extensions_icon, m.column, m.row) {
                     self.set_sidebar_view(SidebarView::Extensions);
+                    return;
+                }
+                if rect_contains(self.welcome_tour_button, m.column, m.row) {
+                    self.start_demo();
                     return;
                 }
                 if rect_contains(self.sidebar_areas.testing_icon, m.column, m.row) {
@@ -49985,6 +50210,10 @@ pub fn run(
     app.start_update_watch_if_remote();
     app.start_drift_probe_if_local();
     app.start_update_check_if_local();
+    // `croft demo` (#377): start the tour once the app is up.
+    if crate::tour::take_startup_demo() {
+        app.start_demo();
+    }
 
     enable_raw_mode().context("enable raw mode")?;
     // Sixel has no env var, so when neither iTerm2 nor Kitty was detected from

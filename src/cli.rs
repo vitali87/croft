@@ -93,6 +93,8 @@ pub enum HookAction {
 
 #[derive(Subcommand, Debug)]
 pub enum CliCommand {
+    /// Take the guided tour (#377) in a throwaway sample project.
+    Demo,
     /// Set macOS Terminal.app's default profile font to a Nerd Font.
     SetupTerminal {
         /// PostScript name of the font (read from the .ttf with `fontTools` or `fc-scan`)
@@ -498,6 +500,11 @@ impl Cli {
                 }
                 crate::collab::ensure_relay(&socket)?;
                 crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
+            }
+            Some(CliCommand::Demo) => {
+                crate::tour::request_startup_demo();
+                let cwd = std::env::current_dir()?;
+                crate::app::run(cwd, None, None, false, Vec::new())
             }
             Some(CliCommand::View { path, as_ext }) => {
                 // Printed and exited here rather than returned: an `Err` out
@@ -1596,6 +1603,12 @@ fn install_rust_target_if_missing(triple: &str) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn demo_is_a_subcommand() {
+        let cli = Cli::try_parse_from(["croft", "demo"]).unwrap();
+        assert!(matches!(cli.command, Some(CliCommand::Demo)));
+    }
 
     /// #282: `--version` is a plain `x.y.z`. The regression this guards is a
     /// well-meaning one — re-adding provenance "so bug reports carry it" is
