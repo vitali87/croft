@@ -3485,6 +3485,11 @@ pub struct App {
     rename_request_id: Option<u64>,
     /// An Explorer rename or move waiting on `willRenameFiles` (#610).
     pending_file_move: Option<PendingFileMove>,
+    /// Closed files that rename edits rewrote on disk in the last
+    /// [`MTIME_GRANULARITY`], with the text written and when: a move right
+    /// after one that rewrote the same file finds its fresh modified time
+    /// is croft's own write, not a change during the wait (#610).
+    rename_disk_writes: std::collections::HashMap<PathBuf, (String, std::time::SystemTime)>,
     /// In-flight prepareRename (#254): (id, path, row, col, edit_seq) —
     /// the deferred rename prompt's context.
     prepare_rename_request: Option<(u64, PathBuf, usize, usize, u64)>,
@@ -5145,6 +5150,7 @@ impl App {
             signature_help_anchor: None,
             rename_request_id: None,
             pending_file_move: None,
+            rename_disk_writes: std::collections::HashMap::new(),
             prepare_rename_request: None,
             format_request_id: None,
             format_request_selection: false,
@@ -11766,7 +11772,14 @@ impl App {
                 let content = std::fs::read_to_string(path)?;
                 let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
                 occ_count += crate::widgets::editor::apply_span_edits_to_lines(&mut lines, edits);
-                std::fs::write(path, lines.join("\n"))?;
+                let text = lines.join("\n");
+                std::fs::write(path, &text)?;
+                let now = std::time::SystemTime::now();
+                self.rename_disk_writes.retain(|_, (_, at)| {
+                    now.duration_since(*at)
+                        .is_ok_and(|age| age < MTIME_GRANULARITY)
+                });
+                self.rename_disk_writes.insert(path.clone(), (text, now));
                 // A hex or log view of it in the active group, which the edit
                 // skipped, must see this write as an external change, even
                 // after a move re-anchors it to the new path.
@@ -46004,10 +46017,16 @@ impl App {
         };
         let now = self.open_tab_edit_seqs();
         let (edits, stale): (Vec<_>, Vec<_>) = edits.into_iter().partition(|(path, _)| {
+            // Unwritten since well before the request, or last written by
+            // croft's own rename edit before it and holding that text still.
             let disk_unchanged = || {
                 std::fs::metadata(path)
                     .and_then(|m| m.modified())
                     .is_ok_and(|t| t + MTIME_GRANULARITY <= pending.requested_at)
+                    || self.rename_disk_writes.get(path).is_some_and(|(text, at)| {
+                        *at <= pending.requested_at
+                            && std::fs::read_to_string(path).is_ok_and(|t| t == *text)
+                    })
             };
             text_unchanged_since(&pending.tabs, &now, path, disk_unchanged)
         });
@@ -46016,7 +46035,7 @@ impl App {
         self.finish_file_move(pending.op, Some(&edits));
         if !stale_names.is_empty() {
             self.status.push_str(&format!(
-                "; not updated in {} (changed during the wait)",
+                "; not updated in {} (changed during the wait or just before it)",
                 stale_names.join(", ")
             ));
         }

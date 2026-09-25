@@ -50127,8 +50127,9 @@ fn a_file_edited_during_the_wait_does_not_take_the_held_edit() {
         if typed {
             assert_eq!(app.editor.lines[0], "xmod foo;");
             assert!(
-                app.status
-                    .ends_with("; not updated in lib.rs (changed during the wait)"),
+                app.status.ends_with(
+                    "; not updated in lib.rs (changed during the wait or just before it)"
+                ),
                 "{}",
                 app.status
             );
@@ -50198,6 +50199,14 @@ fn a_held_edit_fits_only_the_text_it_was_computed_for() {
         written(&[tab(1, false)], &[tab(1, false)]),
         "an open tab is judged by its own text"
     );
+    // The disk is read only when no tab speaks for the file.
+    let unread = |before: &[TabStamp], now: &[TabStamp]| {
+        text_unchanged_since(before, now, path, || unreachable!("the disk was read"))
+    };
+    assert!(unread(&[tab(1, false)], &[tab(1, false)]));
+    assert!(!unread(&[tab(1, false)], &[tab(2, false)]));
+    assert!(!unread(&[], &[tab(3, true)]));
+    assert!(!unread(&[tab(4, true)], &[]));
 }
 
 /// #610: a file opened, typed into and saved during the wait keeps its
@@ -50235,7 +50244,7 @@ fn a_file_saved_during_the_wait_keeps_its_text() {
     );
     assert!(
         app.status
-            .ends_with("; not updated in src/lib.rs (changed during the wait)"),
+            .ends_with("; not updated in src/lib.rs (changed during the wait or just before it)"),
         "{}",
         app.status
     );
@@ -50266,10 +50275,59 @@ fn a_file_written_elsewhere_during_the_wait_keeps_its_text() {
     assert!(dest.join("foo.rs").exists());
     assert!(
         app.status
-            .ends_with("; not updated in lib.rs (changed during the wait)"),
+            .ends_with("; not updated in lib.rs (changed during the wait or just before it)"),
         "{}",
         app.status
     );
+}
+
+/// #610: a move right after one whose edit rewrote a closed file still
+/// edits that file: its fresh modified time is croft's own write. A file
+/// another program rewrote after that write is still left alone.
+#[test]
+fn a_second_move_edits_a_file_the_first_move_rewrote() {
+    for foreign in [false, true] {
+        let (_tmp, lib, foo, mut app) = will_rename_fixture();
+        let root = foo.parent().unwrap().to_path_buf();
+        let dest = root.join("sub");
+        std::fs::create_dir(&dest).unwrap();
+        app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+        let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+        app.lsp
+            .as_ref()
+            .unwrap()
+            .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+        assert!(app.drain_will_rename_files());
+        assert!(
+            std::fs::read_to_string(&lib)
+                .unwrap()
+                .starts_with("mod bar;")
+        );
+        if foreign {
+            std::fs::write(&lib, "mod bar;\n// kept\n").unwrap();
+        }
+        let moved = dest.join("foo.rs");
+        app.apply_paste_or_drop(&root, std::slice::from_ref(&moved), ExplorerClipMode::Cut);
+        let mut back = mod_foo_to_bar(
+            app.pending_file_move.as_ref().expect("held").request_id,
+            &lib,
+        );
+        back.edits[0].1[0].new_text = String::from("baz");
+        app.lsp.as_ref().unwrap().answer_will_rename_files(back);
+        assert!(app.drain_will_rename_files());
+        let text = std::fs::read_to_string(&lib).unwrap();
+        if foreign {
+            assert_eq!(text, "mod bar;\n// kept\n");
+            assert!(
+                app.status.contains("not updated in lib.rs"),
+                "{}",
+                app.status
+            );
+        } else {
+            assert!(text.starts_with("mod baz;"), "{text}");
+            assert!(!app.status.contains("not updated"), "{}", app.status);
+        }
+    }
 }
 
 /// #610: every file that changed during the wait is named, in the order
@@ -50301,8 +50359,9 @@ fn every_file_changed_during_the_wait_is_named() {
     app.lsp.as_ref().unwrap().answer_will_rename_files(answer);
     assert!(app.drain_will_rename_files());
     assert!(
-        app.status
-            .ends_with("; not updated in lib.rs, src/lib.rs (changed during the wait)"),
+        app.status.ends_with(
+            "; not updated in lib.rs, src/lib.rs (changed during the wait or just before it)"
+        ),
         "{}",
         app.status
     );
