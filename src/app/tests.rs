@@ -32690,8 +32690,18 @@ fn a_record_rewrite_re_arms_a_downed_navigator() {
         .unwrap();
     f.set_modified(old_mtime).unwrap();
     app.pair_spawn_override = Some(Box::new(local_test_spawn));
-    app.last_pair_check = None;
-    app.maybe_seat_navigator();
+    // Poll like the app's once-a-second tick: a child forked by a parallel
+    // test can share the host lock's file until its exec closes it, which
+    // reads as Busy for that one tick.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.last_pair_check = None;
+        app.maybe_seat_navigator();
+        if app.pair_host.is_some() || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         app.pair_host.is_some(),
         "a rewritten record must re-arm the downed navigator: {}",
