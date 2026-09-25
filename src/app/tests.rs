@@ -43177,21 +43177,25 @@ fn a_fleet_run_reports_through_the_channel_rather_than_blocking() {
             host: String::from("a"),
             output: String::from("5.15.0"),
             exit: Some(0),
+            elapsed: std::time::Duration::ZERO,
         },
         crate::fleet::HostResult {
             host: String::from("b"),
             output: String::from("5.15.0"),
             exit: Some(0),
+            elapsed: std::time::Duration::ZERO,
         },
         crate::fleet::HostResult {
             host: String::from("odd"),
             output: String::from("6.1.0"),
             exit: Some(0),
+            elapsed: std::time::Duration::ZERO,
         },
         crate::fleet::HostResult {
             host: String::from("down"),
             output: String::from("timed out"),
             exit: None,
+            elapsed: std::time::Duration::ZERO,
         },
     ];
     app.fleet_running = true;
@@ -49713,5 +49717,53 @@ tool = "go"
     assert!(
         !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
         "another extension's record stays"
+    );
+}
+
+#[test]
+fn fleet_output_shows_each_hosts_time_and_the_lines_that_differ() {
+    // #363: a DIFFERS row says what differs, line by line, not just that
+    // something did; every row says how long the host took.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let r = |host: &str, out: &str, ms: u64| crate::fleet::HostResult {
+        host: String::from(host),
+        output: String::from(out),
+        exit: Some(0),
+        elapsed: std::time::Duration::from_millis(ms),
+    };
+    app.fleet_running = true;
+    app.fleet_tx
+        .send(vec![
+            r("zz363-a", "Linux\n6.8.0-45", 120),
+            r("zz363-b", "Linux\n6.8.0-45", 80),
+            r("zz363-odd", "Linux\n6.8.0-31", 1500),
+        ])
+        .unwrap();
+    assert!(app.drain_fleet_results());
+    let lines: Vec<String> = crate::output::snapshot(crate::output::CHANNEL_FLEET)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.text)
+        .collect();
+    let odd = lines
+        .iter()
+        .position(|l| l.starts_with("zz363-odd"))
+        .expect("the odd host has a row");
+    assert!(
+        lines[odd].contains("[DIFFERS]") && lines[odd].contains("1.5s"),
+        "{}",
+        lines[odd]
+    );
+    assert_eq!(
+        lines[odd + 1],
+        "    ≠ 6.8.0-31",
+        "the differing line, alone"
+    );
+    let a = lines.iter().find(|l| l.starts_with("zz363-a")).unwrap();
+    assert!(a.contains("0.1s"), "{a}");
+    assert!(
+        !lines.iter().any(|l| l == "    ≠ Linux"),
+        "an equal line is not marked"
     );
 }

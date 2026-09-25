@@ -26593,12 +26593,23 @@ impl App {
             self.status = String::from("Fleet run needs a command");
             return;
         }
-        let known: Vec<String> = crate::remote::discover_ssh_targets()
+        let mut known: Vec<String> = crate::remote::discover_ssh_targets()
             .into_iter()
             .map(|t| t.alias)
             .collect();
-        if known.is_empty() {
-            self.status = String::from("No hosts in ~/.ssh/config to run on");
+        let no_ssh_hosts = known.is_empty();
+        // `localhost` and running containers can be named explicitly; `*`
+        // still means the ssh hosts only (see `parse_request_with_groups`).
+        known.extend(crate::fleet::local_targets());
+        if no_ssh_hosts
+            && !crate::fleet::split_request(command).is_some_and(|(spec, _)| {
+                spec.split(',')
+                    .any(|n| crate::fleet::is_local_target(n.trim()))
+            })
+        {
+            self.status = String::from(
+                "No hosts in ~/.ssh/config to run on (localhost and docker:<container> work too)",
+            );
             return;
         }
         // The fleet must be NAMED. Defaulting to every configured host means
@@ -26671,8 +26682,28 @@ impl App {
                     } else {
                         crate::output::OutputLevel::Error
                     },
-                    &format!("{}  [{mark}]  {}", r.host, r.output.replace('\n', " ")),
+                    &format!(
+                        "{}  [{mark}]  ({:.1}s)  {}",
+                        r.host,
+                        r.elapsed.as_secs_f64(),
+                        r.output.replace('\n', " ")
+                    ),
                 );
+                // A differing host lists the lines that differ from the
+                // reference, so the row says WHAT differs, not only that
+                // something does.
+                if mark == "DIFFERS"
+                    && let Some(reference) = reference.as_deref()
+                {
+                    let changed = crate::fleet::changed_lines(reference, &r.output);
+                    for (line, _) in r.output.lines().zip(changed).filter(|(_, c)| *c) {
+                        crate::output::push(
+                            crate::output::CHANNEL_FLEET,
+                            crate::output::OutputLevel::Info,
+                            &format!("    ≠ {line}"),
+                        );
+                    }
+                }
             }
             let summary = crate::fleet::summarise(&results, reference.as_deref());
             crate::output::push(
