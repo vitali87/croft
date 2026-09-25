@@ -71,6 +71,7 @@ mod session_host;
 mod session_state;
 mod sheet;
 mod shell_integration;
+mod shortcuts;
 mod snippets;
 mod sqlite_view;
 mod svg;
