@@ -56,12 +56,12 @@ fn string_map(v: Option<&serde_json::Value>) -> BTreeMap<String, String> {
     v.and_then(|v| v.as_object())
         .map(|m| {
             m.iter()
-                .filter_map(|(k, v)| {
+                .map(|(k, v)| {
                     let v = match v {
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    Some((k.clone(), v))
+                    (k.clone(), v)
                 })
                 .collect()
         })
@@ -364,6 +364,50 @@ pub fn up(
         ])?;
     }
     Ok((spec, name))
+}
+
+/// `croft devcontainer [path]` (#617): bring the container up, then run
+/// croft in it on this terminal until it exits.
+pub fn open(path: Option<String>) -> anyhow::Result<()> {
+    let root = match path {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir()?,
+    };
+    let root = root.canonicalize().unwrap_or(root);
+    let docker_program = PathBuf::from("docker");
+    let mut log = |line: String| eprintln!("croft devcontainer: {line}");
+    let (spec, name) = up(
+        &root,
+        &docker_program,
+        &mut |triple| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let built = crate::remote::cross_build_local(triple, &tx);
+            drop(tx);
+            for line in rx.try_iter() {
+                eprintln!("croft devcontainer: {line}");
+            }
+            match built.map_err(|e| format!("{e:#}"))? {
+                crate::remote::CrossBuild::Built(binary) => Ok(binary),
+                crate::remote::CrossBuild::Skipped(reason) => Err(format!(
+                    "croft needs a Linux build for the container: {reason} (run `croft setup-cross`)"
+                )),
+            }
+        },
+        &mut log,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let status = std::process::Command::new(&docker_program)
+        .args(exec_args(
+            &spec,
+            &name,
+            &[String::from("croft"), String::from(".")],
+            true,
+        ))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("croft in {name} exited with {status}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
