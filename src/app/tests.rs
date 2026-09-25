@@ -49975,6 +49975,57 @@ fn a_rename_edit_under_a_diff_or_hex_view_goes_to_disk() {
     }
 }
 
+/// #610: in the active group too, a diff or hex view never takes the edit.
+/// A text tab after a diff view of the same file still gets it; with only a
+/// view open the edit goes to disk, and a hex view reads that write as
+/// external even after a move repoints it.
+#[test]
+fn an_active_diff_or_hex_view_sends_the_edit_to_the_text_tab_or_disk() {
+    let edit = || crate::widgets::editor::TextSpanEdit {
+        start: (0, 7),
+        end: (0, 8),
+        new_text: String::from("g"),
+    };
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    app.editor
+        .open_head_diff_with_text(foo.with_extension("head"), "fn f() {}\n", &foo, true)
+        .unwrap();
+    app.editor.open_pinned(&foo).unwrap();
+    app.apply_rename_edits(&[(foo.clone(), vec![edit()])])
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "pub fn g() {}",
+        "the text tab takes it"
+    );
+    assert_eq!(std::fs::read_to_string(&foo).unwrap(), "pub fn f() {}\n");
+    for hex in [false, true] {
+        let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+        if hex {
+            app.editor.open_hex(&foo).unwrap();
+        } else {
+            app.editor
+                .open_head_diff_with_text(foo.with_extension("head"), "fn f() {}\n", &foo, true)
+                .unwrap();
+        }
+        app.apply_rename_edits(&[(foo.clone(), vec![edit()])])
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&foo).unwrap(),
+            "pub fn g() {}\n",
+            "hex={hex}"
+        );
+        if hex {
+            let moved = foo.with_file_name("moved.rs");
+            std::fs::rename(&foo, &moved).unwrap();
+            app.editor.rename_open_path(&foo, &moved);
+            assert!(
+                app.editor.disk_changed_externally(),
+                "the hex view must not look synced with the rewritten file"
+            );
+        }
+    }
+}
+
 /// #610: a dirty, diverged tab open only in an inactive group keeps its
 /// text while the edit goes to disk, and still reads the write as external
 /// after the move repoints it.

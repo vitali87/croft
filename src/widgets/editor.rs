@@ -14613,7 +14613,7 @@ impl EditorTabs {
         self.find_tab_matching(target, |_| true)
     }
 
-    /// If `path` is open in a tab, apply LSP rename `edits` to that buffer
+    /// If `path` is open in a text tab, apply LSP rename `edits` to that buffer
     /// in-memory (one undo step, marked dirty) and return the count applied.
     /// `None` when no tab holds the file, so the caller can edit it on disk.
     pub fn apply_rename_to_open_tab(

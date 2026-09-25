@@ -11707,6 +11707,9 @@ impl App {
                 // A diverged copy in an inactive group keeps its text; it must
                 // still see this write as an external change, even after a
                 // move re-anchors it to the new path.
+                // So must a hex or log view of it in the active group, which
+                // the edit skipped.
+                self.editor.mark_disk_stale(path);
                 for group in self.editor_layout.inactive_groups_mut() {
                     group.mark_disk_stale(path);
                 }
