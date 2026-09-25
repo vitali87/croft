@@ -6928,7 +6928,8 @@ mod tests {
     /// needs no server on PATH.
     /// Returns `(script, receipt)`: the stub APPENDS one line to `receipt`
     /// for every `workspace/diagnostic` request that reaches it, so a test can
-    /// assert both that a pull arrived and how many did.
+    /// assert both that a pull arrived and how many did, and a `watched` line
+    /// per file of a `workspace/didChangeWatchedFiles`.
     fn mute_pull_server_script(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let path = dir.join("mute_pull_server.py");
         let receipt = dir.join("pull-received");
@@ -6977,6 +6978,11 @@ while True:
         # how many arrived. Then never answer -- the bug.
         with open(sys.argv[1], "a") as f:
             f.write("pull\n")
+    elif method == "workspace/didChangeWatchedFiles":
+        # One line per reported file, for the watched-files test (#610).
+        with open(sys.argv[1], "a") as f:
+            for c in msg["params"]["changes"]:
+                f.write("watched %d %s\n" % (c["type"], c["uri"]))
     elif method == "shutdown":
         write({"jsonrpc": "2.0", "id": msg["id"], "result": None})
     elif "id" in msg:
@@ -9734,6 +9740,25 @@ while True:
                 told,
                 vec![vec![written[0].clone(), written[1].clone()]],
                 "root `a` hears of both once; root `b` of neither"
+            );
+            // And the notification reaches that server as `Changed` (2).
+            state.did_change_watched_files(&written).await;
+            let uri = |p: &PathBuf| Url::from_file_path(p).unwrap().to_string();
+            let expected = format!(
+                "watched 2 {}\nwatched 2 {}\n",
+                uri(&written[0]),
+                uri(&written[1])
+            );
+            let arrived = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while std::fs::read_to_string(&receipt).unwrap_or_default() != expected {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                arrived.is_ok(),
+                "the server got {:?}",
+                std::fs::read_to_string(&receipt).unwrap_or_default()
             );
             state.shutdown_all().await;
         });
