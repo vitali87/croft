@@ -49871,6 +49871,110 @@ fn a_rename_edit_skips_a_diverged_copy_in_another_group() {
     assert_eq!(other.lines[..2], ["pub fn f() {}", "pub fn k() {}"]);
 }
 
+/// #610: a split copy holding the same text as the active group's tab
+/// takes the edit too, so the two stay identical.
+#[test]
+fn a_rename_edit_reaches_an_undiverged_copy_in_another_group() {
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    app.editor.open_pinned(&foo).unwrap();
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    let edit = crate::widgets::editor::TextSpanEdit {
+        start: (0, 7),
+        end: (0, 8),
+        new_text: String::from("g"),
+    };
+    app.apply_rename_edits(&[(foo.clone(), vec![edit])])
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "pub fn g() {}");
+    let groups = app.editor_layout.inactive_groups();
+    let other = groups[0]
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(foo.as_path()))
+        .unwrap();
+    assert_eq!(other.lines[0], "pub fn g() {}");
+    assert!(other.dirty);
+}
+
+/// #610: with the file closed in the active group, a clean copy in one
+/// inactive group takes the edit while a dirty copy in another keeps its
+/// text.
+#[test]
+fn a_rename_edit_picks_the_clean_copy_across_three_groups() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    app.editor.open_pinned(&foo).unwrap();
+    app.editor.open_pinned(&lib).unwrap();
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    app.editor.open_pinned(&foo).unwrap();
+    app.editor.lines.insert(0, String::from("// x"));
+    app.editor.dirty = true;
+    app.editor.open_pinned(&lib).unwrap();
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    assert!(app.editor.find_tab_with_path(&foo).is_none());
+    let edit = crate::widgets::editor::TextSpanEdit {
+        start: (0, 7),
+        end: (0, 8),
+        new_text: String::from("g"),
+    };
+    app.apply_rename_edits(&[(foo.clone(), vec![edit])])
+        .unwrap();
+    let mut texts: Vec<String> = app
+        .editor_layout
+        .inactive_groups()
+        .iter()
+        .filter_map(|g| {
+            g.editors
+                .iter()
+                .find(|e| e.path.as_deref() == Some(foo.as_path()))
+        })
+        .map(|e| e.lines[0].clone())
+        .collect();
+    texts.sort();
+    assert_eq!(
+        texts,
+        ["// x", "pub fn g() {}"],
+        "the dirty copy keeps its text"
+    );
+    assert_eq!(std::fs::read_to_string(&foo).unwrap(), "pub fn f() {}\n");
+}
+
+/// #610: a diff or hex view of the file in another group holds no file
+/// text, so it never swallows the edit: the edit goes to disk instead.
+#[test]
+fn a_rename_edit_under_a_diff_or_hex_view_goes_to_disk() {
+    for hex in [false, true] {
+        let (_tmp, lib, foo, mut app) = will_rename_fixture();
+        if hex {
+            app.editor.open_hex(&foo).unwrap();
+        } else {
+            app.editor
+                .open_head_diff_with_text(foo.with_extension("head"), "fn f() {}\n", &foo, true)
+                .unwrap();
+        }
+        app.editor.open_pinned(&lib).unwrap();
+        app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+        let edit = crate::widgets::editor::TextSpanEdit {
+            start: (0, 7),
+            end: (0, 8),
+            new_text: String::from("g"),
+        };
+        app.apply_rename_edits(&[(foo.clone(), vec![edit])])
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&foo).unwrap(),
+            "pub fn g() {}\n",
+            "hex={hex}"
+        );
+        let groups = app.editor_layout.inactive_groups();
+        let view = groups[0]
+            .editors
+            .iter()
+            .find(|e| e.path.as_deref() == Some(foo.as_path()))
+            .unwrap();
+        assert!(view.has_non_text_view() && !view.dirty, "hex={hex}");
+    }
+}
+
 /// #610: a dirty, diverged tab open only in an inactive group keeps its
 /// text while the edit goes to disk, and still reads the write as external
 /// after the move repoints it.

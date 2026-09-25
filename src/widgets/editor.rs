@@ -14621,25 +14621,26 @@ impl EditorTabs {
         path: &Path,
         edits: &[TextSpanEdit],
     ) -> Option<usize> {
-        let idx = self.find_tab_with_path(path)?;
-        Some(self.editors[idx].apply_span_edits(edits))
+        self.apply_rename_to_open_tab_where(path, edits, |_| true)
     }
 
     /// [`Self::apply_rename_to_open_tab`], but only to a tab `in_sync` accepts,
-    /// i.e. one holding the text the server computed the edits against.
+    /// i.e. one holding the text the server computed the edits against. A
+    /// diff, hex or other non-text view of the file never takes the edits:
+    /// its lines are not the file's text.
     pub fn apply_rename_to_open_tab_where(
         &mut self,
         path: &Path,
         edits: &[TextSpanEdit],
         in_sync: impl Fn(&Editor) -> bool,
     ) -> Option<usize> {
-        let idx = self.find_tab_matching(path, in_sync)?;
+        let idx = self.find_tab_matching(path, |e| !e.has_non_text_view() && in_sync(e))?;
         Some(self.editors[idx].apply_span_edits(edits))
     }
 
-    /// The lines of the tab holding `path`, if one does.
+    /// The lines of the text tab holding `path`, if one does.
     pub fn open_tab_lines(&self, path: &Path) -> Option<Vec<String>> {
-        let idx = self.find_tab_with_path(path)?;
+        let idx = self.find_tab_matching(path, |e| !e.has_non_text_view())?;
         Some(self.editors[idx].lines.clone())
     }
 

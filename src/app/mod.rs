@@ -11677,7 +11677,11 @@ impl App {
             // tabs), else against the disk. A tab in an inactive group gets
             // them only when it holds that same text; a diverged copy would
             // have them land on the wrong characters (#610).
-            let server_text = self.editor.open_tab_lines(path);
+            let server_text = if self.editor_layout.inactive_groups().is_empty() {
+                None
+            } else {
+                self.editor.open_tab_lines(path)
+            };
             let mut applied = self.editor.apply_rename_to_open_tab(path, edits);
             let in_sync = |e: &crate::widgets::editor::Editor| match &server_text {
                 Some(lines) => e.lines == *lines,
