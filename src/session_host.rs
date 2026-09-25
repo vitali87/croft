@@ -128,6 +128,42 @@ pub struct Participant {
     pub rows: u16,
     /// Whether this client's keystrokes reach the PTY (write control).
     pub control: bool,
+    /// The client's croft version from its Hello (#626), so the inner
+    /// croft can say when a client is older than the session. Empty from
+    /// clients that send none and in rosters written by older hosts.
+    #[serde(default)]
+    pub version: String,
+}
+
+/// The status line for attached clients older than this croft, or `None`
+/// when no client that reported a version is older (#626, #652). A client
+/// that reported none (an old client) says nothing either way, and neither
+/// does a newer one: the first-attach banner already covered it, and
+/// reattaching would not help.
+pub fn stale_client_notice(roster: &[Participant], own: &str) -> Option<String> {
+    let mut older: Vec<&str> = roster
+        .iter()
+        .map(|p| p.version.as_str())
+        .filter(|v| version_is_older(v, own))
+        .collect();
+    older.sort_unstable();
+    older.dedup();
+    (!older.is_empty()).then(|| {
+        format!(
+            "Session updated to croft {own}; a client still runs {}. Detach and reattach it to update",
+            older.join(", ")
+        )
+    })
+}
+
+/// True when dotted version `v` sorts strictly below `own`, compared
+/// numerically per component. An empty or unparsable `v` is never older.
+fn version_is_older(v: &str, own: &str) -> bool {
+    let parse = |s: &str| -> Option<Vec<u64>> { s.split('.').map(|c| c.parse().ok()).collect() };
+    match (parse(v), parse(own)) {
+        (Some(v), Some(own)) => v < own,
+        _ => false,
+    }
 }
 
 /// A decoded frame.
@@ -739,6 +775,8 @@ fn spawn_writer(stream: Arc<Mutex<UnixStream>>, outbox: Arc<Outbox>, fd: std::os
 struct Client {
     id: u64,
     name: String,
+    /// The version the client's Hello carried (empty when it sent none).
+    version: String,
     cols: u16,
     rows: u16,
     control: bool,
@@ -1184,6 +1222,7 @@ fn update_presence(host: &Host) {
                 cols: c.cols,
                 rows: c.rows,
                 control: c.control,
+                version: c.version.clone(),
             })
             .collect()
     };
@@ -1239,7 +1278,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                     cols,
                     rows,
                     client_id,
-                    ..
+                    version,
                 }) if my_id.is_none() && !privileged => {
                     // Answer with our version FIRST: registration below makes
                     // this client a broadcast target, and the ServerHello must
@@ -1323,6 +1362,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                             clients.push(Client {
                                 id,
                                 name,
+                                version,
                                 cols,
                                 rows,
                                 control,
@@ -1853,21 +1893,14 @@ fn attach_client_pump(
         let _ = stream.set_read_timeout(None);
     }
     let client_version = env!("CARGO_PKG_VERSION");
-    if server_version.as_deref() != Some(client_version) && !first_attach {
-        // Reconnected across a host swap: the server is now NEWER than this
-        // still-running attach client. A one-line notice, not the
-        // interactive banner - parking a live handover on a keypress would
-        // freeze the session for a formality.
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(
-            format!(
-                "\r\nsession host updated to croft {}; detach and reattach to update this client\r\n",
-                server_version.as_deref().unwrap_or("?")
-            )
-            .as_bytes(),
-        );
-        let _ = out.flush();
-    } else if server_version.as_deref() != Some(client_version) {
+    // A reconnect across a host swap writes nothing even when the server
+    // is now NEWER than this still-running attach client: the screen
+    // belongs to the inner croft, and text printed over it survives in
+    // every cell that croft's next frames leave blank (#626, #652). The
+    // inner croft says it instead, from this client's version in the
+    // roster (`App::poll_session_presence`). Only a first attach, before
+    // the inner croft's attach repaint, may show the banner.
+    if first_attach && server_version.as_deref() != Some(client_version) {
         let mut out = std::io::stdout().lock();
         out.write_all(mismatch_banner(server_version.as_deref(), client_version).as_bytes())
             .context("writing banner")?;
@@ -3837,6 +3870,7 @@ mod tests {
             cols: 80,
             rows: 24,
             control,
+            version: String::new(),
         };
         assert!(sole_participant_lacks_control(&[p(false)]));
         assert!(!sole_participant_lacks_control(&[p(true)]));
@@ -4257,5 +4291,42 @@ mod tests {
         a.send(&encode_bytes_frame(&[0x04]));
         a.read_until(|f| matches!(f, Frame::Control(Control::Exit { .. })));
         let _ = server.join();
+    }
+
+    #[test]
+    fn an_older_client_in_the_roster_gets_one_notice_and_a_current_one_none() {
+        let p = |version: &str| Participant {
+            id: 1,
+            name: String::from("x"),
+            cols: 80,
+            rows: 24,
+            control: true,
+            version: version.into(),
+        };
+        assert_eq!(stale_client_notice(&[p("0.1.959")], "0.1.959"), None);
+        assert_eq!(
+            stale_client_notice(&[p("")], "0.1.959"),
+            None,
+            "no version, no claim"
+        );
+        let n =
+            stale_client_notice(&[p("0.1.900"), p("0.1.959"), p("0.1.900")], "0.1.959").unwrap();
+        assert!(
+            n.contains("croft 0.1.959") && n.contains("still runs 0.1.900."),
+            "{n}"
+        );
+        assert_eq!(
+            stale_client_notice(&[p("0.1.990")], "0.1.959"),
+            None,
+            "a newer client is not out of date"
+        );
+        // Numeric, not lexical: 0.1.99 < 0.1.959 and 0.1.1000 > 0.1.959.
+        assert!(stale_client_notice(&[p("0.1.99")], "0.1.959").is_some());
+        assert_eq!(stale_client_notice(&[p("0.1.1000")], "0.1.959"), None);
+        // A roster written by an older host carries no version field.
+        let old: Vec<Participant> =
+            serde_json::from_str(r#"[{"id":1,"name":"x","cols":80,"rows":24,"control":true}]"#)
+                .unwrap();
+        assert_eq!(old[0].version, "");
     }
 }
