@@ -34688,6 +34688,15 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     // this fails on every machine on every run.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The pane's child writes nothing, so the grid holds only the bytes fed
+    // below: a real shell's startup prompt landing between them adds rows
+    // the geometry does not count (#641).
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "sleep",
+        &[String::from("30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     app.toggle_terminal_maximize();
