@@ -144,6 +144,8 @@ The TERMINAL tab is your `$SHELL` on a real PTY, splittable into side-by-side pa
 * **Selections:** selections stay glued to their text through streaming output, through your scrolling, and even inside full-screen apps that scroll by repainting (Claude Code, pagers). There the highlight follows the app's own scrolling, keeps its surviving rows lit while the app's chrome covers the block's edge, hides only when the text is fully off the app's view (copy still yields the whole selection), and comes back with it. `Shift`+click extends a selection, and a drag held past the pane edge keeps selecting — through scrollback at a shell, or by scrolling the app itself when it owns the wheel.
 * **Jump to source:** Cmd/Ctrl+click on any printed `path:line` reference (a compiler error, test failure, grep hit, or traceback) jumps the editor straight there, with no problem-matcher config. The Command Palette's **Terminal: Search & Replace from Last grep/rg** turns the `grep`/`rg` you just ran in a pane into the Search sidebar's results, ready to replace across every match.
 
+
+**Command suggestions.** As you type at a prompt, the rest of the newest matching command from croft's history appears after the cursor in grey (preferring one that succeeded in the same folder); `Right` at the end of the line accepts it, as in fish. A shell that draws its own suggestions (fish, zsh-autosuggestions) is left alone, and **Terminal: Toggle Command Suggestions** turns croft's off.
 ## Source Control
 
 Source Control mirrors VS Code's git flow: stage, unstage, and discard per file or in bulk, commit / amend / push / pull / sync, branches, stashes, and tags, with clickable change rows opening a side-by-side diff against HEAD.

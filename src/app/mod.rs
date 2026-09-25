@@ -3365,6 +3365,10 @@ pub struct App {
     code_lens_requested: std::collections::HashMap<PathBuf, u64>,
     /// Function breakpoints (#611), handed to each session as it launches.
     function_breakpoints: Vec<String>,
+    /// Terminal command suggestions (#614): on or off, and the one painted
+    /// this frame as (pane index, the text Right arrow would type).
+    term_suggest_enabled: bool,
+    term_suggestion: Option<(usize, String)>,
     /// A Search Editor rerun in flight (#615): the tab it lands in, the
     /// header it ran, and where its hits arrive.
     search_editor_job: Option<(
@@ -4969,6 +4973,8 @@ impl App {
             md_scroll_synced: None,
             code_lens_enabled: true,
             function_breakpoints: Vec::new(),
+            term_suggest_enabled: true,
+            term_suggestion: None,
             search_editor_job: None,
             code_lens_requested: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
@@ -17208,6 +17214,8 @@ impl App {
         // Those images are emitted after ratatui's text and would otherwise
         // composite over the tooltip; re-emitting the box last wins the cell.
         self.ui_tooltip_area = tooltip_area;
+
+        self.paint_terminal_suggestion(frame);
 
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
@@ -30851,6 +30859,16 @@ impl App {
         if self.terminal().selection().is_some() {
             self.terminal_mut().clear_selection();
         }
+        // Right arrow at the end of the typed line accepts the suggestion
+        // painted after it (#614), as in fish; anywhere else it moves.
+        if key.code == KeyCode::Right
+            && key.modifiers.is_empty()
+            && let Some((pane, rest)) = self.term_suggestion.take()
+            && pane == self.active_terminal
+        {
+            self.terminal_mut().write_input(rest.as_bytes());
+            return;
+        }
         self.write_terminal_key(key);
     }
 
@@ -36435,6 +36453,7 @@ impl App {
             Cmd::ToggleCodeLens => self.toggle_code_lens(),
             Cmd::OpenSearchEditor => self.open_search_editor(),
             Cmd::RebaseAbort => self.abort_rebase_todo(),
+            Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::RerunSearchEditor => self.rerun_search_editor(),
             Cmd::DebugAddHitCountBreakpoint => self.debug_edit_hit_condition(),
             Cmd::DebugAddFunctionBreakpoint => self.debug_add_function_breakpoint(),
@@ -42064,6 +42083,57 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
         }
+    }
+
+    /// Paint the history suggestion after the focused terminal's typed line
+    /// (#614) and remember it for Right arrow. Cleared whenever it does not
+    /// apply, so a stale suggestion can never be accepted.
+    fn paint_terminal_suggestion(&mut self, frame: &mut ratatui::Frame) {
+        self.term_suggestion = None;
+        if !self.term_suggest_enabled
+            || self.focus != Pane::Terminal
+            || self.context_menu.is_some()
+            || self.prompt.is_some()
+        {
+            return;
+        }
+        let idx = self.active_terminal;
+        let Some(term) = self.terminals.get(idx) else {
+            return;
+        };
+        let Some((typed, x, y, right)) = term.prompt_tail() else {
+            return;
+        };
+        let cwd = term
+            .shell_cwd()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Some(cmd) = self.command_history.suggest(&typed, &cwd, "") else {
+            return;
+        };
+        let rest = cmd[typed.len()..].to_string();
+        if x >= right {
+            return;
+        }
+        let shown: String = rest.chars().take((right - x) as usize).collect();
+        frame
+            .buffer_mut()
+            .set_string(x, y, &shown, Style::default().fg(self.theme.ignored_fg()));
+        self.term_suggestion = Some((idx, rest));
+    }
+
+    /// Terminal: Toggle Command Suggestions (#614).
+    fn toggle_terminal_suggestions(&mut self) {
+        self.term_suggest_enabled = !self.term_suggest_enabled;
+        self.term_suggestion = None;
+        self.status = format!(
+            "Terminal suggestions: {}",
+            if self.term_suggest_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        );
     }
 
     /// Answer `croft edit --wait`'s poll (#620): whether `path` is still open
