@@ -34680,7 +34680,8 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     // The deterministic half of #397's quick-select entry. Its sibling below
     // was measured at 3 failures in 20 runs under load, because a REAL
     // shell's prompt wraps to several rows and the pane had one row of slack;
-    // a rate is the best evidence a race allows, and it is not a test.
+    // a rate is the best evidence a race allows, and it is not a test. Both
+    // now run on a silent pane.
     //
     // This one feeds the prompt itself, so the geometry is the whole claim
     // and the machine has no say. Four rows of it, then the same park,
@@ -34688,6 +34689,15 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     // this fails on every machine on every run.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The pane's child writes nothing, so the grid holds only the bytes fed
+    // below: a real shell's startup prompt landing between them adds rows
+    // the geometry does not count (#641).
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "sleep",
+        &[String::from("30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     app.toggle_terminal_maximize();
