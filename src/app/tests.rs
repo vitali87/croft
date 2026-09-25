@@ -10530,22 +10530,24 @@ fn close_all_closes_every_split_group() {
     assert_eq!(app.status, format!("Closed {total} tabs"));
 }
 
-/// #679: Cmd+K Shift+D is Session: Detach, not the Cmd+K D scrollback
-/// dump; outside a persistent session it says so and opens nothing.
+/// #679: Cmd+K Shift+A is Session: Detach, not the Cmd+K A participants
+/// picker; outside a persistent session it says so. Both encodings: the
+/// forwarder's uppercase char and CSI-u's lowercase char with SHIFT.
 #[test]
-fn cmd_k_shift_d_detaches_instead_of_dumping_scrollback() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let tabs = app.editor.tab_count();
-    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
-        .unwrap();
-    app.handle_key(key(KeyCode::Char('D'), KeyModifiers::SHIFT))
-        .unwrap();
-    assert_eq!(
-        app.status,
-        "Not a persistent session (start one with `croft attach`)"
-    );
-    assert_eq!(app.editor.tab_count(), tabs, "no scrollback tab opened");
+fn cmd_k_shift_a_detaches_instead_of_listing_participants() {
+    for c in ['A', 'a'] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            app.status,
+            "Nothing to detach from: this is not a persistent session"
+        );
+        assert!(app.list_picker.is_none(), "no participants picker opened");
+    }
 }
 
 #[test]

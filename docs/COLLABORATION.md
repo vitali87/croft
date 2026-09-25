@@ -14,7 +14,7 @@ croft ls                         # list running persistent sessions
 
 `croft attach` runs the session under croft's built-in session host, so its terminals,
 language servers, debugger, and open files keep running after you close the window (or lose
-the SSH connection). Detach with **Session: Detach** (`Cmd+K Shift+D`) or by closing the
+the SSH connection). Detach with **Session: Detach** (`Cmd+K Shift+A`) or by closing the
 window; run `croft attach` again in the same folder to reattach where you left off. This is the persistence `croft remote` gives you over SSH,
 available locally with no external dependency.
 

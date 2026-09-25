@@ -141,7 +141,7 @@ host  tty ── croft attach ──┘        (one accept loop,          (uncha
   because liveness is still "can I connect to the socket". Once stable, the
   dtach dependency can go entirely, including `croft_pkg_install dtach` in the
   remote installer (`src/remote.rs:2182`).
-- **Detach chord** (shipped, #679): `Cmd+K Shift+D`. The host matches the
+- **Detach chord** (shipped, #679): `Cmd+K Shift+A`. The host matches the
   chord in each client's input stream (`DetachChord`), before the read-only
   filter, so a read-only participant and a client of a wedged inner croft
   can both detach; it then closes that connection exactly as a kick does.

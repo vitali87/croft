@@ -933,7 +933,7 @@ impl Command {
             Command::RevealRedactedSecrets => "",
             Command::SearchFromTerminal => "",
             Command::SessionParticipants => "Cmd+K A",
-            Command::SessionDetach => "Cmd+K Shift+D",
+            Command::SessionDetach => "Cmd+K Shift+A",
             Command::CollabCancelStream => "Cmd+K X",
             Command::AskNavigator => "Cmd+K Q",
             Command::AskNavigatorAboutCapture => "",
@@ -1658,7 +1658,7 @@ mod tests {
             palette.results.first(),
             Some(&builtin(Command::SessionDetach))
         );
-        assert_eq!(Command::SessionDetach.keybinding_hint(), "Cmd+K Shift+D");
+        assert_eq!(Command::SessionDetach.keybinding_hint(), "Cmd+K Shift+A");
     }
 
     #[test]

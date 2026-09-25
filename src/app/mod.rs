@@ -18929,6 +18929,14 @@ impl App {
                 self.open_theme_picker();
                 true
             }
+            // Cmd+K Shift+A: Session: Detach (#679). Must precede the
+            // case-insensitive A arm below. The host answers this chord
+            // too, so for a write-control holder the client is usually
+            // gone already and this finds nothing left to do.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'a') => {
+                self.detach_session_client();
+                true
+            }
             // Cmd+K A: who is attached to this multiplayer session
             // (Session: Participants).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'a') => {
@@ -19201,14 +19209,6 @@ impl App {
                     self.show_terminal = true;
                 }
                 self.restore_all_terminal_panes();
-                true
-            }
-            // Cmd+K Shift+D: Session: Detach (#679). Must precede the
-            // case-insensitive D arm below. The host answers this chord
-            // too, so for a write-control holder the client is usually
-            // gone already and this finds nothing left to do.
-            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'d') => {
-                self.detach_session_client();
                 true
             }
             // Cmd+K D: dump the active terminal's scrollback into a scratch
@@ -24312,7 +24312,7 @@ impl App {
     /// or palette Enter that got here came from that client.
     fn detach_session_client(&mut self) {
         let Some(channel) = self.session_channel.as_mut() else {
-            self.status = String::from("Not a persistent session (start one with `croft attach`)");
+            self.status = String::from("Nothing to detach from: this is not a persistent session");
             return;
         };
         let Some(id) = detach_target(self.session_typist, &self.session_participants) else {
@@ -24418,7 +24418,7 @@ impl App {
         if !self.session_host_stale_seen && channel.stale_marker.exists() {
             self.session_host_stale_seen = true;
             self.status = String::from(
-                "Session host runs a pre-update binary; every participant detaches (Cmd+K Shift+D) and reattaches to pick up the update",
+                "Session host runs a pre-update binary; every participant detaches (Cmd+K Shift+A) and reattaches to pick up the update",
             );
         }
         let path = channel.presence.clone();
@@ -48955,10 +48955,7 @@ fn takeover_mode_seq() -> Vec<u8> {
 
 /// Which client Session: Detach disconnects (#679): the one typing, else
 /// the only one attached (a host too old to announce typists).
-fn detach_target(
-    typist: Option<u64>,
-    roster: &[crate::session_host::Participant],
-) -> Option<u64> {
+fn detach_target(typist: Option<u64>, roster: &[crate::session_host::Participant]) -> Option<u64> {
     typist.or(match roster {
         [only] => Some(only.id),
         _ => None,

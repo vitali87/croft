@@ -152,7 +152,7 @@ pub fn stale_client_notice(roster: &[Participant], own: &str) -> Option<String> 
     let older: Vec<&str> = older.into_iter().map(|(_, v)| v).collect();
     (!older.is_empty()).then(|| {
         format!(
-            "Session updated to croft {own}; a client still runs {}. Detach it (Cmd+K Shift+D) and reattach to update",
+            "Session updated to croft {own}; a client still runs {}. Detach it (Cmd+K Shift+A) and reattach to update",
             older.join(", ")
         )
     })
@@ -186,14 +186,14 @@ pub fn session_version<'a>(own: &'a str, host: Option<&'a str>) -> &'a str {
 /// matching the app's own Cmd+K leader window.
 const DETACH_CHORD_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Watches one client's input for `Cmd+K Shift+D` (Session: Detach, #679).
+/// Watches one client's input for `Cmd+K Shift+A` (Session: Detach, #679).
 /// The host runs it on every client's bytes, including the read-only ones
 /// it drops before the PTY: a read-only participant's keys never reach the
 /// app, and a wedged app cannot act on anyone's, but the host sees both.
 ///
 /// The encodings are the ones croft's keyboard flags produce: `Cmd+K`
 /// arrives as the CSI-u `ESC [ 107 ; 9 u` (iTerm2's forwarder and every
-/// kitty-protocol host alike), `Shift+D` as the text `D` (or its CSI-u
+/// kitty-protocol host alike), `Shift+A` as the text `A` (or its CSI-u
 /// form). Mouse reports, focus reports and key releases between the two
 /// keys are not keystrokes and leave the leader armed, as in the app.
 #[derive(Debug, Default)]
@@ -207,7 +207,7 @@ struct DetachChord {
 /// What one CSI sequence means to [`DetachChord`].
 enum ChordKey {
     CmdK,
-    ShiftD,
+    ShiftA,
     /// Not a keypress: mouse, focus, or a key release.
     Ignore,
     Other,
@@ -223,10 +223,18 @@ fn classify_csi(params: &[u8], last: u8) -> ChordKey {
     }
     let text = String::from_utf8_lossy(params);
     let mut fields = text.split(';');
-    let code = fields.next().and_then(|f| f.split(':').next()?.parse::<u32>().ok());
+    let code = fields
+        .next()
+        .and_then(|f| f.split(':').next()?.parse::<u32>().ok());
     let mut mods_field = fields.next().unwrap_or("1").split(':');
-    let mods = mods_field.next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(1);
-    let event = mods_field.next().and_then(|e| e.parse::<u32>().ok()).unwrap_or(1);
+    let mods = mods_field
+        .next()
+        .and_then(|m| m.parse::<u32>().ok())
+        .unwrap_or(1);
+    let event = mods_field
+        .next()
+        .and_then(|e| e.parse::<u32>().ok())
+        .unwrap_or(1);
     if event == 3 {
         return ChordKey::Ignore;
     }
@@ -234,7 +242,7 @@ fn classify_csi(params: &[u8], last: u8) -> ChordKey {
     let held = mods.saturating_sub(1) & 0b1111;
     match (code, held) {
         (Some(107), 8) => ChordKey::CmdK,
-        (Some(100 | 68), 1) => ChordKey::ShiftD,
+        (Some(97 | 65), 1) => ChordKey::ShiftA,
         _ => ChordKey::Other,
     }
 }
@@ -247,51 +255,70 @@ impl DetachChord {
         let mut i = 0;
         while i < input.len() {
             let key = if input[i] == 0x1b {
-                if i + 1 == input.len() {
-                    self.partial = input[i..].to_vec();
-                    return false;
-                }
-                if input[i + 1] != b'[' {
+                // A lone ESC ending a read, or one followed by another ESC,
+                // is the Escape key itself: a terminal writes each key's
+                // sequence whole, so only a CSI or SS3 body is worth
+                // waiting for across reads.
+                if i + 1 == input.len() || input[i + 1] == 0x1b {
+                    i += 1;
+                    ChordKey::Other
+                } else if input[i + 1] == b'O' && i + 2 < input.len() {
+                    // SS3 (application-mode arrows, F1-F4): three bytes,
+                    // whose last must not read as a typed letter.
+                    i += 3;
+                    ChordKey::Other
+                } else if input[i + 1] != b'[' {
+                    // Alt+key (a lone `ESC O` ending a read is Alt+Shift+O).
                     i += 2;
                     ChordKey::Other
                 } else {
-                    let Some(len) = input[i + 2..]
+                    // CSI body: parameter and intermediate bytes, then one
+                    // final byte. Anything else means the `ESC [` was a key
+                    // of its own (Alt+[), and the next key starts there.
+                    let body = input[i + 2..]
                         .iter()
-                        .position(|b| (0x40..=0x7e).contains(b))
-                    else {
-                        // Unterminated: keep it for the next chunk, unless it
-                        // is too long to be a key report at all.
-                        if input.len() - i <= 32 {
-                            self.partial = input[i..].to_vec();
+                        .position(|b| !(0x20..=0x3f).contains(b));
+                    match body.map(|len| (len, input[i + 2 + len])) {
+                        Some((len, last)) if (0x40..=0x7e).contains(&last) => {
+                            let params = &input[i + 2..i + 2 + len];
+                            i += 3 + len;
+                            classify_csi(params, last)
                         }
-                        return false;
-                    };
-                    let params = &input[i + 2..i + 2 + len];
-                    let last = input[i + 2 + len];
-                    i += 3 + len;
-                    classify_csi(params, last)
+                        Some(_) => {
+                            i += 2;
+                            ChordKey::Other
+                        }
+                        None => {
+                            // Unterminated: keep it for the next read, unless
+                            // it is too long to be a key report at all.
+                            if input.len() - i <= 32 {
+                                self.partial = input[i..].to_vec();
+                            }
+                            return false;
+                        }
+                    }
                 }
             } else {
                 let b = input[i];
                 i += 1;
-                if b == b'D' {
-                    ChordKey::ShiftD
+                if b == b'A' {
+                    ChordKey::ShiftA
                 } else {
                     ChordKey::Other
                 }
             };
             match key {
                 ChordKey::CmdK => self.armed = Some(now),
-                ChordKey::ShiftD
-                    if self
-                        .armed
-                        .is_some_and(|t| now.saturating_duration_since(t) <= DETACH_CHORD_TIMEOUT) =>
+                ChordKey::ShiftA
+                    if self.armed.is_some_and(|t| {
+                        now.saturating_duration_since(t) <= DETACH_CHORD_TIMEOUT
+                    }) =>
                 {
                     self.armed = None;
                     return true;
                 }
                 ChordKey::Ignore => {}
-                ChordKey::ShiftD | ChordKey::Other => self.armed = None,
+                ChordKey::ShiftA | ChordKey::Other => self.armed = None,
             }
         }
         false
@@ -3452,20 +3479,20 @@ mod tests {
 
     /// #679: the host's detach chord, as croft's keyboard flags encode it.
     #[test]
-    fn detach_chord_fires_on_cmd_k_then_shift_d() {
+    fn detach_chord_fires_on_cmd_k_then_shift_a() {
         let now = Instant::now();
         let mut chord = DetachChord::default();
-        assert!(chord.feed(b"\x1b[107;9uD", now));
+        assert!(chord.feed(b"\x1b[107;9uA", now));
 
         // Event-type suffixes (REPORT_EVENT_TYPES): the press arms, the
         // release in between is not a keystroke.
         let mut chord = DetachChord::default();
-        assert!(chord.feed(b"\x1b[107;9:1u\x1b[107;9:3uD", now));
+        assert!(chord.feed(b"\x1b[107;9:1u\x1b[107;9:3uA", now));
 
         // Caps Lock (bit 64) does not change which key it is; nor does
-        // Shift+D in its CSI-u form.
+        // Shift+A in its CSI-u form.
         let mut chord = DetachChord::default();
-        assert!(chord.feed(b"\x1b[107;73u\x1b[100;2u", now));
+        assert!(chord.feed(b"\x1b[107;73u\x1b[97;2u", now));
     }
 
     #[test]
@@ -3476,30 +3503,55 @@ mod tests {
         assert!(!chord.feed(b"7;9u", now));
         // Motion tracking reports the pointer between the two keys.
         assert!(!chord.feed(b"\x1b[<35;10;5M\x1b[I", now));
-        assert!(chord.feed(b"D", now));
+        assert!(chord.feed(b"A", now));
+    }
+
+    /// A bare Escape keypress arrives as a lone ESC in its own read (legacy
+    /// encoding, or a terminal without kitty flags). It is a whole key, not
+    /// the start of a split sequence, and must not swallow the next chord.
+    #[test]
+    fn detach_chord_after_a_bare_escape_key() {
+        let now = Instant::now();
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b", now));
+        assert!(chord.feed(b"\x1b[107;9uA", now));
+        let mut chord = DetachChord::default();
+        assert!(
+            chord.feed(b"\x1b\x1b[107;9uA", now),
+            "Escape, then the chord"
+        );
+        // Alt+Shift+O and Alt+[ each ending a read are whole keys too.
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1bO", now));
+        assert!(chord.feed(b"\x1b[107;9uA", now));
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b[", now));
+        assert!(chord.feed(b"\x1b[107;9uA", now));
     }
 
     #[test]
     fn detach_chord_ignores_near_misses() {
         let now = Instant::now();
-        // Cmd+K D (lowercase) is the scrollback dump, not detach.
+        // Cmd+K A (lowercase) is Session: Participants, not detach.
         let mut chord = DetachChord::default();
-        assert!(!chord.feed(b"\x1b[107;9ud", now));
-        // A bare D, and a D after some other key, are typing.
+        assert!(!chord.feed(b"\x1b[107;9ua", now));
+        // Cmd+K Up in application cursor mode ends in an `A` byte.
+        assert!(!chord.feed(b"\x1b[107;9u\x1bOA", now));
+        // A bare A, and an A after some other key, are typing.
         let mut chord = DetachChord::default();
-        assert!(!chord.feed(b"D", now));
-        assert!(!chord.feed(b"\x1b[107;9uxD", now));
+        assert!(!chord.feed(b"A", now));
+        assert!(!chord.feed(b"\x1b[107;9uxA", now));
         // Ctrl+K is kill-to-end-of-line, not the leader.
         assert!(!chord.feed(b"\x1b[107;5uD", now));
-        assert!(!chord.feed(b"\x0bD", now));
+        assert!(!chord.feed(b"\x0bA", now));
         // The leader lapses like the app's.
         let mut chord = DetachChord::default();
         assert!(!chord.feed(b"\x1b[107;9u", now));
-        assert!(!chord.feed(b"D", now + DETACH_CHORD_TIMEOUT + Duration::from_millis(1)));
+        assert!(!chord.feed(b"A", now + DETACH_CHORD_TIMEOUT + Duration::from_millis(1)));
     }
 
     /// #679: a read-only participant's keys never reach the app, so the host
-    /// itself detaches them on Cmd+K Shift+D; the holder stays on.
+    /// itself detaches them on Cmd+K Shift+A; the holder stays on.
     #[test]
     fn read_only_participant_detaches_with_the_chord() {
         let dir = tempfile::tempdir().unwrap();
@@ -3519,7 +3571,7 @@ mod tests {
             "the second attacher is read-only"
         );
 
-        guest.send(&encode_bytes_frame(b"\x1b[107;9uD"));
+        guest.send(&encode_bytes_frame(b"\x1b[107;9uA"));
         let frames = owner.read_until(|f| {
             matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
         });
@@ -3543,7 +3595,7 @@ mod tests {
 
         // Split across two frames, as two separate keypresses arrive.
         owner.send(&encode_bytes_frame(b"\x1b[107;9u"));
-        owner.send(&encode_bytes_frame(b"D"));
+        owner.send(&encode_bytes_frame(b"A"));
         let frames = guest.read_until(|f| {
             matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
         });
