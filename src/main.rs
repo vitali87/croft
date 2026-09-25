@@ -1,3 +1,4 @@
+mod a11y;
 mod agent_lane;
 mod agents;
 mod ansi_text;
@@ -29,6 +30,7 @@ mod hex;
 mod highlight;
 mod history;
 mod http_file;
+mod i18n;
 mod icons;
 mod import_vscode;
 mod inline_complete;

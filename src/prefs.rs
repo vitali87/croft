@@ -325,6 +325,19 @@ pub struct Prefs {
     /// means the built-in 5000. Applies to panes opened after the change.
     #[serde(default)]
     pub terminal_scrollback: usize,
+    /// Screen reader mode (#621): a steady caret kept on the focused text
+    /// and a one-line description of each change in the status bar. Off by
+    /// default.
+    #[serde(default)]
+    pub screen_reader: bool,
+    /// A speech program croft runs with each screen reader line as its last
+    /// argument (`spd-say`, `say`). User layers only: it names a command.
+    #[serde(default)]
+    pub screen_reader_command: Option<String>,
+    /// UI language (#621), such as `de` or `es`. Unset, croft follows
+    /// `LC_ALL` / `LC_MESSAGES` / `LANG`.
+    #[serde(default)]
+    pub locale: Option<String>,
     /// Notification sinks; see [`NotificationSink`]. User layers only: not
     /// in `WORKSPACE_ALLOWED_KEYS`, so a cloned repo cannot make croft run
     /// a command or post to a URL.
@@ -457,6 +470,14 @@ pub fn save_auto_close_pairs(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disable_auto_close_pairs = !enabled;
+    prefs.save(&path)
+}
+
+/// Persist the screen reader choice, preserving other settings.
+pub fn save_screen_reader(enabled: bool) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.screen_reader = enabled;
     prefs.save(&path)
 }
 

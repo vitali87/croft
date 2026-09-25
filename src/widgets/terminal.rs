@@ -2593,6 +2593,22 @@ impl PtyTerminal {
         ))
     }
 
+    /// The shell cursor's screen cell, when it is on screen and the program
+    /// hasn't hidden it (#621: screen reader mode parks the cursor here).
+    pub fn screen_cursor(&self) -> Option<(u16, u16)> {
+        let term = self.term.lock();
+        if !term.mode().contains(TermMode::SHOW_CURSOR) || term.grid().display_offset() != 0 {
+            return None;
+        }
+        let p = term.grid().cursor.point;
+        let inner = self.last_inner;
+        let (line, col) = (p.line.0, p.column.0 as u16);
+        if inner.width == 0 || line < 0 || line as u16 >= inner.height || col >= inner.width {
+            return None;
+        }
+        Some((inner.x + col, inner.y + line as u16))
+    }
+
     /// The arrow-key bytes a plain click at screen cell (col, row) should
     /// send to walk the shell cursor to the clicked column (Ghostty's
     /// click-to-move-cursor). `Some` only when the shell is sitting at a

@@ -184,6 +184,7 @@ pub enum Command {
     RerunSearchEditor,
     RebaseAbort,
     ToggleTerminalSuggestions,
+    ToggleScreenReader,
     OpenKeyboardShortcuts,
     SwitchProfile,
     ToggleInlineSuggestions,
@@ -432,6 +433,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RerunSearchEditor,
     Command::RebaseAbort,
     Command::ToggleTerminalSuggestions,
+    Command::ToggleScreenReader,
     Command::OpenKeyboardShortcuts,
     Command::SwitchProfile,
     Command::ToggleInlineSuggestions,
@@ -649,6 +651,7 @@ impl Command {
             Command::RerunSearchEditor => "Search Editor: Rerun",
             Command::RebaseAbort => "Rebase: Abort",
             Command::ToggleTerminalSuggestions => "Terminal: Toggle Command Suggestions",
+            Command::ToggleScreenReader => "Accessibility: Toggle Screen Reader Mode",
             Command::OpenKeyboardShortcuts => "Preferences: Open Keyboard Shortcuts",
             Command::SwitchProfile => "Profiles: Switch Profile",
             Command::ToggleInlineSuggestions => "Editor: Toggle Inline Suggestions",
@@ -869,6 +872,7 @@ impl Command {
             Command::RerunSearchEditor => "Cmd+K Shift+R",
             Command::RebaseAbort => "",
             Command::ToggleTerminalSuggestions => "",
+            Command::ToggleScreenReader => "",
             Command::OpenKeyboardShortcuts => "Cmd+K Cmd+S",
             Command::SwitchProfile => "",
             Command::ToggleInlineSuggestions => "Cmd+K Shift+G",
@@ -1092,6 +1096,7 @@ impl Command {
             Command::RerunSearchEditor => "rerun_search_editor",
             Command::RebaseAbort => "rebase_abort",
             Command::ToggleTerminalSuggestions => "toggle_terminal_suggestions",
+            Command::ToggleScreenReader => "toggle_screen_reader",
             Command::OpenKeyboardShortcuts => "open_keyboard_shortcuts",
             Command::SwitchProfile => "switch_profile",
             Command::ToggleInlineSuggestions => "toggle_inline_suggestions",
@@ -1361,8 +1366,15 @@ impl CommandPalette {
             .into_iter()
             .enumerate()
             .filter_map(|(idx, item)| {
+                // Match the English title and the translated one (#621), so
+                // a query in either language finds the command.
                 let title_lower = item.title().to_lowercase();
-                fuzzy_score(&needle, &title_lower, 0).map(|score| (score, idx, item))
+                let shown = crate::i18n::tr(item.title()).to_lowercase();
+                let english = fuzzy_score(&needle, &title_lower, 0);
+                let local = (shown != title_lower)
+                    .then(|| fuzzy_score(&needle, &shown, 0))
+                    .flatten();
+                english.max(local).map(|score| (score, idx, item))
             })
             .collect();
         // Higher score first; equal scores keep declaration order.
@@ -1520,7 +1532,7 @@ pub fn render_command_palette(
             Style::default().fg(theme.ui(Color::Rgb(0x8e, 0x95, 0xa4)))
         };
         let prefix = if is_selected { "> " } else { "  " };
-        let title = cmd.title();
+        let title = crate::i18n::tr(cmd.title());
         let hint = cmd.keybinding_hint();
         // Right-align the keybinding hint: pad between the title and the hint
         // so the chord sits at the row's right edge, like VS Code.

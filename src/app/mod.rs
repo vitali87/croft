@@ -2141,6 +2141,32 @@ impl ContextMenu {
         }
     }
 
+    /// Translate every label through the UI catalog (#621). Idempotent: a
+    /// translated label is not itself a key.
+    fn localize(&mut self) {
+        fn walk(items: &mut [MenuEntry]) {
+            for e in items {
+                match e {
+                    MenuEntry::Item { label, .. } | MenuEntry::Header(label) => {
+                        if let std::borrow::Cow::Owned(t) = crate::i18n::tr(label) {
+                            *label = t;
+                        }
+                    }
+                    MenuEntry::Submenu { label, items } => {
+                        if let std::borrow::Cow::Owned(t) = crate::i18n::tr(label) {
+                            *label = t;
+                        }
+                        walk(items);
+                    }
+                    MenuEntry::Separator => {}
+                }
+            }
+        }
+        if crate::i18n::active() {
+            walk(&mut self.items);
+        }
+    }
+
     /// The entries at the active level: the open submenu's children, or the
     /// top-level items.
     fn level_entries(&self) -> &[MenuEntry] {
@@ -3371,6 +3397,13 @@ pub struct App {
     code_lens_requested: std::collections::HashMap<PathBuf, u64>,
     /// Function breakpoints (#611), handed to each session as it launches.
     function_breakpoints: Vec<String>,
+    /// Screen reader mode (#621), its speech command, the announcer, and
+    /// where the status bar drew the announcement this frame (the cursor's
+    /// resting place when no text has focus).
+    screen_reader: bool,
+    screen_reader_command: Option<String>,
+    announcer: crate::a11y::Announcer,
+    announce_pos: Option<(u16, u16)>,
     /// Terminal command suggestions (#614): on or off, and the one painted
     /// this frame as (pane index, the text Right arrow would type).
     term_suggest_enabled: bool,
@@ -4590,6 +4623,9 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
+        if !cfg!(test) {
+            crate::i18n::init(loaded_prefs.locale.as_deref());
+        }
         // Seed the log view's opening default from the saved preference
         // BEFORE any log can be opened (#466): the toggle keeps the two in
         // step afterwards, but a startup that set only `App::log_highlight`
@@ -4999,6 +5035,10 @@ impl App {
             md_scroll_synced: None,
             code_lens_enabled: true,
             function_breakpoints: Vec::new(),
+            screen_reader: loaded_prefs.screen_reader,
+            screen_reader_command: loaded_prefs.screen_reader_command.clone(),
+            announcer: crate::a11y::Announcer::default(),
+            announce_pos: None,
             term_suggest_enabled: true,
             term_suggestion: None,
             recording_shortcut: None,
@@ -6395,7 +6435,9 @@ impl App {
     /// support, which iTerm2 / Terminal.app may have disabled in user
     /// preferences.
     fn cursor_visible_phase(&self) -> bool {
-        self.cursor_blink.visible_phase()
+        // A screen reader follows the cursor; one that vanishes half the
+        // time is lost half the time.
+        self.screen_reader || self.cursor_blink.visible_phase()
     }
 
     /// Re-query git status, but no more than once every ~400ms to avoid
@@ -15815,6 +15857,10 @@ impl App {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let size = frame.area();
         self.last_frame_area = size;
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.localize();
+        }
+        self.update_announcer();
         // Redaction reveal is app state; each pane paints from its own copy.
         let reveal = self.redactions_revealed();
         for t in self.terminals.iter_mut() {
@@ -16956,10 +17002,22 @@ impl App {
         // cheat-sheet — those live in F1 / the Command Palette now. Fenced
         // behind a divider and dimmed so commentary reads apart from the
         // clickable clusters around it.
-        if !self.status.is_empty() {
+        // Screen reader mode shows the announcement in the status slot, and
+        // every status passes through the UI catalog (#621).
+        let status_text = if self.screen_reader && !self.announcer.line.is_empty() {
+            self.announcer.line.clone()
+        } else {
+            crate::i18n::tr(&self.status).into_owned()
+        };
+        self.announce_pos = None;
+        if !status_text.is_empty() {
             spans.push(Span::styled("\u{2502} ", zone_div));
+            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            if status_h > 0 && x < outer[2].width {
+                self.announce_pos = Some((outer[2].x + x, outer[2].y));
+            }
             spans.push(Span::styled(
-                self.status.clone(),
+                status_text.clone(),
                 Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
             ));
         }
@@ -17063,7 +17121,7 @@ impl App {
         // transient loses exactly its tail — for "Opened <deep path>" that
         // was the filename, the one informative part (#100). Middle-elide
         // the transient (always the last span) into the room that survives.
-        if !self.status.is_empty() {
+        if !status_text.is_empty() {
             let left_fixed: u16 = spans
                 .iter()
                 .take(spans.len().saturating_sub(1))
@@ -17079,7 +17137,7 @@ impl App {
             {
                 // Keep the message's dim style through the elision so a
                 // truncated transient doesn't suddenly brighten.
-                *last = Span::styled(elide_middle(&self.status, avail as usize), last.style);
+                *last = Span::styled(elide_middle(&status_text, avail as usize), last.style);
             }
         }
 
@@ -17313,6 +17371,7 @@ impl App {
         {
             frame.set_cursor_position((cx, cy));
         }
+        self.park_screen_reader_cursor(frame);
     }
 
     fn render_context_menu(&self, frame: &mut ratatui::Frame) {
@@ -25595,6 +25654,7 @@ impl App {
                     "toggle:format_on_type" => self.toggle_format_on_type(),
                     "toggle:code_lens" => self.toggle_code_lens(),
                     "toggle:terminal_suggestions" => self.toggle_terminal_suggestions(),
+                    "toggle:screen_reader" => self.toggle_screen_reader(),
                     "cmd:keyboard_shortcuts" => {
                         self.open_keyboard_shortcuts();
                         return;
@@ -25817,6 +25877,13 @@ impl App {
                 label: format!(
                     "Terminal: Command Suggestions: {}",
                     on_off(self.term_suggest_enabled)
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:screen_reader"),
+                label: format!(
+                    "Accessibility: Screen Reader Mode: {}",
+                    on_off(self.screen_reader)
                 ),
             },
         ];
@@ -36604,6 +36671,7 @@ impl App {
             Cmd::OpenSearchEditor => self.open_search_editor(),
             Cmd::RebaseAbort => self.abort_rebase_todo(),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
+            Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
             Cmd::SwitchProfile => self.open_profiles(),
             Cmd::ToggleInlineSuggestions => self.toggle_inline_suggestions(),
@@ -42488,6 +42556,179 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// What screen reader mode describes this frame (#621).
+    fn a11y_snapshot(&self) -> crate::a11y::Snapshot {
+        use crate::a11y::Snapshot;
+        let tr = |s: &str| crate::i18n::tr(s).into_owned();
+        let status = tr(&self.status);
+        if let Some(p) = &self.prompt {
+            return Snapshot {
+                focus: p.label.clone(),
+                item: p.error.clone(),
+                status,
+                ..Default::default()
+            };
+        }
+        if let Some(menu) = &self.context_menu {
+            let item = match menu.cursor_entry() {
+                Some(MenuEntry::Item { label, .. } | MenuEntry::Submenu { label, .. }) => {
+                    Some(label.clone())
+                }
+                _ => None,
+            };
+            return Snapshot {
+                focus: tr("Menu"),
+                item,
+                status,
+                ..Default::default()
+            };
+        }
+        if let Some(p) = &self.command_palette {
+            return Snapshot {
+                focus: tr("Command Palette"),
+                item: p.selected_item().map(|i| tr(i.title())),
+                status,
+                ..Default::default()
+            };
+        }
+        if let Some(f) = &self.file_finder {
+            return Snapshot {
+                focus: tr("Go to File"),
+                item: f.selected_entry().map(|e| e.rel.clone()),
+                status,
+                ..Default::default()
+            };
+        }
+        if let Some(p) = &self.list_picker {
+            return Snapshot {
+                focus: p.title.clone(),
+                item: p.selected_row().map(|r| r.label.clone()),
+                status,
+                ..Default::default()
+            };
+        }
+        match self.focus {
+            Pane::Editor => {
+                let name = self
+                    .editor
+                    .path
+                    .as_deref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| tr("Untitled"));
+                let row = self.editor.cursor_row;
+                let diagnostic = self
+                    .editor
+                    .diagnostics_at(row, self.editor.cursor_col)
+                    .into_iter()
+                    .next()
+                    .map(|(_, m)| m);
+                Snapshot {
+                    focus: format!("{} {name}", tr("Editor")),
+                    line: Some((
+                        row + 1,
+                        self.editor.lines.get(row).cloned().unwrap_or_default(),
+                    )),
+                    diagnostic,
+                    item: self
+                        .completion_popup
+                        .as_ref()
+                        .and_then(|c| c.selected_item())
+                        .map(|c| c.label.clone()),
+                    status,
+                }
+            }
+            Pane::Terminal => Snapshot {
+                focus: format!("{} {}", tr("Terminal"), self.active_terminal + 1),
+                status,
+                ..Default::default()
+            },
+            Pane::Tree => {
+                let (focus, item) = match self.sidebar_view {
+                    SidebarView::Explorer => (
+                        tr("Explorer"),
+                        self.tree
+                            .selected_path()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned()),
+                    ),
+                    SidebarView::Search => (tr("Search"), None),
+                    SidebarView::SourceControl => (tr("Source Control"), None),
+                    SidebarView::Remote => (tr("Remote"), None),
+                    SidebarView::RunDebug => (tr("Run and Debug"), None),
+                    SidebarView::Extensions => (tr("Extensions"), None),
+                    SidebarView::Testing => (tr("Testing"), None),
+                };
+                Snapshot {
+                    focus,
+                    item,
+                    status,
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
+    /// Feed this frame's snapshot to the announcer (#621).
+    fn update_announcer(&mut self) {
+        if !self.screen_reader {
+            return;
+        }
+        let snap = self.a11y_snapshot();
+        let speak = self.screen_reader_command.clone();
+        self.announcer.update(snap, speak.as_deref());
+    }
+
+    /// Accessibility: Toggle Screen Reader Mode (#621), persisted.
+    fn toggle_screen_reader(&mut self) {
+        self.screen_reader = !self.screen_reader;
+        self.announcer.reset();
+        self.status = String::from(if self.screen_reader {
+            "Screen reader mode: on"
+        } else {
+            "Screen reader mode: off"
+        });
+        if !cfg!(test) {
+            let _ = crate::prefs::save_screen_reader(self.screen_reader);
+        }
+    }
+
+    /// Where screen reader mode parks the cursor when no caret is showing:
+    /// the terminal's own cursor, else the start of the announcement.
+    fn park_screen_reader_cursor(&self, frame: &mut ratatui::Frame) {
+        if !self.screen_reader {
+            return;
+        }
+        // A picker covers the caret: read its selection from the status bar.
+        let picker = self.command_palette.is_some()
+            || self.file_finder.is_some()
+            || self.list_picker.is_some();
+        if picker && let Some(pos) = self.announce_pos {
+            frame.set_cursor_position(pos);
+            return;
+        }
+        if self.cursor_should_be_visible() {
+            return;
+        }
+        if self.focus == Pane::Terminal
+            && self.prompt.is_none()
+            && self.context_menu.is_none()
+            && self.command_palette.is_none()
+            && self.file_finder.is_none()
+            && self.list_picker.is_none()
+            && let Some(pos) = self
+                .terminals
+                .get(self.active_terminal)
+                .and_then(|t| t.screen_cursor())
+        {
+            frame.set_cursor_position(pos);
+            return;
+        }
+        if let Some(pos) = self.announce_pos {
+            frame.set_cursor_position(pos);
         }
     }
 

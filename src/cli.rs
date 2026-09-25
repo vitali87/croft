@@ -293,6 +293,15 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         wait: bool,
     },
+    /// Print a JSON template for translating croft's UI into `lang` (#621).
+    ///
+    /// Every palette title, with the built-in translation filled in where one
+    /// exists. Fill in the rest and save it as
+    /// `<config>/locales/<lang>.json`.
+    LocaleTemplate {
+        /// Language code, such as `de` or `fr`.
+        lang: String,
+    },
     /// Open a workspace inside its dev container (#617).
     ///
     /// Reads `.devcontainer/devcontainer.json`, builds or pulls the image,
@@ -515,6 +524,10 @@ impl Cli {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
+                Ok(())
+            }
+            Some(CliCommand::LocaleTemplate { lang }) => {
+                println!("{}", crate::i18n::template(&lang.to_ascii_lowercase(), &[]));
                 Ok(())
             }
             Some(CliCommand::Devcontainer { path, rebuild }) => {
