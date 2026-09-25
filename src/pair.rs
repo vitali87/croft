@@ -2348,7 +2348,7 @@ mod tests {
 
     /// One-shot HTTP stub answering `resp` verbatim after draining the whole
     /// request (headers + Content-Length body), per the SSE-stub trap.
-    fn serve_http_once(resp: String) -> (String, std::thread::JoinHandle<()>) {
+    pub(crate) fn serve_http_once(resp: String) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
