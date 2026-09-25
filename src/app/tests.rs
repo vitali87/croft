@@ -50219,6 +50219,41 @@ fn a_file_saved_during_the_wait_keeps_its_text() {
     );
 }
 
+/// #610: every file that changed during the wait is named, in the order
+/// the servers listed them.
+#[test]
+fn every_file_changed_during_the_wait_is_named() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let root = foo.parent().unwrap().to_path_buf();
+    let nested = root.join("src").join("lib.rs");
+    std::fs::create_dir(nested.parent().unwrap()).unwrap();
+    std::fs::write(&nested, "mod foo;\n").unwrap();
+    let dest = root.join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    app.focus_pane(Pane::Editor);
+    for path in [&lib, &nested] {
+        app.editor.open_pinned(path).unwrap();
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 0;
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let mut answer = mod_foo_to_bar(request_id, &lib);
+    answer
+        .edits
+        .extend(mod_foo_to_bar(request_id, &nested).edits);
+    app.lsp.as_ref().unwrap().answer_will_rename_files(answer);
+    assert!(app.drain_will_rename_files());
+    assert!(
+        app.status
+            .ends_with("; not updated in lib.rs, src/lib.rs (changed during the wait)"),
+        "{}",
+        app.status
+    );
+}
+
 /// #610: Esc stops waiting, the held move goes ahead without an edit, and a
 /// late answer is ignored rather than applied to files that already moved.
 #[test]
