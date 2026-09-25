@@ -26260,6 +26260,21 @@ impl App {
     /// already. Then each symbol tab follows the edit so its clip stays on
     /// its symbol, and closes once the symbol is gone.
     pub(crate) fn sync_symbol_views(&mut self) -> bool {
+        let paths = self.symbol_view_paths();
+        if paths.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for path in &paths {
+            if !self.symbol_path_is_live(path) {
+                changed |= self.mirror_symbol_siblings(path);
+            }
+        }
+        changed | self.follow_symbol_views()
+    }
+
+    /// Every path some symbol tab shows, once each.
+    fn symbol_view_paths(&self) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = Vec::new();
         for group in std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups()) {
             for ed in &group.editors {
@@ -26271,19 +26286,15 @@ impl App {
                 }
             }
         }
-        if paths.is_empty() {
-            return false;
-        }
-        let mut changed = false;
-        for path in &paths {
-            let live = self.collab.as_ref().is_some_and(|session| {
-                collab_file_key(&self.tree.root, path).is_some_and(|f| session.is_live(&f))
-            });
-            if !live {
-                changed |= self.mirror_symbol_siblings(path);
-            }
-        }
-        changed | self.follow_symbol_views()
+        paths
+    }
+
+    /// A file live in a collab session: its tabs follow the session, not
+    /// each other, so [`Self::sync_symbol_views`] leaves them alone.
+    fn symbol_path_is_live(&self, path: &Path) -> bool {
+        self.collab.as_ref().is_some_and(|session| {
+            collab_file_key(&self.tree.root, path).is_some_and(|f| session.is_live(&f))
+        })
     }
 
     /// Mirror the text tabs of `path` against each other; see
@@ -41669,6 +41680,18 @@ impl App {
         // in a second buffer with a different map.
         let mut saved_paths: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> =
             Vec::new();
+        // The tabs of a file with a symbol tab mirror each other (#369), so
+        // they hold one text: the first write saves them all, and writing a
+        // second would read the first as an external change. Settle them
+        // before the sweep (which may close a symbol tab, so before any tab
+        // index is taken) and mark the rest clean after it. A file live in a
+        // collab session is not mirrored, so each of its tabs saves itself.
+        let settled = self.sync_symbol_views();
+        let mirrored: Vec<PathBuf> = self
+            .symbol_view_paths()
+            .into_iter()
+            .filter(|p| !self.symbol_path_is_live(p))
+            .collect();
         // The tab that still holds focus is not saved by the focus-change
         // mode: only buffers that LOST focus are written.
         let keep_focused =
@@ -41704,17 +41727,7 @@ impl App {
         // "name (encoding)" per refused tab: the refusal message names each
         // tab's OWN encoding, which need not be the active tab's.
         let mut lossy: Vec<String> = Vec::new();
-        // The tabs of a file with a symbol tab mirror each other (#369), so
-        // they hold one text: the first write saves them all, and writing a
-        // second would read the first as an external change. Settle them
-        // before the sweep and mark the rest clean after it.
-        self.sync_symbol_views();
-        let mirrored: Vec<PathBuf> = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
-            .flat_map(|g| g.editors.iter())
-            .filter(|e| e.symbol_view.is_some())
-            .filter_map(|e| e.path.clone())
-            .collect();
+        let mut lossy_paths: Vec<PathBuf> = Vec::new();
         let mut sweep = |editors: &mut [crate::widgets::editor::Editor], skip: Option<usize>| {
             for (i, e) in editors
                 .iter_mut()
@@ -41743,8 +41756,14 @@ impl App {
                     // the ONLY chance to tell the user: the FS sweep's
                     // prompt fires on the transition into disk_conflict,
                     // which this save just consumed.
+                    // A mirrored sibling holds the same text and stamp, so it
+                    // meets the same outcome: each file is reported once.
                     Ok(crate::widgets::editor::SaveOutcome::DiskConflict) => {
-                        conflicted.extend(e.path.clone());
+                        if let Some(p) = e.path.clone()
+                            && !conflicted.contains(&p)
+                        {
+                            conflicted.push(p);
+                        }
                     }
                     // Same transition-only reporting as the conflict arm:
                     // the latch just set removes the tab from `due`, so
@@ -41752,7 +41771,11 @@ impl App {
                     // saving. Never arms the lossy write — consent is the
                     // explicit path's alone.
                     Ok(crate::widgets::editor::SaveOutcome::EncodingLoss) => {
-                        if let Some(name) = e.path.as_ref().and_then(|p| p.file_name()) {
+                        if let Some(p) = e.path.as_ref()
+                            && !lossy_paths.contains(p)
+                            && let Some(name) = p.file_name()
+                        {
+                            lossy_paths.push(p.clone());
                             lossy.push(format!(
                                 "{} ({})",
                                 name.to_string_lossy(),
@@ -41788,7 +41811,7 @@ impl App {
         if saved_paths.is_empty() {
             // A conflict-only (or refusal-only) tick still changed the UI:
             // returning false would defer it to the next incidental redraw.
-            return had_conflicts || had_lossy;
+            return settled || had_conflicts || had_lossy;
         }
         // Mirror the explicit-save path: a config file written by auto save
         // must take effect exactly like one written by Cmd+S — including one

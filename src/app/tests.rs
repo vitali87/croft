@@ -43221,6 +43221,60 @@ fn auto_save_writes_a_file_with_a_symbol_tab_once_and_cleans_both() {
     assert!(!app.reload_open_file_after_external_change());
 }
 
+/// #369: both tabs of a file with a symbol tab meet a disk conflict
+/// together, and the prompt names the file once.
+#[test]
+fn auto_save_reports_a_symbol_tabs_file_conflict_once() {
+    use crate::widgets::input_prompt::InputPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.auto_save = true;
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    std::fs::write(
+        &file,
+        "fn a() {\n    1\n}\nfn b() {\n    changed elsewhere\n}",
+    )
+    .unwrap();
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    for e in app.editor.editors.iter_mut() {
+        e.last_edit_at = Some(past);
+    }
+    assert!(app.tick_auto_save());
+    assert!(
+        app.editor.editors.iter().all(|e| e.disk_conflict),
+        "both tabs latch the conflict"
+    );
+    match app.input_prompt.as_ref().map(|p| &p.purpose) {
+        Some(InputPurpose::ReloadConflict { paths }) => assert_eq!(paths, &vec![file]),
+        _ => panic!("a conflict prompt"),
+    }
+}
+
+/// #369: an encoding refusal on a file with a symbol tab names the file
+/// once, not once per tab.
+#[test]
+fn auto_save_names_a_symbol_tabs_file_once_when_its_encoding_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.auto_save = true;
+    app.sync_symbol_views();
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    for e in app.editor.editors.iter_mut() {
+        e.encoding = encoding_rs::WINDOWS_1252;
+        e.lines[4] = String::from("    \u{65e5}\u{672c}");
+        e.dirty = true;
+        e.last_edit_at = Some(past);
+    }
+    assert!(app.tick_auto_save());
+    assert!(app.editor.editors.iter().all(|e| e.encoding_loss));
+    assert_eq!(app.status.matches("two.rs").count(), 1, "{}", app.status);
+}
+
 /// #369: a format-on-save write lands after `save` returned, so it settles
 /// the file's other tab itself rather than leaving it dirty.
 #[test]
