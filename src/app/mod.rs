@@ -29142,7 +29142,7 @@ impl App {
                 dialog.status_line = format!("Verifying credentials with {}", dialog.host);
                 dialog.clear_input();
                 if let Some(auth) = self.connect_auth.as_mut() {
-                    auth.respond_password(&payload);
+                    auth.respond_to_prompt(&payload);
                 }
             }
             KeyCode::Backspace => dialog.pop_input_char(),
@@ -29186,7 +29186,7 @@ impl App {
             );
             dialog.clear_input();
             if let Some(auth) = self.connect_auth.as_mut() {
-                auth.respond_password(&payload);
+                auth.respond_to_prompt(&payload);
             }
             return true;
         }
