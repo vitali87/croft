@@ -403,6 +403,20 @@ pub struct DocumentLinkItem {
     pub target: String,
 }
 
+/// A fresh, complete lens set for one document (#608), every lens already
+/// resolved as far as the server would; same seq contract as
+/// [`InlayHintsUpdate`].
+#[derive(Debug)]
+pub struct CodeLensUpdate {
+    pub path: PathBuf,
+    pub seq: u64,
+    pub lenses: Vec<super::code_lens::Lens>,
+}
+
+/// At most this many unresolved lenses are resolved per request: enough
+/// for a large file's worth of functions, bounded for a generated one.
+const MAX_LENS_RESOLVES: usize = 64;
+
 /// A fresh, complete link set for one document; same seq contract as
 /// [`InlayHintsUpdate`].
 #[derive(Debug)]
@@ -647,6 +661,10 @@ enum Cmd {
         path: PathBuf,
         seq: u64,
     },
+    RequestCodeLens {
+        path: PathBuf,
+        seq: u64,
+    },
     RequestFoldingRanges {
         path: PathBuf,
         seq: u64,
@@ -863,6 +881,7 @@ pub struct LspManager {
     semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
     inlay_rx: std_mpsc::Receiver<InlayHintsUpdate>,
     links_rx: std_mpsc::Receiver<DocumentLinksUpdate>,
+    lens_rx: std_mpsc::Receiver<CodeLensUpdate>,
     folding_rx: std_mpsc::Receiver<FoldingRangesUpdate>,
     colors_rx: std_mpsc::Receiver<DocumentColorsUpdate>,
     color_presentations_rx: std_mpsc::Receiver<ColorPresentationsResult>,
@@ -919,6 +938,7 @@ impl LspManager {
         let (semantic_tx, semantic_rx) = std_mpsc::channel();
         let (inlay_tx, inlay_rx) = std_mpsc::channel();
         let (links_tx, links_rx) = std_mpsc::channel();
+        let (lens_tx, lens_rx) = std_mpsc::channel();
         let (folding_tx, folding_rx) = std_mpsc::channel();
         let (colors_tx, colors_rx) = std_mpsc::channel();
         let (color_presentations_tx, color_presentations_rx) = std_mpsc::channel();
@@ -973,6 +993,7 @@ impl LspManager {
                 semantic_tokens: semantic_tx,
                 inlay_hints: inlay_tx,
                 document_links: links_tx,
+                code_lens: lens_tx,
                 folding_ranges: folding_tx,
                 document_colors: colors_tx,
                 color_presentations: color_presentations_tx,
@@ -1009,6 +1030,7 @@ impl LspManager {
             semantic_rx,
             inlay_rx,
             links_rx,
+            lens_rx,
             folding_rx,
             colors_rx,
             color_presentations_rx,
@@ -1188,6 +1210,17 @@ impl LspManager {
 
     pub fn drain_document_links(&self) -> Option<DocumentLinksUpdate> {
         self.links_rx.try_recv().ok()
+    }
+
+    /// Ask for the document's CodeLens set (#608); fire-and-forget on the
+    /// open/change cadence, silent when no server advertises a
+    /// codeLensProvider.
+    pub fn request_code_lens(&self, path: PathBuf, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestCodeLens { path, seq });
+    }
+
+    pub fn drain_code_lens(&self) -> Option<CodeLensUpdate> {
+        self.lens_rx.try_recv().ok()
     }
 
     /// Ask the server for the document's fold spans (#254). Fire-and-forget
@@ -1827,6 +1860,9 @@ struct ManagedClient {
     supports_document_link: bool,
     supports_folding_range: bool,
     supports_document_color: bool,
+    /// `codeLensProvider` (#608), and whether it resolves lenses lazily.
+    supports_code_lens: bool,
+    code_lens_resolve: bool,
 }
 
 /// Servers are keyed by language AND the file's project root, not language
@@ -1896,6 +1932,7 @@ struct ResultSenders {
     semantic_tokens: std_mpsc::Sender<SemanticTokensUpdate>,
     inlay_hints: std_mpsc::Sender<InlayHintsUpdate>,
     document_links: std_mpsc::Sender<DocumentLinksUpdate>,
+    code_lens: std_mpsc::Sender<CodeLensUpdate>,
     folding_ranges: std_mpsc::Sender<FoldingRangesUpdate>,
     document_colors: std_mpsc::Sender<DocumentColorsUpdate>,
     color_presentations: std_mpsc::Sender<ColorPresentationsResult>,
@@ -2029,6 +2066,9 @@ async fn worker_loop(
                 state
                     .request_document_links(path, seq, &tx.document_links)
                     .await
+            }
+            Cmd::RequestCodeLens { path, seq } => {
+                state.request_code_lens(path, seq, &tx.code_lens).await
             }
             Cmd::RequestFoldingRanges { path, seq } => {
                 state
@@ -2450,6 +2490,12 @@ impl WorkerState {
                         let semantic_supports_range = semantic_tokens_range_supported(caps);
                         let supports_inlay_hints = one_of_supported(&caps.inlay_hint_provider);
                         let supports_document_link = caps.document_link_provider.is_some();
+                        let supports_code_lens = caps.code_lens_provider.is_some();
+                        let code_lens_resolve = caps
+                            .code_lens_provider
+                            .as_ref()
+                            .and_then(|p| p.resolve_provider)
+                            .unwrap_or(false);
                         let supports_folding_range =
                             folding_range_supported(&caps.folding_range_provider);
                         let supports_document_color =
@@ -2494,6 +2540,8 @@ impl WorkerState {
                             supports_document_link,
                             supports_folding_range,
                             supports_document_color,
+                            supports_code_lens,
+                            code_lens_resolve,
                         });
                     }
                     Err(e) => {
@@ -3061,6 +3109,64 @@ impl WorkerState {
                 hints.len()
             ));
             let _ = tx.send(InlayHintsUpdate { path, seq, hints });
+        });
+    }
+
+    /// CodeLens (#608): fire-and-forget, seq-gated, silent when
+    /// unsupported. Lenses the server sent without a command are resolved
+    /// here (up to [`MAX_LENS_RESOLVES`]) so the editor only ever receives
+    /// finished ones.
+    async fn request_code_lens(
+        &mut self,
+        path: PathBuf,
+        seq: u64,
+        tx: &std_mpsc::Sender<CodeLensUpdate>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let picked = clients
+            .iter()
+            .find(|c| c.supports_code_lens)
+            .map(|c| (c.name.clone(), c.client.clone(), c.code_lens_resolve));
+        let Some((server_name, client_arc, can_resolve)) = picked else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await;
+            let mut lenses = match client.code_lens(uri).await {
+                Ok(v) => super::code_lens::parse_lenses(&v),
+                Err(e) => {
+                    log_file::log(&format!("lsp[{server_name}] codeLens error: {e:#}"));
+                    Vec::new()
+                }
+            };
+            if can_resolve {
+                for lens in lenses
+                    .iter_mut()
+                    .filter(|l| l.title.is_none())
+                    .take(MAX_LENS_RESOLVES)
+                {
+                    match client.code_lens_resolve(lens.raw.clone()).await {
+                        Ok(v) => *lens = super::code_lens::resolved(lens, &v),
+                        Err(e) => log_file::log(&format!(
+                            "lsp[{server_name}] codeLens/resolve error: {e:#}"
+                        )),
+                    }
+                }
+            }
+            drop(client);
+            let _ = tx.send(CodeLensUpdate { path, seq, lenses });
         });
     }
 
@@ -5845,6 +5951,9 @@ fn build_client_capabilities() -> ClientCapabilities {
             // Advertise inlay-hint support so servers that gate the provider
             // on it (vtsls) publish `inlayHintProvider` and answer
             // `textDocument/inlayHint`.
+            code_lens: Some(lsp_types::CodeLensClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
             inlay_hint: Some(lsp_types::InlayHintClientCapabilities {
                 dynamic_registration: Some(false),
                 resolve_support: None,
@@ -6506,6 +6615,8 @@ while True:
             supports_document_link: false,
             supports_folding_range: false,
             supports_document_color: false,
+            supports_code_lens: false,
+            code_lens_resolve: false,
         }
     }
 

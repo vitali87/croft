@@ -2509,6 +2509,14 @@ pub struct Editor {
     /// frame: `(screen y, x range, header row, resolution)`. Cleared at
     /// render start so the hit test always describes the painted frame.
     pub merge_action_spans: Vec<(u16, std::ops::Range<u16>, usize, crate::merge::Resolution)>,
+    /// The server's CodeLenses for `code_lens_path` (#608), drawn after
+    /// their line's text while `code_lens_enabled`, and this frame's hit
+    /// spans for the ones croft can act on (cleared at render start, like
+    /// `merge_action_spans`).
+    pub code_lenses: Vec<crate::lsp::code_lens::Lens>,
+    pub code_lens_path: Option<PathBuf>,
+    pub code_lens_enabled: bool,
+    pub lens_action_spans: Vec<(u16, std::ops::Range<u16>, crate::lsp::code_lens::LensAction)>,
     /// Per-source-line git blame for the current file, index 0 = line 1. Set
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
@@ -2989,6 +2997,10 @@ impl Editor {
             auto_pair_at: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
+            code_lenses: Vec::new(),
+            code_lens_path: None,
+            code_lens_enabled: true,
+            lens_action_spans: Vec::new(),
             conflicts_seq: u64::MAX,
             blame_lines: None,
             blame_for: None,
@@ -5766,6 +5778,12 @@ impl Editor {
                 (row > sr || col >= sc) && (row < er || col < ec)
             })
             .map(|l| l.target.as_str())
+    }
+
+    /// Take a fresh CodeLens set for `path` (#608).
+    pub fn apply_code_lens(&mut self, path: PathBuf, lenses: Vec<crate::lsp::code_lens::Lens>) {
+        self.code_lens_path = Some(path);
+        self.code_lenses = lenses;
     }
 
     /// Install the document's color values (#254): wholesale replace,
@@ -12005,6 +12023,7 @@ impl Widget for &mut Editor {
         self.last_scrollbar = Rect::default();
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
+        self.lens_action_spans.clear();
         // Every rect this frame publishes is cleared up front, so a frame
         // that paints nothing leaves nothing behind for the mouse path to
         // hit-test against. `render_log` sets its own when it paints; the
@@ -12863,6 +12882,42 @@ impl Widget for &mut Editor {
                     self.merge_action_spans
                         .push((y, x..x + w, block.ours_start, res));
                     x += w + 2;
+                }
+            }
+
+            // CodeLens (#608): the server's lenses for this line, after its
+            // text on the line's first row, the way the merge lenses above
+            // sit after a marker. The ones croft can carry out are
+            // underlined and clickable; the rest are plain text.
+            if self.code_lens_enabled
+                && (!wrap || row_start == 0)
+                && self.code_lens_path.is_some()
+                && self.code_lens_path == self.path
+            {
+                let text_len = self
+                    .lines
+                    .get(line_idx)
+                    .map(|l| unicode_width::UnicodeWidthStr::width(l.as_str()) as u16)
+                    .unwrap_or(0);
+                let mut x = text_x + text_len.min(row_width) + 3;
+                for lens in self.code_lenses.iter().filter(|l| l.line == line_idx) {
+                    let Some(title) = lens.title.as_deref() else {
+                        continue;
+                    };
+                    let label = crate::lsp::code_lens::display_title(title);
+                    let w = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+                    if w == 0 || x + w > text_x + row_width {
+                        break;
+                    }
+                    let mut style =
+                        Style::default().fg(self.theme.ui(Color::Rgb(0x80, 0x88, 0x98)));
+                    if lens.action != crate::lsp::code_lens::LensAction::None {
+                        style = style.add_modifier(Modifier::UNDERLINED);
+                        self.lens_action_spans
+                            .push((y, x..x + w, lens.action.clone()));
+                    }
+                    buf.set_string(x, y, &label, style);
+                    x += w + 3;
                 }
             }
 

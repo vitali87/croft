@@ -49559,3 +49559,76 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+/// CodeLens (#608) through the App: lenses arriving for the open file are
+/// drawn after their line's text, a references lens is clickable where it
+/// is drawn and moves the caret to the lens's position, a lens croft cannot
+/// carry out is plain text, and the toggle hides them.
+#[test]
+fn code_lenses_draw_after_their_line_and_a_click_carries_them_out() {
+    use crate::lsp::code_lens::{LensAction, parse_lenses};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.ts");
+    std::fs::write(&file, "const x = 1;\nfunction f() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    let lenses = parse_lenses(&serde_json::json!([
+        {"range": {"start": {"line": 1, "character": 9}, "end": {"line": 1, "character": 10}},
+         "command": {"title": "$(refs) 2 references", "command": "editor.action.showReferences",
+                     "arguments": []}},
+        {"range": {"start": {"line": 1, "character": 9}, "end": {"line": 1, "character": 10}},
+         "command": {"title": "custom", "command": "server.only.thing"}}
+    ]));
+    app.editor.apply_code_lens(file.clone(), lenses);
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let row = |term: &ratatui::Terminal<ratatui::backend::TestBackend>, y: u16| -> String {
+        (0..100)
+            .map(|x| term.backend().buffer()[(x, y)].symbol())
+            .collect()
+    };
+    let y = app.editor.last_inner.y + 1;
+    let line = row(&term, y);
+    assert!(
+        line.contains("function f() {}   2 references   custom"),
+        "{line}"
+    );
+    assert_eq!(
+        app.editor.lens_action_spans.len(),
+        1,
+        "only the lens croft can carry out"
+    );
+    let (sy, xs, action) = app.editor.lens_action_spans[0].clone();
+    assert_eq!(action, LensAction::References { line: 1, col: 9 });
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: xs.start,
+        row: sy,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 9));
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleCodeLens);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(!row(&term, y).contains("references"));
+    assert!(app.editor.lens_action_spans.is_empty());
+
+    // Lenses belong to their file: another file in the same editor shows
+    // none of them, even on a line of the same number.
+    app.run_command(crate::widgets::command_palette::Command::ToggleCodeLens);
+    let other = tmp.path().join("b.ts");
+    std::fs::write(
+        &other,
+        "let a = 1;
+let b = 2;
+",
+    )
+    .unwrap();
+    app.editor.open(&other).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let shown = row(&term, y);
+    assert!(shown.contains("let b = 2;"), "{shown}");
+    assert!(!shown.contains("references"), "{shown}");
+}
