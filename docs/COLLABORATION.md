@@ -28,8 +28,9 @@ observers, enforced by the host, with everyone's window sized to the smallest pa
 
 The status bar shows an "N attached" badge whenever someone else is on, and
 **Session: Participants** (`Cmd+K A`) lists everyone so you can grant or revoke write control
-or disconnect a participant. When several people hold control and take turns typing, each keeps
-their own caret: croft parks the previous typist's cursor, restores the new typist's, and shows
+or disconnect a participant. **Session: Detach** (`Cmd+K Shift+Q`) leaves the session without
+ending it, from any client, read-only ones included. When several people hold control and take
+turns typing, each keeps their own caret: croft parks the previous typist's cursor, restores the new typist's, and shows
 everyone else's position as a colored ghost caret in the editor.
 
 ## Independent viewports (`--solo`)

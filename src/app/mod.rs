@@ -18951,6 +18951,13 @@ impl App {
                 self.goto_last_edit_location();
                 true
             }
+            // Cmd+K Shift+Q: Session: Detach (#679). Normally the attach
+            // client takes this chord before it reaches croft; this arm
+            // serves a leader the client released after its pause.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'q') => {
+                self.detach_session_client();
+                true
+            }
             // Cmd+K Q: ask the navigator about the caret line, or the
             // selected lines when a selection is active (Q for question).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'q') => {
@@ -24296,6 +24303,46 @@ impl App {
             rows,
         );
         self.open_list_picker(picker, "No participants yet");
+    }
+
+    /// Session: Detach (#679): disconnect the client that asked, which is
+    /// the one whose keystrokes reached croft last (the host announces the
+    /// typist before its bytes). The session keeps running, and the client
+    /// restores its terminal on the way out.
+    fn detach_session_client(&mut self) {
+        if self.session_channel.is_none() {
+            self.status =
+                String::from("Not attached to a persistent session: nothing to detach from");
+            return;
+        }
+        // The Typing frame for the key that ran this is already on the
+        // channel; take it now rather than on the next tick.
+        self.poll_session_typing();
+        let sole = match self.session_participants.as_slice() {
+            [only] => Some(only.id),
+            _ => None,
+        };
+        let target = self.session_typist.or(sole);
+        let Some(id) = target else {
+            self.status = String::from(
+                "Could not tell which client asked to detach; use Session: Participants (Cmd+K A)",
+            );
+            return;
+        };
+        let name = self
+            .session_participants
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| format!("participant {id}"));
+        let Some(channel) = self.session_channel.as_mut() else {
+            return;
+        };
+        self.status = if channel.kick(id) {
+            format!("{name} detached; the session keeps running")
+        } else {
+            String::from("Session host unreachable")
+        };
     }
 
     /// Second-level picker for one participant: grant or revoke write
@@ -37704,6 +37751,7 @@ impl App {
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
             Cmd::SessionParticipants => self.open_participants_picker(),
+            Cmd::SessionDetach => self.detach_session_client(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),

@@ -51009,3 +51009,17 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+/// #679: outside a persistent session there is nothing to detach from,
+/// and saying so beats a chord that silently does nothing.
+#[test]
+fn session_detach_outside_a_session_says_there_is_nothing_to_detach_from() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_channel = None;
+    app.run_command(crate::widgets::command_palette::Command::SessionDetach);
+    assert_eq!(
+        app.status,
+        "Not attached to a persistent session: nothing to detach from"
+    );
+}

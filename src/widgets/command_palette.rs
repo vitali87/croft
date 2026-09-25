@@ -216,6 +216,9 @@ pub enum Command {
     /// Multiplayer: list who is attached to this persistent session and
     /// grant/revoke write control or disconnect them (docs/MULTIPLAYER.md).
     SessionParticipants,
+    /// Detach the client that invoked it from the persistent session; the
+    /// session keeps running (#679).
+    SessionDetach,
     /// Cancel the AI pilot's token stream into a shared file; the pilot
     /// reverts the streamed text (`croft pair`, docs/MULTIPLAYER.md).
     CollabCancelStream,
@@ -471,6 +474,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RevealRedactedSecrets,
     Command::SearchFromTerminal,
     Command::SessionParticipants,
+    Command::SessionDetach,
     Command::CollabCancelStream,
     Command::AskNavigator,
     Command::AskNavigatorAboutCapture,
@@ -699,6 +703,7 @@ impl Command {
             Command::RevealRedactedSecrets => "Terminal: Reveal Redacted Secrets for 10s",
             Command::SearchFromTerminal => "Terminal: Search & Replace from Last grep/rg",
             Command::SessionParticipants => "Session: Participants",
+            Command::SessionDetach => "Session: Detach",
             Command::CollabCancelStream => "Collab: Cancel AI Stream",
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
             Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
@@ -927,6 +932,7 @@ impl Command {
             Command::RevealRedactedSecrets => "",
             Command::SearchFromTerminal => "",
             Command::SessionParticipants => "Cmd+K A",
+            Command::SessionDetach => "Cmd+K Shift+Q",
             Command::CollabCancelStream => "Cmd+K X",
             Command::AskNavigator => "Cmd+K Q",
             Command::AskNavigatorAboutCapture => "",
@@ -1155,6 +1161,7 @@ impl Command {
             Command::RevealRedactedSecrets => "reveal_redacted_secrets",
             Command::SearchFromTerminal => "search_from_terminal",
             Command::SessionParticipants => "session_participants",
+            Command::SessionDetach => "session_detach",
             Command::CollabCancelStream => "collab_cancel_stream",
             Command::AskNavigator => "navigator_ask",
             Command::AskNavigatorAboutCapture => "captures_ask_navigator",
