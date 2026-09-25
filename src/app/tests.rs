@@ -49586,6 +49586,57 @@ fn mod_foo_to_bar(request_id: u64, lib: &Path) -> crate::lsp::manager::WillRenam
     }
 }
 
+/// #610: while one move is held for the servers' edit, a second rename is
+/// refused in its prompt (which stays open to retry) and nothing moves.
+#[test]
+fn a_rename_prompt_is_refused_while_a_move_is_held() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let rename = |app: &mut App, path: &Path, to: &str| {
+        app.prompt = Some(super::Prompt {
+            label: String::from("Rename"),
+            buffer: String::from(to),
+            kind: super::PromptKind::Rename(path.to_path_buf()),
+            target_dir: path.parent().unwrap().to_path_buf(),
+            error: None,
+        });
+        app.commit_prompt();
+    };
+    rename(&mut app, &foo, "bar.rs");
+    assert!(app.pending_file_move.is_some(), "the first rename is held");
+    rename(&mut app, &lib, "main.rs");
+    let prompt = app.prompt.as_ref().expect("the refused prompt stays open");
+    assert_eq!(
+        prompt.error.as_deref(),
+        Some("Still updating references for the last move (Esc to skip)")
+    );
+    assert!(lib.exists() && !lib.with_file_name("main.rs").exists());
+}
+
+/// #610: the servers' edit lands before the file moves, so a move that then
+/// fails on disk leaves references pointing at the new path; the status says
+/// so instead of only reporting the count.
+#[test]
+fn a_rename_that_fails_after_the_edit_names_the_stranded_references() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    app.editor.open(&lib).unwrap();
+    let gone = foo.with_file_name("gone.rs");
+    app.finish_file_move(
+        super::FileMove::Rename {
+            parent: foo.parent().unwrap().to_path_buf(),
+            old: gone.clone(),
+            new: foo.with_file_name("bar.rs"),
+        },
+        Some(&mod_foo_to_bar(1, &lib).edits),
+    );
+    assert!(app.status.starts_with("Rename failed: "), "{}", app.status);
+    assert!(
+        app.status
+            .ends_with("; 1 reference(s) already point at the new path"),
+        "{}",
+        app.status
+    );
+}
+
 /// #610: with a server listening for `willRenameFiles`, the Explorer rename
 /// waits for its answer, applies the edit to the files where they stand, and
 /// only then renames on disk, the open tab following the file.

@@ -45868,11 +45868,18 @@ impl App {
         op: FileMove,
         edits: Option<&[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)]>,
     ) {
+        // `updated` counts the references already rewritten to the new
+        // paths, which a move that then fails on disk leaves pointing at a
+        // path that does not exist; the failure status says so.
+        let mut updated = 0;
         let note = if let Some(edits) = edits
             && !edits.iter().all(|(_, e)| e.is_empty())
         {
             match self.apply_rename_edits(edits) {
-                Ok((_, occ)) => format!(", {occ} reference(s) updated"),
+                Ok((_, occ)) => {
+                    updated = occ;
+                    format!(", {occ} reference(s) updated")
+                }
                 Err(e) => format!(", updating references failed: {e}"),
             }
         } else if edits.is_none() {
@@ -45886,7 +45893,13 @@ impl App {
                 if old != new {
                     let is_dir = old.is_dir();
                     if let Err(e) = crate::widgets::file_tree::relocate(&old, &new) {
-                        self.status = format!("Rename failed: {e}{note}");
+                        self.status = if updated > 0 {
+                            format!(
+                                "Rename failed: {e}; {updated} reference(s) already point at the new path"
+                            )
+                        } else {
+                            format!("Rename failed: {e}{note}")
+                        };
                         return;
                     }
                     done.push(crate::lsp::manager::FileRename {
@@ -45912,6 +45925,7 @@ impl App {
             } => {
                 let mut affected = BTreeSet::from([dest_dir.clone()]);
                 let mut placed: Vec<PathBuf> = Vec::new();
+                let mut unmoved = 0;
                 for (src, dest) in planned {
                     affected.insert(
                         src.parent()
@@ -45929,9 +45943,19 @@ impl App {
                             });
                             placed.push(dest);
                         }
-                        Err(e) => failed.push(format!("{}: {e}", src.display())),
+                        Err(e) => {
+                            unmoved += 1;
+                            failed.push(format!("{}: {e}", src.display()));
+                        }
                     }
                 }
+                let note = if unmoved > 0 && updated > 0 {
+                    format!(
+                        "{note}, including references to the item(s) that failed to move, which now point at a missing path"
+                    )
+                } else {
+                    note
+                };
                 self.show_placed_entries(
                     &dest_dir, &affected, &placed, &failed, total, "Moved", &note,
                 );
