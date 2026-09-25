@@ -43859,9 +43859,10 @@ fn undo_once_after_m_goes(in_kept: bool) -> String {
             .iter()
             .position(|e| e.symbol_view.as_ref().is_some_and(|v| v.name == name))
     }
+    let m_line = "    fn m() {}";
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("s.rs");
-    std::fs::write(&file, "impl S {\n    fn m() {}\n}\n").unwrap();
+    std::fs::write(&file, format!("impl S {{\n{m_line}\n}}\n")).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_pinned(&file).unwrap();
     for row in [1, 0] {
@@ -43881,9 +43882,9 @@ fn undo_once_after_m_goes(in_kept: bool) -> String {
     let imp = tab(&app, "S").expect("the impl tab");
     app.editor.select(imp);
     app.editor.cursor_row = 1;
-    app.editor.cursor_col = 13;
+    app.editor.cursor_col = m_line.chars().count();
     app.focus_pane(Pane::Editor);
-    for _ in 0..13 {
+    for _ in 0..m_line.chars().count() {
         app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
             .unwrap();
     }
@@ -43894,7 +43895,10 @@ fn undo_once_after_m_goes(in_kept: bool) -> String {
         .iter()
         .position(|e| e.symbol_view.is_none())
         .expect("the m tab became the file tab");
-    assert_eq!(app.editor.editors[kept].lines[1], "");
+    assert_eq!(
+        app.editor.editors[kept].lines[1], "",
+        "the kept tab mirrors the emptied line"
+    );
     let at = if in_kept {
         kept
     } else {
