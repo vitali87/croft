@@ -20498,11 +20498,15 @@ impl App {
         // A data breakpoint answer belongs to the session that was asked,
         // even when focus moved to another compound member meanwhile.
         let mut data_notes: Vec<String> = Vec::new();
+        // So does a note on breakpoints the adapter cannot honour: a
+        // background member says it once, at its `initialized`.
+        let mut breakpoint_notes: Vec<(usize, String)> = Vec::new();
         for (index, session) in self.debug_sessions.iter_mut_indexed() {
             let mut drained = session.poll();
             drained.retain(|e| match e {
                 DapEvent::DataBreakpointInfo {
                     name,
+                    container,
                     data_id,
                     description,
                     access_types,
@@ -20510,10 +20514,15 @@ impl App {
                     data_notes.push(apply_data_breakpoint_info(
                         session,
                         name,
+                        *container,
                         data_id.clone(),
                         description,
                         access_types,
                     ));
+                    false
+                }
+                DapEvent::BreakpointNote(text) => {
+                    breakpoint_notes.push((index, text.clone()));
                     false
                 }
                 _ => true,
@@ -20526,6 +20535,18 @@ impl App {
             if drained.iter().any(|e| matches!(e, DapEvent::Terminated)) {
                 background_ended.push(index);
             }
+        }
+        // Named by member when there is more than one, before any retires.
+        if !breakpoint_notes.is_empty() {
+            let names = self.debug_sessions.names();
+            for (index, text) in breakpoint_notes {
+                let line = match names.get(index) {
+                    Some(name) if names.len() > 1 => format!("{name}: {text}"),
+                    _ => text,
+                };
+                self.debug_console_push(line);
+            }
+            changed_background = true;
         }
         // Highest index first, so removing one does not move the next.
         let mut ended_names = Vec::new();
@@ -20549,8 +20570,8 @@ impl App {
             self.report_member_ended(&ended_names.join(", "));
         }
         let mut changed = !events.is_empty() || changed_background;
-        if let Some(note) = data_notes.pop() {
-            self.status = note;
+        if !data_notes.is_empty() {
+            self.status = data_notes.join("; ");
             changed = true;
         }
         for ev in events {
@@ -39520,13 +39541,21 @@ impl App {
                     }) = self.run_debug.debug_rows.get(idx).map(|r| r.kind.clone())
                 {
                     self.focus_pane(Pane::Tree);
-                    // The item toggles, so it says which way it goes.
-                    let set = self
-                        .debug_sessions
-                        .focused()
-                        .is_some_and(|s| s.data_breakpoints.iter().any(|b| b.name == name));
-                    let label = if set {
+                    // The item toggles, so it says which way it goes. The
+                    // adapter's id decides, and it is only known after asking:
+                    // a same-named variable set under another reference (a
+                    // different scope, or an earlier stop) may or may not be
+                    // this one, so the item does not claim either way.
+                    let (exact, same_name) =
+                        self.debug_sessions.focused().map_or((false, false), |s| {
+                            let mut named = s.data_breakpoints.iter().filter(|b| b.name == name);
+                            let same_name = named.clone().next().is_some();
+                            (named.any(|b| b.container == container), same_name)
+                        });
+                    let label = if exact {
                         "Remove Data Breakpoint"
+                    } else if same_name {
+                        "Toggle Break on Value Change"
                     } else {
                         "Break on Value Change"
                     };
@@ -50591,6 +50620,7 @@ const TERMINAL_RESTORE_SEQ: &[u8] =
 fn apply_data_breakpoint_info(
     session: &mut crate::dap::session::DapSession,
     name: &str,
+    container: i64,
     data_id: Option<String>,
     description: &str,
     access_types: &[String],
@@ -50612,7 +50642,7 @@ fn apply_data_breakpoint_info(
             access_types.join(", ")
         );
     };
-    if session.toggle_data_breakpoint(id, name.to_string(), access) {
+    if session.toggle_data_breakpoint(id, name.to_string(), container, access) {
         format!("Breaks when {name} changes")
     } else {
         format!("No longer breaks when {name} changes")

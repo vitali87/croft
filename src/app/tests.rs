@@ -49805,11 +49805,7 @@ fn a_session_reports_the_breakpoints_its_adapter_cannot_honour() {
         events
             .into_iter()
             .filter_map(|e| match e {
-                crate::dap::session::DapEvent::Output { category, text }
-                    if category == "console" =>
-                {
-                    Some(text)
-                }
+                crate::dap::session::DapEvent::BreakpointNote(text) => Some(text),
                 _ => None,
             })
             .collect()
@@ -50016,6 +50012,46 @@ fn right_click_on_a_variable_breaks_on_its_value_change() {
         vec!["Remove Data Breakpoint"],
         "the item says it removes the breakpoint it toggles off"
     );
+    // Set under another reference (another scope, or an earlier stop): only
+    // the adapter's id can say whether it is this variable.
+    app.debug_sessions.focused_mut().unwrap().data_breakpoints[0].container = 99;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y));
+    let menu = app.context_menu.as_ref().expect("the menu a third time");
+    assert_eq!(
+        menu_labels(&menu.items),
+        vec!["Toggle Break on Value Change"]
+    );
+}
+
+/// A compound member in the background still says which breakpoints its
+/// adapter cannot honour: the note reaches the debug console, named by the
+/// member, although another session is focused.
+#[test]
+fn a_background_members_breakpoint_note_reaches_the_console() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (first, _first_wire) = crate::dap::session::DapSession::fake(Default::default());
+    app.debug_sessions.push("front", first);
+    let (back, back_wire) = crate::dap::session::DapSession::fake(Default::default());
+    let back = with_function_breakpoints(back, &[String::from("main")]);
+    app.debug_sessions.push("back", back);
+    app.debug_sessions.focus(0);
+    back_wire
+        .adapter
+        .send(
+            serde_json::json!({"type": "response", "command": "initialize",
+                                 "success": true, "body": {}}),
+        )
+        .unwrap();
+    back_wire
+        .adapter
+        .send(serde_json::json!({"type": "event", "event": "initialized"}))
+        .unwrap();
+    app.poll_dap();
+    assert_eq!(
+        app.debug_console,
+        ["back: This debug adapter does not support function breakpoints; not set: main"]
+    );
 }
 
 /// Break on Value Change is a write watchpoint: an adapter offering only
@@ -50029,6 +50065,7 @@ fn a_data_breakpoint_answer_sets_a_write_watchpoint_or_says_why_not() {
         let status = apply_data_breakpoint_info(
             &mut session,
             "y",
+            7,
             data_id.map(str::to_string),
             description,
             &types,

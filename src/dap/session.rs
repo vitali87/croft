@@ -70,10 +70,16 @@ pub enum DapEvent {
     /// `description` then says why.
     DataBreakpointInfo {
         name: String,
+        /// The `variablesReference` the variable was asked under.
+        container: i64,
         data_id: Option<String>,
         description: String,
         access_types: Vec<String>,
     },
+    /// A breakpoint the launch set asks for that this adapter cannot honour,
+    /// said once at `initialized`. It belongs in the debug console whichever
+    /// session is focused.
+    BreakpointNote(String),
 }
 
 /// One breakpoint's binding status as reported by the adapter: the source file,
@@ -412,6 +418,9 @@ pub fn set_function_breakpoints_request(names: &[String]) -> Value {
 pub struct DataBreakpoint {
     pub data_id: String,
     pub name: String,
+    /// The `variablesReference` it was set under: a same-named variable in
+    /// another scope is a different variable.
+    pub container: i64,
     pub access_type: Option<String>,
 }
 
@@ -950,7 +959,7 @@ pub struct DapSession {
     /// run, so these end with the session.
     pub data_breakpoints: Vec<DataBreakpoint>,
     /// In-flight `dataBreakpointInfo` requests: request `seq` -> variable name.
-    pending_data_info: std::collections::HashMap<i64, String>,
+    pending_data_info: std::collections::HashMap<i64, (String, i64)>,
     /// A Run to Cursor in progress: the file and line of its temporary
     /// breakpoint, removed at the next stop or exit (#611).
     run_to: Option<(PathBuf, u32)>,
@@ -1278,7 +1287,9 @@ impl DapSession {
                 }
                 Some("dataBreakpointInfo") => {
                     let req_seq = msg.get("request_seq").and_then(Value::as_i64);
-                    if let Some(name) = req_seq.and_then(|s| self.pending_data_info.remove(&s)) {
+                    if let Some((name, container)) =
+                        req_seq.and_then(|s| self.pending_data_info.remove(&s))
+                    {
                         let body = msg.get("body");
                         let text = |key: &str| {
                             body.and_then(|b| b.get(key))
@@ -1297,6 +1308,7 @@ impl DapSession {
                             .unwrap_or_default();
                         out.push(DapEvent::DataBreakpointInfo {
                             name,
+                            container,
                             data_id: text("dataId"),
                             description: text("description")
                                 .or_else(|| text("message"))
@@ -1379,12 +1391,11 @@ impl DapSession {
                 self.push_breakpoints();
                 if !self.degraded_noted {
                     self.degraded_noted = true;
-                    out.extend(self.unsupported_breakpoint_notes().into_iter().map(|text| {
-                        DapEvent::Output {
-                            category: String::from("console"),
-                            text,
-                        }
-                    }));
+                    out.extend(
+                        self.unsupported_breakpoint_notes()
+                            .into_iter()
+                            .map(DapEvent::BreakpointNote),
+                    );
                 }
                 let t = self.active();
                 if self.capabilities.function_breakpoints && !self.function_breakpoints.is_empty() {
@@ -1423,7 +1434,8 @@ impl DapSession {
             DapEvent::BreakpointsUpdated
             | DapEvent::InspectionUpdated
             | DapEvent::Evaluated { .. }
-            | DapEvent::DataBreakpointInfo { .. } => {}
+            | DapEvent::DataBreakpointInfo { .. }
+            | DapEvent::BreakpointNote(_) => {}
         }
         // Suppress the parent's own `terminated` for js-debug while a child is
         // still live (the parent can wind down its bootstrap connection first).
@@ -1459,9 +1471,6 @@ impl DapSession {
         }
     }
 
-    /// Send `path`'s whole breakpoint set as the adapter should see it: hit
-    /// counts dropped when it does not support them, and a pending Run to
-    /// Cursor's temporary breakpoint added.
     /// What the launch set asks for that this adapter cannot honour: function
     /// breakpoints it will not set, and hit counts it drops (those lines
     /// pause on every hit instead).
@@ -1487,6 +1496,9 @@ impl DapSession {
         notes
     }
 
+    /// Send `path`'s whole breakpoint set as the adapter should see it: hit
+    /// counts dropped when it does not support them, and a pending Run to
+    /// Cursor's temporary breakpoint added.
     fn send_file_breakpoints(&self, path: &Path) {
         let mut bps: Vec<SourceBreakpoint> =
             self.breakpoints.get(path).cloned().unwrap_or_default();
@@ -1532,7 +1544,8 @@ impl DapSession {
             .active()
             .send(data_breakpoint_info_request(variables_reference, name))
         {
-            self.pending_data_info.insert(seq, name.to_string());
+            self.pending_data_info
+                .insert(seq, (name.to_string(), variables_reference));
         }
         true
     }
@@ -1543,6 +1556,7 @@ impl DapSession {
         &mut self,
         data_id: String,
         name: String,
+        container: i64,
         access_type: Option<String>,
     ) -> bool {
         let added = if let Some(i) = self
@@ -1556,6 +1570,7 @@ impl DapSession {
             self.data_breakpoints.push(DataBreakpoint {
                 data_id,
                 name,
+                container,
                 access_type,
             });
             true
@@ -1574,6 +1589,7 @@ impl DapSession {
             return false;
         }
         // Every stop ends the previous Run to Cursor, so none is pending here.
+        debug_assert!(self.run_to.is_none());
         self.run_to = Some((path.to_path_buf(), line));
         self.send_file_breakpoints(path);
         self.continue_execution();
@@ -1961,6 +1977,7 @@ mod tests {
             events,
             vec![DapEvent::DataBreakpointInfo {
                 name: String::from("x"),
+                container: 7,
                 data_id: Some(String::from("7:x")),
                 description: String::from("x"),
                 access_types: vec![String::from("write")],
@@ -1970,6 +1987,7 @@ mod tests {
         assert!(session.toggle_data_breakpoint(
             String::from("7:x"),
             String::from("x"),
+            7,
             Some(String::from("write"))
         ));
         assert_eq!(
@@ -1977,7 +1995,7 @@ mod tests {
             json!([{"dataId": "7:x", "accessType": "write"}])
         );
         wire.clear();
-        assert!(!session.toggle_data_breakpoint(String::from("7:x"), String::from("x"), None));
+        assert!(!session.toggle_data_breakpoint(String::from("7:x"), String::from("x"), 7, None));
         assert_eq!(wire.sent()[0]["arguments"]["breakpoints"], json!([]));
     }
 
@@ -2000,6 +2018,7 @@ mod tests {
             events,
             vec![DapEvent::DataBreakpointInfo {
                 name: String::from("f"),
+                container: 7,
                 data_id: None,
                 description: String::from("functions cannot be watched"),
                 access_types: Vec::new(),
@@ -2025,6 +2044,7 @@ mod tests {
             events,
             vec![DapEvent::DataBreakpointInfo {
                 name: String::from("x"),
+                container: 7,
                 data_id: None,
                 description: String::from("not supported here"),
                 access_types: Vec::new(),
