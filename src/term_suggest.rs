@@ -41,7 +41,7 @@ pub fn suggest(
         return Vec::new();
     }
     let mut out: Vec<Suggestion> = Vec::new();
-    let mut push = |out: &mut Vec<Suggestion>, s: Suggestion| {
+    let push = |out: &mut Vec<Suggestion>, s: Suggestion| {
         if !s.insert.is_empty() && !out.iter().any(|o| o.insert == s.insert) {
             out.push(s);
         }

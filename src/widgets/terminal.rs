@@ -2865,6 +2865,19 @@ impl PtyTerminal {
         self.pty_dirty.load(Ordering::Acquire)
     }
 
+    /// The host-screen cell the cursor is drawn in, when the view is at the
+    /// live bottom (not scrolled back) and the pane has been drawn.
+    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
+        let inner = self.last_inner;
+        let term = self.term.lock();
+        if inner.width == 0 || term.grid().display_offset() != 0 {
+            return None;
+        }
+        let c = term.grid().cursor.point;
+        let (row, col) = (u16::try_from(c.line.0).ok()?, c.column.0 as u16);
+        (row < inner.height && col < inner.width).then_some((inner.x + col, inner.y + row))
+    }
+
     pub fn cell_at(&self, col: u16, row: u16) -> Option<(u16, u16)> {
         let inner = self.last_inner;
         if inner.width == 0 || inner.height == 0 {
