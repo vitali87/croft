@@ -72,6 +72,28 @@ pub fn keybindings_file(config_dir: &Path, profile: &str) -> PathBuf {
     config_dir.join("keybindings.json")
 }
 
+/// A settings file's `text` (a JSON object, or empty) with `profile` set
+/// to `name`, or removed when `name` is empty.
+pub fn set_profile_in(text: &str, name: &str) -> Result<String, String> {
+    let mut map = if text.trim().is_empty() {
+        serde_json::Map::new()
+    } else {
+        match serde_json::from_str::<serde_json::Value>(&crate::tasks::strip_jsonc(text)) {
+            Ok(serde_json::Value::Object(m)) => m,
+            Ok(_) => return Err(String::from("the settings file is not a JSON object")),
+            Err(e) => return Err(format!("the settings file does not parse: {e}")),
+        }
+    };
+    if name.is_empty() {
+        map.remove("profile");
+    } else {
+        map.insert(String::from("profile"), serde_json::Value::from(name));
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(map))
+        .map(|s| s + "\n")
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +166,19 @@ mod tests {
             user,
             "an invalid name is ignored"
         );
+    }
+
+    #[test]
+    fn the_profile_key_is_set_or_removed_and_other_keys_stay() {
+        let out = set_profile_in("{\"theme\": \"dark\"}", "Python").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"theme": "dark", "profile": "Python"}));
+        let out = set_profile_in(&out, "").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"theme": "dark"}));
+        let v: serde_json::Value =
+            serde_json::from_str(&set_profile_in("", "Python").unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"profile": "Python"}));
+        assert!(set_profile_in("[1]", "Python").is_err());
     }
 }

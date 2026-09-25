@@ -56,6 +56,11 @@ pub enum ListPurpose {
     /// Action on one participant: `id` is `grant:<id>` / `revoke:<id>` /
     /// `kick:<id>`, applied through the session host's control channel.
     SessionParticipantAction,
+    /// Profiles: Switch Profile (#618): `id` is the profile name, empty for
+    /// no profile.
+    SwitchProfile,
+    /// Profiles: Use Profile in This Workspace (#618): `id` as above.
+    WorkspaceProfile,
 }
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a
