@@ -1655,9 +1655,6 @@ fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
     }
 }
 
-/// Run `cmd` on the remote over the existing master socket (no second auth, no
-/// nested master). Used for the relay inbox bookkeeping (`mkdir`, sentinel
-/// writes). Returns whether it exited zero.
 /// Run `cmd` on the remote and return its exit status: `None` when ssh could
 /// not run it at all, `Some(255)` when the connection failed.
 fn ssh_status(host: &str, socket: &Path, cmd: &str) -> Option<i32> {
@@ -1676,6 +1673,9 @@ fn ssh_status(host: &str, socket: &Path, cmd: &str) -> Option<i32> {
         .and_then(|s| s.code())
 }
 
+/// Run `cmd` on the remote over the existing master socket (no second auth, no
+/// nested master). Used for the relay inbox bookkeeping (`mkdir`, sentinel
+/// writes). Returns whether it exited zero.
 fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
     Command::new("ssh")
         .arg("-S")
