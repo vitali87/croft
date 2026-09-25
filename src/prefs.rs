@@ -461,6 +461,21 @@ pub fn trust_mcp_tool_in(config_dir: &Path, command_id: &str, fingerprint: &str)
     }
 }
 
+/// Forget the recorded tool fingerprints of `command_ids`, so each tool is
+/// trusted afresh on its next run; see [`trust_mcp_tool_in`].
+pub fn forget_mcp_tool_fingerprints_in(config_dir: &Path, command_ids: &[String]) -> Result<()> {
+    let path = config_dir.join("config.json");
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let before = prefs.mcp_tool_fingerprints.len();
+    prefs
+        .mcp_tool_fingerprints
+        .retain(|id, _| !command_ids.contains(id));
+    if prefs.mcp_tool_fingerprints.len() == before {
+        return Ok(());
+    }
+    prefs.save(&path)
+}
+
 /// Persist the Customize Layout chrome choices, preserving other settings.
 /// Best-effort: a write failure is swallowed by the caller.
 pub fn save_layout(layout: LayoutPrefs) -> Result<()> {
@@ -694,13 +709,12 @@ mod tests {
 
     #[test]
     fn an_mcp_tool_is_trusted_on_first_use_and_refused_once_it_changes() {
-        let dir = std::env::temp_dir().join(format!("croft-prefs-tofu-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        save_mcp_consent_in(&dir, "ext").unwrap();
-        assert!(trust_mcp_tool_in(&dir, "ext.cmd", "fp1"));
-        assert!(trust_mcp_tool_in(&dir, "ext.cmd", "fp1"));
-        assert!(!trust_mcp_tool_in(&dir, "ext.cmd", "fp2"));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        save_mcp_consent_in(dir, "ext").unwrap();
+        assert!(trust_mcp_tool_in(dir, "ext.cmd", "fp1"));
+        assert!(trust_mcp_tool_in(dir, "ext.cmd", "fp1"));
+        assert!(!trust_mcp_tool_in(dir, "ext.cmd", "fp2"));
         let saved = Prefs::load(&dir.join("config.json")).unwrap();
         assert_eq!(
             saved
@@ -713,7 +727,19 @@ mod tests {
             saved.mcp_consented.contains("ext"),
             "other settings survive"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Forgetting a command's fingerprint re-approves its tool: the next
+    /// fingerprint seen is trusted, and other commands keep theirs.
+    #[test]
+    fn a_forgotten_fingerprint_is_trusted_afresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(trust_mcp_tool_in(dir, "ext.cmd", "fp1"));
+        assert!(trust_mcp_tool_in(dir, "other.cmd", "o1"));
+        forget_mcp_tool_fingerprints_in(dir, &[String::from("ext.cmd")]).unwrap();
+        assert!(trust_mcp_tool_in(dir, "ext.cmd", "fp2"));
+        assert!(!trust_mcp_tool_in(dir, "other.cmd", "o2"));
     }
 
     #[test]

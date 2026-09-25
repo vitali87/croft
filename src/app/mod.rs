@@ -541,6 +541,23 @@ fn push_variable_rows(
     }
 }
 
+/// The trust-on-first-use gate on a contributed command's MCP tool: an
+/// error naming the recovery when `fingerprint` differs from the one first
+/// recorded for `command_id` under `config_dir`.
+fn mcp_tool_trust(
+    config_dir: &Path,
+    command_id: &str,
+    tool: &str,
+    fingerprint: &str,
+) -> Result<(), String> {
+    if crate::prefs::trust_mcp_tool_in(config_dir, command_id, fingerprint) {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to run: the '{tool}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve"
+    ))
+}
+
 fn activity_explorer_y(bar: Rect) -> u16 {
     bar.y + 1
 }
@@ -19792,6 +19809,12 @@ impl App {
         }
         let _ =
             crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
+        // Turning an extension off forgets its tools' fingerprints, so
+        // turning it back on re-approves a tool whose definition changed.
+        if !now_enabled {
+            let ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, &id);
+            let _ = crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &ids);
+        }
         self.refresh_extensions();
         self.status = format!(
             "{} extension '{id}'",
@@ -49471,12 +49494,12 @@ fn run_mcp_command_blocking(
             ));
         }
         let fingerprint = crate::mcp::client::tool_fingerprint(&list, &resolved.tool);
-        if !crate::prefs::trust_mcp_tool_in(config_dir, &resolved.command_id, &fingerprint) {
-            return Err(format!(
-                "refusing to run: the '{}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve",
-                resolved.tool
-            ));
-        }
+        mcp_tool_trust(
+            config_dir,
+            &resolved.command_id,
+            &resolved.tool,
+            &fingerprint,
+        )?;
 
         let arguments = match (resolved.arg.as_ref(), arg) {
             (Some(name), Some(value)) => json!({ name.as_str(): value }),

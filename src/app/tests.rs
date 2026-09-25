@@ -49598,3 +49598,63 @@ fn a_test_built_app_reads_no_user_settings_layer() {
         );
     }
 }
+
+/// #624 review: the tool trust gate refuses a changed tool definition with
+/// the recovery it names, and lets the first and the unchanged one through.
+#[test]
+fn the_mcp_tool_gate_refuses_a_changed_definition() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(mcp_tool_trust(tmp.path(), "ext.go", "go", "fp1"), Ok(()));
+    assert_eq!(mcp_tool_trust(tmp.path(), "ext.go", "go", "fp1"), Ok(()));
+    let err = mcp_tool_trust(tmp.path(), "ext.go", "go", "fp2").unwrap_err();
+    assert!(err.starts_with("refusing to run: the 'go' tool"), "{err}");
+    assert!(err.contains("toggle the extension off and on"), "{err}");
+}
+
+/// #624 review: toggling an extension off and on re-approves its tools, as
+/// the refusal says: turning it off forgets the fingerprints of the
+/// commands it declares, and only those, so the next run trusts afresh.
+#[test]
+fn toggling_an_extension_off_forgets_its_tool_fingerprints() {
+    const EXT: &str = r#"
+id = "tfp"
+name = "tfp"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/false"
+[[commands]]
+id = "tfp.go"
+title = "tfp: go"
+server = "srv"
+tool = "go"
+"#;
+    let (_scratch, croft) = scratch_config(&[("tfp", EXT)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    // The panel lists the real user dir; seat the scratch extension's row.
+    app.extensions
+        .set_items(crate::widgets::extensions::items_from_summaries(
+            crate::lsp::manifest::summaries(&[EXT]),
+            &app.disabled_extensions,
+        ));
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp1"));
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "other.go", "o1"));
+    let visible = app.extensions.visible_indices();
+    let pos = visible
+        .iter()
+        .position(|&i| app.extensions.items()[i].id == "tfp")
+        .expect("the tfp row is visible");
+    app.extensions.select(pos);
+    app.toggle_selected_extension();
+    assert!(app.disabled_extensions.contains("tfp"), "{}", app.status);
+    assert!(
+        crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp2"),
+        "the changed tool is approved afresh"
+    );
+    assert!(
+        !crate::prefs::trust_mcp_tool_in(&croft, "other.go", "o2"),
+        "another extension's record stays"
+    );
+}
