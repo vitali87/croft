@@ -153,6 +153,43 @@ pub fn conflicts(json: &str, chord: &str, except: Command) -> Vec<Command> {
     out
 }
 
+/// The byte offset of the array's closing bracket: the last `]` that is
+/// code, not part of a `//` comment.
+fn array_close(text: &str) -> Option<usize> {
+    let mut close = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if let Some(i) = line[..code_end(line)].rfind(']') {
+            close = Some(offset + i);
+        }
+        offset += line.len();
+    }
+    close
+}
+
+/// Where `line`'s code ends: the start of a `//` comment outside a string,
+/// else the line's length.
+fn code_end(line: &str) -> usize {
+    let mut in_string = false;
+    let mut escaped = false;
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            return i;
+        }
+    }
+    line.len()
+}
+
 /// Whether `line` is a single-line row binding command `id`.
 fn is_row_for(line: &str, id: &str) -> bool {
     let t = line.trim();
@@ -173,7 +210,7 @@ pub fn unbind(json: &str, id: &str) -> String {
         .split_inclusive('\n')
         .filter(|l| !is_row_for(l, id))
         .collect();
-    if let Some(close) = kept.rfind(']') {
+    if let Some(close) = array_close(&kept) {
         let at = kept[..close].trim_end().len();
         if kept[..at].ends_with(',') {
             kept.remove(at - 1);
@@ -198,18 +235,8 @@ pub fn rebind(json: &str, id: &str, chord: &str) -> Result<String, String> {
         .split_inclusive('\n')
         .filter(|l| !is_row_for(l, id))
         .collect();
-    // The array's closing bracket: the last `]` outside a comment line.
-    let mut close = None;
-    let mut offset = 0;
-    for line in kept.split_inclusive('\n') {
-        if !line.trim_start().starts_with("//")
-            && let Some(i) = line.rfind(']')
-        {
-            close = Some(offset + i);
-        }
-        offset += line.len();
-    }
-    let close = close.ok_or_else(|| String::from("keybindings.json has no [ ... ] array"))?;
+    let close =
+        array_close(&kept).ok_or_else(|| String::from("keybindings.json has no [ ... ] array"))?;
     let at = kept[..close].trim_end().len();
     let last = kept[..at].chars().last();
     let insert = match last {
@@ -372,5 +399,35 @@ mod tests {
         let t = rebind(crate::keymap::TEMPLATE, "quick_open", "ctrl+p").unwrap();
         assert_eq!(user_bindings(&t).len(), 2, "{t}");
         assert!(t.starts_with("// croft keyboard shortcuts."), "{t}");
+    }
+
+    #[test]
+    fn rebind_finds_the_closing_bracket_before_an_inline_comment() {
+        // A `]` inside a trailing comment is not the array's end.
+        let json = "[\n  { \"key\": \"f9\", \"command\": \"quick_open\" }\n] // see [docs]\n";
+        let out = rebind(json, "open_settings", "ctrl+alt+o").unwrap();
+        assert_eq!(
+            user_bindings(&out),
+            vec![
+                ("f9".to_string(), "quick_open".to_string()),
+                ("ctrl+alt+o".to_string(), "open_settings".to_string())
+            ],
+            "{out}"
+        );
+        assert!(
+            out.ends_with("] // see [docs]\n"),
+            "the comment stays after the array: {out}"
+        );
+    }
+
+    #[test]
+    fn unbind_finds_the_closing_bracket_before_an_inline_comment() {
+        let json = "[\n  { \"key\": \"f9\", \"command\": \"quick_open\" },\n  { \"key\": \"f8\", \"command\": \"open_settings\" }\n] // see [docs]\n";
+        let out = unbind(json, "open_settings");
+        assert_eq!(
+            user_bindings(&out),
+            vec![("f9".to_string(), "quick_open".to_string())],
+            "the comma left by the removed last row goes: {out}"
+        );
     }
 }
