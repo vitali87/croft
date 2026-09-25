@@ -3855,6 +3855,10 @@ pub struct App {
     /// are throttled: typing above a box shifts it on every line added.
     comment_store_dirty: bool,
     comment_store_saved: Option<std::time::Instant>,
+    /// Boxes of workspaces left while their save was failing, by root:
+    /// retried with the store's own saves, and taken back on a re-root to
+    /// that workspace, so a failed write never drops them.
+    comment_store_unsaved: Vec<(String, Vec<crate::comments::HumanBox>)>,
     /// Authority: the store changed since it was last broadcast.
     comment_broadcast_due: bool,
     /// Guest: the owner's store arrived since this connection opened; until
@@ -5044,6 +5048,7 @@ impl App {
             },
             comment_store_root: None,
             comment_store_dirty: false,
+            comment_store_unsaved: Vec::new(),
             comment_store_saved: None,
             comment_broadcast_due: false,
             comments_synced: false,
@@ -24469,8 +24474,6 @@ impl App {
         self.status = String::from("Navigator comments cleared");
     }
 
-    /// F4: focus the active file's next comment box (by row, wrapping),
-    /// jumping the caret to its anchor line so the box scrolls into view.
     /// The next comment F4 visits, walking every open file (#367): the
     /// active file's navigator notes, review threads and open human
     /// comments, plus the open human comments of every other open file,
@@ -24531,6 +24534,9 @@ impl App {
         Some((path, id, row))
     }
 
+    /// F4: focus the next comment box in any open file (by path and row,
+    /// wrapping), opening its file and jumping the caret to its anchor line
+    /// so the box scrolls into view.
     fn cycle_comment_box(&mut self) {
         let Some((path, id, row)) = self.next_comment_anywhere() else {
             self.status = String::from("No comments in open files");
@@ -24736,16 +24742,34 @@ impl App {
             let root = self.workspace_root().display().to_string();
             if self.comment_store_root.as_deref() != Some(root.as_str()) {
                 self.flush_comment_store();
+                if self.comment_store_dirty
+                    && self.comment_store_path.is_some()
+                    && let Some(old) = self.comment_store_root.take()
+                {
+                    self.comment_store_unsaved
+                        .push((old, self.comment_store.boxes().to_vec()));
+                    self.comment_store_dirty = false;
+                }
                 if let Some(path) = &self.comment_store_path {
-                    self.comment_store
-                        .set_all(crate::comments::load(path, &root));
+                    let kept = self
+                        .comment_store_unsaved
+                        .iter()
+                        .position(|(r, _)| *r == root);
+                    let boxes = match kept {
+                        Some(i) => {
+                            self.comment_store_dirty = true;
+                            self.comment_store_unsaved.remove(i).1
+                        }
+                        None => crate::comments::load(path, &root),
+                    };
+                    self.comment_store.set_all(boxes);
                     self.comment_broadcast_due = true;
                     self.comment_draft = None;
                     changed = true;
                 }
                 self.comment_store_root = Some(root);
             }
-            if self.comment_store_dirty
+            if (self.comment_store_dirty || !self.comment_store_unsaved.is_empty())
                 && self
                     .comment_store_saved
                     .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
@@ -24775,18 +24799,37 @@ impl App {
     }
 
     /// Write the authority's unsaved comment changes for the workspace they
-    /// were loaded for. Also runs at quit.
+    /// were loaded for, and those of workspaces left while their save
+    /// failed. A failed write stays unsaved, to be tried again. Also runs
+    /// at quit.
     fn flush_comment_store(&mut self) {
-        if !self.comment_store_dirty || self.is_collab_guest() {
+        if self.is_collab_guest() {
             return;
         }
-        let (Some(path), Some(root)) = (&self.comment_store_path, &self.comment_store_root) else {
+        let Some(path) = &self.comment_store_path else {
             return;
         };
-        if let Err(e) = crate::comments::save(path, root, self.comment_store.boxes()) {
+        let mut failed = None;
+        self.comment_store_unsaved.retain(|(root, boxes)| {
+            match crate::comments::save(path, root, boxes) {
+                Ok(()) => false,
+                Err(e) => {
+                    failed = Some(e);
+                    true
+                }
+            }
+        });
+        if self.comment_store_dirty
+            && let Some(root) = &self.comment_store_root
+        {
+            match crate::comments::save(path, root, self.comment_store.boxes()) {
+                Ok(()) => self.comment_store_dirty = false,
+                Err(e) => failed = Some(e),
+            }
+        }
+        if let Some(e) = failed {
             self.status = format!("Comments not saved: {e}");
         }
-        self.comment_store_dirty = false;
         self.comment_store_saved = Some(std::time::Instant::now());
     }
 

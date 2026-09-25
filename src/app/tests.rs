@@ -49959,6 +49959,71 @@ fn comments_persist_per_workspace() {
     assert_eq!(boxes[0].line, 1);
 }
 
+/// #367: a save that fails (here, a store that no longer parses) leaves
+/// the changes unsaved and says so, and the next save writes them.
+#[test]
+fn a_failed_comment_save_is_tried_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store.json");
+    std::fs::write(&store, "not json").unwrap();
+    let (mut app, _file) = comment_app(&tmp, 1);
+    app.comment_store_path = Some(store.clone());
+    app.sync_comments();
+    post_comment(&mut app, "keep me");
+    app.flush_comment_store();
+    assert!(
+        app.status.starts_with("Comments not saved"),
+        "{}",
+        app.status
+    );
+    std::fs::write(&store, "{}").unwrap();
+    app.flush_comment_store();
+    let root = app.workspace_root().display().to_string();
+    let saved = crate::comments::load(&store, &root);
+    assert_eq!(saved.len(), 1, "the retry wrote the box");
+    assert_eq!(saved[0].entries[0].body, "keep me");
+}
+
+/// #367: leaving a workspace while its comments cannot be saved keeps
+/// them: they come back with the workspace, and a later save writes them.
+#[test]
+fn comments_of_a_workspace_left_while_its_save_fails_are_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store.json");
+    std::fs::write(&store, "not json").unwrap();
+    let (mut app, _file) = comment_app(&tmp, 1);
+    app.comment_store_path = Some(store.clone());
+    app.sync_comments();
+    post_comment(&mut app, "keep me");
+    let first = app.workspace_root().to_path_buf();
+    let other = tempfile::tempdir().unwrap();
+    app.change_workspace_root(other.path().to_path_buf());
+    app.sync_comments();
+    assert!(
+        app.comment_store.boxes().is_empty(),
+        "the other workspace's"
+    );
+    assert!(
+        !app.comment_store_dirty,
+        "the other workspace's boxes, just loaded, are not unsaved changes"
+    );
+    app.change_workspace_root(first.clone());
+    app.sync_comments();
+    assert_eq!(
+        app.comment_store.boxes().len(),
+        1,
+        "back with its workspace"
+    );
+
+    app.change_workspace_root(other.path().to_path_buf());
+    app.sync_comments();
+    std::fs::write(&store, "{}").unwrap();
+    app.flush_comment_store();
+    let saved = crate::comments::load(&store, &first.display().to_string());
+    assert_eq!(saved.len(), 1, "written once the store took writes again");
+    assert_eq!(saved[0].entries[0].body, "keep me");
+}
+
 /// #367: a moved or renamed file carries its comments along.
 #[test]
 fn renaming_a_file_carries_its_comments() {
