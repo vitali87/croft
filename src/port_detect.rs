@@ -257,11 +257,14 @@ fn probe(program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.stdin(std::process::Stdio::null());
     // SAFETY: `setsid` is async-signal-safe and the only call in the
-    // pre-exec hook; the forked child is never a process-group leader, so
-    // the call always succeeds.
+    // pre-exec hook. The forked child is never a process-group leader, so
+    // it cannot fail today; if it ever does, the spawn fails rather than
+    // silently keeping the tty.
     unsafe {
         std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -365,9 +368,10 @@ fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
     Some(parse_lsof(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Parse `lsof` rows from a [`LSOF_LISTEN_ARGS`] scan. Field 0 is the command; the NAME
-/// column (`*:3000`, `127.0.0.1:3000`) is followed by a `(LISTEN)` token, so we
-/// scan the row for the first field that parses as a loopback/wildcard address.
+/// Parse `lsof` rows from a [`LSOF_LISTEN_ARGS`] scan. Field 0 is the
+/// command; the NAME column (`*:3000`, `127.0.0.1:3000`) is followed by a
+/// `(LISTEN)` token, so we scan the row for the first field that parses as a
+/// loopback/wildcard address.
 fn parse_lsof(text: &str) -> Vec<PortHit> {
     let mut out: Vec<PortHit> = Vec::new();
     for line in text.lines().skip(1) {
@@ -465,8 +469,7 @@ mod tests {
     /// seconds, so it must own no tty: it leads its own session.
     #[test]
     fn a_socket_probe_runs_in_its_own_session() {
-        // Asked of the kernel, not of `ps`, whose session keyword differs
-        // between Linux (`sid`) and macOS (`sess`).
+        // Asked of the kernel, not of `ps`: macOS `ps` exposes no session id.
         let mut child = probe("sleep").arg("5").spawn().unwrap();
         let pid = child.id() as libc::pid_t;
         // SAFETY: getsid only reads the session id of a live pid.
@@ -477,32 +480,34 @@ mod tests {
         assert_ne!(sid, ours, "the probe shares croft's session");
     }
 
-    /// The `-b -w` scan still finds a listener: bind one and look for it.
-    /// Skipped where lsof is not installed.
+    /// The scoped `-b -w` scan still finds a listener: bind one and look
+    /// for it through the real call site. Skipped where lsof is not
+    /// installed.
     #[test]
     fn the_lsof_scan_still_finds_a_loopback_listener() {
+        if probe("lsof").arg("-v").output().is_err() {
+            return;
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let Ok(out) = probe("lsof")
-            .args(LSOF_LISTEN_ARGS)
-            .args(["-a", "-p", &std::process::id().to_string()])
-            .output()
-        else {
-            return;
-        };
-        let text = String::from_utf8_lossy(&out.stdout);
+        let hits = poll_via_lsof(&HashSet::from([std::process::id() as i32])).expect("lsof ran");
         assert!(
-            parse_lsof(&text).iter().any(|h| h.port == port),
-            "port {port} missing from {text:?}"
+            hits.iter().any(|h| h.port == port),
+            "port {port} missing from {hits:?}"
         );
     }
 
-    /// `-b` keeps lsof off stat/lstat/readlink, which stall on an
-    /// unreachable NFS mount; `-w` drops the warnings `-b` then prints.
+    /// Every poll helper is spawned through `probe`, so none can bring the
+    /// inherited tty back.
     #[test]
-    fn lsof_avoids_calls_that_block_on_a_dead_mount() {
-        assert!(LSOF_LISTEN_ARGS.contains(&"-b"), "{LSOF_LISTEN_ARGS:?}");
-        assert!(LSOF_LISTEN_ARGS.contains(&"-w"), "{LSOF_LISTEN_ARGS:?}");
+    fn every_poll_helper_spawns_through_probe() {
+        let src = include_str!("port_detect.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert_eq!(
+            body.matches("Command::new(").count(),
+            1,
+            "only inside probe"
+        );
     }
 
     #[test]
