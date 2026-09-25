@@ -3491,6 +3491,8 @@ pub struct App {
     /// visual operator deletes/yanks whole lines.
     vim_visual_line: bool,
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
+    /// The interactive rebase list (#620).
+    rebase_editor: Option<crate::widgets::rebase_editor::RebaseEditor>,
     shortcuts_hit_rect: Option<Rect>,
     /// Status-bar clickable-segment hit rects, recorded each render. Empty when
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
@@ -4880,6 +4882,7 @@ impl App {
             vim_last_find: None,
             vim_visual_line: false,
             shortcuts_modal: None,
+            rebase_editor: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
             status_indent_rect: Rect::default(),
@@ -17000,6 +17003,7 @@ impl App {
         self.render_input_prompt(frame);
         self.render_list_picker(frame);
         self.render_shortcuts_modal(frame);
+        self.render_rebase_editor(frame);
         self.render_connect_dialog(frame);
         // The startup unsupported-terminal nudge renders last so it sits above
         // every other overlay until the user dismisses it.
@@ -18849,6 +18853,10 @@ impl App {
         }
         if self.shortcuts_modal.is_some() {
             self.handle_shortcuts_modal_key(key);
+            return Ok(());
+        }
+        if self.rebase_editor.is_some() && self.input_prompt.is_none() {
+            self.handle_rebase_editor_key(key);
             return Ok(());
         }
         if self.file_finder.is_some() {
@@ -23349,6 +23357,14 @@ impl App {
             InputPurpose::NewWorktreeLane => {
                 self.close_input_prompt();
                 self.create_worktree_lane(&value);
+            }
+            InputPurpose::RebaseBase => {
+                self.close_input_prompt();
+                self.submit_rebase_base(&value);
+            }
+            InputPurpose::RebaseMessage { index } => {
+                self.close_input_prompt();
+                self.submit_rebase_message(index, &value);
             }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
@@ -34050,6 +34066,265 @@ impl App {
         }
     }
 
+    /// Run git in the Source Control root with extra environment; stdout on
+    /// success, else the first line git wrote to stderr (or stdout).
+    fn git_with_env(&self, args: &[String], env: &[(&str, String)]) -> Result<String, String> {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args).current_dir(self.scm_root());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("could not run git: {e}"))?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        let text = if err.trim().is_empty() {
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        } else {
+            err.into_owned()
+        };
+        Err(text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("hint:"))
+            .unwrap_or("git failed")
+            .to_string())
+    }
+
+    /// Ask which base an interactive rebase replays onto (#620).
+    fn ask_rebase_base(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let upstream = self
+            .git_with_env(
+                &[
+                    String::from("rev-parse"),
+                    String::from("--abbrev-ref"),
+                    String::from("@{upstream}"),
+                ],
+                &[],
+            )
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::RebaseBase,
+                String::from("Interactive Rebase"),
+                String::from("base: a branch, tag, commit or HEAD~N"),
+            )
+            .with_value(upstream.unwrap_or_else(|| String::from("HEAD~5"))),
+        );
+    }
+
+    /// List `base..HEAD` for an interactive rebase (#620).
+    pub fn submit_rebase_base(&mut self, base: &str) {
+        let base = base.trim();
+        let log = match self.git_with_env(&crate::rebase_todo::log_args(base), &[]) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status = format!("Interactive rebase: {e}");
+                return;
+            }
+        };
+        let entries = crate::rebase_todo::parse_log(&log);
+        if entries.is_empty() {
+            self.status = format!("No commits between {base} and HEAD");
+            return;
+        }
+        self.rebase_editor = Some(crate::widgets::rebase_editor::RebaseEditor::new(
+            base.to_string(),
+            entries,
+        ));
+    }
+
+    /// The new message for a reworded row (#620); an empty one keeps the
+    /// row as it was.
+    pub fn submit_rebase_message(&mut self, index: usize, message: &str) {
+        let Some(e) = self
+            .rebase_editor
+            .as_mut()
+            .and_then(|ed| ed.entries.get_mut(index))
+        else {
+            return;
+        };
+        if message.trim().is_empty() {
+            self.status = String::from("An empty message keeps the commit as it was");
+            return;
+        }
+        e.action = crate::rebase_todo::Action::Reword;
+        e.message = Some(message.trim().to_string());
+    }
+
+    /// Keys while the interactive rebase list is open (#620): p r e s f d
+    /// set the selected row's action, Alt+Up/Down move it, Enter runs the
+    /// rebase, Esc cancels.
+    fn handle_rebase_editor_key(&mut self, key: KeyEvent) {
+        use crate::rebase_todo::Action;
+        let Some(ed) = self.rebase_editor.as_mut() else {
+            return;
+        };
+        let last = ed.entries.len().saturating_sub(1);
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.rebase_editor = None;
+                self.status = String::from("Interactive rebase cancelled");
+            }
+            (KeyCode::Up, m) if m.contains(KeyModifiers::ALT) => {
+                ed.selected = crate::rebase_todo::move_entry(&mut ed.entries, ed.selected, true);
+            }
+            (KeyCode::Down, m) if m.contains(KeyModifiers::ALT) => {
+                ed.selected = crate::rebase_todo::move_entry(&mut ed.entries, ed.selected, false);
+            }
+            (KeyCode::Up, _) => ed.selected = ed.selected.saturating_sub(1),
+            (KeyCode::Down, _) => ed.selected = (ed.selected + 1).min(last),
+            (KeyCode::Char('r'), m) if m.is_empty() => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                let Some(e) = ed.entries.get(ed.selected) else {
+                    return;
+                };
+                let index = ed.selected;
+                let now = e.message.clone().unwrap_or_else(|| e.subject.clone());
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::RebaseMessage { index },
+                        String::from("Reword Commit"),
+                        String::from("new commit message"),
+                    )
+                    .with_value(now),
+                );
+            }
+            (KeyCode::Char(c), m) if m.is_empty() => {
+                if let Some(a) = Action::from_key(c)
+                    && let Some(e) = ed.entries.get_mut(ed.selected)
+                {
+                    e.action = a;
+                    if a != Action::Reword {
+                        e.message = None;
+                    }
+                }
+            }
+            (KeyCode::Enter, _) => self.run_interactive_rebase(),
+            _ => {}
+        }
+    }
+
+    /// Carry out the rebase list (#620): write the todo and any reword
+    /// messages, then let git run it with our todo in place of its own.
+    fn run_interactive_rebase(&mut self) {
+        let Some(ed) = self.rebase_editor.as_ref() else {
+            return;
+        };
+        if let Some(why) = crate::rebase_todo::problem(&ed.entries) {
+            self.status = format!("Cannot rebase: {why}");
+            return;
+        }
+        let dir = croft_cache_dir().join("rebase");
+        let message_file = |i: usize| dir.join(format!("message-{i}.txt"));
+        let prepared = std::fs::create_dir_all(&dir).and_then(|()| {
+            for (i, e) in ed.entries.iter().enumerate() {
+                if let Some(m) = &e.message {
+                    std::fs::write(message_file(i), format!("{m}\n"))?;
+                }
+            }
+            std::fs::write(
+                dir.join("todo"),
+                crate::rebase_todo::todo(&ed.entries, &message_file),
+            )
+        });
+        if let Err(e) = prepared {
+            self.status = format!("{}: {e}", dir.display());
+            return;
+        }
+        let count = ed.entries.len();
+        let base = ed.base.clone();
+        let env = [
+            (
+                "GIT_SEQUENCE_EDITOR",
+                crate::rebase_todo::sequence_editor(&dir.join("todo")),
+            ),
+            ("GIT_EDITOR", String::from("true")),
+        ];
+        let outcome = self.git_with_env(&crate::rebase_todo::rebase_args(&base), &env);
+        self.rebase_editor = None;
+        self.refresh_after_rebase();
+        self.status = match outcome {
+            Ok(_) if !self.rebase_in_progress() => format!("Rebased {count} commits onto {base}"),
+            Ok(_) => {
+                String::from("Rebase stopped to edit a commit: amend it, then Git: Continue Rebase")
+            }
+            Err(e) => format!(
+                "Rebase stopped: {e}. Resolve in the merge editor, then Git: Continue Rebase (or Abort)"
+            ),
+        };
+    }
+
+    fn rebase_in_progress(&self) -> bool {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--git-path", "rebase-merge"])
+            .current_dir(self.scm_root())
+            .output();
+        let Ok(out) = out else {
+            return false;
+        };
+        let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let p = if p.is_absolute() {
+            p
+        } else {
+            self.scm_root().join(p)
+        };
+        p.exists()
+    }
+
+    /// Bring Source Control and open buffers up to date after git rewrote
+    /// the branch.
+    fn refresh_after_rebase(&mut self) {
+        self.active_git_bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    /// `git rebase --continue`, taking git's messages as they are (#620).
+    fn continue_rebase(&mut self) {
+        if !self.rebase_in_progress() {
+            self.status = String::from("No rebase is in progress");
+            return;
+        }
+        let args = [String::from("rebase"), String::from("--continue")];
+        let outcome = self.git_with_env(&args, &[("GIT_EDITOR", String::from("true"))]);
+        self.refresh_after_rebase();
+        self.status = match outcome {
+            Ok(_) if !self.rebase_in_progress() => String::from("Rebase finished"),
+            Ok(_) => String::from("Rebase stopped again: Git: Continue Rebase when ready"),
+            Err(e) => format!("Rebase stopped: {e}"),
+        };
+    }
+
+    /// `git rebase --abort` (#620).
+    fn abort_rebase(&mut self) {
+        if !self.rebase_in_progress() {
+            self.status = String::from("No rebase is in progress");
+            return;
+        }
+        let args = [String::from("rebase"), String::from("--abort")];
+        let outcome = self.git_with_env(&args, &[]);
+        self.refresh_after_rebase();
+        self.status = match outcome {
+            Ok(_) => String::from("Rebase aborted; the branch is as it was"),
+            Err(e) => format!("Abort failed: {e}"),
+        };
+    }
+
+    fn render_rebase_editor(&mut self, frame: &mut ratatui::Frame) {
+        let area = frame.area();
+        let theme = self.theme;
+        if let Some(ed) = self.rebase_editor.as_mut() {
+            crate::widgets::rebase_editor::render(ed, area, frame.buffer_mut(), theme);
+        }
+    }
+
     fn open_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.is_none() {
             self.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
@@ -35784,6 +36059,9 @@ impl App {
             Cmd::StageHunk => self.stage_hunk_at_caret(),
             Cmd::UnstageHunk => self.unstage_hunk_at_caret(),
             Cmd::RevertHunk => self.request_revert_hunk_at_caret(),
+            Cmd::GitInteractiveRebase => self.ask_rebase_base(),
+            Cmd::GitContinueRebase => self.continue_rebase(),
+            Cmd::GitAbortRebase => self.abort_rebase(),
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
