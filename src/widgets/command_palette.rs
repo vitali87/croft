@@ -179,6 +179,8 @@ pub enum Command {
     OpenWorkspaceSettingsJson,
     OpenWorkspaceSettingsLocalJson,
     OpenKeybindingsJson,
+    ExportUiStrings,
+    ToggleScreenReaderMode,
     ConfigureSnippets,
     OpenTriggersJson,
     OpenAgentsJson,
@@ -412,6 +414,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::OpenWorkspaceSettingsJson,
     Command::OpenWorkspaceSettingsLocalJson,
     Command::OpenKeybindingsJson,
+    Command::ExportUiStrings,
+    Command::ToggleScreenReaderMode,
     Command::ConfigureSnippets,
     Command::OpenTriggersJson,
     Command::OpenAgentsJson,
@@ -613,6 +617,8 @@ impl Command {
                 "Preferences: Open Workspace Settings — Local (JSON)"
             }
             Command::OpenKeybindingsJson => "Preferences: Open Keyboard Shortcuts (JSON)",
+            Command::ExportUiStrings => "Preferences: Export UI Strings for Translation",
+            Command::ToggleScreenReaderMode => "Accessibility: Toggle Screen Reader Mode",
             Command::ConfigureSnippets => "Preferences: Configure User Snippets",
             Command::OpenTriggersJson => "Preferences: Open Terminal Triggers (JSON)",
             Command::OpenAgentsJson => "Preferences: Open Agent Lanes (JSON)",
@@ -814,6 +820,8 @@ impl Command {
             Command::OpenWorkspaceSettingsJson => "",
             Command::OpenWorkspaceSettingsLocalJson => "",
             Command::OpenKeybindingsJson => "",
+            Command::ExportUiStrings => "",
+            Command::ToggleScreenReaderMode => "",
             Command::ConfigureSnippets => "",
             Command::OpenTriggersJson => "",
             Command::OpenAgentsJson => "",
@@ -1015,6 +1023,8 @@ impl Command {
             Command::OpenWorkspaceSettingsJson => "open_workspace_settings_json",
             Command::OpenWorkspaceSettingsLocalJson => "open_workspace_settings_local_json",
             Command::OpenKeybindingsJson => "open_keybindings_json",
+            Command::ExportUiStrings => "export_ui_strings",
+            Command::ToggleScreenReaderMode => "toggle_screen_reader_mode",
             Command::ConfigureSnippets => "configure_snippets",
             Command::OpenTriggersJson => "open_triggers_json",
             Command::OpenAgentsJson => "open_agents_json",
@@ -1088,11 +1098,12 @@ pub enum PaletteItem {
 }
 
 impl PaletteItem {
-    /// The label shown in the palette and matched against the query.
-    pub fn title(&self) -> &str {
+    /// The label shown in the palette and matched against the query: a
+    /// built-in command's title in the active UI language (#621).
+    pub fn title(&self) -> std::borrow::Cow<'_, str> {
         match self {
-            PaletteItem::Builtin(c) => c.title(),
-            PaletteItem::Extension(e) => &e.title,
+            PaletteItem::Builtin(c) => crate::i18n::tr(&format!("command.{}", c.id()), c.title()),
+            PaletteItem::Extension(e) => std::borrow::Cow::Borrowed(&e.title),
         }
     }
 
@@ -1556,6 +1567,30 @@ mod tests {
         palette.select_next();
         palette.push_char('s');
         assert_eq!(palette.selected, 0);
+    }
+
+    #[test]
+    fn palette_titles_come_from_the_active_catalog() {
+        // #621: a translated title replaces the English one; others stay.
+        crate::i18n::set(crate::i18n::Catalog {
+            strings: std::collections::HashMap::from([(
+                String::from("command.quick_open"),
+                String::from("Gehe zu Datei"),
+            )]),
+        });
+        assert_eq!(
+            PaletteItem::Builtin(Command::QuickOpen).title(),
+            "Gehe zu Datei"
+        );
+        assert_eq!(
+            PaletteItem::Builtin(Command::GoToSymbol).title(),
+            Command::GoToSymbol.title()
+        );
+        crate::i18n::set(crate::i18n::Catalog::default());
+        assert_eq!(
+            PaletteItem::Builtin(Command::QuickOpen).title(),
+            "Go to File"
+        );
     }
 
     #[test]
