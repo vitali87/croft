@@ -43807,6 +43807,47 @@ fn a_kept_orphan_keeps_the_next_keys_beside_a_sibling_symbol_tab() {
     );
 }
 
+/// #369: one symbol's tabs in two groups, with no file tab left in either:
+/// deleting the symbol keeps one of them as the file's tab, and the other,
+/// whose edits that tab now holds, closes and folds its group away.
+#[test]
+fn one_symbols_tabs_in_two_groups_keep_a_single_file_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.split_editor();
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    let file_tab = |tabs: &crate::widgets::editor::EditorTabs| {
+        tabs.editors
+            .iter()
+            .position(|e| e.symbol_view.is_none())
+            .expect("the file tab")
+    };
+    let i = file_tab(&app.editor);
+    app.editor.close_tab(i);
+    let other = &mut app.editor_layout.inactive_groups_mut()[0];
+    let i = file_tab(other);
+    other.close_tab(i);
+    assert_eq!(app.editor.editors.len(), 1);
+    assert_eq!(app.editor_layout.inactive_groups()[0].editors.len(), 1);
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor_layout.inactive_groups().is_empty(),
+        "the other copy closed and its group folded away"
+    );
+    assert_eq!(app.editor.editors.len(), 1);
+    let kept = &app.editor.editors[0];
+    assert!(kept.symbol_view.is_none() && kept.dirty);
+    assert_eq!(kept.path.as_deref(), Some(file.as_path()));
+    assert!(app.status.contains("whole file"), "{}", app.status);
+}
+
 /// #369: a clean symbol tab whose symbol goes closes even with no file
 /// tab open: it holds nothing the disk does not.
 #[test]
