@@ -1076,9 +1076,6 @@ impl DapSession {
         self.exception_filters.iter().any(|f| f == filter)
     }
 
-    /// Evaluate `expression` in the selected frame (or globally if no frame is
-    /// selected). The result arrives on a later poll as [`DapEvent::Evaluated`].
-    /// `context` is typically `repl` or `watch`.
     /// Ask whether `name` in container `parent` can be watched (#611); the
     /// answer arrives as [`DapEvent::DataBreakpointInfo`].
     pub fn request_data_breakpoint_info(&mut self, parent: i64, name: &str) {
@@ -1095,6 +1092,9 @@ impl DapSession {
         let _ = self.active().send(set_data_breakpoints_request(data_ids));
     }
 
+    /// Evaluate `expression` in the selected frame (or globally if no frame is
+    /// selected). The result arrives on a later poll as [`DapEvent::Evaluated`].
+    /// `context` is typically `repl` or `watch`.
     pub fn evaluate(&mut self, expression: &str, context: &str) {
         let req = evaluate_request(expression, self.selected_frame, context);
         if let Ok(seq) = self.active().send(req) {
