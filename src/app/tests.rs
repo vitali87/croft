@@ -49926,3 +49926,54 @@ tool = "go"
         "another extension's record stays"
     );
 }
+
+const EXITED_EVENT: &str = r#"{"seq":1,"type":"event","event":"exited","body":{"exitCode":0}}"#;
+const TERMINATED_EVENT: &str = r#"{"seq":2,"type":"event","event":"terminated"}"#;
+
+/// Adapters send `exited` and then `terminated`, both of which end a member.
+/// Arriving in one poll they named the member twice, and the second removal
+/// took a live sibling with it.
+#[test]
+fn a_member_that_exits_and_terminates_in_one_poll_is_removed_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("A", stub_emitting(&[EXITED_EVENT, TERMINATED_EVENT]));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.push("C", stub_member(false));
+    app.debug_sessions.focus(2);
+    // Both messages are written before the first poll reads them.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    poll_until(&mut app, |a| {
+        !a.debug_sessions.names().contains(&String::from("A"))
+    });
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec![String::from("B"), String::from("C")]
+    );
+    app.debug_stop();
+}
+
+/// The focused member ending in the same poll a background member stops: the
+/// view used to move to the stopped member first, carrying the ending with it
+/// into the old member's backlog, so the ended member was never removed.
+#[test]
+fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("S", stub_emitting(&[STOPPED_EVENT]));
+    app.debug_sessions
+        .push("F", stub_emitting(&[TERMINATED_EVENT]));
+    app.debug_sessions.focus(1);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    poll_until(&mut app, |a| {
+        a.debug_sessions.names() == vec![String::from("S")]
+    });
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec![String::from("S")],
+        "F ended and must go"
+    );
+    app.debug_stop();
+}

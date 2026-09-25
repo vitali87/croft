@@ -20452,7 +20452,14 @@ impl App {
             changed_background |= !drained.is_empty();
             for ev in drained {
                 match ev {
-                    DapEvent::Terminated => background_ended.push(index),
+                    // `exited` and `terminated` both end a member and often
+                    // arrive together: name it once, or the removal below
+                    // takes a live sibling for the second copy.
+                    DapEvent::Terminated => {
+                        if background_ended.last() != Some(&index) {
+                            background_ended.push(index);
+                        }
+                    }
                     DapEvent::Output { category, text }
                         if crate::dap::session::output_is_user_visible(&category) =>
                     {
@@ -20516,7 +20523,15 @@ impl App {
                 .focused()
                 .is_some_and(|s| s.phase == SessionPhase::Stopped)
                 || events.iter().any(|e| matches!(e, DapEvent::Stopped { .. }));
-            if focused_is_stopped {
+            // A focused member that ended this tick is torn down below, and
+            // the teardown reads the FOCUSED member: moving the view first
+            // would carry the ending into its backlog and leave it running.
+            let focused_ended = self
+                .debug_sessions
+                .focused()
+                .is_some_and(|s| s.phase == SessionPhase::Terminated)
+                || events.iter().any(|e| matches!(e, DapEvent::Terminated));
+            if focused_is_stopped || focused_ended {
                 self.status =
                     format!("{name} stopped in the background · Cmd+Opt+Shift+G switches to it");
             } else {
