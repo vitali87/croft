@@ -23492,7 +23492,11 @@ impl App {
         }
         let before = self.session_participants.len();
         let after = roster.len();
+        // A client older than this croft (the session host was updated
+        // under it) is told here, in croft's own status line (#626).
+        let stale = crate::session_host::stale_client_notice(&roster, env!("CARGO_PKG_VERSION"));
         self.session_participants = roster;
+
         // before == 0 is the initial self-only read; not worth announcing.
         if after > before && before > 0 {
             self.status = format!(
@@ -23500,6 +23504,9 @@ impl App {
             );
         } else if after < before {
             self.status = format!("A participant detached ({after} attached)");
+        }
+        if let Some(notice) = stale {
+            self.status = notice;
         }
         // Keep an open participants picker live without wiping the user's
         // typed filter, highlight, or scroll (any client resizing churns the
