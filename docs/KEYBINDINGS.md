@@ -120,7 +120,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Debug: Edit Hit Count | `Ctrl`+`Shift`+`F9` | Add or edit a hit count on the cursor line's breakpoint (`5`, `>= 5`, `% 2`, as the adapter understands it); blank clears it |
 | Debug: Add Function Breakpoint | `Ctrl`+`F9` | Break when the named function is called; naming one already set removes it |
 | Debug: Break on Value Change | `Ctrl`+`Alt`+`F9` | While paused, break when the named variable of the current frame changes (a data breakpoint) |
-| Debug: Run to Cursor | `Ctrl`+`F10` | While paused, resume and stop at the cursor's line once, through a temporary breakpoint |
+| Debug: Run to Cursor | `Ctrl`+`F10` | While paused, resume and stop at the cursor's line once, through a temporary breakpoint; as in VS Code, a line that already has a breakpoint keeps it, so a conditional, hit-count or log breakpoint there decides |
 | Debug: Toggle Break on Raised Exceptions | `Alt`+`F9` | Break on raised (not just uncaught) exceptions |
 | Debug: Attach to Python Process | `Ctrl`+`F5` | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |

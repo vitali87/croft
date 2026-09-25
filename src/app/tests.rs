@@ -50098,7 +50098,7 @@ fn a_data_breakpoint_answer_sets_a_write_watchpoint_or_says_why_not() {
         let status = apply_data_breakpoint_info(
             &mut session,
             "y",
-            7,
+            (7, 0),
             data_id.map(str::to_string),
             description,
             &types,

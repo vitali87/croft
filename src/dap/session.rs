@@ -72,6 +72,9 @@ pub enum DapEvent {
         name: String,
         /// The `variablesReference` the variable was asked under.
         container: i64,
+        /// The stop that reference belongs to, counted when asked: another
+        /// stop may land before the answer.
+        stop: u64,
         data_id: Option<String>,
         description: String,
         access_types: Vec<String>,
@@ -964,8 +967,9 @@ pub struct DapSession {
     /// This run's data breakpoints (#611). Variable ids are only good for one
     /// run, so these end with the session.
     pub data_breakpoints: Vec<DataBreakpoint>,
-    /// In-flight `dataBreakpointInfo` requests: request `seq` -> variable name.
-    pending_data_info: std::collections::HashMap<i64, (String, i64)>,
+    /// In-flight `dataBreakpointInfo` requests: request `seq` -> the
+    /// variable's name, its `variablesReference` and the stop it was read at.
+    pending_data_info: std::collections::HashMap<i64, (String, i64, u64)>,
     /// A Run to Cursor in progress: the file and line of its temporary
     /// breakpoint, removed at the next stop or exit (#611).
     run_to: Option<(PathBuf, u32)>,
@@ -1294,7 +1298,7 @@ impl DapSession {
                 }
                 Some("dataBreakpointInfo") => {
                     let req_seq = msg.get("request_seq").and_then(Value::as_i64);
-                    if let Some((name, container)) =
+                    if let Some((name, container, stop)) =
                         req_seq.and_then(|s| self.pending_data_info.remove(&s))
                     {
                         let body = msg.get("body");
@@ -1316,6 +1320,7 @@ impl DapSession {
                         out.push(DapEvent::DataBreakpointInfo {
                             name,
                             container,
+                            stop,
                             data_id: text("dataId"),
                             description: text("description")
                                 .or_else(|| text("message"))
@@ -1552,19 +1557,22 @@ impl DapSession {
             .active()
             .send(data_breakpoint_info_request(variables_reference, name))
         {
-            self.pending_data_info
-                .insert(seq, (name.to_string(), variables_reference));
+            self.pending_data_info.insert(
+                seq,
+                (name.to_string(), variables_reference, self.stop_generation),
+            );
         }
         true
     }
 
     /// Add the data breakpoint on `data_id`, or remove it when it is already
-    /// set, and send the new set. True when it was added.
+    /// set, and send the new set. `container` and `stop` say where the
+    /// variable was read. True when it was added.
     pub fn toggle_data_breakpoint(
         &mut self,
         data_id: String,
         name: String,
-        container: i64,
+        (container, stop): (i64, u64),
         access_type: Option<String>,
     ) -> bool {
         let added = if let Some(i) = self
@@ -1579,7 +1587,7 @@ impl DapSession {
                 data_id,
                 name,
                 container,
-                stop: self.stop_generation,
+                stop,
                 access_type,
             });
             true
@@ -1987,6 +1995,7 @@ mod tests {
             vec![DapEvent::DataBreakpointInfo {
                 name: String::from("x"),
                 container: 7,
+                stop: 0,
                 data_id: Some(String::from("7:x")),
                 description: String::from("x"),
                 access_types: vec![String::from("write")],
@@ -1996,7 +2005,7 @@ mod tests {
         assert!(session.toggle_data_breakpoint(
             String::from("7:x"),
             String::from("x"),
-            7,
+            (7, 0),
             Some(String::from("write"))
         ));
         assert_eq!(
@@ -2004,7 +2013,12 @@ mod tests {
             json!([{"dataId": "7:x", "accessType": "write"}])
         );
         wire.clear();
-        assert!(!session.toggle_data_breakpoint(String::from("7:x"), String::from("x"), 7, None));
+        assert!(!session.toggle_data_breakpoint(
+            String::from("7:x"),
+            String::from("x"),
+            (7, 0),
+            None
+        ));
         assert_eq!(wire.sent()[0]["arguments"]["breakpoints"], json!([]));
     }
 
@@ -2028,6 +2042,7 @@ mod tests {
             vec![DapEvent::DataBreakpointInfo {
                 name: String::from("f"),
                 container: 7,
+                stop: 0,
                 data_id: None,
                 description: String::from("functions cannot be watched"),
                 access_types: Vec::new(),
@@ -2054,6 +2069,7 @@ mod tests {
             vec![DapEvent::DataBreakpointInfo {
                 name: String::from("x"),
                 container: 7,
+                stop: 0,
                 data_id: None,
                 description: String::from("not supported here"),
                 access_types: Vec::new(),
@@ -2061,18 +2077,44 @@ mod tests {
         );
     }
 
-    /// A data breakpoint remembers the stop it was set at: variable
-    /// references are only valid while the program stays suspended, so a
-    /// later stop may reuse the number for another variable.
+    /// A data breakpoint remembers the stop its variable was read at:
+    /// variable references are only valid while the program stays
+    /// suspended, so a later stop may reuse the number for another variable.
+    /// The stop is the one current when asked, even when the program
+    /// resumes and stops again before the adapter answers.
     #[test]
     fn a_data_breakpoint_records_the_stop_it_was_set_at() {
         let (mut session, wire) = DapSession::fake(BTreeMap::new());
+        session.capabilities.data_breakpoints = true;
         deliver(&mut session, &wire, &[stopped()]);
         let first = session.stop_generation;
-        assert!(session.toggle_data_breakpoint(String::from("x@7"), String::from("x"), 7, None));
-        assert_eq!(session.data_breakpoints[0].stop, first);
-        deliver(&mut session, &wire, &[stopped()]);
+        session.request_data_breakpoint_info(7, "x");
+        let seq = wire.sent().pop().unwrap()["seq"].clone();
+        let events = deliver(
+            &mut session,
+            &wire,
+            &[
+                json!({"type": "event", "event": "continued", "body": {"threadId": 1}}),
+                stopped(),
+                json!({"type": "response", "command": "dataBreakpointInfo", "success": true,
+                     "request_seq": seq, "body": {"dataId": "x@7", "description": "x"}}),
+            ],
+        );
         assert_ne!(session.stop_generation, first, "each stop is a new one");
+        let stop = events
+            .iter()
+            .find_map(|e| match e {
+                DapEvent::DataBreakpointInfo { stop, .. } => Some(*stop),
+                _ => None,
+            })
+            .expect("the answer");
+        assert_eq!(stop, first, "the stop the variable was read at");
+        assert!(session.toggle_data_breakpoint(
+            String::from("x@7"),
+            String::from("x"),
+            (7, stop),
+            None
+        ));
         assert_eq!(session.data_breakpoints[0].stop, first);
     }
 

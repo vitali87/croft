@@ -1055,7 +1055,7 @@ One launch session: the initialize -> setBreakpoints -> configurationDone -> sto
 
 **Adapter capabilities gate the extra breakpoint kinds.** The `initialize` response fills `AdapterCapabilities`. A hit count (`hitCondition`) is sent only to an adapter that supports it; function breakpoints are stashed on the session and sent on `initialized` before `configurationDone`; a data breakpoint is a `dataBreakpointInfo` question about a variable in its container, answered by `DapEvent::DataBreakpointInfo`, then `setDataBreakpoints`.
 
-**Run to Cursor is a temporary line breakpoint.** `run_to_cursor` adds the line to that file's `setBreakpoints` set and continues; the next `stopped` or `terminated` calls `end_run_to_cursor`, which resends the file's own set without it. The user's breakpoints never hold the temporary line.
+**Run to Cursor is a temporary line breakpoint.** `run_to_cursor` adds the line to that file's `setBreakpoints` set and continues; the next `stopped` or `terminated` calls `end_run_to_cursor`, which resends the file's own set without it. The user's breakpoints never hold the temporary line, and a line that already has one of them gets no temporary one (as VS Code's `runTo`), so its condition, hit count or log message applies.
 
 **No vendored protocol types.** Requests are built from `Value`-based builders, and `AdapterKind` names the launch mechanisms.
 

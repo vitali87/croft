@@ -20507,6 +20507,7 @@ impl App {
                 DapEvent::DataBreakpointInfo {
                     name,
                     container,
+                    stop,
                     data_id,
                     description,
                     access_types,
@@ -20514,7 +20515,7 @@ impl App {
                     data_notes.push(apply_data_breakpoint_info(
                         session,
                         name,
-                        *container,
+                        (*container, *stop),
                         data_id.clone(),
                         description,
                         access_types,
@@ -50626,7 +50627,7 @@ const TERMINAL_RESTORE_SEQ: &[u8] =
 fn apply_data_breakpoint_info(
     session: &mut crate::dap::session::DapSession,
     name: &str,
-    container: i64,
+    read_at: (i64, u64),
     data_id: Option<String>,
     description: &str,
     access_types: &[String],
@@ -50648,7 +50649,7 @@ fn apply_data_breakpoint_info(
             access_types.join(", ")
         );
     };
-    if session.toggle_data_breakpoint(id, name.to_string(), container, access) {
+    if session.toggle_data_breakpoint(id, name.to_string(), read_at, access) {
         format!("Breaks when {name} changes")
     } else {
         format!("No longer breaks when {name} changes")
