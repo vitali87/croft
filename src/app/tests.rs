@@ -49900,3 +49900,55 @@ fn cmd_k_shift_e_runs_the_caret_lines_only_lens() {
         "two lenses open a menu to pick from"
     );
 }
+
+// ---- #611: hit counts, function breakpoints, Run to Cursor ----
+
+#[test]
+fn a_hit_count_prompt_sets_the_breakpoints_hit_condition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\ny = 2\n");
+    app.editor.cursor_row = 1;
+    app.run_command(crate::widgets::command_palette::Command::DebugAddHitCountBreakpoint);
+    let path = app.editor.path.clone().unwrap();
+    assert!(matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(PromptKind::HitCondition { line: 2, .. })
+    ));
+    app.commit_hit_condition(path.clone(), 2, " 5 ");
+    let lines = app.editor.breakpoints.get(&path).cloned().unwrap();
+    assert!(lines.contains(&2), "the breakpoint exists");
+    let specs = app.editor.source_breakpoints(&path, &lines);
+    assert_eq!(specs[0].hit_condition.as_deref(), Some("5"));
+    app.commit_hit_condition(path.clone(), 2, "");
+    let specs = app.editor.source_breakpoints(&path, &lines);
+    assert_eq!(specs[0].hit_condition, None, "blank clears it");
+}
+
+#[test]
+fn function_breakpoints_are_kept_for_the_next_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.commit_function_breakpoint(String::from("main"));
+    app.commit_function_breakpoint(String::from("main"));
+    assert_eq!(
+        app.function_breakpoints,
+        vec![String::from("main")],
+        "no duplicates"
+    );
+    app.debug_clear_function_breakpoints();
+    assert!(app.function_breakpoints.is_empty());
+}
+
+#[test]
+fn run_to_cursor_without_a_session_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    let ctrl_f10 = crossterm::event::KeyEvent::new(KeyCode::F(10), KeyModifiers::CONTROL);
+    assert!(is_run_to_cursor_key(ctrl_f10));
+    assert!(!is_run_to_cursor_key(crossterm::event::KeyEvent::new(
+        KeyCode::F(10),
+        KeyModifiers::NONE
+    )));
+    app.debug_run_to_cursor();
+    assert_eq!(app.status, "Run to Cursor: no debug session");
+}

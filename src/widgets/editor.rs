@@ -2426,6 +2426,11 @@ pub struct Editor {
     /// of pausing. Rendered as an amber diamond in the gutter.
     pub breakpoint_logs:
         std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
+    /// Optional hit count per breakpoint line (path -> line -> DAP
+    /// `hitCondition`, #611): pause only once the line has been hit that
+    /// many times.
+    pub breakpoint_hit_conditions:
+        std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
     /// Reader bookmarks (VS Code's Bookmarks extension, nvim's `m` marks),
     /// keyed by file path as 1-based line numbers — the same shape as
     /// [`breakpoints`](Self::breakpoints), so switching tabs and coming back
@@ -2982,6 +2987,7 @@ impl Editor {
             unverified_breakpoints: std::collections::HashMap::new(),
             breakpoint_conditions: std::collections::HashMap::new(),
             breakpoint_logs: std::collections::HashMap::new(),
+            breakpoint_hit_conditions: std::collections::HashMap::new(),
             bookmarks: std::collections::HashMap::new(),
             bookmark_shadow: None,
             bookmark_sync_paused: false,
@@ -3492,12 +3498,14 @@ impl Editor {
     ) -> Vec<crate::dap::session::SourceBreakpoint> {
         let conds = self.breakpoint_conditions.get(path);
         let logs = self.breakpoint_logs.get(path);
+        let hits = self.breakpoint_hit_conditions.get(path);
         lines
             .iter()
             .map(|&l| crate::dap::session::SourceBreakpoint {
                 line: l as u32,
                 condition: conds.and_then(|c| c.get(&l)).cloned(),
                 log_message: logs.and_then(|m| m.get(&l)).cloned(),
+                hit_condition: hits.and_then(|h| h.get(&l)).cloned(),
             })
             .collect()
     }
@@ -12524,10 +12532,16 @@ impl Widget for &mut Editor {
                     .unverified_breakpoints
                     .get(path)
                     .is_some_and(|s| s.contains(&here));
+                // A hit count is a condition on the pause (#611), so it wears
+                // the conditional diamond too, as in VS Code.
                 let is_conditional = self
                     .breakpoint_conditions
                     .get(path)
-                    .is_some_and(|c| c.contains_key(&here));
+                    .is_some_and(|c| c.contains_key(&here))
+                    || self
+                        .breakpoint_hit_conditions
+                        .get(path)
+                        .is_some_and(|h| h.contains_key(&here));
                 let is_logpoint = self
                     .breakpoint_logs
                     .get(path)

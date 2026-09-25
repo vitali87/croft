@@ -306,6 +306,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Cmd+K` `Cmd+Q` | Go to Last Edit Location: jump to the most recent buffer edit across the open editors (VS Code's chord; distinct from the navigator's plain `Cmd+K` `Q`) |
 | `Alt`+`F12` | Peek Definition: an excerpt popup at the caret — header `path:line`, numbered lines, the definition marked `▶`; `Enter` converts to the real jump, `Esc` closes, any other key closes and keeps its meaning (also Command Palette "Peek Definition") |
 | `Alt`+`Shift`+`F12` | Peek References: the same popup for each reference to the symbol at the caret, titled "Reference 2 of 7"; `Up` / `Down` step through them (wrapping), `Enter` jumps to the one shown, `Esc` closes (also Command Palette "Peek References") |
+| `Ctrl`+`F10` | Debug: Run to Cursor. With the debugger paused, resume and stop once at the caret line, without leaving a breakpoint behind |
 | `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
 | `Ctrl`+`F12` | Go to Type Definition |

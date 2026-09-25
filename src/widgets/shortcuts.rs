@@ -842,6 +842,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Ctrl+F10",
+                description: "Run to cursor (debugger paused): resume and stop once at the caret line",
+                handler: "is_run_to_cursor_key",
+            },
+            ShortcutEntry {
                 keys: "F10",
                 description: "Step over",
                 handler: "",

@@ -2243,6 +2243,19 @@ enum PromptKind {
         path: PathBuf,
         line: usize,
     },
+    /// Debugger "Add Hit Count Breakpoint" (#611): the DAP `hitCondition`
+    /// for the breakpoint on 1-based `line` of `path`. Same commit shape as
+    /// [`PromptKind::BreakpointCondition`].
+    HitCondition {
+        path: PathBuf,
+        line: usize,
+    },
+    /// Debugger "Add Function Breakpoint" (#611): a function name to pause
+    /// on entry to.
+    FunctionBreakpoint,
+    /// Debugger "Break When Value Changes" (#611): a variable name from the
+    /// paused frame's scopes.
+    DataBreakpoint,
     /// Rename the terminal pane at `idx`. The buffer is pre-filled with its
     /// current label; on commit the name overrides the auto label.
     RenameTerminal(usize),
@@ -3333,6 +3346,8 @@ pub struct App {
     /// edit seq last requested per path, so a still buffer asks once.
     code_lens_enabled: bool,
     code_lens_requested: std::collections::HashMap<PathBuf, u64>,
+    /// Function breakpoints (#611), handed to each session as it launches.
+    function_breakpoints: Vec<String>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -4929,6 +4944,7 @@ impl App {
             live_run_runner: None,
             md_scroll_synced: None,
             code_lens_enabled: true,
+            function_breakpoints: Vec::new(),
             code_lens_requested: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
@@ -18411,6 +18427,39 @@ impl App {
                 ]),
                 "Enter to set the log message, {expr} interpolates (blank for a plain breakpoint), Esc to cancel",
             ),
+            PromptKind::HitCondition { .. } => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to set the hit count, e.g. 5 (blank for a plain breakpoint), Esc to cancel",
+            ),
+            PromptKind::FunctionBreakpoint => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to break on entry to this function, Esc to cancel",
+            ),
+            PromptKind::DataBreakpoint => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to pause when this variable is written, Esc to cancel",
+            ),
         };
         frame.render_widget(
             ratatui::widgets::Paragraph::new(top_line),
@@ -19228,6 +19277,10 @@ impl App {
             } else {
                 self.debug_toggle_breakpoint();
             }
+            return Ok(());
+        }
+        if is_run_to_cursor_key(key) && !terminal_owns_fkeys {
+            self.debug_run_to_cursor();
             return Ok(());
         }
         if matches!(key.code, KeyCode::F(10)) && !terminal_owns_fkeys {
@@ -21913,7 +21966,9 @@ impl App {
             }
         };
         match result {
-            Ok(session) => {
+            Ok(mut session) => {
+                // Held until `initialized`, then pushed with the rest (#611).
+                session.set_function_breakpoints(self.function_breakpoints.clone());
                 match slot {
                     LaunchSlot::Replace => self.debug_sessions.replace_with(&name, session),
                     LaunchSlot::Add => self.debug_sessions.push(&name, session),
@@ -22303,6 +22358,178 @@ impl App {
         for session in self.debug_sessions.iter_mut() {
             session.update_breakpoints(&path, &specs);
         }
+    }
+
+    /// A one-line prompt with no pre-fill, for the #611 breakpoint kinds.
+    fn open_debug_prompt(&mut self, label: String, buffer: String, kind: PromptKind) {
+        let target_dir = self.tree.root.clone();
+        self.prompt = Some(Prompt {
+            label,
+            buffer,
+            kind,
+            target_dir,
+            error: None,
+        });
+    }
+
+    /// Debug: Add Hit Count Breakpoint (#611), on the cursor line.
+    pub fn debug_edit_hit_condition(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to set a hit count breakpoint");
+            return;
+        };
+        let line = self.editor.cursor_row + 1;
+        let existing = self
+            .editor
+            .breakpoint_hit_conditions
+            .get(&path)
+            .and_then(|h| h.get(&line))
+            .cloned()
+            .unwrap_or_default();
+        self.open_debug_prompt(
+            format!("Pause after how many hits? · line {line}"),
+            existing,
+            PromptKind::HitCondition { path, line },
+        );
+    }
+
+    /// Commit the hit-count popup: ensure a breakpoint on the line, attach
+    /// the count (or clear it when blank), and push the file's set to every
+    /// session.
+    fn commit_hit_condition(&mut self, path: PathBuf, line: usize, hits: &str) {
+        self.editor
+            .breakpoints
+            .entry(path.clone())
+            .or_default()
+            .insert(line);
+        let hits = hits.trim();
+        if hits.is_empty() {
+            if let Some(h) = self.editor.breakpoint_hit_conditions.get_mut(&path) {
+                h.remove(&line);
+            }
+            self.status = format!("Plain breakpoint at line {line}");
+        } else {
+            self.editor
+                .breakpoint_hit_conditions
+                .entry(path.clone())
+                .or_default()
+                .insert(line, hits.to_string());
+            self.status = format!("Breakpoint at line {line} pauses on hit {hits}");
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(&path)
+            .map(|l| self.editor.source_breakpoints(&path, l))
+            .unwrap_or_default();
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(&path, &specs);
+        }
+    }
+
+    /// Debug: Add Function Breakpoint (#611).
+    pub fn debug_add_function_breakpoint(&mut self) {
+        self.open_debug_prompt(
+            String::from("Break on entry to function"),
+            String::new(),
+            PromptKind::FunctionBreakpoint,
+        );
+    }
+
+    fn commit_function_breakpoint(&mut self, name: String) {
+        if name.is_empty() || self.function_breakpoints.contains(&name) {
+            return;
+        }
+        self.function_breakpoints.push(name.clone());
+        self.push_function_breakpoints();
+        self.status = format!("Function breakpoint: {name}");
+    }
+
+    /// Debug: Remove All Function Breakpoints (#611).
+    pub fn debug_clear_function_breakpoints(&mut self) {
+        self.function_breakpoints.clear();
+        self.push_function_breakpoints();
+        self.status = String::from("Function breakpoints removed");
+    }
+
+    fn push_function_breakpoints(&mut self) {
+        let names = self.function_breakpoints.clone();
+        let mut refused = false;
+        for session in self.debug_sessions.iter_mut() {
+            if session.supports("supportsFunctionBreakpoints") {
+                session.set_function_breakpoints(names.clone());
+            } else {
+                refused = true;
+            }
+        }
+        if refused && !names.is_empty() {
+            self.status = String::from("This debugger does not support function breakpoints");
+        }
+    }
+
+    /// Debug: Run to Cursor (#611, Ctrl+F10): resume and pause once at the
+    /// caret line, without leaving a breakpoint behind.
+    pub fn debug_run_to_cursor(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let line = self.editor.cursor_row as u32 + 1;
+        match self.debug_sessions.focused_mut() {
+            Some(session) if session.stopped_thread.is_some() => {
+                session.run_to_cursor(&path, line);
+                self.status = format!("Running to line {line}");
+            }
+            Some(_) => self.status = String::from("Run to Cursor needs the debugger paused"),
+            None => self.status = String::from("Run to Cursor: no debug session"),
+        }
+    }
+
+    /// Debug: Break When Value Changes (#611): prompt for a variable of the
+    /// paused frame.
+    pub fn debug_break_on_value_change(&mut self) {
+        match self.debug_sessions.focused() {
+            Some(s) if s.stopped_thread.is_none() => {
+                self.status = String::from("Break When Value Changes needs the debugger paused");
+            }
+            Some(s) if !s.supports("supportsDataBreakpoints") => {
+                self.status = String::from("This debugger does not support data breakpoints");
+            }
+            Some(_) => self.open_debug_prompt(
+                String::from("Break when this variable changes"),
+                String::new(),
+                PromptKind::DataBreakpoint,
+            ),
+            None => self.status = String::from("Break When Value Changes: no debug session"),
+        }
+    }
+
+    fn commit_data_breakpoint(&mut self, name: &str) {
+        let Some(session) = self.debug_sessions.focused_mut() else {
+            return;
+        };
+        // The variable's container: the scope (or expanded variable) that
+        // lists it, which is what `dataBreakpointInfo` is asked against.
+        let container = session.scopes.iter().map(|s| s.variables_ref).find(|r| {
+            session
+                .variables
+                .get(r)
+                .is_some_and(|vs| vs.iter().any(|v| v.name == name))
+        });
+        match container {
+            Some(reference) => {
+                session.break_on_change(reference, name);
+                self.status = format!("Pausing when {name} changes");
+            }
+            None => self.status = format!("No variable named {name} in the paused frame"),
+        }
+    }
+
+    /// Debug: Remove All Data Breakpoints (#611).
+    pub fn debug_clear_data_breakpoints(&mut self) {
+        for session in self.debug_sessions.iter_mut() {
+            session.clear_data_breakpoints();
+        }
+        self.status = String::from("Data breakpoints removed");
     }
 
     /// Open the logpoint editor for the cursor line, pre-filled with any
@@ -36149,6 +36376,12 @@ impl App {
             Cmd::ShowIncomingCalls => self.request_call_hierarchy_at_cursor(true),
             Cmd::ShowSupertypes => self.request_type_hierarchy_at_cursor(true),
             Cmd::ToggleCodeLens => self.toggle_code_lens(),
+            Cmd::DebugAddHitCountBreakpoint => self.debug_edit_hit_condition(),
+            Cmd::DebugAddFunctionBreakpoint => self.debug_add_function_breakpoint(),
+            Cmd::DebugRemoveFunctionBreakpoints => self.debug_clear_function_breakpoints(),
+            Cmd::DebugRunToCursor => self.debug_run_to_cursor(),
+            Cmd::DebugBreakOnValueChange => self.debug_break_on_value_change(),
+            Cmd::DebugRemoveDataBreakpoints => self.debug_clear_data_breakpoints(),
             Cmd::RunCodeLens => self.run_code_lens_at_cursor(),
             Cmd::ShowSubtypes => self.request_type_hierarchy_at_cursor(false),
             Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
@@ -46556,6 +46789,21 @@ impl App {
                 self.prompt = None;
                 self.commit_logpoint(path, line, &message);
             }
+            PromptKind::HitCondition { path, line } => {
+                let hits = prompt.buffer.clone();
+                self.prompt = None;
+                self.commit_hit_condition(path, line, &hits);
+            }
+            PromptKind::FunctionBreakpoint => {
+                let name = prompt.buffer.trim().to_string();
+                self.prompt = None;
+                self.commit_function_breakpoint(name);
+            }
+            PromptKind::DataBreakpoint => {
+                let name = prompt.buffer.trim().to_string();
+                self.prompt = None;
+                self.commit_data_breakpoint(&name);
+            }
             PromptKind::RenameTerminal(idx) => {
                 let name = prompt.buffer.trim().to_string();
                 self.prompt = None;
@@ -48554,6 +48802,14 @@ fn is_go_to_references_key(key: KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Debug: Run to Cursor, `Ctrl+F10` (#611), Visual Studio's binding. Checked
+/// before the bare F10 step-over, which accepts any modifier.
+fn is_run_to_cursor_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(10))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// Editor-pane Peek References: `Alt+Shift+F12` (#616). Alt is croft's
