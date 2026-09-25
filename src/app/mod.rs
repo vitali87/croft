@@ -45008,7 +45008,11 @@ impl App {
         self.lsp = match crate::lsp::LspManager::new(new_root.clone()) {
             Ok(m) => Some(m),
             Err(e) => {
-                eprintln!("lsp manager rebind failed: {e}");
+                // Not stderr: the TUI owns the screen here, and text written
+                // around ratatui stays on it (#537's class of leak).
+                let msg = format!("Language servers could not restart: {e}");
+                crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
+                self.status = msg;
                 None
             }
         };
