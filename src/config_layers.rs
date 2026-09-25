@@ -122,17 +122,21 @@ pub fn user_local_config_path() -> PathBuf {
 }
 
 /// Load the full merged view for a workspace (or just the user layers when
-/// `workspace_root` is `None`). Test builds read the user layers from a
-/// per-process dir nothing creates.
+/// `workspace_root` is `None`), reading the user layers from
+/// [`user_layers_dir`].
 pub fn load_merged(workspace_root: Option<&Path>) -> MergedConfig {
-    // Under test the user layers point at a per-process dir nothing creates:
-    // the developer's real config.json must never steer app tests.
-    let user_dir = if cfg!(test) {
+    load_merged_from(&user_layers_dir(), workspace_root, current_platform())
+}
+
+/// Where [`load_merged`] reads the user layers (`config.json` and
+/// `config.local.json`). Test builds use a per-process dir nothing creates,
+/// so the user's own settings never steer a test (#624).
+fn user_layers_dir() -> PathBuf {
+    if cfg!(test) {
         std::env::temp_dir().join(format!("croft-test-config-{}", std::process::id()))
     } else {
         crate::prefs::config_dir()
-    };
-    load_merged_from(&user_dir, workspace_root, current_platform())
+    }
 }
 
 /// The platform key active on this build, matching the scope-block names.
@@ -500,6 +504,19 @@ pub fn ensure_workspace_local_ignored(root: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #624: a test build reads the user layers from a dir outside the
+    /// user's config dir, so their own settings never reach a test.
+    #[test]
+    fn a_test_build_reads_the_user_layers_outside_the_config_dir() {
+        let dir = user_layers_dir();
+        assert!(
+            !dir.starts_with(crate::prefs::config_dir()),
+            "user layers read from the real config dir: {}",
+            dir.display()
+        );
+        assert!(!dir.exists(), "nothing creates the test user dir");
+    }
 
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -36258,8 +36258,8 @@ fn workspace_settings_layer_applies_at_startup_and_reloads_live() {
     )
     .unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    // The workspace layer is later in the chain than any user layer, so
-    // these hold regardless of the developer's real ~/.config contents.
+    // The workspace layer is later in the chain than any user layer, and
+    // test builds read no user layer at all (`config_layers::user_layers_dir`).
     assert!(app.format_on_save, "committed workspace setting applies");
     assert!(!app.indent_guides_enabled);
     assert_eq!(
@@ -49597,13 +49597,4 @@ fn a_test_built_app_reads_no_user_settings_layer() {
             app.settings_provenance
         );
     }
-}
-
-/// The saved prefs read outside the settings layers (MCP consents, the
-/// terminal warning, extension toggles) are the defaults under test too.
-#[test]
-fn a_test_build_reads_default_saved_prefs() {
-    let loaded = serde_json::to_value(crate::prefs::Prefs::load_or_default()).unwrap();
-    let default = serde_json::to_value(crate::prefs::Prefs::default()).unwrap();
-    assert_eq!(loaded, default);
 }

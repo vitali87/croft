@@ -332,18 +332,23 @@ pub struct Prefs {
     pub notifications: Vec<NotificationSink>,
 }
 
+/// The `config.json` that [`Prefs::load_or_default`] reads, or `None` in
+/// test builds: the user's real `config.json` must never steer a test
+/// (#624), the same rule `config_layers::load_merged` applies to the
+/// settings layers.
+fn saved_prefs_path() -> Option<PathBuf> {
+    (!cfg!(test)).then(config_path)
+}
+
 impl Prefs {
     /// Load preferences from `config_path()`, falling back to defaults when
     /// the file is absent or unreadable. Preferences are best-effort: a
     /// corrupt config should never block startup. Test builds always get
-    /// the defaults: the developer's real `config.json` must never steer a
-    /// test (#624), the same rule `config_layers::load_merged` applies to
-    /// the settings layers.
+    /// the defaults (see [`saved_prefs_path`]).
     pub fn load_or_default() -> Self {
-        if cfg!(test) {
-            return Self::default();
-        }
-        Self::load(&config_path()).unwrap_or_default()
+        saved_prefs_path()
+            .and_then(|p| Self::load(&p).ok())
+            .unwrap_or_default()
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -668,6 +673,17 @@ pub(crate) fn config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #624: a test build reads no saved `config.json`, so the MCP
+    /// consents, the terminal warning and the extension toggles that
+    /// `load_or_default` feeds are the defaults on every machine.
+    #[test]
+    fn a_test_build_reads_no_saved_prefs() {
+        assert_eq!(saved_prefs_path(), None);
+        let loaded = serde_json::to_value(Prefs::load_or_default()).unwrap();
+        let default = serde_json::to_value(Prefs::default()).unwrap();
+        assert_eq!(loaded, default);
+    }
 
     #[test]
     fn round_trips_theme_through_disk() {
