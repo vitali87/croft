@@ -1629,6 +1629,13 @@ enum LaunchSlot {
     Add,
 }
 
+/// Where the session at `index` sits once every index in `removed` has been
+/// taken out of the set: `None` if it was removed itself, otherwise shifted
+/// down by one for each removal below it (#567).
+fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
+    (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
+}
+
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
 /// task runs in a terminal pane, and the FinishedCommand sweep decides.
 struct PendingDebugLaunch {
@@ -3911,6 +3918,9 @@ pub struct App {
     /// Whether the host's stale-image marker (#238) has already been
     /// announced, so the status hint fires once per session, not per poll.
     session_host_stale_seen: bool,
+    /// The stale-client notice the current roster warrants (#626, #652), so
+    /// it is raised once when it changes, not on every roster churn.
+    session_stale_notice: Option<String>,
     /// Multiplayer: the participant whose keystrokes are currently flowing
     /// into this croft (from the host's typing attribution frames).
     session_typist: Option<u64>,
@@ -5118,6 +5128,7 @@ impl App {
             session_channel: crate::session_host::InnerChannel::from_env(),
             session_participants: Vec::new(),
             session_host_stale_seen: false,
+            session_stale_notice: None,
             session_typist: None,
             session_carets: std::collections::HashMap::new(),
             session_presence_mtime: None,
@@ -19239,6 +19250,12 @@ impl App {
             self.debug_pause();
             return Ok(());
         }
+        // Debug: Switch Session (#567), only while debugging: with no session
+        // the chord is not claimed at all.
+        if is_switch_debug_session_key(key) && !self.debug_sessions.is_empty() {
+            self.switch_debug_session();
+            return Ok(());
+        }
         if matches!(key.code, KeyCode::F(9)) && !(terminal_owns_fkeys && !self.f9_update_armed()) {
             if key.modifiers.contains(KeyModifiers::SHIFT)
                 && key.modifiers.contains(KeyModifiers::ALT)
@@ -20626,24 +20643,70 @@ impl App {
         // reverse request nobody answered. It would be started, named in the
         // status, and dead.
         //
-        // Only the FOCUSED session's events drive the UI; a background
-        // member's are drained, and noticed only when they retire it.
+        // Only the FOCUSED session's events drive the UI. A background
+        // member's output still reaches the console, tagged with its name,
+        // and everything else it reports is queued on it and replayed when it
+        // is focused (#567): dropping its `stopped` left a breakpoint hit that
+        // nothing showed, so the member looked hung.
+        const BACKLOG_CAP: usize = 256;
         let focused = self.debug_sessions.focused_index();
-        let mut events = Vec::new();
+        // A session focused since the last poll first replays what it did
+        // while in the background.
+        let mut events = self.debug_sessions.take_focused_backlog();
         let mut background_ended: Vec<usize> = Vec::new();
-        for (index, session) in self.debug_sessions.iter_mut_indexed() {
-            let drained = session.poll();
+        let mut background_output: Vec<String> = Vec::new();
+        // By index, not name: a compound can list one configuration twice,
+        // so two members can share a name.
+        let mut background_stopped: Option<usize> = None;
+        for (index, named) in self.debug_sessions.iter_named_mut_indexed() {
+            let drained = named.session.poll();
             if index == focused {
-                events = drained;
+                events.extend(drained);
                 continue;
             }
             changed_background |= !drained.is_empty();
-            if drained.iter().any(|e| matches!(e, DapEvent::Terminated)) {
-                background_ended.push(index);
+            for ev in drained {
+                match ev {
+                    // `exited` and `terminated` both end a member and often
+                    // arrive together: name it once, or the removal below
+                    // takes a live sibling for the second copy.
+                    DapEvent::Terminated => {
+                        if background_ended.last() != Some(&index) {
+                            background_ended.push(index);
+                        }
+                    }
+                    DapEvent::Output { category, text }
+                        if crate::dap::session::output_is_user_visible(&category) =>
+                    {
+                        background_output.extend(
+                            text.split('\n')
+                                .filter(|l| !l.is_empty())
+                                .map(|l| format!("[{}] {l}", named.name)),
+                        );
+                    }
+                    DapEvent::Output { .. } => {}
+                    other => {
+                        if matches!(other, DapEvent::Stopped { .. }) {
+                            background_stopped.get_or_insert(index);
+                        }
+                        named.backlog.push(other);
+                        if named.backlog.len() > BACKLOG_CAP {
+                            let overflow = named.backlog.len() - BACKLOG_CAP;
+                            named.backlog.drain(..overflow);
+                        }
+                    }
+                }
             }
+        }
+        for line in background_output {
+            self.debug_console_push(line);
         }
         // Highest index first, so removing one does not move the next.
         let mut ended_names = Vec::new();
+        // Where the stopped member sits once the ended ones are gone: gone
+        // itself if it also ended, else shifted down past every removal below.
+        let background_stopped =
+            background_stopped.and_then(|i| index_after_removals(i, &background_ended));
         for index in background_ended.into_iter().rev() {
             if let Some(mut gone) = self.debug_sessions.remove(index) {
                 gone.session.disconnect();
@@ -20662,6 +20725,34 @@ impl App {
         }
         if !ended_names.is_empty() && !self.debug_sessions.is_empty() {
             self.report_member_ended(&ended_names.join(", "));
+        }
+        // A background member stopped (a breakpoint, an exception, a pause).
+        // If the member being looked at is still running, show the stopped
+        // one, as VS Code does; otherwise say so rather than steal the view
+        // from a stop the user is already inspecting.
+        if let Some(index) = background_stopped
+            && let Some(name) = self.debug_sessions.names().get(index).cloned()
+        {
+            let focused_is_stopped = self
+                .debug_sessions
+                .focused()
+                .is_some_and(|s| s.phase == SessionPhase::Stopped)
+                || events.iter().any(|e| matches!(e, DapEvent::Stopped { .. }));
+            // A focused member that ended this tick is torn down below, and
+            // the teardown reads the FOCUSED member: moving the view first
+            // would carry the ending into its backlog and leave it running.
+            let focused_ended = self
+                .debug_sessions
+                .focused()
+                .is_some_and(|s| s.phase == SessionPhase::Terminated)
+                || events.iter().any(|e| matches!(e, DapEvent::Terminated));
+            if focused_is_stopped || focused_ended {
+                self.status =
+                    format!("{name} stopped in the background · Cmd+Opt+Shift+G switches to it");
+            } else {
+                self.refocus_debug_session(index, &mut events);
+                self.status = format!("{name} stopped · now showing it");
+            }
         }
         let mut changed = !events.is_empty() || changed_background;
         for ev in events {
@@ -22510,6 +22601,82 @@ impl App {
             format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
     }
 
+    /// Move the UI to the session at `index` (#567). `events` holds what the
+    /// previously focused session produced this tick: its output goes to the
+    /// console now, and the rest goes back on its own backlog so it replays
+    /// when that session is focused again, rather than being applied to the
+    /// wrong one. `events` is then the new session's queued backlog, so the
+    /// caller's event loop replays its stop as if it had been focused all
+    /// along.
+    fn refocus_debug_session(
+        &mut self,
+        index: usize,
+        events: &mut Vec<crate::dap::session::DapEvent>,
+    ) {
+        use crate::dap::session::DapEvent;
+        let old = self.debug_sessions.focused_index();
+        if index == old || !self.debug_sessions.focus(index) {
+            return;
+        }
+        let mut keep = Vec::new();
+        for ev in events.drain(..) {
+            match ev {
+                DapEvent::Output { category, text }
+                    if crate::dap::session::output_is_user_visible(&category) =>
+                {
+                    for line in text.split('\n').filter(|l| !l.is_empty()) {
+                        self.debug_console_push(line.to_string());
+                    }
+                }
+                DapEvent::Output { .. } => {}
+                other => keep.push(other),
+            }
+        }
+        if let Some((_, named)) = self
+            .debug_sessions
+            .iter_named_mut_indexed()
+            .find(|(i, _)| *i == old)
+        {
+            keep.append(&mut named.backlog);
+            named.backlog = keep;
+        }
+        *events = self.debug_sessions.take_focused_backlog();
+        // The arrow belongs to the session that was focused; the phase pass
+        // after the event loop redraws it for the new one.
+        self.editor.stop_line = None;
+    }
+
+    /// Debug: Switch Session (#567): focus the next member of a compound, so
+    /// one stopped in the background can be inspected. Its queued events
+    /// replay on the next poll.
+    fn switch_debug_session(&mut self) {
+        if self.debug_sessions.len() < 2 {
+            self.status = String::from("Only one debug session is running");
+            return;
+        }
+        let next = (self.debug_sessions.focused_index() + 1) % self.debug_sessions.len();
+        let mut none = Vec::new();
+        self.refocus_debug_session(next, &mut none);
+        // Nothing drained this tick belongs to the old session here, so the
+        // new session's backlog goes back to wait for the next poll.
+        if let Some((_, named)) = self
+            .debug_sessions
+            .iter_named_mut_indexed()
+            .find(|(i, _)| *i == next)
+        {
+            none.append(&mut named.backlog);
+            named.backlog = none;
+        }
+        let name = self
+            .debug_sessions
+            .focused_name()
+            .unwrap_or("?")
+            .to_string();
+        let running = self.debug_sessions.names().join(", ");
+        self.status = format!("Debugging {name} · running: {running}");
+        self.refresh_debug_panel();
+    }
+
     /// Shift+F5: stop debugging and tear the session down.
     pub fn debug_stop(&mut self) {
         // EVERY session, not the focused one (#310). A compound launches
@@ -23709,8 +23876,32 @@ impl App {
         }
         self.session_presence_mtime = mtime;
         let roster = crate::session_host::read_presence(&path).unwrap_or_default();
+        // A client older than this session is told here, in croft's own
+        // status line, never over its screen (#626, #652). The reference is
+        // the newer of this croft and its host: a host swap moves the host
+        // past this croft until an F9 reload, and a client still on the old
+        // binary is then out of date even though it matches us. Raised only
+        // when the notice changes (a client resizing churns the roster), and
+        // decided before the unchanged-roster return, since a swap can leave
+        // the roster identical while the host's version moved.
+        let host_version = crate::session_host::read_host_version(&channel.host_version);
+        let reference = crate::session_host::session_version(
+            env!("CARGO_PKG_VERSION"),
+            host_version.as_deref(),
+        );
+        let stale = crate::session_host::stale_client_notice_on_change(
+            self.session_stale_notice.as_deref(),
+            &roster,
+            reference,
+        );
+        self.session_stale_notice = crate::session_host::stale_client_notice(&roster, reference);
         if roster == self.session_participants {
-            return false;
+            // Unchanged roster: redraw only for a newly raised notice.
+            let Some(notice) = stale else {
+                return false;
+            };
+            self.status = notice;
+            return true;
         }
         let before = self.session_participants.len();
         let after = roster.len();
@@ -23722,6 +23913,9 @@ impl App {
             );
         } else if after < before {
             self.status = format!("A participant detached ({after} attached)");
+        }
+        if let Some(notice) = stale {
+            self.status = notice;
         }
         // Keep an open participants picker live without wiping the user's
         // typed filter, highlight, or scroll (any client resizing churns the
@@ -36203,6 +36397,7 @@ impl App {
             Cmd::SelectDebugConfig => self.open_debug_config_picker(),
             Cmd::StopDebugging => self.debug_stop(),
             Cmd::PauseDebugging => self.debug_pause(),
+            Cmd::SwitchDebugSession => self.switch_debug_session(),
             Cmd::RestartDebugging => self.debug_restart(),
             Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
             Cmd::EditLogpoint => self.debug_edit_logpoint(),
@@ -47573,6 +47768,12 @@ fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
 /// Bookmarks extension binds `Ctrl+Alt+K`; nvim spells it `m<letter>`).
 fn is_toggle_bookmark_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'k')
+}
+
+/// `Cmd+Opt+Shift+G`: focus the next member of a compound debug session
+/// (#567), so one stopped in the background can be inspected.
+fn is_switch_debug_session_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'g')
 }
 
 /// `Cmd+Opt+Shift+B`: clear every bookmark in the open file. `Cmd+Shift+B`
