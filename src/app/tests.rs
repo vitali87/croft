@@ -49594,6 +49594,8 @@ fn written_long_ago(path: &Path) {
     );
 }
 
+/// Opened for writing only to set the time: without `truncate` the text
+/// stays as it is.
 fn set_mtime(path: &Path, at: std::time::SystemTime) {
     std::fs::File::options()
         .write(true)
@@ -50259,8 +50261,11 @@ fn a_file_written_elsewhere_during_the_wait_keeps_its_text() {
     let dest = foo.parent().unwrap().join("sub");
     std::fs::create_dir(&dest).unwrap();
     app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
-    let pending = app.pending_file_move.as_ref().expect("held");
-    let (request_id, requested_at) = (pending.request_id, pending.requested_at);
+    let &PendingFileMove {
+        request_id,
+        requested_at,
+        ..
+    } = app.pending_file_move.as_ref().expect("held");
     std::fs::write(&lib, "mod foo;\n// kept\n").unwrap();
     set_mtime(&lib, requested_at - std::time::Duration::from_secs(1));
     app.lsp
