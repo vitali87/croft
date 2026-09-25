@@ -337,10 +337,17 @@ pub fn read_line_by_deadline(
                     ));
                 }
             }
+            // EINTR is retried like a timeout: a signal landing on this
+            // thread mid-`recv` (any child exiting under a handler, a resize)
+            // says nothing about the client, and the deadline above still
+            // bounds the loop. Returning it refused a well-formed request
+            // with "Interrupted system call", seen under the parallel suite.
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
                 ) => {}
             Err(e) => return Err(e),
         }
