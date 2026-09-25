@@ -246,6 +246,126 @@ pub fn exec_args(spec: &Spec, name: &str, command: &[String], interactive: bool)
     out
 }
 
+/// Run `docker` with `args`: stdout, or the first line docker wrote to
+/// stderr.
+fn docker(program: &Path, args: &[String]) -> Result<String, String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("could not run docker: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("docker failed")
+            .to_string())
+    }
+}
+
+/// Bring up the workspace's container and make sure croft is in it (#617):
+/// reuse a running one, start a stopped one, or build and create it (then
+/// run `postCreateCommand`). `binary_for` supplies a Linux croft for a
+/// target triple when the container has none. Returns the spec and the
+/// container name.
+pub fn up(
+    root: &Path,
+    docker_program: &Path,
+    binary_for: &mut dyn FnMut(&str) -> Result<PathBuf, String>,
+    log: &mut dyn FnMut(String),
+) -> Result<(Spec, String), String> {
+    let path = find(root).ok_or_else(|| {
+        format!(
+            "no .devcontainer/devcontainer.json (or .devcontainer.json) in {}",
+            root.display()
+        )
+    })?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let spec = parse(&text, root)?;
+    let name = container_name(root);
+    let run = |args: Vec<String>| docker(docker_program, &args);
+    let state = run(vec![
+        String::from("ps"),
+        String::from("-a"),
+        String::from("--filter"),
+        format!("name=^/{name}$"),
+        String::from("--format"),
+        String::from("{{.State}}"),
+    ])?;
+    match state.trim() {
+        "running" => log(format!("Using the running container {name}")),
+        "" => {
+            let image = match (&spec.image, &spec.build) {
+                (Some(image), _) => image.clone(),
+                (None, Some(build)) => {
+                    let tag = format!("{name}:latest");
+                    log(format!("Building {tag}"));
+                    let config_dir = path.parent().unwrap_or(root);
+                    run(build_args(build, config_dir, &tag))?;
+                    tag
+                }
+                (None, None) => unreachable!("parse requires an image or a build"),
+            };
+            log(format!("Creating {name} from {image}"));
+            run(run_args(&spec, root, &name, &image))?;
+            if let Some(cmd) = &spec.post_create {
+                log(format!("Running postCreateCommand: {cmd}"));
+                run(exec_args(
+                    &spec,
+                    &name,
+                    &[String::from("sh"), String::from("-lc"), cmd.clone()],
+                    false,
+                ))?;
+            }
+        }
+        other => {
+            log(format!("Starting {name} ({other})"));
+            run(vec![String::from("start"), name.clone()])?;
+        }
+    }
+    let has_croft = run(exec_args(
+        &spec,
+        &name,
+        &[
+            String::from("sh"),
+            String::from("-c"),
+            String::from("command -v croft"),
+        ],
+        false,
+    ))
+    .is_ok();
+    if !has_croft {
+        let arch = run(exec_args(
+            &spec,
+            &name,
+            &[String::from("uname"), String::from("-m")],
+            false,
+        ))?;
+        let triple = crate::remote::arch_to_musl_triple(arch.trim())
+            .ok_or_else(|| format!("no croft build for a {} container", arch.trim()))?;
+        log(format!("Installing croft ({triple}) into {name}"));
+        let binary = binary_for(triple)?;
+        run(vec![
+            String::from("cp"),
+            binary.display().to_string(),
+            format!("{name}:/usr/local/bin/croft"),
+        ])?;
+        run(vec![
+            String::from("exec"),
+            String::from("-u"),
+            String::from("0"),
+            name.clone(),
+            String::from("chmod"),
+            String::from("755"),
+            String::from("/usr/local/bin/croft"),
+        ])?;
+    }
+    Ok((spec, name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +542,131 @@ mod tests {
             exec_args(&s, "c1", &["croft".into(), ".".into()], true)[..3],
             ["exec", "-it", "-u"]
         );
+    }
+
+    /// A stand-in `docker`: logs each call, answers from `rules` (pattern in
+    /// the arguments -> stdout), exits 1 for patterns in `fails`.
+    #[cfg(unix)]
+    fn fake_docker(dir: &Path, rules: &[(&str, &str)], fails: &[&str]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let mut script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in\n",
+            dir.join("calls.log").display()
+        );
+        for f in fails {
+            script.push_str(&format!("  *'{f}'*) echo 'no such thing' >&2; exit 1 ;;\n"));
+        }
+        for (pattern, out) in rules {
+            script.push_str(&format!("  *'{pattern}'*) printf '%s' '{out}' ;;\n"));
+        }
+        script.push_str("  *) ;;\nesac\n");
+        let bin = dir.join("docker");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    fn calls(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_workspace_gets_its_container_built_created_set_up_and_croft_installed() {
+        let ws = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(".devcontainer")).unwrap();
+        std::fs::write(
+            ws.path().join(".devcontainer/devcontainer.json"),
+            r#"{"build": {"dockerfile": "Dockerfile"}, "postCreateCommand": "make setup"}"#,
+        )
+        .unwrap();
+        let docker = fake_docker(
+            bin.path(),
+            &[("uname -m", "aarch64"), ("ps -a", "")],
+            &["command -v croft"],
+        );
+        let croft_linux = bin.path().join("croft-linux");
+        std::fs::write(&croft_linux, "binary").unwrap();
+        let mut asked = Vec::new();
+        let mut log = Vec::new();
+        let (spec, name) = up(
+            ws.path(),
+            &docker,
+            &mut |triple| {
+                asked.push(triple.to_string());
+                Ok(croft_linux.clone())
+            },
+            &mut |l| log.push(l),
+        )
+        .unwrap();
+        assert_eq!(name, container_name(ws.path()));
+        assert!(spec.build.is_some());
+        assert_eq!(asked, ["aarch64-unknown-linux-musl"]);
+        let c = calls(bin.path());
+        let verbs: Vec<&str> = c
+            .iter()
+            .map(|l| l.split(' ').next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            verbs,
+            ["ps", "build", "run", "exec", "exec", "exec", "cp", "exec"],
+            "{c:#?}"
+        );
+        assert!(
+            c[3].ends_with("sh -lc make setup"),
+            "postCreateCommand: {}",
+            c[3]
+        );
+        assert!(
+            c[6].contains(&format!("{name}:/usr/local/bin/croft")),
+            "{}",
+            c[6]
+        );
+        assert!(!log.is_empty(), "progress is reported");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_container_is_reused_or_started_and_not_set_up_again() {
+        let ws = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join(".devcontainer.json"),
+            r#"{"image": "img", "postCreateCommand": "x"}"#,
+        )
+        .unwrap();
+        let docker = fake_docker(bin.path(), &[("ps -a", "exited")], &[]);
+        up(
+            ws.path(),
+            &docker,
+            &mut |_| unreachable!("croft is there"),
+            &mut |_| {},
+        )
+        .unwrap();
+        let c = calls(bin.path());
+        let verbs: Vec<&str> = c
+            .iter()
+            .map(|l| l.split(' ').next().unwrap_or(""))
+            .collect();
+        assert_eq!(verbs, ["ps", "start", "exec"], "{c:#?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn up_reports_a_missing_devcontainer_json_and_dockers_own_errors() {
+        let ws = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let docker = fake_docker(bin.path(), &[("ps -a", "")], &["run -d"]);
+        let err = up(ws.path(), &docker, &mut |_| unreachable!(), &mut |_| {}).unwrap_err();
+        assert!(err.contains("devcontainer.json"), "{err}");
+        std::fs::write(ws.path().join(".devcontainer.json"), r#"{"image": "img"}"#).unwrap();
+        let err = up(ws.path(), &docker, &mut |_| unreachable!(), &mut |_| {}).unwrap_err();
+        assert!(err.contains("no such thing"), "{err}");
     }
 }
