@@ -995,6 +995,8 @@ Loopback-port detection behind the PORTS panel. A stateful output-stream scraper
 
 **Subtree scoping answers only one question.** It says what should be SURFACED, never what is still UP. `poll_all_listening` is the unscoped companion the reconciliation uses, and it returns `None` (no evidence) rather than an empty set when neither tool runs.
 
+**Probes own no tty.** Every `ps`/`lsof`/`ss` the poll spawns goes through `probe`, which `setsid`s the child. The kernel prints a hung-NFS notice ("nfs server X: not responding") on the controlling tty of the process waiting on the mount, and a probe that inherited croft's tty put that text on top of the UI every few seconds. `lsof` also runs with `-b -w`, which skips the `stat` of every mounted file system that stalls on an unreachable server.
+
 ### ports.rs
 
 The panel group's PORTS tab: a registry of detected loopback ports (port, address, process, origin) fed by `port_detect.rs`, with an orange `⇄ host` marker for a forwarded remote port. It is a pure widget handling selection and click hit-testing; the App runs the open, forward, copy and stop actions.
@@ -1135,6 +1137,8 @@ Reads `launch.json` (`.croft` over `.vscode`), both its `configurations` and its
 ### dap/session.rs — the session set
 
 croft debugs several configurations at once (#310). `DebugSessions` holds them with one FOCUSED, and the distinction is the whole feature: the call stack, variables, stepping and the status line mean the focused session, while stopping and polling mean all of them.
+
+**A background member is still heard.** Only the focused session's events drive the call stack, variables and stop arrow, but a background member's program output goes to the debug console tagged `[name]`, and everything else it reports is kept on its own backlog rather than dropped (#567). A `stopped` there moves the view to it when the focused member is still running, as VS Code does; when the user is already inspecting a stop, the status names the member instead of stealing the view. Debug: Switch Session (`Cmd+Opt+Shift+G`) cycles members, and the backlog replays through the normal event handling when a member is focused, so its stop, stack and arrow appear as if it had been focused all along. Events the previously focused member produced in the same tick go back on ITS backlog, never onto the newly focused one.
 
 **A configuration launch REPLACES the set; a compound member JOINS it.** Starting a configuration has always terminated whatever was running, and that stays true — but the normal launch path opens by stopping the world, so calling it per member would leave only the last one alive. That asymmetry is why a compound has its own launch path rather than a loop over the single one.
 

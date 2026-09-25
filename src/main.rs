@@ -1,3 +1,4 @@
+mod agent_hook;
 mod agent_lane;
 mod agents;
 mod ansi_text;
@@ -65,6 +66,7 @@ mod remote_bulk;
 mod remote_connect;
 mod review_threads;
 mod rewind;
+mod sarif;
 mod scrubber;
 mod session;
 mod session_host;

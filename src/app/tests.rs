@@ -30885,6 +30885,7 @@ fn participant_rows_show_role_and_size() {
         cols: 120,
         rows: 40,
         control: true,
+        version: String::new(),
     };
     let row = participant_row(&p);
     assert_eq!(row.id, "7");
@@ -30898,6 +30899,7 @@ fn participant_rows_show_role_and_size() {
         cols: 0,
         rows: 0,
         control: false,
+        version: String::new(),
     };
     let row = participant_row(&p);
     assert!(row.label.contains("read-only"));
@@ -34680,7 +34682,8 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     // The deterministic half of #397's quick-select entry. Its sibling below
     // was measured at 3 failures in 20 runs under load, because a REAL
     // shell's prompt wraps to several rows and the pane had one row of slack;
-    // a rate is the best evidence a race allows, and it is not a test.
+    // a rate is the best evidence a race allows, and it is not a test. Both
+    // now run on a silent pane.
     //
     // This one feeds the prompt itself, so the geometry is the whole claim
     // and the machine has no say. Four rows of it, then the same park,
@@ -34688,6 +34691,15 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     // this fails on every machine on every run.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The pane's child writes nothing, so the grid holds only the bytes fed
+    // below: a real shell's startup prompt landing between them adds rows
+    // the geometry does not count (#641).
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "sleep",
+        &[String::from("30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     app.toggle_terminal_maximize();
@@ -36258,8 +36270,8 @@ fn workspace_settings_layer_applies_at_startup_and_reloads_live() {
     )
     .unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    // The workspace layer is later in the chain than any user layer, so
-    // these hold regardless of the developer's real ~/.config contents.
+    // The workspace layer is later in the chain than any user layer, and
+    // test builds read no user layer at all (`config_layers::user_layers_dir`).
     assert!(app.format_on_save, "committed workspace setting applies");
     assert!(!app.indent_guides_enabled);
     assert_eq!(
@@ -50260,6 +50272,217 @@ fn stub_member(ends: bool) -> crate::dap::session::DapSession {
     .expect("sh spawns")
 }
 
+/// A stand-in adapter that sends each JSON DAP message in `messages`, framed
+/// with its byte length, and then idles.
+fn stub_emitting(messages: &[&str]) -> crate::dap::session::DapSession {
+    let mut script = String::new();
+    for m in messages {
+        script.push_str(&format!(
+            "printf 'Content-Length: %d\\r\\n\\r\\n%s' {} '{}'; ",
+            m.len(),
+            m
+        ));
+    }
+    script.push_str("sleep 30");
+    crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), script],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns")
+}
+
+/// Poll until `done` holds or two seconds pass.
+fn poll_until(app: &mut App, done: impl Fn(&App) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !done(app) && std::time::Instant::now() < deadline {
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// #567 item 1: a background member's program output used to be drained and
+/// dropped. It reaches the debug console, tagged with the member's name.
+#[test]
+fn a_background_members_output_reaches_the_console_with_its_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "A",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"event","event":"output","body":{"category":"stdout","output":"hello from A\n"}}"#,
+        ]),
+    );
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    poll_until(&mut app, |a| {
+        a.debug_console.iter().any(|l| l.contains("hello from A"))
+    });
+    assert!(
+        app.debug_console.iter().any(|l| l == "[A] hello from A"),
+        "console: {:?}",
+        app.debug_console
+    );
+    assert_eq!(
+        app.debug_sessions.focused_name(),
+        Some("B"),
+        "output alone does not steal focus"
+    );
+    app.debug_stop();
+}
+
+/// #567 item 1: a background member hitting a breakpoint looked hung, its
+/// `stopped` drained and dropped. With the focused member still running, the
+/// view moves to the stopped one and says so.
+#[test]
+fn a_background_stop_moves_the_view_to_the_stopped_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "A",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#,
+        ]),
+    );
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    poll_until(&mut app, |a| a.debug_sessions.focused_name() == Some("A"));
+    assert_eq!(app.debug_sessions.focused_name(), Some("A"));
+    assert!(app.status.contains("A stopped"), "status: {}", app.status);
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Paused (breakpoint)"),
+        "the stop replays through the normal handler once A is focused"
+    );
+    app.debug_stop();
+}
+
+const STOPPED_EVENT: &str =
+    r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#;
+
+/// A compound can list one configuration twice, so two members can share a
+/// name: the member that stopped is the one shown, not the first of that name.
+#[test]
+fn a_stop_shows_the_member_that_stopped_even_when_names_repeat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(false));
+    app.debug_sessions
+        .push("A", stub_emitting(&[STOPPED_EVENT]));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(2);
+    poll_until(&mut app, |a| a.debug_sessions.focused_index() != 2);
+    assert_eq!(
+        app.debug_sessions.focused_index(),
+        1,
+        "the second A stopped"
+    );
+    app.debug_stop();
+}
+
+/// A member ending in the same poll shifts the stopped member's position; the
+/// view still lands on the member that stopped.
+#[test]
+fn a_stop_lands_on_the_right_member_when_an_earlier_one_ends_alongside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Gone",
+        stub_emitting(&[r#"{"seq":1,"type":"event","event":"terminated"}"#]),
+    );
+    app.debug_sessions
+        .push("Stops", stub_emitting(&[STOPPED_EVENT]));
+    app.debug_sessions.push("Watched", stub_member(false));
+    app.debug_sessions.focus(2);
+    poll_until(&mut app, |a| {
+        a.debug_sessions.len() == 2 && a.debug_sessions.focused_name() == Some("Stops")
+    });
+    assert_eq!(app.debug_sessions.names(), vec!["Stops", "Watched"]);
+    assert_eq!(app.debug_sessions.focused_name(), Some("Stops"));
+    app.debug_stop();
+}
+
+/// The stopped member's position once members that ended in the same poll
+/// are removed: shifted past removals below it, untouched by those above,
+/// and gone if it ended itself.
+#[test]
+fn index_after_removals_shifts_past_lower_removals_only() {
+    assert_eq!(index_after_removals(2, &[]), Some(2));
+    assert_eq!(index_after_removals(2, &[0]), Some(1));
+    assert_eq!(index_after_removals(3, &[0, 1]), Some(1));
+    assert_eq!(
+        index_after_removals(1, &[2, 3]),
+        Some(1),
+        "removals above do not move it"
+    );
+    assert_eq!(index_after_removals(2, &[0, 2]), None, "it ended itself");
+}
+
+/// The switch command cycles the members, and says so when there is only one.
+#[test]
+fn switch_debug_session_cycles_the_members() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(false));
+    app.switch_debug_session();
+    assert_eq!(app.status, "Only one debug session is running");
+    app.debug_sessions.push("B", stub_member(false));
+    assert_eq!(app.debug_sessions.focused_name(), Some("B"));
+    app.switch_debug_session();
+    assert_eq!(app.debug_sessions.focused_name(), Some("A"));
+    assert!(
+        app.status.starts_with("Debugging A"),
+        "status: {}",
+        app.status
+    );
+    app.switch_debug_session();
+    assert_eq!(app.debug_sessions.focused_name(), Some("B"));
+    assert!(is_switch_debug_session_key(key(
+        KeyCode::Char('g'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    )));
+    assert!(!is_switch_debug_session_key(key(
+        KeyCode::Char('g'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    )));
+    app.debug_stop();
+}
+
+/// What a member reported in the background replays when it is switched to:
+/// a queued `stopped` drives the same handler it would have when focused.
+#[test]
+fn a_switched_to_member_replays_its_queued_stop() {
+    use crate::dap::session::DapEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(false));
+    app.debug_sessions.push("B", stub_member(false));
+    let (_, a) = app
+        .debug_sessions
+        .iter_named_mut_indexed()
+        .find(|(i, _)| *i == 0)
+        .unwrap();
+    a.backlog.push(DapEvent::Stopped {
+        thread_id: 1,
+        reason: String::from("exception"),
+    });
+    app.poll_dap();
+    assert_ne!(
+        app.run_debug.feedback.as_deref(),
+        Some("Paused (exception)"),
+        "not replayed while A is in the background"
+    );
+    app.switch_debug_session();
+    app.poll_dap();
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Paused (exception)")
+    );
+    app.debug_stop();
+}
+
 /// Poll until the set shrinks below `from` members or two seconds pass.
 fn poll_until_shrinks(app: &mut App, from: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -50386,6 +50609,203 @@ fn the_focused_member_ending_names_the_session_now_shown() {
         app.status.starts_with("A ended — showing B; running: B"),
         "{}",
         app.status
+    );
+    app.debug_stop();
+}
+
+/// A test-built App never reads the developer's own settings layers: a
+/// preference in the real `config.json` (say, the TIMELINE hidden) must not
+/// steer app tests. Workspace layers under the test root still load.
+#[test]
+fn a_test_built_app_reads_no_user_settings_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let user_dir = crate::prefs::config_dir();
+    // At startup and again on a live settings reload.
+    for when in ["startup", "reload"] {
+        if when == "reload" {
+            app.remerge_settings();
+        }
+        let leaked: Vec<_> = app
+            .settings_chain
+            .iter()
+            .filter(|p| p.starts_with(&user_dir))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{when}: user layers read under test: {leaked:?}"
+        );
+        assert!(
+            app.settings_chain
+                .contains(&crate::config_layers::workspace_config_path(tmp.path())),
+            "{when}: the workspace layer must still load: {:?}",
+            app.settings_chain
+        );
+        assert!(
+            app.settings_provenance.values().all(|k| !matches!(
+                k,
+                crate::config_layers::LayerKind::User | crate::config_layers::LayerKind::UserLocal
+            )),
+            "{when}: a setting came from a user layer: {:?}",
+            app.settings_provenance
+        );
+    }
+}
+
+/// #624 review: the tool trust gate refuses a changed tool definition with
+/// the recovery it names, and lets the first and the unchanged one through.
+#[test]
+fn the_mcp_tool_gate_refuses_a_changed_definition() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(mcp_tool_trust(tmp.path(), "ext.go", "go", "fp1"), Ok(()));
+    assert_eq!(mcp_tool_trust(tmp.path(), "ext.go", "go", "fp1"), Ok(()));
+    let err = mcp_tool_trust(tmp.path(), "ext.go", "go", "fp2").unwrap_err();
+    assert!(err.starts_with("refusing to run: the 'go' tool"), "{err}");
+    assert!(err.contains("toggle the extension off and on"), "{err}");
+}
+
+/// #624 review: toggling an extension off and on re-approves its tools, as
+/// the refusal says: turning it off forgets the fingerprints of the
+/// commands it declares, and only those, so the next run trusts afresh.
+#[test]
+fn toggling_an_extension_off_forgets_its_tool_fingerprints() {
+    const EXT: &str = r#"
+id = "tfp"
+name = "tfp"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/false"
+[[commands]]
+id = "tfp.go"
+title = "tfp: go"
+server = "srv"
+tool = "go"
+"#;
+    let other = EXT.replace("tfp", "oth");
+    let (_scratch, croft) = scratch_config(&[("tfp", EXT), ("oth", &other)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    // The panel lists the real user dir; seat the scratch extension's row.
+    // A toggle refreshes the panel from that dir, so re-seat before each.
+    let toggle_tfp = |app: &mut App| {
+        app.extensions
+            .set_items(crate::widgets::extensions::items_from_summaries(
+                crate::lsp::manifest::summaries(&[EXT]),
+                &app.disabled_extensions,
+            ));
+        let visible = app.extensions.visible_indices();
+        let pos = visible
+            .iter()
+            .position(|&i| app.extensions.items()[i].id == "tfp")
+            .expect("the tfp row is visible");
+        app.extensions.select(pos);
+        app.toggle_selected_extension();
+    };
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp1"));
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o1"));
+    toggle_tfp(&mut app);
+    assert!(app.disabled_extensions.contains("tfp"), "{}", app.status);
+    assert!(
+        crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp2"),
+        "the changed tool is approved afresh"
+    );
+    assert!(
+        !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
+        "another extension's record stays"
+    );
+    // Turning it back on keeps the new record: a further change is refused.
+    toggle_tfp(&mut app);
+    assert!(!app.disabled_extensions.contains("tfp"), "{}", app.status);
+    assert!(!crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp3"));
+}
+
+/// Uninstalling an extension forgets its tools' fingerprints, so a re-added
+/// newer version approves its tools afresh instead of being refused.
+#[test]
+fn uninstalling_an_extension_forgets_its_tool_fingerprints() {
+    // Only a catalog entry uninstalls, so the fixture is the bundled Time
+    // sidecar beside a hand-added extension whose record must stay.
+    const TIME: &str = include_str!("../../assets/catalog/mcp-time/extension.toml");
+    const OTH: &str = r#"
+id = "oth"
+name = "oth"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/false"
+[[commands]]
+id = "oth.go"
+title = "oth: go"
+server = "srv"
+tool = "go"
+"#;
+    let (_scratch, croft) = scratch_config(&[("mcp-time", TIME), ("oth", OTH)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "time.now", "fp1"));
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o1"));
+    app.perform_extension_uninstall("mcp-time");
+    assert!(app.status.starts_with("Uninstalled"), "{}", app.status);
+    assert!(
+        crate::prefs::trust_mcp_tool_in(&croft, "time.now", "fp2"),
+        "the re-added tool is approved afresh"
+    );
+    assert!(
+        !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
+        "another extension's record stays"
+    );
+}
+
+const EXITED_EVENT: &str = r#"{"seq":1,"type":"event","event":"exited","body":{"exitCode":0}}"#;
+const TERMINATED_EVENT: &str = r#"{"seq":2,"type":"event","event":"terminated"}"#;
+
+/// Adapters send `exited` and then `terminated`, both of which end a member.
+/// Arriving in one poll they named the member twice, and the second removal
+/// took a live sibling with it.
+#[test]
+fn a_member_that_exits_and_terminates_in_one_poll_is_removed_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("A", stub_emitting(&[EXITED_EVENT, TERMINATED_EVENT]));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.push("C", stub_member(false));
+    app.debug_sessions.focus(2);
+    // Both messages are written before the first poll reads them.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    poll_until(&mut app, |a| {
+        !a.debug_sessions.names().contains(&String::from("A"))
+    });
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec![String::from("B"), String::from("C")]
+    );
+    app.debug_stop();
+}
+
+/// The focused member ending in the same poll a background member stops: the
+/// view used to move to the stopped member first, carrying the ending with it
+/// into the old member's backlog, so the ended member was never removed.
+#[test]
+fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("S", stub_emitting(&[STOPPED_EVENT]));
+    app.debug_sessions
+        .push("F", stub_emitting(&[TERMINATED_EVENT]));
+    app.debug_sessions.focus(1);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    poll_until(&mut app, |a| {
+        a.debug_sessions.names() == vec![String::from("S")]
+    });
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec![String::from("S")],
+        "F ended and must go"
     );
     app.debug_stop();
 }
