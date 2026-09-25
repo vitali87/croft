@@ -122,7 +122,8 @@ pub fn user_local_config_path() -> PathBuf {
 }
 
 /// Load the full merged view for a workspace (or just the user layers when
-/// `workspace_root` is `None`).
+/// `workspace_root` is `None`). Test builds read the user layers from a
+/// per-process dir nothing creates.
 pub fn load_merged(workspace_root: Option<&Path>) -> MergedConfig {
     // Under test the user layers point at a per-process dir nothing creates:
     // the developer's real config.json must never steer app tests.

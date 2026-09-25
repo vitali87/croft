@@ -335,8 +335,14 @@ pub struct Prefs {
 impl Prefs {
     /// Load preferences from `config_path()`, falling back to defaults when
     /// the file is absent or unreadable. Preferences are best-effort: a
-    /// corrupt config should never block startup.
+    /// corrupt config should never block startup. Test builds always get
+    /// the defaults: the developer's real `config.json` must never steer a
+    /// test (#624), the same rule `config_layers::load_merged` applies to
+    /// the settings layers.
     pub fn load_or_default() -> Self {
+        if cfg!(test) {
+            return Self::default();
+        }
         Self::load(&config_path()).unwrap_or_default()
     }
 

@@ -49566,18 +49566,44 @@ fn the_focused_member_ending_names_the_session_now_shown() {
 #[test]
 fn a_test_built_app_reads_no_user_settings_layer() {
     let tmp = tempfile::tempdir().unwrap();
-    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let user_dir = crate::prefs::config_dir();
-    let leaked: Vec<_> = app
-        .settings_chain
-        .iter()
-        .filter(|p| p.starts_with(&user_dir))
-        .collect();
-    assert!(leaked.is_empty(), "user layers read under test: {leaked:?}");
-    assert!(
-        app.settings_chain
-            .contains(&crate::config_layers::workspace_config_path(tmp.path())),
-        "the workspace layer must still load: {:?}",
-        app.settings_chain
-    );
+    // At startup and again on a live settings reload.
+    for when in ["startup", "reload"] {
+        if when == "reload" {
+            app.remerge_settings();
+        }
+        let leaked: Vec<_> = app
+            .settings_chain
+            .iter()
+            .filter(|p| p.starts_with(&user_dir))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{when}: user layers read under test: {leaked:?}"
+        );
+        assert!(
+            app.settings_chain
+                .contains(&crate::config_layers::workspace_config_path(tmp.path())),
+            "{when}: the workspace layer must still load: {:?}",
+            app.settings_chain
+        );
+        assert!(
+            app.settings_provenance.values().all(|k| !matches!(
+                k,
+                crate::config_layers::LayerKind::User | crate::config_layers::LayerKind::UserLocal
+            )),
+            "{when}: a setting came from a user layer: {:?}",
+            app.settings_provenance
+        );
+    }
+}
+
+/// The saved prefs read outside the settings layers (MCP consents, the
+/// terminal warning, extension toggles) are the defaults under test too.
+#[test]
+fn a_test_build_reads_default_saved_prefs() {
+    let loaded = serde_json::to_value(crate::prefs::Prefs::load_or_default()).unwrap();
+    let default = serde_json::to_value(crate::prefs::Prefs::default()).unwrap();
+    assert_eq!(loaded, default);
 }
