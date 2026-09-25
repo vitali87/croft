@@ -4828,6 +4828,9 @@ impl Editor {
             notebook: false,
             doc_path: Some(path.to_path_buf()),
             media: true,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         });
         self.status = format!("Opened media info {}", path.display());
         Ok(())
@@ -4901,6 +4904,9 @@ impl Editor {
             notebook: false,
             doc_path: Some(path.to_path_buf()),
             media: false,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         });
         self.status = format!("Opened document {}", path.display());
         Ok(())
@@ -5639,7 +5645,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables) = crate::markdown::render_markdown_full(
+        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
@@ -5648,6 +5654,7 @@ impl Editor {
         );
         if let Some(md) = self.markdown_preview.as_mut() {
             md.lines = lines;
+            md.source_map = source_map;
             md.images = images;
             md.runnables = runnables;
             md.built_seq = self.edit_seq;
@@ -6058,7 +6065,12 @@ impl Editor {
     /// Markdown: Toggle Preview (Cmd/Ctrl+Shift+V). Returns false when the
     /// active tab is not a Markdown text buffer (the caller reports why).
     pub fn toggle_markdown_preview(&mut self) -> bool {
-        if self.markdown_preview.take().is_some() {
+        if let Some(md) = self.markdown_preview.take() {
+            // Back to the source where the preview was (#619).
+            if let Some(line) = md.source_line_at_top() {
+                self.scroll = line.min(self.lines.len().saturating_sub(1));
+                self.scroll_sub = 0;
+            }
             return true;
         }
         let is_notebook = self
@@ -6081,13 +6093,15 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables) = crate::markdown::render_markdown_full(
+        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
             base.as_deref(),
             self.md_outputs.clone(),
         );
+        // Open where the source is scrolled (#619).
+        let scroll_to_source = Some(self.scroll);
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -6104,6 +6118,9 @@ impl Editor {
             notebook: false,
             doc_path: None,
             media: false,
+            source_map,
+            row_of_line: Vec::new(),
+            scroll_to_source,
         });
         true
     }
@@ -6146,6 +6163,9 @@ impl Editor {
             notebook: true,
             doc_path: None,
             media: false,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         });
         true
     }
@@ -13343,7 +13363,7 @@ impl Editor {
                 .path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images, runnables) = crate::markdown::render_markdown_full(
+            let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
                 &text,
                 self.theme,
                 &mut self.registry,
@@ -13352,6 +13372,7 @@ impl Editor {
             );
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
+                md.source_map = source_map;
                 md.images = images;
                 md.runnables = runnables;
                 md.built_seq = self.edit_seq;
@@ -13396,7 +13417,27 @@ impl Editor {
                 .iter()
                 .map(|r| visual_row(r.first_line))
                 .collect();
+            // Scroll sync (#619): each built line's first visual row. A
+            // paragraph wraps line by line, so per-line counts sum exactly.
+            let mut row = 0usize;
+            md.row_of_line = md
+                .lines
+                .iter()
+                .map(|l| {
+                    let here = row;
+                    row += Paragraph::new(Text::from(vec![l.clone()]))
+                        .wrap(Wrap { trim: false })
+                        .line_count(text_area.width)
+                        .max(1);
+                    here
+                })
+                .collect();
             md.wrap_key = (md.built_seq, text_area.width);
+        }
+        if let Some(line) = md.scroll_to_source.take()
+            && let Some(row) = md.row_for_source_line(line)
+        {
+            md.scroll = (row as u16).min(max_scroll);
         }
         md.last_area = text_area;
         para.scroll((md.scroll, 0)).render(text_area, buf);
@@ -19343,6 +19384,39 @@ mod tests {
             text.contains("# Title"),
             "the source view must show the raw markdown again; got:\n{text}"
         );
+    }
+
+    #[test]
+    fn markdown_preview_opens_where_the_source_was_and_returns_there() {
+        // #619: the preview scrolls to the source's top line, and toggling
+        // back puts the source at the preview's top line.
+        let mut body = String::from("# Top\n\n");
+        for i in 0..40 {
+            body.push_str(&format!("para {i}\n\n"));
+        }
+        body.push_str("## Deep heading\n\n");
+        for i in 0..20 {
+            body.push_str(&format!("after {i}\n\n"));
+        }
+        let mut e = editor_with(&body);
+        e.lang = Some(LangKind::Markdown);
+        let deep = e.lines.iter().position(|l| l == "## Deep heading").unwrap();
+        e.scroll = deep;
+        assert!(e.toggle_markdown_preview());
+        let text = first_row_screen(&mut e, 60, 8);
+        // The first painted content row, inside the pane border.
+        let top = text
+            .lines()
+            .skip(1)
+            .find(|l| {
+                !l.trim_matches(|c: char| c == '\u{2502}' || c.is_whitespace())
+                    .is_empty()
+            })
+            .unwrap_or("");
+        assert!(top.contains("Deep heading"), "preview top: {top:?}\n{text}");
+        e.scroll = 0;
+        assert!(e.toggle_markdown_preview(), "back to source");
+        assert_eq!(e.scroll, deep, "the source comes back to the same place");
     }
 
     #[test]

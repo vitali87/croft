@@ -49771,3 +49771,45 @@ fn rename_target_validates_without_touching_the_disk() {
     assert!(old.exists(), "nothing moved yet");
     assert!(crate::widgets::file_tree::rename_target(tmp.path(), &old, "taken.txt").is_err());
 }
+
+// ---- Markdown preview scroll sync across a split (#619) ----
+
+#[test]
+fn a_split_preview_follows_the_source_pane_scroll() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("doc.md");
+    let mut body = String::from("# Top\n\n");
+    for i in 0..30 {
+        body.push_str(&format!("para {i}\n\n"));
+    }
+    std::fs::write(&f, &body).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.editor.toggle_markdown_preview(),
+        "left pane shows the preview"
+    );
+    app.split_editor();
+    assert!(
+        app.editor.markdown_preview.is_none(),
+        "the new pane shows the source"
+    );
+    app.editor.scroll = 20;
+    assert!(
+        app.sync_markdown_scroll(),
+        "the preview pane is told to follow"
+    );
+    let preview_pane = app
+        .editor_layout
+        .inactive_groups()
+        .into_iter()
+        .find_map(|g| g.editors.get(g.active_index()))
+        .and_then(|t| t.markdown_preview.as_ref())
+        .expect("the other pane still shows the preview");
+    assert_eq!(preview_pane.scroll_to_source, Some(20));
+    assert!(
+        !app.sync_markdown_scroll(),
+        "a still viewport costs nothing"
+    );
+}

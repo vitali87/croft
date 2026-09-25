@@ -3319,6 +3319,10 @@ pub struct App {
     live_run_sent: std::collections::HashMap<PathBuf, Vec<String>>,
     /// The background runner, spawned on the first toggle.
     live_run_runner: Option<crate::live_run::Runner>,
+    /// The last position [`App::sync_markdown_scroll`] pushed across split
+    /// panes: (path, whether the preview led, source line), so a still
+    /// viewport costs nothing per tick.
+    md_scroll_synced: Option<(PathBuf, bool, usize)>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -4913,6 +4917,7 @@ impl App {
             live_run_files: std::collections::HashSet::new(),
             live_run_sent: std::collections::HashMap::new(),
             live_run_runner: None,
+            md_scroll_synced: None,
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
@@ -41742,6 +41747,53 @@ impl App {
         }
     }
 
+    /// Scroll sync between split panes (#619): when the focused pane shows a
+    /// Markdown file and another pane shows the same file the other way
+    /// (source beside preview), the other one follows. Returns true when it
+    /// moved anything.
+    pub fn sync_markdown_scroll(&mut self) -> bool {
+        let active = &*self.editor;
+        let Some(path) = active.path.clone() else {
+            self.md_scroll_synced = None;
+            return false;
+        };
+        // What the focused pane says the position is, in source lines.
+        let (leads_preview, line) = match active.markdown_preview.as_ref() {
+            Some(md) => match md.source_line_at_top() {
+                Some(line) => (true, line),
+                None => return false,
+            },
+            None => (false, active.scroll),
+        };
+        let key = (path.clone(), leads_preview, line);
+        if self.md_scroll_synced.as_ref() == Some(&key) {
+            return false;
+        }
+        let mut moved = false;
+        for group in self.editor_layout.inactive_groups_mut() {
+            let idx = group.active_index();
+            let Some(tab) = group.editors.get_mut(idx) else {
+                continue;
+            };
+            if tab.path.as_deref() != Some(path.as_path()) {
+                continue;
+            }
+            match (leads_preview, tab.markdown_preview.as_mut()) {
+                (false, Some(md)) if md.source_map.len() > 1 => {
+                    md.scroll_to_source = Some(line);
+                    moved = true;
+                }
+                (true, None) => {
+                    tab.scroll = line.min(tab.lines.len().saturating_sub(1));
+                    moved = true;
+                }
+                _ => {}
+            }
+        }
+        self.md_scroll_synced = Some(key);
+        moved
+    }
+
     /// Arm or disarm Live Run for the active file (Cmd+K V).
     pub(crate) fn toggle_live_run(&mut self) {
         let Some(path) = self.editor.path.clone() else {
@@ -50891,7 +50943,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
-        let live_run_changed = app.tick_live_run();
+        let live_run_changed = app.tick_live_run() | app.sync_markdown_scroll();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
