@@ -8,6 +8,15 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// What a posted export settles once it lands: navigator notes to remove
+/// and sticky notes to mark resolved. It rides the job and comes back in
+/// its outcome, so only the submission that carried them can settle them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Settles {
+    pub notes: Vec<u64>,
+    pub sticky: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Job {
     Reply {
@@ -25,14 +34,25 @@ pub enum Job {
         event: ReviewEvent,
         summary: String,
         pending: Vec<PendingComment>,
+        settles: Settles,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Replied { thread: u64, text: String },
-    Resolved { thread: u64, resolved: bool },
-    Submitted { inline: usize, folded: usize },
+    Replied {
+        thread: u64,
+        text: String,
+    },
+    Resolved {
+        thread: u64,
+        resolved: bool,
+    },
+    Submitted {
+        inline: usize,
+        folded: usize,
+        settles: Settles,
+    },
     Failed(String),
 }
 
@@ -114,6 +134,7 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
             event,
             summary,
             pending,
+            settles,
         } => {
             // The diff decides which comments GitHub will take inline; a
             // failure to read it folds every comment into the summary rather
@@ -141,6 +162,7 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
                 Ok(_) => Outcome::Submitted {
                     inline,
                     folded: pending.len() - inline,
+                    settles,
                 },
                 Err(e) => Outcome::Failed(format!("Review not submitted: {e}")),
             }
@@ -231,13 +253,15 @@ mod tests {
                         body: "later".into(),
                     },
                 ],
+                settles: Settles::default(),
             },
         );
         assert_eq!(
             out,
             Outcome::Submitted {
                 inline: 1,
-                folded: 1
+                folded: 1,
+                settles: Settles::default(),
             }
         );
         let sent: serde_json::Value =

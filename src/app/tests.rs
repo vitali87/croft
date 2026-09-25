@@ -50642,6 +50642,47 @@ fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
     assert!(calls.contains("resolveReviewThread"), "{calls}");
 }
 
+/// Pending comments belong to the PR they were written on: once the
+/// branch's PR changes, they neither post there nor mix with new ones, and
+/// a failed export settles none of the notes it carried.
+#[test]
+fn pending_comments_stay_with_their_pull_request() {
+    let (_tmp, root, f, _log, stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
+    app.editor.cursor_row = 0;
+    app.open_review_comment_prompt();
+    let rel = app.prompt.take().unwrap().target_dir;
+    app.add_pending_review_comment("on seven", rel.clone());
+    assert_eq!(app.review_pending.len(), 1);
+
+    // The branch now has another PR.
+    app.review_pr = Some((root.clone(), String::from("8")));
+    app.add_pending_review_comment("on eight", rel);
+    assert_eq!(app.review_pending.len(), 1, "not mixed in");
+    assert!(app.status.contains("PR #7"), "{}", app.status);
+    app.submit_review(String::from("LGTM"));
+    assert!(!stdin.exists(), "nothing posted to #8");
+
+    // A failed export keeps the navigator notes it carried.
+    app.review_pending.clear();
+    app.navigator_notes
+        .insert(String::from("a.rs"), vec![(1, 1, String::from("n"))]);
+    app.drain_review_ops();
+    app.review_tx
+        .send(crate::review_ops::Outcome::Failed(String::from("nope")))
+        .unwrap();
+    app.drain_review_ops();
+    app.review_tx
+        .send(crate::review_ops::Outcome::Submitted {
+            inline: 0,
+            folded: 0,
+            settles: crate::review_ops::Settles::default(),
+        })
+        .unwrap();
+    app.drain_review_ops();
+    assert_eq!(app.navigator_notes["a.rs"].len(), 1);
+}
+
 /// #368: the navigator's notes and pending comments are previewed, then
 /// posted as one review with the navigator's marked as AI-authored; a note
 /// off the diff lands in the summary, and posted notes leave the editor.

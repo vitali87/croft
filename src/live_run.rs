@@ -391,6 +391,9 @@ impl Drop for ReportFile {
     }
 }
 
+/// How much of a failed run's stderr is kept for its error line.
+const STDERR_TAIL: usize = 16 * 1024;
+
 /// Run one job to completion (or to the kill deadline) and parse its report.
 fn run(job: &Job) -> Result<Report, String> {
     let report_file = ReportFile::create().map_err(|e| format!("Live Run: no temp file: {e}"))?;
@@ -421,6 +424,27 @@ fn run(job: &Job) -> Result<Report, String> {
         // below says why.
         let _ = stdin.write_all(source.as_bytes());
     }
+    // Drained while the script runs: one that writes more than a pipe
+    // holds would otherwise block on stderr until the deadline killed it.
+    let stderr = child.stderr.take().map(|mut pipe| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut tail: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > STDERR_TAIL {
+                    tail.drain(..tail.len() - STDERR_TAIL);
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&tail).into_owned());
+        });
+        rx
+    });
     let deadline = Instant::now() + RUN_BUDGET + KILL_GRACE;
     loop {
         match child.try_wait() {
@@ -439,11 +463,11 @@ fn run(job: &Job) -> Result<Report, String> {
     }
     let json = std::fs::read_to_string(report_file.path()).unwrap_or_default();
     if json.trim().is_empty() {
-        let mut err = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            use std::io::Read;
-            let _ = stderr.read_to_string(&mut err);
-        }
+        // A process the script left behind can hold stderr open; don't
+        // wait on it for long.
+        let err = stderr
+            .and_then(|rx| rx.recv_timeout(Duration::from_millis(500)).ok())
+            .unwrap_or_default();
         let last = err.lines().rev().find(|l| !l.trim().is_empty());
         return Err(match last {
             Some(line) => format!("Live Run: {}", line.trim()),
@@ -635,5 +659,30 @@ mod tests {
         assert_eq!(r.coverage[&5], Coverage::NeverRan);
         assert_eq!(r.notes[&6].last().unwrap().1, Kind::Error);
         assert_eq!(r.stdout, "sum 6\n");
+    }
+
+    /// A script that floods stderr past the pipe's buffer still reports.
+    #[test]
+    fn a_script_that_floods_stderr_still_reports() {
+        let Ok(out) = Command::new("python3").arg("--version").output() else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let job = Job {
+            path: dir.path().join("loud.py"),
+            lines: vec![
+                String::from("import sys"),
+                String::from("sys.stderr.write('x' * 1_000_000)"),
+                String::from("n = len('done')"),
+            ],
+            python: PathBuf::from("python3"),
+        };
+        let started = Instant::now();
+        let r = run(&job).expect("reports instead of being killed");
+        assert!(started.elapsed() < RUN_BUDGET);
+        assert_eq!(r.notes[&2][0].0, "n = 4");
     }
 }

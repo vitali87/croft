@@ -3585,11 +3585,12 @@ pub struct App {
     /// goes stale the moment the user edits, and the box it was protecting
     /// becomes invisible again.
     review_boxes: Option<(PathBuf, Vec<crate::review_threads::Thread>)>,
-    /// Writing reviews (#366): comments not yet submitted, the PR they are
-    /// for as (repo root, number), each thread's GraphQL node id, the chosen
-    /// verdict while its summary is typed, the `gh` to run, and where
-    /// finished jobs report.
+    /// Writing reviews (#366): comments not yet submitted and the PR they
+    /// were written on, the PR last looked up as (repo root, number), each
+    /// thread's GraphQL node id, the chosen verdict while its summary is
+    /// typed, the `gh` to run, and where finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
+    review_pending_pr: Option<(PathBuf, String)>,
     /// Sticky notes (#367): every note in the workspace, where the owner
     /// keeps them (`None` under test), and which box id is which note.
     notes: crate::sticky_notes::Notes,
@@ -3597,15 +3598,13 @@ pub struct App {
     note_box_ids: std::collections::HashMap<u64, String>,
     notes_shown_gen: u64,
     /// Export to a PR (#368): the previewed comments and the navigator
-    /// notes they came from, the notes a posted export clears, and the
+    /// notes they came from, the sticky notes it would settle, and the
     /// prefix that marks the navigator's comments as AI-authored.
     review_export: Option<(
         Vec<crate::review_threads::PendingComment>,
         Vec<u64>,
         Vec<crate::widgets::list_picker::ListRow>,
     )>,
-    review_exported_notes: Vec<u64>,
-    review_exported_sticky: Vec<String>,
     review_export_sticky: Vec<String>,
     review_ai_prefix: String,
     review_pr: Option<(PathBuf, String)>,
@@ -5286,6 +5285,7 @@ impl App {
             pending_code_actions: Vec::new(),
             review_boxes: None,
             review_pending: Vec::new(),
+            review_pending_pr: None,
             notes: notes_path
                 .as_deref()
                 .map(crate::sticky_notes::Notes::load)
@@ -5294,8 +5294,6 @@ impl App {
             note_box_ids: std::collections::HashMap::new(),
             notes_shown_gen: 0,
             review_export: None,
-            review_exported_notes: Vec::new(),
-            review_exported_sticky: Vec::new(),
             review_export_sticky: Vec::new(),
             review_ai_prefix: loaded_prefs
                 .review_ai_prefix
@@ -25109,6 +25107,13 @@ impl App {
         if body.is_empty() {
             return;
         }
+        let Some((root, number)) = self.review_pr.clone() else {
+            return;
+        };
+        if !self.pending_is_for(&root, &number) {
+            return;
+        }
+        self.review_pending_pr = Some((root, number));
         self.review_pending
             .push(crate::review_threads::PendingComment {
                 path: rel.to_string_lossy().into_owned(),
@@ -25119,6 +25124,24 @@ impl App {
             "{} pending comment(s): Review: Submit Review sends them",
             self.review_pending.len()
         );
+    }
+
+    /// Whether the pending comments (if any) were written on PR `number` in
+    /// `root`. Comments written on another PR (another branch, another
+    /// repository of the workspace) must never post here; the status says
+    /// which PR they belong to.
+    fn pending_is_for(&mut self, root: &Path, number: &str) -> bool {
+        match &self.review_pending_pr {
+            Some((r, n)) if !self.review_pending.is_empty() && (r != root || n != number) => {
+                self.status = format!(
+                    "{} pending comment(s) belong to PR #{n} in {}: submit or discard them there first",
+                    self.review_pending.len(),
+                    r.display()
+                );
+                false
+            }
+            _ => true,
+        }
     }
 
     /// Review: Submit Review: pick the verdict, then type the summary.
@@ -25153,6 +25176,9 @@ impl App {
         let Some((root, number)) = self.review_pr.clone() else {
             return;
         };
+        if !self.pending_is_for(&root, &number) {
+            return;
+        }
         if event == ReviewEvent::Comment && summary.is_empty() && self.review_pending.is_empty() {
             self.status = String::from("Nothing to submit: add a comment or a summary");
             return;
@@ -25165,6 +25191,7 @@ impl App {
                 event,
                 summary,
                 pending: self.review_pending.clone(),
+                settles: crate::review_ops::Settles::default(),
             },
             self.review_tx.clone(),
         );
@@ -25263,17 +25290,22 @@ impl App {
                         "Thread reopened"
                     });
                 }
-                Outcome::Submitted { inline, folded } => {
+                Outcome::Submitted {
+                    inline,
+                    folded,
+                    settles,
+                } => {
                     self.review_pending.clear();
+                    self.review_pending_pr = None;
                     // Exported navigator notes now live on GitHub; reload
                     // shows them there, as threads, rather than twice.
                     // Exported sticky notes are settled: resolved for everyone.
-                    for id in std::mem::take(&mut self.review_exported_sticky) {
+                    for id in settles.sticky {
                         if let Some(n) = self.notes.update(&id, |n| n.resolved = true) {
                             self.publish_note(&n);
                         }
                     }
-                    let exported = std::mem::take(&mut self.review_exported_notes);
+                    let exported = settles.notes;
                     if !exported.is_empty() {
                         for id in &exported {
                             if let Some(host) = &self.pair_host {
@@ -28043,8 +28075,10 @@ impl App {
         let Some((root, number)) = self.review_pr.clone() else {
             return;
         };
-        self.review_exported_notes = notes;
-        self.review_exported_sticky = std::mem::take(&mut self.review_export_sticky);
+        let sticky = std::mem::take(&mut self.review_export_sticky);
+        if !self.pending_is_for(&root, &number) {
+            return;
+        }
         crate::review_ops::spawn(
             self.review_gh.clone(),
             root,
@@ -28053,6 +28087,7 @@ impl App {
                 event: crate::review_threads::ReviewEvent::Comment,
                 summary: String::new(),
                 pending: comments,
+                settles: crate::review_ops::Settles { notes, sticky },
             },
             self.review_tx.clone(),
         );
@@ -37684,6 +37719,7 @@ impl App {
             Cmd::ReviewDiscardPending => {
                 let n = self.review_pending.len();
                 self.review_pending.clear();
+                self.review_pending_pr = None;
                 self.status = format!("Discarded {n} pending comment(s)");
             }
             Cmd::ToggleSessionRecording => self.toggle_session_recording(),
@@ -43337,8 +43373,11 @@ impl App {
             self.status = format!("Could not switch profile: {e}");
             return;
         }
-        let (map, _) =
-            crate::keymap::Keymap::load_with_warnings(&crate::keymap::keybindings_path());
+        // Recorded shortcuts go to the active profile's file from now on.
+        if !cfg!(test) {
+            self.keybindings_file = crate::keymap::keybindings_path();
+        }
+        let (map, _) = crate::keymap::Keymap::load_with_warnings(&self.keybindings_file);
         self.keymap = map;
         self.snippets = crate::snippets::SnippetSet::load(&crate::snippets::snippets_path());
         self.status = format!(
