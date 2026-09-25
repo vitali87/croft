@@ -646,7 +646,8 @@ pub fn save_proactive_navigator(enabled: bool) -> Result<()> {
 }
 
 pub fn config_path() -> PathBuf {
-    config_dir().join("config.json")
+    // Through the active profile (#618); the config dir when there is none.
+    crate::profiles::file("config.json")
 }
 
 pub(crate) fn config_dir() -> PathBuf {

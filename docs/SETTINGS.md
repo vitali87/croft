@@ -149,3 +149,14 @@ the notification in `CROFT_TITLE`, `CROFT_BODY`, `CROFT_LINK`, and
 queue and one retry for transient failures; what finally fails appears in
 the **Notifications** OUTPUT channel, naming only a URL's host. The key is
 user-config only, and a webhook's headers belong in `config.local.json`.
+
+## Profiles
+
+A profile is a named set of settings, keybindings and snippets you can switch between (for example "Python" and "Writing"). **Profiles: Switch Profile** in the palette lists them:
+
+* **New Profile from Current Setup** copies the settings, keybindings and snippets now in effect into a new profile and switches to it.
+* Choosing a profile (or **Default**) switches to it. Keybindings and snippets apply at once; settings apply the next time croft starts.
+* **Use the Active Profile for This Workspace** writes `.croft/profile`, so this folder always opens with that profile, whatever the global choice.
+
+Profiles live in `~/.config/croft/profiles/<name>/`. History, macros and sessions are shared by every profile.
+

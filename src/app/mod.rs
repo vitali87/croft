@@ -2277,6 +2277,8 @@ enum PromptKind {
     /// Debugger "Break When Value Changes" (#611): a variable name from the
     /// paused frame's scopes.
     DataBreakpoint,
+    /// Profiles: New Profile (#618): the new profile's name.
+    NewProfile,
     /// Rename the terminal pane at `idx`. The buffer is pre-filled with its
     /// current label; on commit the name overrides the auto label.
     RenameTerminal(usize),
@@ -4565,6 +4567,12 @@ impl App {
         // first sync tick. Re-detected on every re-root (see sync_explorer_panels).
         let dep_ecosystems = crate::widgets::dependencies::detect_ecosystems(&root);
         dependencies.set_header(crate::widgets::dependencies::header_label(&dep_ecosystems));
+        // The active profile (#618) decides which settings, keybindings and
+        // snippets files are read below, so it is chosen first. Never under
+        // test: a developer's own profile choice must not leak into the suite.
+        if !cfg!(test) {
+            crate::profiles::activate_for_workspace(&root);
+        }
         // Layered settings (#251): defaults ← user ← user-local ← workspace
         // layers of the primary root, one merged view. Warnings (refused
         // workspace keys, parse errors) land in the Settings OUTPUT channel.
@@ -18513,6 +18521,17 @@ impl App {
                 ]),
                 "Enter to pause when this variable is written, Esc to cancel",
             ),
+            PromptKind::NewProfile => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to create it from your current settings, keybindings and snippets, Esc to cancel",
+            ),
         };
         frame.render_widget(
             ratatui::widgets::Paragraph::new(top_line),
@@ -25487,6 +25506,45 @@ impl App {
                     self.run_participant_action(verb, id);
                 }
             }
+            ListPurpose::Profiles => match row.id.as_str() {
+                "new" => {
+                    let target_dir = self.tree.root.clone();
+                    self.prompt = Some(Prompt {
+                        label: String::from("New profile name"),
+                        buffer: String::new(),
+                        kind: PromptKind::NewProfile,
+                        target_dir,
+                        error: None,
+                    });
+                }
+                "workspace" => {
+                    let active = crate::profiles::active();
+                    match crate::profiles::set_workspace_default(&self.tree.root, active.as_deref())
+                    {
+                        Ok(()) => {
+                            self.status = format!(
+                                "This workspace now opens with profile {}",
+                                active.unwrap_or_default()
+                            )
+                        }
+                        Err(e) => self.status = format!("Could not save: {e}"),
+                    }
+                }
+                "workspace-clear" => {
+                    match crate::profiles::set_workspace_default(&self.tree.root, None) {
+                        Ok(()) => {
+                            self.status = String::from("This workspace no longer picks a profile")
+                        }
+                        Err(e) => self.status = format!("Could not save: {e}"),
+                    }
+                }
+                id => {
+                    if let Some(name) = id.strip_prefix("profile:") {
+                        let name = (!name.is_empty()).then(|| name.to_string());
+                        self.switch_profile(name);
+                    }
+                }
+            },
             ListPurpose::KeyboardShortcuts => {
                 if let Some(cmd) = row
                     .id
@@ -36524,6 +36582,7 @@ impl App {
             Cmd::RebaseAbort => self.abort_rebase_todo(),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
+            Cmd::SwitchProfile => self.open_profiles(),
             Cmd::RerunSearchEditor => self.rerun_search_editor(),
             Cmd::DebugAddHitCountBreakpoint => self.debug_edit_hit_condition(),
             Cmd::DebugAddFunctionBreakpoint => self.debug_add_function_breakpoint(),
@@ -42155,6 +42214,58 @@ impl App {
         }
     }
 
+    /// Profiles: Switch Profile (#618): the default, every profile, and the
+    /// actions to make a new one or pin one to this workspace.
+    fn open_profiles(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let active = crate::profiles::active();
+        let mark = |on: bool| if on { "  \u{2713}" } else { "" };
+        let mut rows = vec![ListRow {
+            id: String::from("profile:"),
+            label: format!("Default{}", mark(active.is_none())),
+        }];
+        for name in crate::profiles::list() {
+            rows.push(ListRow {
+                id: format!("profile:{name}"),
+                label: format!("{name}{}", mark(active.as_deref() == Some(name.as_str()))),
+            });
+        }
+        rows.push(ListRow {
+            id: String::from("new"),
+            label: String::from("New Profile from Current Setup\u{2026}"),
+        });
+        if active.is_some() {
+            rows.push(ListRow {
+                id: String::from("workspace"),
+                label: String::from("Use the Active Profile for This Workspace"),
+            });
+        }
+        if crate::profiles::workspace_choice_path(&self.tree.root).exists() {
+            rows.push(ListRow {
+                id: String::from("workspace-clear"),
+                label: String::from("Stop Using a Profile for This Workspace"),
+            });
+        }
+        self.open_list_picker(ListPicker::new(ListPurpose::Profiles, "Profiles", rows), "");
+    }
+
+    /// Make `name` (or the default) the active profile and apply what can be
+    /// applied live: keybindings and snippets. Settings are read at startup.
+    fn switch_profile(&mut self, name: Option<String>) {
+        if let Err(e) = crate::profiles::switch(name.as_deref()) {
+            self.status = format!("Could not switch profile: {e}");
+            return;
+        }
+        let (map, _) =
+            crate::keymap::Keymap::load_with_warnings(&crate::keymap::keybindings_path());
+        self.keymap = map;
+        self.snippets = crate::snippets::SnippetSet::load(&crate::snippets::snippets_path());
+        self.status = format!(
+            "Profile: {}; keybindings and snippets applied, settings apply at the next launch",
+            name.as_deref().unwrap_or("Default")
+        );
+    }
+
     /// Preferences: Open Keyboard Shortcuts (#612, Cmd+K Cmd+S): every
     /// command with its shortcut, searchable; choosing one records a new one.
     pub(crate) fn open_keyboard_shortcuts(&mut self) {
@@ -47270,6 +47381,20 @@ impl App {
                 let name = prompt.buffer.trim().to_string();
                 self.prompt = None;
                 self.commit_data_breakpoint(&name);
+            }
+            PromptKind::NewProfile => {
+                let name = prompt.buffer.trim().to_string();
+                match crate::profiles::create_from_current(&name) {
+                    Ok(()) => {
+                        self.prompt = None;
+                        self.switch_profile(Some(name));
+                    }
+                    Err(e) => {
+                        if let Some(p) = self.prompt.as_mut() {
+                            p.error = Some(e.to_string());
+                        }
+                    }
+                }
             }
             PromptKind::RenameTerminal(idx) => {
                 let name = prompt.buffer.trim().to_string();

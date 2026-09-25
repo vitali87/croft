@@ -52,6 +52,10 @@ pub enum ListPurpose {
     /// Preferences: Open Keyboard Shortcuts (#612): one row per command,
     /// `id` = `kb:<command id>`; choosing one records its new chord.
     KeyboardShortcuts,
+    /// Profiles: Switch Profile (#618). `id` is `profile:<name>`,
+    /// `profile:` for the default, or an action (`new`, `workspace`,
+    /// `workspace-clear`).
+    Profiles,
     /// Multiplayer session roster (Session: Participants): the rows are the
     /// clients attached to this session's host; `id` is the participant id.
     /// Enter opens the per-participant action picker.

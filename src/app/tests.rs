@@ -50118,3 +50118,46 @@ fn escape_leaves_the_shortcut_unchanged() {
     assert_eq!(app.status, "Shortcut unchanged");
     assert!(!app.keybindings_file.exists());
 }
+
+// ---- Profiles (#618) ----
+
+#[test]
+fn the_profiles_picker_offers_the_default_and_a_new_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SwitchProfile);
+    let picker = app.list_picker.as_ref().expect("picker open");
+    assert!(matches!(
+        picker.purpose,
+        crate::widgets::list_picker::ListPurpose::Profiles
+    ));
+    let ids: Vec<&str> = picker.rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids.first(), Some(&"profile:"), "Default comes first");
+    assert!(ids.contains(&"new"));
+    assert!(
+        !ids.contains(&"workspace-clear"),
+        "no workspace choice to clear in a fresh workspace"
+    );
+}
+
+#[test]
+fn a_new_profile_prompt_refuses_an_unsafe_name_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.prompt = Some(Prompt {
+        label: String::from("New profile name"),
+        buffer: String::from("../escape"),
+        kind: PromptKind::NewProfile,
+        target_dir: tmp.path().to_path_buf(),
+        error: None,
+    });
+    app.commit_prompt();
+    let p = app.prompt.as_ref().expect("the prompt stays open");
+    assert!(
+        p.error
+            .as_deref()
+            .is_some_and(|e| e.contains("profile name")),
+        "{:?}",
+        p.error
+    );
+}

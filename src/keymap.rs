@@ -828,7 +828,7 @@ pub fn rebind_text(src: Option<&str>, command: &str, chord: &str) -> String {
 }
 
 pub fn keybindings_path() -> PathBuf {
-    crate::prefs::config_dir().join("keybindings.json")
+    crate::profiles::file("keybindings.json")
 }
 
 /// The starter file written on first "Open Keyboard Shortcuts (JSON)" so the
