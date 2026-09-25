@@ -237,11 +237,6 @@ pub(crate) enum QuickInputPosition {
     Center,
 }
 
-/// One in-flight `textDocument/selectionRange` request (#254): the
-/// Expand Selection gesture waiting on its chains. `positions` snapshots
-/// the exact cursors the request was fired for, so a reply (or a reuse
-/// attempt) after ANY caret movement is recognised as stale even though
-/// `edit_seq` did not move.
 /// An Explorer rename or move held until the language servers have answered
 /// `workspace/willRenameFiles`, so their edit lands before the files move
 /// (#610).
@@ -286,6 +281,11 @@ impl FileMove {
     }
 }
 
+/// One in-flight `textDocument/selectionRange` request (#254): the
+/// Expand Selection gesture waiting on its chains. `positions` snapshots
+/// the exact cursors the request was fired for, so a reply (or a reuse
+/// attempt) after ANY caret movement is recognised as stale even though
+/// `edit_seq` did not move.
 struct PendingSelectionRanges {
     id: u64,
     path: PathBuf,
