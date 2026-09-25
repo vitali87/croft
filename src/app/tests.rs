@@ -49656,6 +49656,79 @@ fn esc_skips_the_wait_and_a_late_answer_is_dropped() {
     assert_eq!(std::fs::read_to_string(&lib).unwrap(), "mod foo;\n");
 }
 
+/// #610: a cut pasted while another move is still held is refused, and the
+/// cut survives so the paste can be repeated once the first move is done.
+#[test]
+fn a_refused_cut_paste_keeps_the_cut() {
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    let root = foo.parent().unwrap().to_path_buf();
+    let (one, two) = (root.join("one"), root.join("two"));
+    std::fs::create_dir(&one).unwrap();
+    std::fs::create_dir(&two).unwrap();
+    let other = root.join("other.rs");
+    std::fs::write(&other, "").unwrap();
+    app.apply_paste_or_drop(&one, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    assert!(app.pending_file_move.is_some(), "the first move is held");
+
+    app.tree_clipboard = Some(super::ExplorerClipboard {
+        mode: ExplorerClipMode::Cut,
+        paths: vec![other.clone()],
+    });
+    app.paste_into(two.clone());
+    assert!(app.status.starts_with("Still updating"), "{}", app.status);
+    assert!(app.tree_clipboard.is_some(), "the refused cut is kept");
+    assert!(other.exists());
+
+    app.skip_held_file_move();
+    app.paste_into(two.clone());
+    assert!(
+        app.pending_file_move.is_some(),
+        "the second move is now held"
+    );
+    assert!(app.tree_clipboard.is_none(), "an accepted cut is consumed");
+}
+
+/// #610: a re-root while a move is held performs it without the edit, so
+/// the move is neither lost nor left waiting on servers that were rebound.
+#[test]
+fn a_re_root_settles_a_held_move() {
+    let (tmp, _lib, foo, mut app) = will_rename_fixture();
+    let dest = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    assert!(app.pending_file_move.is_some());
+
+    app.change_workspace_root(dest.clone());
+    assert!(app.pending_file_move.is_none());
+    assert!(
+        !foo.exists() && dest.join("foo.rs").exists(),
+        "the move happened"
+    );
+    drop(tmp);
+}
+
+/// #610: Esc skips a held move without swallowing the key: it still reaches
+/// the focused pane (here it clears the editor's selection).
+#[test]
+fn esc_skips_a_held_move_and_still_reaches_the_pane() {
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    let dest = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.editor.open(&foo.with_file_name("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    app.editor.select_all();
+    assert!(app.editor.selection.is_some());
+
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_file_move.is_none());
+    assert!(
+        app.editor.selection.is_none(),
+        "Esc also cleared the selection"
+    );
+}
+
 /// Planning a move before performing it must still give two same-named
 /// sources distinct destinations, as moving them one by one did.
 #[test]

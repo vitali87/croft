@@ -268,8 +268,9 @@ pub struct FileRename {
 }
 
 /// The merged `workspace/willRenameFiles` answer of every server that asked
-/// to hear about the rename (#610). Always sent, even when no server asked,
-/// because the app defers the rename until it arrives.
+/// to hear about the rename (#610). Sent even when no server asked, because
+/// the app defers the rename until it arrives; a cancelled request sends
+/// nothing.
 #[derive(Debug)]
 pub struct WillRenameFilesResult {
     pub request_id: u64,
@@ -788,6 +789,12 @@ enum Cmd {
     WillRenameFiles {
         request_id: u64,
         files: Vec<FileRename>,
+    },
+    /// Stop a `WillRenameFiles` still in flight (#610): the app moved the
+    /// files without the edit, so the answer is no longer wanted and the
+    /// clients it holds are released.
+    CancelWillRenameFiles {
+        request_id: u64,
     },
     /// `workspace/didRenameFiles` once the files have moved (#610).
     DidRenameFiles {
@@ -1647,6 +1654,13 @@ impl LspManager {
         id
     }
 
+    /// Abandon the `willRenameFiles` request `request_id` (#610).
+    pub fn cancel_will_rename_files(&self, request_id: u64) {
+        if !cfg!(test) {
+            let _ = self.cmd_tx.send(Cmd::CancelWillRenameFiles { request_id });
+        }
+    }
+
     #[cfg(test)]
     pub fn set_will_rename_listeners(&self, any: bool) {
         self.will_rename_listeners.store(any, Ordering::Relaxed);
@@ -1955,6 +1969,9 @@ struct WorkerState {
     // recomputed whenever a server starts or retires; the app reads it to
     // skip the round trip when nobody listens.
     will_rename_listeners: Arc<AtomicBool>,
+    // The `willRenameFiles` request in flight, if any, so Esc can abort it
+    // and release the client locks it holds (#610).
+    will_rename_task: Option<(u64, tokio::task::AbortHandle)>,
     // Cloned into every spawned client's router so the server-pushed
     // `textDocument/publishDiagnostics` notifications reach the app.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
@@ -2030,6 +2047,7 @@ async fn worker_loop(
         inlay_refresh,
         diagnostic_refresh,
         will_rename_listeners,
+        will_rename_task: None,
         diagnostics_tx: tx.diagnostics.clone(),
         progress_tx: tx.progress.clone(),
     };
@@ -2319,6 +2337,15 @@ async fn worker_loop(
             }
             Cmd::WillRenameFiles { request_id, files } => {
                 state.will_rename_files(request_id, files, &tx.will_rename_files)
+            }
+            Cmd::CancelWillRenameFiles { request_id } => {
+                if let Some((id, task)) = state.will_rename_task.take() {
+                    if id == request_id {
+                        task.abort();
+                    } else {
+                        state.will_rename_task = Some((id, task));
+                    }
+                }
             }
             Cmd::DidRenameFiles { files } => state.did_rename_files(&files),
             Cmd::RequestPrepareRename {
@@ -4542,14 +4569,14 @@ impl WorkerState {
     /// for all of them (each bounded by [`WILL_RENAME_TIMEOUT`]), and send one
     /// merged answer. Always answers: the app holds the rename until it does.
     fn will_rename_files(
-        &self,
+        &mut self,
         request_id: u64,
         files: Vec<FileRename>,
         tx: &std_mpsc::Sender<WillRenameFilesResult>,
     ) {
         let audience = self.file_op_audience(&files, |c| c.will_rename_filters.as_ref());
         let tx = tx.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let asks = audience
                 .into_iter()
                 .map(|(name, client, matched)| async move {
@@ -4584,6 +4611,7 @@ impl WorkerState {
                 edits: merge_file_edits(answers),
             });
         });
+        self.will_rename_task = Some((request_id, task.abort_handle()));
     }
 
     /// `workspace/didRenameFiles` (#610) to every server whose filters match.
@@ -8357,6 +8385,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8419,6 +8448,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8455,6 +8485,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8551,6 +8582,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8629,6 +8661,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8697,6 +8730,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8807,6 +8841,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8926,6 +8961,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -9107,6 +9143,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -9352,6 +9389,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
+            will_rename_task: None,
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };

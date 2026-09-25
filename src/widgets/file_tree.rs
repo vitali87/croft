@@ -1146,17 +1146,23 @@ fn already_exists(path: &Path) -> std::io::Error {
 }
 
 /// Move `source` to exactly `dest`, which must not exist yet. Falls back to
-/// copy-then-remove when `std::fs::rename` fails, as it does with `EXDEV`
-/// across filesystems.
+/// copy-then-remove only when `std::fs::rename` fails with `EXDEV`, across
+/// filesystems.
 pub fn relocate(source: &Path, dest: &Path) -> std::io::Result<()> {
     if dest.symlink_metadata().is_ok() {
         return Err(already_exists(dest));
     }
-    if std::fs::rename(source, dest).is_ok() {
-        return Ok(());
+    match std::fs::rename(source, dest) {
+        Ok(()) => Ok(()),
+        // Only a move across filesystems falls back to copy-then-remove;
+        // any other refusal (a folder into itself, a missing parent) is the
+        // answer, not a reason to copy.
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            copy_recursive(source, dest)?;
+            remove_recursive(source)
+        }
+        Err(e) => Err(e),
     }
-    copy_recursive(source, dest)?;
-    remove_recursive(source)
 }
 
 /// Given a filesystem event path and the tree's workspace root, return the
@@ -1835,6 +1841,18 @@ mod tests {
         (tmp, second, tree)
     }
 
+    /// A rename refused for any reason but `EXDEV` is reported, never
+    /// retried as a copy: a folder moved into itself must not be copied
+    /// into its own subtree.
+    #[test]
+    fn relocate_copies_only_across_filesystems() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        std::fs::create_dir_all(a.join("b")).unwrap();
+        assert!(relocate(&a, &a.join("b").join("a")).is_err());
+        assert!(!a.join("b").join("a").exists(), "nothing was copied");
+        assert!(a.join("b").is_dir(), "the source is untouched");
+    }
     #[test]
     fn add_root_appends_a_loaded_depth_zero_section_and_keeps_the_primary() {
         let (tmp, second, tree) = two_root_fixture();

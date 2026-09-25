@@ -18802,11 +18802,9 @@ impl App {
         {
             self.dismiss_ssh_offer();
             // Esc stops waiting on the language servers: the held rename
-            // or move goes ahead without their edit (#610).
-            if let Some(pending) = self.pending_file_move.take() {
-                self.finish_file_move(pending.op, &[]);
-                return Ok(());
-            }
+            // or move goes ahead without their edit (#610). Like the offer,
+            // it is not consumed.
+            self.skip_held_file_move();
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
@@ -42791,6 +42789,9 @@ impl App {
     /// into the old workspace.
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
         let display = new_root.display().to_string();
+        // A held rename or move (#610) finishes before the servers that
+        // were asked about it are rebound, so it is neither lost nor stuck.
+        self.skip_held_file_move();
         // The remembered task belongs to the old workspace; Rerun Last Task
         // must rediscover, not rerun the old project's command here.
         self.last_task = None;
@@ -45678,8 +45679,11 @@ impl App {
             self.status = String::from("Explorer clipboard is empty");
             return;
         };
-        self.apply_paste_or_drop(&dest_dir, &clip.paths, clip.mode);
-        if matches!(clip.mode, ExplorerClipMode::Cut) {
+        // A refused move (another one still held) keeps the cut, so the
+        // paste can be repeated once that one finishes.
+        if self.apply_paste_or_drop(&dest_dir, &clip.paths, clip.mode)
+            && matches!(clip.mode, ExplorerClipMode::Cut)
+        {
             self.tree_clipboard = None;
         }
     }
@@ -45687,8 +45691,13 @@ impl App {
     /// Shared implementation for explorer paste and drag-drop. `mode`
     /// distinguishes a move (Cut/drag) from a copy (Copy/Alt-drag). A move
     /// is planned here and performed by [`Self::begin_file_move`], which asks
-    /// the language servers first (#610).
-    fn apply_paste_or_drop(&mut self, dest_dir: &Path, paths: &[PathBuf], mode: ExplorerClipMode) {
+    /// the language servers first (#610). False when the move was refused.
+    fn apply_paste_or_drop(
+        &mut self,
+        dest_dir: &Path,
+        paths: &[PathBuf],
+        mode: ExplorerClipMode,
+    ) -> bool {
         if matches!(mode, ExplorerClipMode::Cut) {
             let mut planned: Vec<(PathBuf, PathBuf)> = Vec::new();
             let mut failed: Vec<String> = Vec::new();
@@ -45707,8 +45716,9 @@ impl App {
             };
             if let Err(msg) = self.begin_file_move(op) {
                 self.status = msg;
+                return false;
             }
-            return;
+            return true;
         }
         let mut placed: Vec<PathBuf> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -45728,6 +45738,7 @@ impl App {
             "Copied",
             "",
         );
+        true
     }
 
     /// Refresh the folders a paste, drop or move touched, mark and select
@@ -45799,6 +45810,18 @@ impl App {
         }
         self.finish_file_move(op, &[]);
         Ok(())
+    }
+
+    /// Stop waiting on the servers for a held rename or move (#610): cancel
+    /// the request and perform the move without their edit.
+    fn skip_held_file_move(&mut self) {
+        let Some(pending) = self.pending_file_move.take() else {
+            return;
+        };
+        if let Some(lsp) = self.lsp.as_ref() {
+            lsp.cancel_will_rename_files(pending.request_id);
+        }
+        self.finish_file_move(pending.op, &[]);
     }
 
     /// Perform a held rename or move once the servers have answered.
