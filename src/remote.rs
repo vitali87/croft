@@ -1130,7 +1130,7 @@ fn run_pump(
     pump_requests(
         BufReader::new(stdout),
         &stop,
-        |id| ssh_exec(&host, &socket, &claim_command(&inbox_dir, id)),
+        |id| ssh_status(&host, &socket, &claim_command(&inbox_dir, id)),
         |request| dispatch_relay_request(&host, &socket, &inbox_dir, request),
     );
 }
@@ -1139,9 +1139,16 @@ fn run_pump(
 /// `mkdir` of the request's own inbox directory, with no `-p`, which exactly
 /// one caller can win. The remote croft never creates that directory, only
 /// removes it once the request resolves, so the claim goes with it.
+///
+/// Exits 0 when this pump won, [`CLAIM_LOST`] when the directory already
+/// exists (another pump won), and 2 when `mkdir` failed for any other reason.
 fn claim_command(inbox_dir: &str, id: &str) -> String {
-    format!("mkdir {}", shell_quote(&format!("{inbox_dir}/{id}")))
+    let dir = shell_quote(&format!("{inbox_dir}/{id}"));
+    format!("mkdir {dir} 2>/dev/null && exit 0; [ -d {dir} ] && exit {CLAIM_LOST}; exit 2")
 }
+
+/// The claim's exit status when another pump already holds the request.
+const CLAIM_LOST: i32 = 1;
 
 /// Read relay requests line by line and act on each one this pump claims.
 ///
@@ -1149,14 +1156,18 @@ fn claim_command(inbox_dir: &str, id: &str) -> String {
 /// and every pump tails the same `requests.log`, so without a claim a single
 /// request is served once per window: one click on a forwarded port opened a
 /// browser tab per window (#648). `claim` must succeed for exactly one pump
-/// per request id. An `unforward` carries no usable id and cancelling a
+/// per request id; `claim` returns the claim's exit status, and only
+/// [`CLAIM_LOST`] skips a request. A claim that could not run (ssh failed,
+/// or `mkdir` failed for another reason) falls through to the handler, which
+/// reports its own failure through `.err` rather than dropping the request
+/// silently. An `unforward` carries no usable id and cancelling a
 /// forward twice is harmless, so it is not claimed. An id croft could not
 /// have minted is dropped rather than claimed, since the claim creates a
 /// directory named after it.
 fn pump_requests(
     reader: impl BufRead,
     stop: &AtomicBool,
-    mut claim: impl FnMut(&str) -> bool,
+    mut claim: impl FnMut(&str) -> Option<i32>,
     mut act: impl FnMut(RelayRequest),
 ) {
     for line in reader.lines() {
@@ -1168,7 +1179,7 @@ fn pump_requests(
             continue;
         };
         if let Some(id) = request.id()
-            && !(copy_request_id_is_safe(id) && claim(id))
+            && (!copy_request_id_is_safe(id) || claim(id) == Some(CLAIM_LOST))
         {
             continue;
         }
@@ -1647,6 +1658,24 @@ fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
 /// Run `cmd` on the remote over the existing master socket (no second auth, no
 /// nested master). Used for the relay inbox bookkeeping (`mkdir`, sentinel
 /// writes). Returns whether it exited zero.
+/// Run `cmd` on the remote and return its exit status: `None` when ssh could
+/// not run it at all, `Some(255)` when the connection failed.
+fn ssh_status(host: &str, socket: &Path, cmd: &str) -> Option<i32> {
+    Command::new("ssh")
+        .arg("-S")
+        .arg(socket)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg(host)
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .and_then(|s| s.code())
+}
+
 fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
     Command::new("ssh")
         .arg("-S")
@@ -4097,9 +4126,9 @@ Host !blocked *.internal
                         std::process::Command::new("sh")
                             .arg("-c")
                             .arg(super::claim_command(&inbox_dir, id))
-                            .stderr(std::process::Stdio::null())
                             .status()
-                            .is_ok_and(|s| s.success())
+                            .ok()
+                            .and_then(|s| s.code())
                     },
                     |request| {
                         acted.push(
@@ -4139,6 +4168,48 @@ Host !blocked *.internal
             !root.path().join("escape").exists(),
             "an unsafe id creates nothing"
         );
+    }
+
+    /// #648: the claim tells "another pump won" apart from "the claim could
+    /// not be made", and only the first skips a request. A request whose claim
+    /// failed is still handed to its handler, which reports the failure
+    /// through `.err`; dropping it left the remote croft waiting out its
+    /// timeout.
+    #[test]
+    fn only_a_lost_claim_skips_a_request() {
+        use std::sync::atomic::AtomicBool;
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        std::fs::create_dir(&inbox).unwrap();
+        let inbox_dir = inbox.display().to_string();
+        let run = |dir: &str, id: &str| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(super::claim_command(dir, id))
+                .status()
+                .unwrap()
+                .code()
+        };
+        assert_eq!(run(&inbox_dir, "open-1-0"), Some(0), "the first pump wins");
+        assert_eq!(
+            run(&inbox_dir, "open-1-0"),
+            Some(super::CLAIM_LOST),
+            "the second one loses"
+        );
+        let missing = root.path().join("gone").display().to_string();
+        assert_eq!(run(&missing, "open-1-0"), Some(2), "mkdir failed otherwise");
+
+        for outcome in [Some(0), Some(2), Some(255), None, Some(super::CLAIM_LOST)] {
+            let mut acted = 0;
+            super::pump_requests(
+                std::io::Cursor::new("open\topen-1-0\thttps://example.com/"),
+                &AtomicBool::new(false),
+                |_| outcome,
+                |_| acted += 1,
+            );
+            let expected = usize::from(outcome != Some(super::CLAIM_LOST));
+            assert_eq!(acted, expected, "claim outcome {outcome:?}");
+        }
     }
 
     #[test]
