@@ -14482,11 +14482,22 @@ impl EditorTabs {
     pub fn close_all(&mut self) -> usize {
         let n = self.editors.len();
         let was_focused = self.editors[self.active].focused;
-        let mut fresh = Editor::new();
-        fresh.focused = was_focused;
-        self.editors = vec![fresh];
+        // Pinned tabs survive Close All as they survive Close Others (#616).
+        let mut kept: Vec<Editor> = std::mem::take(&mut self.editors)
+            .into_iter()
+            .filter(|e| e.pinned)
+            .collect();
+        let removed = n - kept.len();
+        if kept.is_empty() {
+            kept.push(Editor::new());
+        }
+        for e in kept.iter_mut() {
+            e.focused = false;
+        }
+        kept[0].focused = was_focused;
+        self.editors = kept;
         self.active = 0;
-        n
+        removed
     }
 
     /// Close every saved (non-dirty) tab, keeping any with unsaved changes.
@@ -15144,7 +15155,22 @@ impl Widget for &mut EditorTabs {
         let pointer = self.hover_pointer;
         let display_labels = disambiguated_tab_labels(&self.editors);
         for (i, ed) in self.editors.iter().enumerate() {
-            let label_text = display_labels[i].clone();
+            // A pinned tab shows only its file's icon (#616): it keeps its
+            // place at the left edge in a cell or two.
+            let label_text = match ed.path.as_deref().filter(|_| ed.pinned) {
+                Some(p) => {
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy())
+                        .unwrap_or_default();
+                    let ext = p
+                        .extension()
+                        .map(|e| e.to_string_lossy())
+                        .unwrap_or_default();
+                    crate::icons::for_path(&name, &ext).glyph.to_string()
+                }
+                None => display_labels[i].clone(),
+            };
             // Display CELLS, not chars (#168 review): a CJK file or
             // directory name is double-width, and a char count shifted
             // the close button and hit ranges left of the painted text.
@@ -24180,16 +24206,25 @@ mod tests {
     }
 
     #[test]
-    fn close_all_closes_pinned_tabs_too() {
-        // VS Code parity: Close All does not spare pinned tabs.
+    fn close_all_keeps_pinned_tabs() {
+        // #616: a pinned tab survives Close All, as it survives Close
+        // Others; with nothing pinned the pane still resets to one blank tab.
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/a"));
         t.add_tab_with_path(std::path::PathBuf::from("/b"));
         t.toggle_pin(0);
         let removed = t.close_all();
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 1);
+        assert_eq!(t.tab_count(), 1);
+        assert!(t.is_pinned(0));
+        assert_eq!(
+            t.editors[0].path.as_deref(),
+            Some(std::path::Path::new("/a"))
+        );
+        t.toggle_pin(0);
+        assert_eq!(t.close_all(), 1);
         assert_eq!(t.tab_count(), 1, "collapses to a single blank tab");
-        assert!(!t.is_pinned(0));
+        assert!(t.editors[0].path.is_none() && !t.is_pinned(0));
     }
 
     #[test]

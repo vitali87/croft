@@ -2420,6 +2420,9 @@ type GraphReply = (
 type GraphReplyRx = std::sync::mpsc::Receiver<GraphReply>;
 type GraphReplyTx = std::sync::mpsc::Sender<GraphReply>;
 
+/// A place in a file: path, 0-based line and LSP character.
+type Location = (PathBuf, u32, u32);
+
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
@@ -3342,6 +3345,11 @@ pub struct App {
     /// frame; `peek_target` is where Enter jumps.
     peek_popup: Option<crate::widgets::hover_popup::HoverPopup>,
     peek_target: Option<(PathBuf, u32, u32)>,
+    /// Peek References (#616): every reference and the one the peek shows,
+    /// and the id of the references request that asked for a peek rather
+    /// than the picker.
+    peek_refs: Option<(Vec<Location>, usize)>,
+    references_peek_id: Option<u64>,
     declaration_request_id: Option<u64>,
     type_definition_request_id: Option<u64>,
     /// The `(active file, last-seen LSP edit seq)` the OUTLINE was last synced
@@ -5071,6 +5079,8 @@ impl App {
             peek_definition_request_id: None,
             peek_popup: None,
             peek_target: None,
+            peek_refs: None,
+            references_peek_id: None,
             outline_synced: None,
             declaration_request_id: None,
             type_definition_request_id: None,
@@ -9721,6 +9731,55 @@ impl App {
     fn close_peek_popup(&mut self) {
         self.peek_popup = None;
         self.peek_target = None;
+        self.peek_refs = None;
+    }
+
+    /// Show references in the peek popup (#616), starting at the first.
+    fn present_reference_peek(&mut self, targets: Vec<Location>) {
+        if targets.is_empty() {
+            return;
+        }
+        self.peek_refs = Some((targets, 0));
+        self.show_reference_peek();
+    }
+
+    /// (Re)draw the peek at the current reference, titled with its place in
+    /// the list.
+    fn show_reference_peek(&mut self) {
+        let Some((targets, i)) = self.peek_refs.clone() else {
+            return;
+        };
+        let (path, line, col) = targets[i].clone();
+        let n = targets.len();
+        self.open_peek_popup(path, line, col);
+        self.peek_refs = Some((targets, i));
+        if let Some(popup) = self.peek_popup.as_mut() {
+            popup.lines.insert(
+                0,
+                format!("Reference {} of {n} (\u{2191}\u{2193} next)", i + 1),
+            );
+        }
+    }
+
+    /// Step the reference peek forward or back, wrapping.
+    fn cycle_reference_peek(&mut self, forward: bool) {
+        let Some((targets, i)) = self.peek_refs.as_mut() else {
+            return;
+        };
+        let n = targets.len();
+        *i = if forward {
+            (*i + 1) % n
+        } else {
+            (*i + n - 1) % n
+        };
+        self.show_reference_peek();
+    }
+
+    /// Shift+F12 (#616): the references of the symbol at the caret in the
+    /// peek popup, VS Code's Peek References.
+    fn peek_references_at_cursor(&mut self) {
+        self.request_references_at_cursor();
+        self.references_peek_id = self.references_request_id;
     }
 
     pub fn drain_lsp_declaration(&mut self) -> bool {
@@ -9851,6 +9910,10 @@ impl App {
         if unsupported {
             self.status =
                 String::from("Go to References: not supported by this file's language server");
+            return true;
+        }
+        if self.references_peek_id.take() == self.references_request_id && !targets.is_empty() {
+            self.present_reference_peek(targets);
             return true;
         }
         match targets.len() {
@@ -18790,6 +18853,10 @@ impl App {
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         {
             match key.code {
+                KeyCode::Down | KeyCode::Up if self.peek_refs.is_some() => {
+                    self.cycle_reference_peek(key.code == KeyCode::Down);
+                    return Ok(());
+                }
                 KeyCode::Enter => {
                     if let Some((path, line, col)) = self.peek_target.take() {
                         self.close_peek_popup();
@@ -28623,7 +28690,12 @@ impl App {
                 && self.editor.sheet.is_none()
                 && self.editor.image.is_none()
             {
-                self.request_references_at_cursor();
+                // Shift+F12 peeks (#616); Alt+Shift+F12 lists them all.
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.request_references_at_cursor();
+                } else {
+                    self.peek_references_at_cursor();
+                }
             }
             return;
         }
@@ -35450,6 +35522,7 @@ impl App {
             },
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
+            Cmd::PeekReferences => self.peek_references_at_cursor(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -43467,12 +43540,28 @@ impl App {
     fn close_all_tabs(&mut self) {
         let mut removed = self.editor.close_all();
         if self.editor_layout.is_split() {
-            removed += self
-                .editor_layout
-                .inactive_groups()
-                .iter()
-                .map(|g| g.editors.len())
-                .sum::<usize>();
+            // Pinned tabs in the other groups survive too (#616), gathered
+            // into the one group that remains.
+            let mut pinned = Vec::new();
+            for group in self.editor_layout.inactive_groups_mut() {
+                let (keep, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut group.editors)
+                    .into_iter()
+                    .partition(|e| e.pinned);
+                removed += gone.len();
+                pinned.extend(keep);
+            }
+            if !pinned.is_empty() {
+                let blank = self.editor.editors.len() == 1
+                    && !self.editor.editors[0].pinned
+                    && self.editor.editors[0].path.is_none();
+                if blank {
+                    self.editor.editors.clear();
+                }
+                for e in pinned.iter_mut() {
+                    e.focused = false;
+                }
+                self.editor.editors.extend(pinned);
+            }
             self.editor_layout = editor_layout::EditorLayout::single();
             self.editor_seams.clear();
             self.disable_editor_image(1);

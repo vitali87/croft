@@ -49559,3 +49559,129 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+/// Pinned tabs (#616): a pinned tab shows only its icon in the strip, and
+/// survives Close All, in its own group and across a split.
+#[test]
+fn a_pinned_tab_is_an_icon_and_survives_close_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    for n in ["alpha.rs", "beta.rs", "gamma.rs"] {
+        std::fs::write(tmp.path().join(n), "fn x() {}\n").unwrap();
+    }
+    let mut app = app_with_open_file(tmp.path(), "alpha.rs", "fn x() {}\n");
+    app.editor
+        .open_in_new_tab(&tmp.path().join("beta.rs"))
+        .unwrap();
+    assert!(app.editor.toggle_pin(0), "alpha.rs is pinned");
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let strip: String = (0..20)
+        .map(|y| {
+            (0..100)
+                .map(|x| term.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .find(|row| row.contains("beta.rs"))
+        .expect("the tab strip");
+    let icon = crate::icons::for_path("alpha.rs", "rs").glyph.to_string();
+    assert!(strip.contains(&icon), "{strip}");
+    assert!(
+        !strip.contains("alpha.rs"),
+        "a pinned tab shows its icon only: {strip}"
+    );
+    assert!(strip.contains("beta.rs"), "{strip}");
+
+    // A split whose other group holds a pinned and an unpinned tab.
+    app.split_editor();
+    app.editor
+        .open_in_new_tab(&tmp.path().join("gamma.rs"))
+        .unwrap();
+    let gamma = app.editor.tab_count() - 1;
+    assert!(app.editor.toggle_pin(gamma));
+    app.focus_editor_group(true);
+
+    app.close_all_tabs();
+    assert!(!app.editor_layout.is_split());
+    let kept: Vec<String> = app
+        .editor
+        .editors
+        .iter()
+        .map(|e| {
+            e.path
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(kept, vec!["alpha.rs".to_string(), "gamma.rs".to_string()]);
+    assert!(app.editor.editors.iter().all(|e| e.pinned));
+}
+
+/// Peek References (#616): the references open in the peek popup titled
+/// with their place in the list, arrows step through them and wrap, and
+/// Enter jumps to the one shown.
+#[test]
+fn peek_references_steps_through_the_references_and_enter_jumps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "a.rs",
+        "fn one() {}\nfn two() {}\nfn three() {}\n",
+    );
+    let other = tmp.path().join("b.rs");
+    std::fs::write(&other, "use a;\nfn main() { one(); }\n").unwrap();
+    let a = app.editor.path.clone().unwrap();
+    app.present_reference_peek(vec![
+        (a.clone(), 0, 3),
+        (other.clone(), 1, 12),
+        (a.clone(), 2, 3),
+    ]);
+    let title = |app: &App| {
+        app.peek_popup
+            .as_ref()
+            .map(|p| p.lines[0].clone())
+            .unwrap_or_default()
+    };
+    assert!(
+        title(&app).starts_with("Reference 1 of 3"),
+        "{}",
+        title(&app)
+    );
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        title(&app).starts_with("Reference 2 of 3"),
+        "{}",
+        title(&app)
+    );
+    assert!(
+        app.peek_popup
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|l| l.contains("fn main() { one(); }")),
+        "the peek shows the second reference's line"
+    );
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        title(&app).starts_with("Reference 3 of 3"),
+        "Up from the first wraps to the last"
+    );
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.peek_popup.is_none() && app.peek_refs.is_none());
+    assert_eq!(app.editor.path.as_deref(), Some(other.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+}

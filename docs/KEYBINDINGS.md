@@ -71,7 +71,7 @@ Per platform:
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `r` re-discovers, click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, ↑/↓ scroll or drag the scrollbar |
 | `Cmd+K` `Enter` | Run the test the editor caret sits in (also in the palette as "Testing: Run Test at Cursor") |
 | `Cmd+K` `Shift+Enter` | Debug the test the editor caret sits in: pytest runs as a debugpy module launch under the project's venv, a cargo test binary launches under lldb-dap with the test name as its filter ("Testing: Debug Test at Cursor"); Alt+click a gutter ▷ does the same for that test. When the last run of that test FAILED and named a place in your own code, croft sets a temporary breakpoint at the assertion first, so the session stops where it broke without you finding the line; that breakpoint is removed when the session ends, and a breakpoint you set yourself on the same line is left alone |
-| `Cmd+K` `P` | Pin / unpin the active editor tab (moved off `Cmd+K` `Shift+Enter`, which now debugs tests) |
+| `Cmd+K` `P` | Pin / unpin the active editor tab (moved off `Cmd+K` `Shift+Enter`, which now debugs tests). A pinned tab sits at the left edge showing only its file icon, and survives Close All, Close Others and Close to the Right |
 | `Cmd+K` `Shift+P` | Keep the active preview tab open (promote the italic preview to a real tab; moved off `Cmd+K` `Enter`, which now runs tests) |
 | `Cmd+K` `H` | Show incoming calls: a picker of everyone calling the symbol at the caret (LSP call hierarchy, one level per invocation; pick a caller and invoke again to walk up) |
 | `Cmd+K` `Shift+H` | Show outgoing calls: everything the function at the caret calls, each entry jumping to the callee's definition |
@@ -301,7 +301,8 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`Shift`+`-` | Go Forward: return along the trail Go Back walked, restoring each position (also on the editor right-click menu and as Command Palette "Go Forward"). On terminals without the extended keyboard protocol the chord is indistinguishable from `Ctrl`+`-` and stays Go Back; use the palette there |
 | `Cmd+K` `Cmd+Q` | Go to Last Edit Location: jump to the most recent buffer edit across the open editors (VS Code's chord; distinct from the navigator's plain `Cmd+K` `Q`) |
 | `Alt`+`F12` | Peek Definition: an excerpt popup at the caret — header `path:line`, numbered lines, the definition marked `▶`; `Enter` converts to the real jump, `Esc` closes, any other key closes and keeps its meaning (also Command Palette "Peek Definition") |
-| `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
+| `Shift`+`F12` | Peek References: the references open in the peek popup under the caret, titled "Reference 2 of 5"; `↑`/`↓` step through them (wrapping), `Enter` jumps to the one shown, `Esc` closes |
+| `Alt`+`Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
 | `Ctrl`+`F12` | Go to Type Definition |
 | `Cmd`+`F12` | Go to Implementations (concrete implementors of a trait / interface) |
