@@ -270,6 +270,15 @@ struct TabStamp {
     dirty: bool,
 }
 
+/// A fingerprint of text croft wrote, compared with the file's text later
+/// (see `App::rename_disk_writes`).
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
 /// Whether `path` still holds the text the servers answered for, comparing
 /// its tabs when the request went out (`before`) with its tabs now. Edit
 /// counters are per tab and two tabs can share a value, so the whole sorted
@@ -278,7 +287,8 @@ struct TabStamp {
 /// disk is unwritten since (`disk_unchanged`: a save clears the dirty flag
 /// but not the change); a file whose tabs all closed since fits when none
 /// of them held unsaved text and, likewise, the disk is unwritten since.
-/// `disk_unchanged` stats the file, so it runs only when those cases need it.
+/// `disk_unchanged` stats, and may read, the file, so it runs only when
+/// those cases need it.
 fn text_unchanged_since(
     before: &[TabStamp],
     now: &[TabStamp],
@@ -3485,11 +3495,13 @@ pub struct App {
     rename_request_id: Option<u64>,
     /// An Explorer rename or move waiting on `willRenameFiles` (#610).
     pending_file_move: Option<PendingFileMove>,
-    /// Closed files that rename edits rewrote on disk in the last
-    /// [`MTIME_GRANULARITY`], with the text written and when: a move right
-    /// after one that rewrote the same file finds its fresh modified time
-    /// is croft's own write, not a change during the wait (#610).
-    rename_disk_writes: std::collections::HashMap<PathBuf, (String, std::time::SystemTime)>,
+    /// Closed files that rename edits rewrote on disk, keyed by path, with a
+    /// hash of the text written and when: a move right after one that
+    /// rewrote the same file at the same path finds its fresh modified time
+    /// is croft's own write, not a change during the wait (#610). Entries
+    /// older than [`MTIME_GRANULARITY`] are dropped at the next rename edit
+    /// or answered move, since the modified time alone covers them then.
+    rename_disk_writes: std::collections::HashMap<PathBuf, (u64, std::time::SystemTime)>,
     /// In-flight prepareRename (#254): (id, path, row, col, edit_seq) —
     /// the deferred rename prompt's context.
     prepare_rename_request: Option<(u64, PathBuf, usize, usize, u64)>,
@@ -11737,6 +11749,11 @@ impl App {
     ) -> Result<(usize, usize)> {
         let mut file_count = 0;
         let mut occ_count = 0;
+        self.prune_rename_disk_writes();
+        // Closed files written on disk below, which the servers learn of
+        // before any later request (#610).
+        let mut rewritten = Vec::new();
+        let mut failed = None;
         for (path, edits) in files {
             if edits.is_empty() {
                 continue;
@@ -11769,17 +11786,25 @@ impl App {
                 // those edits flow to the owner as ops).
                 continue;
             } else {
-                let content = std::fs::read_to_string(path)?;
+                let content = match std::fs::read_to_string(path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                };
                 let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
                 occ_count += crate::widgets::editor::apply_span_edits_to_lines(&mut lines, edits);
                 let text = lines.join("\n");
-                std::fs::write(path, &text)?;
-                let now = std::time::SystemTime::now();
-                self.rename_disk_writes.retain(|_, (_, at)| {
-                    now.duration_since(*at)
-                        .is_ok_and(|age| age < MTIME_GRANULARITY)
-                });
-                self.rename_disk_writes.insert(path.clone(), (text, now));
+                if let Err(e) = std::fs::write(path, &text) {
+                    failed = Some(e);
+                    break;
+                }
+                self.rename_disk_writes.insert(
+                    path.clone(),
+                    (text_hash(&text), std::time::SystemTime::now()),
+                );
+                rewritten.push(path.clone());
                 // A hex or log view of it in the active group, which the edit
                 // skipped, must see this write as an external change, even
                 // after a move re-anchors it to the new path.
@@ -11792,7 +11817,25 @@ impl App {
             }
             file_count += 1;
         }
+        if !rewritten.is_empty()
+            && let Some(lsp) = self.lsp.as_mut()
+        {
+            lsp.notify_files_changed_on_disk(rewritten);
+        }
+        if let Some(e) = failed {
+            return Err(e.into());
+        }
         Ok((file_count, occ_count))
+    }
+
+    /// Drop [`Self::rename_disk_writes`] entries old enough that the file's
+    /// modified time alone places them before any request made from now on.
+    fn prune_rename_disk_writes(&mut self) {
+        let now = std::time::SystemTime::now();
+        self.rename_disk_writes.retain(|_, (_, at)| {
+            now.duration_since(*at)
+                .is_ok_and(|age| age < MTIME_GRANULARITY)
+        });
     }
 
     /// VS Code "Format Document" (Cmd+Opt+Shift+F): ask the language server to
@@ -46023,13 +46066,14 @@ impl App {
                 std::fs::metadata(path)
                     .and_then(|m| m.modified())
                     .is_ok_and(|t| t + MTIME_GRANULARITY <= pending.requested_at)
-                    || self.rename_disk_writes.get(path).is_some_and(|(text, at)| {
+                    || self.rename_disk_writes.get(path).is_some_and(|(hash, at)| {
                         *at <= pending.requested_at
-                            && std::fs::read_to_string(path).is_ok_and(|t| t == *text)
+                            && std::fs::read_to_string(path).is_ok_and(|t| text_hash(&t) == *hash)
                     })
             };
             text_unchanged_since(&pending.tabs, &now, path, disk_unchanged)
         });
+        self.prune_rename_disk_writes();
         // Named before the move, which may carry them to new paths.
         let stale_names: Vec<String> = stale.iter().map(|(p, _)| self.status_path(p)).collect();
         self.finish_file_move(pending.op, Some(&edits));

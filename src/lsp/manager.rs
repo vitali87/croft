@@ -837,6 +837,11 @@ enum Cmd {
     DidRenameFiles {
         files: Vec<FileRename>,
     },
+    /// `workspace/didChangeWatchedFiles` for closed files croft rewrote on
+    /// disk (#610).
+    DidChangeWatchedFiles {
+        paths: Vec<PathBuf>,
+    },
     RequestPrepareRename {
         request_id: u64,
         path: PathBuf,
@@ -965,6 +970,9 @@ pub struct LspManager {
     /// Every `didRenameFiles` batch sent, for tests to read back.
     #[cfg(test)]
     pub did_rename_log: Vec<Vec<FileRename>>,
+    /// Every batch of files reported changed on disk, for tests to read back.
+    #[cfg(test)]
+    pub files_changed_log: Vec<Vec<PathBuf>>,
     _runtime: LspRuntime,
 }
 
@@ -1124,6 +1132,8 @@ impl LspManager {
             workspace_root,
             #[cfg(test)]
             did_rename_log: Vec::new(),
+            #[cfg(test)]
+            files_changed_log: Vec::new(),
             _runtime: runtime,
         })
     }
@@ -1734,6 +1744,15 @@ impl LspManager {
         #[cfg(test)]
         self.did_rename_log.push(files.clone());
         let _ = self.cmd_tx.send(Cmd::DidRenameFiles { files });
+    }
+
+    /// Tell the servers croft rewrote the closed files `paths` on disk, so
+    /// a request queued after this one is answered for their new text
+    /// (#610).
+    pub fn notify_files_changed_on_disk(&mut self, paths: Vec<PathBuf>) {
+        #[cfg(test)]
+        self.files_changed_log.push(paths.clone());
+        let _ = self.cmd_tx.send(Cmd::DidChangeWatchedFiles { paths });
     }
 
     pub fn request_formatting(&mut self, path: PathBuf, tab_size: u32, insert_spaces: bool) -> u64 {
@@ -2392,6 +2411,7 @@ async fn worker_loop(
                 state.will_rename_files(request_id, files, &tx.will_rename_files)
             }
             Cmd::DidRenameFiles { files } => state.did_rename_files(&files).await,
+            Cmd::DidChangeWatchedFiles { paths } => state.did_change_watched_files(&paths).await,
             Cmd::RequestPrepareRename {
                 request_id,
                 path,
@@ -4677,6 +4697,58 @@ impl WorkerState {
             let mut client = client.lock().await;
             if let Err(e) = client.did_rename_files(&uris) {
                 log_file::log(&format!("lsp[{name}] didRenameFiles error: {e:#}"));
+            }
+        }
+    }
+
+    /// The servers to tell about `paths` changing on disk: each server and
+    /// root once, with the paths under that root.
+    fn watched_files_audience(
+        &self,
+        paths: &[PathBuf],
+    ) -> Vec<(String, Arc<TokioMutex<LspClient>>, Vec<PathBuf>)> {
+        let mut keys: Vec<&ClientKey> = self.clients.keys().collect();
+        keys.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.lsp_id().cmp(b.0.lsp_id())));
+        let mut seen: Vec<(String, PathBuf)> = Vec::new();
+        let mut out = Vec::new();
+        for key in keys {
+            let root = &key.1;
+            let under: Vec<PathBuf> = paths
+                .iter()
+                .filter(|p| p.starts_with(root))
+                .cloned()
+                .collect();
+            if under.is_empty() {
+                continue;
+            }
+            for c in &self.clients[key] {
+                let id = (c.name.clone(), root.clone());
+                if seen.contains(&id) {
+                    continue;
+                }
+                seen.push(id);
+                out.push((c.name.clone(), c.client.clone(), under.clone()));
+            }
+        }
+        out
+    }
+
+    /// `workspace/didChangeWatchedFiles` (#610) to every server whose root
+    /// holds one of `paths`. Sent inline, so a server has it before any
+    /// request croft queues after it.
+    async fn did_change_watched_files(&self, paths: &[PathBuf]) {
+        for (name, client, under) in self.watched_files_audience(paths) {
+            let uris: Vec<Url> = under
+                .iter()
+                .filter_map(|p| Url::from_file_path(p).ok())
+                .collect();
+            log_file::log(&format!(
+                "lsp[{name}] didChangeWatchedFiles: {} file(s)",
+                uris.len()
+            ));
+            let mut client = client.lock().await;
+            if let Err(e) = client.did_change_watched_files(&uris) {
+                log_file::log(&format!("lsp[{name}] didChangeWatchedFiles error: {e:#}"));
             }
         }
     }
@@ -9541,7 +9613,8 @@ while True:
 
     /// #610: each interested server is asked once per root, only about the
     /// files under that root its filters match, and the app's listeners flag
-    /// follows whether any client registered a `willRenameFiles` filter.
+    /// follows whether any client registered a `willRenameFiles` filter. A
+    /// rewrite on disk reaches each server and root once, unfiltered.
     #[test]
     fn file_op_audience_filters_by_root_and_asks_each_server_once() {
         let Some(python) = python_for_stub_server() else {
@@ -9648,6 +9721,19 @@ while True:
                 asked,
                 vec![vec![files[0].clone()], vec![files[1].clone()]],
                 "root `a` is asked once, about x.py only; root `b` about y.py"
+            );
+            // A rewrite on disk goes to each server and root once, whatever
+            // its filters, with only the paths under that root.
+            let written = vec![a.join("z.txt"), a.join("x.py"), root.join("c.py")];
+            let told: Vec<Vec<PathBuf>> = state
+                .watched_files_audience(&written)
+                .into_iter()
+                .map(|(_, _, p)| p)
+                .collect();
+            assert_eq!(
+                told,
+                vec![vec![written[0].clone(), written[1].clone()]],
+                "root `a` hears of both once; root `b` of neither"
             );
             state.shutdown_all().await;
         });

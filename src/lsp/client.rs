@@ -596,6 +596,24 @@ impl LspClient {
             .context("did_rename_files")
     }
 
+    /// `workspace/didChangeWatchedFiles` (#610): croft rewrote these closed
+    /// files on disk.
+    pub fn did_change_watched_files(&mut self, uris: &[Url]) -> Result<()> {
+        self.server
+            .notify::<lsp_types::notification::DidChangeWatchedFiles>(
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: uris
+                        .iter()
+                        .map(|uri| lsp_types::FileEvent {
+                            uri: uri.clone(),
+                            typ: lsp_types::FileChangeType::CHANGED,
+                        })
+                        .collect(),
+                },
+            )
+            .context("did_change_watched_files")
+    }
+
     pub async fn completion(
         &mut self,
         uri: Url,

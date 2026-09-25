@@ -50335,6 +50335,112 @@ fn a_second_move_edits_a_file_the_first_move_rewrote() {
     }
 }
 
+/// #610: a rename edit that rewrites a closed file on disk tells the
+/// servers, so the next request is answered for the new text; a file
+/// edited in its open tab is not reported.
+#[test]
+fn a_rename_edit_reports_the_closed_files_it_rewrote() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let root = foo.parent().unwrap().to_path_buf();
+    let open = root.join("open.rs");
+    std::fs::write(&open, "mod foo;\n").unwrap();
+    app.editor.open_pinned(&open).unwrap();
+    let dest = root.join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    let mut answer = mod_foo_to_bar(request_id, &lib);
+    answer.edits.extend(mod_foo_to_bar(request_id, &open).edits);
+    app.lsp.as_ref().unwrap().answer_will_rename_files(answer);
+    assert!(app.drain_will_rename_files());
+    assert_eq!(app.editor.lines[0], "mod bar;", "the open tab took it");
+    assert_eq!(app.lsp.as_ref().unwrap().files_changed_log, vec![vec![lib]]);
+}
+
+/// #610: croft's own write to a closed file after the request went out
+/// (a symbol rename during the wait) is a change during the wait like any
+/// other, so the held edit leaves the file alone and names it.
+#[test]
+fn an_own_write_during_the_wait_is_named() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let dest = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    let mut during = mod_foo_to_bar(request_id, &lib);
+    during.edits[0].1[0].new_text = String::from("qux");
+    app.apply_rename_edits(&during.edits).unwrap();
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), "mod qux;\n");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+    assert!(app.drain_will_rename_files());
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), "mod qux;\n");
+    assert!(
+        app.status.contains("not updated in lib.rs"),
+        "{}",
+        app.status
+    );
+}
+
+/// #610: croft's record of its own write is judged by the file's text, so
+/// another program writing back exactly that text leaves the file taking
+/// the next move's edit.
+#[test]
+fn a_rewrite_with_the_same_text_still_counts_as_croft_s_own() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let root = foo.parent().unwrap().to_path_buf();
+    let dest = root.join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+    assert!(app.drain_will_rename_files());
+    let text = std::fs::read_to_string(&lib).unwrap();
+    std::fs::write(&lib, &text).unwrap();
+    let moved = dest.join("foo.rs");
+    app.apply_paste_or_drop(&root, std::slice::from_ref(&moved), ExplorerClipMode::Cut);
+    let mut back = mod_foo_to_bar(
+        app.pending_file_move.as_ref().expect("held").request_id,
+        &lib,
+    );
+    back.edits[0].1[0].new_text = String::from("baz");
+    app.lsp.as_ref().unwrap().answer_will_rename_files(back);
+    assert!(app.drain_will_rename_files());
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), "mod baz;\n");
+}
+
+/// #610: the record of croft's own writes drops entries the modified time
+/// alone now covers, at the next rename edit and at the next answered move.
+#[test]
+fn old_own_write_records_are_dropped() {
+    let (_tmp, lib, _foo, mut app) = will_rename_fixture();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    app.rename_disk_writes.insert(lib.clone(), (0, long_ago));
+    app.apply_rename_edits(&[]).unwrap();
+    assert!(app.rename_disk_writes.is_empty(), "a rename edit prunes");
+
+    // An empty answer runs no rename edit, so the drain prunes itself.
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let dest = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    app.rename_disk_writes.insert(lib, (0, long_ago));
+    app.lsp.as_ref().unwrap().answer_will_rename_files(
+        crate::lsp::manager::WillRenameFilesResult {
+            request_id,
+            edits: Vec::new(),
+        },
+    );
+    assert!(app.drain_will_rename_files());
+    assert!(app.rename_disk_writes.is_empty(), "an answered move prunes");
+}
+
 /// #610: every file that changed during the wait is named, in the order
 /// the servers listed them.
 #[test]
