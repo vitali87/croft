@@ -246,7 +246,43 @@ struct PendingFileMove {
     /// Each open tab's path and edit counter when the request went out. The
     /// servers answer for that text, so a file typed into during the wait
     /// does not take their edit: its spans would land on shifted text.
-    edit_seqs: Vec<(PathBuf, u64)>,
+    edit_seqs: Vec<TabStamp>,
+}
+
+/// One open text tab when a `willRenameFiles` request went out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabStamp {
+    path: PathBuf,
+    seq: u64,
+    dirty: bool,
+}
+
+/// Whether `path` still holds the text the servers answered for, comparing
+/// its tabs when the request went out (`before`) with its tabs now. Edit
+/// counters are per tab and two tabs can share a value, so the whole sorted
+/// list must match, not each counter on its own. A file with no tab then
+/// was read from disk, so tabs opened since fit while they are clean; a file
+/// whose tabs all closed since fits when none of them held unsaved text.
+fn text_unchanged_since(before: &[TabStamp], now: &[TabStamp], path: &Path) -> bool {
+    let tabs = |set: &[TabStamp]| -> Vec<(u64, bool)> {
+        let mut tabs: Vec<(u64, bool)> = set
+            .iter()
+            .filter(|t| t.path == path)
+            .map(|t| (t.seq, t.dirty))
+            .collect();
+        tabs.sort_unstable();
+        tabs
+    };
+    let (then, now) = (tabs(before), tabs(now));
+    if then.is_empty() {
+        return now.iter().all(|(_, dirty)| !dirty);
+    }
+    if now.is_empty() {
+        return then.iter().all(|(_, dirty)| !dirty);
+    }
+    then.iter()
+        .map(|(seq, _)| seq)
+        .eq(now.iter().map(|(seq, _)| seq))
 }
 
 /// An Explorer rename or move, planned and validated, waiting to be
@@ -45904,12 +45940,20 @@ impl App {
         self.rename_review_boxes_path(old, new);
     }
 
-    /// Every open tab's path and edit counter, in every editor group.
-    fn open_tab_edit_seqs(&self) -> Vec<(PathBuf, u64)> {
+    /// Every open text tab's path, edit counter and dirty flag, in every
+    /// editor group. Diff, hex and log views never take an edit.
+    fn open_tab_edit_seqs(&self) -> Vec<TabStamp> {
         std::iter::once(&self.editor)
             .chain(self.editor_layout.inactive_groups())
             .flat_map(|tabs| tabs.editors.iter())
-            .filter_map(|e| Some((e.path.clone()?, e.edit_seq)))
+            .filter(|e| !e.has_non_text_view())
+            .filter_map(|e| {
+                Some(TabStamp {
+                    path: e.path.clone()?,
+                    seq: e.edit_seq,
+                    dirty: e.dirty,
+                })
+            })
             .collect()
     }
 
@@ -45935,21 +45979,16 @@ impl App {
             return false;
         };
         let now = self.open_tab_edit_seqs();
-        let (edits, stale): (Vec<_>, Vec<_>) = edits.into_iter().partition(|(path, _)| {
-            now.iter()
-                .filter(|(p, _)| p == path)
-                .all(|tab| pending.edit_seqs.contains(tab))
-        });
+        let (edits, stale): (Vec<_>, Vec<_>) = edits
+            .into_iter()
+            .partition(|(path, _)| text_unchanged_since(&pending.edit_seqs, &now, path));
+        // Named before the move, which may carry them to new paths.
+        let stale_names: Vec<String> = stale.iter().map(|(p, _)| self.status_path(p)).collect();
         self.finish_file_move(pending.op, Some(&edits));
-        if !stale.is_empty() {
+        if !stale_names.is_empty() {
             self.status.push_str(&format!(
                 "; not updated in {} (changed during the wait)",
-                stale
-                    .iter()
-                    .filter_map(|(p, _)| p.file_name())
-                    .map(|n| n.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                stale_names.join(", ")
             ));
         }
         true

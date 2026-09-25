@@ -50116,6 +50116,57 @@ fn a_file_edited_during_the_wait_does_not_take_the_held_edit() {
     }
 }
 
+/// #610: a file that was not open when the request went out was read from
+/// disk, so opening it clean during the wait still takes the edit.
+#[test]
+fn a_file_opened_during_the_wait_still_takes_the_held_edit() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let dest = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    app.editor.open_pinned(&lib).unwrap();
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+    assert!(app.drain_will_rename_files());
+    assert_eq!(app.editor.lines[0], "mod bar;");
+    assert!(
+        !app.status.contains("changed during the wait"),
+        "{}",
+        app.status
+    );
+}
+
+/// #610: which files still hold the text the servers answered for. Edit
+/// counters are per tab, so two copies can trade values; tabs opened or
+/// closed during the wait fit only while they hold no unsaved text.
+#[test]
+fn a_held_edit_fits_only_the_text_it_was_computed_for() {
+    let path = Path::new("/w/lib.rs");
+    let tab = |seq, dirty| TabStamp {
+        path: path.to_path_buf(),
+        seq,
+        dirty,
+    };
+    let fits = |before: &[TabStamp], now: &[TabStamp]| text_unchanged_since(before, now, path);
+    assert!(fits(
+        &[tab(1, false), tab(2, true)],
+        &[tab(2, true), tab(1, false)]
+    ));
+    // Copy A (seq 1) typed into once lands on copy B's seq 2.
+    assert!(!fits(
+        &[tab(1, false), tab(2, true)],
+        &[tab(2, true), tab(2, true)]
+    ));
+    assert!(fits(&[], &[tab(1, false)]), "opened clean: the disk text");
+    assert!(!fits(&[], &[tab(3, true)]), "opened and typed into");
+    assert!(fits(&[tab(1, false)], &[]), "closed with nothing unsaved");
+    assert!(!fits(&[tab(4, true)], &[]), "closed with unsaved text");
+    assert!(fits(&[], &[]), "never open: the disk text");
+}
+
 /// #610: Esc stops waiting, the held move goes ahead without an edit, and a
 /// late answer is ignored rather than applied to files that already moved.
 #[test]
