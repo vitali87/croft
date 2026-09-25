@@ -166,6 +166,22 @@ fn is_row_for(line: &str, id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `json` with `id`'s single-line user bindings removed. A row left with
+/// a trailing comma before the closing bracket loses the comma.
+pub fn unbind(json: &str, id: &str) -> String {
+    let mut kept: String = json
+        .split_inclusive('\n')
+        .filter(|l| !is_row_for(l, id))
+        .collect();
+    if let Some(close) = kept.rfind(']') {
+        let at = kept[..close].trim_end().len();
+        if kept[..at].ends_with(',') {
+            kept.remove(at - 1);
+        }
+    }
+    kept
+}
+
 /// `json` with `id`'s single-line user bindings removed and one binding of
 /// `chord` to `id` added at the end of the array; comments and every other
 /// row stay as written. An error when the text has no array to add to.

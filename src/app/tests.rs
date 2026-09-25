@@ -49559,3 +49559,141 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+#[test]
+fn the_shortcuts_editor_records_a_chord_flags_conflicts_and_writes_keybindings_json() {
+    // #612: search a command, record a chord, see the clash, write the file.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("keybindings.json"),
+        "// mine\n[\n  { \"key\": \"ctrl+alt+j\", \"command\": \"quick_open\" }\n]\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = cfg.path().to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::OpenKeyboardShortcuts);
+    assert!(app.shortcuts_editor.is_some(), "the editor opens");
+    for c in "open settings".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let ed = app.shortcuts_editor.as_ref().unwrap();
+    assert_eq!(
+        ed.selected_row().map(|r| r.command),
+        Some(crate::widgets::command_palette::Command::OpenSettings)
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    // The chord Go to File already has.
+    app.handle_key(key(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    let rec = app
+        .shortcuts_editor
+        .as_ref()
+        .unwrap()
+        .recording
+        .clone()
+        .expect("recording");
+    assert_eq!(rec.chord.as_deref(), Some("ctrl+alt+j"));
+    assert_eq!(
+        rec.conflicts,
+        vec![crate::widgets::command_palette::Command::QuickOpen]
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(screen.contains("ctrl+alt+j"), "{screen}");
+    assert!(
+        screen.contains("Go to File"),
+        "the clash is named: {screen}"
+    );
+    // A free chord instead, then Enter writes it.
+    app.handle_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let written = std::fs::read_to_string(cfg.path().join("keybindings.json")).unwrap();
+    assert!(
+        written.starts_with("// mine\n"),
+        "comments survive: {written}"
+    );
+    assert_eq!(
+        crate::shortcuts::user_bindings(&written),
+        vec![
+            ("ctrl+alt+j".to_string(), "quick_open".to_string()),
+            ("ctrl+alt+k".to_string(), "open_settings".to_string())
+        ]
+    );
+    let ed = app
+        .shortcuts_editor
+        .as_ref()
+        .expect("the editor stays open");
+    assert!(ed.recording.is_none());
+    assert_eq!(
+        app.keymap.command_for(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )),
+        Some(crate::widgets::command_palette::Command::OpenSettings),
+        "the new chord works at once"
+    );
+    // Delete removes the selected command's own bindings; Esc closes.
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    let written = std::fs::read_to_string(cfg.path().join("keybindings.json")).unwrap();
+    assert_eq!(
+        crate::shortcuts::user_bindings(&written),
+        vec![("ctrl+alt+j".to_string(), "quick_open".to_string())]
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.shortcuts_editor.is_none());
+}
+
+#[test]
+fn the_shortcuts_editor_refuses_a_bare_key_and_esc_cancels_recording() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = cfg.path().to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::OpenKeyboardShortcuts);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE))
+        .unwrap();
+    let rec = app
+        .shortcuts_editor
+        .as_ref()
+        .unwrap()
+        .recording
+        .clone()
+        .expect("still recording");
+    assert_eq!(rec.chord, None, "plain typing is not a chord");
+    assert!(app.status.contains("modifier"), "{}", app.status);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    let ed = app
+        .shortcuts_editor
+        .as_ref()
+        .expect("Esc ends recording, not the editor");
+    assert!(ed.recording.is_none());
+    assert!(
+        !cfg.path().join("keybindings.json").exists(),
+        "nothing written"
+    );
+}

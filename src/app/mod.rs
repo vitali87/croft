@@ -3484,6 +3484,8 @@ pub struct App {
     /// visual operator deletes/yanks whole lines.
     vim_visual_line: bool,
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
+    /// The Keyboard Shortcuts editor (#612).
+    shortcuts_editor: Option<crate::widgets::shortcuts_editor::ShortcutsEditor>,
     shortcuts_hit_rect: Option<Rect>,
     /// Status-bar clickable-segment hit rects, recorded each render. Empty when
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
@@ -4870,6 +4872,7 @@ impl App {
             vim_last_find: None,
             vim_visual_line: false,
             shortcuts_modal: None,
+            shortcuts_editor: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
             status_indent_rect: Rect::default(),
@@ -16989,6 +16992,7 @@ impl App {
         self.render_input_prompt(frame);
         self.render_list_picker(frame);
         self.render_shortcuts_modal(frame);
+        self.render_shortcuts_editor(frame);
         self.render_connect_dialog(frame);
         // The startup unsupported-terminal nudge renders last so it sits above
         // every other overlay until the user dismisses it.
@@ -18838,6 +18842,10 @@ impl App {
         }
         if self.shortcuts_modal.is_some() {
             self.handle_shortcuts_modal_key(key);
+            return Ok(());
+        }
+        if self.shortcuts_editor.is_some() {
+            self.handle_shortcuts_editor_key(key);
             return Ok(());
         }
         if self.file_finder.is_some() {
@@ -33845,6 +33853,140 @@ impl App {
         }
     }
 
+    fn keybindings_file(&self) -> PathBuf {
+        self.config_dir.join("keybindings.json")
+    }
+
+    /// Open the Keyboard Shortcuts editor (#612).
+    fn open_shortcuts_editor(&mut self) {
+        let json = std::fs::read_to_string(self.keybindings_file()).unwrap_or_default();
+        self.shortcuts_editor = Some(crate::widgets::shortcuts_editor::ShortcutsEditor::new(
+            crate::shortcuts::rows(&json),
+        ));
+    }
+
+    /// Write `json` to keybindings.json and bring the keymap and the
+    /// editor's rows up to date with it.
+    fn write_keybindings(&mut self, json: &str) -> Result<(), String> {
+        let path = self.keybindings_file();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, json).map_err(|e| e.to_string())?;
+        let (map, warns) = crate::keymap::Keymap::load_with_warnings(&path);
+        self.keymap = map;
+        for w in &warns {
+            crate::output::push("Keybindings", crate::output::OutputLevel::Warn, w);
+        }
+        if let Some(ed) = self.shortcuts_editor.as_mut() {
+            ed.rows = crate::shortcuts::rows(json);
+        }
+        Ok(())
+    }
+
+    /// Keys while the Keyboard Shortcuts editor is open (#612): typing
+    /// searches, Enter records a chord for the selected command and Enter
+    /// again saves it, Delete removes that command's own bindings.
+    fn handle_shortcuts_editor_key(&mut self, key: KeyEvent) {
+        use crate::widgets::shortcuts_editor::Recording;
+        let Some(ed) = self.shortcuts_editor.as_mut() else {
+            return;
+        };
+        if let Some(rec) = ed.recording.clone() {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, m) if m.is_empty() => ed.recording = None,
+                (KeyCode::Enter, m) if m.is_empty() => {
+                    let Some(chord) = rec.chord else {
+                        return;
+                    };
+                    let json = std::fs::read_to_string(self.keybindings_file()).unwrap_or_default();
+                    match crate::shortcuts::rebind(&json, rec.command.id(), &chord) {
+                        Ok(new) => match self.write_keybindings(&new) {
+                            Ok(()) => {
+                                if let Some(ed) = self.shortcuts_editor.as_mut() {
+                                    ed.recording = None;
+                                }
+                                self.status = format!("{} is now {chord}", rec.command.title());
+                            }
+                            Err(e) => self.status = format!("keybindings.json: {e}"),
+                        },
+                        Err(e) => self.status = e,
+                    }
+                }
+                _ => match crate::shortcuts::chord_string(key) {
+                    Some(chord) => {
+                        let json =
+                            std::fs::read_to_string(self.keybindings_file()).unwrap_or_default();
+                        let conflicts = crate::shortcuts::conflicts(&json, &chord, rec.command);
+                        if let Some(ed) = self.shortcuts_editor.as_mut() {
+                            ed.recording = Some(Recording {
+                                command: rec.command,
+                                chord: Some(chord),
+                                conflicts,
+                            });
+                        }
+                    }
+                    None => {
+                        self.status = String::from(
+                            "A shortcut needs a modifier (Ctrl, Alt, Cmd) or a function key",
+                        );
+                    }
+                },
+            }
+            return;
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.shortcuts_editor = None,
+            (KeyCode::Up, _) => ed.move_selection(-1),
+            (KeyCode::Down, _) => ed.move_selection(1),
+            (KeyCode::PageUp, _) => ed.move_selection(-10),
+            (KeyCode::PageDown, _) => ed.move_selection(10),
+            (KeyCode::Enter, _) => {
+                if let Some(row) = ed.selected_row() {
+                    ed.recording = Some(Recording {
+                        command: row.command,
+                        chord: None,
+                        conflicts: Vec::new(),
+                    });
+                }
+            }
+            (KeyCode::Delete, _) => {
+                let Some(row) = ed.selected_row().cloned() else {
+                    return;
+                };
+                if row.user.is_empty() {
+                    self.status = format!("{} has no bindings of yours", row.title);
+                    return;
+                }
+                let json = std::fs::read_to_string(self.keybindings_file()).unwrap_or_default();
+                let new = crate::shortcuts::unbind(&json, row.id);
+                self.status = match self.write_keybindings(&new) {
+                    Ok(()) => format!("Removed your bindings for {}", row.title),
+                    Err(e) => format!("keybindings.json: {e}"),
+                };
+            }
+            (KeyCode::Backspace, _) => {
+                let mut q = ed.query.clone();
+                q.pop();
+                ed.set_query(q);
+            }
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                let mut q = ed.query.clone();
+                q.push(c);
+                ed.set_query(q);
+            }
+            _ => {}
+        }
+    }
+
+    fn render_shortcuts_editor(&mut self, frame: &mut ratatui::Frame) {
+        let area = frame.area();
+        let theme = self.theme;
+        if let Some(ed) = self.shortcuts_editor.as_mut() {
+            crate::widgets::shortcuts_editor::render(ed, area, frame.buffer_mut(), theme);
+        }
+    }
+
     fn open_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.is_none() {
             self.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
@@ -36115,6 +36257,7 @@ impl App {
                 .open_config_file_in_editor(crate::prefs::config_path(), ConfigFileSeed::Settings),
             Cmd::OpenWorkspaceSettingsJson => self.open_workspace_settings(false),
             Cmd::OpenWorkspaceSettingsLocalJson => self.open_workspace_settings(true),
+            Cmd::OpenKeyboardShortcuts => self.open_shortcuts_editor(),
             Cmd::OpenKeybindingsJson => self.open_config_file_in_editor(
                 crate::keymap::keybindings_path(),
                 ConfigFileSeed::Keybindings,

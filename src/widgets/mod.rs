@@ -30,6 +30,7 @@ pub mod scm_menu;
 pub mod scrollbar;
 pub mod search;
 pub mod shortcuts;
+pub mod shortcuts_editor;
 pub mod signature_help_popup;
 pub mod source_control;
 pub mod symbol_picker;
