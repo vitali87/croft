@@ -42034,6 +42034,13 @@ impl App {
     }
 
     fn save(&mut self) {
+        self.save_active_tab();
+        // The saved text is every same-file tab's text: settle them now, so
+        // none reads as dirty or as changed on disk before the next tick (#369).
+        self.sync_symbol_views();
+    }
+
+    fn save_active_tab(&mut self) {
         // A hex tab with pending overwrites saves through its own byte
         // path (#173) — never `write_buffer_to_disk`, whose #185 guard
         // refuses every preview kind. Same disk-conflict double-press

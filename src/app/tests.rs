@@ -43163,6 +43163,33 @@ fn saving_the_files_tab_leaves_no_conflict_on_its_symbol_tab() {
     assert_eq!(app.editor.editors[1].lines[4], "    27");
 }
 
+/// #369: Cmd+S in the symbol tab writes the file and leaves both tabs clean,
+/// with no conflict for the file's tab, which holds the same text.
+#[test]
+fn cmd_s_in_a_symbol_tab_saves_the_file_and_cleans_both_tabs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.editors[0].dirty, "the file's tab has the edit");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "fn a() {\n    1\n}\nfn b() {\n    27\n}"
+    );
+    assert!(!app.editor.editors[1].dirty, "the symbol tab is saved");
+    assert!(!app.editor.editors[0].dirty, "so is the file's tab");
+    assert!(
+        !app.reload_open_file_after_external_change(),
+        "the file's tab already holds the saved text"
+    );
+    assert!(app.input_prompt.is_none(), "no reload prompt");
+}
+
 /// #369: every way in opens the same symbol tab.
 ///
 /// `Cmd+K V` takes the symbol at the caret, and an OUTLINE row's right-click
