@@ -10457,7 +10457,8 @@ impl Editor {
     /// Keep a symbol tab's caret, selections and viewport on its symbol's
     /// lines. Positions above the clip snap to its first character, below
     /// it to its last, so every motion that would leave the symbol stops at
-    /// its edge instead.
+    /// its edge instead. Secondary carets outside the clip are dropped
+    /// rather than snapped, and duplicates removed.
     pub fn clamp_to_symbol_view(&mut self) {
         let Some((first, end)) = self.symbol_clip() else {
             return;

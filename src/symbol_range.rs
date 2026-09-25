@@ -241,7 +241,8 @@ pub fn enclosing_symbol(
 /// saw against the text now. One keystroke, paste, undo or reformat of one
 /// region is exactly one span. Several regions changed at once (a
 /// replace-all) collapse into one span covering them all, which may straddle
-/// the symbol; `SymbolView::follow` re-anchors by name when that happens.
+/// the symbol; `SymbolView::follow` re-anchors by name, kind and depth when
+/// that happens.
 ///
 /// Both ends back off to a char boundary so the span never splits a UTF-8
 /// sequence (`é` -> `è` shares its lead byte).
@@ -398,10 +399,10 @@ impl SymbolView {
     ///
     /// The byte arithmetic in `after_edit` handles the common cases. The
     /// outline is consulted only when it has something to say: an edit
-    /// touching the symbol's first line may have renamed it, and a lost
-    /// range (a straddling or multi-region edit) is re-found by name nearest
-    /// its old position. Parsing only then keeps per-keystroke cost to a
-    /// diff.
+    /// touching the heading line may have renamed the symbol, and a lost
+    /// range (a straddling or multi-region edit) is re-found by name, kind
+    /// and depth where it overlaps the old lines carried through the edit.
+    /// Parsing only then keeps per-keystroke cost to a diff.
     pub fn follow(
         &mut self,
         text: String,
@@ -465,6 +466,7 @@ impl SymbolView {
                     {
                         let renamed = self.syntax_name.is_some();
                         self.syntax_name = Some(sym.name.clone());
+                        self.syntax_shape = Some((sym.kind, sym.depth));
                         if renamed {
                             update = ViewUpdate::Renamed(std::mem::replace(
                                 &mut self.name,
@@ -910,6 +912,26 @@ mod tests {
         let mut v = beta_view();
         assert_eq!(v.follow(opened, 2, rust(), there(7, 0)), ViewUpdate::Kept);
         assert_eq!((v.first, v.last), (4, 6));
+    }
+
+    /// Enter at the start of the heading, typed in the symbol's own tab,
+    /// carries the heading down with it: renaming it afterwards still
+    /// retitles the tab.
+    #[test]
+    fn a_line_opened_before_the_heading_carries_it_down() {
+        let mut v = beta_view();
+        let opened = edit(SRC, "\n\nfn beta", "\n\n\nfn beta");
+        let own = Some(Caret {
+            row: 5,
+            col: 0,
+            own: true,
+        });
+        assert_eq!(v.follow(opened.clone(), 2, rust(), own), ViewUpdate::Kept);
+        let renamed = edit(&opened, "fn beta", "fn betamax");
+        assert_eq!(
+            v.follow(renamed, 3, rust(), None),
+            ViewUpdate::Renamed(String::from("beta"))
+        );
     }
 
     /// A lost range does not re-anchor to another symbol that only shares

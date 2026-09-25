@@ -43238,6 +43238,45 @@ fn multi_cursor_commands_stay_in_the_symbol() {
     }
     app.editor.clamp_to_symbol_view();
     assert!(app.editor.carets.is_empty(), "outside carets are dropped");
+    // Two copies of one inside caret, and one on the primary, leave one.
+    let (row, col) = (app.editor.cursor_row, app.editor.cursor_col);
+    for (r, c) in [(4, 0), (4, 0), (row, col)] {
+        app.editor
+            .carets
+            .push(crate::widgets::editor::EditorSelection::new(r, c));
+    }
+    app.editor.clamp_to_symbol_view();
+    assert_eq!(app.editor.carets.len(), 1, "duplicates are removed");
+    app.editor.carets.clear();
+    // Add Selection to Next Match finds no `fn` outside the symbol.
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 0;
+    assert_eq!(app.editor.select_next_occurrence(), 1, "selects the word");
+    assert_eq!(
+        app.editor.select_next_occurrence(),
+        1,
+        "fn a's `fn` is outside"
+    );
+    assert!(app.editor.carets.is_empty());
+}
+
+/// #369: Add Cursor Below in a symbol tab stops at the symbol's last line,
+/// with the rest of the file below it.
+#[test]
+fn add_cursor_below_stops_at_the_symbols_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 1;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    assert_eq!(app.editor.symbol_clip(), Some((0, 3)));
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.editor.add_cursor_below();
+    assert!(app.editor.carets.is_empty(), "fn b is not the tab's");
 }
 
 /// #369: a collaborator's edit is not the symbol tab's own. A line they
