@@ -78,6 +78,7 @@ mod sqlite_view;
 mod svg;
 mod symbol_range;
 mod tasks;
+mod term_suggest;
 mod terminal_session;
 mod termux;
 #[cfg(test)]
