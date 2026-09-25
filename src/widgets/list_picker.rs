@@ -49,6 +49,19 @@ pub enum ListPurpose {
     /// boolean setting (`id` = `toggle:<field>`) or run a follow-up command
     /// (`id` = `cmd:<command_id>`, e.g. open a JSON file or the theme picker).
     Settings,
+    /// Preferences: Open Keyboard Shortcuts (#612): one row per command,
+    /// `id` = `kb:<command id>`; choosing one records its new chord.
+    KeyboardShortcuts,
+    /// Profiles: Switch Profile (#618). `id` is `profile:<name>`,
+    /// `profile:` for the default, or an action (`new`, `workspace`,
+    /// `workspace-clear`).
+    Profiles,
+    /// Review: Submit Review (#366): the verdict, `id` = `COMMENT`,
+    /// `APPROVE` or `REQUEST_CHANGES`.
+    ReviewVerdict,
+    /// Source Control: Export Comments to Pull Request (#368): a `post` row,
+    /// then one row per comment to be posted.
+    ExportComments,
     /// Multiplayer session roster (Session: Participants): the rows are the
     /// clients attached to this session's host; `id` is the participant id.
     /// Enter opens the per-participant action picker.
