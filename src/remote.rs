@@ -676,32 +676,26 @@ fn install_remote_croft_streaming(
     Ok(())
 }
 
-/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
-/// fast path is unavailable (the reason feeds the fallback confirmation);
-/// `Err` = the fast path was attempted and broke.
-fn try_local_cross_install_streaming(
-    ssh: &SshControl,
-    lane: &crate::remote_bulk::BulkLane,
-    source_stamp: &str,
-    log_tx: &std::sync::mpsc::Sender<String>,
-) -> Result<Option<String>> {
+/// Why a local static build for `triple` can't run, or `None` when it can.
+/// Shared by the remote installer and dev containers (#617).
+pub(crate) fn cross_build_unavailable(triple: &str) -> Option<String> {
     if let Some(reason) = cross_compile_unavailable_reason() {
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
+        return Some(reason);
     }
-    let Some(triple) = remote_target_triple(ssh)? else {
-        let reason = String::from("could not detect the remote architecture");
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
-    };
     if !rust_target_installed(triple) {
-        let reason = format!(
+        return Some(format!(
             "rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
-        );
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
+        ));
     }
+    None
+}
 
+/// Cross-build a static croft for `triple` from this checkout and return the
+/// binary's path.
+pub(crate) fn cross_build_static(
+    triple: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<PathBuf> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // This build runs *concurrently* with the live remote session, whose
     // keystrokes are relayed by this same local machine. A default `-j N`
@@ -741,6 +735,36 @@ fn try_local_cross_install_streaming(
             binary.display()
         );
     }
+    Ok(binary)
+}
+
+/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
+/// fast path is unavailable (the reason feeds the fallback confirmation);
+/// `Err` = the fast path was attempted and broke.
+fn try_local_cross_install_streaming(
+    ssh: &SshControl,
+    lane: &crate::remote_bulk::BulkLane,
+    source_stamp: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<Option<String>> {
+    if let Some(reason) = cross_compile_unavailable_reason() {
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    }
+    let Some(triple) = remote_target_triple(ssh)? else {
+        let reason = String::from("could not detect the remote architecture");
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    };
+    if !rust_target_installed(triple) {
+        let reason = format!(
+            "rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
+        );
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    }
+
+    let binary = cross_build_static(triple, log_tx)?;
 
     let mkdir = ssh.background_shell("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
     let mkdir_status =

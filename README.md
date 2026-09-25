@@ -101,6 +101,7 @@ croft ~/projects                 # opens a specific folder
 croft ~/proj --open-file a.rs    # opens a folder with a file already open
 croft ~/proj --open-file a.rs --zen  # ...focused on just the file (no sidebar/terminal)
 croft remote <host>              # launch croft over SSH on a Linux server (host from ~/.ssh/config)
+croft devcontainer [folder]      # open a folder inside its dev container (.devcontainer/devcontainer.json)
 croft attach                     # open the current folder as a persistent session (survives closing the window)
 croft attach ~/projects          # ...for a specific folder
 croft attach --solo ~/projects   # join a shared folder in your own viewport (live co-editing)
@@ -113,6 +114,8 @@ croft --help
 ```
 
 `croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works as-is. See [LINUX.md](docs/LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
+
+`croft devcontainer` builds or pulls the image in `devcontainer.json`, starts the container with the folder mounted, runs `postCreateCommand` once, installs croft into it the same way, and runs it there. It supports `image`, `build`, `mounts`, `forwardPorts`, `postCreateCommand`, `workspaceFolder`, `containerEnv`, `remoteUser` and `runArgs`. The next run reuses the container, and an edited config (or `--rebuild`) replaces it.
 
 ## Collaboration
 

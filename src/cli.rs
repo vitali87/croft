@@ -293,6 +293,18 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         wait: bool,
     },
+    /// Open a workspace inside its dev container (#617).
+    ///
+    /// Reads `.devcontainer/devcontainer.json`, builds or pulls the image,
+    /// starts (or reuses) the container, runs `postCreateCommand` once,
+    /// installs croft into it and runs it there on this terminal.
+    Devcontainer {
+        /// Workspace folder (default: the current directory).
+        path: Option<std::path::PathBuf>,
+        /// Replace the existing container even if the config is unchanged.
+        #[arg(long, default_value_t = false)]
+        rebuild: bool,
+    },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
     /// binaries for (x86_64 / aarch64 musl). After this finishes, the
@@ -504,6 +516,10 @@ impl Cli {
                     std::process::exit(1);
                 }
                 Ok(())
+            }
+            Some(CliCommand::Devcontainer { path, rebuild }) => {
+                let root = path.unwrap_or_else(|| std::path::PathBuf::from("."));
+                crate::devcontainer::up_and_attach(&root, rebuild)
             }
             Some(CliCommand::Pair {
                 workspace,
