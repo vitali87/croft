@@ -3499,8 +3499,9 @@ pub struct App {
     /// hash of the text written and when: a move right after one that
     /// rewrote the same file at the same path finds its fresh modified time
     /// is croft's own write, not a change during the wait (#610). Entries
-    /// older than [`MTIME_GRANULARITY`] are dropped at the next rename edit
-    /// or answered move, since the modified time alone covers them then.
+    /// older than [`MTIME_GRANULARITY`] (measured to a held move's request)
+    /// are dropped at the next rename edit or answered move, since the
+    /// modified time alone covers them then.
     rename_disk_writes: std::collections::HashMap<PathBuf, (u64, std::time::SystemTime)>,
     /// In-flight prepareRename (#254): (id, path, row, col, edit_seq) —
     /// the deferred rename prompt's context.
@@ -11750,8 +11751,9 @@ impl App {
         let mut file_count = 0;
         let mut occ_count = 0;
         self.prune_rename_disk_writes();
-        // Closed files written on disk below, which the servers learn of
-        // before any later request (#610).
+        // Closed files written on disk below, sent to the servers ahead of
+        // any later request (#610). croft declares no watched-files
+        // capability, so the notification is unsolicited.
         let mut rewritten = Vec::new();
         let mut failed = None;
         for (path, edits) in files {
@@ -11829,12 +11831,19 @@ impl App {
     }
 
     /// Drop [`Self::rename_disk_writes`] entries old enough that the file's
-    /// modified time alone places them before any request made from now on.
+    /// modified time alone places them before any request still to be
+    /// judged: a held move's, or any made from now on.
     fn prune_rename_disk_writes(&mut self) {
         let now = std::time::SystemTime::now();
+        let horizon = self
+            .pending_file_move
+            .as_ref()
+            .map_or(now, |p| p.requested_at.min(now));
         self.rename_disk_writes.retain(|_, (_, at)| {
-            now.duration_since(*at)
-                .is_ok_and(|age| age < MTIME_GRANULARITY)
+            horizon
+                .duration_since(*at)
+                .ok()
+                .is_none_or(|age| age < MTIME_GRANULARITY)
         });
     }
 

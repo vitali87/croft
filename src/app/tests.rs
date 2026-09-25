@@ -50414,6 +50414,55 @@ fn a_rewrite_with_the_same_text_still_counts_as_croft_s_own() {
     assert_eq!(std::fs::read_to_string(&lib).unwrap(), "mod baz;\n");
 }
 
+/// #610: a rename edit during a held move keeps the record of croft's own
+/// earlier write that the held move still needs: older than the margin now,
+/// but not at the moment of its request.
+#[test]
+fn a_record_a_held_move_needs_outlives_a_rename_edit_during_the_wait() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let root = foo.parent().unwrap().to_path_buf();
+    let dest = root.join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+    assert!(app.drain_will_rename_files());
+    let moved = dest.join("foo.rs");
+    app.apply_paste_or_drop(&root, std::slice::from_ref(&moved), ExplorerClipMode::Cut);
+    // Requested a second ago; croft's write came 1.5s before that.
+    let now = std::time::SystemTime::now();
+    let requested_at = now - std::time::Duration::from_secs(1);
+    let written_at = now - std::time::Duration::from_millis(2500);
+    let pending = app.pending_file_move.as_mut().expect("held");
+    pending.requested_at = requested_at;
+    let request_id = pending.request_id;
+    set_mtime(&lib, written_at);
+    app.rename_disk_writes.get_mut(&lib).expect("recorded").1 = written_at;
+    app.apply_rename_edits(&[]).unwrap();
+    let mut back = mod_foo_to_bar(request_id, &lib);
+    back.edits[0].1[0].new_text = String::from("baz");
+    app.lsp.as_ref().unwrap().answer_will_rename_files(back);
+    assert!(app.drain_will_rename_files());
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), "mod baz;\n");
+    assert!(!app.status.contains("not updated"), "{}", app.status);
+}
+
+/// #610: a rename edit that fails partway still reports the closed files
+/// it rewrote before the failure.
+#[test]
+fn a_rename_edit_failing_partway_reports_what_it_wrote() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let missing = foo.parent().unwrap().join("missing.rs");
+    let mut edits = mod_foo_to_bar(0, &lib).edits;
+    edits.extend(mod_foo_to_bar(0, &missing).edits);
+    assert!(app.apply_rename_edits(&edits).is_err());
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), "mod bar;\n");
+    assert_eq!(app.lsp.as_ref().unwrap().files_changed_log, vec![vec![lib]]);
+}
+
 /// #610: the record of croft's own writes drops entries the modified time
 /// alone now covers, at the next rename edit and at the next answered move.
 #[test]
