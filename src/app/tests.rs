@@ -43190,6 +43190,57 @@ fn cmd_s_in_a_symbol_tab_saves_the_file_and_cleans_both_tabs() {
     assert!(app.input_prompt.is_none(), "no reload prompt");
 }
 
+/// #369: auto save writes a file with a symbol tab once. Both tabs hold the
+/// edit and are due together; writing the second would read the first
+/// write as an external change and raise a conflict prompt.
+#[test]
+fn auto_save_writes_a_file_with_a_symbol_tab_once_and_cleans_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.auto_save = true;
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    for e in app.editor.editors.iter_mut() {
+        assert!(e.dirty, "fixture: both tabs hold the edit");
+        e.last_edit_at = Some(past);
+    }
+    assert!(app.tick_auto_save());
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "fn a() {\n    1\n}\nfn b() {\n    27\n}"
+    );
+    for e in &app.editor.editors {
+        assert!(!e.dirty && !e.disk_conflict, "both tabs are saved");
+    }
+    assert!(app.input_prompt.is_none(), "no conflict prompt");
+    assert!(!app.reload_open_file_after_external_change());
+}
+
+/// #369: a format-on-save write lands after `save` returned, so it settles
+/// the file's other tab itself rather than leaving it dirty.
+#[test]
+fn a_deferred_format_on_save_write_cleans_the_symbol_tabs_sibling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    app.save_after_format = Some(file.clone());
+    app.complete_pending_save();
+    assert!(std::fs::read_to_string(&file).unwrap().contains("27"));
+    assert!(!app.editor.editors[1].dirty, "the symbol tab is saved");
+    assert!(!app.editor.editors[0].dirty, "so is the file's tab");
+    assert!(!app.reload_open_file_after_external_change());
+}
+
 /// #369: every way in opens the same symbol tab.
 ///
 /// `Cmd+K V` takes the symbol at the caret, and an OUTLINE row's right-click

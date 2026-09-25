@@ -41610,9 +41610,11 @@ impl App {
         // active — which wrote an unrequested file and left this one dirty.
         if self.editor.path.as_deref() == Some(path.as_path()) {
             self.write_current_to_disk();
-            return;
+        } else {
+            self.write_tab_to_disk(&path);
         }
-        self.write_tab_to_disk(&path);
+        // As in `save`: the file's other tabs hold the text just written.
+        self.sync_symbol_views();
     }
 
     /// Flip `editor.formatOnSave`, persist it, and report the new state.
@@ -41702,6 +41704,17 @@ impl App {
         // "name (encoding)" per refused tab: the refusal message names each
         // tab's OWN encoding, which need not be the active tab's.
         let mut lossy: Vec<String> = Vec::new();
+        // The tabs of a file with a symbol tab mirror each other (#369), so
+        // they hold one text: the first write saves them all, and writing a
+        // second would read the first as an external change. Settle them
+        // before the sweep and mark the rest clean after it.
+        self.sync_symbol_views();
+        let mirrored: Vec<PathBuf> = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| e.symbol_view.is_some())
+            .filter_map(|e| e.path.clone())
+            .collect();
         let mut sweep = |editors: &mut [crate::widgets::editor::Editor], skip: Option<usize>| {
             for (i, e) in editors
                 .iter_mut()
@@ -41709,6 +41722,11 @@ impl App {
                 .filter(|(i, e)| Some(*i) != skip && due(e))
             {
                 let _ = i;
+                if e.path.as_ref().is_some_and(|p| {
+                    mirrored.contains(p) && saved_paths.iter().any(|(q, ..)| q == p)
+                }) {
+                    continue;
+                }
                 // `save_to_disk` re-checks the disk and flags (never
                 // overwrites) an external change; auto save must not
                 // arm the force-overwrite path an explicit Cmd+S offers.
@@ -41749,6 +41767,9 @@ impl App {
         sweep(&mut self.editor.editors, keep_focused);
         for group in self.editor_layout.inactive_groups_mut() {
             sweep(&mut group.editors, None);
+        }
+        if !saved_paths.is_empty() {
+            self.sync_symbol_views();
         }
         let had_conflicts = !conflicted.is_empty();
         if had_conflicts {
@@ -42036,10 +42057,14 @@ impl App {
     fn save(&mut self) {
         self.save_active_tab();
         // The saved text is every same-file tab's text: settle them now, so
-        // none reads as dirty or as changed on disk before the next tick (#369).
+        // none reads as dirty or as changed on disk before the next tick
+        // (#369). A format-on-save write lands later and settles them in
+        // `complete_pending_save`.
         self.sync_symbol_views();
     }
 
+    /// Save only the active tab; its same-file siblings are left as they
+    /// are. Callers go through [`Self::save`].
     fn save_active_tab(&mut self) {
         // A hex tab with pending overwrites saves through its own byte
         // path (#173) — never `write_buffer_to_disk`, whose #185 guard
