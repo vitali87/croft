@@ -57,6 +57,10 @@ pub const ACTIVITY_EXTENSIONS: char = '\u{eae6}';
 /// entry. Verified 2026-06-30 against the upstream codicon `mapping.json`:
 /// `beaker` is decimal 60025 (U+EA79).
 pub const ACTIVITY_TESTING: char = '\u{ea79}';
+/// CodeQL (#578). No codicon draws "QL", and the image path rasterises
+/// `assets/icons/ql.svg`; the glyph fallback is the letter itself.
+#[allow(dead_code)] // drawn once the activity bar gains the icon
+pub const ACTIVITY_CODEQL: char = 'Q';
 /// Codicon `replace-all` — the two-line "find & replace, all" glyph VS Code
 /// shows beside the Replace input in its Search sidebar. Verified on
 /// 2026-06-19 against the upstream codicon `mapping.json`: replace-all is

@@ -132,6 +132,7 @@ fn rgb(c: (u8, u8, u8)) -> Color {
 fn chip_for(id: &str) -> Option<(char, Color)> {
     let (glyph, c) = match id {
         "pdf" => ('\u{f1c1}', (0xe5, 0x25, 0x2a)), // fa-file_pdf, red
+        "codeql" => ('Q', (0x21, 0x88, 0xff)),     // the QL mark, GitHub blue
         "csv" => ('\u{eefc}', (0x21, 0xa3, 0x66)), // fa-file_csv, green
         "vim" => ('\u{e62b}', (0x01, 0x97, 0x33)), // custom-vim, green
         "lsp-python" => ('\u{e73c}', (0x37, 0x76, 0xab)), // dev-python, blue
