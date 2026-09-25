@@ -29,6 +29,7 @@ pub mod run_debug;
 pub mod scm_menu;
 pub mod scrollbar;
 pub mod search;
+pub mod settings_editor;
 pub mod shortcuts;
 pub mod signature_help_popup;
 pub mod source_control;
