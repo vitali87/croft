@@ -224,14 +224,14 @@ impl Notes {
         }
     }
 
-    /// Write the notes, dropping tombstones (a restart has no peer to
-    /// out-vote).
+    /// Write every note, tombstones included: a guest that reconnects after
+    /// a restart still holds its copy of a deleted note, and only the
+    /// tombstone stops that copy bringing the note back.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let live: Vec<&Note> = self.live().collect();
-        std::fs::write(path, serde_json::to_string(&live).unwrap_or_default())
+        std::fs::write(path, serde_json::to_string(&self.notes).unwrap_or_default())
     }
 }
 
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn notes_persist_without_tombstones() {
+    fn a_deleted_note_stays_deleted_across_a_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let path = Notes::store_path(tmp.path(), Path::new("/w"));
         let mut n = Notes::default();
@@ -296,9 +296,13 @@ mod tests {
         let drop = n.add("ada", "a.rs", 1, "y", "drop");
         n.update(&drop.id, |d| d.deleted = true);
         n.save(&path).unwrap();
-        let back = Notes::load(&path);
+        let mut back = Notes::load(&path);
         assert_eq!(back.live().count(), 1);
         assert_eq!(back.get(&keep.id).map(|k| k.body.as_str()), Some("keep"));
+        // A guest's stale copy from before the delete, arriving after the
+        // restart, must not bring it back.
+        back.merge(drop.clone());
+        assert!(back.get(&drop.id).is_none());
     }
 
     #[test]

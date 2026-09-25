@@ -3168,6 +3168,12 @@ impl Editor {
                     self.breakpoint_logs.remove(&path);
                 }
             }
+            if let Some(hits) = self.breakpoint_hit_conditions.get_mut(&path) {
+                hits.remove(&line);
+                if hits.is_empty() {
+                    self.breakpoint_hit_conditions.remove(&path);
+                }
+            }
             false
         } else {
             set.insert(line);
@@ -16498,6 +16504,25 @@ mod tests {
         assert_eq!(
             specs[0].condition, None,
             "a re-added breakpoint must be unconditional"
+        );
+    }
+
+    #[test]
+    fn removing_a_breakpoint_drops_its_hit_condition() {
+        let mut e = Editor::new();
+        let p = PathBuf::from("/x/a.py");
+        e.path = Some(p.clone());
+        e.lines = vec!["a".into(), "b".into()];
+        e.toggle_breakpoint_line(1);
+        e.breakpoint_hit_conditions
+            .entry(p.clone())
+            .or_default()
+            .insert(1, String::from(">= 5"));
+        e.toggle_breakpoint_line(1);
+        e.toggle_breakpoint_line(1);
+        assert!(
+            !e.breakpoint_hit_conditions.contains_key(&p),
+            "a fresh breakpoint on the line must not inherit the old hit count"
         );
     }
 

@@ -375,6 +375,19 @@ impl Prefs {
         serde_json::from_str(&json).context("parsing prefs")
     }
 
+    /// The preferences a read-modify-write starts from: defaults only when
+    /// the file does not exist. A file that exists but can't be read or
+    /// parsed is an error, so saving one toggle never replaces the user's
+    /// other settings with defaults.
+    pub fn load_for_update(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(json) => serde_json::from_str(&crate::tasks::strip_jsonc(&json))
+                .with_context(|| format!("parsing {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -397,7 +410,7 @@ impl Prefs {
 /// stored. Best-effort: a write failure is swallowed by the caller.
 pub fn save_theme(theme: Theme) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.set_theme(theme);
     prefs.save(&path)
 }
@@ -406,7 +419,7 @@ pub fn save_theme(theme: Theme) -> Result<()> {
 /// Best-effort: a write failure is swallowed by the caller.
 pub fn save_osk_split(split: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.osk_split = split;
     prefs.save(&path)
 }
@@ -415,7 +428,7 @@ pub fn save_osk_split(split: bool) -> Result<()> {
 /// other settings. Best-effort: a write failure is swallowed by the caller.
 pub fn save_suppress_terminal_warning(suppress: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.suppress_terminal_warning = suppress;
     prefs.save(&path)
 }
@@ -424,7 +437,7 @@ pub fn save_suppress_terminal_warning(suppress: bool) -> Result<()> {
 /// Best-effort: a write failure is swallowed by the caller.
 pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.explorer_views = views;
     prefs.save(&path)
 }
@@ -433,7 +446,7 @@ pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
 /// Best-effort: a write failure is swallowed by the caller.
 pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String>) -> Result<()> {
     let path = config_dir.join("config.json");
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disabled_extensions = disabled.clone();
     prefs.save(&path)
 }
@@ -443,7 +456,7 @@ pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String
 /// of mutating the process-wide environment (which races sibling tests).
 pub fn save_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
     let path = config_dir.join("config.json");
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.mcp_consented.insert(ext_id.to_string());
     prefs.save(&path)
 }
@@ -452,7 +465,7 @@ pub fn save_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
 /// [`save_mcp_consent_in`] for why the dir is a parameter.
 pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
     let path = config_dir.join("config.json");
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     if !prefs.mcp_consented.remove(ext_id) {
         return Ok(());
     }
@@ -466,7 +479,11 @@ pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
 /// different one was recorded before, meaning the tool definition changed.
 pub fn trust_mcp_tool_in(config_dir: &Path, command_id: &str, fingerprint: &str) -> bool {
     let path = config_dir.join("config.json");
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    // An unreadable config can't vouch for a fingerprint, and saving over
+    // it would lose every other setting: refuse the call instead.
+    let Ok(mut prefs) = Prefs::load_for_update(&path) else {
+        return false;
+    };
     match prefs.mcp_tool_fingerprints.get(command_id) {
         Some(prev) => prev == fingerprint,
         None => {
@@ -483,7 +500,7 @@ pub fn trust_mcp_tool_in(config_dir: &Path, command_id: &str, fingerprint: &str)
 /// trusted afresh on its next run; see [`trust_mcp_tool_in`].
 pub fn forget_mcp_tool_fingerprints_in(config_dir: &Path, command_ids: &[String]) -> Result<()> {
     let path = config_dir.join("config.json");
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     let before = prefs.mcp_tool_fingerprints.len();
     prefs
         .mcp_tool_fingerprints
@@ -498,7 +515,7 @@ pub fn forget_mcp_tool_fingerprints_in(config_dir: &Path, command_ids: &[String]
 /// Best-effort: a write failure is swallowed by the caller.
 pub fn save_layout(layout: LayoutPrefs) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.layout = layout;
     prefs.save(&path)
 }
@@ -508,7 +525,7 @@ pub fn save_layout(layout: LayoutPrefs) -> Result<()> {
 /// Best-effort: a write failure is swallowed by the caller.
 pub fn save_auto_close_pairs(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disable_auto_close_pairs = !enabled;
     prefs.save(&path)
 }
@@ -516,7 +533,7 @@ pub fn save_auto_close_pairs(enabled: bool) -> Result<()> {
 /// Persist the screen reader choice, preserving other settings.
 pub fn save_screen_reader(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.screen_reader = enabled;
     prefs.save(&path)
 }
@@ -525,7 +542,7 @@ pub fn save_screen_reader(enabled: bool) -> Result<()> {
 /// Best-effort: a write failure is swallowed by the caller.
 pub fn save_format_on_type(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.format_on_type = enabled;
     prefs.save(&path)
 }
@@ -534,7 +551,7 @@ pub fn save_format_on_type(enabled: bool) -> Result<()> {
 /// a write failure is swallowed by the caller.
 pub fn save_format_on_save(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.format_on_save = enabled;
     prefs.save(&path)
 }
@@ -563,7 +580,7 @@ pub fn save_disable_log_highlight(disabled: bool) -> Result<()> {
 
 pub fn save_copy_on_select(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.copy_on_select = enabled;
     prefs.save(&path)
 }
@@ -583,7 +600,7 @@ pub fn terminal_scrollback_lines(configured: usize, default: usize) -> usize {
 /// a write failure is swallowed by the caller.
 pub fn save_auto_save(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.auto_save = enabled;
     prefs.save(&path)
 }
@@ -592,7 +609,7 @@ pub fn save_auto_save(enabled: bool) -> Result<()> {
 /// settings. Best-effort, like [`save_auto_save`].
 pub fn save_auto_save_on_focus_change(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.auto_save_on_focus_change = enabled;
     prefs.save(&path)
 }
@@ -655,7 +672,7 @@ pub fn save_problems_scope(mode: &str) -> Result<()> {
 
 pub fn save_inline_blame(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disable_inline_blame = !enabled;
     prefs.save(&path)
 }
@@ -663,7 +680,7 @@ pub fn save_inline_blame(enabled: bool) -> Result<()> {
 /// Persist the debugger inline-values toggle (stored as its disable flag).
 pub fn save_inline_values(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disable_inline_values = !enabled;
     prefs.save(&path)
 }
@@ -671,7 +688,7 @@ pub fn save_inline_values(enabled: bool) -> Result<()> {
 /// Persist the whitespace rendering mode ("selection" / "all" / "none").
 pub fn save_render_whitespace(mode: &str) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.render_whitespace = mode.to_string();
     prefs.save(&path)
 }
@@ -679,7 +696,7 @@ pub fn save_render_whitespace(mode: &str) -> Result<()> {
 /// Persist the bracket-pair colorization toggle (stored as its disable flag).
 pub fn save_bracket_colors(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disable_bracket_colors = !enabled;
     prefs.save(&path)
 }
@@ -687,21 +704,21 @@ pub fn save_bracket_colors(enabled: bool) -> Result<()> {
 /// Persist the indentation-guides toggle (stored as its disable flag).
 pub fn save_indent_guides(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disable_indent_guides = !enabled;
     prefs.save(&path)
 }
 
 pub fn save_inlay_hints(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disable_inlay_hints = !enabled;
     prefs.save(&path)
 }
 
 pub fn save_proactive_navigator(enabled: bool) -> Result<()> {
     let path = config_path();
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disable_proactive_navigator = !enabled;
     prefs.save(&path)
 }
@@ -1070,5 +1087,22 @@ mod tests {
             "unrelated settings survive the toggle"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_one_setting_never_replaces_an_unreadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "{ \"theme\": ").unwrap();
+        assert!(Prefs::load_for_update(&path).is_err());
+        assert!(
+            Prefs::load_for_update(&tmp.path().join("absent.json")).is_ok(),
+            "a missing file starts from defaults"
+        );
+        std::fs::write(&path, "{\n  // a comment\n  \"format_on_save\": true,\n}").unwrap();
+        assert!(
+            Prefs::load_for_update(&path).unwrap().format_on_save,
+            "JSONC reads"
+        );
     }
 }

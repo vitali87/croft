@@ -315,6 +315,10 @@ pub enum CliCommand {
         /// Block until the file's tab is closed.
         #[arg(long, default_value_t = false)]
         wait: bool,
+        /// Running as git's sequence editor: defer to `sequence.editor`
+        /// when the repository's git config names one.
+        #[arg(long, default_value_t = false, hide = true)]
+        sequence_editor: bool,
     },
     /// Print a JSON template for translating croft's UI into `lang` (#621).
     ///
@@ -554,7 +558,21 @@ impl Cli {
                 }
                 Ok(())
             }
-            Some(CliCommand::Edit { path, wait }) => {
+            Some(CliCommand::Edit {
+                path,
+                wait,
+                sequence_editor,
+            }) => {
+                if sequence_editor && let Some(configured) = configured_sequence_editor() {
+                    // Exactly how git itself runs an editor value.
+                    let status = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("{configured} \"$@\""))
+                        .arg(configured.as_str())
+                        .arg(&path)
+                        .status();
+                    std::process::exit(status.ok().and_then(|s| s.code()).unwrap_or(1));
+                }
                 if let Err(e) = crate::view_ipc::edit(&path, wait, &crate::app::croft_cache_dir()) {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -725,6 +743,18 @@ impl Cli {
             }
         }
     }
+}
+
+/// The user's own `sequence.editor` for the repository git is running in,
+/// if they set one (#620).
+fn configured_sequence_editor() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", "sequence.editor"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !value.is_empty()).then_some(value)
 }
 
 /// `croft open-link` (#359): check the link, then become the `croft remote`

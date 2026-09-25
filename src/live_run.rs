@@ -294,7 +294,7 @@ pub struct Done {
     pub outcome: Result<Report, String>,
 }
 
-/// The background runner: one thread, newest job wins.
+/// The background runner: one thread, newest job per file wins.
 pub struct Runner {
     tx: Sender<Job>,
     rx: Receiver<Done>,
@@ -307,11 +307,22 @@ impl Runner {
         std::thread::Builder::new()
             .name("croft-live-run".into())
             .spawn(move || {
-                while let Ok(mut job) = job_rx.recv() {
-                    // Typing outpaces runs: only the newest buffer matters.
-                    while let Ok(newer) = job_rx.try_recv() {
-                        job = newer;
+                // Typing outpaces runs: only the newest buffer of each file
+                // matters, but every armed file with a pending job still runs
+                // (the app won't resubmit a file whose text it already sent).
+                let mut pending: Vec<Job> = Vec::new();
+                loop {
+                    if pending.is_empty() {
+                        match job_rx.recv() {
+                            Ok(job) => pending.push(job),
+                            Err(_) => return,
+                        }
                     }
+                    while let Ok(newer) = job_rx.try_recv() {
+                        pending.retain(|j| j.path != newer.path);
+                        pending.push(newer);
+                    }
+                    let job = pending.remove(0);
                     let outcome = run(&job);
                     let done = Done {
                         path: job.path,

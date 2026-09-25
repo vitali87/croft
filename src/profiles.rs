@@ -160,9 +160,19 @@ pub fn set_workspace_default(root: &Path, name: Option<&str>) -> std::io::Result
     let path = workspace_choice_path(root);
     match name {
         Some(n) => {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
+            // A cloned repo controls `.croft/`: a symlinked `.croft` or
+            // `profile` would turn this write into truncating whatever file
+            // it points at. Write only to a plain file inside the workspace.
+            let dir = path.parent().unwrap_or(root);
+            if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink())
+                || std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} is a symlink; not writing through it", path.display()),
+                ));
             }
+            std::fs::create_dir_all(dir)?;
             std::fs::write(&path, format!("{n}\n"))
         }
         None => match std::fs::remove_file(&path) {
@@ -221,6 +231,24 @@ mod tests {
         set_workspace_default(tmp.path(), None).unwrap();
         assert!(!workspace_choice_path(tmp.path()).exists());
         set_workspace_default(tmp.path(), None).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_workspace_choice_is_never_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "keep me").unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".croft")).unwrap();
+        std::os::unix::fs::symlink(&victim, workspace_choice_path(&ws)).unwrap();
+        assert!(set_workspace_default(&ws, Some("Python")).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+
+        let ws2 = tmp.path().join("ws2");
+        std::fs::create_dir(&ws2).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), ws2.join(".croft")).unwrap();
+        assert!(set_workspace_default(&ws2, Some("Python")).is_err());
     }
 
     #[test]

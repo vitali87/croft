@@ -1324,7 +1324,9 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     // `git rebase -i` opens its plan in this croft (#620), unless the user
-    // chose their own sequence editor, which always wins.
+    // chose their own sequence editor, which always wins: an exported
+    // GIT_SEQUENCE_EDITOR here, or `sequence.editor` in git config, which
+    // `croft edit --sequence-editor` looks up in the rebasing repo itself.
     if view_sock.is_some()
         && std::env::var_os("GIT_SEQUENCE_EDITOR").is_none()
         && let Ok(exe) = std::env::current_exe()
@@ -1349,7 +1351,7 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
 /// through the shell, so the binary's path is single-quoted.
 pub(crate) fn sequence_editor_command(exe: &std::path::Path) -> String {
     let quoted = exe.to_string_lossy().replace('\'', r"'\''");
-    format!("'{quoted}' edit --wait")
+    format!("'{quoted}' edit --wait --sequence-editor")
 }
 
 impl PtyTerminal {

@@ -466,8 +466,12 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
             let id = docker_out(&refs)?;
             for argv in &dc.post_create {
                 step(&format!("postCreateCommand: {}", argv.join(" ")));
-                let status = docker(&exec_args(&dc, &id, argv, false))?;
-                if !status.success() {
+                let ok = docker(&exec_args(&dc, &id, argv, false));
+                if !matches!(&ok, Ok(status) if status.success()) {
+                    // A half-set-up container carries the current config hash,
+                    // so the next run would reuse it and skip setup: remove it.
+                    let _ = docker_out(&["rm", "-f", &id]);
+                    let status = ok?;
                     bail!("postCreateCommand exited with {status}");
                 }
             }

@@ -754,6 +754,13 @@ struct Renderer<'r> {
     /// runnable check (#353).
     code_info: String,
     code_lines: (usize, usize),
+    /// The source line of the open block's first code line (#619): after a
+    /// fence's opener, or the block's own first line when indented.
+    code_first: usize,
+    /// `(source line, built row)` of every code line (#619). Exact anchors
+    /// inside a block, so interpolation never runs across the captured
+    /// output rows a run adds under it.
+    code_anchors: Vec<(usize, usize)>,
     runnables: Vec<MdRunnable>,
     /// Captured runs to show under their fences (#354). Empty for a
     /// document nothing has been run from, which is the common case.
@@ -900,6 +907,8 @@ impl Renderer<'_> {
                 Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi, code_fg)),
                 _ => spans.push(Span::styled(line.to_string(), Style::default().fg(code_fg))),
             }
+            self.code_anchors
+                .push((self.code_first + i, self.out.len()));
             self.out.push(Line::from(spans));
         }
         if let Some(r) = runnable {
@@ -1095,6 +1104,8 @@ pub fn render_markdown_mapped(
         code_block: None,
         code_info: String::new(),
         code_lines: (0, 0),
+        code_first: 0,
+        code_anchors: Vec::new(),
         runnables: Vec::new(),
         outputs,
         table: None,
@@ -1153,6 +1164,8 @@ pub fn render_markdown_mapped(
                         line_of(range.start),
                         line_of(range.end.saturating_sub(1)) + 1,
                     );
+                    r.code_first =
+                        r.code_lines.0 + usize::from(matches!(kind, CodeBlockKind::Fenced(_)));
                     r.code_block = Some((lang, String::new()));
                 }
                 Tag::List(start) => {
@@ -1349,6 +1362,8 @@ pub fn render_markdown_mapped(
         .map(|i| i.first_line + i.rows as usize)
         .max()
         .unwrap_or(0);
+    source_map.append(&mut r.code_anchors);
+    source_map.sort_unstable();
     let mut removed_front = 0usize;
     // Runnables are anchored to a row exactly as images are, so the guard
     // and the shift below have to cover both. They did not: a runnable's
@@ -1488,6 +1503,31 @@ mod tests {
                 line_text(&lines[built])
             );
             assert_eq!(source_line_for_built(&map, built), Some(src), "and back");
+        }
+    }
+
+    #[test]
+    fn a_line_inside_a_run_fence_maps_to_its_code_not_the_output_box() {
+        let md = "```sh\necho a\necho b\necho c\n```\n\nafter\n";
+        let mut outputs = BlockOutputs::new();
+        outputs.insert(
+            0,
+            BlockOutput {
+                text: (1..=10).map(|i| format!("out{i}\n")).collect(),
+                exit: Some(0),
+                timed_out: false,
+            },
+        );
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, outputs);
+        for (src, needle) in [(1, "echo a"), (2, "echo b"), (3, "echo c"), (6, "after")] {
+            let built = built_line_for_source(&map, src).expect("mapped");
+            assert!(
+                line_text(&lines[built]).contains(needle),
+                "source line {src} should land on {needle:?}, got {:?}",
+                line_text(&lines[built])
+            );
         }
     }
 

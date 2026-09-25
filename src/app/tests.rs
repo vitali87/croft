@@ -50274,7 +50274,7 @@ fn the_sequence_editor_command_quotes_the_binary_path() {
         crate::widgets::terminal::sequence_editor_command(std::path::Path::new(
             "/opt/my croft/croft"
         )),
-        "'/opt/my croft/croft' edit --wait"
+        "'/opt/my croft/croft' edit --wait --sequence-editor"
     );
 }
 

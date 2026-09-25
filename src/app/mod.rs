@@ -28072,27 +28072,43 @@ impl App {
         // Resolution and the node id Resolve needs live only in GraphQL.
         // Best effort: without it every thread reads as unresolved, the safe
         // default, and Resolve says why it can't act.
-        let states = std::process::Command::new(&self.review_gh)
-            .args([
-                "api",
-                "graphql",
-                "-F",
-                "owner={owner}",
-                "-F",
-                "repo={repo}",
-                "-F",
-                &format!("number={number}"),
-                "-f",
-                &format!("query={}", crate::review_threads::THREADS_QUERY),
-            ])
-            .current_dir(&root)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| {
-                crate::review_threads::parse_thread_states(&String::from_utf8_lossy(&o.stdout))
-            })
-            .unwrap_or_default();
+        // Every page: a PR past 100 threads would otherwise show the rest
+        // as unresolved and leave them without the id Resolve needs.
+        let mut states = std::collections::HashMap::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut args = vec![
+                String::from("api"),
+                String::from("graphql"),
+                String::from("-F"),
+                String::from("owner={owner}"),
+                String::from("-F"),
+                String::from("repo={repo}"),
+                String::from("-F"),
+                format!("number={number}"),
+                String::from("-f"),
+                format!("query={}", crate::review_threads::THREADS_QUERY),
+            ];
+            if let Some(cursor) = &after {
+                args.push(String::from("-f"));
+                args.push(format!("after={cursor}"));
+            }
+            let Some(page) = std::process::Command::new(&self.review_gh)
+                .args(&args)
+                .current_dir(&root)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            else {
+                break;
+            };
+            states.extend(crate::review_threads::parse_thread_states(&page));
+            match crate::review_threads::next_page(&page) {
+                Some(cursor) if after.as_deref() != Some(cursor.as_str()) => after = Some(cursor),
+                _ => break,
+            }
+        }
         for t in &mut threads {
             if let Some((node, resolved)) = states.get(&t.id) {
                 t.resolved = *resolved;

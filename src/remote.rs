@@ -1161,6 +1161,15 @@ fn run_pump(
         // Two local windows attached to one session tail the same log. The
         // first to claim a request handles it; without this every window
         // ran every open, forward and pull, one browser tab each (#648).
+        //
+        // A pull names a file on ONE computer: when two computers are
+        // attached, only the one that has it may claim it, or the other
+        // would claim it, fail, and leave the file's owner nothing to do.
+        if let Some(RelayRequest::Pull { src, .. }) = &request
+            && !Path::new(src).exists()
+        {
+            continue;
+        }
         if let Some(id) = request.as_ref().and_then(RelayRequest::id)
             && !ssh_exec(&host, &socket, &claim_command(&inbox_dir, id))
         {

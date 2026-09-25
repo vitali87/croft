@@ -1114,9 +1114,13 @@ impl LspClient {
             .context("rename")
     }
 
-    /// `textDocument/codeLens` (#608).
-    pub async fn code_lens(&mut self, uri: Url) -> Result<Option<Vec<lsp_types::CodeLens>>> {
-        self.server
+    /// `textDocument/codeLens` (#608), on a detached server handle so the
+    /// client's lock isn't held while the server answers.
+    pub async fn code_lens_on(
+        mut server: ServerSocket,
+        uri: Url,
+    ) -> Result<Option<Vec<lsp_types::CodeLens>>> {
+        server
             .code_lens(lsp_types::CodeLensParams {
                 text_document: TextDocumentIdentifier { uri },
                 work_done_progress_params: WorkDoneProgressParams::default(),
@@ -1126,12 +1130,13 @@ impl LspClient {
             .context("codeLens")
     }
 
-    /// `codeLens/resolve` (#608): fill in a lens's command.
-    pub async fn code_lens_resolve(
-        &mut self,
+    /// `codeLens/resolve` (#608): fill in a lens's command, on a detached
+    /// server handle.
+    pub async fn code_lens_resolve_on(
+        mut server: ServerSocket,
         lens: lsp_types::CodeLens,
     ) -> Result<lsp_types::CodeLens> {
-        self.server
+        server
             .code_lens_resolve(lens)
             .await
             .context("codeLens/resolve")

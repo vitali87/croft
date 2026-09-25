@@ -3392,25 +3392,54 @@ impl WorkerState {
         };
         let tx = tx.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
-            let lenses = match client.code_lens(uri).await {
-                Ok(Some(ls)) => ls,
-                Ok(None) => Vec::new(),
-                Err(e) => {
+            // Detached, and bounded: the worker loop's did-change for every
+            // keystroke waits on this client's lock, so the lock is held only
+            // to take a handle, and a server that never answers a resolve
+            // costs at most the deadline (the #533 failure mode otherwise).
+            let server = client_arc.lock().await.detached_server();
+            let lenses = match tokio::time::timeout(
+                CODE_LENS_TIMEOUT,
+                LspClient::code_lens_on(server.clone(), uri),
+            )
+            .await
+            {
+                Ok(Ok(Some(ls))) => ls,
+                Ok(Ok(None)) => Vec::new(),
+                Ok(Err(e)) => {
                     log_file::log(&format!("lsp[{server_name}] codeLens error: {e:#}"));
                     return;
                 }
+                Err(_) => {
+                    log_file::log(&format!("lsp[{server_name}] codeLens timed out"));
+                    return;
+                }
             };
+            let deadline = tokio::time::Instant::now() + CODE_LENS_TIMEOUT;
             let mut out = Vec::new();
             for lens in lenses.into_iter().take(MAX_CODE_LENSES) {
                 let lens = if lens.command.is_none() && resolve {
-                    match client.code_lens_resolve(lens).await {
-                        Ok(l) => l,
-                        Err(e) => {
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(
+                        left,
+                        LspClient::code_lens_resolve_on(server.clone(), lens),
+                    )
+                    .await
+                    {
+                        Ok(Ok(l)) => l,
+                        Ok(Err(e)) => {
                             log_file::log(&format!(
                                 "lsp[{server_name}] codeLens/resolve error: {e:#}"
                             ));
                             continue;
+                        }
+                        Err(_) => {
+                            log_file::log(&format!(
+                                "lsp[{server_name}] codeLens/resolve timed out; showing what resolved"
+                            ));
+                            break;
                         }
                     }
                 } else {
@@ -3430,7 +3459,6 @@ impl WorkerState {
                     arguments: cmd.arguments.unwrap_or_default(),
                 });
             }
-            drop(client);
             let _ = tx.send(CodeLensUpdate {
                 path,
                 seq,
@@ -5640,6 +5668,8 @@ const WORKSPACE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// The most lenses resolved per document (#608): each resolve is a round
 /// trip, and a generated file can carry thousands.
 const MAX_CODE_LENSES: usize = 500;
+/// How long a codeLens request, and then all its resolves together, may take.
+const CODE_LENS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long one server may take to answer `willRenameFiles` (#610) before
 /// the Explorer move goes ahead without its edit. VS Code waits about as

@@ -118,7 +118,20 @@ pub fn parse_thread_states(json: &str) -> std::collections::HashMap<u64, (String
 
 /// GraphQL for each review thread's node id, resolution and first comment.
 /// Takes `$owner`, `$repo` and `$number`.
-pub const THREADS_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}";
+/// Paged: `$after` is the previous page's end cursor (omit it for the
+/// first page), and [`next_page`] says whether another page follows.
+pub const THREADS_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!,$after:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}";
+
+/// The cursor for the page after this [`THREADS_QUERY`] result, if any.
+pub fn next_page(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let info = v.pointer("/data/repository/pullRequest/reviewThreads/pageInfo")?;
+    if info.get("hasNextPage")?.as_bool()? {
+        info.get("endCursor")?.as_str().map(str::to_string)
+    } else {
+        None
+    }
+}
 
 /// The GraphQL mutation that resolves (or unresolves) thread `$id`.
 pub fn resolve_mutation(resolve: bool) -> &'static str {
@@ -402,6 +415,15 @@ mod tests {
         let t = parse_threads(json);
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].body, "why?\n\nbob: because");
+    }
+
+    #[test]
+    fn the_threads_query_pages_until_the_last_page() {
+        let more = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":true,"endCursor":"C1"},"nodes":[]}}}}}"#;
+        let last = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":"C2"},"nodes":[]}}}}}"#;
+        assert_eq!(next_page(more).as_deref(), Some("C1"));
+        assert_eq!(next_page(last), None);
+        assert!(THREADS_QUERY.contains("after:$after"));
     }
 
     #[test]
