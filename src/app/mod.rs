@@ -3296,6 +3296,10 @@ pub struct App {
     /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
     /// once the worker sends a CompletionResult back.
     pub completion_popup: Option<crate::widgets::completion_popup::CompletionPopup>,
+    /// Screen reader mode (#621).
+    screen_reader: bool,
+    /// What the screen reader was last told about.
+    a11y_focus: Option<crate::a11y::Focus>,
     /// Most recent completion request id; later responses with a stale
     /// id are dropped so a slow earlier response cannot clobber a fresh
     /// one (e.g. user already moved past the original trigger).
@@ -4874,6 +4878,8 @@ impl App {
             markdown_lint_last_seen: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
+            screen_reader: loaded_prefs.screen_reader,
+            a11y_focus: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
             vim: crate::vim::VimState::new(),
@@ -6252,7 +6258,9 @@ impl App {
     /// support, which iTerm2 / Terminal.app may have disabled in user
     /// preferences.
     fn cursor_visible_phase(&self) -> bool {
-        self.cursor_blink.visible_phase()
+        // A screen reader follows the real cursor: it must never blink off
+        // (#621).
+        self.screen_reader || self.cursor_blink.visible_phase()
     }
 
     /// Re-query git status, but no more than once every ~400ms to avoid
@@ -36334,6 +36342,7 @@ impl App {
             Cmd::OpenWorkspaceSettingsJson => self.open_workspace_settings(false),
             Cmd::OpenWorkspaceSettingsLocalJson => self.open_workspace_settings(true),
             Cmd::ExportUiStrings => self.export_ui_strings(),
+            Cmd::ToggleScreenReaderMode => self.toggle_screen_reader(),
             Cmd::OpenKeybindingsJson => self.open_config_file_in_editor(
                 crate::keymap::keybindings_path(),
                 ConfigFileSeed::Keybindings,
@@ -42227,6 +42236,75 @@ impl App {
                 if merged.warnings.len() == 1 { "" } else { "s" }
             )
         };
+    }
+
+    /// Flip screen reader mode and save it (#621).
+    fn toggle_screen_reader(&mut self) {
+        self.screen_reader = !self.screen_reader;
+        self.a11y_focus = None;
+        if let Err(e) = crate::prefs::save_screen_reader_in(&self.config_dir, self.screen_reader) {
+            crate::output::push(
+                "Settings",
+                crate::output::OutputLevel::Warn,
+                &format!("screen reader mode not saved: {e}"),
+            );
+        }
+        self.status = String::from(if self.screen_reader {
+            "Screen reader mode on"
+        } else {
+            "Screen reader mode off"
+        });
+    }
+
+    /// Put what changed under the reader into the status line (#621);
+    /// `true` when it announced something.
+    pub fn announce_focus(&mut self) -> bool {
+        use crate::lsp::manager::DiagnosticSeverity as S;
+        if !self.screen_reader || self.focus != Pane::Editor {
+            return false;
+        }
+        let row = self.editor.cursor_row;
+        let rank = |s: &S| match s {
+            S::Error => 0,
+            S::Warning => 1,
+            S::Information => 2,
+            S::Hint => 3,
+        };
+        let diagnostic = self
+            .editor
+            .diagnostics_in_line_range(row as u32, row as u32)
+            .into_iter()
+            .min_by_key(|d| rank(&d.severity))
+            .map(|d| {
+                let kind = match d.severity {
+                    S::Error => "error",
+                    S::Warning => "warning",
+                    S::Information => "info",
+                    S::Hint => "hint",
+                };
+                format!("{kind}: {}", d.message)
+            });
+        let now = crate::a11y::Focus {
+            file: self
+                .editor
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| String::from("untitled")),
+            line: row + 1,
+            text: self.editor.lines.get(row).cloned().unwrap_or_default(),
+            diagnostic,
+        };
+        let said = crate::a11y::announce(self.a11y_focus.as_ref(), &now);
+        self.a11y_focus = Some(now);
+        match said {
+            Some(s) => {
+                self.status = s;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Load the UI language's string catalog (#621): the `locale` setting,
@@ -50703,6 +50781,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
+        let announced = app.announce_focus();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
@@ -50831,6 +50910,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || blink_changed
             || spinner_changed
             || ext_index_changed
+            || announced
             || search_changed
             || log_index_changed
             || remote_changed

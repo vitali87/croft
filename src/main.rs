@@ -1,3 +1,4 @@
+mod a11y;
 mod agent_hook;
 mod agent_lane;
 mod agents;

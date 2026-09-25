@@ -275,6 +275,10 @@ pub struct Prefs {
     /// `locale/<language>.json` from its config folder. Empty follows `LANG`.
     #[serde(default)]
     pub locale: String,
+    /// Screen reader mode (#621): a steady cursor on the focused text and
+    /// spoken descriptions of line changes in the status line.
+    #[serde(default)]
+    pub screen_reader: bool,
     /// Opt-out for tailspin highlighting in the rendered log view (#466):
     /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
     /// are coloured on lines that carry no colour of their own. Stored as
@@ -421,6 +425,14 @@ pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String
     let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disabled_extensions = disabled.clone();
+    prefs.save(&path)
+}
+
+/// Persist screen reader mode (#621) under an explicit config dir.
+pub fn save_screen_reader_in(config_dir: &Path, enabled: bool) -> Result<()> {
+    let path = config_dir.join("config.json");
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.screen_reader = enabled;
     prefs.save(&path)
 }
 
