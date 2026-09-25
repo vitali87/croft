@@ -14351,6 +14351,13 @@ impl EditorTabs {
         for e in &mut self.editors {
             if let Some(moved) = e.path.as_deref().and_then(|p| moved_path(p, old, new)) {
                 e.path = Some(moved);
+                // A PDF tab rasterizes its pages from its own copy of the
+                // path.
+                if let Some(pdf) = e.image.as_mut().and_then(|i| i.pdf.as_mut())
+                    && let Some(moved) = moved_path(&pdf.source_path, old, new)
+                {
+                    pdf.source_path = moved;
+                }
                 // Re-anchor the disk stamp to the new path so the rename
                 // isn't mistaken for an external content change on the next
                 // FS-sync sweep.
@@ -22743,6 +22750,34 @@ mod tests {
         assert_eq!(diff.left_lines, vec!["alpha", "bravo", "charlie"]);
         assert_eq!(diff.right_lines, vec!["alpha", "BRAVO", "charlie"]);
         assert_eq!(diff.rows.len(), 3);
+    }
+
+    /// #610: a PDF tab inside a moved folder reads its pages from the new
+    /// path.
+    #[test]
+    fn a_moved_pdf_tab_rasterizes_from_its_new_path() {
+        let mut t = EditorTabs::new();
+        t.path = Some(PathBuf::from("/a/doc.pdf"));
+        t.image = Some(ImageView {
+            bytes: Vec::new(),
+            format_label: String::from("PDF"),
+            pixel_w: 1,
+            pixel_h: 1,
+            byte_size: 0,
+            generation: 0,
+            pdf: Some(PdfState {
+                source_path: PathBuf::from("/a/doc.pdf"),
+                current_page: 1,
+                page_count: None,
+                backend: crate::pdf::PdfBackend::SipsCli,
+                source_byte_size: 0,
+                links: None,
+            }),
+        });
+        t.rename_open_path(Path::new("/a"), Path::new("/b"));
+        assert_eq!(t.path.as_deref(), Some(Path::new("/b/doc.pdf")));
+        let pdf = t.image.as_ref().and_then(|i| i.pdf.as_ref()).unwrap();
+        assert_eq!(pdf.source_path, PathBuf::from("/b/doc.pdf"));
     }
 
     #[test]

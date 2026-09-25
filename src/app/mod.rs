@@ -45832,7 +45832,6 @@ impl App {
             group.rename_open_path(old, new);
         }
         self.rename_review_boxes_path(old, new);
-        self.sync_open_file_poll_mtime();
     }
 
     /// Perform a held rename or move once the servers have answered.
@@ -45938,9 +45937,11 @@ impl App {
                 );
             }
         }
-        if !done.is_empty()
-            && let Some(lsp) = self.lsp.as_mut()
-        {
+        if done.is_empty() {
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        if let Some(lsp) = self.lsp.as_mut() {
             lsp.notify_did_rename_files(done);
         }
     }
@@ -50281,6 +50282,9 @@ pub fn run(
     let mut terminal: CroftTerminal = Terminal::new(backend).context("create terminal")?;
 
     let result = main_loop(&mut app, &mut terminal);
+    // A rename or move still waiting on the servers happens now, without
+    // their edit, rather than being dropped, however the loop ended (#610).
+    app.skip_held_file_move();
 
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
@@ -51143,8 +51147,5 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             needs_redraw = true;
         }
     }
-    // A rename or move still waiting on the servers happens now, without
-    // their edit, rather than being dropped (#610).
-    app.skip_held_file_move();
     Ok(())
 }

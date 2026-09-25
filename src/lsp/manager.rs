@@ -278,18 +278,47 @@ pub struct WillRenameFilesResult {
     pub edits: Vec<(PathBuf, Vec<TextSpanEdit>)>,
 }
 
-/// The `willRenameFiles` request in flight and its task (#610).
-type WillRenameTask = Arc<StdMutex<Option<(u64, tokio::task::AbortHandle)>>>;
+/// The `willRenameFiles` request in flight and its task (#610), and the
+/// newest request a skip abandoned: the worker may not have started that
+/// request yet, and must not start it once it gets there.
+#[derive(Default)]
+struct WillRenameSlot {
+    task: Option<(u64, tokio::task::AbortHandle)>,
+    skipped: u64,
+}
 
-/// Abort the task in `slot` if it is request `request_id`'s; a later
-/// request's task is left running.
+type WillRenameTask = Arc<StdMutex<WillRenameSlot>>;
+
+/// Abandon request `request_id`: abort its task if it is running, and mark
+/// it so a task not yet started never starts. A later request's task is
+/// left running. The servers are not told (no `$/cancelRequest`): an answer
+/// they finish anyway goes nowhere.
 fn abort_will_rename(slot: &WillRenameTask, request_id: u64) {
     let mut slot = slot.lock().unwrap();
-    if slot.as_ref().is_some_and(|(id, _)| *id == request_id)
-        && let Some((_, task)) = slot.take()
+    slot.skipped = slot.skipped.max(request_id);
+    if slot.task.as_ref().is_some_and(|(id, _)| *id == request_id)
+        && let Some((_, task)) = slot.task.take()
     {
         task.abort();
     }
+}
+
+/// Spawn request `request_id`'s task unless a skip already abandoned it.
+/// The check and the spawn share one lock, so a skip lands either before
+/// (nothing starts) or after (the task is there to abort).
+fn start_will_rename(
+    slot: &WillRenameTask,
+    request_id: u64,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) -> bool {
+    let mut slot = slot.lock().unwrap();
+    if request_id <= slot.skipped {
+        return false;
+    }
+    // Left in place once the task ends: aborting a finished task does
+    // nothing, and the next request replaces it.
+    slot.task = Some((request_id, tokio::spawn(task).abort_handle()));
+    true
 }
 
 /// How long a server may take to answer `willRenameFiles` before the rename
@@ -4584,7 +4613,7 @@ impl WorkerState {
     ) {
         let audience = self.file_op_audience(&files, |c| c.will_rename_filters.as_ref());
         let tx = tx.clone();
-        let task = tokio::spawn(async move {
+        let task = async move {
             let asks = audience
                 .into_iter()
                 .map(|(name, client, matched)| async move {
@@ -4620,10 +4649,8 @@ impl WorkerState {
                 request_id,
                 edits: merge_file_edits(answers),
             });
-        });
-        // Left in place once the task ends: aborting a finished task does
-        // nothing, and the next request replaces it.
-        *self.will_rename_task.lock().unwrap() = Some((request_id, task.abort_handle()));
+        };
+        start_will_rename(&self.will_rename_task, request_id, task);
     }
 
     /// `workspace/didRenameFiles` (#610) to every server whose filters match.
@@ -6548,15 +6575,36 @@ mod tests {
         rt.block_on(async {
             let slot = WillRenameTask::default();
             let task = tokio::spawn(std::future::pending::<()>());
-            *slot.lock().unwrap() = Some((2, task.abort_handle()));
+            slot.lock().unwrap().task = Some((2, task.abort_handle()));
             abort_will_rename(&slot, 1);
             assert!(
-                slot.lock().unwrap().is_some(),
+                slot.lock().unwrap().task.is_some(),
                 "another request's task runs on"
             );
             abort_will_rename(&slot, 2);
-            assert!(slot.lock().unwrap().is_none());
+            assert!(slot.lock().unwrap().task.is_none());
             assert!(task.await.unwrap_err().is_cancelled());
+        });
+    }
+
+    /// #610: a skip that lands while the request still waits in the
+    /// worker's queue stops it from starting; the next request starts.
+    #[test]
+    fn a_skip_before_the_worker_starts_the_request_stops_it() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let slot = WillRenameTask::default();
+            abort_will_rename(&slot, 3);
+            assert!(
+                !start_will_rename(&slot, 3, std::future::pending()),
+                "a skipped request never starts"
+            );
+            assert!(slot.lock().unwrap().task.is_none());
+            assert!(start_will_rename(&slot, 4, std::future::pending()));
+            assert!(slot.lock().unwrap().task.is_some());
         });
     }
     #[test]
