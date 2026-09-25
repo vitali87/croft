@@ -34680,7 +34680,8 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     // The deterministic half of #397's quick-select entry. Its sibling below
     // was measured at 3 failures in 20 runs under load, because a REAL
     // shell's prompt wraps to several rows and the pane had one row of slack;
-    // a rate is the best evidence a race allows, and it is not a test.
+    // a rate is the best evidence a race allows, and it is not a test. Both
+    // now run on a silent pane.
     //
     // This one feeds the prompt itself, so the geometry is the whole claim
     // and the machine has no say. Four rows of it, then the same park,
