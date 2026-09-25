@@ -9886,14 +9886,12 @@ impl App {
         let Some(result) = result else {
             return false;
         };
-        let noun = if result.incoming {
-            "incoming calls"
-        } else {
-            "outgoing calls"
-        };
+        let noun = result.kind.noun();
         if result.unsupported {
-            self.status =
-                String::from("Call hierarchy: not supported by this file's language server");
+            self.status = format!(
+                "{}: not supported by this file's language server",
+                result.kind.feature()
+            );
             return true;
         }
         if result.sites.is_empty() {
@@ -9961,6 +9959,23 @@ impl App {
             return;
         };
         let id = lsp.request_call_hierarchy(path, line, character, incoming);
+        self.call_hierarchy_request_id = Some(id);
+    }
+
+    /// Request the supertypes or subtypes of the type at the cursor (#613).
+    /// The reply shares the call hierarchy's request slot and picker.
+    fn request_type_hierarchy_at_cursor(&mut self, supertypes: bool) {
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(lsp) = self.lsp.as_mut() else {
+            self.status = String::from("Type hierarchy: no language server for this file");
+            return;
+        };
+        let id = lsp.request_type_hierarchy(path, line, character, supertypes);
         self.call_hierarchy_request_id = Some(id);
     }
 
@@ -35967,6 +35982,8 @@ impl App {
             Cmd::ToggleBreakpoint => self.debug_toggle_breakpoint(),
             Cmd::EditLogpoint => self.debug_edit_logpoint(),
             Cmd::ShowIncomingCalls => self.request_call_hierarchy_at_cursor(true),
+            Cmd::ShowSupertypes => self.request_type_hierarchy_at_cursor(true),
+            Cmd::ShowSubtypes => self.request_type_hierarchy_at_cursor(false),
             Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),
