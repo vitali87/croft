@@ -2501,6 +2501,8 @@ pub struct App {
     /// User key bindings from `~/.config/croft/keybindings.json`, consulted
     /// ahead of the built-in chords so a rebind wins over the default.
     keymap: crate::keymap::Keymap,
+    /// The profile in force (#618); empty for none.
+    active_profile: String,
     /// Live macro recording (#255), `None` when not recording. Carries the
     /// vim register it will be stored under, or `None` for the palette
     /// recorder, whose macro is the unnamed "last recording".
@@ -4465,6 +4467,7 @@ impl App {
         // layers of the primary root, one merged view. Warnings (refused
         // workspace keys, parse errors) land in the Settings OUTPUT channel.
         let merged_settings = crate::config_layers::load_merged(Some(&root));
+        let startup_profile = merged_settings.prefs.profile.clone();
         for w in &merged_settings.warnings {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
@@ -4492,7 +4495,10 @@ impl App {
         let loaded_keymap = if cfg!(test) {
             crate::keymap::Keymap::default()
         } else {
-            crate::keymap::Keymap::load(&crate::keymap::keybindings_path())
+            crate::keymap::Keymap::load(&crate::profiles::keybindings_file(
+                &crate::prefs::config_dir(),
+                &startup_profile,
+            ))
         };
         // `Keymap::load` already reports its own warnings to OUTPUT ·
         // Keybindings, so nothing to do here.
@@ -4601,6 +4607,7 @@ impl App {
             // Hoisted rather than inlined so the parse warnings can be
             // reported once, in OUTPUT · Keybindings.
             keymap: loaded_keymap,
+            active_profile: startup_profile,
             last_mouse_pos: None,
             macro_recording: None,
             macro_last: None,
@@ -23350,6 +23357,10 @@ impl App {
                 self.close_input_prompt();
                 self.create_worktree_lane(&value);
             }
+            InputPurpose::ProfileName => {
+                self.close_input_prompt();
+                self.submit_profile_name(&value);
+            }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
                 // the status line the run writes, so the user cannot see the
@@ -25163,6 +25174,8 @@ impl App {
                 }
                 self.pending_color_presentations.clear();
             }
+            ListPurpose::SwitchProfile => self.use_profile(&row.id, false),
+            ListPurpose::WorkspaceProfile => self.use_profile(&row.id, true),
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
                     self.run_project_task(task);
@@ -36324,6 +36337,9 @@ impl App {
             Cmd::RerunLastTask => self.rerun_last_task(),
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
             Cmd::OpenSettings => self.open_settings_view(),
+            Cmd::SwitchProfile => self.open_profile_picker(false),
+            Cmd::CreateProfile => self.ask_profile_name(),
+            Cmd::UseProfileInWorkspace => self.open_profile_picker(true),
             Cmd::OpenSettingsJson => self
                 .open_config_file_in_editor(crate::prefs::config_path(), ConfigFileSeed::Settings),
             Cmd::OpenWorkspaceSettingsJson => self.open_workspace_settings(false),
@@ -42151,7 +42167,7 @@ impl App {
     /// Shared by the explicit-save path (active tab) and the auto-save
     /// sweep (every written tab, background and inactive splits included).
     fn reload_config_for_path(&mut self, path: &std::path::Path) {
-        if path == crate::keymap::keybindings_path() {
+        if path == crate::keymap::keybindings_path() || path == self.active_keybindings_file() {
             // The non-reporting loader: this path needs the warnings itself
             // for the status summary below, and `load` would print each one to
             // OUTPUT a second time.
@@ -42200,12 +42216,107 @@ impl App {
         }
     }
 
+    /// The keybindings file the active profile uses (#618).
+    fn active_keybindings_file(&self) -> PathBuf {
+        crate::profiles::keybindings_file(&self.config_dir, &self.active_profile)
+    }
+
+    /// Offer the profiles to switch to, or to make this workspace's
+    /// default (#618). The first row is "no profile".
+    fn open_profile_picker(&mut self, workspace: bool) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let mark = |name: &str| {
+            if name == self.active_profile {
+                "\u{25cf} "
+            } else {
+                "  "
+            }
+        };
+        let mut rows = vec![ListRow {
+            id: String::new(),
+            label: format!("{}Default (no profile)", mark("")),
+        }];
+        for name in crate::profiles::list(&self.config_dir) {
+            rows.push(ListRow {
+                label: format!("{}{name}", mark(&name)),
+                id: name,
+            });
+        }
+        let (purpose, title) = if workspace {
+            (
+                ListPurpose::WorkspaceProfile,
+                "Use Profile in This Workspace",
+            )
+        } else {
+            (ListPurpose::SwitchProfile, "Switch Profile")
+        };
+        self.open_list_picker(ListPicker::new(purpose, title, rows), "");
+    }
+
+    /// Ask for a new profile's name (#618).
+    fn ask_profile_name(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::ProfileName,
+            String::from("Create Profile"),
+            String::from("name, e.g. Python or Writing"),
+        ));
+    }
+
+    /// Create profile `name` and switch to it (#618).
+    pub fn submit_profile_name(&mut self, name: &str) {
+        let name = name.trim();
+        match crate::profiles::create(&self.config_dir, name) {
+            Ok(_) => self.use_profile(name, false),
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Make `name` (empty: none) the user's profile or this workspace's
+    /// default, then re-merge (#618).
+    fn use_profile(&mut self, name: &str, workspace: bool) {
+        let path = if workspace {
+            crate::config_layers::workspace_config_path(self.roots.primary())
+        } else {
+            self.config_dir.join("config.json")
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let written = crate::profiles::set_profile_in(&text, name).and_then(|new| {
+            path.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, new))
+                .map_err(|e| e.to_string())
+        });
+        if let Err(e) = written {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        self.remerge_settings();
+        let who = if name.is_empty() { "no profile" } else { name };
+        self.status = if workspace {
+            format!("This workspace now uses {who}")
+        } else {
+            format!("Switched to {who}")
+        };
+    }
+
     /// Re-run the layered settings merge (#251) and apply everything that can
     /// apply live: theme, editor toggles, save behavior, host accents. Called
     /// when any file of the chain is saved in the editor; layout and other
     /// startup-read settings still say "next launch".
     fn remerge_settings(&mut self) {
-        let merged = crate::config_layers::load_merged(Some(self.roots.primary()));
+        // `self.config_dir`, which is the user's config folder outside
+        // tests, so a test never merges the real one.
+        let merged = crate::config_layers::load_merged_from(
+            &self.config_dir,
+            Some(self.roots.primary()),
+            crate::config_layers::current_platform(),
+        );
+        if merged.prefs.profile != self.active_profile {
+            // A profile brings its own keybindings (#618).
+            self.active_profile = merged.prefs.profile.clone();
+            self.keymap = crate::keymap::Keymap::load(&self.active_keybindings_file());
+        }
         for w in &merged.warnings {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
