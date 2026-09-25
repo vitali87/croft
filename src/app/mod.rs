@@ -3491,6 +3491,8 @@ pub struct App {
     /// visual operator deletes/yanks whole lines.
     vim_visual_line: bool,
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
+    /// The Settings editor (#612).
+    settings_editor: Option<crate::widgets::settings_editor::SettingsEditor>,
     shortcuts_hit_rect: Option<Rect>,
     /// Status-bar clickable-segment hit rects, recorded each render. Empty when
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
@@ -4880,6 +4882,7 @@ impl App {
             vim_last_find: None,
             vim_visual_line: false,
             shortcuts_modal: None,
+            settings_editor: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
             status_indent_rect: Rect::default(),
@@ -17000,6 +17003,7 @@ impl App {
         self.render_input_prompt(frame);
         self.render_list_picker(frame);
         self.render_shortcuts_modal(frame);
+        self.render_settings_editor(frame);
         self.render_connect_dialog(frame);
         // The startup unsupported-terminal nudge renders last so it sits above
         // every other overlay until the user dismisses it.
@@ -18849,6 +18853,10 @@ impl App {
         }
         if self.shortcuts_modal.is_some() {
             self.handle_shortcuts_modal_key(key);
+            return Ok(());
+        }
+        if self.settings_editor.is_some() && self.input_prompt.is_none() {
+            self.handle_settings_editor_key(key);
             return Ok(());
         }
         if self.file_finder.is_some() {
@@ -23349,6 +23357,10 @@ impl App {
             InputPurpose::NewWorktreeLane => {
                 self.close_input_prompt();
                 self.create_worktree_lane(&value);
+            }
+            InputPurpose::SettingValue { key } => {
+                self.close_input_prompt();
+                self.submit_setting_value(&key, &value);
             }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
@@ -34050,6 +34062,172 @@ impl App {
         }
     }
 
+    /// The merged settings as the Settings editor sees them: the user layers
+    /// from `self.config_dir`, the workspace layers from the primary root.
+    fn merged_settings_here(&self) -> crate::config_layers::MergedConfig {
+        crate::config_layers::load_merged_from(
+            &self.config_dir,
+            Some(self.roots.primary()),
+            crate::config_layers::current_platform(),
+        )
+    }
+
+    /// Open the Settings editor (#612).
+    fn open_settings_editor(&mut self) {
+        let merged = self.merged_settings_here();
+        self.settings_editor = Some(crate::widgets::settings_editor::SettingsEditor::new(
+            crate::settings_editor::rows(&merged.prefs, &merged.provenance),
+        ));
+    }
+
+    /// Write `key = value` into the Settings editor's target layer, re-merge
+    /// and apply it live, and refresh the editor's rows.
+    fn write_setting(&mut self, key: &str, value: serde_json::Value) {
+        use crate::config_layers::LayerKind;
+        let Some(target) = self.settings_editor.as_ref().map(|e| e.target) else {
+            return;
+        };
+        let path = match target {
+            LayerKind::Workspace => {
+                if !crate::config_layers::WORKSPACE_ALLOWED_KEYS.contains(&key) {
+                    self.status =
+                        format!("{key} can only be set in your user settings (Tab switches layer)");
+                    return;
+                }
+                crate::config_layers::workspace_config_path(self.roots.primary())
+            }
+            _ => self.config_dir.join("config.json"),
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let new = match crate::settings_editor::set_key(&text, key, value) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, new));
+        if let Err(e) = written {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        let merged = self.merged_settings_here();
+        for w in &merged.warnings {
+            crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
+        }
+        self.apply_merged_settings(&merged.prefs);
+        self.settings_provenance = merged.provenance.clone();
+        if let Some(ed) = self.settings_editor.as_mut() {
+            ed.rows = crate::settings_editor::rows(&merged.prefs, &merged.provenance);
+        }
+        self.status = format!("{key} saved to {}", path.display());
+    }
+
+    /// Keys while the Settings editor is open (#612): typing searches, Enter
+    /// edits the selected setting, Tab switches between the user and the
+    /// workspace layer.
+    fn handle_settings_editor_key(&mut self, key: KeyEvent) {
+        use crate::config_layers::LayerKind;
+        use crate::settings_editor::Kind;
+        let Some(ed) = self.settings_editor.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.settings_editor = None,
+            (KeyCode::Up, _) => ed.move_selection(-1),
+            (KeyCode::Down, _) => ed.move_selection(1),
+            (KeyCode::PageUp, _) => ed.move_selection(-10),
+            (KeyCode::PageDown, _) => ed.move_selection(10),
+            (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
+                ed.target = if ed.target == LayerKind::Workspace {
+                    LayerKind::User
+                } else {
+                    LayerKind::Workspace
+                };
+            }
+            (KeyCode::Enter, _) => {
+                let Some(row) = ed.selected_row().cloned() else {
+                    return;
+                };
+                match row.kind {
+                    Kind::Bool | Kind::Choice(_) => {
+                        if let Some(v) = crate::settings_editor::next_value(&row) {
+                            self.write_setting(&row.key, v);
+                        }
+                    }
+                    Kind::Number | Kind::Text => {
+                        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                        let now = crate::settings_editor::display(&row.value);
+                        self.open_input_prompt(
+                            InputPrompt::new(
+                                InputPurpose::SettingValue {
+                                    key: row.key.clone(),
+                                },
+                                row.key.replace('_', " "),
+                                String::from("new value"),
+                            )
+                            .with_value(now),
+                        );
+                    }
+                    Kind::Json => {
+                        self.settings_editor = None;
+                        self.status =
+                            format!("{} is edited in the JSON file", row.key.replace('_', " "));
+                        self.open_config_file_in_editor(
+                            self.config_dir.join("config.json"),
+                            ConfigFileSeed::Settings,
+                        );
+                    }
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                let mut q = ed.query.clone();
+                q.pop();
+                ed.set_query(q);
+            }
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                let mut q = ed.query.clone();
+                q.push(c);
+                ed.set_query(q);
+            }
+            _ => {}
+        }
+    }
+
+    /// A typed value for setting `key` (#612): numbers must parse as one.
+    fn submit_setting_value(&mut self, key: &str, value: &str) {
+        let Some(row) = self
+            .settings_editor
+            .as_ref()
+            .and_then(|e| e.rows.iter().find(|r| r.key == key).cloned())
+        else {
+            return;
+        };
+        let v = value.trim();
+        let parsed = match row.kind {
+            crate::settings_editor::Kind::Number => match v.parse::<u64>() {
+                Ok(n) => serde_json::Value::from(n),
+                Err(_) => {
+                    self.status = format!("{key} needs a whole number, not \"{v}\"");
+                    return;
+                }
+            },
+            _ => serde_json::Value::from(v),
+        };
+        self.write_setting(key, parsed);
+    }
+
+    fn render_settings_editor(&mut self, frame: &mut ratatui::Frame) {
+        let area = frame.area();
+        let theme = self.theme;
+        if let Some(ed) = self.settings_editor.as_mut() {
+            crate::widgets::settings_editor::render(ed, area, frame.buffer_mut(), theme);
+        }
+    }
+
     fn open_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.is_none() {
             self.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
@@ -36324,6 +36502,7 @@ impl App {
             Cmd::RerunLastTask => self.rerun_last_task(),
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
             Cmd::OpenSettings => self.open_settings_view(),
+            Cmd::OpenSettingsEditor => self.open_settings_editor(),
             Cmd::OpenSettingsJson => self
                 .open_config_file_in_editor(crate::prefs::config_path(), ConfigFileSeed::Settings),
             Cmd::OpenWorkspaceSettingsJson => self.open_workspace_settings(false),

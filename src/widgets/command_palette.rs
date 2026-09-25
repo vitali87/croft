@@ -175,6 +175,7 @@ pub enum Command {
     ColorTheme,
     KeyboardShortcuts,
     OpenSettings,
+    OpenSettingsEditor,
     OpenSettingsJson,
     OpenWorkspaceSettingsJson,
     OpenWorkspaceSettingsLocalJson,
@@ -408,6 +409,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ColorTheme,
     Command::KeyboardShortcuts,
     Command::OpenSettings,
+    Command::OpenSettingsEditor,
     Command::OpenSettingsJson,
     Command::OpenWorkspaceSettingsJson,
     Command::OpenWorkspaceSettingsLocalJson,
@@ -607,6 +609,7 @@ impl Command {
             Command::ColorTheme => "Preferences: Color Theme",
             Command::KeyboardShortcuts => "Help: Keyboard Shortcuts Reference",
             Command::OpenSettings => "Preferences: Open Settings",
+            Command::OpenSettingsEditor => "Preferences: Open Settings (UI)",
             Command::OpenSettingsJson => "Preferences: Open Settings (JSON)",
             Command::OpenWorkspaceSettingsJson => "Preferences: Open Workspace Settings (JSON)",
             Command::OpenWorkspaceSettingsLocalJson => {
@@ -810,6 +813,7 @@ impl Command {
             // loader is that a user can bind these (the seeded template shows
             // Cmd+, -> open_settings as the example).
             Command::OpenSettings => "",
+            Command::OpenSettingsEditor => "",
             Command::OpenSettingsJson => "",
             Command::OpenWorkspaceSettingsJson => "",
             Command::OpenWorkspaceSettingsLocalJson => "",
@@ -1011,6 +1015,7 @@ impl Command {
             Command::ColorTheme => "color_theme",
             Command::KeyboardShortcuts => "keyboard_shortcuts",
             Command::OpenSettings => "open_settings",
+            Command::OpenSettingsEditor => "open_settings_editor",
             Command::OpenSettingsJson => "open_settings_json",
             Command::OpenWorkspaceSettingsJson => "open_workspace_settings_json",
             Command::OpenWorkspaceSettingsLocalJson => "open_workspace_settings_local_json",

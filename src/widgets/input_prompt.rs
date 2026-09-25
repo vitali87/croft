@@ -33,6 +33,10 @@ pub enum InputPurpose {
     NewWorktreeLane,
     /// The command to run across the fleet (#363).
     FleetCommand,
+    /// A new value for the setting `key` (#612).
+    SettingValue {
+        key: String,
+    },
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
     /// Submitting stores the query on the view and jumps to the first
