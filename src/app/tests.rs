@@ -49979,3 +49979,155 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+/// A repository with a base commit and `subjects` committed on top, each
+/// touching its own file; returns its directory.
+fn rebase_fixture(subjects: &[&str]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+    for (i, s) in subjects.iter().enumerate() {
+        std::fs::write(dir.path().join(format!("f{i}.txt")), format!("{s}\n")).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", s]);
+    }
+    dir
+}
+
+fn log_subjects(dir: &std::path::Path) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args(["log", "--format=%s"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn an_interactive_rebase_reorders_drops_and_rewords_commits() {
+    // #620: rows you reorder and give actions, then git carries them out.
+    let repo = rebase_fixture(&["one", "two", "three"]);
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitInteractiveRebase);
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::RebaseBase)
+    ));
+    app.close_input_prompt();
+    app.submit_rebase_base("HEAD~3");
+    let subjects = |app: &App| {
+        app.rebase_editor
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.subject.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(subjects(&app), ["one", "two", "three"], "oldest first");
+    // "two" -> drop; "three" -> reword and move above "two".
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Up, KeyModifiers::ALT)).unwrap();
+    assert_eq!(subjects(&app), ["one", "three", "two"]);
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::RebaseMessage { index: 1 })
+    ));
+    app.close_input_prompt();
+    app.submit_rebase_message(1, "Three, reworded");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.rebase_editor.is_none(),
+        "the list closes once git has run"
+    );
+    assert_eq!(
+        log_subjects(repo.path()),
+        ["Three, reworded", "one", "base"],
+        "{}",
+        app.status
+    );
+    assert!(app.status.contains("Rebased"), "{}", app.status);
+}
+
+#[test]
+fn an_impossible_rebase_list_is_refused_before_git_runs() {
+    let repo = rebase_fixture(&["one", "two"]);
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.submit_rebase_base("HEAD~2");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.rebase_editor.is_some(), "still editing");
+    assert!(app.status.contains("no kept commit"), "{}", app.status);
+    assert_eq!(log_subjects(repo.path()), ["two", "one", "base"]);
+}
+
+#[test]
+fn a_rebase_that_stops_to_edit_can_be_continued_or_aborted() {
+    let repo = rebase_fixture(&["one", "two"]);
+    let head = |dir: &std::path::Path| {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let before = head(repo.path());
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.submit_rebase_base("HEAD~2");
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        repo.path().join(".git/rebase-merge").exists(),
+        "stopped for the edit"
+    );
+    assert!(app.status.contains("stopped"), "{}", app.status);
+    app.run_command(crate::widgets::command_palette::Command::GitAbortRebase);
+    assert!(!repo.path().join(".git/rebase-merge").exists());
+    assert_eq!(head(repo.path()), before, "abort restores HEAD");
+    // Again, and this time continue.
+    app.submit_rebase_base("HEAD~2");
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitContinueRebase);
+    assert!(
+        !repo.path().join(".git/rebase-merge").exists(),
+        "{}",
+        app.status
+    );
+    assert_eq!(log_subjects(repo.path()), ["two", "one", "base"]);
+}
