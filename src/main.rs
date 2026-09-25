@@ -68,8 +68,6 @@ mod review_threads;
 mod rewind;
 mod sarif;
 mod scrubber;
-// Used by the Search Editor commands, which land in the next change.
-#[allow(dead_code)]
 mod search_editor;
 mod session;
 mod session_host;
