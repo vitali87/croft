@@ -49680,6 +49680,125 @@ fn an_explorer_rename_waits_for_the_servers_edit_and_applies_it_first() {
     assert!(app.pending_file_move.is_none());
 }
 
+/// #610: the servers' edit reaches a file open only in an inactive split
+/// group, so that tab keeps the edit instead of the stale text on disk.
+#[test]
+fn a_held_rename_edits_a_tab_open_only_in_an_inactive_group() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let bar = foo.with_file_name("bar.rs");
+    app.editor.open_pinned(&foo).unwrap();
+    app.editor.open_pinned(&lib).unwrap();
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    assert!(
+        app.editor.find_tab_with_path(&foo).is_none(),
+        "foo.rs is open only in the inactive group"
+    );
+    app.prompt = Some(super::Prompt {
+        label: String::from("Rename foo.rs"),
+        buffer: String::from("bar.rs"),
+        kind: super::PromptKind::Rename(foo.clone()),
+        target_dir: foo.parent().unwrap().to_path_buf(),
+        error: None,
+    });
+    app.commit_prompt();
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    app.lsp.as_ref().unwrap().answer_will_rename_files(
+        crate::lsp::manager::WillRenameFilesResult {
+            request_id,
+            edits: vec![(
+                foo.clone(),
+                vec![crate::widgets::editor::TextSpanEdit {
+                    start: (0, 7),
+                    end: (0, 8),
+                    new_text: String::from("g"),
+                }],
+            )],
+        },
+    );
+    assert!(app.drain_will_rename_files());
+    assert!(bar.exists(), "the rename happened");
+    let groups = app.editor_layout.inactive_groups();
+    let tab = groups[0]
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(bar.as_path()))
+        .expect("the inactive tab follows the file");
+    assert_eq!(tab.lines[0], "pub fn g() {}");
+    assert!(tab.dirty, "the edit is unsaved in the tab");
+    assert!(
+        app.status.ends_with(", 1 reference(s) updated"),
+        "{}",
+        app.status
+    );
+}
+
+/// #610: a move repoints a tab that is open but not showing in the active
+/// group, not just the visible one.
+#[test]
+fn a_move_repoints_a_background_tab_in_the_active_group() {
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    app.lsp.as_ref().unwrap().set_will_rename_listeners(false);
+    let dest = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.editor.open_pinned(&foo).unwrap();
+    let lib = foo.with_file_name("lib.rs");
+    app.editor.open_pinned(&lib).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    assert!(dest.join("foo.rs").exists(), "the move happened");
+    assert_eq!(app.editor.path.as_deref(), Some(lib.as_path()));
+    assert!(
+        app.editor
+            .editors
+            .iter()
+            .any(|e| e.path.as_deref() == Some(dest.join("foo.rs").as_path())),
+        "the background tab follows the file"
+    );
+    assert!(app.editor.find_tab_with_path(&foo).is_none());
+}
+
+/// #610: `didRenameFiles` names only the items that really moved, so a
+/// planned move whose relocate fails is left out.
+#[test]
+fn did_rename_files_leaves_out_an_item_that_failed_to_move() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let root = foo.parent().unwrap().to_path_buf();
+    let dest = root.join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    let other = root.join("other.rs");
+    std::fs::write(&other, "").unwrap();
+    app.apply_paste_or_drop(&dest, &[foo.clone(), other.clone()], ExplorerClipMode::Cut);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    std::fs::remove_file(&other).unwrap();
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+    assert!(app.drain_will_rename_files());
+    assert_eq!(
+        app.lsp.as_ref().unwrap().did_rename_log,
+        vec![vec![crate::lsp::manager::FileRename {
+            old: foo.clone(),
+            new: dest.join("foo.rs"),
+            is_dir: false,
+        }]]
+    );
+}
+
+/// #610: a Finder drop of a path already inside the workspace is an
+/// Explorer move, so it waits for the servers' edit like a cut-paste.
+#[test]
+fn a_finder_drop_of_a_workspace_path_is_held_for_the_servers() {
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    let root = foo.parent().unwrap().to_path_buf();
+    let sub = root.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let baz = sub.join("baz.rs");
+    std::fs::write(&baz, "").unwrap();
+    app.import_paths_into_explorer(std::slice::from_ref(&baz));
+    assert!(app.pending_file_move.is_some(), "the drop is held");
+    assert!(baz.exists(), "nothing moves before the answer");
+}
+
 /// #610: Esc stops waiting, the held move goes ahead without an edit, and a
 /// late answer is ignored rather than applied to files that already moved.
 #[test]

@@ -245,6 +245,8 @@ struct PendingFileMove {
     op: FileMove,
 }
 
+/// An Explorer rename or move, planned and validated, waiting to be
+/// performed once the servers' `willRenameFiles` edit is in (#610).
 enum FileMove {
     /// The Explorer rename prompt: `old` becomes `new` inside `parent`.
     Rename {
@@ -11669,7 +11671,16 @@ impl App {
             if edits.is_empty() {
                 continue;
             }
-            if let Some(n) = self.editor.apply_rename_to_open_tab(path, edits) {
+            // Every group holding the file gets the edit: a tab open only in
+            // an inactive group would otherwise keep its old text over a
+            // disk write, and a move re-anchors it to that write (#610).
+            let mut applied = self.editor.apply_rename_to_open_tab(path, edits);
+            for group in self.editor_layout.inactive_groups_mut() {
+                if let Some(n) = group.apply_rename_to_open_tab(path, edits) {
+                    applied.get_or_insert(n);
+                }
+            }
+            if let Some(n) = applied {
                 occ_count += n;
             } else if self.is_collab_guest() && collab_file_key(&self.tree.root, path).is_some() {
                 // Closed-file rename edits are raw disk writes; a collab
@@ -31461,8 +31472,19 @@ impl App {
     /// currently pointing at. Files outside the workspace are *moved* in
     /// (matching the user's Finder-drop expectation), not copied — they
     /// disappear from the source location and re-appear in the explorer.
+    /// A drop that includes a path already inside the workspace is an
+    /// Explorer move, so it takes the cut-paste route: language servers
+    /// update references and open tabs follow (#610).
     fn import_paths_into_explorer(&mut self, paths: &[PathBuf]) {
         let dest_dir = self.paste_target_dir();
+        let root = self.tree.root.clone();
+        if paths
+            .iter()
+            .any(|p| p.starts_with(&root) || self.tree.root_paths().any(|r| p.starts_with(r)))
+        {
+            self.apply_paste_or_drop(&dest_dir, paths, ExplorerClipMode::Cut);
+            return;
+        }
         let total = paths.len();
         let mut placed: Vec<PathBuf> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -45951,7 +45973,7 @@ impl App {
                 }
                 let note = if unmoved > 0 && updated > 0 {
                     format!(
-                        "{note}, including references to the item(s) that failed to move, which now point at a missing path"
+                        "{note}; references to the item(s) that failed to move may now point at a missing path"
                     )
                 } else {
                     note

@@ -1124,8 +1124,8 @@ pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Res
     Ok(target)
 }
 
-/// The path [`rename_in`] would rename `old_path` to, validated but not
-/// performed, so the language servers can be asked about it first (#610).
+/// The path an Explorer rename of `old_path` to `new_name` lands on,
+/// validated but not performed, so the language servers can be asked about it first (#610).
 pub fn rename_target(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
     let trimmed = new_name.trim();
     if let Err(msg) = validate_new_name(trimmed) {
@@ -1853,6 +1853,7 @@ mod tests {
         assert!(!a.join("b").join("a").exists(), "nothing was copied");
         assert!(a.join("b").is_dir(), "the source is untouched");
     }
+
     #[test]
     fn add_root_appends_a_loaded_depth_zero_section_and_keeps_the_primary() {
         let (tmp, second, tree) = two_root_fixture();

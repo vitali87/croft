@@ -962,6 +962,9 @@ pub struct LspManager {
     will_rename_task: WillRenameTask,
     next_request_id: u64,
     workspace_root: PathBuf,
+    /// Every `didRenameFiles` batch sent, for tests to read back.
+    #[cfg(test)]
+    pub did_rename_log: Vec<Vec<FileRename>>,
     _runtime: LspRuntime,
 }
 
@@ -1119,6 +1122,8 @@ impl LspManager {
             will_rename_task,
             next_request_id: 1,
             workspace_root,
+            #[cfg(test)]
+            did_rename_log: Vec::new(),
             _runtime: runtime,
         })
     }
@@ -1726,6 +1731,8 @@ impl LspManager {
 
     /// Tell the servers `files` have moved on disk (#610).
     pub fn notify_did_rename_files(&mut self, files: Vec<FileRename>) {
+        #[cfg(test)]
+        self.did_rename_log.push(files.clone());
         let _ = self.cmd_tx.send(Cmd::DidRenameFiles { files });
     }
 
@@ -2384,7 +2391,7 @@ async fn worker_loop(
             Cmd::WillRenameFiles { request_id, files } => {
                 state.will_rename_files(request_id, files, &tx.will_rename_files)
             }
-            Cmd::DidRenameFiles { files } => state.did_rename_files(&files),
+            Cmd::DidRenameFiles { files } => state.did_rename_files(&files).await,
             Cmd::RequestPrepareRename {
                 request_id,
                 path,
@@ -4654,7 +4661,9 @@ impl WorkerState {
     }
 
     /// `workspace/didRenameFiles` (#610) to every server whose filters match.
-    fn did_rename_files(&self, files: &[FileRename]) {
+    /// Sent inline, like the document sync, so a server sees it in the order
+    /// croft queued it relative to the moved documents' didClose/didOpen.
+    async fn did_rename_files(&self, files: &[FileRename]) {
         for (name, client, matched) in
             self.file_op_audience(files, |c| c.did_rename_filters.as_ref())
         {
@@ -4665,12 +4674,10 @@ impl WorkerState {
                 "lsp[{name}] didRenameFiles: {} file(s)",
                 uris.len()
             ));
-            tokio::spawn(async move {
-                let mut client = client.lock().await;
-                if let Err(e) = client.did_rename_files(&uris) {
-                    log_file::log(&format!("lsp[{name}] didRenameFiles error: {e:#}"));
-                }
-            });
+            let mut client = client.lock().await;
+            if let Err(e) = client.did_rename_files(&uris) {
+                log_file::log(&format!("lsp[{name}] didRenameFiles error: {e:#}"));
+            }
         }
     }
 
@@ -6607,6 +6614,7 @@ mod tests {
             assert!(slot.lock().unwrap().task.is_some());
         });
     }
+
     #[test]
     fn normalise_inlay_hint_flattens_parts_and_folds_padding() {
         // vtsls sends parts labels; rust-analyzer sends plain strings with
@@ -9529,6 +9537,120 @@ while True:
                 )
                 .collect(),
         }
+    }
+
+    /// #610: each interested server is asked once per root, only about the
+    /// files under that root its filters match, and the app's listeners flag
+    /// follows whether any client registered a `willRenameFiles` filter.
+    #[test]
+    fn file_op_audience_filters_by_root_and_asks_each_server_once() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (script, receipt) = mute_pull_server_script(&root);
+        let (a, b) = (root.join("a"), root.join("b"));
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            let config = ServerConfig {
+                name: "mute-pull",
+                command: python.to_string_lossy().into_owned(),
+                args: vec![
+                    script.to_string_lossy().into_owned(),
+                    receipt.to_string_lossy().into_owned(),
+                ],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            };
+            let py = file_op_filters(Some(&file_op_registration(vec![(
+                Some("file"),
+                "**/*.py",
+                None,
+                false,
+            )])));
+            let mut managed = Vec::new();
+            for _ in 0..3 {
+                let (diag_tx, _diag_rx) = std_mpsc::channel();
+                let (prog_tx, _prog_rx) = std_mpsc::channel();
+                let client = LspClient::spawn(
+                    &config,
+                    &root,
+                    build_client_capabilities(),
+                    &[],
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    diag_tx,
+                    prog_tx,
+                )
+                .await
+                .expect("the stub server handshakes");
+                let mut m = managed_client_for_pull_test(client);
+                m.will_rename_filters = py.clone();
+                managed.push(m);
+            }
+            let (diag_tx, _diag_rx) = std_mpsc::channel();
+            let (prog_tx, _prog_rx) = std_mpsc::channel();
+            let listeners = Arc::new(AtomicBool::new(false));
+            let mut state = WorkerState {
+                workspace_root: root.clone(),
+                extra_roots: Vec::new(),
+                registry: ServerRegistry::new(),
+                clients: HashMap::new(),
+                docs: HashMap::new(),
+                capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+                semantic_refresh: Arc::new(AtomicBool::new(false)),
+                inlay_refresh: Arc::new(AtomicBool::new(false)),
+                diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+                will_rename_listeners: listeners.clone(),
+                will_rename_task: WillRenameTask::default(),
+                diagnostics_tx: diag_tx,
+                progress_tx: prog_tx,
+            };
+            state.refresh_will_rename_listeners();
+            assert!(
+                !listeners.load(Ordering::Relaxed),
+                "no clients, no listeners"
+            );
+
+            let third = managed.pop().unwrap();
+            let second = managed.pop().unwrap();
+            let first = managed.pop().unwrap();
+            // One server serving two languages of root `a`, another for `b`.
+            state
+                .clients
+                .insert((Language::PYTHON, a.clone()), vec![first]);
+            state
+                .clients
+                .insert((Language::TYPESCRIPT, a.clone()), vec![second]);
+            state
+                .clients
+                .insert((Language::PYTHON, b.clone()), vec![third]);
+            state.refresh_will_rename_listeners();
+            assert!(listeners.load(Ordering::Relaxed), "a filter was registered");
+
+            let rename = |old: PathBuf| FileRename {
+                new: old.with_extension("new"),
+                old,
+                is_dir: false,
+            };
+            let files = vec![
+                rename(a.join("x.py")),
+                rename(b.join("y.py")),
+                rename(a.join("z.txt")),
+            ];
+            let audience = state.file_op_audience(&files, |c| c.will_rename_filters.as_ref());
+            let asked: Vec<Vec<FileRename>> = audience.into_iter().map(|(_, _, f)| f).collect();
+            assert_eq!(
+                asked,
+                vec![vec![files[0].clone()], vec![files[1].clone()]],
+                "root `a` is asked once, about x.py only; root `b` about y.py"
+            );
+            state.shutdown_all().await;
+        });
     }
 
     /// The `fileOperations` filters pick which renames a server hears about
