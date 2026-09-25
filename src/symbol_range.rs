@@ -112,6 +112,100 @@ impl SymbolRange {
     }
 }
 
+/// Who made an edit, and whether its inserted text ends a line: the two
+/// facts a byte diff cannot recover and `after_attributed_edit` needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditOrigin {
+    /// The edit was typed in the symbol tab itself, whose caret never leaves
+    /// the symbol: an insertion at either edge is the symbol's.
+    pub own: bool,
+    /// The inserted text ends with a newline, so an insertion at the
+    /// symbol's first byte pushes that whole line down rather than joining
+    /// it.
+    pub opens_line: bool,
+}
+
+impl SymbolRange {
+    /// [`Self::after_edit`], with the two edge cases a pure insertion leaves
+    /// ambiguous settled by who typed it.
+    ///
+    /// At the END: `after_edit` puts it below, since from another tab it is
+    /// the start of whatever follows. Typed in the symbol tab, it is Enter or
+    /// a paste on the symbol's last line, and the symbol grows: otherwise a
+    /// function could never gain a trailing line from its own tab.
+    ///
+    /// At the START: `after_edit` keeps it inside, since a character typed
+    /// before `fn` joins the symbol's first line. A new LINE typed there
+    /// from another tab (Enter at column 0 of the first line) belongs above,
+    /// or the tab would gain a blank line it never had.
+    pub fn after_attributed_edit(
+        self,
+        at: usize,
+        removed: usize,
+        inserted: usize,
+        origin: EditOrigin,
+    ) -> RangeAfterEdit {
+        if removed == 0 && inserted > 0 {
+            if origin.own && at == self.end {
+                return RangeAfterEdit::At(SymbolRange::new(self.start, self.end + inserted));
+            }
+            if !origin.own && origin.opens_line && at == self.start {
+                return RangeAfterEdit::At(SymbolRange::new(
+                    self.start + inserted,
+                    self.end + inserted,
+                ));
+            }
+        }
+        self.after_edit(at, removed, inserted)
+    }
+}
+
+/// Place a [`single_edit_span`] where the caret says the edit happened.
+///
+/// A diff cannot tell WHERE in a run of equal bytes an edit landed: Enter at
+/// the end of the line above a symbol (`}` + `\n`) and Enter at column 0 of
+/// the symbol's first line produce the same texts, and the longest-prefix
+/// diff always reports the later one, inside the symbol. The caret sits
+/// just past the inserted text after any typed edit, so `caret - inserted`
+/// is where it began; that placement is used when it describes the same
+/// edit, and the diff's own placement otherwise (a paste far from the
+/// caret, a replace-all).
+pub fn settle_on_caret(
+    old: &str,
+    new: &str,
+    (at, removed, inserted): (usize, usize, usize),
+    caret: usize,
+) -> (usize, usize, usize) {
+    let Some(q) = caret.checked_sub(inserted) else {
+        return (at, removed, inserted);
+    };
+    let fits = q != at
+        && q + removed <= old.len()
+        && q + inserted <= new.len()
+        && new.is_char_boundary(q)
+        && old.is_char_boundary(q)
+        && old.as_bytes()[..q] == new.as_bytes()[..q]
+        && old.as_bytes()[q + removed..] == new.as_bytes()[q + inserted..];
+    if fits {
+        (q, removed, inserted)
+    } else {
+        (at, removed, inserted)
+    }
+}
+
+/// Byte offset of (`row`, `col`), `col` a CHAR index, in `text` whose lines
+/// `\n` separates. Past the end clamps to the end.
+pub fn caret_offset(text: &str, row: usize, col: usize) -> usize {
+    let mut line_start = 0;
+    for (i, line) in text.split('\n').enumerate() {
+        if i == row {
+            return line_start + line.char_indices().nth(col).map_or(line.len(), |(b, _)| b);
+        }
+        line_start += line.len() + 1;
+    }
+    text.len()
+}
+
 /// The innermost symbol whose line range encloses `line`, if any.
 ///
 /// INNERMOST, so a method inside an `impl` wins over the `impl` — a symbol
@@ -196,7 +290,9 @@ pub fn range_for_lines(text: &str, first: usize, last: usize) -> SymbolRange {
 }
 
 /// The 0-based lines a range covers: the line holding `start`, through the
-/// line holding its last byte (`end - 1`; `end` itself is exclusive).
+/// line `end` sits on. `end` is exclusive and sits on the separator after
+/// the last line, or at the start of that line when it is empty (a symbol
+/// that just gained a blank last line), so both count the same way.
 pub fn lines_of(text: &str, range: SymbolRange) -> (usize, usize) {
     let newlines = |upto: usize| {
         text.as_bytes()[..upto.min(text.len())]
@@ -206,7 +302,7 @@ pub fn lines_of(text: &str, range: SymbolRange) -> (usize, usize) {
     };
     let first = newlines(range.start);
     let last = if range.end > range.start {
-        newlines(range.end - 1)
+        newlines(range.end)
     } else {
         first
     };
@@ -234,6 +330,24 @@ pub struct SymbolView {
     /// or a lost range is resolved against. Kept apart from `name` because
     /// an LSP outline may spell the same symbol differently.
     syntax_name: Option<String>,
+    /// The tree-sitter symbol's kind and depth: a lost range re-anchors only
+    /// to a symbol with the same name AND these, so deleting one of several
+    /// `fn new` does not land the tab on another impl's.
+    syntax_shape: Option<(crate::lsp::manager::OutlineKind, u16)>,
+    /// Lines from `first` to the line the tree-sitter symbol starts on. An
+    /// LSP outline's range includes doc comments and attributes, the
+    /// tree-sitter one starts at the item, so this is often not zero.
+    head: usize,
+}
+
+/// Where a caret was when the edit a view follows was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caret {
+    pub row: usize,
+    /// A CHAR index into the row, as the editor keeps it.
+    pub col: usize,
+    /// The edit was made in this view's own tab.
+    pub own: bool,
 }
 
 /// What an edit did to a symbol tab.
@@ -258,21 +372,20 @@ impl SymbolView {
     ) -> Self {
         let range = range_for_lines(&text, first, last);
         let (first, last) = lines_of(&text, range);
-        let syntax_name = kind.and_then(|k| {
-            syntax_symbol_starting_at(
-                &crate::outline_syntax::symbols_for(k, text.as_bytes()),
-                first,
-            )
-            .map(|s| s.name.clone())
-        });
+        let symbols = kind
+            .map(|k| crate::outline_syntax::symbols_for(k, text.as_bytes()))
+            .unwrap_or_default();
+        let sym = syntax_symbol_heading(&symbols, &name, first, last);
         Self {
+            syntax_name: sym.map(|s| s.name.clone()),
+            syntax_shape: sym.map(|s| (s.kind, s.depth)),
+            head: sym.map_or(0, |s| s.range_start_line as usize - first),
             name,
             range,
             first,
             last,
             seen_seq: seq,
             text,
-            syntax_name,
         }
     }
 
@@ -289,25 +402,38 @@ impl SymbolView {
         text: String,
         seq: u64,
         kind: Option<crate::highlight::LangKind>,
+        caret: Option<Caret>,
     ) -> ViewUpdate {
         self.seen_seq = seq;
-        let Some((at, removed, inserted)) = single_edit_span(&self.text, &text) else {
+        let Some(span) = single_edit_span(&self.text, &text) else {
             return ViewUpdate::Kept;
         };
-        let old_first = self.first;
+        let (at, removed, inserted) = match caret {
+            Some(c) => settle_on_caret(&self.text, &text, span, caret_offset(&text, c.row, c.col)),
+            None => span,
+        };
+        let origin = EditOrigin {
+            own: caret.is_some_and(|c| c.own),
+            opens_line: text.as_bytes()[..at + inserted].ends_with(b"\n") && inserted > 0,
+        };
+        let (old_first, old_last) = (self.first, self.last);
         let mut update = ViewUpdate::Kept;
-        match self.range.after_edit(at, removed, inserted) {
+        match self
+            .range
+            .after_attributed_edit(at, removed, inserted, origin)
+        {
             RangeAfterEdit::At(moved) => {
                 self.range = moved;
                 (self.first, self.last) = lines_of(&text, moved);
-                let first_line_end = text[moved.start..]
-                    .find('\n')
-                    .map_or(text.len(), |i| moved.start + i);
-                if at <= first_line_end
+                // Only an edit on the symbol's own head line can rename it.
+                let head_line = (self.first + self.head).min(self.last);
+                let head_start = range_for_lines(&text, head_line, head_line);
+                if at >= head_start.start
+                    && at <= head_start.end
                     && let Some(kind) = kind
                 {
                     let symbols = crate::outline_syntax::symbols_for(kind, text.as_bytes());
-                    if let Some(sym) = syntax_symbol_starting_at(&symbols, self.first)
+                    if let Some(sym) = syntax_symbol_starting_at(&symbols, head_line)
                         && self.syntax_name.as_deref() != Some(sym.name.as_str())
                     {
                         let renamed = self.syntax_name.is_some();
@@ -322,10 +448,18 @@ impl SymbolView {
                 }
             }
             RangeAfterEdit::Gone => {
+                // Re-found only as the same kind of symbol at the same depth,
+                // overlapping the lines it held: another item that merely
+                // shares the name is not this symbol.
                 let found = kind.zip(self.syntax_name.as_deref()).and_then(|(k, want)| {
                     crate::outline_syntax::symbols_for(k, text.as_bytes())
                         .into_iter()
-                        .filter(|s| s.name == want)
+                        .filter(|s| {
+                            s.name == want
+                                && Some((s.kind, s.depth)) == self.syntax_shape
+                                && (s.range_start_line as usize) <= old_last
+                                && (s.range_end_line as usize) >= old_first
+                        })
                         .min_by_key(|s| (s.range_start_line as usize).abs_diff(old_first))
                 });
                 match found {
@@ -336,6 +470,7 @@ impl SymbolView {
                             sym.range_end_line as usize,
                         );
                         (self.first, self.last) = lines_of(&text, self.range);
+                        self.head = 0;
                     }
                     None => update = ViewUpdate::Gone,
                 }
@@ -344,6 +479,23 @@ impl SymbolView {
         self.text = text;
         update
     }
+}
+
+/// The tree-sitter symbol a tab over lines `first..=last` shows: the one
+/// starting on `first`, else, for an LSP range that opens with doc comments
+/// or attributes, the outermost one named `name` starting inside the range.
+fn syntax_symbol_heading<'a>(
+    symbols: &'a [crate::lsp::manager::OutlineSymbol],
+    name: &str,
+    first: usize,
+    last: usize,
+) -> Option<&'a crate::lsp::manager::OutlineSymbol> {
+    syntax_symbol_starting_at(symbols, first).or_else(|| {
+        symbols
+            .iter()
+            .filter(|s| s.name == name && (first..=last).contains(&(s.range_start_line as usize)))
+            .min_by_key(|s| s.range_start_line)
+    })
 }
 
 /// The innermost outline symbol whose range starts on `line`: the one a
@@ -600,15 +752,15 @@ mod tests {
         assert_eq!((v.first, v.last), (4, 6));
 
         let above = edit(SRC, "    1\n", "    1\n    0\n");
-        assert_eq!(v.follow(above.clone(), 2, rust()), ViewUpdate::Kept);
+        assert_eq!(v.follow(above.clone(), 2, rust(), None), ViewUpdate::Kept);
         assert_eq!((v.first, v.last), (5, 7), "moved down one line");
 
         let inside = edit(&above, "    2\n", "    2\n    3\n");
-        assert_eq!(v.follow(inside.clone(), 3, rust()), ViewUpdate::Kept);
+        assert_eq!(v.follow(inside.clone(), 3, rust(), None), ViewUpdate::Kept);
         assert_eq!((v.first, v.last), (5, 8), "grew by one line");
 
         let below = format!("{inside}\n\nfn gamma() {{}}");
-        assert_eq!(v.follow(below, 4, rust()), ViewUpdate::Kept);
+        assert_eq!(v.follow(below, 4, rust(), None), ViewUpdate::Kept);
         assert_eq!((v.first, v.last), (5, 8), "untouched by text below");
         assert_eq!(v.seen_seq, 4);
     }
@@ -619,7 +771,7 @@ mod tests {
         let mut v = beta_view();
         let renamed = edit(SRC, "fn beta", "fn betamax");
         assert_eq!(
-            v.follow(renamed, 2, rust()),
+            v.follow(renamed, 2, rust(), None),
             ViewUpdate::Renamed(String::from("beta"))
         );
         assert_eq!(v.name, "betamax");
@@ -638,11 +790,112 @@ mod tests {
             "    1\n}\n\nfn beta() {\n    2",
             "    9\n}\nfn beta() {\n    8",
         );
-        assert_eq!(v.follow(straddled, 2, rust()), ViewUpdate::Kept);
+        assert_eq!(v.follow(straddled, 2, rust(), None), ViewUpdate::Kept);
         assert_eq!((v.first, v.last), (3, 5));
 
         let mut v = beta_view();
         let gone = edit(SRC, "\n\nfn beta() {\n    2\n}", "");
-        assert_eq!(v.follow(gone, 2, rust()), ViewUpdate::Gone);
+        assert_eq!(v.follow(gone, 2, rust(), None), ViewUpdate::Gone);
+    }
+
+    /// A caret in another tab (`own: false`) at (`row`, `col`).
+    fn there(row: usize, col: usize) -> Option<Caret> {
+        Some(Caret {
+            row,
+            col,
+            own: false,
+        })
+    }
+
+    /// Enter at the end of the line ABOVE a symbol, from another tab, puts
+    /// the new line above it; what is then typed there stays out of it, and
+    /// does not retitle it.
+    #[test]
+    fn a_line_opened_just_above_a_symbol_stays_above_it() {
+        let mut v = beta_view();
+        // Enter after the blank line 3: the caret lands on the new line 4.
+        let opened = edit(SRC, "}\n\nfn beta", "}\n\n\nfn beta");
+        assert_eq!(
+            v.follow(opened.clone(), 2, rust(), there(4, 0)),
+            ViewUpdate::Kept
+        );
+        assert_eq!(
+            (v.first, v.last),
+            (5, 7),
+            "moved down, no blank line gained"
+        );
+
+        let typed = edit(&opened, "\n\nfn beta", "\nfn c() {}\nfn beta");
+        assert_eq!(v.follow(typed, 3, rust(), there(4, 9)), ViewUpdate::Kept);
+        assert_eq!((v.first, v.last), (5, 7));
+        assert_eq!(v.name, "beta");
+    }
+
+    /// Enter at column 0 of a symbol's first line, from another tab, pushes
+    /// the whole symbol down.
+    #[test]
+    fn a_line_opened_before_a_symbol_from_another_tab_is_above_it() {
+        let mut v = beta_view();
+        let opened = edit(SRC, "fn beta", "\nfn beta");
+        assert_eq!(v.follow(opened, 2, rust(), there(5, 0)), ViewUpdate::Kept);
+        assert_eq!((v.first, v.last), (5, 7));
+    }
+
+    /// Enter on a symbol's last line, typed in its own tab, grows it: the
+    /// new line is the symbol's, not the start of what follows.
+    #[test]
+    fn a_line_opened_at_a_symbols_end_from_its_own_tab_grows_it() {
+        let mut v = beta_view();
+        let opened = format!("{SRC}\n");
+        let own = Some(Caret {
+            row: 7,
+            col: 0,
+            own: true,
+        });
+        assert_eq!(v.follow(opened.clone(), 2, rust(), own), ViewUpdate::Kept);
+        assert_eq!((v.first, v.last), (4, 7));
+
+        // The same text from another tab is below the symbol.
+        let mut v = beta_view();
+        assert_eq!(v.follow(opened, 2, rust(), there(7, 0)), ViewUpdate::Kept);
+        assert_eq!((v.first, v.last), (4, 6));
+    }
+
+    /// A lost range does not re-anchor to another symbol that only shares
+    /// the name: deleting `B::new` closes its tab rather than moving it to
+    /// `A::new`.
+    #[test]
+    fn a_deleted_symbol_does_not_reanchor_to_a_namesake() {
+        let src = "impl A {\n    fn new() {}\n}\nimpl B {\n    fn new() {}\n}";
+        let mut v = SymbolView::new(String::from("new"), String::from(src), 4, 4, 1, rust());
+        let gone = edit(src, "impl B {\n    fn new() {}\n}", "impl B {\n}");
+        assert_eq!(v.follow(gone, 2, rust(), None), ViewUpdate::Gone);
+    }
+
+    /// A range that opens with a doc comment, as an LSP outline's does,
+    /// still finds its symbol, so a rename retitles the tab.
+    #[test]
+    fn a_documented_symbol_still_follows_a_rename() {
+        let src = "fn alpha() {}\n/// Doc.\n#[inline]\nfn beta() {\n    2\n}";
+        let mut v = SymbolView::new(String::from("beta"), String::from(src), 1, 5, 1, rust());
+        let renamed = edit(src, "fn beta", "fn betamax");
+        assert_eq!(
+            v.follow(renamed, 2, rust(), None),
+            ViewUpdate::Renamed(String::from("beta"))
+        );
+        assert_eq!((v.first, v.last), (1, 5));
+    }
+
+    /// The caret moves an ambiguous span to where it was typed, and leaves
+    /// one that does not fit (a paste elsewhere) alone.
+    #[test]
+    fn the_caret_settles_an_ambiguous_span() {
+        let (old, new) = ("}\n\nfn", "}\n\n\nfn");
+        let span = single_edit_span(old, new).unwrap();
+        assert_eq!(span, (3, 0, 1));
+        assert_eq!(settle_on_caret(old, new, span, 2), (1, 0, 1));
+        assert_eq!(settle_on_caret(old, new, span, 6), span, "does not fit");
+        assert_eq!(caret_offset("ab\nçd", 1, 1), 5, "char col, byte offset");
+        assert_eq!(caret_offset("ab", 5, 0), 2, "past the end clamps");
     }
 }

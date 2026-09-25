@@ -43016,7 +43016,8 @@ fn a_symbol_tab_mirrors_its_file_and_follows_the_symbol() {
     app.editor.cursor_col = 5;
     app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
         .unwrap();
-    assert!(app.sync_symbol_views());
+    // The key itself mirrors the edit, so nothing is left for the tick.
+    assert!(!app.sync_symbol_views());
     assert_eq!(app.editor.editors[0].lines[4], "    27");
     assert!(
         app.editor.editors[0].dirty,
@@ -43191,6 +43192,148 @@ fn session_capture_keeps_a_symbol_tab_only_when_it_is_the_files_last_tab() {
             .unwrap()
             .contains("    9")
     );
+}
+
+/// #369: an edit on a symbol's edge lands on the side its caret is on.
+///
+/// Enter at the end of the symbol, typed in its own tab, opens a line the
+/// tab keeps showing, so the caret stays on it; Enter at the start of the
+/// symbol's first line, typed in the file's tab, opens a line above it that
+/// the clip leaves out.
+/// #369: scrolling a symbol tab stops once its last line reaches the pane's
+/// bottom; a short symbol never leaves a lone line above blank rows.
+#[test]
+fn a_symbol_tab_never_scrolls_its_tail_off_a_pane_it_fits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 0;
+    app.editor.scroll = 5;
+    painted(&mut app);
+    assert_eq!(
+        app.editor.scroll, 3,
+        "fn b's three lines fill the pane top down"
+    );
+}
+
+#[test]
+fn a_line_opened_on_a_symbols_edge_goes_where_the_caret_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[6], "z", "the caret stayed on the new line");
+    assert_eq!(app.editor.cursor_row, 6);
+    let view = app.editor.editors[1].symbol_view.as_ref().unwrap();
+    assert_eq!((view.first, view.last), (3, 6), "the symbol grew");
+
+    app.editor.select(0);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let view = app.editor.editors[1].symbol_view.as_ref().unwrap();
+    assert_eq!(
+        (view.first, view.last),
+        (4, 7),
+        "the opened line is above the symbol"
+    );
+}
+
+/// #369: a mirrored tab undoes as far as the tab that was typed in.
+///
+/// A typing burst is one undo step where it was typed, so it is one step in
+/// the file's tab too, and a selection away from the edit survives it.
+#[test]
+fn a_mirrored_typing_burst_is_one_undo_step_and_keeps_a_distant_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    let before = app.editor.lines.clone();
+    let mut sel = crate::widgets::editor::EditorSelection::new(0, 0);
+    sel.head = (0, 4);
+    app.editor.editors[0].selection = Some(sel);
+
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    for c in ['a', 'b', 'c'] {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(app.editor.editors[0].lines[4], "    2abc");
+    assert_eq!(
+        app.editor.editors[0].selection,
+        Some(sel),
+        "a selection clear of the edit is kept"
+    );
+    assert!(app.editor.editors[0].undo());
+    assert!(app.editor.editors[1].undo());
+    assert_eq!(app.editor.editors[1].lines, before);
+    assert_eq!(
+        app.editor.editors[0].lines, before,
+        "one undo takes back the whole burst in the file's tab too"
+    );
+}
+
+/// #369: Join Lines, a counted line delete, find and Replace All stay
+/// inside the symbol.
+#[test]
+fn line_joins_counted_deletes_and_find_stay_in_the_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 1;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    assert_eq!(app.editor.symbol_clip(), Some((0, 3)));
+    let before = app.editor.lines.clone();
+
+    app.editor.cursor_row = 2;
+    app.editor.join_lines();
+    assert_eq!(app.editor.lines, before, "the last line joins nothing");
+
+    // Find wraps within the symbol: from `fn a`'s `}`, the next `}` is
+    // that same one, not `fn b`'s.
+    let opts = crate::widgets::search::SearchOpts::default();
+    let m = app.editor_find_step(true, "}", opts, 2, 0, true).unwrap();
+    assert_eq!(m.row, 2);
+
+    let mut find = crate::widgets::editor_find::EditorFind::new("fn".into(), opts);
+    find.replace_visible = true;
+    find.replace = "FN".into();
+    app.editor_find = Some(find);
+    app.editor_find_replace_all();
+    assert_eq!(app.editor.lines[0], "FN a() {");
+    assert_eq!(app.editor.lines[3], "fn b() {", "outside the symbol");
+
+    app.editor.cursor_row = 1;
+    app.editor.delete_lines(10);
+    assert_eq!(
+        app.editor.lines,
+        ["FN a() {", "fn b() {", "    2", "}"],
+        "the count stops at the symbol's end"
+    );
+}
+
+/// #369: two symbol tabs of one file with no file tab restore as ONE tab.
+#[test]
+fn session_capture_keeps_one_tab_for_orphaned_symbol_tabs_of_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.editor.close_tab(0);
+    app.open_symbol_tab_for("a".into(), 0, 2);
+    assert_eq!(app.editor.editors.len(), 2);
+    let state = app.capture_session_state();
+    assert_eq!(state.tabs.len(), 1);
+    assert_eq!(state.tabs[0].path, file);
 }
 
 /// #369: going to a file lands on the tab that shows ALL of it.

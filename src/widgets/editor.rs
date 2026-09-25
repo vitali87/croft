@@ -56,6 +56,13 @@ fn next_image_generation() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A fresh id for an undo step, unique across every editor, so a symbol-tab
+/// sibling can tell one of its source's steps from the next (#369).
+fn next_undo_step_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PdfState {
     pub source_path: PathBuf,
@@ -2721,6 +2728,15 @@ pub struct Editor {
     /// symbol-tab siblings. `None` = not (yet) mirrored with them, so this
     /// buffer is a copy that may predate them and never a mirror source.
     pub mirror_seq: Option<u64>,
+    /// Id of this buffer's latest undo step (or undo/redo), 0 before any.
+    /// A mirrored sibling takes one step per source step, so undo walks it
+    /// back as far as the source's own undo would.
+    pub undo_step_id: u64,
+    /// The source step the last mirrored edit was folded into.
+    mirrored_step: Option<u64>,
+    /// Where the source's caret sat after the edit last mirrored in: the
+    /// symbol view settles an ambiguous edit against it (#369).
+    pub mirror_caret: Option<(usize, usize)>,
     undo_stack: Vec<Snapshot>,
     /// States popped off `undo_stack` by `undo`, awaiting `redo`. Cleared by any
     /// fresh edit (`push_undo`) so a new edit branches history like VS Code.
@@ -2985,6 +3001,9 @@ impl Editor {
             edit_seq: 0,
             symbol_view: None,
             mirror_seq: None,
+            undo_step_id: 0,
+            mirrored_step: None,
+            mirror_caret: None,
             ruler_search_cache: None,
             ruler_starts_cache: None,
             collab_synced_seq: 0,
@@ -4634,6 +4653,8 @@ impl Editor {
             // that file: its clip and mirror state described the old one.
             self.symbol_view = None;
             self.mirror_seq = None;
+            self.mirrored_step = None;
+            self.mirror_caret = None;
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -8214,6 +8235,8 @@ impl Editor {
             if self.undo_stack.len() > UNDO_STACK_LIMIT {
                 self.undo_stack.remove(0);
             }
+            self.undo_step_id = next_undo_step_id();
+            self.mirrored_step = None;
         }
         // A fresh edit branches history: whatever was undone can no longer be
         // redone (VS Code's model). Cleared even on a coalesced keystroke so a
@@ -8230,6 +8253,7 @@ impl Editor {
         // Stash the pre-undo state so `redo` can reinstate it.
         self.redo_stack.push(self.snapshot());
         self.restore_snapshot(snap);
+        self.undo_step_id = next_undo_step_id();
         true
     }
 
@@ -8242,6 +8266,7 @@ impl Editor {
         };
         self.undo_stack.push(self.snapshot());
         self.restore_snapshot(snap);
+        self.undo_step_id = next_undo_step_id();
         true
     }
 
@@ -8684,7 +8709,9 @@ impl Editor {
         self.clear_selection();
         let n = count.max(1);
         let start = self.cursor_row;
-        let end = (start + n).min(self.lines.len());
+        // A count on a symbol tab stops at the symbol's last line.
+        let limit = self.symbol_clip().map_or(self.lines.len(), |(_, e)| e);
+        let end = (start + n).min(limit).max(start + 1).min(self.lines.len());
         let yanked = self.lines_slice_text(start, end - start);
         self.lines.drain(start..end);
         if self.lines.is_empty() {
@@ -8895,10 +8922,20 @@ impl Editor {
         self.recompute_highlights();
     }
 
-    /// Take a sibling's text as one undo step, replacing only the lines that
-    /// differ so a caret below the change moves with its line rather than
+    /// Take a sibling's text, replacing only the lines that differ so a
+    /// caret or selection below the change moves with its line rather than
     /// staying on a row number that now holds different text.
-    pub fn mirror_lines_from(&mut self, new_lines: &[String]) {
+    ///
+    /// `source_step` is the sibling's [`Self::undo_step_id`]: edits it made
+    /// within one of its undo steps (a typing burst) fold into one step
+    /// here, so undo in this tab walks back as far as it would there.
+    /// `source_caret` is where the sibling's caret sits after the edit.
+    pub fn mirror_lines_from(
+        &mut self,
+        new_lines: &[String],
+        source_step: u64,
+        source_caret: (usize, usize),
+    ) {
         if self.lines == new_lines || new_lines.is_empty() {
             return;
         }
@@ -8920,12 +8957,30 @@ impl Editor {
         let old_end = self.lines.len() - suffix;
         let new_end = new_lines.len() - suffix;
         self.pin_on_edit();
-        self.push_undo(EditKind::Replace);
-        self.clear_selection();
+        if self.mirrored_step == Some(source_step) {
+            self.seed_bookmark_shadow();
+            self.redo_stack.clear();
+        } else {
+            self.push_undo(EditKind::Replace);
+            self.mirrored_step = Some(source_step);
+        }
+        // A selection clear of the changed lines survives, moving with its
+        // lines; one touching them is cleared.
+        let shift = |row: usize| row + new_end - old_end;
+        if let Some(sel) = self.selection.as_mut() {
+            let (lo, hi) = (sel.anchor.0.min(sel.head.0), sel.anchor.0.max(sel.head.0));
+            if lo >= old_end {
+                sel.anchor.0 = shift(sel.anchor.0);
+                sel.head.0 = shift(sel.head.0);
+            } else if hi >= prefix {
+                self.selection = None;
+            }
+        }
+        self.mirror_caret = Some(source_caret);
         self.lines
             .splice(prefix..old_end, new_lines[prefix..new_end].iter().cloned());
         if self.cursor_row >= old_end {
-            self.cursor_row = self.cursor_row + new_end - old_end;
+            self.cursor_row = shift(self.cursor_row);
         }
         self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
@@ -9240,7 +9295,8 @@ impl Editor {
     pub fn join_lines(&mut self) {
         let (start, end) = self.selected_or_cursor_row_range();
         let last = if start == end { start + 1 } else { end };
-        if last >= self.lines.len() {
+        // A symbol tab's last line has nothing below it to join.
+        if last >= self.symbol_clip().map_or(self.lines.len(), |(_, e)| e) {
             return;
         }
         self.push_undo(EditKind::JoinLines);
@@ -10369,6 +10425,15 @@ impl Editor {
         let v = self.symbol_view.as_ref()?;
         let end = (v.last + 1).min(self.lines.len()).max(1);
         Some((v.first.min(end - 1), end))
+    }
+
+    /// The lines find and replace work over, and the row of the first: a
+    /// symbol tab's symbol, or the whole buffer.
+    pub fn find_scope(&self) -> (&[String], usize) {
+        match self.symbol_clip() {
+            Some((first, end)) => (&self.lines[first..end], first),
+            None => (&self.lines, 0),
+        }
     }
 
     /// The clip in the scrollbar's units: content rows above it, and rows
@@ -12394,7 +12459,24 @@ impl Widget for &mut Editor {
                 }
             }
             if let Some((first, end)) = self.symbol_clip() {
-                self.scroll = self.scroll.clamp(first, end - 1);
+                // The lowest top that still fills the pane with the clip's
+                // tail, so scrolling never strands one clip line at the top.
+                let bw = inner.width.saturating_sub(gutter_width + 3) as usize;
+                let (mut top, mut rows) = (end, 0);
+                while top > first {
+                    let line = top - 1;
+                    let need = if self.is_line_hidden(line) {
+                        0
+                    } else {
+                        1 + self.box_rows_between(line, top, bw)
+                    };
+                    if rows + need > text_height {
+                        break;
+                    }
+                    rows += need;
+                    top = line;
+                }
+                self.scroll = self.scroll.clamp(first, top.min(end - 1));
             }
             if self.scroll != scroll_before {
                 self.scroll_sub = 0;

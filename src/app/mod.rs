@@ -19304,6 +19304,10 @@ impl App {
                     }
                 }
                 self.handle_editor_key(key);
+                // Settle the clip on this edit before clamping the caret to
+                // it: a line opened at the symbol's end grows the clip, so
+                // the caret on it is inside, not past it (#369).
+                self.sync_symbol_views();
                 // A symbol tab's caret never leaves its symbol (#369).
                 self.editor.clamp_to_symbol_view();
                 self.poke_cursor();
@@ -26319,10 +26323,12 @@ impl App {
             .or_else(|| members.iter().position(|(_, ed)| ed.mirror_seq.is_some()))
             .unwrap_or(0);
         let lines = members[source].1.lines.clone();
+        let step = members[source].1.undo_step_id;
+        let caret = (members[source].1.cursor_row, members[source].1.cursor_col);
         let mut changed = false;
         for (i, (_, ed)) in members.iter_mut().enumerate() {
             if i != source && ed.lines != lines {
-                ed.mirror_lines_from(&lines);
+                ed.mirror_lines_from(&lines, step, caret);
                 changed = true;
             }
         }
@@ -26353,11 +26359,25 @@ impl App {
             }
             let kind = ed.path.as_deref().and_then(syntax_kind_of);
             let text = ed.lines.join("\n");
+            // The caret that made the edit: a sibling's, mirrored in, or
+            // this tab's own.
+            let caret = match ed.mirror_caret.take() {
+                Some((row, col)) => crate::symbol_range::Caret {
+                    row,
+                    col,
+                    own: false,
+                },
+                None => crate::symbol_range::Caret {
+                    row: ed.cursor_row,
+                    col: ed.cursor_col,
+                    own: true,
+                },
+            };
             let Some(view) = ed.symbol_view.as_mut() else {
                 return false;
             };
             changed = true;
-            match view.follow(text, seq, kind) {
+            match view.follow(text, seq, kind, Some(caret)) {
                 crate::symbol_range::ViewUpdate::Kept => false,
                 crate::symbol_range::ViewUpdate::Renamed(old) => {
                     notes.push(format!("{old} is now {}", view.name));
@@ -27736,7 +27756,12 @@ impl App {
             // A symbol tab is a view over its file's tab (#369): the file tab
             // carries the text, so only an orphaned symbol tab is kept, as a
             // plain file tab, to keep its unsaved edits.
-            if ed.symbol_view.is_some() && self.editor.find_tab_with_path(&path).is_some() {
+            if ed.symbol_view.is_some()
+                && (self.editor.find_tab_with_path(&path).is_some()
+                    || tabs
+                        .iter()
+                        .any(|t: &crate::session_state::OpenTabState| t.path == path))
+            {
                 if idx == self.editor.active_index() {
                     active_path = Some(path);
                 }
@@ -34737,7 +34762,17 @@ impl App {
             (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
                 let target = picker.selected_item().map(|i| i.path.clone());
                 self.jump_to_workspace_symbol_selection();
-                if target.is_some() && self.editor.path == target {
+                // The server's path may be spelled differently from the
+                // tab's (a symlink, `..`): a landed jump is the same file.
+                let landed = match (target, self.editor.path.as_ref()) {
+                    (Some(t), Some(p)) => {
+                        &t == p
+                            || std::fs::canonicalize(&t)
+                                .is_ok_and(|t| std::fs::canonicalize(p).is_ok_and(|p| p == t))
+                    }
+                    _ => false,
+                };
+                if landed {
                     self.open_symbol_tab();
                 }
             }
@@ -37753,7 +37788,11 @@ impl App {
         state.query = new_query;
         let opts = state.opts;
         state.set_match_count(
-            crate::widgets::editor_find::count_matches(&self.editor.lines, &state.query, opts),
+            crate::widgets::editor_find::count_matches(
+                self.editor.find_scope().0,
+                &state.query,
+                opts,
+            ),
             false,
         );
         if state.query.is_empty() {
@@ -37762,18 +37801,11 @@ impl App {
             self.editor.set_search_highlight(None, opts);
             return;
         }
-        self.editor
-            .set_search_highlight(Some(state.query.clone()), opts);
+        let query = state.query.clone();
+        self.editor.set_search_highlight(Some(query.clone()), opts);
         let from_row = self.editor.cursor_row;
         let from_col = self.editor.cursor_col;
-        if let Some(m) = crate::widgets::editor_find::find_next_match(
-            &self.editor.lines,
-            &state.query,
-            opts,
-            from_row,
-            from_col,
-            false,
-        ) {
+        if let Some(m) = self.editor_find_step(true, &query, opts, from_row, from_col, false) {
             self.jump_editor_to_match(m);
         }
         self.refresh_editor_find_index();
@@ -37796,8 +37828,8 @@ impl App {
         }
         let opts = state.opts;
         let needle = state.query.clone();
-        if let Some(m) = crate::widgets::editor_find::find_next_match(
-            &self.editor.lines,
+        if let Some(m) = self.editor_find_step(
+            true,
             &needle,
             opts,
             self.editor.cursor_row,
@@ -37830,8 +37862,8 @@ impl App {
         }
         let opts = state.opts;
         let needle = state.query.clone();
-        if let Some(m) = crate::widgets::editor_find::find_prev_match(
-            &self.editor.lines,
+        if let Some(m) = self.editor_find_step(
+            false,
             &needle,
             opts,
             self.editor.cursor_row,
@@ -37994,17 +38026,41 @@ impl App {
         self.editor.ensure_cursor_col_visible();
     }
 
+    /// The next (`forward`) or previous find-bar match from `(row, col)`,
+    /// searching and wrapping within a symbol tab's symbol only (#369).
+    fn editor_find_step(
+        &self,
+        forward: bool,
+        needle: &str,
+        opts: crate::widgets::search::SearchOpts,
+        row: usize,
+        col: usize,
+        skip_current: bool,
+    ) -> Option<crate::widgets::editor_find::MatchPos> {
+        let (scope, first) = self.editor.find_scope();
+        let row = row.saturating_sub(first).min(scope.len().saturating_sub(1));
+        let step = if forward {
+            crate::widgets::editor_find::find_next_match
+        } else {
+            crate::widgets::editor_find::find_prev_match
+        };
+        let mut m = step(scope, needle, opts, row, col, skip_current)?;
+        m.row += first;
+        Some(m)
+    }
+
     fn refresh_editor_find_index(&mut self) {
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
         let opts = state.opts;
         let needle = state.query.clone();
+        let (scope, first) = self.editor.find_scope();
         state.match_index = crate::widgets::editor_find::match_index_at(
-            &self.editor.lines,
+            scope,
             &needle,
             opts,
-            self.editor.cursor_row,
+            self.editor.cursor_row.saturating_sub(first),
             self.editor.cursor_col,
         );
     }
@@ -38145,12 +38201,16 @@ impl App {
         self.editor.set_search_highlight(Some(needle.clone()), opts);
         if let Some(s) = self.editor_find.as_mut() {
             s.set_match_count(
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts),
+                crate::widgets::editor_find::count_matches(
+                    self.editor.find_scope().0,
+                    &needle,
+                    opts,
+                ),
                 false,
             );
         }
-        if let Some(m) = crate::widgets::editor_find::find_next_match(
-            &self.editor.lines,
+        if let Some(m) = self.editor_find_step(
+            true,
             &needle,
             opts,
             self.editor.cursor_row,
@@ -38175,14 +38235,17 @@ impl App {
             return;
         }
         let (needle, replacement, opts) = (state.query.clone(), state.replace.clone(), state.opts);
-        let Some((new_lines, n)) = crate::widgets::editor_find::replace_all_in_lines(
-            &self.editor.lines,
-            &needle,
-            &replacement,
-            opts,
-        ) else {
+        // A symbol tab replaces within its symbol only (#369).
+        let (scope, first) = self.editor.find_scope();
+        let scope_end = first + scope.len();
+        let Some((replaced, n)) =
+            crate::widgets::editor_find::replace_all_in_lines(scope, &needle, &replacement, opts)
+        else {
             return;
         };
+        let mut new_lines = self.editor.lines[..first].to_vec();
+        new_lines.extend(replaced);
+        new_lines.extend_from_slice(&self.editor.lines[scope_end..]);
         if n == 0 {
             self.status = String::from("Replace All: no matches");
             return;
@@ -38194,7 +38257,11 @@ impl App {
             // matches, and a hard zero would read "No results" over a body
             // still painted full of highlights.
             s.set_match_count(
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts),
+                crate::widgets::editor_find::count_matches(
+                    self.editor.find_scope().0,
+                    &needle,
+                    opts,
+                ),
                 false,
             );
             s.match_index = None;
@@ -50635,6 +50702,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             run_pending_scp_uploads(app, terminal)?;
             needs_redraw = true;
         }
+        // Same-file tabs agree before the watcher is read: a save from one
+        // symbol tab leaves its siblings holding the saved text, so the
+        // change event reads as their own write, not a conflict (#369).
+        let symbol_views_settled = app.sync_symbol_views();
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         let fs_changed = app.drain_fs_events();
@@ -50658,7 +50729,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
         let collab_changed = app.poll_collab();
-        let symbol_views_changed = app.sync_symbol_views();
+        let symbol_views_changed = app.sync_symbol_views() | symbol_views_settled;
         let bells_changed = app.drain_terminal_bells();
         // A block whose command has finished gets its output box (#354).
         let captures_changed = app.settle_block_captures();
