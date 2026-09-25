@@ -138,6 +138,13 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         solo: bool,
     },
+    /// Open a workspace inside the container its devcontainer.json
+    /// describes (#617): build or start the container, install croft in it,
+    /// then run croft there.
+    Devcontainer {
+        /// Workspace folder (defaults to the current directory).
+        path: Option<String>,
+    },
     /// Attach to (or create) a persistent local session for a workspace, so its
     /// terminals, LSP, DAP, and editor state survive closing the window. Detach
     /// by closing the window; reattach by running `croft attach` again. Runs
@@ -431,6 +438,7 @@ impl Cli {
                     crate::remote::RemoteOutcome::Exited => Ok(()),
                 }
             }
+            Some(CliCommand::Devcontainer { path }) => crate::devcontainer::open(path),
             Some(CliCommand::Attach { path, solo }) => crate::session::attach(path, solo),
             Some(CliCommand::Ls) => crate::session::list(),
             Some(CliCommand::Plot {
@@ -2105,6 +2113,11 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(CliCommand::Remote { solo: true, .. })
+        ));
+        let cli = Cli::parse_from(["croft", "devcontainer", "/work"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Devcontainer { path: Some(ref p) }) if p == "/work"
         ));
         let cli = Cli::parse_from(["croft", "remote", "reasoner"]);
         assert!(matches!(
