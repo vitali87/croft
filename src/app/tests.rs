@@ -50507,3 +50507,23 @@ fn x_dismisses_the_selected_results_code_scanning_alert_with_a_reason() {
         "the dismissed result leaves the default list"
     );
 }
+
+#[test]
+fn the_info_tab_lists_the_results_taxa() {
+    // #577: CWE / OWASP entries a result names, resolved through taxonomies.
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("t.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"T"}},
+            "taxonomies":[{"name":"CWE","taxa":[{"id":"CWE-89","name":"SqlInjection"}]}],
+            "results":[{"ruleId":"R1","message":{"text":"m"},
+              "taxa":[{"id":"CWE-89","toolComponent":{"name":"CWE"}}]}]}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.editor.sarif.as_mut().unwrap().selected = 1;
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("CWE CWE-89: SqlInjection"), "{screen}");
+}

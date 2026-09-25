@@ -86,9 +86,80 @@ pub struct Details {
     pub guid: Option<String>,
     pub rank: Option<f64>,
     pub occurrence_count: Option<i64>,
+    /// Taxonomy entries (CWE, OWASP, ...) the result or its rule names,
+    /// resolved through `run.taxonomies` (§3.27.26, §3.49.15).
+    pub taxa: Vec<String>,
     /// Every thread flow of every code flow, in order.
     pub threads: Vec<Thread>,
     pub stacks: Vec<StackView>,
+}
+
+/// The label of one taxon reference: "<taxonomy> <id>: <description>".
+/// The taxonomy is found by `toolComponent` index, name or guid; the taxon
+/// by index, id or guid. What does not resolve keeps the reference's own id.
+fn taxon_label(run: &Run, r: &crate::sarif::model::ReportingDescriptorReference) -> Option<String> {
+    let tc = r.tool_component.as_ref()?;
+    let taxonomy = tc
+        .index
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| run.taxonomies.get(i))
+        .or_else(|| {
+            run.taxonomies.iter().find(|t| {
+                tc.name.as_deref().is_some_and(|n| n == t.name)
+                    || (tc.guid.is_some() && tc.guid == t.guid)
+            })
+        });
+    let taxon = taxonomy.and_then(|t| {
+        r.index
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| t.taxa.get(i))
+            .or_else(|| {
+                t.taxa.iter().find(|x| {
+                    r.id.as_deref().is_some_and(|id| id == x.id)
+                        || (r.guid.is_some() && r.guid == x.guid)
+                })
+            })
+    });
+    let name = taxonomy
+        .map(|t| t.name.clone())
+        .or_else(|| tc.name.clone())
+        .unwrap_or_default();
+    let id = taxon
+        .map(|x| x.id.clone())
+        .or_else(|| r.id.clone())
+        .or_else(|| r.guid.clone())?;
+    let what = taxon.and_then(|x| {
+        x.short_description
+            .as_ref()
+            .map(|d| d.text.clone())
+            .or_else(|| x.name.clone())
+    });
+    let head = format!("{name} {id}").trim().to_string();
+    Some(match what {
+        Some(w) if !w.is_empty() => format!("{head}: {w}"),
+        _ => head,
+    })
+}
+
+/// The labels of every taxon the result or its rule refers to: the
+/// result's `taxa` first, then the rule's relationships that point into a
+/// taxonomy, each once.
+fn taxa(
+    run: &Run,
+    result: &SarifResult,
+    rule: Option<&crate::sarif::model::ReportingDescriptor>,
+) -> Vec<String> {
+    let refs = result.taxa.iter().chain(
+        rule.into_iter()
+            .flat_map(|r| r.relationships.iter().map(|rel| &rel.target)),
+    );
+    let mut out: Vec<String> = Vec::new();
+    for label in refs.filter_map(|r| taxon_label(run, r)) {
+        if !out.contains(&label) {
+            out.push(label);
+        }
+    }
+    out
 }
 
 pub fn details(run: &Run, result: &SarifResult, roots: &[PathBuf]) -> Details {
@@ -216,6 +287,7 @@ pub fn details(run: &Run, result: &SarifResult, roots: &[PathBuf]) -> Details {
         guid: result.guid.clone(),
         rank: result.rank,
         occurrence_count: result.occurrence_count,
+        taxa: taxa(run, result, rule),
         threads,
         stacks,
     }
@@ -570,5 +642,36 @@ mod tests {
         assert!(raw.contains("\"occurrenceCount\": 3"));
         assert!(raw_result_json(&p, 0, 5).is_none());
         assert!(raw_result_json(&dir.path().join("missing.sarif"), 0, 0).is_none());
+    }
+
+    #[test]
+    fn taxa_come_from_the_result_and_the_rules_relationships() {
+        let log = parse_log(
+            r#"{"version":"2.1.0","runs":[{
+              "tool":{"driver":{"name":"T","rules":[{"id":"R1","relationships":[
+                {"target":{"id":"CWE-89","toolComponent":{"name":"CWE"}},"kinds":["superset"]},
+                {"target":{"index":1,"toolComponent":{"index":0}}}]}]}},
+              "taxonomies":[{"name":"CWE","taxa":[
+                {"id":"CWE-89","name":"SqlInjection","shortDescription":{"text":"Improper Neutralization of SQL"}},
+                {"id":"CWE-20","shortDescription":{"text":"Improper Input Validation"}}]},
+                {"name":"OWASP","taxa":[{"id":"A03","name":"Injection"}]}],
+              "results":[{"ruleId":"R1","ruleIndex":0,"message":{"text":"m"},
+                "taxa":[{"id":"A03","toolComponent":{"name":"OWASP"}},
+                        {"id":"CWE-89","toolComponent":{"name":"CWE"}},
+                        {"id":"X-1","toolComponent":{"name":"Unknown"}}]}]}]}"#,
+        )
+        .unwrap();
+        let run = &log.runs[0];
+        let d = details(run, &run.results.as_ref().unwrap()[0], &[]);
+        assert_eq!(
+            d.taxa,
+            vec![
+                "OWASP A03: Injection",
+                "CWE CWE-89: Improper Neutralization of SQL",
+                "Unknown X-1",
+                "CWE CWE-20: Improper Input Validation",
+            ],
+            "result taxa first, then the rule's, each once; an unresolved one keeps its id"
+        );
     }
 }

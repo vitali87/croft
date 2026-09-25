@@ -438,6 +438,15 @@ fn render_details(
             if let Some(u) = &d.help_uri {
                 lines.push((u.clone(), dim));
             }
+            if !d.taxa.is_empty() {
+                lines.push((String::new(), text));
+                lines.push(("taxa".to_string(), text.add_modifier(Modifier::BOLD)));
+                for t in &d.taxa {
+                    for l in wrap(t, w) {
+                        lines.push((l, text));
+                    }
+                }
+            }
             if !d.properties.is_empty() || !d.fingerprints.is_empty() {
                 lines.push((String::new(), text));
             }
