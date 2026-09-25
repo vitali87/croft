@@ -43295,6 +43295,58 @@ fn a_deferred_format_on_save_write_cleans_the_symbol_tabs_sibling() {
     assert!(!app.reload_open_file_after_external_change());
 }
 
+/// #369: a format-on-save reply that lands after the user moved to another
+/// file writes the requested file's tab and still settles its symbol tab.
+#[test]
+fn a_late_format_on_save_write_cleans_the_symbol_tabs_sibling_from_another_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    let other = tmp.path().join("other.rs");
+    std::fs::write(&other, "fn c() {}").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(other.as_path()));
+    app.save_after_format = Some(file.clone());
+    app.complete_pending_save();
+    assert!(std::fs::read_to_string(&file).unwrap().contains("27"));
+    let tabs: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .filter(|e| e.path.as_deref() == Some(file.as_path()))
+        .collect();
+    assert_eq!(tabs.len(), 2, "fixture: the file and its symbol tab");
+    assert!(tabs.iter().all(|e| !e.dirty), "both tabs are saved");
+}
+
+/// #369: the focus-change sweep, which waits for no delay, also writes a
+/// file with a symbol tab once and cleans both when focus leaves the editor.
+#[test]
+fn a_focus_change_save_writes_a_file_with_a_symbol_tab_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert!(app.editor.editors.iter().all(|e| e.dirty), "fixture");
+    // Focus left the editor, so both tabs are due at once.
+    app.focus = Pane::Tree;
+    assert!(app.sweep_auto_save(false));
+    assert!(std::fs::read_to_string(&file).unwrap().contains("27"));
+    for e in &app.editor.editors {
+        assert!(!e.dirty && !e.disk_conflict, "both tabs are saved");
+    }
+    assert!(app.input_prompt.is_none(), "no conflict prompt");
+}
+
 /// #369: every way in opens the same symbol tab.
 ///
 /// `Cmd+K V` takes the symbol at the caret, and an OUTLINE row's right-click
