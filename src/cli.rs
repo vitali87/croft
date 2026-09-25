@@ -140,7 +140,8 @@ pub enum CliCommand {
     },
     /// Attach to (or create) a persistent local session for a workspace, so its
     /// terminals, LSP, DAP, and editor state survive closing the window. Detach
-    /// by closing the window; reattach by running `croft attach` again. Runs
+    /// with Session: Detach (Cmd+K Shift+A) or by closing the window; reattach
+    /// by running `croft attach` again. Runs
     /// under croft's built-in session host, which also lets others co-attach (no
     /// external dependency); sessions started by an older croft under dtach keep
     /// reattaching through dtach until they end.

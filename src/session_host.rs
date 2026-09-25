@@ -238,8 +238,8 @@ fn classify_csi(params: &[u8], last: u8) -> ChordKey {
     if event == 3 {
         return ChordKey::Ignore;
     }
-    // Shift, Alt, Ctrl, Super; the lock bits (Caps, Num) do not change the key.
-    let held = mods.saturating_sub(1) & 0b1111;
+    // The lock bits (Caps 64, Num 128) do not change which key it is.
+    let held = mods.saturating_sub(1) & !(64 | 128);
     match (code, held) {
         (Some(107), 8) => ChordKey::CmdK,
         (Some(97 | 65), 1) => ChordKey::ShiftA,
@@ -250,8 +250,15 @@ fn classify_csi(params: &[u8], last: u8) -> ChordKey {
 impl DetachChord {
     /// Feed one chunk of a client's input; true when it completes the chord.
     fn feed(&mut self, bytes: &[u8], now: Instant) -> bool {
-        let mut input = std::mem::take(&mut self.partial);
-        input.extend_from_slice(bytes);
+        let joined;
+        let input: &[u8] = if self.partial.is_empty() {
+            bytes
+        } else {
+            let mut held = std::mem::take(&mut self.partial);
+            held.extend_from_slice(bytes);
+            joined = held;
+            &joined
+        };
         let mut i = 0;
         while i < input.len() {
             let key = if input[i] == 0x1b {
@@ -2010,7 +2017,7 @@ pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
 
 /// The line a detached client leaves in the shell (#679).
 const DETACHED_NOTE: &str =
-    "Detached from the croft session; it keeps running. Run the same command to reattach.";
+    "Detached from the croft session; it keeps running. Attach again to return to it.";
 
 /// Pump the attach, reconnecting across host swaps (#238): a HostSwap frame
 /// means the host is re-execing into the updated binary and the socket
@@ -2025,8 +2032,9 @@ fn attach_client_loop(socket: &Path, stream: &mut UnixStream) -> Result<PumpOutc
             PumpOutcome::HostSwapped => {
                 let Some(fresh) = reconnect_after_swap(socket) else {
                     // The successor never came up: from here the session is
-                    // as gone as a killed server, which is an Exit(0) detach.
-                    return Ok(PumpOutcome::Exit(0));
+                    // as gone as a killed server, and the screen still holds
+                    // the inner croft's modes.
+                    return Ok(PumpOutcome::Disconnected);
                 };
                 *tx.lock().unwrap() = fresh.try_clone().context("cloning socket")?;
                 *stream = fresh;
@@ -3520,6 +3528,9 @@ mod tests {
             chord.feed(b"\x1b\x1b[107;9uA", now),
             "Escape, then the chord"
         );
+        // A CSI-u Shift+A carrying its shifted key as an alternate.
+        let mut chord = DetachChord::default();
+        assert!(chord.feed(b"\x1b[107;9u\x1b[97:65;2u", now));
         // Alt+Shift+O and Alt+[ each ending a read are whole keys too.
         let mut chord = DetachChord::default();
         assert!(!chord.feed(b"\x1bO", now));
@@ -3541,6 +3552,10 @@ mod tests {
         let mut chord = DetachChord::default();
         assert!(!chord.feed(b"A", now));
         assert!(!chord.feed(b"\x1b[107;9uxA", now));
+        // A paste after Cmd+K is not a keypress, even when it holds an A.
+        assert!(!chord.feed(b"\x1b[107;9u\x1b[200~A\x1b[201~", now));
+        // Cmd+Hyper+K is some other chord.
+        assert!(!chord.feed(b"\x1b[107;25uA", now));
         // Ctrl+K is kill-to-end-of-line, not the leader.
         assert!(!chord.feed(b"\x1b[107;5uD", now));
         assert!(!chord.feed(b"\x0bA", now));

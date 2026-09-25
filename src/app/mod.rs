@@ -18930,11 +18930,15 @@ impl App {
                 true
             }
             // Cmd+K Shift+A: Session: Detach (#679). Must precede the
-            // case-insensitive A arm below. The host answers this chord
-            // too, so for a write-control holder the client is usually
-            // gone already and this finds nothing left to do.
+            // case-insensitive A arm below. In a session the host has
+            // already detached whoever sent these bytes (DetachChord), so
+            // there is nothing to do here: kicking the typist instead could
+            // hit someone else, since the typing attribution for this whole
+            // loop iteration is drained before its keys are handled.
             KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'a') => {
-                self.detach_session_client();
+                if self.session_channel.is_none() {
+                    self.status = String::from(NOT_A_SESSION_TO_DETACH);
+                }
                 true
             }
             // Cmd+K A: who is attached to this multiplayer session
@@ -24306,13 +24310,16 @@ impl App {
         self.open_list_picker(picker, "No participants yet");
     }
 
-    /// Session: Detach (#679): disconnect the client that asked, leaving
-    /// the session running. The asker is the current typist: the host
-    /// announces a writer before its bytes reach the PTY, so the keystroke
-    /// or palette Enter that got here came from that client.
+    /// Session: Detach from the palette (#679): disconnect the client that
+    /// asked, leaving the session running. The asker is taken to be the
+    /// current typist: the host announces a writer before its bytes reach
+    /// the PTY. That attribution is per loop iteration, not per key, so a
+    /// second holder typing in the same instant could be taken instead;
+    /// the chord has no such gap, because the host matches it in the
+    /// sender's own byte stream.
     fn detach_session_client(&mut self) {
         let Some(channel) = self.session_channel.as_mut() else {
-            self.status = String::from("Nothing to detach from: this is not a persistent session");
+            self.status = String::from(NOT_A_SESSION_TO_DETACH);
             return;
         };
         let Some(id) = detach_target(self.session_typist, &self.session_participants) else {
@@ -48953,6 +48960,9 @@ fn takeover_mode_seq() -> Vec<u8> {
     seq
 }
 
+/// Status for Session: Detach outside a persistent session (#679).
+const NOT_A_SESSION_TO_DETACH: &str = "Nothing to detach from: this is not a persistent session";
+
 /// Which client Session: Detach disconnects (#679): the one typing, else
 /// the only one attached (a host too old to announce typists).
 fn detach_target(typist: Option<u64>, roster: &[crate::session_host::Participant]) -> Option<u64> {
@@ -48987,7 +48997,11 @@ fn release_mode_seq() -> Vec<u8> {
 /// only ever got [`mode_reassert_seq`]'s SET, so a pop would unwind a
 /// stack entry that belongs to the user's shell.
 pub(crate) fn detached_client_restore_seq() -> Vec<u8> {
-    let mut seq = set_title_seq("");
+    // CAN first: a kick can cut the stream inside an escape sequence (a
+    // chunked graphics payload), and the terminal must leave it before the
+    // restore bytes can mean anything.
+    let mut seq = vec![0x18];
+    seq.extend(set_title_seq(""));
     seq.extend_from_slice(reset_host_colors_seq().as_bytes());
     if crate::iterm2_inline::detect_iterm2_inline_support() {
         seq.extend_from_slice(reset_session_bg_seq().as_bytes());

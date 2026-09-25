@@ -145,8 +145,14 @@ host  tty ── croft attach ──┘        (one accept loop,          (uncha
   chord in each client's input stream (`DetachChord`), before the read-only
   filter, so a read-only participant and a client of a wedged inner croft
   can both detach; it then closes that connection exactly as a kick does.
-  The palette entry "Session: Detach" goes through the inner croft instead,
-  kicking the current typist over the privileged channel. On an EOF with no
+  Because the host matches it, the chord works in every app state, a prompt
+  or picker included. The app's own handler for the chord does nothing in a
+  session: typing attribution is drained per loop iteration, so by the time
+  it runs the typist may be another holder. The palette entry "Session:
+  Detach" does go through the inner croft, kicking the current typist over
+  the privileged channel. The host matches the Cmd form only (`CSI 107;9u`),
+  not Termux's Ctrl stand-in, where Ctrl+K is kill-to-end-of-line. On an
+  EOF with no
   `exit` frame the attach client writes the inverse of croft's takeover
   modes (the inner croft never sends its teardown to a client it no longer
   serves) and, if the socket is still live, a one-line "detached" note.
