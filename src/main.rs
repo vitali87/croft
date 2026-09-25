@@ -16,6 +16,7 @@ mod command_history;
 mod config_layers;
 mod config_sync;
 mod dap;
+mod deep_link;
 mod devcontainer;
 mod docx;
 mod editorconfig;

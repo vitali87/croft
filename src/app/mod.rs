@@ -52397,6 +52397,12 @@ pub fn run(
     if let Some(file) = open_file.as_ref() {
         app.open_file_at_launch(file);
     }
+    // A `croft://` link (#359) names what to land on.
+    match std::env::var("CROFT_FOCUS").as_deref() {
+        Ok("terminal") => app.focus_pane(Pane::Terminal),
+        Ok("editor") => app.focus_pane(Pane::Editor),
+        _ => {}
+    }
     app.start_update_watch_if_remote();
     app.start_drift_probe_if_local();
     app.start_update_check_if_local();
