@@ -24068,9 +24068,9 @@ impl App {
     /// unreachable garbage.
     fn rename_review_boxes_path(&mut self, old: &Path, new: &Path) {
         if let Some((p, _)) = &mut self.review_boxes
-            && p == old
+            && let Some(moved) = crate::widgets::editor::moved_path(p, old, new)
         {
-            *p = new.to_path_buf();
+            *p = moved;
         }
     }
 
@@ -45808,20 +45808,31 @@ impl App {
             self.status = String::from("Updating references before the move (Esc to skip)");
             return Ok(());
         }
-        self.finish_file_move(op, &[]);
+        self.finish_file_move(op, Some(&[]));
         Ok(())
     }
 
     /// Stop waiting on the servers for a held rename or move (#610): cancel
     /// the request and perform the move without their edit.
-    fn skip_held_file_move(&mut self) {
+    pub(crate) fn skip_held_file_move(&mut self) {
         let Some(pending) = self.pending_file_move.take() else {
             return;
         };
         if let Some(lsp) = self.lsp.as_ref() {
             lsp.cancel_will_rename_files(pending.request_id);
         }
-        self.finish_file_move(pending.op, &[]);
+        self.finish_file_move(pending.op, None);
+    }
+
+    /// Point every tab and review box at `old`, or under the folder `old`,
+    /// at its place under `new`, in every editor group.
+    fn follow_moved_path(&mut self, old: &Path, new: &Path) {
+        self.editor.rename_open_path(old, new);
+        for group in self.editor_layout.inactive_groups_mut() {
+            group.rename_open_path(old, new);
+        }
+        self.rename_review_boxes_path(old, new);
+        self.sync_open_file_poll_mtime();
     }
 
     /// Perform a held rename or move once the servers have answered.
@@ -45845,25 +45856,30 @@ impl App {
         let Some(pending) = self.pending_file_move.take() else {
             return false;
         };
-        self.finish_file_move(pending.op, &edits);
+        self.finish_file_move(pending.op, Some(&edits));
         true
     }
 
     /// Apply the servers' edit (at the files' old paths, before they move),
     /// move the files, follow them in the tree and tabs, and tell the servers
     /// with `workspace/didRenameFiles` which moves actually happened.
+    /// `edits` is `None` when the wait was skipped, which the status says.
     fn finish_file_move(
         &mut self,
         op: FileMove,
-        edits: &[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)],
+        edits: Option<&[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)]>,
     ) {
-        let note = if edits.iter().all(|(_, e)| e.is_empty()) {
-            String::new()
-        } else {
+        let note = if let Some(edits) = edits
+            && !edits.iter().all(|(_, e)| e.is_empty())
+        {
             match self.apply_rename_edits(edits) {
                 Ok((_, occ)) => format!(", {occ} reference(s) updated"),
                 Err(e) => format!(", updating references failed: {e}"),
             }
+        } else if edits.is_none() {
+            String::from(", references not updated (skipped)")
+        } else {
+            String::new()
         };
         let mut done: Vec<crate::lsp::manager::FileRename> = Vec::new();
         match op {
@@ -45887,9 +45903,7 @@ impl App {
                         self.tree.select(new_idx);
                     }
                 }
-                self.editor.rename_open_path(&old, &new);
-                self.rename_review_boxes_path(&old, &new);
-                self.sync_open_file_poll_mtime();
+                self.follow_moved_path(&old, &new);
             }
             FileMove::Move {
                 dest_dir,
@@ -45908,10 +45922,7 @@ impl App {
                     let is_dir = src.is_dir();
                     match crate::widgets::file_tree::relocate(&src, &dest) {
                         Ok(()) => {
-                            if self.editor.matches_open_path(&src) {
-                                self.editor.rename_open_path(&src, &dest);
-                                self.rename_review_boxes_path(&src, &dest);
-                            }
+                            self.follow_moved_path(&src, &dest);
                             done.push(crate::lsp::manager::FileRename {
                                 old: src,
                                 new: dest.clone(),
@@ -51132,5 +51143,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             needs_redraw = true;
         }
     }
+    // A rename or move still waiting on the servers happens now, without
+    // their edit, rather than being dropped (#610).
+    app.skip_held_file_move();
     Ok(())
 }

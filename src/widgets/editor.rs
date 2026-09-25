@@ -56,6 +56,17 @@ fn next_image_generation() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Where `path` lands when `old` (a file, or a folder holding `path`) moves
+/// to `new`; `None` when the move does not touch it.
+pub fn moved_path(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(old).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        new.to_path_buf()
+    } else {
+        new.join(rest)
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PdfState {
     pub source_path: PathBuf,
@@ -14332,13 +14343,14 @@ impl EditorTabs {
         reverted
     }
 
-    /// If any tab currently points at `old`, repoint it to `new`. The on-
-    /// disk file has already been moved; this only updates the in-memory
-    /// path so subsequent saves and the tab label track the new name.
+    /// Repoint every tab at `old`, or at a file under the folder `old`, to
+    /// the same place under `new`. The on-disk file has already been moved;
+    /// this only updates the in-memory path so subsequent saves and the tab
+    /// label track the new name.
     pub fn rename_open_path(&mut self, old: &Path, new: &Path) {
         for e in &mut self.editors {
-            if e.path.as_deref() == Some(old) {
-                e.path = Some(new.to_path_buf());
+            if let Some(moved) = e.path.as_deref().and_then(|p| moved_path(p, old, new)) {
+                e.path = Some(moved);
                 // Re-anchor the disk stamp to the new path so the rename
                 // isn't mistaken for an external content change on the next
                 // FS-sync sweep.

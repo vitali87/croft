@@ -49729,6 +49729,64 @@ fn esc_skips_a_held_move_and_still_reaches_the_pane() {
     );
 }
 
+/// #610: a move repoints every tab it touches, not just the active one: a
+/// background tab on a moved file, and a tab on a file inside a moved
+/// folder.
+#[test]
+fn a_move_repoints_background_tabs_and_tabs_inside_a_moved_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (pkg, dest) = (root.join("pkg"), root.join("dest"));
+    std::fs::create_dir(&pkg).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(pkg.join("inner.rs"), "inner").unwrap();
+    std::fs::write(root.join("loose.rs"), "loose").unwrap();
+    std::fs::write(root.join("other.rs"), "other").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    for f in ["pkg/inner.rs", "loose.rs", "other.rs"] {
+        app.editor.open_in_new_tab(&root.join(f)).unwrap();
+    }
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(root.join("other.rs").as_path())
+    );
+    // The moved tabs stay behind in the group a split leaves inactive.
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+
+    app.apply_paste_or_drop(
+        &dest,
+        &[pkg.clone(), root.join("loose.rs")],
+        ExplorerClipMode::Cut,
+    );
+    let groups = app.editor_layout.inactive_groups();
+    let paths: Vec<_> = groups[0]
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&dest.join("pkg").join("inner.rs")),
+        "{paths:?}"
+    );
+    assert!(paths.contains(&dest.join("loose.rs")), "{paths:?}");
+    assert!(paths.contains(&root.join("other.rs")), "{paths:?}");
+}
+
+/// #610: a skipped wait says the references were left as they were.
+#[test]
+fn a_skipped_move_says_references_were_not_updated() {
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    let dest = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    app.skip_held_file_move();
+    assert!(
+        app.status.contains("references not updated"),
+        "{}",
+        app.status
+    );
+}
+
 /// Planning a move before performing it must still give two same-named
 /// sources distinct destinations, as moving them one by one did.
 #[test]

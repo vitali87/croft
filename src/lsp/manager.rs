@@ -278,6 +278,20 @@ pub struct WillRenameFilesResult {
     pub edits: Vec<(PathBuf, Vec<TextSpanEdit>)>,
 }
 
+/// The `willRenameFiles` request in flight and its task (#610).
+type WillRenameTask = Arc<StdMutex<Option<(u64, tokio::task::AbortHandle)>>>;
+
+/// Abort the task in `slot` if it is request `request_id`'s; a later
+/// request's task is left running.
+fn abort_will_rename(slot: &WillRenameTask, request_id: u64) {
+    let mut slot = slot.lock().unwrap();
+    if slot.as_ref().is_some_and(|(id, _)| *id == request_id)
+        && let Some((_, task)) = slot.take()
+    {
+        task.abort();
+    }
+}
+
 /// How long a server may take to answer `willRenameFiles` before the rename
 /// goes ahead without its edit. VS Code's `files.participants.timeout`
 /// default.
@@ -790,12 +804,6 @@ enum Cmd {
         request_id: u64,
         files: Vec<FileRename>,
     },
-    /// Stop a `WillRenameFiles` still in flight (#610): the app moved the
-    /// files without the edit, so the answer is no longer wanted and the
-    /// clients it holds are released.
-    CancelWillRenameFiles {
-        request_id: u64,
-    },
     /// `workspace/didRenameFiles` once the files have moved (#610).
     DidRenameFiles {
         files: Vec<FileRename>,
@@ -919,6 +927,10 @@ pub struct LspManager {
     diagnostic_refresh: Arc<AtomicBool>,
     /// Set while any running server listens for `willRenameFiles` (#610).
     will_rename_listeners: Arc<AtomicBool>,
+    /// The `willRenameFiles` request in flight, shared with the worker so
+    /// a skip aborts it from here, not from the worker's command queue,
+    /// which can sit behind a `didChange` waiting on the same client.
+    will_rename_task: WillRenameTask,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -978,6 +990,7 @@ impl LspManager {
         let inlay_refresh = Arc::new(AtomicBool::new(false));
         let diagnostic_refresh = Arc::new(AtomicBool::new(false));
         let will_rename_listeners = Arc::new(AtomicBool::new(false));
+        let will_rename_task = WillRenameTask::default();
         let root = workspace_root.clone();
         // Load user-installed extensions (`~/.config/croft/extensions`) and merge
         // them with the bundled ones. The language table must be initialised
@@ -1034,6 +1047,7 @@ impl LspManager {
             inlay_refresh.clone(),
             diagnostic_refresh.clone(),
             will_rename_listeners.clone(),
+            will_rename_task.clone(),
         ));
         Ok(Self {
             semantic_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1073,6 +1087,7 @@ impl LspManager {
             inlay_refresh,
             diagnostic_refresh,
             will_rename_listeners,
+            will_rename_task,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -1654,11 +1669,10 @@ impl LspManager {
         id
     }
 
-    /// Abandon the `willRenameFiles` request `request_id` (#610).
+    /// Abandon the `willRenameFiles` request `request_id` (#610): abort its
+    /// task, releasing the client locks it holds.
     pub fn cancel_will_rename_files(&self, request_id: u64) {
-        if !cfg!(test) {
-            let _ = self.cmd_tx.send(Cmd::CancelWillRenameFiles { request_id });
-        }
+        abort_will_rename(&self.will_rename_task, request_id);
     }
 
     #[cfg(test)]
@@ -1969,9 +1983,11 @@ struct WorkerState {
     // recomputed whenever a server starts or retires; the app reads it to
     // skip the round trip when nobody listens.
     will_rename_listeners: Arc<AtomicBool>,
-    // The `willRenameFiles` request in flight, if any, so Esc can abort it
-    // and release the client locks it holds (#610).
-    will_rename_task: Option<(u64, tokio::task::AbortHandle)>,
+    // The `willRenameFiles` request in flight, shared with the manager,
+    // which aborts it on a skip (#610). A finished task stays in the slot
+    // until the next request replaces it: aborting a finished task is a
+    // no-op.
+    will_rename_task: WillRenameTask,
     // Cloned into every spawned client's router so the server-pushed
     // `textDocument/publishDiagnostics` notifications reach the app.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
@@ -2035,6 +2051,7 @@ async fn worker_loop(
     inlay_refresh: Arc<AtomicBool>,
     diagnostic_refresh: Arc<AtomicBool>,
     will_rename_listeners: Arc<AtomicBool>,
+    will_rename_task: WillRenameTask,
 ) {
     let mut state = WorkerState {
         workspace_root,
@@ -2047,7 +2064,7 @@ async fn worker_loop(
         inlay_refresh,
         diagnostic_refresh,
         will_rename_listeners,
-        will_rename_task: None,
+        will_rename_task,
         diagnostics_tx: tx.diagnostics.clone(),
         progress_tx: tx.progress.clone(),
     };
@@ -2337,15 +2354,6 @@ async fn worker_loop(
             }
             Cmd::WillRenameFiles { request_id, files } => {
                 state.will_rename_files(request_id, files, &tx.will_rename_files)
-            }
-            Cmd::CancelWillRenameFiles { request_id } => {
-                if let Some((id, task)) = state.will_rename_task.take() {
-                    if id == request_id {
-                        task.abort();
-                    } else {
-                        state.will_rename_task = Some((id, task));
-                    }
-                }
             }
             Cmd::DidRenameFiles { files } => state.did_rename_files(&files),
             Cmd::RequestPrepareRename {
@@ -4587,11 +4595,13 @@ impl WorkerState {
                         "lsp[{name}] willRenameFiles: {} file(s)",
                         uris.len()
                     ));
-                    let mut client = client.lock().await;
-                    let resp =
-                        tokio::time::timeout(WILL_RENAME_TIMEOUT, client.will_rename_files(&uris))
-                            .await;
-                    drop(client);
+                    // The wait for the client lock counts against the
+                    // timeout too: a busy client must not hold the move
+                    // past it.
+                    let resp = tokio::time::timeout(WILL_RENAME_TIMEOUT, async {
+                        client.lock().await.will_rename_files(&uris).await
+                    })
+                    .await;
                     match resp {
                         Ok(Ok(Some(we))) => workspace_edits(&we),
                         Ok(Ok(None)) => Vec::new(),
@@ -4611,7 +4621,9 @@ impl WorkerState {
                 edits: merge_file_edits(answers),
             });
         });
-        self.will_rename_task = Some((request_id, task.abort_handle()));
+        // Left in place once the task ends: aborting a finished task does
+        // nothing, and the next request replaces it.
+        *self.will_rename_task.lock().unwrap() = Some((request_id, task.abort_handle()));
     }
 
     /// `workspace/didRenameFiles` (#610) to every server whose filters match.
@@ -6526,6 +6538,27 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    /// #610: a skipped move aborts its own request's task, not a later one.
+    #[test]
+    fn a_skip_aborts_only_its_own_will_rename_request() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let slot = WillRenameTask::default();
+            let task = tokio::spawn(std::future::pending::<()>());
+            *slot.lock().unwrap() = Some((2, task.abort_handle()));
+            abort_will_rename(&slot, 1);
+            assert!(
+                slot.lock().unwrap().is_some(),
+                "another request's task runs on"
+            );
+            abort_will_rename(&slot, 2);
+            assert!(slot.lock().unwrap().is_none());
+            assert!(task.await.unwrap_err().is_cancelled());
+        });
+    }
     #[test]
     fn normalise_inlay_hint_flattens_parts_and_folds_padding() {
         // vtsls sends parts labels; rust-analyzer sends plain strings with
@@ -8385,7 +8418,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8448,7 +8481,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8485,7 +8518,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8582,7 +8615,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8661,7 +8694,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8730,7 +8763,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8841,7 +8874,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -8961,7 +8994,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -9143,7 +9176,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
@@ -9389,7 +9422,7 @@ while True:
             inlay_refresh: Arc::new(AtomicBool::new(false)),
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             will_rename_listeners: Arc::new(AtomicBool::new(false)),
-            will_rename_task: None,
+            will_rename_task: WillRenameTask::default(),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
         };
