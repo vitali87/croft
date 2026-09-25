@@ -3004,6 +3004,12 @@ pub struct App {
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
     view_listener: Option<std::os::unix::net::UnixListener>,
+    /// Agent edit approvals (#347): this workspace's hook socket, the
+    /// proposals waiting on the user in arrival order, and the popup's
+    /// state for the one at the head (`Some` exactly while one waits).
+    hook_listener: Option<std::os::unix::net::UnixListener>,
+    approvals: std::collections::VecDeque<crate::agent_approval::Pending>,
+    approval_ui: Option<crate::agent_approval::ApprovalUi>,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -4518,6 +4524,13 @@ impl App {
         // `view_ipc::SOCK_PATH` at spawn time, so this ordering is what
         // decides whether the startup pane can use `croft view` at all (#362).
         let view_listener = Self::bind_view_socket();
+        // A second croft on the same workspace finds the socket live and
+        // leaves it to the first: one editor answers a workspace's agents.
+        let hook_listener = if cfg!(test) {
+            None
+        } else {
+            crate::agent_approval::bind(&root).ok()
+        };
         let view_bind_error = VIEW_BIND_ERROR.lock().unwrap().take();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
@@ -4789,6 +4802,9 @@ impl App {
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
             view_listener,
+            hook_listener,
+            approvals: std::collections::VecDeque::new(),
+            approval_ui: None,
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -14661,11 +14677,72 @@ impl App {
         out
     }
 
+    /// Take agent edit proposals off the hook socket and drop the ones
+    /// whose hook has already given up, keeping the popup on the head of
+    /// the queue.
+    fn drain_hook_requests(&mut self) -> bool {
+        let head = self.approvals.front().map(|p| p.arrived);
+        let mut changed = match self.hook_listener.as_ref() {
+            Some(listener) => crate::agent_approval::accept_into(listener, &mut self.approvals),
+            None => false,
+        };
+        let now = std::time::Instant::now();
+        let before = self.approvals.len();
+        self.approvals.retain(|p| !p.expired(now));
+        changed |= self.approvals.len() != before;
+        if self.approvals.front().map(|p| p.arrived) != head {
+            self.approval_ui = None;
+        }
+        if self.approvals.is_empty() {
+            self.approval_ui = None;
+        } else if self.approval_ui.is_none() {
+            self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(now));
+            changed = true;
+        }
+        changed
+    }
+
+    fn handle_approval_key(&mut self, key: KeyEvent) {
+        let rows = self
+            .approvals
+            .front()
+            .map(|p| crate::agent_approval::diff_rows(&p.proposal).len())
+            .unwrap_or(0);
+        let Some(ui) = self.approval_ui.as_mut() else {
+            return;
+        };
+        let Some(decision) = ui.key(key, std::time::Instant::now(), rows) else {
+            return;
+        };
+        if let Some(head) = self.approvals.pop_front() {
+            head.answer(&decision);
+        }
+        self.approval_ui = (!self.approvals.is_empty())
+            .then(|| crate::agent_approval::ApprovalUi::new(std::time::Instant::now()));
+    }
+
+    fn render_approval_popup(&self, frame: &mut ratatui::Frame) {
+        let (Some(ui), Some(head)) = (self.approval_ui.as_ref(), self.approvals.front()) else {
+            return;
+        };
+        let area = frame.area();
+        crate::widgets::approval_popup::render(
+            area,
+            frame.buffer_mut(),
+            self.theme,
+            head,
+            ui,
+            self.approvals.len(),
+            self.workspace_root(),
+        );
+    }
+
     /// Whether a modal overlay owns the screen right now. The same eleven-way
     /// check was repeated verbatim at three overlay-flush sites; auto-hide
     /// (#260) needs it too, so it lives here once.
     fn modal_overlay_open(&self) -> bool {
-        self.shortcuts_modal.is_some()
+        self.approval_ui.is_some()
+            || self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
             || self.go_to_symbol.is_some()
@@ -16992,6 +17069,7 @@ impl App {
         self.render_connect_dialog(frame);
         // The startup unsupported-terminal nudge renders last so it sits above
         // every other overlay until the user dismisses it.
+        self.render_approval_popup(frame);
         self.render_terminal_warning(frame);
 
         // Chrome button-hint tooltip. Rendered at the top level against the
@@ -18830,6 +18908,10 @@ impl App {
                 KeyCode::Char('d') | KeyCode::Char('D') => self.dismiss_terminal_warning(true),
                 _ => self.dismiss_terminal_warning(false),
             }
+            return Ok(());
+        }
+        if self.approval_ui.is_some() {
+            self.handle_approval_key(key);
             return Ok(());
         }
         if self.connect_dialog.is_some() {
@@ -38325,6 +38407,10 @@ impl App {
         {
             return;
         }
+        // The approval popup takes no clicks, and none reach what it covers.
+        if self.approval_ui.is_some() {
+            return;
+        }
         if self.connect_dialog.is_some() {
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.handle_connect_dialog_click(m.column, m.row);
@@ -50470,6 +50556,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
+        let hook_changed = app.drain_hook_requests();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
@@ -50598,6 +50685,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || remote_changed
             || pulls_changed
             || view_changed
+            || hook_changed
             || ports_changed
             || session_presence_changed
             || session_typing_changed

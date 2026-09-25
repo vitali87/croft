@@ -88,9 +88,27 @@ for `{"decision": "allow" | "deny" | "ask", "reason": ...}`.
   Claude Code's prompt takes over.
 
 The request carries no Claude-specific fields, so another agent with a hook
-system needs only a settings writer and its own reply shape. The croft side
-that answers (a live diff of the proposed edit, approve or deny in place)
-is #347.
+system needs only a settings writer and its own reply shape.
+
+In croft, each proposal opens a popup over everything else. The title reads
+`claude-code wants to edit src/foo.rs`, and the body is the change as a
+unified diff against the file on disk. More than one proposal queues in
+arrival order, and the title counts the ones waiting (`· 2 pending`).
+
+| Key | Does |
+|---|---|
+| `Enter` | approve |
+| `Esc` | deny |
+| `r` | deny with a reason: type it, `Enter` sends it to the agent, `Esc` goes back |
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` | scroll the diff |
+
+For its first 400 ms the popup ignores keys, so an `Enter` meant for the pane
+you were typing in cannot approve an edit you have not seen. Approving only
+answers the agent, which then makes the edit itself; croft writes nothing.
+If an edit can't be worked out against the file on disk (its text is missing,
+or ambiguous without `replace_all`), croft answers `ask` without showing the
+popup. A proposal still waiting when the hook's 120 s run out leaves the
+queue.
 
 ## The resident navigator
 

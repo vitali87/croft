@@ -1,3 +1,4 @@
+mod agent_approval;
 mod agent_hook;
 mod agent_lane;
 mod agents;
