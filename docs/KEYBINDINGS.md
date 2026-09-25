@@ -461,6 +461,7 @@ Pick a configuration with "Debug: Select and Start Debugging" or the config row 
 | `Shift+Cmd+F5` | Restart the debug session |
 | `Ctrl+F5` | Attach to a running Python process |
 | `F6` | Pause (interrupt) a running program |
+| `Cmd+Opt+Shift+G` | Switch to the next debug session of a compound |
 | `F9` | Toggle a breakpoint on the cursor's line (a red dot in the gutter); pushed live when a session is running |
 | `Shift+F9` | Add or edit a conditional breakpoint on the cursor's line |
 | `Shift+Alt+F9` | Add or edit a logpoint on the cursor's line (amber diamond; prints instead of pausing) |
