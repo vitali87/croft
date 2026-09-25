@@ -446,7 +446,7 @@ pub fn set_data_breakpoints_request(breakpoints: &[DataBreakpoint]) -> Value {
 }
 
 /// Build a `setBreakpoints` request body for one source file, carrying any
-/// per-breakpoint `condition` and `logMessage`.
+/// per-breakpoint `condition`, `hitCondition` and `logMessage`.
 pub fn set_breakpoints_request(path: &Path, breakpoints: &[SourceBreakpoint]) -> Value {
     let bps: Vec<Value> = breakpoints
         .iter()
@@ -954,6 +954,9 @@ pub struct DapSession {
     /// A Run to Cursor in progress: the file and line of its temporary
     /// breakpoint, removed at the next stop or exit (#611).
     run_to: Option<(PathBuf, u32)>,
+    /// Whether the console already says which breakpoints this adapter
+    /// cannot honour, so a js-debug child's `initialized` does not repeat it.
+    degraded_noted: bool,
 }
 
 impl DapSession {
@@ -1048,9 +1051,6 @@ impl DapSession {
         ))
     }
 
-    /// Assemble a fresh session around its (parent) `transport`. `js_server` is
-    /// set only for vscode-js-debug, marking the session multi-session and
-    /// carrying the address its child connection reuses.
     /// A session with no adapter behind it: the returned wire shows what it
     /// sends and feeds it what an adapter would answer.
     #[cfg(test)]
@@ -1061,6 +1061,9 @@ impl DapSession {
         (Self::new_with_transport(transport, breakpoints, None), wire)
     }
 
+    /// Assemble a fresh session around its (parent) `transport`. `js_server` is
+    /// set only for vscode-js-debug, marking the session multi-session and
+    /// carrying the address its child connection reuses.
     fn new_with_transport(
         transport: DapTransport,
         breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
@@ -1088,6 +1091,7 @@ impl DapSession {
             data_breakpoints: Vec::new(),
             pending_data_info: std::collections::HashMap::new(),
             run_to: None,
+            degraded_noted: false,
         }
     }
 
@@ -1373,6 +1377,15 @@ impl DapSession {
                 // just initialized (parent or child). `active()` already resolves
                 // to the child once it exists, and to the parent before that.
                 self.push_breakpoints();
+                if !self.degraded_noted {
+                    self.degraded_noted = true;
+                    out.extend(self.unsupported_breakpoint_notes().into_iter().map(|text| {
+                        DapEvent::Output {
+                            category: String::from("console"),
+                            text,
+                        }
+                    }));
+                }
                 let t = self.active();
                 if self.capabilities.function_breakpoints && !self.function_breakpoints.is_empty() {
                     let _ = t.send(set_function_breakpoints_request(&self.function_breakpoints));
@@ -1449,6 +1462,31 @@ impl DapSession {
     /// Send `path`'s whole breakpoint set as the adapter should see it: hit
     /// counts dropped when it does not support them, and a pending Run to
     /// Cursor's temporary breakpoint added.
+    /// What the launch set asks for that this adapter cannot honour: function
+    /// breakpoints it will not set, and hit counts it drops (those lines
+    /// pause on every hit instead).
+    fn unsupported_breakpoint_notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if !self.capabilities.function_breakpoints && !self.function_breakpoints.is_empty() {
+            notes.push(format!(
+                "This debug adapter does not support function breakpoints; not set: {}",
+                self.function_breakpoints.join(", ")
+            ));
+        }
+        if !self.capabilities.hit_conditional_breakpoints
+            && self
+                .breakpoints
+                .values()
+                .flatten()
+                .any(|b| b.hit_condition.is_some())
+        {
+            notes.push(String::from(
+                "This debug adapter does not support hit counts; those breakpoints pause on every hit",
+            ));
+        }
+        notes
+    }
+
     fn send_file_breakpoints(&self, path: &Path) {
         let mut bps: Vec<SourceBreakpoint> =
             self.breakpoints.get(path).cloned().unwrap_or_default();
@@ -1535,11 +1573,8 @@ impl DapSession {
         if self.stopped_thread.is_none() || self.phase != SessionPhase::Stopped {
             return false;
         }
-        if let Some((old, _)) = self.run_to.replace((path.to_path_buf(), line))
-            && old != path
-        {
-            self.send_file_breakpoints(&old);
-        }
+        // Every stop ends the previous Run to Cursor, so none is pending here.
+        self.run_to = Some((path.to_path_buf(), line));
         self.send_file_breakpoints(path);
         self.continue_execution();
         true
@@ -1773,12 +1808,6 @@ mod session_set_tests {
 mod tests {
     use super::*;
 
-    fn fake_session(
-        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
-    ) -> (DapSession, crate::dap::transport::FakeWire) {
-        DapSession::fake(breakpoints)
-    }
-
     /// Feed `msgs` as if the adapter sent them, and drain them.
     fn deliver(
         session: &mut DapSession,
@@ -1844,7 +1873,7 @@ mod tests {
     #[test]
     fn function_breakpoints_go_out_on_initialized_only_when_supported() {
         for supported in [true, false] {
-            let (mut session, wire) = fake_session(BTreeMap::new());
+            let (mut session, wire) = DapSession::fake(BTreeMap::new());
             assert!(session.set_function_breakpoints(vec![String::from("main")]));
             deliver(
                 &mut session,
@@ -1886,7 +1915,7 @@ mod tests {
             hit_condition: Some(String::from(">= 3")),
             ..SourceBreakpoint::plain(4)
         };
-        let (mut session, wire) = fake_session(BTreeMap::new());
+        let (mut session, wire) = DapSession::fake(BTreeMap::new());
         session.update_breakpoints(&path, std::slice::from_ref(&bp));
         let sent = wire.sent();
         assert!(
@@ -1905,7 +1934,7 @@ mod tests {
 
     #[test]
     fn a_data_breakpoint_is_asked_about_then_toggled() {
-        let (mut session, wire) = fake_session(BTreeMap::new());
+        let (mut session, wire) = DapSession::fake(BTreeMap::new());
         assert!(!session.request_data_breakpoint_info(7, "x"));
         assert!(
             wire.sent().is_empty(),
@@ -1954,7 +1983,7 @@ mod tests {
 
     #[test]
     fn a_variable_that_cannot_carry_a_data_breakpoint_says_why() {
-        let (mut session, wire) = fake_session(BTreeMap::new());
+        let (mut session, wire) = DapSession::fake(BTreeMap::new());
         session.capabilities.data_breakpoints = true;
         session.request_data_breakpoint_info(7, "f");
         let seq = wire.sent().pop().unwrap()["seq"].clone();
@@ -1983,7 +2012,7 @@ mod tests {
         let path = PathBuf::from("/a/b.py");
         let mut bps = BTreeMap::new();
         bps.insert(path.clone(), vec![SourceBreakpoint::plain(3)]);
-        let (mut session, wire) = fake_session(bps);
+        let (mut session, wire) = DapSession::fake(bps);
         assert!(
             !session.run_to_cursor(&path, 9),
             "only a paused session runs to a line"
@@ -2013,7 +2042,7 @@ mod tests {
         let path = PathBuf::from("/a/b.py");
         let mut bps = BTreeMap::new();
         bps.insert(path.clone(), vec![SourceBreakpoint::plain(3)]);
-        let (mut session, wire) = fake_session(bps);
+        let (mut session, wire) = DapSession::fake(bps);
         deliver(&mut session, &wire, &[stopped()]);
         wire.clear();
         assert!(session.run_to_cursor(&path, 3));

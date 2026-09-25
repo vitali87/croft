@@ -838,7 +838,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Ctrl+Shift+F9",
-                description: "Add or edit a hit count: the breakpoint pauses only on that hit (5, >= 5)",
+                description: "Add or edit a hit count: the breakpoint pauses once the hit count condition holds (5, >= 5)",
                 handler: "",
             },
             ShortcutEntry {

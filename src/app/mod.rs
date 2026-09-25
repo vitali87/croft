@@ -20495,8 +20495,29 @@ impl App {
         let focused = self.debug_sessions.focused_index();
         let mut events = Vec::new();
         let mut background_ended: Vec<usize> = Vec::new();
+        // A data breakpoint answer belongs to the session that was asked,
+        // even when focus moved to another compound member meanwhile.
+        let mut data_notes: Vec<String> = Vec::new();
         for (index, session) in self.debug_sessions.iter_mut_indexed() {
-            let drained = session.poll();
+            let mut drained = session.poll();
+            drained.retain(|e| match e {
+                DapEvent::DataBreakpointInfo {
+                    name,
+                    data_id,
+                    description,
+                    access_types,
+                } => {
+                    data_notes.push(apply_data_breakpoint_info(
+                        session,
+                        name,
+                        data_id.clone(),
+                        description,
+                        access_types,
+                    ));
+                    false
+                }
+                _ => true,
+            });
             if index == focused {
                 events = drained;
                 continue;
@@ -20528,6 +20549,10 @@ impl App {
             self.report_member_ended(&ended_names.join(", "));
         }
         let mut changed = !events.is_empty() || changed_background;
+        if let Some(note) = data_notes.pop() {
+            self.status = note;
+            changed = true;
+        }
         for ev in events {
             match ev {
                 // Route program output to the debug console (each embedded
@@ -20568,34 +20593,6 @@ impl App {
                     self.refresh_watches();
                     self.refresh_inline_values();
                     changed = true;
-                }
-                DapEvent::DataBreakpointInfo {
-                    name,
-                    data_id,
-                    description,
-                    access_types,
-                } => {
-                    self.status = match data_id {
-                        Some(id) => {
-                            let access = access_types
-                                .iter()
-                                .find(|a| a.as_str() == "write")
-                                .or_else(|| access_types.first())
-                                .cloned();
-                            let added = self.debug_sessions.focused_mut().is_some_and(|s| {
-                                s.toggle_data_breakpoint(id, name.clone(), access)
-                            });
-                            if added {
-                                format!("Breaks when {name} changes")
-                            } else {
-                                format!("No longer breaks when {name} changes")
-                            }
-                        }
-                        None if description.is_empty() => {
-                            format!("Cannot break on {name}: the adapter refused")
-                        }
-                        None => format!("Cannot break on {name}: {description}"),
-                    };
                 }
                 DapEvent::Stopped { reason, .. } => {
                     self.run_debug.feedback = Some(format!("Paused ({reason})"));
@@ -22402,12 +22399,16 @@ impl App {
                 .entry(path.clone())
                 .or_default()
                 .insert(line, hits.to_string());
-            self.status = format!("Breakpoint at line {line} pauses on hit {hits}");
-            if self
-                .debug_sessions
-                .iter()
-                .any(|s| !s.capabilities.hit_conditional_breakpoints)
-            {
+            self.status = format!("Breakpoint at line {line} with hit count {hits}");
+            // A session still in its handshake has not reported what it
+            // supports yet, and an ended one no longer matters.
+            if self.debug_sessions.iter().any(|s| {
+                !matches!(
+                    s.phase,
+                    crate::dap::session::SessionPhase::Initializing
+                        | crate::dap::session::SessionPhase::Terminated
+                ) && !s.capabilities.hit_conditional_breakpoints
+            }) {
                 self.status
                     .push_str(" (this debug adapter does not support hit counts)");
             }
@@ -22482,6 +22483,9 @@ impl App {
     /// ask for a data breakpoint on it.
     fn debug_break_on_named_value(&mut self, name: &str) {
         let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
         let container = self.debug_sessions.focused().and_then(|s| {
             s.scopes.iter().find_map(|scope| {
                 s.variables
@@ -22500,7 +22504,10 @@ impl App {
     /// carry a data breakpoint. The answer adds or removes it when it lands
     /// (see `DapEvent::DataBreakpointInfo` in [`App::poll_dap`]).
     fn debug_break_on_value_change(&mut self, container: i64, name: &str) {
-        let Some(session) = self.debug_sessions.focused_mut() else {
+        // A variables reference is valid only while the program stays
+        // paused; a menu opened before a resume holds a stale one.
+        let paused = self.debug_paused();
+        let Some(session) = self.debug_sessions.focused_mut().filter(|_| paused) else {
             self.status = String::from("Break on Value Change needs a paused debug session");
             return;
         };
@@ -39513,10 +39520,20 @@ impl App {
                     }) = self.run_debug.debug_rows.get(idx).map(|r| r.kind.clone())
                 {
                     self.focus_pane(Pane::Tree);
+                    // The item toggles, so it says which way it goes.
+                    let set = self
+                        .debug_sessions
+                        .focused()
+                        .is_some_and(|s| s.data_breakpoints.iter().any(|b| b.name == name));
+                    let label = if set {
+                        "Remove Data Breakpoint"
+                    } else {
+                        "Break on Value Change"
+                    };
                     self.context_menu = Some(ContextMenu::flat(
                         (m.column, m.row),
                         vec![(
-                            String::from("Break on Value Change"),
+                            String::from(label),
                             MenuAction::BreakOnValueChange { container, name },
                         )],
                         self.tree.root.clone(),
@@ -50567,6 +50584,40 @@ fn restore_host_terminal_state() {
 // host colors), so the color reset can't strand a live session.
 const TERMINAL_RESTORE_SEQ: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
+
+/// Act on a `dataBreakpointInfo` answer for `name` in the session that asked,
+/// and say what happened. Break on Value Change is a write watchpoint, so an
+/// adapter that offers only other access kinds gets none (#611).
+fn apply_data_breakpoint_info(
+    session: &mut crate::dap::session::DapSession,
+    name: &str,
+    data_id: Option<String>,
+    description: &str,
+    access_types: &[String],
+) -> String {
+    let Some(id) = data_id else {
+        return if description.is_empty() {
+            format!("Cannot break on {name}: the adapter refused")
+        } else {
+            format!("Cannot break on {name}: {description}")
+        };
+    };
+    let access = if access_types.is_empty() {
+        None
+    } else if access_types.iter().any(|a| a == "write") {
+        Some(String::from("write"))
+    } else {
+        return format!(
+            "Cannot break on {name} changing: the adapter only offers {}",
+            access_types.join(", ")
+        );
+    };
+    if session.toggle_data_breakpoint(id, name.to_string(), access) {
+        format!("Breaks when {name} changes")
+    } else {
+        format!("No longer breaks when {name} changes")
+    }
+}
 
 fn install_terminal_restore_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();

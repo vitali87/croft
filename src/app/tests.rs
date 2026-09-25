@@ -49725,6 +49725,78 @@ fn a_new_debug_session_is_handed_the_function_breakpoints() {
     );
 }
 
+/// An adapter without function breakpoints or hit counts says, once, which
+/// of the launch set it cannot honour, instead of dropping them silently.
+#[test]
+fn a_session_reports_the_breakpoints_its_adapter_cannot_honour() {
+    let mut bp = crate::dap::session::SourceBreakpoint::plain(3);
+    bp.hit_condition = Some(String::from("2"));
+    let bps = std::collections::BTreeMap::from([(PathBuf::from("/p.py"), vec![bp])]);
+    let (session, wire) = crate::dap::session::DapSession::fake(bps);
+    let mut session = with_function_breakpoints(session, &[String::from("main")]);
+    wire.adapter
+        .send(
+            serde_json::json!({"type": "response", "command": "initialize",
+                                 "success": true, "body": {}}),
+        )
+        .unwrap();
+    wire.adapter
+        .send(serde_json::json!({"type": "event", "event": "initialized"}))
+        .unwrap();
+    let notes = |events: Vec<crate::dap::session::DapEvent>| -> Vec<String> {
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::dap::session::DapEvent::Output { category, text }
+                    if category == "console" =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let first = notes(session.poll());
+    assert_eq!(
+        first,
+        [
+            "This debug adapter does not support function breakpoints; not set: main",
+            "This debug adapter does not support hit counts; those breakpoints pause on every hit",
+        ]
+    );
+    assert!(sent_of(&wire, "setFunctionBreakpoints").is_empty());
+    wire.adapter
+        .send(serde_json::json!({"type": "event", "event": "initialized"}))
+        .unwrap();
+    assert!(notes(session.poll()).is_empty(), "said once");
+}
+
+/// A hit count set while the session is still in its handshake does not
+/// warn: the adapter has not said what it supports yet.
+#[test]
+fn a_hit_count_during_the_handshake_does_not_warn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("prog.py");
+    std::fs::write(&f, "l1\nl2\nl3\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_row = 1;
+    let (session, _wire) = crate::dap::session::DapSession::fake(Default::default());
+    app.debug_sessions.push("fake", session);
+    app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    for c in "3".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, "Breakpoint at line 2 with hit count 3");
+}
+
 /// Ctrl+F10 resumes a paused session to the cursor line through a temporary
 /// breakpoint; without a paused session it says so and sends nothing.
 #[test]
@@ -49878,6 +49950,97 @@ fn right_click_on_a_variable_breaks_on_its_value_change() {
     assert_eq!(
         set.last().unwrap()["arguments"]["breakpoints"],
         serde_json::json!([{"dataId": "12:y", "accessType": "write"}])
+    );
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y));
+    let menu = app.context_menu.as_ref().expect("the menu again");
+    assert_eq!(
+        menu_labels(&menu.items),
+        vec!["Remove Data Breakpoint"],
+        "the item says it removes the breakpoint it toggles off"
+    );
+}
+
+/// Break on Value Change is a write watchpoint: an adapter offering only
+/// other access kinds sets none, one naming no kinds gets its default, and a
+/// refusal is reported with the adapter's reason.
+#[test]
+fn a_data_breakpoint_answer_sets_a_write_watchpoint_or_says_why_not() {
+    let answer = |data_id: Option<&str>, description: &str, types: &[&str]| {
+        let (mut session, wire) = crate::dap::session::DapSession::fake(Default::default());
+        let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        let status = apply_data_breakpoint_info(
+            &mut session,
+            "y",
+            data_id.map(str::to_string),
+            description,
+            &types,
+        );
+        (status, sent_of(&wire, "setDataBreakpoints"))
+    };
+    let (status, sent) = answer(Some("12:y"), "y", &["read"]);
+    assert_eq!(
+        status,
+        "Cannot break on y changing: the adapter only offers read"
+    );
+    assert!(sent.is_empty(), "no read watchpoint is set: {sent:?}");
+    let (status, sent) = answer(Some("12:y"), "y", &[]);
+    assert_eq!(status, "Breaks when y changes");
+    assert_eq!(
+        sent[0]["arguments"]["breakpoints"],
+        serde_json::json!([{"dataId": "12:y"}]),
+        "no accessType: the adapter's default"
+    );
+    let (status, sent) = answer(None, "not supported here", &[]);
+    assert_eq!(status, "Cannot break on y: not supported here");
+    assert!(sent.is_empty());
+}
+
+/// The answer to a data breakpoint question lands on the session that was
+/// asked, even when focus moved to another compound member meanwhile.
+#[test]
+fn a_data_breakpoint_answer_after_a_focus_change_reaches_the_asking_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let wire = seat_paused_fake_session(&mut app);
+    load_two_scopes(&mut app);
+    let (other, other_wire) = crate::dap::session::DapSession::fake(Default::default());
+    app.debug_sessions.push("other", other);
+    app.debug_sessions.focus(0);
+    app.debug_break_on_value_change(12, "y");
+    let ask = sent_of(&wire, "dataBreakpointInfo");
+    app.debug_sessions.focus(1);
+    wire.adapter
+        .send(
+            serde_json::json!({"type": "response", "command": "dataBreakpointInfo",
+                                 "success": true, "request_seq": ask[0]["seq"],
+                                 "body": {"dataId": "12:y", "description": "y",
+                                          "accessTypes": ["write"]}}),
+        )
+        .unwrap();
+    app.poll_dap();
+    assert_eq!(app.status, "Breaks when y changes");
+    assert_eq!(sent_of(&wire, "setDataBreakpoints").len(), 1);
+    assert!(sent_of(&other_wire, "setDataBreakpoints").is_empty());
+}
+
+/// A VARIABLES menu opened while paused holds a variables reference that a
+/// resume invalidates, so choosing it afterwards asks nothing.
+#[test]
+fn break_on_value_change_after_a_resume_asks_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let wire = seat_paused_fake_session(&mut app);
+    load_two_scopes(&mut app);
+    wire.adapter
+        .send(serde_json::json!({"type": "event", "event": "continued",
+                                 "body": {"threadId": 1}}))
+        .unwrap();
+    app.poll_dap();
+    app.debug_break_on_value_change(12, "y");
+    assert!(sent_of(&wire, "dataBreakpointInfo").is_empty());
+    assert_eq!(
+        app.status,
+        "Break on Value Change needs a paused debug session"
     );
 }
 
