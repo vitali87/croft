@@ -2427,6 +2427,14 @@ type GraphReply = (
 type GraphReplyRx = std::sync::mpsc::Receiver<GraphReply>;
 type GraphReplyTx = std::sync::mpsc::Sender<GraphReply>;
 
+/// An inline completion request in flight (#607): its generation, its
+/// reply, and where it was asked (row, column).
+type InlinePending = (
+    crate::inline_complete::Generation,
+    std::sync::mpsc::Receiver<Result<String, String>>,
+    (usize, usize),
+);
+
 pub struct App {
     pub tree: FileTree,
     pub search: SearchPanel,
@@ -3296,6 +3304,19 @@ pub struct App {
     /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
     /// once the worker sends a CompletionResult back.
     pub completion_popup: Option<crate::widgets::completion_popup::CompletionPopup>,
+    /// Inline completions after a typing pause (#607).
+    inline_completions: bool,
+    /// Every edit or caret move bumps it; an answer for an older one is
+    /// dropped.
+    inline_gen: crate::inline_complete::Generation,
+    /// The inline completion request in flight: its generation, its reply,
+    /// and where it was asked (row, column).
+    inline_pending: Option<InlinePending>,
+    /// When the buffer last changed, for the typing pause.
+    inline_last_edit: std::time::Instant,
+    /// The model endpoint to ask, when set here instead of read from the
+    /// workspace's navigator record (tests).
+    inline_endpoint: Option<(crate::pair::Provider, Option<String>)>,
     /// Most recent completion request id; later responses with a stale
     /// id are dropped so a slow earlier response cannot clobber a fresh
     /// one (e.g. user already moved past the original trigger).
@@ -4874,6 +4895,11 @@ impl App {
             markdown_lint_last_seen: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
+            inline_completions: merged_settings.prefs.inline_completions,
+            inline_gen: crate::inline_complete::Generation::default(),
+            inline_pending: None,
+            inline_last_edit: std::time::Instant::now(),
+            inline_endpoint: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
             vim: crate::vim::VimState::new(),
@@ -28394,7 +28420,197 @@ impl App {
         }
     }
 
+    /// The model to ask for inline completions: the test override, else the
+    /// workspace's navigator record (#607).
+    fn inline_model(&self) -> Option<(crate::pair::Provider, Option<String>)> {
+        if let Some(e) = &self.inline_endpoint {
+            return Some(e.clone());
+        }
+        let record =
+            crate::session::read_pair_record(&crate::session::pair_record_path(&self.tree.root))?;
+        Some((
+            crate::pair::Provider::from_record(
+                record.provider.as_deref(),
+                record.base_url.as_deref(),
+            ),
+            record.model,
+        ))
+    }
+
+    /// Ask the navigator's model to complete at the caret now (#607). Only
+    /// at the end of a line, and never over an LSP completion list.
+    fn request_inline_completion(&mut self) {
+        if self.completion_popup.is_some() {
+            return;
+        }
+        let row = self.editor.cursor_row;
+        let col = self.editor.cursor_col;
+        let at_end = self
+            .editor
+            .lines
+            .get(row)
+            .is_some_and(|l| col >= l.chars().count());
+        if !at_end {
+            self.status = String::from("Inline completions start at the end of a line");
+            return;
+        }
+        let Some((provider, model)) = self.inline_model() else {
+            self.status = String::from(
+                "Inline completions use the navigator's model: set one up with croft pair",
+            );
+            return;
+        };
+        let file = self
+            .editor
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let ctx = crate::inline_complete::context(&file, &self.editor.lines, row, col);
+        let generation = self.inline_gen.bump();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let user = crate::inline_complete::prompt(&ctx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let reply = match provider {
+                crate::pair::Provider::Local { base_url } => crate::pair::local::complete_once(
+                    &base_url,
+                    model.as_deref().unwrap_or("default"),
+                    crate::inline_complete::SYSTEM,
+                    &user,
+                    deadline,
+                ),
+                crate::pair::Provider::Claude => {
+                    let mut cmd = std::process::Command::new("claude");
+                    cmd.arg("-p");
+                    if let Some(m) = &model {
+                        cmd.args(["--model", m]);
+                    }
+                    cmd.arg(format!("{}\n\n{user}", crate::inline_complete::SYSTEM));
+                    cmd.output()
+                        .map_err(|e| format!("could not run claude: {e}"))
+                        .and_then(|o| {
+                            if o.status.success() {
+                                Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+                            } else {
+                                Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
+                            }
+                        })
+                }
+            };
+            let _ = tx
+                .send(reply.map(|answer| {
+                    crate::inline_complete::clean(&answer, &ctx).unwrap_or_default()
+                }));
+        });
+        self.inline_pending = Some((generation, rx, (row, col)));
+    }
+
+    /// Collect an inline completion reply; `true` when the screen changed
+    /// (#607). A reply for an older generation, or for a caret that has
+    /// since moved, is dropped.
+    pub fn drain_inline_completion(&mut self) -> bool {
+        let reply = match self.inline_pending.as_ref() {
+            Some((_, rx, _)) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err(String::from("the request stopped"))
+                }
+            },
+            None => return false,
+        };
+        let Some((asked, _, (row, col))) = self.inline_pending.take() else {
+            return false;
+        };
+        let here = (self.editor.cursor_row, self.editor.cursor_col) == (row, col);
+        match reply {
+            Ok(text) if !text.is_empty() && here && self.inline_gen.is_current(asked) => {
+                self.editor.inline_ghost = Some((row, col, text));
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                self.status = format!("Inline completion: {e}");
+                true
+            }
+        }
+    }
+
+    /// Automatic requests after a typing pause, when switched on (#607).
+    pub fn poll_inline_completion(&mut self) -> bool {
+        let changed = self.drain_inline_completion();
+        if self.inline_completions
+            && self.inline_pending.is_none()
+            && self.editor.inline_ghost.is_none()
+            && matches!(self.focus, Pane::Editor)
+            && self.inline_last_edit.elapsed() >= std::time::Duration::from_millis(600)
+            && self.inline_last_edit.elapsed() < std::time::Duration::from_secs(5)
+            && self
+                .editor
+                .lines
+                .get(self.editor.cursor_row)
+                .is_some_and(|l| {
+                    self.editor.cursor_col >= l.chars().count() && !l.trim().is_empty()
+                })
+        {
+            // Once per pause: pushing the edit time back keeps the next
+            // request for the next pause.
+            self.inline_last_edit -= std::time::Duration::from_secs(5);
+            self.request_inline_completion();
+        }
+        changed
+    }
+
+    /// Tab accepts the ghost as the navigator's; any other key discards it
+    /// and makes a pending reply stale. `true` when the key was Tab (#607).
+    fn inline_completion_key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Tab
+            && key.modifiers.is_empty()
+            && let Some((row, col, text)) = self.editor.inline_ghost.take()
+        {
+            if (self.editor.cursor_row, self.editor.cursor_col) == (row, col) {
+                self.editor
+                    .insert_str_as(&text, crate::provenance::Seat::Navigator);
+            }
+            self.inline_gen.bump();
+            return true;
+        }
+        if key.code == KeyCode::Char('\\') && key.modifiers == KeyModifiers::ALT {
+            self.editor.inline_ghost = None;
+            self.request_inline_completion();
+            return true;
+        }
+        self.editor.inline_ghost = None;
+        self.inline_gen.bump();
+        self.inline_last_edit = std::time::Instant::now();
+        false
+    }
+
+    /// Flip automatic inline completions (#607).
+    fn toggle_inline_completions(&mut self) {
+        self.inline_completions = !self.inline_completions;
+        if let Err(e) =
+            crate::prefs::save_inline_completions_in(&self.config_dir, self.inline_completions)
+        {
+            crate::output::push(
+                "Settings",
+                crate::output::OutputLevel::Warn,
+                &format!("inline completions not saved: {e}"),
+            );
+        }
+        self.status = if self.inline_completions {
+            String::from("Inline completions on: they appear after a pause at the end of a line")
+        } else {
+            self.editor.inline_ghost = None;
+            String::from("Inline completions off")
+        };
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        if self.inline_completion_key(key) {
+            return;
+        }
         // Inline find bar (Cmd+F / Ctrl+F) eats every key while open.
         if self.editor_find.is_some() {
             self.handle_editor_find_key(key);
@@ -35557,6 +35773,8 @@ impl App {
             Cmd::ToggleFormatOnSave => self.toggle_format_on_save(),
             Cmd::ToggleAutoSave => self.toggle_auto_save(),
             Cmd::ToggleAutoSaveOnFocusChange => self.toggle_auto_save_on_focus_change(),
+            Cmd::TriggerInlineCompletion => self.request_inline_completion(),
+            Cmd::ToggleInlineCompletions => self.toggle_inline_completions(),
             Cmd::ToggleInlineBlame => self.toggle_inline_blame(),
             Cmd::ToggleProvenance => self.toggle_provenance(),
             Cmd::DiffToggleGroupBySeat => self.diff_toggle_group_by_seat(),
@@ -42239,6 +42457,7 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        self.inline_completions = p.inline_completions;
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
@@ -50666,6 +50885,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
+        let inline_changed = app.poll_inline_completion();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
@@ -50794,6 +51014,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || blink_changed
             || spinner_changed
             || ext_index_changed
+            || inline_changed
             || search_changed
             || log_index_changed
             || remote_changed

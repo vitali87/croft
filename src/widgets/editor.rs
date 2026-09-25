@@ -2781,6 +2781,9 @@ pub struct Editor {
     /// stop from the VARIABLES data and cleared on resume/step/terminate.
     /// Painted like the blame trailer; the cursor-line blame yields to it.
     pub inline_values: std::collections::BTreeMap<usize, String>,
+    /// An inline completion on show (#607): its row, its column (the end
+    /// of that row), and the text Tab would insert.
+    pub inline_ghost: Option<(usize, usize, String)>,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -3060,6 +3063,7 @@ impl Editor {
             whitespace_mode: WhitespaceMode::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
+            inline_ghost: None,
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -13089,6 +13093,38 @@ impl Widget for &mut Editor {
                 if start_x < right {
                     let avail = (right - start_x) as usize;
                     let shown: String = note.chars().take(avail).collect();
+                    buf.set_string(
+                        start_x,
+                        y,
+                        &shown,
+                        Style::default()
+                            .fg(self.theme.ignored_fg())
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
+            }
+
+            // Inline completion (#607): the ghost's first line right after the
+            // caret at the end of its line, dim; a longer one says how many
+            // more lines Tab would bring.
+            if row_end >= line_len
+                && let Some((ghost_row, _, ghost)) = &self.inline_ghost
+                && *ghost_row == line_idx
+            {
+                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let start_x = text_x + text_cols as u16;
+                let right = inner.x + inner.width;
+                if start_x < right {
+                    let mut ghost_lines = ghost.lines();
+                    let first = ghost_lines.next().unwrap_or("");
+                    let more = ghost_lines.count();
+                    let shown = if more == 0 {
+                        first.to_string()
+                    } else {
+                        format!("{first}  \u{22ef} +{more} lines")
+                    };
+                    let avail = (right - start_x) as usize;
+                    let shown: String = shown.chars().take(avail).collect();
                     buf.set_string(
                         start_x,
                         y,
