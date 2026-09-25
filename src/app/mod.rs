@@ -18653,6 +18653,14 @@ impl App {
                 self.restore_all_terminal_panes();
                 true
             }
+            // Cmd+K Shift+D: Session: Detach (#679). Must precede the
+            // case-insensitive D arm below. The host answers this chord
+            // too, so for a write-control holder the client is usually
+            // gone already and this finds nothing left to do.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'d') => {
+                self.detach_session_client();
+                true
+            }
             // Cmd+K D: dump the active terminal's scrollback into a scratch
             // editor tab (kitty's show_scrollback, with the editor as the
             // pager: find, vim mode, save, and path:line jumps come free).
@@ -23561,6 +23569,24 @@ impl App {
         self.open_list_picker(picker, "No participants yet");
     }
 
+    /// Session: Detach (#679): disconnect the client that asked, leaving
+    /// the session running. The asker is the current typist: the host
+    /// announces a writer before its bytes reach the PTY, so the keystroke
+    /// or palette Enter that got here came from that client.
+    fn detach_session_client(&mut self) {
+        let Some(channel) = self.session_channel.as_mut() else {
+            self.status = String::from("Not a persistent session (start one with `croft attach`)");
+            return;
+        };
+        let Some(id) = detach_target(self.session_typist, &self.session_participants) else {
+            self.status = String::from("No attached client to detach");
+            return;
+        };
+        if !channel.kick(id) {
+            self.status = String::from("Session host unreachable");
+        }
+    }
+
     /// Second-level picker for one participant: grant or revoke write
     /// control, or disconnect them. Safe to expose to every attacher: a
     /// read-only guest's keystrokes are dropped at the session host, so any
@@ -23655,7 +23681,7 @@ impl App {
         if !self.session_host_stale_seen && channel.stale_marker.exists() {
             self.session_host_stale_seen = true;
             self.status = String::from(
-                "Session host runs a pre-update binary; detach and reattach (all participants) to pick up the update",
+                "Session host runs a pre-update binary; every participant detaches (Cmd+K Shift+D) and reattaches to pick up the update",
             );
         }
         let path = channel.presence.clone();
@@ -36187,6 +36213,7 @@ impl App {
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
             Cmd::SessionParticipants => self.open_participants_picker(),
+            Cmd::SessionDetach => self.detach_session_client(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
@@ -46191,6 +46218,53 @@ fn takeover_mode_seq() -> Vec<u8> {
     seq
 }
 
+/// Which client Session: Detach disconnects (#679): the one typing, else
+/// the only one attached (a host too old to announce typists).
+fn detach_target(
+    typist: Option<u64>,
+    roster: &[crate::session_host::Participant],
+) -> Option<u64> {
+    typist.or(match roster {
+        [only] => Some(only.id),
+        _ => None,
+    })
+}
+
+/// The inverse of [`takeover_mode_seq`]: the modes croft hands back when it
+/// gives a screen up (exit, the scp prompt, a detached client). Keep the two
+/// lists in step; the kitty keyboard flags are handled by each caller, since
+/// only the startup push can be paired with a pop.
+fn release_mode_seq() -> Vec<u8> {
+    let mut seq = Vec::new();
+    let _ = execute!(
+        seq,
+        crossterm::cursor::SetCursorStyle::DefaultUserShape,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        crossterm::cursor::Show,
+    );
+    seq
+}
+
+/// What an attach client writes when its session drops it (Session:
+/// Detach, a kick, #679). The client passes every mode byte through
+/// untouched, so the terminal is still in the inner croft's modes, and
+/// the inner croft keeps running and will never send its teardown. The
+/// kitty flags are SET to zero rather than popped: a reattached terminal
+/// only ever got [`mode_reassert_seq`]'s SET, so a pop would unwind a
+/// stack entry that belongs to the user's shell.
+pub(crate) fn detached_client_restore_seq() -> Vec<u8> {
+    let mut seq = set_title_seq("");
+    seq.extend_from_slice(reset_host_colors_seq().as_bytes());
+    if crate::iterm2_inline::detect_iterm2_inline_support() {
+        seq.extend_from_slice(reset_session_bg_seq().as_bytes());
+    }
+    seq.extend_from_slice(b"\x1b[=0;1u");
+    seq.extend(release_mode_seq());
+    seq
+}
+
 /// Escape bytes re-asserting every terminal mode croft set at startup. A
 /// dtach reattach (`-r winch`) delivers only a SIGWINCH: the newly attached
 /// terminal never received the startup DECSETs, so the alt screen, mouse
@@ -50289,14 +50363,12 @@ pub fn run(
     if kbd_enhanced {
         execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
     }
-    execute!(
-        terminal.backend_mut(),
-        crossterm::cursor::SetCursorStyle::DefaultUserShape,
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste,
-    )
-    .ok();
+    {
+        use std::io::Write;
+        let backend = terminal.backend_mut();
+        backend.write_all(&release_mode_seq()).ok();
+        backend.flush().ok();
+    }
     terminal.show_cursor().ok();
 
     // Reap the navigator's claude child before any exit: drop-to-local
@@ -50464,14 +50536,8 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
     }
     // Tear down the TUI surface so scp can use the real terminal.
     disable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        crossterm::cursor::SetCursorStyle::DefaultUserShape,
-    )
-    .ok();
+    terminal.backend_mut().write_all(&release_mode_seq()).ok();
+    terminal.backend_mut().flush().ok();
     terminal.show_cursor().ok();
 
     let total = uploads.len();

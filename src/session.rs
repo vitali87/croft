@@ -8,8 +8,8 @@
 //! - `croft attach [path]` attaches to (or creates) the persistent session for
 //!   a workspace. Several attachers share the session (see
 //!   docs/MULTIPLAYER.md).
-//! - Detach by closing the window: the client dies, the host keeps croft
-//!   alive.
+//! - Detach with Session: Detach (`Cmd+K Shift+D`, #679) or by closing the
+//!   window: the client goes, the host keeps croft alive.
 //! - `croft ls` lists the live sessions and prunes dead sockets.
 //! - Sessions created by an older croft under dtach keep reattaching through
 //!   dtach until they end; new sessions never need dtach.

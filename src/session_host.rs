@@ -152,7 +152,7 @@ pub fn stale_client_notice(roster: &[Participant], own: &str) -> Option<String> 
     let older: Vec<&str> = older.into_iter().map(|(_, v)| v).collect();
     (!older.is_empty()).then(|| {
         format!(
-            "Session updated to croft {own}; a client still runs {}. Detach and reattach it to update",
+            "Session updated to croft {own}; a client still runs {}. Detach it (Cmd+K Shift+D) and reattach to update",
             older.join(", ")
         )
     })
@@ -179,6 +179,122 @@ pub fn session_version<'a>(own: &'a str, host: Option<&'a str>) -> &'a str {
     match host {
         Some(h) if version_is_older(own, h) => h,
         _ => own,
+    }
+}
+
+/// How long after `Cmd+K` the second key of the detach chord may arrive,
+/// matching the app's own Cmd+K leader window.
+const DETACH_CHORD_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Watches one client's input for `Cmd+K Shift+D` (Session: Detach, #679).
+/// The host runs it on every client's bytes, including the read-only ones
+/// it drops before the PTY: a read-only participant's keys never reach the
+/// app, and a wedged app cannot act on anyone's, but the host sees both.
+///
+/// The encodings are the ones croft's keyboard flags produce: `Cmd+K`
+/// arrives as the CSI-u `ESC [ 107 ; 9 u` (iTerm2's forwarder and every
+/// kitty-protocol host alike), `Shift+D` as the text `D` (or its CSI-u
+/// form). Mouse reports, focus reports and key releases between the two
+/// keys are not keystrokes and leave the leader armed, as in the app.
+#[derive(Debug, Default)]
+struct DetachChord {
+    /// When `Cmd+K` was pressed, while no other key has followed it yet.
+    armed: Option<Instant>,
+    /// An escape sequence cut off at the end of the previous chunk.
+    partial: Vec<u8>,
+}
+
+/// What one CSI sequence means to [`DetachChord`].
+enum ChordKey {
+    CmdK,
+    ShiftD,
+    /// Not a keypress: mouse, focus, or a key release.
+    Ignore,
+    Other,
+}
+
+/// Classify a complete CSI sequence (`params` between `ESC [` and `last`).
+fn classify_csi(params: &[u8], last: u8) -> ChordKey {
+    match last {
+        b'M' | b'm' if params.first() == Some(&b'<') => return ChordKey::Ignore,
+        b'I' | b'O' if params.is_empty() => return ChordKey::Ignore,
+        b'u' => {}
+        _ => return ChordKey::Other,
+    }
+    let text = String::from_utf8_lossy(params);
+    let mut fields = text.split(';');
+    let code = fields.next().and_then(|f| f.split(':').next()?.parse::<u32>().ok());
+    let mut mods_field = fields.next().unwrap_or("1").split(':');
+    let mods = mods_field.next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(1);
+    let event = mods_field.next().and_then(|e| e.parse::<u32>().ok()).unwrap_or(1);
+    if event == 3 {
+        return ChordKey::Ignore;
+    }
+    // Shift, Alt, Ctrl, Super; the lock bits (Caps, Num) do not change the key.
+    let held = mods.saturating_sub(1) & 0b1111;
+    match (code, held) {
+        (Some(107), 8) => ChordKey::CmdK,
+        (Some(100 | 68), 1) => ChordKey::ShiftD,
+        _ => ChordKey::Other,
+    }
+}
+
+impl DetachChord {
+    /// Feed one chunk of a client's input; true when it completes the chord.
+    fn feed(&mut self, bytes: &[u8], now: Instant) -> bool {
+        let mut input = std::mem::take(&mut self.partial);
+        input.extend_from_slice(bytes);
+        let mut i = 0;
+        while i < input.len() {
+            let key = if input[i] == 0x1b {
+                if i + 1 == input.len() {
+                    self.partial = input[i..].to_vec();
+                    return false;
+                }
+                if input[i + 1] != b'[' {
+                    i += 2;
+                    ChordKey::Other
+                } else {
+                    let Some(len) = input[i + 2..]
+                        .iter()
+                        .position(|b| (0x40..=0x7e).contains(b))
+                    else {
+                        // Unterminated: keep it for the next chunk, unless it
+                        // is too long to be a key report at all.
+                        if input.len() - i <= 32 {
+                            self.partial = input[i..].to_vec();
+                        }
+                        return false;
+                    };
+                    let params = &input[i + 2..i + 2 + len];
+                    let last = input[i + 2 + len];
+                    i += 3 + len;
+                    classify_csi(params, last)
+                }
+            } else {
+                let b = input[i];
+                i += 1;
+                if b == b'D' {
+                    ChordKey::ShiftD
+                } else {
+                    ChordKey::Other
+                }
+            };
+            match key {
+                ChordKey::CmdK => self.armed = Some(now),
+                ChordKey::ShiftD
+                    if self
+                        .armed
+                        .is_some_and(|t| now.saturating_duration_since(t) <= DETACH_CHORD_TIMEOUT) =>
+                {
+                    self.armed = None;
+                    return true;
+                }
+                ChordKey::Ignore => {}
+                ChordKey::ShiftD | ChordKey::Other => self.armed = None,
+            }
+        }
+        false
     }
 }
 
@@ -1307,6 +1423,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
     let mut buf = [0u8; 16384];
     let mut my_id: Option<u64> = None;
     let mut privileged = false;
+    let mut detach_chord = DetachChord::default();
     'conn: loop {
         let n = match stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -1458,6 +1575,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         let clients = host.clients.lock().unwrap();
                         clients.iter().any(|c| c.id == id && c.control)
                     };
+                    let detach = detach_chord.feed(&bytes, Instant::now());
                     // Server-side enforcement: a read-only client's input
                     // never reaches the PTY (unlike abduco's advisory -r).
                     if has_control {
@@ -1466,6 +1584,15 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         if pty.write_all(&bytes).and_then(|_| pty.flush()).is_err() {
                             break 'conn;
                         }
+                    }
+                    // Session: Detach (#679). A holder's chord still reached
+                    // the app, whose own handler then finds this client
+                    // already gone; forwarding it keeps the app's Cmd+K
+                    // leader from dangling for the next typist. Shut down
+                    // like a kick: the client learns of it by the EOF.
+                    if detach {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        break 'conn;
                     }
                 }
                 Frame::Control(Control::Resize { cols, rows }) => {
@@ -1656,10 +1783,10 @@ pub fn attach_or_create(socket: &Path, workspace: Option<&Path>, inner: &[String
             PumpOutcome::RestartRequested => {
                 kill_stale_server(socket);
             }
-            // attach_client resolves swap handovers internally and returns
-            // Exit when reconnection is exhausted; this arm is exhaustiveness
-            // only.
-            PumpOutcome::HostSwapped => return Ok(0),
+            // attach_client resolves swap handovers and disconnects
+            // internally and returns Exit instead; these arms are
+            // exhaustiveness only.
+            PumpOutcome::HostSwapped | PumpOutcome::Disconnected => return Ok(0),
         }
     }
 }
@@ -1779,6 +1906,10 @@ pub enum PumpOutcome {
     /// connection is about to drop while the socket stays bound. Internal
     /// to the attach loop, which reconnects; callers never see it.
     HostSwapped,
+    /// The connection dropped with no Exit frame: this client was detached
+    /// (Session: Detach or a kick, #679) or the host died. Internal to
+    /// [`attach_client`], which hands the terminal back and reports Exit(0).
+    Disconnected,
 }
 
 /// How long the client waits for [`Control::ServerHello`] after its Hello.
@@ -1832,9 +1963,27 @@ pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
         .with_context(|| format!("connecting to {}", socket.display()))?;
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     let result = attach_client_loop(socket, &mut stream);
+    let disconnected = matches!(result, Ok(PumpOutcome::Disconnected));
+    if disconnected {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&crate::app::detached_client_restore_seq());
+        let _ = out.flush();
+    }
     let _ = crossterm::terminal::disable_raw_mode();
-    result
+    if !disconnected {
+        return result;
+    }
+    // A live socket means the session outlived this client: a detach, not a
+    // crash. Printed after raw mode is off, into the restored screen.
+    if crate::session::is_alive(socket) {
+        println!("{DETACHED_NOTE}");
+    }
+    Ok(PumpOutcome::Exit(0))
 }
+
+/// The line a detached client leaves in the shell (#679).
+const DETACHED_NOTE: &str =
+    "Detached from the croft session; it keeps running. Run the same command to reattach.";
 
 /// Pump the attach, reconnecting across host swaps (#238): a HostSwap frame
 /// means the host is re-execing into the updated binary and the socket
@@ -2066,7 +2215,7 @@ fn attach_client_pump(
     let mut buf = [0u8; 65536];
     loop {
         let n = match stream.read(&mut buf) {
-            Ok(0) => return Ok(PumpOutcome::Exit(0)),
+            Ok(0) => return Ok(PumpOutcome::Disconnected),
             Ok(n) => n,
             // A read timeout can survive the version phase when clearing it
             // failed (see above): an expiry on a quiet session is "nothing
@@ -2079,7 +2228,7 @@ fn attach_client_pump(
             {
                 continue;
             }
-            Err(_) => return Ok(PumpOutcome::Exit(0)),
+            Err(_) => return Ok(PumpOutcome::Disconnected),
         };
         for frame in reader.push(&buf[..n]) {
             match frame {
@@ -3299,6 +3448,107 @@ mod tests {
             "the wedged ghost must be evicted once its backlog passes the limit"
         );
         drop(ghost);
+    }
+
+    /// #679: the host's detach chord, as croft's keyboard flags encode it.
+    #[test]
+    fn detach_chord_fires_on_cmd_k_then_shift_d() {
+        let now = Instant::now();
+        let mut chord = DetachChord::default();
+        assert!(chord.feed(b"\x1b[107;9uD", now));
+
+        // Event-type suffixes (REPORT_EVENT_TYPES): the press arms, the
+        // release in between is not a keystroke.
+        let mut chord = DetachChord::default();
+        assert!(chord.feed(b"\x1b[107;9:1u\x1b[107;9:3uD", now));
+
+        // Caps Lock (bit 64) does not change which key it is; nor does
+        // Shift+D in its CSI-u form.
+        let mut chord = DetachChord::default();
+        assert!(chord.feed(b"\x1b[107;73u\x1b[100;2u", now));
+    }
+
+    #[test]
+    fn detach_chord_survives_split_reads_and_mouse_reports() {
+        let now = Instant::now();
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b[10", now));
+        assert!(!chord.feed(b"7;9u", now));
+        // Motion tracking reports the pointer between the two keys.
+        assert!(!chord.feed(b"\x1b[<35;10;5M\x1b[I", now));
+        assert!(chord.feed(b"D", now));
+    }
+
+    #[test]
+    fn detach_chord_ignores_near_misses() {
+        let now = Instant::now();
+        // Cmd+K D (lowercase) is the scrollback dump, not detach.
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b[107;9ud", now));
+        // A bare D, and a D after some other key, are typing.
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"D", now));
+        assert!(!chord.feed(b"\x1b[107;9uxD", now));
+        // Ctrl+K is kill-to-end-of-line, not the leader.
+        assert!(!chord.feed(b"\x1b[107;5uD", now));
+        assert!(!chord.feed(b"\x0bD", now));
+        // The leader lapses like the app's.
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b[107;9u", now));
+        assert!(!chord.feed(b"D", now + DETACH_CHORD_TIMEOUT + Duration::from_millis(1)));
+    }
+
+    /// #679: a read-only participant's keys never reach the app, so the host
+    /// itself detaches them on Cmd+K Shift+D; the holder stays on.
+    #[test]
+    fn read_only_participant_detaches_with_the_chord() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut owner = TestClient::connect(&socket, "owner", 80, 24);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut guest = TestClient::connect(&socket, "guest", 80, 24);
+        let frames = owner.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let ps = roster(&frames).unwrap();
+        assert!(
+            !ps.iter().find(|p| p.name == "guest").unwrap().control,
+            "the second attacher is read-only"
+        );
+
+        guest.send(&encode_bytes_frame(b"\x1b[107;9uD"));
+        let frames = owner.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
+        });
+        let ps = roster(&frames).unwrap();
+        assert_eq!(ps[0].name, "owner", "only the guest detached");
+    }
+
+    #[test]
+    fn write_control_holder_detaches_with_the_chord() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut owner = TestClient::connect(&socket, "owner", 80, 24);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut guest = TestClient::connect(&socket, "guest", 80, 24);
+        guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+
+        // Split across two frames, as two separate keypresses arrive.
+        owner.send(&encode_bytes_frame(b"\x1b[107;9u"));
+        owner.send(&encode_bytes_frame(b"D"));
+        let frames = guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
+        });
+        let ps = roster(&frames).unwrap();
+        assert_eq!(ps[0].name, "guest", "only the owner detached");
     }
 
     #[test]

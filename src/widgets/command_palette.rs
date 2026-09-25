@@ -196,6 +196,10 @@ pub enum Command {
     /// Multiplayer: list who is attached to this persistent session and
     /// grant/revoke write control or disconnect them (docs/MULTIPLAYER.md).
     SessionParticipants,
+    /// Detach this client from the persistent session, leaving the session
+    /// running (#679). The host also answers the chord itself, so it works
+    /// for read-only participants.
+    SessionDetach,
     /// Cancel the AI pilot's token stream into a shared file; the pilot
     /// reverts the streamed text (`croft pair`, docs/MULTIPLAYER.md).
     CollabCancelStream,
@@ -424,6 +428,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RevealRedactedSecrets,
     Command::SearchFromTerminal,
     Command::SessionParticipants,
+    Command::SessionDetach,
     Command::CollabCancelStream,
     Command::AskNavigator,
     Command::AskNavigatorAboutCapture,
@@ -625,6 +630,7 @@ impl Command {
             Command::RevealRedactedSecrets => "Terminal: Reveal Redacted Secrets for 10s",
             Command::SearchFromTerminal => "Terminal: Search & Replace from Last grep/rg",
             Command::SessionParticipants => "Session: Participants",
+            Command::SessionDetach => "Session: Detach",
             Command::CollabCancelStream => "Collab: Cancel AI Stream",
             Command::AskNavigator => "Navigator: Ask About Line or Selection",
             Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
@@ -826,6 +832,7 @@ impl Command {
             Command::RevealRedactedSecrets => "",
             Command::SearchFromTerminal => "",
             Command::SessionParticipants => "Cmd+K A",
+            Command::SessionDetach => "Cmd+K Shift+D",
             Command::CollabCancelStream => "Cmd+K X",
             Command::AskNavigator => "Cmd+K Q",
             Command::AskNavigatorAboutCapture => "",
@@ -1027,6 +1034,7 @@ impl Command {
             Command::RevealRedactedSecrets => "reveal_redacted_secrets",
             Command::SearchFromTerminal => "search_from_terminal",
             Command::SessionParticipants => "session_participants",
+            Command::SessionDetach => "session_detach",
             Command::CollabCancelStream => "collab_cancel_stream",
             Command::AskNavigator => "navigator_ask",
             Command::AskNavigatorAboutCapture => "captures_ask_navigator",
@@ -1498,6 +1506,17 @@ mod tests {
             Some(&builtin(Command::FormatDocument))
         );
         assert_eq!(Command::FormatDocument.keybinding_hint(), "Cmd+Opt+Shift+F");
+    }
+
+    #[test]
+    fn session_detach_is_reachable_and_shows_its_chord() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("session detach");
+        assert_eq!(
+            palette.results.first(),
+            Some(&builtin(Command::SessionDetach))
+        );
+        assert_eq!(Command::SessionDetach.keybinding_hint(), "Cmd+K Shift+D");
     }
 
     #[test]

@@ -141,9 +141,15 @@ host  tty ── croft attach ──┘        (one accept loop,          (uncha
   because liveness is still "can I connect to the socket". Once stable, the
   dtach dependency can go entirely, including `croft_pkg_install dtach` in the
   remote installer (`src/remote.rs:2182`).
-- **Detach chord**: the control channel supplies what the comment at
-  `src/session.rs:9` deferred — an in-app detach command sends a `detach`
-  frame instead of needing a dtach escape key.
+- **Detach chord** (shipped, #679): `Cmd+K Shift+D`. The host matches the
+  chord in each client's input stream (`DetachChord`), before the read-only
+  filter, so a read-only participant and a client of a wedged inner croft
+  can both detach; it then closes that connection exactly as a kick does.
+  The palette entry "Session: Detach" goes through the inner croft instead,
+  kicking the current typist over the privileged channel. On an EOF with no
+  `exit` frame the attach client writes the inverse of croft's takeover
+  modes (the inner croft never sends its teardown to a client it no longer
+  serves) and, if the socket is still live, a one-line "detached" note.
 
 ### How the inner croft learns about participants
 

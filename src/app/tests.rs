@@ -10508,6 +10508,58 @@ fn close_all_closes_every_split_group() {
     assert_eq!(app.status, format!("Closed {total} tabs"));
 }
 
+/// #679: Cmd+K Shift+D is Session: Detach, not the Cmd+K D scrollback
+/// dump; outside a persistent session it says so and opens nothing.
+#[test]
+fn cmd_k_shift_d_detaches_instead_of_dumping_scrollback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let tabs = app.editor.tab_count();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('D'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.status,
+        "Not a persistent session (start one with `croft attach`)"
+    );
+    assert_eq!(app.editor.tab_count(), tabs, "no scrollback tab opened");
+}
+
+#[test]
+fn detach_target_is_the_typist_else_the_only_participant() {
+    let p = |id| crate::session_host::Participant {
+        id,
+        name: format!("p{id}"),
+        cols: 80,
+        rows: 24,
+        control: true,
+        version: String::new(),
+    };
+    assert_eq!(detach_target(Some(2), &[p(1), p(2)]), Some(2));
+    assert_eq!(detach_target(None, &[p(7)]), Some(7));
+    assert_eq!(detach_target(None, &[p(1), p(2)]), None, "never guess");
+    assert_eq!(detach_target(None, &[]), None);
+}
+
+/// #679: a detached client must leave the shell usable: the inner croft
+/// never sends its own teardown to a client it no longer serves.
+#[test]
+fn detached_client_restore_seq_hands_every_mode_back() {
+    let seq = String::from_utf8(detached_client_restore_seq()).unwrap();
+    for (bytes, what) in [
+        ("\x1b[?1049l", "alternate screen"),
+        ("\x1b[?1000l", "mouse tracking"),
+        ("\x1b[?1003l", "motion tracking"),
+        ("\x1b[?2004l", "bracketed paste"),
+        ("\x1b[?25h", "cursor visibility"),
+        ("\x1b[=0;1u", "kitty keyboard flags"),
+        ("\x1b]110\x07", "host foreground"),
+    ] {
+        assert!(seq.contains(bytes), "must restore {what}");
+    }
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
