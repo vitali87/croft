@@ -50150,7 +50150,10 @@ fn a_held_edit_fits_only_the_text_it_was_computed_for() {
         seq,
         dirty,
     };
-    let fits = |before: &[TabStamp], now: &[TabStamp]| text_unchanged_since(before, now, path);
+    let fits =
+        |before: &[TabStamp], now: &[TabStamp]| text_unchanged_since(before, now, path, true);
+    let written =
+        |before: &[TabStamp], now: &[TabStamp]| text_unchanged_since(before, now, path, false);
     assert!(fits(
         &[tab(1, false), tab(2, true)],
         &[tab(2, true), tab(1, false)]
@@ -50165,6 +50168,55 @@ fn a_held_edit_fits_only_the_text_it_was_computed_for() {
     assert!(fits(&[tab(1, false)], &[]), "closed with nothing unsaved");
     assert!(!fits(&[tab(4, true)], &[]), "closed with unsaved text");
     assert!(fits(&[], &[]), "never open: the disk text");
+    // The disk written during the wait (a save clears the dirty flag).
+    assert!(!written(&[], &[tab(1, false)]), "opened, typed, saved");
+    assert!(!written(&[tab(1, false)], &[]), "typed, saved, closed");
+    assert!(!written(&[], &[]), "written by another program");
+    assert!(
+        written(&[tab(1, false)], &[tab(1, false)]),
+        "an open tab is judged by its own text"
+    );
+}
+
+/// #610: a file opened, typed into and saved during the wait keeps its
+/// text, and the status names it by its workspace path.
+#[test]
+fn a_file_saved_during_the_wait_keeps_its_text() {
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    let root = foo.parent().unwrap().to_path_buf();
+    let nested = root.join("src").join("lib.rs");
+    std::fs::create_dir(nested.parent().unwrap()).unwrap();
+    std::fs::write(&nested, "mod foo;\n").unwrap();
+    let dest = root.join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    app.editor.open_pinned(&nested).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.save_to_disk().unwrap();
+    assert!(!app.editor.dirty);
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .answer_will_rename_files(mod_foo_to_bar(request_id, &nested));
+    assert!(app.drain_will_rename_files());
+    assert_eq!(app.editor.lines[0], "xmod foo;");
+    assert!(
+        std::fs::read_to_string(&nested)
+            .unwrap()
+            .starts_with("xmod foo;")
+    );
+    assert!(
+        app.status
+            .ends_with("; not updated in src/lib.rs (changed during the wait)"),
+        "{}",
+        app.status
+    );
 }
 
 /// #610: Esc stops waiting, the held move goes ahead without an edit, and a

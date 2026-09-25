@@ -243,14 +243,18 @@ pub(crate) enum QuickInputPosition {
 struct PendingFileMove {
     request_id: u64,
     op: FileMove,
-    /// Each open tab's path and edit counter when the request went out. The
-    /// servers answer for that text, so a file typed into during the wait
-    /// does not take their edit: its spans would land on shifted text.
-    edit_seqs: Vec<TabStamp>,
+    /// Each open text tab's path, edit counter and dirty flag when the
+    /// request went out. The servers answer for that text, so a file typed
+    /// into during the wait does not take their edit: its spans would land
+    /// on shifted text.
+    tabs: Vec<TabStamp>,
+    /// When the request went out: a file written since (a save, auto save,
+    /// another program) no longer holds the disk text the servers read.
+    requested_at: std::time::SystemTime,
 }
 
 /// One open text tab when a `willRenameFiles` request went out.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct TabStamp {
     path: PathBuf,
     seq: u64,
@@ -261,9 +265,18 @@ struct TabStamp {
 /// its tabs when the request went out (`before`) with its tabs now. Edit
 /// counters are per tab and two tabs can share a value, so the whole sorted
 /// list must match, not each counter on its own. A file with no tab then
-/// was read from disk, so tabs opened since fit while they are clean; a file
-/// whose tabs all closed since fits when none of them held unsaved text.
-fn text_unchanged_since(before: &[TabStamp], now: &[TabStamp], path: &Path) -> bool {
+/// was read from disk, so tabs opened since fit while they are clean and the
+/// disk is unwritten since (`disk_unchanged`: a save clears the dirty flag
+/// but not the change); a file whose tabs all closed since fits when none
+/// of them held unsaved text and, likewise, the disk is unwritten since.
+fn text_unchanged_since(
+    before: &[TabStamp],
+    now: &[TabStamp],
+    path: &Path,
+    disk_unchanged: bool,
+) -> bool {
+    // Sorted with the dirty flag riding along; the lists compare by
+    // counter alone.
     let tabs = |set: &[TabStamp]| -> Vec<(u64, bool)> {
         let mut tabs: Vec<(u64, bool)> = set
             .iter()
@@ -275,10 +288,10 @@ fn text_unchanged_since(before: &[TabStamp], now: &[TabStamp], path: &Path) -> b
     };
     let (then, now) = (tabs(before), tabs(now));
     if then.is_empty() {
-        return now.iter().all(|(_, dirty)| !dirty);
+        return disk_unchanged && now.iter().all(|(_, dirty)| !dirty);
     }
     if now.is_empty() {
-        return then.iter().all(|(_, dirty)| !dirty);
+        return disk_unchanged && then.iter().all(|(_, dirty)| !dirty);
     }
     then.iter()
         .map(|(seq, _)| seq)
@@ -45905,11 +45918,12 @@ impl App {
             && lsp.has_will_rename_listeners()
         {
             let request_id = lsp.request_will_rename_files(files);
-            let edit_seqs = self.open_tab_edit_seqs();
+            let tabs = self.open_tab_edit_seqs();
             self.pending_file_move = Some(PendingFileMove {
                 request_id,
                 op,
-                edit_seqs,
+                tabs,
+                requested_at: std::time::SystemTime::now(),
             });
             self.status = String::from("Updating references before the move (Esc to skip)");
             return Ok(());
@@ -45979,9 +45993,12 @@ impl App {
             return false;
         };
         let now = self.open_tab_edit_seqs();
-        let (edits, stale): (Vec<_>, Vec<_>) = edits
-            .into_iter()
-            .partition(|(path, _)| text_unchanged_since(&pending.edit_seqs, &now, path));
+        let (edits, stale): (Vec<_>, Vec<_>) = edits.into_iter().partition(|(path, _)| {
+            let disk_unchanged = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t <= pending.requested_at);
+            text_unchanged_since(&pending.tabs, &now, path, disk_unchanged)
+        });
         // Named before the move, which may carry them to new paths.
         let stale_names: Vec<String> = stale.iter().map(|(p, _)| self.status_path(p)).collect();
         self.finish_file_move(pending.op, Some(&edits));
