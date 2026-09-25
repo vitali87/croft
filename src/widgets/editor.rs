@@ -4821,6 +4821,9 @@ impl Editor {
             notebook: false,
             doc_path: Some(path.to_path_buf()),
             media: true,
+            source_lines: Vec::new(),
+            line_rows: Vec::new(),
+            pending_source_line: None,
         });
         self.status = format!("Opened media info {}", path.display());
         Ok(())
@@ -4894,6 +4897,9 @@ impl Editor {
             notebook: false,
             doc_path: Some(path.to_path_buf()),
             media: false,
+            source_lines: Vec::new(),
+            line_rows: Vec::new(),
+            pending_source_line: None,
         });
         self.status = format!("Opened document {}", path.display());
         Ok(())
@@ -5632,7 +5638,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables) = crate::markdown::render_markdown_full(
+        let (lines, images, runnables, source_lines) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
@@ -5643,6 +5649,7 @@ impl Editor {
             md.lines = lines;
             md.images = images;
             md.runnables = runnables;
+            md.source_lines = source_lines;
             md.built_seq = self.edit_seq;
         }
     }
@@ -6048,10 +6055,39 @@ impl Editor {
         self.lines.len()
     }
 
+    /// The source line at the top of the view: the preview's top line
+    /// mapped back to the source while a Markdown preview shows, the
+    /// text view's own top line otherwise (#619). `None` for previews that
+    /// are not Markdown source (notebooks, documents, media).
+    pub fn top_source_line(&self) -> Option<usize> {
+        match self.markdown_preview.as_ref() {
+            Some(md) => md.source_at_scroll(),
+            None => Some(self.scroll),
+        }
+    }
+
+    /// Bring source `line` to the top: in the preview once its next render
+    /// knows the wrap, in the text view at once (#619).
+    pub fn scroll_source_line_to_top(&mut self, line: usize) {
+        match self.markdown_preview.as_mut() {
+            Some(md) if !md.source_lines.is_empty() => md.pending_source_line = Some(line),
+            Some(_) => {}
+            None => {
+                self.scroll = line.min(self.lines.len().saturating_sub(1));
+                self.scroll_sub = 0;
+            }
+        }
+    }
+
     /// Markdown: Toggle Preview (Cmd/Ctrl+Shift+V). Returns false when the
     /// active tab is not a Markdown text buffer (the caller reports why).
     pub fn toggle_markdown_preview(&mut self) -> bool {
-        if self.markdown_preview.take().is_some() {
+        if let Some(md) = self.markdown_preview.take() {
+            // Back to the source where the preview was (#619).
+            if let Some(line) = md.source_at_scroll() {
+                self.scroll = line.min(self.lines.len().saturating_sub(1));
+                self.scroll_sub = 0;
+            }
             return true;
         }
         let is_notebook = self
@@ -6074,7 +6110,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables) = crate::markdown::render_markdown_full(
+        let (lines, images, runnables, source_lines) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
@@ -6097,6 +6133,10 @@ impl Editor {
             notebook: false,
             doc_path: None,
             media: false,
+            source_lines,
+            line_rows: Vec::new(),
+            // Open where the source was (#619).
+            pending_source_line: Some(self.scroll),
         });
         true
     }
@@ -6139,6 +6179,9 @@ impl Editor {
             notebook: true,
             doc_path: None,
             media: false,
+            source_lines: Vec::new(),
+            line_rows: Vec::new(),
+            pending_source_line: None,
         });
         true
     }
@@ -13279,7 +13322,7 @@ impl Editor {
                 .path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images, runnables) = crate::markdown::render_markdown_full(
+            let (lines, images, runnables, source_lines) = crate::markdown::render_markdown_mapped(
                 &text,
                 self.theme,
                 &mut self.registry,
@@ -13290,6 +13333,7 @@ impl Editor {
                 md.lines = lines;
                 md.images = images;
                 md.runnables = runnables;
+                md.source_lines = source_lines;
                 md.built_seq = self.edit_seq;
             }
         }
@@ -13332,7 +13376,28 @@ impl Editor {
                 .iter()
                 .map(|r| visual_row(r.first_line))
                 .collect();
+            // Every line's first visual row, for scroll sync (#619). Each
+            // `Line` wraps on its own, so a running sum stays linear.
+            let mut row = 0usize;
+            md.line_rows = md
+                .lines
+                .iter()
+                .map(|l| {
+                    let at = row;
+                    row += Paragraph::new(Text::from(vec![l.clone()]))
+                        .wrap(Wrap { trim: false })
+                        .line_count(text_area.width)
+                        .max(1);
+                    at
+                })
+                .collect();
             md.wrap_key = (md.built_seq, text_area.width);
+        }
+        if let Some(source) = md.pending_source_line.take()
+            && let Some(line) = md.line_for_source(source)
+            && let Some(&row) = md.line_rows.get(line)
+        {
+            md.scroll = (row as u16).min(max_scroll);
         }
         md.last_area = text_area;
         para.scroll((md.scroll, 0)).render(text_area, buf);

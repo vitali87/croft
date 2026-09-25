@@ -87,6 +87,7 @@ The collapse is also held off whenever something else on screen depends on the s
 
 * Tree-sitter highlighting, side-by-side splits, and bracket-match highlighting.
 * Inline previews for images / PDFs / spreadsheets. The rendered Markdown / notebook / document view is selectable: drag to select the text you can see, `Cmd`/`Ctrl`+`C` copies the rendered text rather than the source, `Esc` clears.
+* The Markdown preview keeps its place with the source. `Cmd`/`Ctrl`+`Shift`+`V` opens the preview at the source line that was at the top, and closing it returns the source to the preview's top line. With the file open in two split groups, one as source and one as preview, scrolling either one brings the other to the same place.
 * A minimap: a rasterized file preview in a right-edge strip; click or drag to jump, right-click to toggle or re-side it.
 * A breadcrumbs bar: the file path plus the enclosing symbol trail at the caret, click to jump.
 * Sticky scroll: the enclosing scope headers pinned to the top while you scroll.

@@ -3004,6 +3004,9 @@ pub struct App {
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
     view_listener: Option<std::os::unix::net::UnixListener>,
+    /// The (file, top source line) the Markdown scroll sync last followed
+    /// (#619), so a split group follows the active one only when it moves.
+    md_sync_last: Option<(PathBuf, usize)>,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -4789,6 +4792,7 @@ impl App {
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
             view_listener,
+            md_sync_last: None,
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -28175,6 +28179,34 @@ impl App {
         };
     }
 
+    /// Markdown scroll sync across split groups (#619): when another group
+    /// shows the active file as source while this one previews it (or the
+    /// other way round), it follows the active group's top line. Only a
+    /// move of the active side is followed, so the two never fight.
+    fn sync_markdown_scroll(&mut self) -> bool {
+        let Some(path) = self.editor.path.clone() else {
+            return false;
+        };
+        let Some(top) = self.editor.top_source_line() else {
+            return false;
+        };
+        let key = (path.clone(), top);
+        if self.md_sync_last.as_ref() == Some(&key) {
+            return false;
+        }
+        self.md_sync_last = Some(key);
+        let previewing = self.editor.markdown_preview.is_some();
+        let mut changed = false;
+        for group in self.editor_layout.inactive_groups_mut() {
+            if group.path.as_ref() == Some(&path) && group.markdown_preview.is_some() != previewing
+            {
+                group.scroll_source_line_to_top(top);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Markdown: Toggle Preview — flips the active tab between source and the
     /// rendered view; explains itself on a non-Markdown tab.
     fn toggle_markdown_preview(&mut self) {
@@ -50441,6 +50473,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
+        let md_sync_changed = app.sync_markdown_scroll();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
@@ -50569,6 +50602,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || remote_changed
             || pulls_changed
             || view_changed
+            || md_sync_changed
             || ports_changed
             || session_presence_changed
             || session_typing_changed

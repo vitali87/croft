@@ -65,6 +65,15 @@ pub struct MarkdownPreview {
     /// True when `doc_path` names a MEDIA file (#183): the rebuild
     /// dispatch probes headers instead of walking document XML.
     pub media: bool,
+    /// Scroll sync (#619): for each line of `lines`, the 0-based SOURCE
+    /// line it was rendered from (non-decreasing; empty for previews that
+    /// are not Markdown source). Frame truth like `anchor_rows`: each
+    /// line's first VISUAL row, at `wrap_key`.
+    pub source_lines: Vec<usize>,
+    pub line_rows: Vec<usize>,
+    /// A source line to bring to the top once the next render knows the
+    /// wrap (set when the preview opens, or a split source view scrolls).
+    pub pending_source_line: Option<usize>,
 }
 
 /// One runnable fenced block in a rendered preview (#353): a shell (or,
@@ -996,6 +1005,25 @@ pub fn render_markdown_full(
     base_dir: Option<&std::path::Path>,
     outputs: BlockOutputs,
 ) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>) {
+    let (lines, images, runnables, _) =
+        render_markdown_mapped(text, theme, registry, base_dir, outputs);
+    (lines, images, runnables)
+}
+
+/// [`render_markdown_full`] plus, for each rendered line, the 0-based source
+/// line it came from (#619), for the preview's scroll sync.
+pub fn render_markdown_mapped(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+    base_dir: Option<&std::path::Path>,
+    outputs: BlockOutputs,
+) -> (
+    Vec<Line<'static>>,
+    Vec<MdImage>,
+    Vec<MdRunnable>,
+    Vec<usize>,
+) {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut r = Renderer {
@@ -1030,7 +1058,20 @@ pub fn render_markdown_full(
             .partition_point(|&s| s <= offset)
             .saturating_sub(1)
     };
+    // Rendered line -> source line (#619): lines an event produces map onto
+    // the event's source span in order, clamped to its last line.
+    let mut source_lines: Vec<usize> = Vec::new();
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        let (mut ev_first, ev_last) = (line_of(range.start), line_of(range.end.saturating_sub(1)));
+        // A fenced block's opening fence is never rendered: its first
+        // rendered line is the source line after it.
+        if matches!(event, Event::End(TagEnd::CodeBlock))
+            && text[line_starts[ev_first]..]
+                .trim_start()
+                .starts_with(['`', '~'])
+        {
+            ev_first += 1;
+        }
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -1237,8 +1278,12 @@ pub fn render_markdown_full(
             }
             _ => {}
         }
+        let added = r.out.len().saturating_sub(source_lines.len());
+        source_lines.extend((0..added).map(|k| (ev_first + k).min(ev_last.max(ev_first))));
     }
     r.flush_line();
+    let last = source_lines.last().copied().unwrap_or(0);
+    source_lines.resize(r.out.len(), last);
     // Trim the leading/trailing blank separators so the preview starts at
     // the first real line - shifting the image anchors with the front
     // trim, and never eating a trailing image's RESERVED blanks.
@@ -1276,10 +1321,34 @@ pub fn render_markdown_full(
     {
         r.out.pop();
     }
-    (r.out, r.images, r.runnables)
+    source_lines.drain(..removed_front.min(source_lines.len()));
+    source_lines.truncate(r.out.len());
+    (r.out, r.images, r.runnables, source_lines)
 }
 
 impl MarkdownPreview {
+    /// The first rendered line drawn from `source` or later (#619).
+    pub fn line_for_source(&self, source: usize) -> Option<usize> {
+        if self.source_lines.is_empty() {
+            return None;
+        }
+        let i = self.source_lines.partition_point(|&s| s < source);
+        Some(i.min(self.source_lines.len() - 1))
+    }
+
+    /// The source line of the rendered line at the top of the view, once
+    /// a render has mapped lines to rows.
+    pub fn source_at_scroll(&self) -> Option<usize> {
+        if self.line_rows.is_empty() || self.source_lines.is_empty() {
+            return None;
+        }
+        let top = self
+            .line_rows
+            .partition_point(|&row| row <= self.scroll as usize)
+            .saturating_sub(1);
+        self.source_lines.get(top).copied()
+    }
+
     /// The selection normalised to (start, end) in reading order.
     fn ordered_selection(&self) -> Option<((u16, u16), (u16, u16))> {
         let (a, b) = self.selection?;
@@ -2096,6 +2165,9 @@ mod preview_selection_tests {
             notebook: false,
             doc_path: None,
             media: false,
+            source_lines: Vec::new(),
+            line_rows: Vec::new(),
+            pending_source_line: None,
         }
     }
 
@@ -2179,5 +2251,57 @@ mod preview_selection_tests {
         let mut p = preview(&["only row"]);
         p.selection = Some(((0, 2), (9, 40)));
         assert_eq!(p.selection_text(), "ly row");
+    }
+
+    #[test]
+    fn rendered_lines_map_back_to_their_source_lines() {
+        let mut reg = LangRegistry::default();
+        let md = "# Title\n\nfirst para\nstill first\n\n```sh\necho a\necho b\n```\n\nlast";
+        let (lines, _, _, map) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert_eq!(map.len(), lines.len());
+        assert!(
+            map.windows(2).all(|w| w[0] <= w[1]),
+            "non-decreasing: {map:?}"
+        );
+        let text = |i: usize| {
+            lines[i]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let at = |needle: &str| {
+            (0..lines.len())
+                .find(|&i| text(i).contains(needle))
+                .unwrap()
+        };
+        assert_eq!(map[at("Title")], 0);
+        assert_eq!(map[at("first para")], 2);
+        assert_eq!(map[at("echo b")], 7, "a fence's lines follow its source");
+        assert_eq!(map[at("last")], 10);
+    }
+
+    #[test]
+    fn the_preview_finds_rendered_lines_for_source_and_back() {
+        let mut p = preview(&[]);
+        p.source_lines = vec![0, 0, 2, 3, 7, 7, 10];
+        p.line_rows = vec![0, 1, 2, 4, 5, 6, 8];
+        assert_eq!(p.line_for_source(0), Some(0));
+        assert_eq!(
+            p.line_for_source(5),
+            Some(4),
+            "the next rendered line after a gap"
+        );
+        assert_eq!(p.line_for_source(99), Some(6), "clamped to the end");
+        p.scroll = 3;
+        assert_eq!(
+            p.source_at_scroll(),
+            Some(2),
+            "row 3 is inside line 2's wrap"
+        );
+        p.scroll = 8;
+        assert_eq!(p.source_at_scroll(), Some(10));
+        assert_eq!(preview(&[]).source_at_scroll(), None);
     }
 }

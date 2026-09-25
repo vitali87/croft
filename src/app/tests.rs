@@ -49559,3 +49559,85 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+fn long_markdown() -> String {
+    (0..60)
+        .map(|i| format!("## Heading {i}\n\nParagraph {i} body.\n"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Markdown scroll sync (#619) in one view: the preview opens at the source
+/// line that was at the top, and closing it returns the source to the
+/// preview's top line.
+#[test]
+fn the_markdown_preview_opens_and_closes_where_the_other_view_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "doc.md", &long_markdown());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    let screen = |term: &ratatui::Terminal<ratatui::backend::TestBackend>| -> String {
+        let b = term.backend().buffer();
+        (0..30)
+            .map(|y| (0..100).map(|x| b[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // Source line 80 is "## Heading 20" (4 lines per section).
+    app.editor.scroll_source_line_to_top(80);
+    app.toggle_markdown_preview();
+    term.draw(|f| app.render(f)).unwrap();
+    let shown = screen(&term);
+    assert!(shown.contains("Heading 20"), "{shown}");
+    assert!(
+        !shown.contains("Heading 19 "),
+        "the preview starts at the source's top: {shown}"
+    );
+
+    // Scroll the preview on, then close it: the source follows.
+    app.editor.markdown_preview.as_mut().unwrap().scroll += 12;
+    term.draw(|f| app.render(f)).unwrap();
+    let top = app.editor.top_source_line().unwrap();
+    assert!(top > 80, "{top}");
+    app.toggle_markdown_preview();
+    assert_eq!(app.editor.scroll, top);
+}
+
+/// The same across split groups: the source in one group and its preview in
+/// the other follow each other, whichever is active.
+#[test]
+fn a_split_source_and_preview_follow_each_other() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "doc.md", &long_markdown());
+    app.split_editor();
+    app.toggle_markdown_preview();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Active preview scrolls: the source group follows its top line.
+    app.editor.markdown_preview.as_mut().unwrap().scroll = 20;
+    term.draw(|f| app.render(f)).unwrap();
+    let top = app.editor.top_source_line().unwrap();
+    assert!(top > 0);
+    assert!(app.sync_markdown_scroll());
+    let source = app
+        .editor_layout
+        .inactive_groups_mut()
+        .into_iter()
+        .next()
+        .map(|g| g.scroll)
+        .unwrap();
+    assert_eq!(source, top);
+    assert!(
+        !app.sync_markdown_scroll(),
+        "nothing moved, nothing to follow"
+    );
+
+    // Now the source side is active and moves: the preview follows.
+    app.focus_editor_group(true);
+    assert!(app.editor.markdown_preview.is_none());
+    app.editor.scroll_source_line_to_top(160);
+    assert!(app.sync_markdown_scroll());
+    app.focus_editor_group(false);
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.editor.top_source_line(), Some(160));
+}
