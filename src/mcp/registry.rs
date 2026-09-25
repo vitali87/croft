@@ -285,6 +285,16 @@ pub fn contributed_commands() -> Vec<ContributedCommand> {
     contributed_in(&all_sources(), &disabled)
 }
 
+/// The ids of the commands extension `ext_id` declares, enabled or not,
+/// read from under an explicit config dir.
+pub fn command_ids_of_in_dir(config_dir: &Path, ext_id: &str) -> Vec<String> {
+    contributed_in(&all_sources_in_dir(config_dir), &BTreeSet::new())
+        .into_iter()
+        .filter(|c| c.ext_id == ext_id)
+        .map(|c| c.id)
+        .collect()
+}
+
 /// Resolve a palette command id to its server and tool, reading the
 /// extensions under an explicit config dir.
 pub fn resolve_command_in_dir(config_dir: &Path, command_id: &str) -> Option<ResolvedCommand> {
