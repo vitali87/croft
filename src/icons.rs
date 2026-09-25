@@ -30,6 +30,8 @@ pub const CHEVRON_OPEN: char = '▾';
 /// stack). Verified against Nerd Font cmap; do NOT use U+EAEB which is
 /// `cod-file_pdf` and renders the literal "PDF" document.
 pub const ACTIVITY_EXPLORER: char = '\u{eaf0}';
+/// Codicon `comment`: the Explorer's per-file count of open comments (#367).
+pub const COMMENT: char = '\u{ea6b}';
 pub const ACTIVITY_SEARCH: char = '\u{ea6d}';
 pub const ACTIVITY_REMOTE: char = '\u{eb39}';
 /// Codicon `source-control` — the Y-fork glyph with three nodes that

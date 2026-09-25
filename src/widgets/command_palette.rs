@@ -253,6 +253,7 @@ pub enum Command {
     /// Ignore the focused navigator comment box, or the next one from the
     /// caret (Shift+F4).
     IgnoreComment,
+    AddComment,
 }
 
 /// Every command, in palette display order. Single source of truth for both
@@ -447,6 +448,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleProactiveNavigator,
     Command::NextComment,
     Command::IgnoreComment,
+    Command::AddComment,
 ];
 
 impl Command {
@@ -647,6 +649,7 @@ impl Command {
             Command::ToggleProactiveNavigator => "Navigator: Toggle Proactive Comments",
             Command::NextComment => "Navigator: Next Comment",
             Command::IgnoreComment => "Navigator: Ignore Comment",
+            Command::AddComment => "Comments: Add Comment",
         }
     }
 
@@ -850,6 +853,7 @@ impl Command {
             Command::ToggleProactiveNavigator => "",
             Command::NextComment => "F4",
             Command::IgnoreComment => "Shift+F4",
+            Command::AddComment => "Cmd+K Shift+C",
         }
         // No catch-all: every Command must carry an accelerator (croft tenet),
         // so adding a variant fails to compile until its hint is supplied.
@@ -1047,6 +1051,7 @@ impl Command {
             Command::ToggleProactiveNavigator => "navigator_toggle_proactive",
             Command::NextComment => "navigator_next_comment",
             Command::IgnoreComment => "navigator_ignore_comment",
+            Command::AddComment => "comments_add_comment",
             Command::RunTask => "run_task",
             Command::RunBuildTask => "run_build_task",
             Command::RerunLastTask => "rerun_last_task",

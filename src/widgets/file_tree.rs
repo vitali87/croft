@@ -55,6 +55,10 @@ pub struct FileTree {
     /// root path. Swapped in by the app whenever a lane or a seat changes;
     /// a root with no entry paints as before.
     pub root_badges: Arc<HashMap<PathBuf, String>>,
+    /// Unresolved human comments per file (#367), absolute paths, painted
+    /// as a count after the name. Swapped in by the app when the comment
+    /// store changes; exact membership, like `agent_touched`.
+    pub comment_counts: Arc<HashMap<PathBuf, usize>>,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -112,6 +116,7 @@ impl FileTree {
             theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
             agent_touched: Arc::default(),
+            comment_counts: Arc::default(),
             root_badges: Arc::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
@@ -162,6 +167,7 @@ impl FileTree {
         // the new tree, describing a lane the user has walked away from —
         // the exact staleness this decoration exists to avoid.
         self.agent_touched = Arc::default();
+        self.comment_counts = Arc::default();
         self.load_children(0);
     }
 
@@ -1589,6 +1595,13 @@ impl Widget for &mut FileTree {
                     spans.push(Span::styled(
                         format!(" {AGENT_DOT}"),
                         Style::default().fg(self.theme.ui(Color::Yellow)),
+                    ));
+                }
+                // Open comments (#367): trailing like the agent dot.
+                if let Some(n) = self.comment_counts.get(&node.path) {
+                    spans.push(Span::styled(
+                        format!(" {} {n}", icons::COMMENT),
+                        Style::default().fg(self.theme.ui(Color::Cyan)),
                     ));
                 }
             }

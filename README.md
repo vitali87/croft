@@ -119,7 +119,8 @@ croft --help
 `croft attach` keeps a session alive after you close the window, and lets other people join it.
 Add `--solo` and each participant gets an independent viewport on the same files, live. An AI can
 take a seat too, either as an MCP guest or as a resident pair-programming navigator croft hosts
-itself (`croft pair`), local open-weight models included.
+itself (`croft pair`), local open-weight models included. Anyone can leave comments on a line
+for the others (`Cmd+K Shift+C`).
 
 See **[COLLABORATION.md](docs/COLLABORATION.md)** for the full guide.
 

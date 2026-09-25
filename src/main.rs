@@ -11,6 +11,7 @@ mod clipboard;
 mod collab;
 mod collab_agent;
 mod command_history;
+mod comments;
 mod config_layers;
 mod config_sync;
 mod dap;

@@ -46,6 +46,22 @@ appear as colored ghost carets wearing their owner's name while they move (VS Co
 style), and the session owner is the single writer to disk, so saves, history, and the file
 watcher see one author.
 
+### Comments
+
+`Cmd+K Shift+C` (or **Comments: Add Comment** in the palette) opens a comment box under the
+caret's line. Type, then `Enter` to post it; `Esc` drops it. The box wears your name and
+color, never touches the file, and appears at the same line for every participant. It follows
+the line as anyone adds or removes lines above it.
+
+- `F4` walks the open comments of every open file; typing into a focused box and `Enter` adds a
+  reply to its thread.
+- `Shift+F4`, or the box's **Resolve** button, resolves it for everyone. It stays, dimmed, with
+  a **Reopen** button.
+- The Explorer shows how many open comments each file holds.
+- Renaming or moving a file in the Explorer carries its comments along.
+- The session owner saves the comments per workspace, so they outlive a disconnect and a
+  restart. Without a shared session they work the same way as personal sticky notes.
+
 ## An AI seat via MCP
 
 Register croft's collab agent as an MCP server, for example with Claude Code:

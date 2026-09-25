@@ -527,6 +527,19 @@ pub enum CollabMsg {
     /// design: at most one stream runs per relay (one pilot seat), so there
     /// is nothing to address.
     StreamCancel {},
+    /// A guest asks the owner for every human comment box (#367); sent on
+    /// connect and repeated until [`CollabMsg::Comments`] arrives, since
+    /// the relay has no replay. Older peers drop these variants in `drain`.
+    CommentsRequest {},
+    /// The owner's whole comment store, broadcast after every change.
+    Comments {
+        boxes: Vec<crate::comments::HumanBox>,
+    },
+    /// One participant's change to the comment store, for the owner to
+    /// apply (other guests ignore it and wait for the owner's broadcast).
+    CommentEdit {
+        edit: crate::comments::CommentEdit,
+    },
 }
 
 impl CollabMsg {
@@ -877,6 +890,12 @@ pub enum CollabEvent {
     },
     /// A participant asked the streaming pilot to stop and revert.
     StreamCancel,
+    /// A guest wants the comment store (the owner answers).
+    CommentsRequested,
+    /// The owner's comment store.
+    Comments(Vec<crate::comments::HumanBox>),
+    /// A participant's comment change.
+    CommentEdit(crate::comments::CommentEdit),
 }
 
 /// One participant's collab state machine: per-file replicated documents
@@ -1089,6 +1108,24 @@ impl CollabSession {
         });
     }
 
+    /// Guest: ask the owner for the comment store.
+    pub fn request_comments(&mut self) {
+        self.channel.send(&CollabMsg::CommentsRequest {});
+    }
+
+    /// Owner: broadcast the whole comment store.
+    pub fn send_comments(&mut self, boxes: &[crate::comments::HumanBox]) {
+        self.channel.send(&CollabMsg::Comments {
+            boxes: boxes.to_vec(),
+        });
+    }
+
+    /// Send one comment change to the owner.
+    pub fn send_comment_edit(&mut self, edit: &crate::comments::CommentEdit) {
+        self.channel
+            .send(&CollabMsg::CommentEdit { edit: edit.clone() });
+    }
+
     /// Ask whoever is streaming on this relay to stop and revert.
     // Callers land with the cancel affordances (follow-up slice).
     #[allow(dead_code)]
@@ -1218,6 +1255,9 @@ impl CollabSession {
                     active,
                 }),
                 CollabMsg::StreamCancel {} => events.push(CollabEvent::StreamCancel),
+                CollabMsg::CommentsRequest {} => events.push(CollabEvent::CommentsRequested),
+                CollabMsg::Comments { boxes } => events.push(CollabEvent::Comments(boxes)),
+                CollabMsg::CommentEdit { edit } => events.push(CollabEvent::CommentEdit(edit)),
             }
         }
         // Give up on bootstraps nobody answered (no owner running).

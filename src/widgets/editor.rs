@@ -2120,13 +2120,42 @@ impl ExternalReloadReport {
 /// same orange its note ◆ wore). Fixed like the git decoration colors —
 /// legible on every dark background.
 pub(crate) const NAVIGATOR_ACCENT: Color = Color::Rgb(0xff, 0x9d, 0x2f);
-/// Columns of the comment-box footer tail ` ✕ Ignore ╯`.
-const IGNORE_TAIL_COLS: usize = 11;
+/// What a comment box's footer button does (its label and the width of
+/// the ` <label> ╯` tail the hit test gives it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BoxAction {
+    /// Dismiss the box: the navigator's notes and review threads.
+    #[default]
+    Ignore,
+    /// Mark a human comment resolved (#367).
+    Resolve,
+    /// Reopen a resolved human comment.
+    Reopen,
+    /// Drop the unsaved box a new comment is typed into.
+    Cancel,
+}
 
-/// One comment box: the AI pair programmer's voice, anchored below a buffer
-/// line. Rendered as an unnumbered block (title, body, reply field + Ignore
+impl BoxAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ignore => " \u{2715} Ignore ",
+            Self::Resolve => " \u{2713} Resolve ",
+            Self::Reopen => " \u{21ba} Reopen ",
+            Self::Cancel => " \u{2715} Cancel ",
+        }
+    }
+
+    /// Columns of the footer tail: the label plus the closing corner.
+    fn tail_cols(self) -> usize {
+        self.label().chars().count() + 1
+    }
+}
+
+/// One comment box anchored below a buffer line: the AI pair programmer's
+/// note, a pull-request review thread, or a participant's comment (#367).
+/// Rendered as an unnumbered block (title, body, reply field + footer
 /// button); it never touches the buffer text and is never saved. The App
-/// feeds these per tick from the pair host's note snapshot.
+/// feeds these per frame from its sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommentBox {
     /// The note's stable id in the pilot's state (Ignore removes it, a
@@ -2138,6 +2167,27 @@ pub struct CommentBox {
     pub author: String,
     /// Body text; replies append as further lines.
     pub body: String,
+    /// The chrome color: [`NAVIGATOR_ACCENT`] for the navigator, the
+    /// author's color for a human comment.
+    pub accent: Color,
+    /// The footer button.
+    pub action: BoxAction,
+    /// Paint the body dimmed (a resolved comment).
+    pub dimmed: bool,
+}
+
+impl Default for CommentBox {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            line: 0,
+            author: String::new(),
+            body: String::new(),
+            accent: NAVIGATOR_ACCENT,
+            action: BoxAction::Ignore,
+            dimmed: false,
+        }
+    }
 }
 
 /// What a click inside a comment box landed on.
@@ -2147,7 +2197,8 @@ pub enum CommentHit {
     Body,
     /// The footer's reply field: focus and place the caret.
     Reply,
-    /// The footer's ✕ Ignore button: dismiss the box.
+    /// The footer's button ([`BoxAction`]): dismiss, resolve, reopen or
+    /// cancel the box.
     Ignore,
 }
 
@@ -3997,9 +4048,14 @@ impl Editor {
         }
         let b = &self.comment_boxes[box_idx];
         let accent = Style::default()
-            .fg(NAVIGATOR_ACCENT)
+            .fg(b.accent)
             .bg(self.theme.sticky_scroll_bg());
         let body_st = Style::default().bg(self.theme.sticky_scroll_bg());
+        let text_st = if b.dimmed {
+            body_st.fg(Color::DarkGray)
+        } else {
+            body_st
+        };
         let dim = Style::default()
             .fg(Color::DarkGray)
             .bg(self.theme.sticky_scroll_bg());
@@ -4023,13 +4079,13 @@ impl Editor {
             let text = body_lines.get(box_row - 1).cloned().unwrap_or_default();
             Line::from(vec![
                 Span::styled("\u{2502} ", accent),
-                Span::styled(pad(&text, w - 4), body_st),
+                Span::styled(pad(&text, w - 4), text_st),
                 Span::styled(" \u{2502}", accent),
             ])
         } else {
             // Footer: `╰ ❯ <reply>            ✕ Ignore ╯`
             let focus = self.comment_focus.as_ref().filter(|f| f.id == b.id);
-            let field_w = w.saturating_sub(4 + IGNORE_TAIL_COLS);
+            let field_w = w.saturating_sub(4 + b.action.tail_cols());
             // Window the draft around the caret: a reply longer than the
             // field otherwise froze at its first field_w chars and the
             // user typed blind, with no caret drawn anywhere.
@@ -4062,7 +4118,7 @@ impl Editor {
                 }
                 _ => spans.push(Span::styled(draft, style)),
             }
-            spans.push(Span::styled(" \u{2715} Ignore ", accent));
+            spans.push(Span::styled(b.action.label(), accent));
             spans.push(Span::styled("\u{256f}", accent));
             Line::from(spans)
         };
@@ -4098,7 +4154,7 @@ impl Editor {
         if box_row + 1 == self.comment_box_height(box_idx, w) {
             // Footer: the ` ✕ Ignore ╯` tail owns its cells.
             let rel = (col.saturating_sub(text_x)) as usize;
-            if rel + IGNORE_TAIL_COLS >= w && rel < w {
+            if rel + b.action.tail_cols() >= w && rel < w {
                 return Some((b.id, CommentHit::Ignore));
             }
             return Some((b.id, CommentHit::Reply));
@@ -18604,6 +18660,7 @@ mod tests {
             line: 0,
             author: "navigator".into(),
             body: "tighten this".into(),
+            ..Default::default()
         }];
         let area = Rect {
             x: 0,
@@ -18657,6 +18714,7 @@ mod tests {
             line: 0,
             author: "navigator".into(),
             body: "tighten this".into(),
+            ..Default::default()
         }];
         let area = Rect {
             x: 0,
@@ -18690,6 +18748,7 @@ mod tests {
             line: 0,
             author: "navigator".into(),
             body: "tighten this".into(),
+            ..Default::default()
         }];
         let area = Rect {
             x: 0,
@@ -18732,6 +18791,7 @@ mod tests {
             line: 0,
             author: "navigator".into(),
             body: "tighten this".into(),
+            ..Default::default()
         }];
         let area = Rect {
             x: 0,
@@ -18764,6 +18824,7 @@ mod tests {
                 .map(|i| format!("p{i}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            ..Default::default()
         }];
         let area = Rect {
             x: 0,
@@ -18804,6 +18865,7 @@ mod tests {
                 .map(|i| format!("point {i}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            ..Default::default()
         }];
         let area = Rect {
             x: 0,
@@ -18851,6 +18913,7 @@ mod tests {
             line: 0,
             author: "navigator".into(),
             body: "tighten this".into(),
+            ..Default::default()
         }];
         let reply = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_TAIL";
         e.comment_focus = Some(CommentFocus {
@@ -18893,6 +18956,7 @@ mod tests {
             line: 0,
             author: "navigator".into(),
             body: "tighten this".into(),
+            ..Default::default()
         }];
         e.comment_focus = Some(CommentFocus {
             id: 7,
@@ -20991,6 +21055,7 @@ mod tests {
                 .map(|i| format!("line {i}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            ..Default::default()
         });
         let area = Rect {
             x: 0,

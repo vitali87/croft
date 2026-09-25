@@ -3841,6 +3841,36 @@ pub struct App {
     /// notes, refreshed each tick from the host; drives the gutter ◆ marks
     /// and the note popup.
     navigator_notes: std::collections::HashMap<String, Vec<(u64, usize, String)>>,
+    /// Human comment boxes (#367; `crate::comments`): canonical on the
+    /// authority (the session owner, or a croft with no shared session),
+    /// the owner's latest broadcast on a guest.
+    comment_store: crate::comments::CommentStore,
+    /// Where the authority persists the store. None under test, so no test
+    /// touches the user's store; a test that wants persistence sets one.
+    comment_store_path: Option<PathBuf>,
+    /// The workspace root the store was loaded for: a re-root saves the old
+    /// workspace's boxes and loads the new one's.
+    comment_store_root: Option<String>,
+    /// Unsaved store changes, and when the store was last written. Saves
+    /// are throttled: typing above a box shifts it on every line added.
+    comment_store_dirty: bool,
+    comment_store_saved: Option<std::time::Instant>,
+    /// Authority: the store changed since it was last broadcast.
+    comment_broadcast_due: bool,
+    /// Guest: the owner's store arrived since this connection opened; until
+    /// then the request repeats (the relay has no replay), timed by
+    /// `comments_requested`.
+    comments_synced: bool,
+    comments_requested: Option<std::time::Instant>,
+    /// Guest: edits made while no session was connected, sent on connect.
+    comment_outbox: Vec<crate::comments::CommentEdit>,
+    /// The unsaved box a new comment is typed into: (file key, line).
+    comment_draft: Option<(String, usize)>,
+    /// Anchor tracking: per file key, the text its boxes were last mapped
+    /// against and the `edit_seq` of the buffer it came from.
+    comment_shadows: std::collections::HashMap<String, (u64, Vec<String>)>,
+    /// The store generation the Explorer counts were built from.
+    comment_counts_gen: Option<u64>,
     /// The navigator's prose accumulated over the streaming turn; lands as
     /// one comment box at the turn's origin when the turn ends (boxes are
     /// the navigator's single voice — there is no OUTPUT channel for it).
@@ -5006,6 +5036,22 @@ impl App {
             pair_host_lock_path: crate::session::pair_host_lock_path(&root),
             last_pair_check: None,
             navigator_notes: std::collections::HashMap::new(),
+            comment_store: crate::comments::CommentStore::default(),
+            comment_store_path: if cfg!(test) {
+                None
+            } else {
+                Some(crate::comments::path())
+            },
+            comment_store_root: None,
+            comment_store_dirty: false,
+            comment_store_saved: None,
+            comment_broadcast_due: false,
+            comments_synced: false,
+            comments_requested: None,
+            comment_outbox: Vec::new(),
+            comment_draft: None,
+            comment_shadows: std::collections::HashMap::new(),
+            comment_counts_gen: None,
             pair_commentary_buf: String::new(),
             pair_turn_origin: None,
             pair_notes_this_turn: 0,
@@ -15978,6 +16024,7 @@ impl App {
                             line: *row,
                             author: author.clone(),
                             body: body.clone(),
+                            ..Default::default()
                         })
                         .collect()
                 })
@@ -15997,8 +16044,63 @@ impl App {
                         line: t.box_line(lines),
                         author: t.title_for(lines),
                         body: t.body.clone(),
+                        ..Default::default()
                     }
                 }));
+            }
+            // Human comments (#367) after both: a box a participant left,
+            // in its author's color; a resolved one stays, dimmed, with a
+            // Reopen button. The unsaved draft exists only while its field
+            // holds the keyboard.
+            if self.comment_draft.is_some()
+                && self
+                    .editor
+                    .comment_focus
+                    .as_ref()
+                    .is_none_or(|f| f.id != crate::comments::DRAFT_ID)
+            {
+                self.comment_draft = None;
+            }
+            if let Some(file) = self
+                .editor
+                .path
+                .as_ref()
+                .filter(|_| !self.editor.has_non_text_view())
+                .and_then(|p| collab_file_key(&self.tree.root, p))
+            {
+                use crate::widgets::editor::{BoxAction, CommentBox};
+                let last = self.editor.lines.len().saturating_sub(1);
+                self.editor
+                    .comment_boxes
+                    .extend(self.comment_store.in_file(&file).map(|b| CommentBox {
+                        id: b.id,
+                        line: b.line.min(last),
+                        author: if b.resolved {
+                            format!("{} \u{b7} resolved", b.author())
+                        } else {
+                            b.author().to_string()
+                        },
+                        body: b.body_text(),
+                        accent: comment_author_color(b.author()),
+                        action: if b.resolved {
+                            BoxAction::Reopen
+                        } else {
+                            BoxAction::Resolve
+                        },
+                        dimmed: b.resolved,
+                    }));
+                if let Some((_, line)) = self.comment_draft.as_ref().filter(|(f, _)| *f == file) {
+                    let author = collab_display_name();
+                    self.editor.comment_boxes.push(CommentBox {
+                        id: crate::comments::DRAFT_ID,
+                        line: (*line).min(last),
+                        accent: comment_author_color(&author),
+                        author,
+                        body: String::from("New comment: type it below, Enter posts it"),
+                        action: BoxAction::Cancel,
+                        dimmed: false,
+                    });
+                }
             }
             // A focused box that vanished (ignored elsewhere, cleared, or
             // re-anchored away) releases the keyboard back to the buffer.
@@ -18333,6 +18435,14 @@ impl App {
                     'S' => self.select_command_output(idx, d),
                     _ => self.rerun_command(idx, d),
                 }
+                true
+            }
+            // Cmd+K Shift+C elsewhere: start a comment box on the caret's
+            // line (Cmd+K C stays Compare). Matched case-insensitively for
+            // the CSI-u `Char('c') + SHIFT` form. Must precede the
+            // case-insensitive C compare arm below.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'c') => {
+                self.start_comment();
                 true
             }
             // Cmd+K Shift+T: reopen the most recently closed terminal pane
@@ -23919,7 +24029,15 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => {
-                self.editor.comment_focus = None;
+                // Leaving the draft drops it: it was never posted.
+                if self
+                    .editor
+                    .comment_focus
+                    .take()
+                    .is_some_and(|f| f.id == crate::comments::DRAFT_ID)
+                {
+                    self.comment_draft = None;
+                }
                 return;
             }
             KeyCode::Enter => {
@@ -23973,6 +24091,10 @@ impl App {
         };
         let reply = focus.reply.trim().to_string();
         if reply.is_empty() {
+            return;
+        }
+        if crate::comments::is_human_id(focus.id) {
+            self.submit_human_comment(focus.id, reply);
             return;
         }
         let Some(host) = &self.pair_host else {
@@ -24078,15 +24200,16 @@ impl App {
             .map(|f| f.id)
             .or_else(|| self.next_comment_from_caret().map(|(id, _)| id));
         match id {
-            Some(id) => self.ignore_comment_box(id),
-            None => self.status = String::from("No navigator comments in this file"),
+            Some(id) => self.comment_box_action(id),
+            None => self.status = String::from("No comments in this file"),
         }
     }
 
-    /// The active file's next comment from the caret (by row, wrapping):
-    /// (id, row).
-    fn next_comment_from_caret(&self) -> Option<(u64, usize)> {
-        // Built from the same two SOURCES the render merges, in the same
+    /// The active file's comments as (id, row, body), in the order the
+    /// render stacks them: navigator notes, review threads, open human
+    /// comments.
+    fn active_comment_notes(&self) -> Vec<(u64, usize, String)> {
+        // Built from the same SOURCES the render merges, in the same
         // order, rather than from `editor.comment_boxes` itself: that field
         // is a render output, so reading it would make F4 depend on a frame
         // having been drawn first, and the walk would find nothing before
@@ -24112,6 +24235,28 @@ impl App {
                     .map(|t| (t.id, t.box_line(lines), t.body.clone())),
             );
         }
+        // Open human comments (#367), after both like the render.
+        if let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+        {
+            let last = self.editor.lines.len().saturating_sub(1);
+            notes.extend(
+                self.comment_store
+                    .in_file(&file)
+                    .filter(|b| !b.resolved)
+                    .map(|b| (b.id, b.line.min(last), String::new())),
+            );
+        }
+        notes
+    }
+
+    /// The active file's next comment from the caret (by row, wrapping):
+    /// (id, row).
+    fn next_comment_from_caret(&self) -> Option<(u64, usize)> {
+        let notes = self.active_comment_notes();
         if notes.is_empty() {
             return None;
         }
@@ -24326,13 +24471,71 @@ impl App {
 
     /// F4: focus the active file's next comment box (by row, wrapping),
     /// jumping the caret to its anchor line so the box scrolls into view.
+    /// The next comment F4 visits, walking every open file (#367): the
+    /// active file's navigator notes, review threads and open human
+    /// comments, plus the open human comments of every other open file,
+    /// ordered by (path, row) and wrapping. (path, id, row).
+    fn next_comment_anywhere(&self) -> Option<(PathBuf, u64, usize)> {
+        let root = &self.tree.root;
+        let active_key = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| collab_file_key(root, p));
+        let mut stops: Vec<(PathBuf, usize, usize, u64)> = Vec::new();
+        if let Some(path) = self.editor.path.clone() {
+            // The active file's three sources, merged in render order.
+            for (i, (id, row, _)) in self.active_comment_notes().into_iter().enumerate() {
+                stops.push((path.clone(), row, i, id));
+            }
+        }
+        for (file, ed) in self.open_file_buffers() {
+            if Some(&file) == active_key.as_ref() {
+                continue;
+            }
+            let Some(path) = ed.path.clone() else {
+                continue;
+            };
+            let last = ed.lines.len().saturating_sub(1);
+            for (i, b) in self
+                .comment_store
+                .in_file(&file)
+                .filter(|b| !b.resolved)
+                .enumerate()
+            {
+                stops.push((path.clone(), b.line.min(last), i, b.id));
+            }
+        }
+        if stops.is_empty() {
+            return None;
+        }
+        let keys: Vec<(PathBuf, usize, usize)> = stops
+            .iter()
+            .map(|(p, r, i, _)| (p.clone(), *r, *i))
+            .collect();
+        let here = self
+            .editor
+            .comment_focus
+            .as_ref()
+            .and_then(|f| stops.iter().position(|s| s.3 == f.id))
+            .map(|i| keys[i].clone())
+            .unwrap_or_else(|| {
+                (
+                    self.editor.path.clone().unwrap_or_default(),
+                    self.editor.cursor_row,
+                    usize::MAX,
+                )
+            });
+        let idx = next_by_key(&keys, &here);
+        let (path, row, _, id) = stops.swap_remove(idx);
+        Some((path, id, row))
+    }
+
     fn cycle_comment_box(&mut self) {
-        let Some((id, row)) = self.next_comment_from_caret() else {
-            self.status = String::from("No navigator comments in this file");
+        let Some((path, id, row)) = self.next_comment_anywhere() else {
+            self.status = String::from("No comments in open files");
             return;
         };
-        let row = row.min(self.editor.lines.len().saturating_sub(1));
-        let path = self.editor.path.clone().expect("comments imply a file");
         match self.open_at(&path, row, 0) {
             Ok(()) => {
                 self.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
@@ -24343,6 +24546,335 @@ impl App {
             }
             Err(e) => self.status = format!("Comment jump failed: {e}"),
         }
+    }
+
+    /// Apply one local change to the human comment store (#367): at once
+    /// here, and on a guest also to the owner, whose broadcast then
+    /// confirms it (or, with no session connected, once one is).
+    fn edit_comments(&mut self, edit: crate::comments::CommentEdit) {
+        let changed = self.comment_store.apply(&edit);
+        if self.is_collab_guest() {
+            match &mut self.collab {
+                Some(session) => session.send_comment_edit(&edit),
+                None => self.comment_outbox.push(edit),
+            }
+        } else if changed {
+            self.comment_store_dirty = true;
+            self.comment_broadcast_due = true;
+        }
+    }
+
+    /// One tick of the collab session and the comment boxes riding it:
+    /// (collab changed, comments changed). Anchors follow this
+    /// participant's LOCAL edits, so they are mapped before the pump
+    /// applies remote ones (whose authors send their own shifts), and the
+    /// shadows then absorb the remote text; see `crate::comments`.
+    fn pump_collab_and_comments(&mut self) -> (bool, bool) {
+        let anchors_changed = self.track_comment_anchors();
+        let collab_changed = self.poll_collab();
+        self.resync_comment_shadows();
+        let comments_changed = self.sync_comments() | anchors_changed;
+        // A box that just arrived (or a file that just got its first box)
+        // takes its baseline now, so the next local edit moves it: the
+        // text has not changed since the resync, so this shifts nothing.
+        self.track_comment_anchors();
+        (collab_changed, comments_changed)
+    }
+
+    /// Carry comment boxes (and an unposted draft) across a rename or move
+    /// of `old` to `new`, a file or a folder. Paths outside the workspace
+    /// hold no boxes.
+    fn rename_comment_boxes(&mut self, old: &Path, new: &Path) {
+        let root = &self.tree.root;
+        let (Some(from), Some(to)) = (collab_file_key(root, old), collab_file_key(root, new))
+        else {
+            return;
+        };
+        let under = |file: &str| {
+            file == from
+                || file
+                    .strip_prefix(from.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        if let Some((file, _)) = &mut self.comment_draft
+            && under(file)
+        {
+            *file = format!("{to}{}", &file[from.len()..]);
+        }
+        if self.comment_store.boxes().iter().any(|b| under(&b.file)) {
+            self.edit_comments(crate::comments::CommentEdit::Rename { from, to });
+        }
+    }
+
+    /// One buffer per open file key, in tab order: the active group first,
+    /// then the others. Sibling panes of one file mirror each other, so the
+    /// first is the file's text.
+    fn open_file_buffers(&self) -> Vec<(String, &crate::widgets::editor::Editor)> {
+        let root = &self.tree.root;
+        let mut seen = std::collections::HashSet::new();
+        std::iter::once(&self.editor.editors)
+            .chain(
+                self.editor_layout
+                    .inactive_groups()
+                    .into_iter()
+                    .map(|g| &g.editors),
+            )
+            .flatten()
+            .filter(|ed| !ed.has_non_text_view())
+            .filter_map(|ed| Some((collab_file_key(root, ed.path.as_ref()?)?, ed)))
+            .filter(|(file, _)| seen.insert(file.clone()))
+            .collect()
+    }
+
+    /// Move comment anchors with this participant's own edits: each open
+    /// file holding a box is diffed against the text its boxes were last
+    /// mapped on, and every box whose line moved gets a Shift. Runs before
+    /// the collab pump applies remote edits; [`Self::resync_comment_shadows`]
+    /// then absorbs those without shifting (their authors send the shifts).
+    fn track_comment_anchors(&mut self) -> bool {
+        if self.comment_store.boxes().is_empty() && self.comment_draft.is_none() {
+            self.comment_shadows.clear();
+            return false;
+        }
+        let mut shifts = Vec::new();
+        let mut draft_delta = 0;
+        let mut shadows = std::mem::take(&mut self.comment_shadows);
+        let mut kept = std::collections::HashMap::new();
+        for (file, ed) in self.open_file_buffers() {
+            let draft = self
+                .comment_draft
+                .as_ref()
+                .filter(|(f, _)| *f == file)
+                .map(|(_, line)| *line);
+            let boxes: Vec<(u64, usize)> = self
+                .comment_store
+                .in_file(&file)
+                .map(|b| (b.id, b.line))
+                .collect();
+            if boxes.is_empty() && draft.is_none() {
+                continue;
+            }
+            match shadows.remove(&file) {
+                Some((seq, old)) if seq == ed.edit_seq => {
+                    kept.insert(file, (seq, old));
+                    continue;
+                }
+                Some((_, old)) if old != ed.lines => {
+                    let mut rows: Vec<usize> = boxes.iter().map(|(_, l)| *l).collect();
+                    rows.extend(draft);
+                    let deltas = crate::comments::line_deltas(&old, &ed.lines, &rows);
+                    for ((id, _), delta) in boxes.iter().zip(&deltas) {
+                        if *delta != 0 {
+                            shifts.push(crate::comments::CommentEdit::Shift {
+                                id: *id,
+                                delta: *delta,
+                            });
+                        }
+                    }
+                    if draft.is_some() {
+                        draft_delta = deltas.last().copied().unwrap_or(0);
+                    }
+                }
+                _ => {}
+            }
+            kept.insert(file, (ed.edit_seq, ed.lines.clone()));
+        }
+        self.comment_shadows = kept;
+        if let Some((_, line)) = &mut self.comment_draft {
+            *line = usize::try_from(*line as i64 + draft_delta).unwrap_or(0);
+        }
+        let moved = !shifts.is_empty() || draft_delta != 0;
+        for edit in shifts {
+            self.edit_comments(edit);
+        }
+        moved
+    }
+
+    /// After the collab pump: adopt each tracked file's current text as the
+    /// baseline without shifting anything, so remote edits (and a bootstrap
+    /// swap) are never mapped again as if they were this participant's.
+    fn resync_comment_shadows(&mut self) {
+        if self.comment_shadows.is_empty() {
+            return;
+        }
+        let current: Vec<(String, u64, Vec<String>)> = self
+            .open_file_buffers()
+            .into_iter()
+            .filter(|(file, ed)| {
+                self.comment_shadows
+                    .get(file)
+                    .is_some_and(|(seq, _)| *seq != ed.edit_seq)
+            })
+            .map(|(file, ed)| (file, ed.edit_seq, ed.lines.clone()))
+            .collect();
+        for (file, seq, lines) in current {
+            self.comment_shadows.insert(file, (seq, lines));
+        }
+    }
+
+    /// Per-tick comment-store upkeep. The authority loads the workspace's
+    /// store (again after a re-root), saves it (throttled) and broadcasts
+    /// changes; a guest flushes its outbox and asks for the owner's store
+    /// until it arrives. Also rebuilds the Explorer counts on a change.
+    fn sync_comments(&mut self) -> bool {
+        let mut changed = false;
+        if self.is_collab_guest() {
+            if let Some(session) = &mut self.collab {
+                for edit in self.comment_outbox.drain(..) {
+                    session.send_comment_edit(&edit);
+                }
+                if !self.comments_synced
+                    && self
+                        .comments_requested
+                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2))
+                {
+                    session.request_comments();
+                    self.comments_requested = Some(std::time::Instant::now());
+                }
+            }
+        } else {
+            let root = self.workspace_root().display().to_string();
+            if self.comment_store_root.as_deref() != Some(root.as_str()) {
+                self.flush_comment_store();
+                if let Some(path) = &self.comment_store_path {
+                    self.comment_store
+                        .set_all(crate::comments::load(path, &root));
+                    self.comment_broadcast_due = true;
+                    self.comment_draft = None;
+                    changed = true;
+                }
+                self.comment_store_root = Some(root);
+            }
+            if self.comment_store_dirty
+                && self
+                    .comment_store_saved
+                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+            {
+                self.flush_comment_store();
+            }
+            if self.comment_broadcast_due
+                && let Some(session) = &mut self.collab
+            {
+                session.send_comments(self.comment_store.boxes());
+                self.comment_broadcast_due = false;
+            }
+        }
+        if self.comment_counts_gen != Some(self.comment_store.generation()) {
+            self.comment_counts_gen = Some(self.comment_store.generation());
+            let root = self.tree.root.clone();
+            self.tree.comment_counts = std::sync::Arc::new(
+                self.comment_store
+                    .unresolved_counts()
+                    .into_iter()
+                    .map(|(file, n)| (root.join(file), n))
+                    .collect(),
+            );
+            changed = true;
+        }
+        changed
+    }
+
+    /// Write the authority's unsaved comment changes for the workspace they
+    /// were loaded for. Also runs at quit.
+    fn flush_comment_store(&mut self) {
+        if !self.comment_store_dirty || self.is_collab_guest() {
+            return;
+        }
+        let (Some(path), Some(root)) = (&self.comment_store_path, &self.comment_store_root) else {
+            return;
+        };
+        if let Err(e) = crate::comments::save(path, root, self.comment_store.boxes()) {
+            self.status = format!("Comments not saved: {e}");
+        }
+        self.comment_store_dirty = false;
+        self.comment_store_saved = Some(std::time::Instant::now());
+    }
+
+    /// Cmd+K Shift+C / palette: open an empty comment box under the caret's
+    /// line, its field focused. Enter posts it, Esc drops it.
+    fn start_comment(&mut self) {
+        let Some(file) = self
+            .editor
+            .path
+            .as_ref()
+            .filter(|_| !self.editor.has_non_text_view())
+            .and_then(|p| collab_file_key(&self.tree.root, p))
+        else {
+            self.status = String::from("Add Comment: open a workspace file first");
+            return;
+        };
+        self.focus_pane(Pane::Editor);
+        self.comment_draft = Some((file, self.editor.cursor_row));
+        self.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+            id: crate::comments::DRAFT_ID,
+            reply: String::new(),
+            cursor: 0,
+        });
+    }
+
+    /// Enter in a human box: post the draft as a new comment, or add the
+    /// field's text to the thread as a reply.
+    fn submit_human_comment(&mut self, id: u64, text: String) {
+        let author = collab_display_name();
+        if id == crate::comments::DRAFT_ID {
+            let Some((file, line)) = self.comment_draft.take() else {
+                return;
+            };
+            self.edit_comments(crate::comments::CommentEdit::Add(
+                crate::comments::HumanBox {
+                    id: crate::comments::new_id(&author),
+                    file,
+                    line,
+                    entries: vec![crate::comments::Entry::new(&author, &text)],
+                    resolved: false,
+                },
+            ));
+            self.status = String::from("Comment added");
+        } else if self.comment_store.get(id).is_some() {
+            self.edit_comments(crate::comments::CommentEdit::Reply {
+                id,
+                entry: crate::comments::Entry::new(&author, &text),
+            });
+            self.status = String::from("Reply added");
+        } else {
+            self.status = String::from("That comment is gone");
+        }
+        self.editor.comment_focus = None;
+    }
+
+    /// A comment box's footer button (a click, Shift+F4): cancel the draft,
+    /// resolve or reopen a human comment, or ignore the navigator's note or
+    /// a review thread.
+    fn comment_box_action(&mut self, id: u64) {
+        if id == crate::comments::DRAFT_ID {
+            self.comment_draft = None;
+            self.editor.comment_focus = None;
+            self.status = String::from("Comment discarded");
+            return;
+        }
+        if !crate::comments::is_human_id(id) {
+            self.ignore_comment_box(id);
+            return;
+        }
+        let Some(resolved) = self.comment_store.get(id).map(|b| !b.resolved) else {
+            self.status = String::from("That comment is gone");
+            return;
+        };
+        self.edit_comments(crate::comments::CommentEdit::SetResolved { id, resolved });
+        if resolved
+            && self
+                .editor
+                .comment_focus
+                .as_ref()
+                .is_some_and(|f| f.id == id)
+        {
+            self.editor.comment_focus = None;
+        }
+        self.status = String::from(if resolved {
+            "Comment resolved"
+        } else {
+            "Comment reopened"
+        });
     }
 
     /// Phase D per-tick collab pump (docs/MULTIPLAYER.md): connect lazily,
@@ -24370,7 +24902,13 @@ impl App {
             }
             self.last_collab_connect = Some(std::time::Instant::now());
             match CollabChannel::connect(&socket, role) {
-                Some(ch) => self.collab = Some(CollabSession::new(ch, collab_display_name())),
+                Some(ch) => {
+                    self.collab = Some(CollabSession::new(ch, collab_display_name()));
+                    // A new connection asks for the comment store afresh:
+                    // what arrived on the last one may be stale.
+                    self.comments_synced = false;
+                    self.comments_requested = None;
+                }
                 None => return mirrored,
             }
         }
@@ -24515,6 +25053,25 @@ impl App {
                 // The cancel request is for the streaming pilot, not for
                 // viewers; the badge clears via StreamState(inactive).
                 CollabEvent::StreamCancel => {}
+                // Comment boxes (#367): the owner answers requests and
+                // applies edits; a guest adopts the owner's store.
+                CollabEvent::CommentsRequested => {
+                    if session.role == CollabRole::Owner {
+                        self.comment_broadcast_due = true;
+                    }
+                }
+                CollabEvent::Comments(boxes) => {
+                    if session.role == CollabRole::Guest {
+                        self.comment_store.set_all(boxes);
+                        self.comments_synced = true;
+                    }
+                }
+                CollabEvent::CommentEdit(edit) => {
+                    if session.role == CollabRole::Owner && self.comment_store.apply(&edit) {
+                        self.comment_store_dirty = true;
+                        self.comment_broadcast_due = true;
+                    }
+                }
             }
         }
 
@@ -31433,7 +31990,10 @@ impl App {
                 affected.insert(parent.to_path_buf());
             }
             match crate::widgets::file_tree::move_into(&dest_dir, src) {
-                Ok(p) => placed.push(p),
+                Ok(p) => {
+                    self.rename_comment_boxes(src, &p);
+                    placed.push(p);
+                }
                 Err(e) => errors.push(format!("{}: {e}", src.display())),
             }
         }
@@ -36124,6 +36684,7 @@ impl App {
             Cmd::ToggleProactiveNavigator => self.toggle_proactive_navigator(),
             Cmd::NextComment => self.cycle_comment_box(),
             Cmd::IgnoreComment => self.ignore_focused_comment(),
+            Cmd::AddComment => self.start_comment(),
             Cmd::RunTask => self.open_run_task_picker(),
             Cmd::RunBuildTask => self.run_build_task(),
             Cmd::RerunLastTask => self.rerun_last_task(),
@@ -40525,13 +41086,14 @@ impl App {
                         self.collab_cancel_stream();
                         return;
                     }
-                    // Comment-box surfaces: ✕ Ignore dismisses the box; the
+                    // Comment-box surfaces: the footer button acts on the
+                    // box (ignore, resolve, reopen, cancel); the
                     // footer's reply field (or the body) focuses it, placing
                     // the caret where the click landed in the field.
                     if let Some((id, hit)) = self.editor.comment_box_hit(m.column, m.row) {
                         use crate::widgets::editor::CommentHit;
                         match hit {
-                            CommentHit::Ignore => self.ignore_comment_box(id),
+                            CommentHit::Ignore => self.comment_box_action(id),
                             CommentHit::Reply | CommentHit::Body => {
                                 let keep = self.editor.comment_focus.take().filter(|f| f.id == id);
                                 let mut focus =
@@ -45670,6 +46232,9 @@ impl App {
             };
             match result {
                 Ok(p) => {
+                    if matches!(mode, ExplorerClipMode::Cut) {
+                        self.rename_comment_boxes(src, &p);
+                    }
                     if matches!(mode, ExplorerClipMode::Cut) && self.editor.matches_open_path(src) {
                         self.editor.rename_open_path(src, &p);
                         self.rename_review_boxes_path(src, &p);
@@ -45875,6 +46440,7 @@ impl App {
                         }
                         self.editor.rename_open_path(&old_path, &new_path);
                         self.rename_review_boxes_path(&old_path, &new_path);
+                        self.rename_comment_boxes(&old_path, &new_path);
                         self.sync_open_file_poll_mtime();
                     }
                     Err(e) => {
@@ -46710,17 +47276,23 @@ fn turn_note_summary(notes: usize, files: &std::collections::BTreeSet<String>) -
 /// navigator's answer on the answered note's own row, and a row-only walk
 /// could never step from the first co-anchored note to the second.
 fn next_note_by_row(notes: &[(u64, usize, String)], here: (usize, usize)) -> usize {
-    notes
+    let keys: Vec<(usize, usize)> = notes
         .iter()
         .enumerate()
-        .filter(|(i, (_, row, _))| (*row, *i) > here)
-        .min_by_key(|(i, (_, row, _))| (*row, *i))
-        .or_else(|| {
-            notes
-                .iter()
-                .enumerate()
-                .min_by_key(|(i, (_, row, _))| (*row, *i))
-        })
+        .map(|(i, (_, row, _))| (*row, i))
+        .collect();
+    next_by_key(&keys, &here)
+}
+
+/// The index of the smallest key strictly after `here`, wrapping to the
+/// smallest key overall: the F4 walk's order, over one file's (row, index)
+/// or every open file's (path, row, index) (#367).
+fn next_by_key<K: Ord>(keys: &[K], here: &K) -> usize {
+    keys.iter()
+        .enumerate()
+        .filter(|(_, k)| *k > here)
+        .min_by(|a, b| a.1.cmp(b.1))
+        .or_else(|| keys.iter().enumerate().min_by(|a, b| a.1.cmp(b.1)))
         .map(|(i, _)| i)
         .unwrap_or(0)
 }
@@ -49834,6 +50406,16 @@ fn collab_display_name() -> String {
         .collect()
 }
 
+/// A human comment's chrome color (#367): the caret palette keyed by the
+/// author's NAME, so one person's boxes wear one color on every client
+/// (caret colors key off per-file site ids, which carry no identity).
+fn comment_author_color(name: &str) -> Color {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    participant_color(h.finish())
+}
+
 /// The stable color a participant's ghost caret wears, from a small palette
 /// keyed by their id (also the join order, so the first guest is always
 /// green, the second magenta, and so on).
@@ -50070,6 +50652,8 @@ pub fn run(
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
     app.save_terminal_session();
+    // Comment boxes (#367) saved in the last throttle window.
+    app.flush_comment_store();
 
     disable_raw_mode().ok();
     {
@@ -50473,7 +51057,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
-        let collab_changed = app.poll_collab();
+        let (collab_changed, comments_changed) = app.pump_collab_and_comments();
         let bells_changed = app.drain_terminal_bells();
         // A block whose command has finished gets its output box (#354).
         let captures_changed = app.settle_block_captures();
@@ -50602,6 +51186,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || session_presence_changed
             || session_typing_changed
             || collab_changed
+            || comments_changed
             || bells_changed
             || captures_changed
             || labels_changed

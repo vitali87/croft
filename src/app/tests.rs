@@ -49715,3 +49715,372 @@ tool = "go"
         "another extension's record stays"
     );
 }
+
+/// #367: an App on `root` with `file` ("a" to "e", one per line) open and the
+/// caret on `row`.
+fn comment_app(tmp: &tempfile::TempDir, row: usize) -> (App, PathBuf) {
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "a\nb\nc\nd\ne").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = 0;
+    (app, file)
+}
+
+/// #367: Cmd+K Shift+C, type, Enter: the whole keyboard path of a comment.
+fn post_comment(app: &mut App, text: &str) {
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT))
+        .unwrap();
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+}
+
+/// #367: the screen cell of box `id`'s footer part `want`, found through the
+/// same hit test the mouse path uses.
+fn comment_hit_cell(
+    app: &App,
+    id: u64,
+    want: crate::widgets::editor::CommentHit,
+) -> Option<(u16, u16)> {
+    (0..40u16)
+        .flat_map(|y| (0..120u16).map(move |x| (x, y)))
+        .find(|&(x, y)| app.editor.comment_box_hit(x, y) == Some((id, want)))
+}
+
+/// #367: Cmd+K Shift+C opens an empty box under the caret's line with its
+/// field focused; Enter posts it as the participant's comment, a later
+/// Enter in the same box replies, and Esc on a fresh draft drops it.
+#[test]
+fn cmd_k_shift_c_posts_a_comment_box_that_takes_replies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = comment_app(&tmp, 2);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        app.editor.comment_focus.as_ref().map(|f| f.id),
+        Some(crate::comments::DRAFT_ID)
+    );
+    draw(&mut app, 120, 40);
+    assert!(
+        app.editor
+            .comment_boxes
+            .iter()
+            .any(|b| b.id == crate::comments::DRAFT_ID && b.line == 2),
+        "the draft box sits under the caret's line"
+    );
+    let before = app.editor.lines.clone();
+    for c in "why?".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, before, "the buffer is untouched");
+    assert_eq!(app.status, "Comment added");
+    let boxes = app.comment_store.boxes().to_vec();
+    assert_eq!(boxes.len(), 1);
+    assert_eq!((boxes[0].file.as_str(), boxes[0].line), ("f.txt", 2));
+    assert_eq!(boxes[0].entries[0].body, "why?");
+    assert!(crate::comments::is_human_id(boxes[0].id));
+    draw(&mut app, 120, 40);
+    let shown = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|b| b.id == boxes[0].id)
+        .expect("the posted box renders");
+    assert_eq!(shown.action, crate::widgets::editor::BoxAction::Resolve);
+    assert!(shown.body.contains("why?"));
+
+    // F4 reaches it; typing and Enter add a reply to the thread.
+    app.editor.comment_focus = None;
+    app.handle_key(key(KeyCode::F(4), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.comment_focus.as_ref().map(|f| f.id),
+        Some(boxes[0].id)
+    );
+    for c in "because".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, "Reply added");
+    let thread = &app.comment_store.get(boxes[0].id).unwrap().entries;
+    assert_eq!(
+        thread.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
+        ["why?", "because"]
+    );
+
+    // A second draft dropped with Esc leaves nothing behind.
+    app.editor.comment_focus = None;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT))
+        .unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.comment_draft.is_none());
+    draw(&mut app, 120, 40);
+    assert!(
+        !app.editor
+            .comment_boxes
+            .iter()
+            .any(|b| b.id == crate::comments::DRAFT_ID)
+    );
+    assert_eq!(app.comment_store.boxes().len(), 1);
+}
+
+/// #367: Cmd+K C stays Compare: the unshifted chord never opens a comment.
+#[test]
+fn cmd_k_c_without_shift_does_not_start_a_comment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = comment_app(&tmp, 0);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.comment_draft.is_none());
+    assert!(app.editor.comment_focus.is_none());
+}
+
+/// #367: Shift+F4 resolves the nearest open comment; the box stays, dimmed,
+/// with a Reopen button, and clicking that button reopens it. The Explorer
+/// counts only open comments.
+#[test]
+fn a_comment_resolves_and_reopens_and_the_explorer_counts_open_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = comment_app(&tmp, 3);
+    post_comment(&mut app, "todo");
+    let id = app.comment_store.boxes()[0].id;
+    app.sync_comments();
+    assert_eq!(app.tree.comment_counts.get(&file), Some(&1));
+
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 0;
+    app.handle_key(key(KeyCode::F(4), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(app.status, "Comment resolved");
+    assert!(app.comment_store.get(id).unwrap().resolved);
+    app.sync_comments();
+    assert_eq!(app.tree.comment_counts.get(&file), None);
+    draw(&mut app, 120, 40);
+    let shown = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|b| b.id == id)
+        .expect("a resolved box stays visible");
+    assert!(shown.dimmed);
+    assert_eq!(shown.action, crate::widgets::editor::BoxAction::Reopen);
+
+    let (x, y) = comment_hit_cell(&app, id, crate::widgets::editor::CommentHit::Ignore)
+        .expect("the Reopen button is on screen");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    assert_eq!(app.status, "Comment reopened");
+    assert!(!app.comment_store.get(id).unwrap().resolved);
+    app.sync_comments();
+    assert_eq!(app.tree.comment_counts.get(&file), Some(&1));
+}
+
+/// #367: F4 walks comments in every open file, not only the active one.
+#[test]
+fn f4_walks_comments_across_open_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = comment_app(&tmp, 4);
+    post_comment(&mut app, "over here");
+    let id = app.comment_store.boxes()[0].id;
+    let other = tmp.path().join("g.txt");
+    std::fs::write(&other, "x\ny").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    app.editor.comment_focus = None;
+    assert_eq!(app.editor.path.as_deref(), Some(other.as_path()));
+    app.handle_key(key(KeyCode::F(4), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
+    assert_eq!(app.editor.cursor_row, 4);
+    assert_eq!(app.editor.comment_focus.as_ref().map(|f| f.id), Some(id));
+}
+
+/// #367: a comment follows its line when lines are added or removed above
+/// it, and stays near the spot when its own line is deleted.
+#[test]
+fn a_comment_follows_its_line_through_local_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = comment_app(&tmp, 2);
+    post_comment(&mut app, "on c");
+    let id = app.comment_store.boxes()[0].id;
+    app.pump_collab_and_comments();
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.pump_collab_and_comments();
+    assert_eq!(app.editor.lines[3], "c");
+    assert_eq!(app.comment_store.get(id).unwrap().line, 3);
+    app.editor.cursor_row = 0;
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    app.pump_collab_and_comments();
+    assert_eq!(app.editor.lines[2], "c");
+    assert_eq!(app.comment_store.get(id).unwrap().line, 2);
+}
+
+/// #367: comments are the owner's and outlive the session: they are saved
+/// per workspace and a fresh App on the same workspace shows them again.
+#[test]
+fn comments_persist_per_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store.json");
+    let (mut app, _file) = comment_app(&tmp, 1);
+    app.comment_store_path = Some(store.clone());
+    app.sync_comments();
+    post_comment(&mut app, "keep me");
+    app.flush_comment_store();
+
+    let (mut again, _) = comment_app(&tmp, 0);
+    again.comment_store_path = Some(store);
+    assert!(again.sync_comments());
+    let boxes = again.comment_store.boxes();
+    assert_eq!(boxes.len(), 1);
+    assert_eq!(boxes[0].entries[0].body, "keep me");
+    assert_eq!(boxes[0].line, 1);
+}
+
+/// #367: a moved or renamed file carries its comments along.
+#[test]
+fn renaming_a_file_carries_its_comments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = comment_app(&tmp, 1);
+    post_comment(&mut app, "moves along");
+    let id = app.comment_store.boxes()[0].id;
+    let renamed = tmp.path().join("h.txt");
+    std::fs::rename(&file, &renamed).unwrap();
+    app.rename_comment_boxes(&file, &renamed);
+    assert_eq!(app.comment_store.get(id).unwrap().file, "h.txt");
+}
+
+/// #367: two solo clients on one workspace through a real relay. A guest's
+/// comment reaches the owner and every guest, an edit above it moves it on
+/// both without a double shift, and resolving it resolves it for both.
+#[test]
+fn comments_replicate_between_collab_clients() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "a\nb\nc\nd\ne").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    let pump = |owner: &mut App, guest: &mut App, what: &str, done: &dyn Fn(&App, &App) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done(owner, guest) {
+            assert!(
+                Instant::now() < deadline,
+                "never settled: {what}\nowner {:?} {:?}\nguest {:?} {:?}",
+                owner.editor.lines,
+                owner.comment_store.boxes(),
+                guest.editor.lines,
+                guest.comment_store.boxes(),
+            );
+            owner.pump_collab_and_comments();
+            guest.pump_collab_and_comments();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    pump(&mut owner, &mut guest, "bootstrap", &|_, g| {
+        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt")) && g.comments_synced
+    });
+
+    guest.focus_pane(Pane::Editor);
+    guest.editor.cursor_row = 3;
+    post_comment(&mut guest, "from the guest");
+    pump(
+        &mut owner,
+        &mut guest,
+        "the guest's comment reaches the owner",
+        &|o, _| o.comment_store.boxes().len() == 1,
+    );
+    let id = owner.comment_store.boxes()[0].id;
+    assert_eq!(owner.comment_store.boxes()[0].line, 3);
+
+    // The owner adds a line above it: both see it one line lower, once.
+    owner.focus_pane(Pane::Editor);
+    owner.editor.comment_focus = None;
+    owner.editor.cursor_row = 0;
+    owner.editor.cursor_col = 0;
+    owner
+        .handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    pump(
+        &mut owner,
+        &mut guest,
+        "the edit and the move reach the guest",
+        &|o, g| {
+            g.editor.lines == o.editor.lines
+                && g.comment_store.get(id).is_some_and(|b| b.line == 4)
+                && o.comment_store.get(id).is_some_and(|b| b.line == 4)
+        },
+    );
+    for _ in 0..20 {
+        owner.pump_collab_and_comments();
+        guest.pump_collab_and_comments();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(owner.comment_store.get(id).unwrap().line, 4);
+    assert_eq!(
+        guest.comment_store.get(id).unwrap().line,
+        4,
+        "no double shift"
+    );
+
+    // The owner resolves it; the guest's copy follows.
+    owner.comment_box_action(id);
+    pump(
+        &mut owner,
+        &mut guest,
+        "resolve reaches the guest",
+        &|_, g| g.comment_store.get(id).is_some_and(|b| b.resolved),
+    );
+
+    // A guest that joins later gets the whole store.
+    let mut late = App::new(tmp.path().to_path_buf()).unwrap();
+    late.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    pump(
+        &mut owner,
+        &mut late,
+        "a late guest gets the comments",
+        &|_, l| {
+            l.comment_store
+                .get(id)
+                .is_some_and(|b| b.resolved && b.line == 4)
+        },
+    );
+}

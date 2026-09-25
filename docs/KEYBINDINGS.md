@@ -54,10 +54,11 @@ Per platform:
 | `Cmd+K` `Q` | Navigator: ask the resident AI pair programmer about the caret line, or the selected lines when a selection is active (opens the instruction box; also on the gutter and body right-click menus) |
 | `Cmd+K` `Y` | Navigator: yield the turn — it reviews the active file comment-only; its remarks land as orange `◆` note diamonds in the gutter and in the Navigator OUTPUT channel |
 | PROBLEMS row right-click → **Fix with Navigator** (also the last row of the `Cmd+.` Quick Fix picker when the caret sits on a diagnostic, and the palette's **Problems: Fix With Navigator**) | Navigator: fix that diagnostic. The file opens at the diagnostic and the navigator gets an ask turn naming what was reported, by whom, and where, with the server's own quick fixes as hints; its edit streams into the buffer under its caret, the row wears a spinner until the turn ends, and the server's next publish clears or updates the row. `Cmd+K X` cancels and reverts the streamed text. With no navigator seated the action says so |
-| `F4` | Focus the active file's next navigator comment box (wraps, jumping the caret to its line) |
-| `Shift+F4` | Ignore the focused navigator comment box (or the next one from the caret) |
+| `Cmd+K` `Shift+C` | Comments: Add Comment. Opens an empty comment box under the caret's line, authored by you; `Enter` posts it, `Esc` drops it. In a `--solo` session every participant sees it; alone it is a personal sticky note. `Cmd+K C` stays Compare |
+| `F4` | Focus the next comment box (wraps, jumping the caret to its line): the active file's navigator notes and review threads, and the open human comments of every open file |
+| `Shift+F4` | On the focused box (or the next one from the caret): resolve a human comment, or ignore a navigator note or review thread. A resolved comment stays, dimmed, with a **Reopen** button |
 | (box focused) type / `Backspace` / `←` `→` | Edit the box's reply draft (the buffer is untouched) |
-| (box focused) `Enter` | Send the reply to the navigator (a comment-only turn) |
+| (box focused) `Enter` | Send the reply to the navigator (a comment-only turn), or add it to a human comment's thread |
 | (box focused) `Esc` | Leave the box; the keyboard returns to the buffer |
 | `Cmd+K` `→` | Close the editor tabs to the right of the active one |
 | `Cmd+K` `S` | Select the active file as the compare anchor |
