@@ -22,7 +22,7 @@ The non-negotiables behind every decision in croft:
 
 Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **panel** bottom right with PROBLEMS, OUTPUT, TERMINAL, CAPTURES, and PORTS tabs. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, Remote (SSH), Run and Debug, Extensions, and Testing, and holds the theme picker. Every seam drags to resize, and a **Customize Layout** popup mirrors VS Code's title-bar controls.
 
-The essentials are all there: full LSP editing (completion, hover, go-to-definition, rename, quick fixes, inlay hints) with tree-sitter highlighting, multi-cursor, minimap, git gutter, inline blame, and an optional vim mode; a real terminal with shell integration, splits, triggers, copy mode, and durable command history; Source Control with hunk staging and a commit graph; a Test Explorer; a zero-config task runner; and debugging for Python, JavaScript/TypeScript, Rust, C, and C++ over DAP.
+The essentials are all there: full LSP editing (completion, hover, go-to-definition, rename, quick fixes, inlay hints) with tree-sitter highlighting, multi-cursor, minimap, git gutter, inline blame, and an optional vim mode; a real terminal with shell integration, splits, triggers, copy mode, and durable command history; Source Control with hunk staging and a commit graph; a Test Explorer; a zero-config task runner; Live Run, which re-runs a Python file as you type and shows every line's values inline; and debugging for Python, JavaScript/TypeScript, Rust, C, and C++ over DAP.
 
 See **[LAYOUT.md](docs/LAYOUT.md)** for the pane-by-pane reference: every editor, terminal, Source Control, Testing, and status-bar feature, the debugging workflow, and language-server setup.
 
@@ -101,6 +101,8 @@ croft ~/projects                 # opens a specific folder
 croft ~/proj --open-file a.rs    # opens a folder with a file already open
 croft ~/proj --open-file a.rs --zen  # ...focused on just the file (no sidebar/terminal)
 croft remote <host>              # launch croft over SSH on a Linux server (host from ~/.ssh/config)
+croft devcontainer [folder]      # open a folder inside its dev container (.devcontainer/devcontainer.json)
+croft open-link 'croft://attach?host=devbox&path=/srv/app'  # what a croft:// link runs (croft install-link-handler registers them)
 croft attach                     # open the current folder as a persistent session (survives closing the window)
 croft attach ~/projects          # ...for a specific folder
 croft attach --solo ~/projects   # join a shared folder in your own viewport (live co-editing)
@@ -108,11 +110,14 @@ croft ls                         # list running persistent sessions
 croft view report.pdf            # from any pane: open a file in the croft you are sitting in
 cat data.csv | croft view -      # ...or pipe it in (staged to ~/.cache/croft, 0600, swept at the next launch once a day old)
 croft theme-import theme.json    # use a VS Code colour theme in croft
+croft locale-template fr         # start translating croft's UI (see docs/SETTINGS.md)
 croft theme-import dracula-theme.theme-dracula   # ...or fetch one from the marketplace
 croft --help
 ```
 
 `croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works as-is. See [LINUX.md](docs/LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
+
+`croft devcontainer` builds or pulls the image in `devcontainer.json`, starts the container with the folder mounted, runs `postCreateCommand` once, installs croft into it the same way, and runs it there. It supports `image`, `build`, `mounts`, `forwardPorts`, `postCreateCommand`, `workspaceFolder`, `containerEnv`, `remoteUser` and `runArgs`. The next run reuses the container, and an edited config (or `--rebuild`) replaces it.
 
 ## Collaboration
 

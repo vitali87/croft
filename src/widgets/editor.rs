@@ -2433,6 +2433,11 @@ pub struct Editor {
     /// of pausing. Rendered as an amber diamond in the gutter.
     pub breakpoint_logs:
         std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
+    /// Optional hit count per breakpoint line (path -> line -> DAP
+    /// `hitCondition`, #611): pause only once the line has been hit that
+    /// many times.
+    pub breakpoint_hit_conditions:
+        std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
     /// Reader bookmarks (VS Code's Bookmarks extension, nvim's `m` marks),
     /// keyed by file path as 1-based line numbers — the same shape as
     /// [`breakpoints`](Self::breakpoints), so switching tabs and coming back
@@ -2516,6 +2521,16 @@ pub struct Editor {
     /// frame: `(screen y, x range, header row, resolution)`. Cleared at
     /// render start so the hit test always describes the painted frame.
     pub merge_action_spans: Vec<(u16, std::ops::Range<u16>, usize, crate::merge::Resolution)>,
+    /// The language server's code lenses for this buffer (#608), painted at
+    /// the end of their line while it still reads as it did when they came.
+    pub code_lenses: Vec<crate::code_lens::EditorLens>,
+    /// Clickable lens spans painted this frame: `(screen y, x range, index
+    /// into code_lenses)`. Cleared at render start, like the merge spans.
+    pub code_lens_spans: Vec<(u16, std::ops::Range<u16>, usize)>,
+    /// An inline AI suggestion (#607): `(row, col, edit_seq, text)`, painted
+    /// as ghost text at the caret while the caret, the buffer and the row
+    /// are all still where the suggestion was asked for.
+    pub ghost: Option<(usize, usize, u64, String)>,
     /// Per-source-line git blame for the current file, index 0 = line 1. Set
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
@@ -2804,6 +2819,10 @@ pub struct Editor {
     /// stop from the VARIABLES data and cleared on resume/step/terminate.
     /// Painted like the blame trailer; the cursor-line blame yields to it.
     pub inline_values: std::collections::BTreeMap<usize, String>,
+    /// Live Run's latest report for this buffer (`crate::live_run`): value
+    /// trailers and line coverage, set by the app when a run lands. Each
+    /// line paints only while it still matches the text that ran.
+    pub live_run: Option<crate::live_run::View>,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -2995,6 +3014,7 @@ impl Editor {
             unverified_breakpoints: std::collections::HashMap::new(),
             breakpoint_conditions: std::collections::HashMap::new(),
             breakpoint_logs: std::collections::HashMap::new(),
+            breakpoint_hit_conditions: std::collections::HashMap::new(),
             bookmarks: std::collections::HashMap::new(),
             bookmark_shadow: None,
             bookmark_sync_paused: false,
@@ -3017,6 +3037,9 @@ impl Editor {
             auto_pair_at: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
+            code_lenses: Vec::new(),
+            code_lens_spans: Vec::new(),
+            ghost: None,
             conflicts_seq: u64::MAX,
             blame_lines: None,
             blame_for: None,
@@ -3088,6 +3111,7 @@ impl Editor {
             whitespace_mode: WhitespaceMode::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
+            live_run: None,
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -3170,6 +3194,12 @@ impl Editor {
                 logs.remove(&line);
                 if logs.is_empty() {
                     self.breakpoint_logs.remove(&path);
+                }
+            }
+            if let Some(hits) = self.breakpoint_hit_conditions.get_mut(&path) {
+                hits.remove(&line);
+                if hits.is_empty() {
+                    self.breakpoint_hit_conditions.remove(&path);
                 }
             }
             false
@@ -3507,12 +3537,14 @@ impl Editor {
     ) -> Vec<crate::dap::session::SourceBreakpoint> {
         let conds = self.breakpoint_conditions.get(path);
         let logs = self.breakpoint_logs.get(path);
+        let hits = self.breakpoint_hit_conditions.get(path);
         lines
             .iter()
             .map(|&l| crate::dap::session::SourceBreakpoint {
                 line: l as u32,
                 condition: conds.and_then(|c| c.get(&l)).cloned(),
                 log_message: logs.and_then(|m| m.get(&l)).cloned(),
+                hit_condition: hits.and_then(|h| h.get(&l)).cloned(),
             })
             .collect()
     }
@@ -4652,6 +4684,10 @@ impl Editor {
             // A symbol tab reused for another file is an ordinary tab of
             // that file: its clip and mirror state described the old one.
             self.leave_symbol_view();
+            // Live Run answered for the old file's text, same as above.
+            self.live_run = None;
+            self.code_lenses.clear();
+            self.ghost = None;
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -4852,6 +4888,9 @@ impl Editor {
             notebook: false,
             doc_path: Some(path.to_path_buf()),
             media: true,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         });
         self.status = format!("Opened media info {}", path.display());
         Ok(())
@@ -4925,6 +4964,9 @@ impl Editor {
             notebook: false,
             doc_path: Some(path.to_path_buf()),
             media: false,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         });
         self.status = format!("Opened document {}", path.display());
         Ok(())
@@ -5663,7 +5705,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables) = crate::markdown::render_markdown_full(
+        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
@@ -5672,6 +5714,7 @@ impl Editor {
         );
         if let Some(md) = self.markdown_preview.as_mut() {
             md.lines = lines;
+            md.source_map = source_map;
             md.images = images;
             md.runnables = runnables;
             md.built_seq = self.edit_seq;
@@ -6082,7 +6125,12 @@ impl Editor {
     /// Markdown: Toggle Preview (Cmd/Ctrl+Shift+V). Returns false when the
     /// active tab is not a Markdown text buffer (the caller reports why).
     pub fn toggle_markdown_preview(&mut self) -> bool {
-        if self.markdown_preview.take().is_some() {
+        if let Some(md) = self.markdown_preview.take() {
+            // Back to the source where the preview was (#619).
+            if let Some(line) = md.source_line_at_top() {
+                self.scroll = line.min(self.lines.len().saturating_sub(1));
+                self.scroll_sub = 0;
+            }
             return true;
         }
         let is_notebook = self
@@ -6105,13 +6153,15 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables) = crate::markdown::render_markdown_full(
+        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
             base.as_deref(),
             self.md_outputs.clone(),
         );
+        // Open where the source is scrolled (#619).
+        let scroll_to_source = Some(self.scroll);
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -6128,6 +6178,9 @@ impl Editor {
             notebook: false,
             doc_path: None,
             media: false,
+            source_map,
+            row_of_line: Vec::new(),
+            scroll_to_source,
         });
         true
     }
@@ -6170,6 +6223,9 @@ impl Editor {
             notebook: true,
             doc_path: None,
             media: false,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         });
         true
     }
@@ -7974,6 +8030,43 @@ impl Editor {
                 self.inline_values.insert(li, parts.join(", "));
             }
         }
+    }
+
+    /// The inline suggestion (#607) when it still applies: the caret where it
+    /// was asked for and no edit since.
+    pub fn live_ghost(&self) -> Option<&str> {
+        let (row, col, seq, text) = self.ghost.as_ref()?;
+        (*row == self.cursor_row && *col == self.cursor_col && *seq == self.edit_seq)
+            .then_some(text.as_str())
+    }
+
+    /// Indices of the code lenses on 0-based `line` whose line still reads
+    /// as it did when they arrived (#608).
+    pub fn lenses_on_line(&self, line: usize) -> Vec<usize> {
+        let Some(text) = self.lines.get(line) else {
+            return Vec::new();
+        };
+        self.code_lenses
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.line == line && &l.line_text == text)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The code lens painted under screen cell `(col, row)` this frame.
+    pub fn code_lens_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.code_lens_spans
+            .iter()
+            .find(|(y, xs, _)| *y == row && xs.contains(&col))
+            .map(|(_, _, idx)| *idx)
+    }
+
+    /// Live Run's trailer for 0-based `line`, when the line still reads as
+    /// it did in the run that produced it.
+    fn live_note(&self, line: usize) -> Option<&crate::live_run::Note> {
+        let text = self.lines.get(line)?;
+        self.live_run.as_ref()?.note(line, text)
     }
 
     /// Column distance between indentation guides: the indent width for
@@ -12264,6 +12357,7 @@ impl Widget for &mut Editor {
         self.last_scrollbar = Rect::default();
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
+        self.code_lens_spans.clear();
         // Every rect this frame publishes is cleared up front, so a frame
         // that paints nothing leaves nothing behind for the mouse path to
         // hit-test against. `render_log` sets its own when it paints; the
@@ -12705,8 +12799,20 @@ impl Widget for &mut Editor {
                     line_idx + 1,
                     width = gutter_width as usize - 1
                 );
-                let gutter =
-                    Line::from(Span::styled(line_no, Style::default().fg(Color::DarkGray)));
+                // Live Run coverage tints the number: green for a statement
+                // that ran, a muted red for one that never did.
+                let number_fg = match self
+                    .live_run
+                    .as_ref()
+                    .and_then(|v| v.coverage(line_idx, &self.lines[line_idx]))
+                {
+                    Some(crate::live_run::Coverage::Ran) => self.theme.git_added(),
+                    Some(crate::live_run::Coverage::NeverRan) => {
+                        self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
+                    }
+                    None => Color::DarkGray,
+                };
+                let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
                 buf.set_line(inner.x, y, &gutter, gutter_width);
             } else {
                 buf.set_line(
@@ -12740,10 +12846,16 @@ impl Widget for &mut Editor {
                     .unverified_breakpoints
                     .get(path)
                     .is_some_and(|s| s.contains(&here));
+                // A hit count is a condition on the pause (#611), so it wears
+                // the conditional diamond too, as in VS Code.
                 let is_conditional = self
                     .breakpoint_conditions
                     .get(path)
-                    .is_some_and(|c| c.contains_key(&here));
+                    .is_some_and(|c| c.contains_key(&here))
+                    || self
+                        .breakpoint_hit_conditions
+                        .get(path)
+                        .is_some_and(|h| h.contains_key(&here));
                 let is_logpoint = self
                     .breakpoint_logs
                     .get(path)
@@ -13351,6 +13463,9 @@ impl Widget for &mut Editor {
                 && line_idx == self.cursor_row
                 && row_end >= line_len
                 && !self.inline_values.contains_key(&line_idx)
+                && self.live_note(line_idx).is_none()
+                && self.lenses_on_line(line_idx).is_empty()
+                && self.live_ghost().is_none()
                 && let Some(note) = self.current_line_blame_annotation()
             {
                 let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
@@ -13391,6 +13506,119 @@ impl Widget for &mut Editor {
                             .fg(self.theme.ignored_fg())
                             .add_modifier(Modifier::ITALIC),
                     );
+                }
+            }
+
+            // Inline suggestion (#607): the first line as ghost text right at
+            // the caret (suggestions are only asked for at a line's end), with
+            // a count of the lines that come with it. It owns the line's tail,
+            // so the trailers below stand aside.
+            let ghost_here = self.focused
+                && line_idx == self.cursor_row
+                && row_end >= line_len
+                && self.live_ghost().is_some();
+            if ghost_here && let Some(text) = self.live_ghost() {
+                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let x = text_x + text_cols as u16;
+                let right = inner.x + inner.width;
+                if x < right {
+                    let mut lines = text.split('\n');
+                    let first = lines.next().unwrap_or("");
+                    let more = lines.count();
+                    let shown = if more > 0 {
+                        format!(
+                            "{first}  (+{more} line{})",
+                            if more == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        first.to_string()
+                    };
+                    let clipped: String = shown.chars().take((right - x) as usize).collect();
+                    buf.set_string(
+                        x,
+                        y,
+                        &clipped,
+                        Style::default()
+                            .fg(self.theme.ignored_fg())
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
+            }
+
+            // Code lenses (#608): the server's "3 references | Run" at the end
+            // of the symbol's line, clickable, yielding to the debugger's and
+            // Live Run's trailers, which describe this very run.
+            if row_end >= line_len
+                && !ghost_here
+                && !self.inline_values.contains_key(&line_idx)
+                && self.live_note(line_idx).is_none()
+            {
+                let lenses = self.lenses_on_line(line_idx);
+                if !lenses.is_empty() {
+                    let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                    let mut x = text_x + text_cols as u16 + 2;
+                    let right = inner.x + inner.width;
+                    let style = Style::default()
+                        .fg(self.theme.ignored_fg())
+                        .add_modifier(Modifier::UNDERLINED);
+                    for (n, idx) in lenses.into_iter().enumerate() {
+                        if n > 0 && x + 3 < right {
+                            buf.set_string(
+                                x,
+                                y,
+                                " | ",
+                                Style::default().fg(self.theme.ignored_fg()),
+                            );
+                            x += 3;
+                        }
+                        if x >= right {
+                            break;
+                        }
+                        let title = &self.code_lenses[idx].title;
+                        let shown: String = title.chars().take((right - x) as usize).collect();
+                        let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                        buf.set_string(x, y, &shown, style);
+                        self.code_lens_spans.push((y, x..x + w, idx));
+                        x += w;
+                    }
+                }
+            }
+
+            // Live Run trailer: what this line did on the last run, painted
+            // where the debugger's values go and yielding to them, since a
+            // paused session is the more specific answer.
+            if row_end >= line_len
+                && !ghost_here
+                && !self.inline_values.contains_key(&line_idx)
+                && let Some(note) = self.live_note(line_idx)
+            {
+                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let mut x = text_x + text_cols as u16 + 2;
+                let right = inner.x + inner.width;
+                for (text, kind) in note {
+                    if x >= right {
+                        break;
+                    }
+                    let color = match kind {
+                        crate::live_run::Kind::Value => self.theme.ignored_fg(),
+                        crate::live_run::Kind::Output => {
+                            self.theme.ui(Color::Rgb(0x3b, 0x9e, 0xff))
+                        }
+                        crate::live_run::Kind::Error => self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+                        crate::live_run::Kind::Timeout => {
+                            self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))
+                        }
+                    };
+                    let avail = (right - x) as usize;
+                    let shown: String = text.chars().take(avail).collect();
+                    let width = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                    buf.set_string(
+                        x,
+                        y,
+                        &shown,
+                        Style::default().fg(color).add_modifier(Modifier::ITALIC),
+                    );
+                    x = x.saturating_add(width + 2);
                 }
             }
 
@@ -13573,7 +13801,7 @@ impl Editor {
                 .path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images, runnables) = crate::markdown::render_markdown_full(
+            let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
                 &text,
                 self.theme,
                 &mut self.registry,
@@ -13582,6 +13810,7 @@ impl Editor {
             );
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
+                md.source_map = source_map;
                 md.images = images;
                 md.runnables = runnables;
                 md.built_seq = self.edit_seq;
@@ -13626,7 +13855,27 @@ impl Editor {
                 .iter()
                 .map(|r| visual_row(r.first_line))
                 .collect();
+            // Scroll sync (#619): each built line's first visual row. A
+            // paragraph wraps line by line, so per-line counts sum exactly.
+            let mut row = 0usize;
+            md.row_of_line = md
+                .lines
+                .iter()
+                .map(|l| {
+                    let here = row;
+                    row += Paragraph::new(Text::from(vec![l.clone()]))
+                        .wrap(Wrap { trim: false })
+                        .line_count(text_area.width)
+                        .max(1);
+                    here
+                })
+                .collect();
             md.wrap_key = (md.built_seq, text_area.width);
+        }
+        if let Some(line) = md.scroll_to_source.take()
+            && let Some(row) = md.row_for_source_line(line)
+        {
+            md.scroll = (row as u16).min(max_scroll);
         }
         md.last_area = text_area;
         para.scroll((md.scroll, 0)).render(text_area, buf);
@@ -16585,6 +16834,25 @@ mod tests {
         assert_eq!(
             specs[0].condition, None,
             "a re-added breakpoint must be unconditional"
+        );
+    }
+
+    #[test]
+    fn removing_a_breakpoint_drops_its_hit_condition() {
+        let mut e = Editor::new();
+        let p = PathBuf::from("/x/a.py");
+        e.path = Some(p.clone());
+        e.lines = vec!["a".into(), "b".into()];
+        e.toggle_breakpoint_line(1);
+        e.breakpoint_hit_conditions
+            .entry(p.clone())
+            .or_default()
+            .insert(1, String::from(">= 5"));
+        e.toggle_breakpoint_line(1);
+        e.toggle_breakpoint_line(1);
+        assert!(
+            !e.breakpoint_hit_conditions.contains_key(&p),
+            "a fresh breakpoint on the line must not inherit the old hit count"
         );
     }
 
@@ -19609,6 +19877,39 @@ mod tests {
             text.contains("# Title"),
             "the source view must show the raw markdown again; got:\n{text}"
         );
+    }
+
+    #[test]
+    fn markdown_preview_opens_where_the_source_was_and_returns_there() {
+        // #619: the preview scrolls to the source's top line, and toggling
+        // back puts the source at the preview's top line.
+        let mut body = String::from("# Top\n\n");
+        for i in 0..40 {
+            body.push_str(&format!("para {i}\n\n"));
+        }
+        body.push_str("## Deep heading\n\n");
+        for i in 0..20 {
+            body.push_str(&format!("after {i}\n\n"));
+        }
+        let mut e = editor_with(&body);
+        e.lang = Some(LangKind::Markdown);
+        let deep = e.lines.iter().position(|l| l == "## Deep heading").unwrap();
+        e.scroll = deep;
+        assert!(e.toggle_markdown_preview());
+        let text = first_row_screen(&mut e, 60, 8);
+        // The first painted content row, inside the pane border.
+        let top = text
+            .lines()
+            .skip(1)
+            .find(|l| {
+                !l.trim_matches(|c: char| c == '\u{2502}' || c.is_whitespace())
+                    .is_empty()
+            })
+            .unwrap_or("");
+        assert!(top.contains("Deep heading"), "preview top: {top:?}\n{text}");
+        e.scroll = 0;
+        assert!(e.toggle_markdown_preview(), "back to source");
+        assert_eq!(e.scroll, deep, "the source comes back to the same place");
     }
 
     #[test]
@@ -26722,6 +27023,63 @@ mod tests {
             " ",
             "an unannotated line gets no trailer"
         );
+    }
+
+    fn live_view(lines: &[&str], notes: &[(usize, &str)]) -> crate::live_run::View {
+        let mut report = crate::live_run::Report::default();
+        for &(line, text) in notes {
+            report
+                .notes
+                .insert(line, vec![(text.to_string(), crate::live_run::Kind::Value)]);
+            report.coverage.insert(line, crate::live_run::Coverage::Ran);
+        }
+        crate::live_run::View {
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+            report,
+        }
+    }
+
+    #[test]
+    fn render_paints_a_live_run_trailer_and_tints_the_line_number() {
+        let mut e = editor_with("x = f()\ny = 2");
+        e.live_run = Some(live_view(&["x = f()", "y = 2"], &[(0, "x = 7")]));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        let start = text_x + 7 + 2;
+        assert_eq!(buf[(start, y0)].symbol(), "x");
+        assert_eq!(buf[(start + 4, y0)].symbol(), "7");
+        let number_x = (e.last_inner.x..text_x)
+            .find(|&x| buf[(x, y0)].symbol() == "1")
+            .expect("line number painted");
+        assert_eq!(
+            buf[(number_x, y0)].fg,
+            e.theme.git_added(),
+            "a line that ran is green"
+        );
+    }
+
+    #[test]
+    fn a_live_run_trailer_hides_once_its_line_is_edited() {
+        let mut e = editor_with("x = f() + 1");
+        e.live_run = Some(live_view(&["x = f()"], &[(0, "x = 7")]));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            buf[(text_x + 11 + 2, e.last_inner.y)].symbol(),
+            " ",
+            "the value belongs to the text that ran, not this one"
+        );
+    }
+
+    #[test]
+    fn debugger_inline_values_outrank_the_live_run_trailer() {
+        let mut e = editor_with("x = f()");
+        e.live_run = Some(live_view(&["x = f()"], &[(0, "x = 7")]));
+        e.inline_values.insert(0, String::from("x = 9"));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(buf[(text_x + 7 + 2 + 4, e.last_inner.y)].symbol(), "9");
     }
 
     #[test]

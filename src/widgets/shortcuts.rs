@@ -542,6 +542,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_peek_definition_key",
             },
             ShortcutEntry {
+                keys: "Opt+Shift+F12",
+                description: "Peek references (Up/Down step, Enter jumps, Esc closes)",
+                handler: "is_peek_references_key",
+            },
+            ShortcutEntry {
                 keys: "Shift+F12",
                 description: "Go to references (project-wide)",
                 handler: "is_go_to_references_key",
@@ -840,6 +845,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Alt+F9",
                 description: "Toggle break on raised (not just uncaught) exceptions",
                 handler: "",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+F10",
+                description: "Run to cursor (debugger paused): resume and stop once at the caret line",
+                handler: "is_run_to_cursor_key",
             },
             ShortcutEntry {
                 keys: "F10",

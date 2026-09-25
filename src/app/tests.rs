@@ -893,6 +893,28 @@ fn cmd_k_h_chords_fire_call_hierarchy_requests() {
 }
 
 #[test]
+fn cmd_k_shift_u_and_d_fire_type_hierarchy_requests() {
+    // #613: Shift+U asks for supertypes, Shift+D for subtypes, and neither
+    // falls through to the plain U / D arms (close saved tabs, etc.).
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.py");
+    std::fs::write(&f, "class A:\n    pass\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('U'), KeyModifiers::SHIFT)));
+    let first = app.call_hierarchy_request_id.expect("supertypes armed");
+    // CSI-u hosts report Shift+D as a lowercase char with SHIFT.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('d'), KeyModifiers::SHIFT)));
+    let second = app.call_hierarchy_request_id.expect("subtypes armed");
+    assert!(second > first);
+    assert_eq!(
+        app.editor.tab_count(),
+        1,
+        "the tab survived: no close arm ran"
+    );
+}
+
+#[test]
 fn a_late_call_hierarchy_reply_does_not_clobber_an_open_menu() {
     // rust-analyzer can answer seconds later; if the user opened another
     // menu while waiting, the reply must be dropped, not replace what they
@@ -32668,8 +32690,18 @@ fn a_record_rewrite_re_arms_a_downed_navigator() {
         .unwrap();
     f.set_modified(old_mtime).unwrap();
     app.pair_spawn_override = Some(Box::new(local_test_spawn));
-    app.last_pair_check = None;
-    app.maybe_seat_navigator();
+    // Poll like the app's once-a-second tick: a child forked by a parallel
+    // test can share the host lock's file until its exec closes it, which
+    // reads as Busy for that one tick.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.last_pair_check = None;
+        app.maybe_seat_navigator();
+        if app.pair_host.is_some() || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         app.pair_host.is_some(),
         "a rewritten record must re-arm the downed navigator: {}",
@@ -35865,6 +35897,52 @@ fn peek_popup_shows_the_target_then_enter_jumps_and_esc_closes() {
         app.editor.cursor_row, 1,
         "the dismissing key keeps its normal meaning — Down still moves"
     );
+}
+
+#[test]
+fn peek_references_steps_through_every_reference_with_up_and_down() {
+    // #616: the reply's references in the peek popup, "N of M" in the title,
+    // Up/Down wrapping through them, Enter jumping to the one shown.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn f() {}\nfn g() { f(); }\n").unwrap();
+    std::fs::write(&b, "fn h() {\n    f();\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.peek_refs = Some((vec![(a.clone(), 1, 9), (b.clone(), 1, 4)], 0));
+    app.show_peeked_reference();
+    let text = |app: &App| app.peek_popup.as_ref().expect("popup").lines.join("\n");
+    assert!(text(&app).starts_with("Reference 1 of 2"), "{}", text(&app));
+    assert!(text(&app).contains("a.rs:2"));
+
+    let press = |app: &mut App, code| {
+        app.handle_key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
+            .unwrap()
+    };
+    press(&mut app, KeyCode::Down);
+    assert!(
+        text(&app).starts_with("Reference 2 of 2"),
+        "Down steps, not dismisses"
+    );
+    assert!(text(&app).contains("b.rs:2"));
+    press(&mut app, KeyCode::Down);
+    assert!(text(&app).starts_with("Reference 1 of 2"), "and wraps");
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.peek_popup.is_none() && app.peek_refs.is_none());
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+#[test]
+fn alt_shift_f12_is_peek_references_not_go_to_references() {
+    let key_of = |m| crossterm::event::KeyEvent::new(KeyCode::F(12), m);
+    let peek = key_of(KeyModifiers::ALT | KeyModifiers::SHIFT);
+    assert!(is_peek_references_key(peek));
+    assert!(!is_peek_references_key(key_of(KeyModifiers::SHIFT)));
+    assert!(is_go_to_references_key(key_of(KeyModifiers::SHIFT)));
 }
 
 #[test]
@@ -43361,7 +43439,7 @@ fn a_focus_change_save_writes_a_file_with_a_symbol_tab_once() {
 
 /// #369: every way in opens the same symbol tab.
 ///
-/// `Cmd+K V` takes the symbol at the caret, and an OUTLINE row's right-click
+/// `Cmd+K Shift+V` takes the symbol at the caret, and an OUTLINE row's right-click
 /// menu opens the row's symbol even when the caret sits elsewhere.
 #[test]
 fn the_chord_and_the_outline_menu_open_a_symbol_tab() {
@@ -43371,12 +43449,24 @@ fn the_chord_and_the_outline_menu_open_a_symbol_tab() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_pinned(&file).unwrap();
     app.editor.cursor_row = 1;
+    // Plain Cmd+K V is Live Run's.
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('v'), KeyModifiers::NONE)));
+    assert!(
+        app.editor.symbol_view.is_none(),
+        "Cmd+K V is not the symbol tab"
+    );
+    // Shift arrives lowercase with SHIFT under CSI-u.
+    let mut csi_u = App::new(tmp.path().to_path_buf()).unwrap();
+    csi_u.editor.open_pinned(&file).unwrap();
+    csi_u.editor.cursor_row = 1;
+    assert!(csi_u.handle_cmd_k_chord(key(KeyCode::Char('v'), KeyModifiers::SHIFT)));
+    assert!(csi_u.editor.symbol_view.is_some(), "Shift+v opens it too");
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('V'), KeyModifiers::SHIFT)));
     let view = app
         .editor
         .symbol_view
         .as_ref()
-        .expect("Cmd+K V opened a symbol tab");
+        .expect("Cmd+K Shift+V opened a symbol tab");
     assert_eq!((view.name.as_str(), view.first, view.last), ("a", 0, 2));
 
     app.editor.select(0);
@@ -50611,6 +50701,958 @@ fn the_focused_member_ending_names_the_session_now_shown() {
         app.status
     );
     app.debug_stop();
+}
+
+// ---- Live Run (Cmd+K V) ----
+
+#[test]
+fn live_run_refuses_a_file_that_is_not_python() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "hello\n");
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    assert!(app.live_run_files.is_empty(), "nothing is armed");
+    assert!(app.status.contains("Python"), "{}", app.status);
+}
+
+#[test]
+fn live_run_arms_only_the_active_file_and_disarming_clears_its_trailers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    let path = app.editor.path.clone().unwrap();
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    assert_eq!(
+        app.live_run_files.iter().collect::<Vec<_>>(),
+        vec![&path],
+        "exactly the active file is armed"
+    );
+    app.editor.live_run = Some(crate::live_run::View::default());
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    assert!(app.live_run_files.is_empty());
+    assert!(
+        app.editor.live_run.is_none(),
+        "a disarmed file keeps no trailers"
+    );
+}
+
+/// The whole loop against a real interpreter, when the machine has one:
+/// arm, tick until the run lands, and find its values on the tab.
+#[test]
+fn live_run_lands_a_real_run_on_the_tab() {
+    let has_python = std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_python {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "n = len('abc')\nprint(n * 2)\n");
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.editor.live_run.is_none() && std::time::Instant::now() < deadline {
+        app.tick_live_run();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let view = app.editor.live_run.as_ref().expect("the run landed");
+    assert_eq!(
+        view.note(0, "n = len('abc')").map(|n| n[0].0.as_str()),
+        Some("n = 3")
+    );
+    assert_eq!(
+        view.note(1, "print(n * 2)").map(|n| n[0].0.as_str()),
+        Some("\u{25b8} 6")
+    );
+    assert!(app.status.starts_with("Live Run: ok"), "{}", app.status);
+}
+
+// ---- Explorer moves ask the servers first (#610) ----
+
+#[test]
+fn a_file_move_applies_the_servers_edits_before_renaming() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("util.py"), "def f(): pass\n").unwrap();
+    std::fs::write(root.join("main.py"), "import util\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    let pending = PendingFileMove {
+        request_id: 7,
+        op: FileMove::Rename {
+            parent: root.clone(),
+            old: root.join("util.py"),
+            new_name: String::from("helpers.py"),
+        },
+        renames: vec![crate::lsp::manager::FileRenameOp {
+            old: root.join("util.py"),
+            new: root.join("helpers.py"),
+            is_dir: false,
+        }],
+        deadline: std::time::Instant::now(),
+    };
+    let edits = vec![(
+        root.join("main.py"),
+        vec![crate::widgets::editor::TextSpanEdit {
+            start: (0, 7),
+            end: (0, 11),
+            new_text: String::from("helpers"),
+        }],
+    )];
+    app.finish_file_move(pending, edits);
+    assert!(root.join("helpers.py").exists(), "the file moved");
+    assert!(!root.join("util.py").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("main.py")).unwrap(),
+        "import helpers\n",
+        "the import followed it"
+    );
+    assert!(
+        app.status.contains("references updated in 1 file"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn a_pending_move_goes_ahead_at_its_deadline_without_an_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "x").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.pending_file_move = Some(PendingFileMove {
+        request_id: u64::MAX,
+        op: FileMove::Rename {
+            parent: root.clone(),
+            old: root.join("a.txt"),
+            new_name: String::from("b.txt"),
+        },
+        renames: Vec::new(),
+        deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+    });
+    assert!(app.tick_file_moves());
+    assert!(app.pending_file_move.is_none());
+    assert!(
+        root.join("b.txt").exists(),
+        "a silent server cannot block the move"
+    );
+}
+
+#[test]
+fn rename_target_validates_without_touching_the_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = tmp.path().join("a.txt");
+    std::fs::write(&old, "x").unwrap();
+    std::fs::write(tmp.path().join("taken.txt"), "y").unwrap();
+    let target = crate::widgets::file_tree::rename_target(tmp.path(), &old, "b.txt").unwrap();
+    assert_eq!(target, tmp.path().join("b.txt"));
+    assert!(old.exists(), "nothing moved yet");
+    assert!(crate::widgets::file_tree::rename_target(tmp.path(), &old, "taken.txt").is_err());
+}
+
+// ---- Markdown preview scroll sync across a split (#619) ----
+
+#[test]
+fn a_split_preview_follows_the_source_pane_scroll() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("doc.md");
+    let mut body = String::from("# Top\n\n");
+    for i in 0..30 {
+        body.push_str(&format!("para {i}\n\n"));
+    }
+    std::fs::write(&f, &body).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.editor.toggle_markdown_preview(),
+        "left pane shows the preview"
+    );
+    app.split_editor();
+    assert!(
+        app.editor.markdown_preview.is_none(),
+        "the new pane shows the source"
+    );
+    app.editor.scroll = 20;
+    assert!(
+        app.sync_markdown_scroll(),
+        "the preview pane is told to follow"
+    );
+    let preview_pane = app
+        .editor_layout
+        .inactive_groups()
+        .into_iter()
+        .find_map(|g| g.editors.get(g.active_index()))
+        .and_then(|t| t.markdown_preview.as_ref())
+        .expect("the other pane still shows the preview");
+    assert_eq!(preview_pane.scroll_to_source, Some(20));
+    assert!(
+        !app.sync_markdown_scroll(),
+        "a still viewport costs nothing"
+    );
+}
+
+// ---- Code lenses (#608) ----
+
+fn lens_at(line: usize, text: &str, title: &str, command: &str) -> crate::code_lens::EditorLens {
+    crate::code_lens::EditorLens {
+        line,
+        line_text: text.to_string(),
+        title: title.to_string(),
+        command: Some(command.to_string()),
+        arguments: Vec::new(),
+        server_side: false,
+    }
+}
+
+#[test]
+fn clicking_a_painted_code_lens_runs_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}\n");
+    app.editor.code_lenses = vec![lens_at(
+        0,
+        "fn main() {}",
+        "Frobnicate",
+        "vendor.frobnicate",
+    )];
+    let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(
+        &mut *app.editor as &mut crate::widgets::editor::Editor,
+        area,
+        &mut buf,
+    );
+    let (y, xs, idx) = app
+        .editor
+        .code_lens_spans
+        .first()
+        .cloned()
+        .expect("lens painted");
+    assert_eq!(idx, 0);
+    let painted: String = xs
+        .clone()
+        .map(|x| buf[(x, y)].symbol().to_string())
+        .collect();
+    assert_eq!(painted, "Frobnicate");
+    assert_eq!(app.editor.code_lens_at(xs.start, y), Some(0));
+    app.run_code_lens(0);
+    assert!(
+        app.status
+            .contains("vendor.frobnicate is not a command croft runs"),
+        "an unmappable lens says why: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_code_lens_hides_once_its_line_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}\n");
+    app.editor.code_lenses = vec![lens_at(0, "fn main() {}", "Run", "x")];
+    assert_eq!(app.editor.lenses_on_line(0), vec![0]);
+    app.editor.lines[0] = String::from("fn main() { edited }");
+    assert!(
+        app.editor.lenses_on_line(0).is_empty(),
+        "stale lens is not shown"
+    );
+}
+
+#[test]
+fn cmd_k_shift_e_runs_the_caret_lines_only_lens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}\n");
+    app.editor.code_lenses = vec![lens_at(
+        0,
+        "fn main() {}",
+        "Frobnicate",
+        "vendor.frobnicate",
+    )];
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('E'), KeyModifiers::SHIFT)));
+    assert!(app.status.starts_with("Code lens:"), "{}", app.status);
+    app.editor
+        .code_lenses
+        .push(lens_at(0, "fn main() {}", "Other", "vendor.other"));
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('e'), KeyModifiers::SHIFT)));
+    assert!(
+        app.context_menu.is_some(),
+        "two lenses open a menu to pick from"
+    );
+}
+
+// ---- #611: hit counts, function breakpoints, Run to Cursor ----
+
+#[test]
+fn a_hit_count_prompt_sets_the_breakpoints_hit_condition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\ny = 2\n");
+    app.editor.cursor_row = 1;
+    app.run_command(crate::widgets::command_palette::Command::DebugAddHitCountBreakpoint);
+    let path = app.editor.path.clone().unwrap();
+    assert!(matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(PromptKind::HitCondition { line: 2, .. })
+    ));
+    app.commit_hit_condition(path.clone(), 2, " 5 ");
+    let lines = app.editor.breakpoints.get(&path).cloned().unwrap();
+    assert!(lines.contains(&2), "the breakpoint exists");
+    let specs = app.editor.source_breakpoints(&path, &lines);
+    assert_eq!(specs[0].hit_condition.as_deref(), Some("5"));
+    app.commit_hit_condition(path.clone(), 2, "");
+    let specs = app.editor.source_breakpoints(&path, &lines);
+    assert_eq!(specs[0].hit_condition, None, "blank clears it");
+}
+
+#[test]
+fn function_breakpoints_are_kept_for_the_next_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.commit_function_breakpoint(String::from("main"));
+    app.commit_function_breakpoint(String::from("main"));
+    assert_eq!(
+        app.function_breakpoints,
+        vec![String::from("main")],
+        "no duplicates"
+    );
+    app.debug_clear_function_breakpoints();
+    assert!(app.function_breakpoints.is_empty());
+}
+
+#[test]
+fn run_to_cursor_without_a_session_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    let ctrl_f10 = crossterm::event::KeyEvent::new(KeyCode::F(10), KeyModifiers::CONTROL);
+    assert!(is_run_to_cursor_key(ctrl_f10));
+    assert!(!is_run_to_cursor_key(crossterm::event::KeyEvent::new(
+        KeyCode::F(10),
+        KeyModifiers::NONE
+    )));
+    app.debug_run_to_cursor();
+    assert_eq!(app.status, "Run to Cursor: no debug session");
+}
+
+// ---- Search Editor (#615) ----
+
+#[test]
+fn a_search_editor_reruns_its_header_and_opens_results() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "one\nthe needle is here\nthree\n").unwrap();
+    std::fs::write(root.join("b.txt"), "no match\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::OpenSearchEditor);
+    assert!(crate::search_editor::is_search_editor(&app.editor.lines));
+    app.editor.lines[0] = String::from("# Query: needle");
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('R'), KeyModifiers::SHIFT)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_search_editor() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let text = app.editor.lines.join("\n");
+    assert!(text.contains("1 result - 1 file"), "{text}");
+    assert!(text.contains("a.txt:"), "{text}");
+    let row = app
+        .editor
+        .lines
+        .iter()
+        .position(|l| l.contains("the needle is here"))
+        .expect("result row");
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = row;
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(root.join("a.txt").as_path())
+    );
+    assert_eq!(app.editor.cursor_row, 1, "the match's line, 0-based");
+}
+
+// ---- Interactive rebase in croft (#620) ----
+
+#[test]
+fn rebase_todo_keys_set_the_action_and_step_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "git-rebase-todo",
+        "pick aaa111 first\npick bbb222 second\n# comment\n",
+    );
+    app.editor.cursor_row = 1;
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('f'),
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines[1], "fixup bbb222 second");
+    assert_eq!(app.editor.cursor_row, 2, "the caret moves to the next line");
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('d'),
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.editor.lines[2], "d# comment",
+        "a comment line types normally"
+    );
+}
+
+#[test]
+fn rebase_keys_type_normally_outside_a_todo_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "pick aaa111 first\n");
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('s'),
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines[0], "spick aaa111 first");
+}
+
+#[test]
+fn a_probe_reports_whether_the_file_is_still_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", "pick a b\n");
+    let path = app.editor.path.clone().unwrap();
+    assert_eq!(app.probe_view_path(&path), crate::view_ipc::ViewReply::Ok);
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    assert!(matches!(
+        app.probe_view_path(&path),
+        crate::view_ipc::ViewReply::Err { .. }
+    ));
+}
+
+#[test]
+fn the_sequence_editor_command_quotes_the_binary_path() {
+    assert_eq!(
+        crate::widgets::terminal::sequence_editor_command(std::path::Path::new(
+            "/opt/my croft/croft"
+        )),
+        "'/opt/my croft/croft' edit --wait --sequence-editor"
+    );
+}
+
+#[test]
+fn a_plain_view_request_has_no_probe_field_on_the_wire() {
+    // An older croft must read this build's `croft view` unchanged.
+    let json = serde_json::to_string(&crate::view_ipc::ViewRequest::new(std::path::Path::new(
+        "/a",
+    )))
+    .unwrap();
+    assert!(!json.contains("probe"), "{json}");
+    let probe = serde_json::to_string(&crate::view_ipc::ViewRequest::probe(std::path::Path::new(
+        "/a",
+    )))
+    .unwrap();
+    assert!(probe.contains("\"probe\":true"));
+}
+
+// ---- Keyboard Shortcuts editor (#612) ----
+
+#[test]
+fn recording_a_shortcut_writes_it_and_takes_effect_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keybindings_file = tmp.path().join("keybindings.json");
+    app.open_keyboard_shortcuts();
+    let cmd = crate::widgets::command_palette::Command::ToggleLiveRun;
+    app.recording_shortcut = Some(cmd);
+    // Plain typing is refused and ends the recording.
+    app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.status.contains("needs a function key"),
+        "{}",
+        app.status
+    );
+    assert!(!app.keybindings_file.exists());
+    app.recording_shortcut = Some(cmd);
+    app.handle_key(key(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(
+        app.status.starts_with("ctrl+alt+j now runs"),
+        "{}",
+        app.status
+    );
+    let written = std::fs::read_to_string(&app.keybindings_file).unwrap();
+    assert!(written.contains("\"toggle_live_run\""), "{written}");
+    assert_eq!(app.keymap.chord_for(cmd).as_deref(), Some("ctrl+alt+j"));
+}
+
+#[test]
+fn escape_leaves_the_shortcut_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keybindings_file = tmp.path().join("keybindings.json");
+    app.recording_shortcut = Some(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, "Shortcut unchanged");
+    assert!(!app.keybindings_file.exists());
+}
+
+// ---- Profiles (#618) ----
+
+#[test]
+fn the_profiles_picker_offers_the_default_and_a_new_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SwitchProfile);
+    let picker = app.list_picker.as_ref().expect("picker open");
+    assert!(matches!(
+        picker.purpose,
+        crate::widgets::list_picker::ListPurpose::Profiles
+    ));
+    let ids: Vec<&str> = picker.rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids.first(), Some(&"profile:"), "Default comes first");
+    assert!(ids.contains(&"new"));
+    assert!(
+        !ids.contains(&"workspace-clear"),
+        "no workspace choice to clear in a fresh workspace"
+    );
+}
+
+#[test]
+fn a_new_profile_prompt_refuses_an_unsafe_name_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.prompt = Some(Prompt {
+        label: String::from("New profile name"),
+        buffer: String::from("../escape"),
+        kind: PromptKind::NewProfile,
+        target_dir: tmp.path().to_path_buf(),
+        error: None,
+    });
+    app.commit_prompt();
+    let p = app.prompt.as_ref().expect("the prompt stays open");
+    assert!(
+        p.error
+            .as_deref()
+            .is_some_and(|e| e.contains("profile name")),
+        "{:?}",
+        p.error
+    );
+}
+
+// ---- Inline AI suggestions (#607) ----
+
+/// A one-shot fake `/v1/messages`: answers the first request with `text`
+/// and hands back the raw request it read.
+fn fake_messages_endpoint(text: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        // Headers, then as much body as Content-Length says.
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let s = String::from_utf8_lossy(&buf).to_string();
+            if let Some(h) = s.find("\r\n\r\n") {
+                let len = s[..h]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= h + 4 + len {
+                    break;
+                }
+            }
+        }
+        let body = serde_json::json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}).to_string();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+    });
+    (url, rx)
+}
+
+#[test]
+fn an_inline_suggestion_appears_after_a_pause_and_tab_takes_it() {
+    let (url, requests) = fake_messages_endpoint("1 + 1;");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "let x = \n");
+    app.inline_config = Some(crate::inline_complete::Config {
+        backend: crate::inline_complete::Backend::Claude {
+            base_url: url,
+            api_key: String::from("test-key"),
+        },
+        model: String::from("claude-opus-5"),
+    });
+    app.inline_worker = Some(crate::inline_complete::Worker::spawn());
+    app.inline_enabled = true;
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 8;
+    app.editor.last_edit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.editor.live_ghost().is_none() && std::time::Instant::now() < deadline {
+        app.tick_inline_complete();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(app.editor.live_ghost(), Some("1 + 1;"));
+    let req = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(req.contains("x-api-key: test-key"), "{req}");
+    assert!(req.contains("anthropic-version: 2023-06-01"));
+    assert!(
+        req.contains("let x = <CURSOR>"),
+        "the caret is marked: {req}"
+    );
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines[0], "let x = 1 + 1;");
+    assert!(app.editor.live_ghost().is_none());
+}
+
+#[test]
+fn an_edit_makes_a_suggestion_stale_and_esc_dismisses_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "let x = \n");
+    app.editor.cursor_col = 8;
+    let seq = app.editor.edit_seq;
+    app.editor.ghost = Some((0, 8, seq, String::from("1;")));
+    assert!(app.editor.live_ghost().is_some());
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert!(app.editor.ghost.is_none(), "Esc dismisses");
+    app.editor.ghost = Some((0, 8, seq, String::from("1;")));
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('2'),
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert!(app.editor.live_ghost().is_none(), "typing makes it stale");
+}
+
+/// A git repo holding `a.rs` and a fake `gh` that answers the review
+/// calls (#366, #368): (tempdir, repo root, a.rs, gh's call log, the last
+/// review payload, the gh script).
+fn review_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(&args)
+            .status();
+    }
+    let f = root.join("a.rs");
+    std::fs::write(&f, "fn a() {}\nfn b() {}\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-m", "init", "--quiet"]] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(&args)
+            .status();
+    }
+    let log = tmp.path().join("gh.log");
+    let stdin = tmp.path().join("gh.stdin");
+    let gh = tmp.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  "pr view"*) echo 7 ;;
+  "pr diff"*) printf 'diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,1 +1,2 @@\n fn a() {{}}\n+fn b() {{}}\n' ;;
+  *graphql*reviewThreads*) echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_1","isResolved":false,"comments":{{"nodes":[{{"databaseId":5}}]}}}}]}}}}}}}}}}' ;;
+  *graphql*) echo '{{}}' ;;
+  *"/comments --paginate"*) echo '[{{"id":5,"path":"a.rs","line":1,"user":{{"login":"ada"}},"body":"why?"}}]' ;;
+  *reviews*) cat > '{stdin}'; echo '{{}}' ;;
+  *) echo '{{}}' ;;
+esac
+"#,
+            log = log.display(),
+            stdin = stdin.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    (tmp, root, f, log, stdin, gh)
+}
+
+/// An app on the review fixture, with git's view of the repo in place.
+fn review_app(root: &std::path::Path, f: &std::path::Path, gh: &std::path::Path) -> App {
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.review_gh = gh.display().to_string();
+    app.editor.open_pinned(f).unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "git to find the repository",
+        || {
+            app.git.drain_into(None);
+            app.git.status().repo_root.is_some()
+        },
+    );
+    app
+}
+
+/// #366's write side end to end against a fake `gh`: threads load with
+/// their GraphQL resolution, a reply and a resolve go to GitHub off the
+/// frame loop, and a pending comment is submitted with the chosen verdict.
+#[test]
+fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
+    let (_tmp, root, f, log, stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
+    app.load_review_threads();
+    let threads = app.review_boxes.as_ref().map(|(_, t)| t.clone()).unwrap();
+    assert_eq!(threads.len(), 1);
+    assert!(!threads[0].resolved);
+    assert_eq!(app.review_nodes.get(&5).map(String::as_str), Some("PRRT_1"));
+
+    let wait_for = |app: &mut App, what: &str, done: &dyn Fn(&App) -> bool| {
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), what, || {
+            app.drain_review_ops();
+            done(app)
+        });
+    };
+
+    app.editor.cursor_row = 0;
+    app.toggle_review_thread_resolved();
+    wait_for(&mut app, "the resolve", &|a| {
+        a.review_boxes.as_ref().is_some_and(|(_, t)| t[0].resolved)
+    });
+
+    assert!(app.reply_to_review_thread(5, "done"));
+    wait_for(&mut app, "the reply", &|a| {
+        a.review_boxes
+            .as_ref()
+            .is_some_and(|(_, t)| t[0].body.ends_with("you: done"))
+    });
+
+    app.editor.cursor_row = 1;
+    app.open_review_comment_prompt();
+    let rel = app.prompt.as_ref().unwrap().target_dir.clone();
+    app.prompt = None;
+    app.add_pending_review_comment("add a test", rel);
+    app.review_verdict = Some(crate::review_threads::ReviewEvent::RequestChanges);
+    app.submit_review(String::from("Close."));
+    wait_for(&mut app, "the review", &|a| a.review_pending.is_empty());
+
+    let sent: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stdin).unwrap()).unwrap();
+    assert_eq!(sent["event"], "REQUEST_CHANGES");
+    assert_eq!(sent["comments"][0]["path"], "a.rs");
+    assert_eq!(sent["comments"][0]["line"], 2);
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains("pulls/7/comments/5/replies -f body=done"),
+        "{calls}"
+    );
+    assert!(calls.contains("resolveReviewThread"), "{calls}");
+}
+
+/// Pending comments belong to the PR they were written on: once the
+/// branch's PR changes, they neither post there nor mix with new ones, and
+/// a failed export settles none of the notes it carried.
+#[test]
+fn pending_comments_stay_with_their_pull_request() {
+    let (_tmp, root, f, _log, stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
+    app.editor.cursor_row = 0;
+    app.open_review_comment_prompt();
+    let rel = app.prompt.take().unwrap().target_dir;
+    app.add_pending_review_comment("on seven", rel.clone());
+    assert_eq!(app.review_pending.len(), 1);
+
+    // The branch now has another PR.
+    app.review_pr = Some((root.clone(), String::from("8")));
+    app.add_pending_review_comment("on eight", rel);
+    assert_eq!(app.review_pending.len(), 1, "not mixed in");
+    assert!(app.status.contains("PR #7"), "{}", app.status);
+    app.submit_review(String::from("LGTM"));
+    assert!(!stdin.exists(), "nothing posted to #8");
+
+    // A failed export keeps the navigator notes it carried.
+    app.review_pending.clear();
+    app.navigator_notes
+        .insert(String::from("a.rs"), vec![(1, 1, String::from("n"))]);
+    app.drain_review_ops();
+    app.review_tx
+        .send(crate::review_ops::Outcome::Failed(String::from("nope")))
+        .unwrap();
+    app.drain_review_ops();
+    app.review_tx
+        .send(crate::review_ops::Outcome::Submitted {
+            inline: 0,
+            folded: 0,
+            settles: crate::review_ops::Settles::default(),
+        })
+        .unwrap();
+    app.drain_review_ops();
+    assert_eq!(app.navigator_notes["a.rs"].len(), 1);
+}
+
+/// #368: the navigator's notes and pending comments are previewed, then
+/// posted as one review with the navigator's marked as AI-authored; a note
+/// off the diff lands in the summary, and posted notes leave the editor.
+#[test]
+fn comments_export_to_the_pull_request_after_a_preview() {
+    let (_tmp, root, f, _log, stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
+    app.navigator_notes.insert(
+        String::from("a.rs"),
+        vec![
+            (1, 1, String::from("b is unused")),
+            (2, 40, String::from("far")),
+        ],
+    );
+    app.review_pending
+        .push(crate::review_threads::PendingComment {
+            path: String::from("a.rs"),
+            line: 0,
+            body: String::from("mine"),
+        });
+    app.open_export_comments();
+    let picker = app.list_picker.as_ref().expect("the preview is shown");
+    assert_eq!(
+        picker.rows[0].label,
+        "Post to PR #7: 2 inline, 1 in the summary"
+    );
+    assert_eq!(picker.rows.len(), 4);
+    app.post_exported_comments();
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the post", || {
+        app.drain_review_ops();
+        app.navigator_notes.get("a.rs").is_some_and(Vec::is_empty)
+    });
+    let sent: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stdin).unwrap()).unwrap();
+    assert_eq!(sent["event"], "COMMENT");
+    let bodies: Vec<&str> = sent["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, vec!["mine", "[AI, croft navigator] b is unused"]);
+    assert!(
+        sent["body"]
+            .as_str()
+            .unwrap()
+            .contains("`a.rs:41`: [AI, croft navigator] far")
+    );
+    assert!(app.review_pending.is_empty());
+}
+
+/// #367: a sticky note hangs under its line as a box, follows the line when
+/// lines are added above, takes replies, resolves from its ✕, is counted in
+/// the Explorer while open, and is reached by F4.
+#[test]
+fn a_sticky_note_is_a_box_that_follows_its_line_and_takes_replies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "fn a() {}\nfn b() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_row = 1;
+    app.open_sticky_note_prompt();
+    assert!(matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(PromptKind::StickyNote)
+    ));
+    app.prompt = None;
+    app.add_sticky_note("why b?");
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|fr| app.render(fr)).unwrap();
+    let b = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|b| b.body == "why b?")
+        .cloned()
+        .expect("the note is drawn as a box");
+    assert_eq!(b.line, 1);
+    assert_eq!(
+        app.tree.note_counts.get(&f).copied(),
+        Some(1),
+        "the Explorer counts it"
+    );
+
+    // Two lines land above it: the box follows fn b.
+    app.editor.lines.insert(0, String::from("// one"));
+    app.editor.lines.insert(0, String::from("// two"));
+    term.draw(|fr| app.render(fr)).unwrap();
+    let moved = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|x| x.id == b.id)
+        .unwrap();
+    assert_eq!(moved.line, 3);
+
+    app.editor.cursor_row = 0;
+    assert_eq!(app.next_comment_from_caret().map(|(id, _)| id), Some(b.id));
+
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id: b.id,
+        reply: String::from("it is used"),
+        cursor: 0,
+    });
+    app.submit_comment_reply();
+    app.ignore_comment_box(b.id);
+    term.draw(|fr| app.render(fr)).unwrap();
+    let after = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|x| x.id == b.id)
+        .unwrap();
+    assert!(after.body.ends_with(": it is used"), "{}", after.body);
+    assert!(after.author.ends_with("resolved"));
+    assert!(
+        app.tree.note_counts.is_empty(),
+        "a resolved note isn't counted"
+    );
+
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 0;
+    app.delete_sticky_note_here();
+    term.draw(|fr| app.render(fr)).unwrap();
+    assert!(!app.editor.comment_boxes.iter().any(|x| x.id == b.id));
 }
 
 /// A test-built App never reads the developer's own settings layers: a
