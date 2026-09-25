@@ -84,6 +84,7 @@ mod sheet;
 mod shell_integration;
 mod snippets;
 mod sqlite_view;
+mod sticky_notes;
 mod svg;
 mod symbol_range;
 mod tasks;

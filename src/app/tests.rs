@@ -50459,3 +50459,82 @@ fn comments_export_to_the_pull_request_after_a_preview() {
     );
     assert!(app.review_pending.is_empty());
 }
+
+/// #367: a sticky note hangs under its line as a box, follows the line when
+/// lines are added above, takes replies, resolves from its ✕, is counted in
+/// the Explorer while open, and is reached by F4.
+#[test]
+fn a_sticky_note_is_a_box_that_follows_its_line_and_takes_replies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "fn a() {}\nfn b() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_row = 1;
+    app.open_sticky_note_prompt();
+    assert!(matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(PromptKind::StickyNote)
+    ));
+    app.prompt = None;
+    app.add_sticky_note("why b?");
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|fr| app.render(fr)).unwrap();
+    let b = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|b| b.body == "why b?")
+        .cloned()
+        .expect("the note is drawn as a box");
+    assert_eq!(b.line, 1);
+    assert_eq!(
+        app.tree.note_counts.get(&f).copied(),
+        Some(1),
+        "the Explorer counts it"
+    );
+
+    // Two lines land above it: the box follows fn b.
+    app.editor.lines.insert(0, String::from("// one"));
+    app.editor.lines.insert(0, String::from("// two"));
+    term.draw(|fr| app.render(fr)).unwrap();
+    let moved = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|x| x.id == b.id)
+        .unwrap();
+    assert_eq!(moved.line, 3);
+
+    app.editor.cursor_row = 0;
+    assert_eq!(app.next_comment_from_caret().map(|(id, _)| id), Some(b.id));
+
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id: b.id,
+        reply: String::from("it is used"),
+        cursor: 0,
+    });
+    app.submit_comment_reply();
+    app.ignore_comment_box(b.id);
+    term.draw(|fr| app.render(fr)).unwrap();
+    let after = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|x| x.id == b.id)
+        .unwrap();
+    assert!(after.body.ends_with(": it is used"), "{}", after.body);
+    assert!(after.author.ends_with("resolved"));
+    assert!(
+        app.tree.note_counts.is_empty(),
+        "a resolved note isn't counted"
+    );
+
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 0;
+    app.delete_sticky_note_here();
+    term.draw(|fr| app.render(fr)).unwrap();
+    assert!(!app.editor.comment_boxes.iter().any(|x| x.id == b.id));
+}

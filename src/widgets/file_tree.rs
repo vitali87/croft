@@ -55,6 +55,9 @@ pub struct FileTree {
     /// root path. Swapped in by the app whenever a lane or a seat changes;
     /// a root with no entry paints as before.
     pub root_badges: Arc<HashMap<PathBuf, String>>,
+    /// Unresolved sticky notes per file (#367), painted as a count after
+    /// the name.
+    pub note_counts: Arc<HashMap<PathBuf, usize>>,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -112,6 +115,7 @@ impl FileTree {
             theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
             agent_touched: Arc::default(),
+            note_counts: Arc::default(),
             root_badges: Arc::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
@@ -1596,6 +1600,12 @@ impl Widget for &mut FileTree {
                     spans.push(Span::styled(
                         format!(" {AGENT_DOT}"),
                         Style::default().fg(self.theme.ui(Color::Yellow)),
+                    ));
+                }
+                if let Some(n) = self.note_counts.get(&node.path) {
+                    spans.push(Span::styled(
+                        format!(" \u{270e}{n}"),
+                        Style::default().fg(self.theme.ui(Color::Gray)),
                     ));
                 }
             }

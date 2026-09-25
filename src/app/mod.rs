@@ -2307,6 +2307,7 @@ enum PromptKind {
     NewProfile,
     ReviewComment,
     ReviewSummary,
+    StickyNote,
     /// Rename the terminal pane at `idx`. The buffer is pre-filled with its
     /// current label; on commit the name overrides the auto label.
     RenameTerminal(usize),
@@ -3582,6 +3583,12 @@ pub struct App {
     /// verdict while its summary is typed, the `gh` to run, and where
     /// finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
+    /// Sticky notes (#367): every note in the workspace, where the owner
+    /// keeps them (`None` under test), and which box id is which note.
+    notes: crate::sticky_notes::Notes,
+    notes_path: Option<PathBuf>,
+    note_box_ids: std::collections::HashMap<u64, String>,
+    notes_shown_gen: u64,
     /// Export to a PR (#368): the previewed comments and the navigator
     /// notes they came from, the notes a posted export clears, and the
     /// prefix that marks the navigator's comments as AI-authored.
@@ -3591,6 +3598,8 @@ pub struct App {
         Vec<crate::widgets::list_picker::ListRow>,
     )>,
     review_exported_notes: Vec<u64>,
+    review_exported_sticky: Vec<String>,
+    review_export_sticky: Vec<String>,
     review_ai_prefix: String,
     review_pr: Option<(PathBuf, String)>,
     review_nodes: std::collections::HashMap<u64, String>,
@@ -4647,6 +4656,8 @@ impl App {
         }
         let loaded_prefs = merged_settings.prefs.clone();
         let (review_tx, review_rx) = std::sync::mpsc::channel();
+        let notes_path = (!cfg!(test))
+            .then(|| crate::sticky_notes::Notes::store_path(&croft_cache_dir(), &root));
         if !cfg!(test) {
             crate::i18n::init(loaded_prefs.locale.as_deref());
         }
@@ -5264,8 +5275,17 @@ impl App {
             pending_code_actions: Vec::new(),
             review_boxes: None,
             review_pending: Vec::new(),
+            notes: notes_path
+                .as_deref()
+                .map(crate::sticky_notes::Notes::load)
+                .unwrap_or_default(),
+            notes_path,
+            note_box_ids: std::collections::HashMap::new(),
+            notes_shown_gen: 0,
             review_export: None,
             review_exported_notes: Vec::new(),
+            review_exported_sticky: Vec::new(),
+            review_export_sticky: Vec::new(),
             review_ai_prefix: loaded_prefs
                 .review_ai_prefix
                 .clone()
@@ -15898,6 +15918,15 @@ impl App {
             menu.localize();
         }
         self.update_announcer();
+        if self.notes.generation != self.notes_shown_gen {
+            self.notes_shown_gen = self.notes.generation;
+            let mut counts: std::collections::HashMap<PathBuf, usize> =
+                std::collections::HashMap::new();
+            for n in self.notes.live().filter(|n| !n.resolved) {
+                *counts.entry(self.tree.root.join(&n.file)).or_default() += 1;
+            }
+            self.tree.note_counts = std::sync::Arc::new(counts);
+        }
         // Redaction reveal is app state; each pane paints from its own copy.
         let reveal = self.redactions_revealed();
         for t in self.terminals.iter_mut() {
@@ -16314,6 +16343,32 @@ impl App {
                         body: t.body.clone(),
                     }
                 }));
+            }
+            // Sticky notes (#367) on this file, at their re-found lines.
+            self.note_box_ids.clear();
+            if let Some(file) = self.note_file_key() {
+                let lines = &self.editor.lines;
+                let boxes: Vec<(u64, String, crate::widgets::editor::CommentBox)> = self
+                    .notes
+                    .on_file(&file)
+                    .map(|n| {
+                        let id = Self::note_box_id(&n.id);
+                        (
+                            id,
+                            n.id.clone(),
+                            crate::widgets::editor::CommentBox {
+                                id,
+                                line: n.place(lines),
+                                author: n.title(),
+                                body: n.text(),
+                            },
+                        )
+                    })
+                    .collect();
+                for (id, note_id, b) in boxes {
+                    self.note_box_ids.insert(id, note_id);
+                    self.editor.comment_boxes.push(b);
+                }
             }
             // Pending review comments (#366) on this file, until submitted.
             if !self.review_pending.is_empty()
@@ -18691,6 +18746,17 @@ impl App {
                 ]),
                 "Enter to submit the review (the summary may be empty), Esc to cancel",
             ),
+            PromptKind::StickyNote => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to leave the note on this line (shared with everyone in the session), Esc to cancel",
+            ),
         };
         frame.render_widget(
             ratatui::widgets::Paragraph::new(top_line),
@@ -18738,6 +18804,17 @@ impl App {
         let plain = !key.modifiers.contains(KeyModifiers::ALT);
         let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
+            // Cmd+K N in the editor: leave a sticky note on this line (#367).
+            // In a terminal the same chord keeps its meaning (below).
+            KeyCode::Char(c)
+                if plain
+                    && !shifted
+                    && c.eq_ignore_ascii_case(&'n')
+                    && self.focus == Pane::Editor =>
+            {
+                self.open_sticky_note_prompt();
+                true
+            }
             // Cmd+K ⇧C / ⇧S / ⇧R with the terminal focused: the keyboard
             // forms of the decoration-menu actions, applied to the LAST
             // finished command (VS Code's copyLastCommandOutput family).
@@ -24629,6 +24706,17 @@ impl App {
         if self.reply_to_review_thread(focus.id, &reply) {
             return;
         }
+        let me = collab_display_name();
+        if self.change_note_box(focus.id, |n| {
+            n.replies.push(crate::sticky_notes::Reply {
+                author: me,
+                body: reply.clone(),
+            })
+        }) {
+            self.editor.comment_focus = None;
+            self.status = String::from("Reply added to the note");
+            return;
+        }
         if Self::pending_review_index(focus.id).is_some() {
             self.status =
                 String::from("A pending comment has no thread yet; submit the review first");
@@ -24674,6 +24762,116 @@ impl App {
                 self.editor.comment_focus = None;
             }
             Err(e) => self.status = format!("Reply failed: {e}"),
+        }
+    }
+
+    /// The workspace-relative key a note on the open file uses.
+    fn note_file_key(&self) -> Option<String> {
+        let path = self.editor.path.as_deref()?;
+        repo_relative(&self.tree.root, path)
+    }
+
+    /// Notes: Add Note (Cmd+K N) (#367).
+    fn open_sticky_note_prompt(&mut self) {
+        if self.note_file_key().is_none() {
+            self.status = String::from("Notes go on files inside the workspace");
+            return;
+        }
+        self.prompt = Some(Prompt {
+            label: format!("Note on line {}", self.editor.cursor_row + 1),
+            buffer: String::new(),
+            kind: PromptKind::StickyNote,
+            target_dir: self.tree.root.clone(),
+            error: None,
+        });
+    }
+
+    fn add_sticky_note(&mut self, body: &str) {
+        let Some(file) = self.note_file_key() else {
+            return;
+        };
+        if body.is_empty() {
+            return;
+        }
+        let row = self.editor.cursor_row;
+        let anchor = self.editor.lines.get(row).cloned().unwrap_or_default();
+        let note = self
+            .notes
+            .add(&collab_display_name(), &file, row, &anchor, body);
+        self.publish_note(&note);
+        self.status = String::from("Note added");
+    }
+
+    /// Send a changed note to the session and keep the store current.
+    fn publish_note(&mut self, note: &crate::sticky_notes::Note) {
+        let mut session = self.collab.take();
+        if let Some(s) = session.as_mut() {
+            s.send_note(note);
+        }
+        self.save_notes(session.as_ref());
+        self.collab = session;
+    }
+
+    /// The owner (or a lone croft) writes the notes; a guest's copy lives
+    /// with the owner.
+    fn save_notes(&self, session: Option<&crate::collab::CollabSession>) {
+        if session.is_some_and(|s| s.role == crate::collab::CollabRole::Guest) {
+            return;
+        }
+        if let Some(path) = &self.notes_path {
+            let _ = self.notes.save(path);
+        }
+    }
+
+    /// A note's comment-box id: high in the id space, clear of navigator
+    /// notes (from 1), GitHub ids (~4e9) and pending review comments (top).
+    fn note_box_id(id: &str) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in id.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        (1 << 62) | (h & ((1 << 61) - 1))
+    }
+
+    /// Change the note behind box `id`, if it is one. Returns whether it was.
+    fn change_note_box(
+        &mut self,
+        id: u64,
+        change: impl FnOnce(&mut crate::sticky_notes::Note),
+    ) -> bool {
+        let Some(note_id) = self.note_box_ids.get(&id).cloned() else {
+            return false;
+        };
+        if let Some(note) = self.notes.update(&note_id, change) {
+            self.publish_note(&note);
+        }
+        true
+    }
+
+    /// Notes: Delete Note: the focused note, else the next from the caret.
+    fn delete_sticky_note_here(&mut self) {
+        let id = self
+            .editor
+            .comment_focus
+            .as_ref()
+            .map(|f| f.id)
+            .filter(|id| self.note_box_ids.contains_key(id))
+            .or_else(|| {
+                let file = self.note_file_key()?;
+                let lines = &self.editor.lines;
+                self.notes
+                    .on_file(&file)
+                    .map(|n| (n.place(lines), Self::note_box_id(&n.id)))
+                    .filter(|(row, _)| *row >= self.editor.cursor_row)
+                    .min()
+                    .map(|(_, id)| id)
+            });
+        match id {
+            Some(id) if self.change_note_box(id, |n| n.deleted = true) => {
+                self.status = String::from("Note deleted");
+            }
+            _ => self.status = String::from("No note here"),
         }
     }
 
@@ -24864,6 +25062,12 @@ impl App {
                     self.review_pending.clear();
                     // Exported navigator notes now live on GitHub; reload
                     // shows them there, as threads, rather than twice.
+                    // Exported sticky notes are settled: resolved for everyone.
+                    for id in std::mem::take(&mut self.review_exported_sticky) {
+                        if let Some(n) = self.notes.update(&id, |n| n.resolved = true) {
+                            self.publish_note(&n);
+                        }
+                    }
                     let exported = std::mem::take(&mut self.review_exported_notes);
                     if !exported.is_empty() {
                         for id in &exported {
@@ -24911,6 +25115,12 @@ impl App {
     /// from the local snapshot (the next poll would resurrect it otherwise
     /// only if the pilot still had it).
     fn ignore_comment_box(&mut self, id: u64) {
+        // A note's ✕ resolves it (and a resolved note's reopens it): notes
+        // are shared, so dismissing one is a decision for everyone.
+        if self.change_note_box(id, |n| n.resolved = !n.resolved) {
+            self.status = String::from("Note resolved or reopened");
+            return;
+        }
         if let Some(host) = &self.pair_host {
             host.remove_note(id);
         }
@@ -24989,6 +25199,17 @@ impl App {
                     .iter()
                     .map(|t| (t.id, t.box_line(lines), t.body.clone())),
             );
+        }
+        // Unresolved sticky notes (#367) too: F4 is how they are walked.
+        if let Some(file) = self.note_file_key() {
+            let lines = &self.editor.lines;
+            notes.extend(
+                self.notes
+                    .on_file(&file)
+                    .filter(|n| !n.resolved)
+                    .map(|n| (Self::note_box_id(&n.id), n.place(lines), n.body.clone())),
+            );
+            notes.sort_by_key(|(_, row, _)| *row);
         }
         if notes.is_empty() {
             return None;
@@ -25248,7 +25469,13 @@ impl App {
             }
             self.last_collab_connect = Some(std::time::Instant::now());
             match CollabChannel::connect(&socket, role) {
-                Some(ch) => self.collab = Some(CollabSession::new(ch, collab_display_name())),
+                Some(ch) => {
+                    let mut session = CollabSession::new(ch, collab_display_name());
+                    if session.role == CollabRole::Guest {
+                        session.send_notes_request();
+                    }
+                    self.collab = Some(session);
+                }
                 None => return mirrored,
             }
         }
@@ -25393,6 +25620,16 @@ impl App {
                 // The cancel request is for the streaming pilot, not for
                 // viewers; the badge clears via StreamState(inactive).
                 CollabEvent::StreamCancel => {}
+                CollabEvent::Note(note) => {
+                    if self.notes.merge(note) {
+                        self.save_notes(Some(&session));
+                    }
+                }
+                CollabEvent::NotesRequested => {
+                    for note in self.notes.all().to_vec() {
+                        session.send_note(&note);
+                    }
+                }
             }
         }
 
@@ -27515,6 +27752,23 @@ impl App {
                 notes.push(*id);
             }
         }
+        // Unresolved sticky notes (#367), each with its author and replies.
+        let mut exported_notes = Vec::new();
+        for n in self.notes.live().filter(|n| !n.resolved) {
+            let Some(rel) = repo_relative(&repo_root, &self.tree.root.join(&n.file)) else {
+                continue;
+            };
+            let lines = std::fs::read_to_string(self.tree.root.join(&n.file))
+                .map(|t| t.lines().map(str::to_string).collect::<Vec<_>>())
+                .unwrap_or_default();
+            comments.push(crate::review_threads::PendingComment {
+                path: rel,
+                line: n.place(&lines),
+                body: format!("{}: {}", n.author, n.text()),
+            });
+            exported_notes.push(n.id.clone());
+        }
+        self.review_export_sticky = exported_notes;
         if comments.is_empty() {
             self.status = String::from("No comments to export");
             return;
@@ -27585,6 +27839,7 @@ impl App {
             return;
         };
         self.review_exported_notes = notes;
+        self.review_exported_sticky = std::mem::take(&mut self.review_export_sticky);
         crate::review_ops::spawn(
             self.review_gh.clone(),
             root,
@@ -37195,6 +37450,8 @@ impl App {
             Cmd::ReviewSubmit => self.open_review_submit(),
             Cmd::ReviewToggleResolved => self.toggle_review_thread_resolved(),
             Cmd::ExportCommentsToPr => self.open_export_comments(),
+            Cmd::NoteAdd => self.open_sticky_note_prompt(),
+            Cmd::NoteDelete => self.delete_sticky_note_here(),
             Cmd::ReviewDiscardPending => {
                 let n = self.review_pending.len();
                 self.review_pending.clear();
@@ -48296,6 +48553,11 @@ impl App {
                 let (body, rel) = (prompt.buffer.trim().to_string(), prompt.target_dir.clone());
                 self.prompt = None;
                 self.add_pending_review_comment(&body, rel);
+            }
+            PromptKind::StickyNote => {
+                let body = prompt.buffer.trim().to_string();
+                self.prompt = None;
+                self.add_sticky_note(&body);
             }
             PromptKind::ReviewSummary => {
                 let summary = prompt.buffer.trim().to_string();

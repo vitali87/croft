@@ -527,6 +527,13 @@ pub enum CollabMsg {
     /// design: at most one stream runs per relay (one pilot seat), so there
     /// is nothing to address.
     StreamCancel {},
+    /// A sticky note (#367) was added or changed. Peers keep the newest
+    /// revision of each note; older peers drop the variant in `drain`.
+    Note {
+        note: crate::sticky_notes::Note,
+    },
+    /// A joiner asks the owner for every note in the workspace.
+    NotesRequest {},
 }
 
 impl CollabMsg {
@@ -877,6 +884,10 @@ pub enum CollabEvent {
     },
     /// A participant asked the streaming pilot to stop and revert.
     StreamCancel,
+    /// A peer's copy of a sticky note (#367).
+    Note(crate::sticky_notes::Note),
+    /// A joiner wants every note; the owner answers with [`Self::Note`]s.
+    NotesRequested,
 }
 
 /// One participant's collab state machine: per-file replicated documents
@@ -1089,6 +1100,16 @@ impl CollabSession {
         });
     }
 
+    /// Broadcast a sticky note's current copy (#367).
+    pub fn send_note(&mut self, note: &crate::sticky_notes::Note) {
+        self.channel.send(&CollabMsg::Note { note: note.clone() });
+    }
+
+    /// Ask the owner for every sticky note (a guest, on joining).
+    pub fn send_notes_request(&mut self) {
+        self.channel.send(&CollabMsg::NotesRequest {});
+    }
+
     /// Ask whoever is streaming on this relay to stop and revert.
     // Callers land with the cancel affordances (follow-up slice).
     #[allow(dead_code)]
@@ -1218,6 +1239,12 @@ impl CollabSession {
                     active,
                 }),
                 CollabMsg::StreamCancel {} => events.push(CollabEvent::StreamCancel),
+                CollabMsg::Note { note } => events.push(CollabEvent::Note(note)),
+                CollabMsg::NotesRequest {} => {
+                    if self.role == CollabRole::Owner {
+                        events.push(CollabEvent::NotesRequested);
+                    }
+                }
             }
         }
         // Give up on bootstraps nobody answered (no owner running).
@@ -1978,6 +2005,35 @@ mod tests {
         assert!(oe.iter().any(
             |e| matches!(e, CollabEvent::Caret { row: 0, col: 5, name, .. } if name == "guest")
         ));
+    }
+
+    /// Sticky notes (#367) travel between sessions, and a joiner's request
+    /// reaches only the owner.
+    #[test]
+    fn collab_sessions_carry_sticky_notes_and_the_joiners_request() {
+        let (_dir, mut owner, mut guest) = session_pair();
+        let mut notes = crate::sticky_notes::Notes::default();
+        let note = notes.add("guest", "src/f.rs", 2, "let x = 1;", "why 1?");
+        guest.send_note(&note);
+        guest.send_notes_request();
+        let (oe, _) = pump(&mut owner, &mut guest, "unused", |oe, _| {
+            oe.iter().any(|e| matches!(e, CollabEvent::Note(_)))
+                && oe.iter().any(|e| matches!(e, CollabEvent::NotesRequested))
+        });
+        assert!(
+            oe.iter()
+                .any(|e| matches!(e, CollabEvent::Note(n) if n == &note))
+        );
+
+        owner.send_notes_request();
+        owner.send_note(&note);
+        let (_, ge) = pump(&mut owner, &mut guest, "unused", |_, ge| {
+            ge.iter().any(|e| matches!(e, CollabEvent::Note(_)))
+        });
+        assert!(
+            !ge.iter().any(|e| matches!(e, CollabEvent::NotesRequested)),
+            "only the owner answers for the notes"
+        );
     }
 
     /// Stream state and cancel travel between sessions without any doc being
