@@ -8317,6 +8317,15 @@ impl Editor {
         self.save_seq = self.save_seq.wrapping_add(1);
     }
 
+    /// Record that the file was rewritten on disk under this buffer, so the
+    /// next FS-sync sweep or save treats it as an external change even after
+    /// a move re-anchors the tab to the new path.
+    pub fn mark_disk_stale(&mut self) {
+        if self.disk_stamp.is_some() {
+            self.disk_stamp = Some(DISK_STALE);
+        }
+    }
+
     /// True when the file on disk no longer matches the (mtime, len) we last
     /// loaded or saved — i.e. some other process wrote it. A file with no
     /// recorded stamp (blank buffer, or never synced) is treated as
@@ -14155,6 +14164,10 @@ pub struct Crumb {
 /// A rendered breadcrumb crumb's hit-test span: `(x_start, width, jump target)`.
 type BreadcrumbRange = (u16, u16, Option<(u32, u32)>);
 
+/// The disk stamp of a buffer whose file was rewritten under it: it matches
+/// no real (mtime, len), so the buffer reads as changed on disk.
+const DISK_STALE: (SystemTime, u64) = (SystemTime::UNIX_EPOCH, u64::MAX);
+
 pub struct EditorTabs {
     pub editors: Vec<Editor>,
     active: usize,
@@ -14360,8 +14373,11 @@ impl EditorTabs {
                 }
                 // Re-anchor the disk stamp to the new path so the rename
                 // isn't mistaken for an external content change on the next
-                // FS-sync sweep.
-                e.mark_synced_with_disk();
+                // FS-sync sweep. A buffer whose file was rewritten under it
+                // stays stale, so the sweep still reports that write.
+                if e.disk_stamp != Some(DISK_STALE) {
+                    e.mark_synced_with_disk();
+                }
             }
         }
     }
@@ -14607,6 +14623,34 @@ impl EditorTabs {
     ) -> Option<usize> {
         let idx = self.find_tab_with_path(path)?;
         Some(self.editors[idx].apply_span_edits(edits))
+    }
+
+    /// [`Self::apply_rename_to_open_tab`], but only to a tab `in_sync` accepts,
+    /// i.e. one holding the text the server computed the edits against.
+    pub fn apply_rename_to_open_tab_where(
+        &mut self,
+        path: &Path,
+        edits: &[TextSpanEdit],
+        in_sync: impl Fn(&Editor) -> bool,
+    ) -> Option<usize> {
+        let idx = self.find_tab_matching(path, in_sync)?;
+        Some(self.editors[idx].apply_span_edits(edits))
+    }
+
+    /// The lines of the tab holding `path`, if one does.
+    pub fn open_tab_lines(&self, path: &Path) -> Option<Vec<String>> {
+        let idx = self.find_tab_with_path(path)?;
+        Some(self.editors[idx].lines.clone())
+    }
+
+    /// Mark every tab holding `path` as out of sync with a disk write made
+    /// under it (see [`Editor::mark_disk_stale`]).
+    pub fn mark_disk_stale(&mut self, path: &Path) {
+        while let Some(idx) =
+            self.find_tab_matching(path, |e| e.disk_stamp.is_some_and(|s| s != DISK_STALE))
+        {
+            self.editors[idx].mark_disk_stale();
+        }
     }
 
     fn find_tab_matching(&self, target: &Path, extra: impl Fn(&Editor) -> bool) -> Option<usize> {

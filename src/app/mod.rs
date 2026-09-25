@@ -11658,8 +11658,9 @@ impl App {
     }
 
     /// Apply an LSP rename `WorkspaceEdit` (already normalised to per-file
-    /// char-indexed spans). Open tabs are edited in-memory as one undo step
-    /// and left dirty; closed files are rewritten on disk (the fs watcher
+    /// char-indexed spans). Open tabs, in every split group, are edited
+    /// in-memory as one undo step and left dirty when they hold the text the
+    /// server saw; other files are rewritten on disk (the fs watcher
     /// refreshes the tree). Returns (files touched, occurrences replaced).
     fn apply_rename_edits(
         &mut self,
@@ -11671,12 +11672,19 @@ impl App {
             if edits.is_empty() {
                 continue;
             }
-            // Every group holding the file gets the edit: a tab open only in
-            // an inactive group would otherwise keep its old text over a
-            // disk write, and a move re-anchors it to that write (#610).
+            // The server computed the edits against the active group's
+            // buffer when that group holds the file (sync_lsp sends only its
+            // tabs), else against the disk. A tab in an inactive group gets
+            // them only when it holds that same text; a diverged copy would
+            // have them land on the wrong characters (#610).
+            let server_text = self.editor.open_tab_lines(path);
             let mut applied = self.editor.apply_rename_to_open_tab(path, edits);
+            let in_sync = |e: &crate::widgets::editor::Editor| match &server_text {
+                Some(lines) => e.lines == *lines,
+                None => !e.dirty && !e.disk_changed_externally(),
+            };
             for group in self.editor_layout.inactive_groups_mut() {
-                if let Some(n) = group.apply_rename_to_open_tab(path, edits) {
+                if let Some(n) = group.apply_rename_to_open_tab_where(path, edits, in_sync) {
                     applied.get_or_insert(n);
                 }
             }
@@ -11692,6 +11700,12 @@ impl App {
                 let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
                 occ_count += crate::widgets::editor::apply_span_edits_to_lines(&mut lines, edits);
                 std::fs::write(path, lines.join("\n"))?;
+                // A diverged copy in an inactive group keeps its text; it must
+                // still see this write as an external change, even after a
+                // move re-anchors it to the new path.
+                for group in self.editor_layout.inactive_groups_mut() {
+                    group.mark_disk_stale(path);
+                }
             }
             file_count += 1;
         }
@@ -31473,14 +31487,14 @@ impl App {
     /// (matching the user's Finder-drop expectation), not copied — they
     /// disappear from the source location and re-appear in the explorer.
     /// A drop that includes a path already inside the workspace is an
-    /// Explorer move, so it takes the cut-paste route: language servers
-    /// update references and open tabs follow (#610).
+    /// Explorer move, so the whole drop takes the cut-paste route and its
+    /// status reads "Moved": language servers update references and open
+    /// tabs follow (#610).
     fn import_paths_into_explorer(&mut self, paths: &[PathBuf]) {
         let dest_dir = self.paste_target_dir();
-        let root = self.tree.root.clone();
         if paths
             .iter()
-            .any(|p| p.starts_with(&root) || self.tree.root_paths().any(|r| p.starts_with(r)))
+            .any(|p| self.tree.root_paths().any(|r| p.starts_with(r)))
         {
             self.apply_paste_or_drop(&dest_dir, paths, ExplorerClipMode::Cut);
             return;

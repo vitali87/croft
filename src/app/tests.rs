@@ -49797,6 +49797,121 @@ fn a_finder_drop_of_a_workspace_path_is_held_for_the_servers() {
     app.import_paths_into_explorer(std::slice::from_ref(&baz));
     assert!(app.pending_file_move.is_some(), "the drop is held");
     assert!(baz.exists(), "nothing moves before the answer");
+    let request_id = app.pending_file_move.as_ref().unwrap().request_id;
+    app.lsp.as_ref().unwrap().answer_will_rename_files(
+        crate::lsp::manager::WillRenameFilesResult {
+            request_id,
+            edits: Vec::new(),
+        },
+    );
+    assert!(app.drain_will_rename_files());
+    let dest = app.paste_target_dir().join("baz.rs");
+    assert!(!baz.exists() && dest.exists(), "the drop moved it");
+    assert_eq!(
+        app.lsp.as_ref().unwrap().did_rename_log,
+        vec![vec![crate::lsp::manager::FileRename {
+            old: baz.clone(),
+            new: dest,
+            is_dir: false,
+        }]]
+    );
+}
+
+/// #610: a Finder drop mixing an outside file with a workspace path moves
+/// both, as one Explorer move held for the servers.
+#[test]
+fn a_mixed_finder_drop_moves_the_outside_file_and_the_workspace_path() {
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    let sub = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let baz = sub.join("baz.rs");
+    std::fs::write(&baz, "").unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("ext.txt");
+    std::fs::write(&outside, "x").unwrap();
+    app.import_paths_into_explorer(&[outside.clone(), baz.clone()]);
+    let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+    app.lsp.as_ref().unwrap().answer_will_rename_files(
+        crate::lsp::manager::WillRenameFilesResult {
+            request_id,
+            edits: Vec::new(),
+        },
+    );
+    assert!(app.drain_will_rename_files());
+    let dest = app.paste_target_dir();
+    assert!(!outside.exists() && dest.join("ext.txt").exists());
+    assert!(!baz.exists() && dest.join("baz.rs").exists());
+    assert!(app.status.starts_with("Moved 2 item"), "{}", app.status);
+}
+
+/// #610: with the same file split into two groups whose texts diverged, the
+/// servers' edit lands only on the active copy it was computed against.
+#[test]
+fn a_rename_edit_skips_a_diverged_copy_in_another_group() {
+    let (_tmp, _lib, foo, mut app) = will_rename_fixture();
+    std::fs::write(&foo, "pub fn f() {}\npub fn k() {}\n").unwrap();
+    app.editor.open_pinned(&foo).unwrap();
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    app.editor.lines.insert(0, String::from("// x"));
+    app.editor.dirty = true;
+    let edit = crate::widgets::editor::TextSpanEdit {
+        start: (1, 7),
+        end: (1, 8),
+        new_text: String::from("g"),
+    };
+    app.apply_rename_edits(&[(foo.clone(), vec![edit])])
+        .unwrap();
+    assert_eq!(app.editor.lines[1], "pub fn g() {}");
+    let groups = app.editor_layout.inactive_groups();
+    let other = groups[0]
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(foo.as_path()))
+        .unwrap();
+    assert_eq!(other.lines[..2], ["pub fn f() {}", "pub fn k() {}"]);
+}
+
+/// #610: a dirty, diverged tab open only in an inactive group keeps its
+/// text while the edit goes to disk, and still reads the write as external
+/// after the move repoints it.
+#[test]
+fn a_rename_edit_under_a_dirty_inactive_tab_stays_an_external_change() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    app.editor.open_pinned(&foo).unwrap();
+    app.editor.open_pinned(&lib).unwrap();
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    {
+        let mut groups = app.editor_layout.inactive_groups_mut();
+        let tab = groups[0]
+            .editors
+            .iter_mut()
+            .find(|e| e.path.as_deref() == Some(foo.as_path()))
+            .unwrap();
+        tab.lines.insert(0, String::from("// x"));
+        tab.dirty = true;
+    }
+    let edit = crate::widgets::editor::TextSpanEdit {
+        start: (0, 7),
+        end: (0, 8),
+        new_text: String::from("g"),
+    };
+    app.apply_rename_edits(&[(foo.clone(), vec![edit])])
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&foo).unwrap(), "pub fn g() {}\n");
+    let bar = foo.with_file_name("bar.rs");
+    std::fs::rename(&foo, &bar).unwrap();
+    let mut groups = app.editor_layout.inactive_groups_mut();
+    groups[0].rename_open_path(&foo, &bar);
+    let tab = groups[0]
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(bar.as_path()))
+        .unwrap();
+    assert_eq!(tab.lines[..2], ["// x", "pub fn f() {}"]);
+    assert!(
+        tab.disk_changed_externally(),
+        "the write under the tab is not re-anchored away"
+    );
 }
 
 /// #610: Esc stops waiting, the held move goes ahead without an edit, and a
