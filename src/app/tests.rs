@@ -43848,11 +43848,11 @@ fn one_symbols_tabs_in_two_groups_keep_a_single_file_tab() {
     assert!(app.status.contains("whole file"), "{}", app.status);
 }
 
-/// Opens `impl S` and `fn m` as symbol tabs, closes the file tab, sends
-/// `keys` to the impl tab with the caret at row 1, `col` (they must make m
-/// go), then presses undo once in the impl tab or in the m tab (by then the
-/// file's tab); hands back the line undo left.
-fn undo_once_after_m_goes(col: usize, keys: &[KeyCode], in_kept: bool) -> String {
+/// Opens `impl S` and `fn m` as symbol tabs, closes the file tab, deletes
+/// m's line from the impl tab one Backspace at a time (m goes on the last
+/// one), then presses undo once in the impl tab or in the m tab (by then
+/// the file's tab); hands back the line undo left.
+fn undo_once_after_m_goes(in_kept: bool) -> String {
     fn tab(app: &App, name: &str) -> Option<usize> {
         app.editor
             .editors
@@ -43881,10 +43881,11 @@ fn undo_once_after_m_goes(col: usize, keys: &[KeyCode], in_kept: bool) -> String
     let imp = tab(&app, "S").expect("the impl tab");
     app.editor.select(imp);
     app.editor.cursor_row = 1;
-    app.editor.cursor_col = col;
+    app.editor.cursor_col = 13;
     app.focus_pane(Pane::Editor);
-    for &k in keys {
-        app.handle_key(key(k, KeyModifiers::NONE)).unwrap();
+    for _ in 0..13 {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
     }
     assert!(tab(&app, "m").is_none(), "m is gone");
     let kept = app
@@ -43893,6 +43894,7 @@ fn undo_once_after_m_goes(col: usize, keys: &[KeyCode], in_kept: bool) -> String
         .iter()
         .position(|e| e.symbol_view.is_none())
         .expect("the m tab became the file tab");
+    assert_eq!(app.editor.editors[kept].lines[1], "");
     let at = if in_kept {
         kept
     } else {
@@ -43906,16 +43908,18 @@ fn undo_once_after_m_goes(col: usize, keys: &[KeyCode], in_kept: bool) -> String
 
 /// #369: a method's symbol tab kept as the file's tab while the impl tab's
 /// Backspaces delete the method keeps taking one undo step per Backspace,
-/// so one undo there walks back as far as it does in the impl tab.
+/// so one undo there walks back as far as it does in the impl tab. m goes
+/// on the last Backspace, in the pass that last mirrored it: the kept tab
+/// must stay a mirror member (its `mirror_seq` kept), or its undo is
+/// overwritten by the impl tab's text.
 #[test]
 fn a_kept_orphan_undoes_the_backspaces_that_deleted_its_symbol_like_its_sibling() {
-    let keys = [KeyCode::Backspace; 13];
-    let in_impl = undo_once_after_m_goes(13, &keys, false);
+    let in_impl = undo_once_after_m_goes(false);
     assert_ne!(
         in_impl, "",
         "undo in the impl tab restores part of the line"
     );
-    assert_eq!(undo_once_after_m_goes(13, &keys, true), in_impl);
+    assert_eq!(undo_once_after_m_goes(true), in_impl);
 }
 
 /// #369: a clean symbol tab whose symbol goes closes even with no file

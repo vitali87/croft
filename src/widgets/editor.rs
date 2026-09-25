@@ -15776,9 +15776,9 @@ fn tab_label(e: &Editor) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// #369: a symbol tab turned into its file's tab mid-burst keeps the
-    /// step it last mirrored, so the rest of the sibling's burst folds into
-    /// it rather than taking another undo step.
+    /// #369: a symbol tab turned into its file's tab keeps the step it
+    /// last mirrored, so should a sibling's undo step span the change, the
+    /// rest of it folds in rather than taking another undo step.
     #[test]
     fn dropping_the_symbol_clip_keeps_folding_the_siblings_burst() {
         let lines = |s: &[&str]| s.iter().map(|l| l.to_string()).collect::<Vec<_>>();
