@@ -541,23 +541,6 @@ fn push_variable_rows(
     }
 }
 
-/// The trust-on-first-use gate on a contributed command's MCP tool: an
-/// error naming the recovery when `fingerprint` differs from the one first
-/// recorded for `command_id` under `config_dir`.
-fn mcp_tool_trust(
-    config_dir: &Path,
-    command_id: &str,
-    tool: &str,
-    fingerprint: &str,
-) -> Result<(), String> {
-    if crate::prefs::trust_mcp_tool_in(config_dir, command_id, fingerprint) {
-        return Ok(());
-    }
-    Err(format!(
-        "refusing to run: the '{tool}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve"
-    ))
-}
-
 fn activity_explorer_y(bar: Rect) -> u16 {
     bar.y + 1
 }
@@ -19857,8 +19840,13 @@ impl App {
     /// Perform the confirmed uninstall (the popup's Enter path). Removes the
     /// catalog/index-installed manifest and refreshes the panel.
     fn perform_extension_uninstall(&mut self, id: &str) {
+        // Read before the manifest goes: a re-add of a newer version must
+        // approve its tools afresh, like its consent below.
+        let command_ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, id);
         match crate::mcp::catalog::uninstall_in(&self.config_dir.join("extensions"), id) {
             Ok(()) => {
+                let _ =
+                    crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &command_ids);
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
                 if self.disabled_extensions.remove(id) {
@@ -49441,6 +49429,23 @@ fn resolve_mcp_program(
             ));
         }
     }
+}
+
+/// The trust-on-first-use gate on a contributed command's MCP tool: an
+/// error naming the recovery when `fingerprint` differs from the one first
+/// recorded for `command_id` under `config_dir`.
+fn mcp_tool_trust(
+    config_dir: &Path,
+    command_id: &str,
+    tool: &str,
+    fingerprint: &str,
+) -> Result<(), String> {
+    if crate::prefs::trust_mcp_tool_in(config_dir, command_id, fingerprint) {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to run: the '{tool}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve"
+    ))
 }
 
 /// Run a resolved MCP command to completion on a worker thread: provision +

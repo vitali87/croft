@@ -49629,32 +49629,79 @@ title = "tfp: go"
 server = "srv"
 tool = "go"
 "#;
-    let (_scratch, croft) = scratch_config(&[("tfp", EXT)]);
+    let other = EXT.replace("tfp", "oth");
+    let (_scratch, croft) = scratch_config(&[("tfp", EXT), ("oth", &other)]);
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.config_dir = croft.clone();
     // The panel lists the real user dir; seat the scratch extension's row.
-    app.extensions
-        .set_items(crate::widgets::extensions::items_from_summaries(
-            crate::lsp::manifest::summaries(&[EXT]),
-            &app.disabled_extensions,
-        ));
+    // A toggle refreshes the panel from that dir, so re-seat before each.
+    let toggle_tfp = |app: &mut App| {
+        app.extensions
+            .set_items(crate::widgets::extensions::items_from_summaries(
+                crate::lsp::manifest::summaries(&[EXT]),
+                &app.disabled_extensions,
+            ));
+        let visible = app.extensions.visible_indices();
+        let pos = visible
+            .iter()
+            .position(|&i| app.extensions.items()[i].id == "tfp")
+            .expect("the tfp row is visible");
+        app.extensions.select(pos);
+        app.toggle_selected_extension();
+    };
     assert!(crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp1"));
-    assert!(crate::prefs::trust_mcp_tool_in(&croft, "other.go", "o1"));
-    let visible = app.extensions.visible_indices();
-    let pos = visible
-        .iter()
-        .position(|&i| app.extensions.items()[i].id == "tfp")
-        .expect("the tfp row is visible");
-    app.extensions.select(pos);
-    app.toggle_selected_extension();
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o1"));
+    toggle_tfp(&mut app);
     assert!(app.disabled_extensions.contains("tfp"), "{}", app.status);
     assert!(
         crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp2"),
         "the changed tool is approved afresh"
     );
     assert!(
-        !crate::prefs::trust_mcp_tool_in(&croft, "other.go", "o2"),
+        !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
+        "another extension's record stays"
+    );
+    // Turning it back on keeps the new record: a further change is refused.
+    toggle_tfp(&mut app);
+    assert!(!app.disabled_extensions.contains("tfp"), "{}", app.status);
+    assert!(!crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp3"));
+}
+
+/// Uninstalling an extension forgets its tools' fingerprints, so a re-added
+/// newer version approves its tools afresh instead of being refused.
+#[test]
+fn uninstalling_an_extension_forgets_its_tool_fingerprints() {
+    // Only a catalog entry uninstalls, so the fixture is the bundled Time
+    // sidecar beside a hand-added extension whose record must stay.
+    const TIME: &str = include_str!("../../assets/catalog/mcp-time/extension.toml");
+    const OTH: &str = r#"
+id = "oth"
+name = "oth"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/false"
+[[commands]]
+id = "oth.go"
+title = "oth: go"
+server = "srv"
+tool = "go"
+"#;
+    let (_scratch, croft) = scratch_config(&[("mcp-time", TIME), ("oth", OTH)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "time.now", "fp1"));
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o1"));
+    app.perform_extension_uninstall("mcp-time");
+    assert!(app.status.starts_with("Uninstalled"), "{}", app.status);
+    assert!(
+        crate::prefs::trust_mcp_tool_in(&croft, "time.now", "fp2"),
+        "the re-added tool is approved afresh"
+    );
+    assert!(
+        !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
         "another extension's record stays"
     );
 }
