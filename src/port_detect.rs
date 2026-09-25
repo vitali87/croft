@@ -249,6 +249,10 @@ const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
 /// X: not responding") on the controlling tty of the process waiting on the
 /// mount: with croft's tty inherited, that text lands on top of the UI. With
 /// no controlling tty the notice goes to the system log only.
+///
+/// The null stdin only states intent (`.output()` already gives one); the
+/// session is the fix. A pre-exec hook takes std off `posix_spawn` and onto a
+/// full `fork`, a cost paid per probe on the poll thread, never the UI thread.
 fn probe(program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.stdin(std::process::Stdio::null());
@@ -361,7 +365,7 @@ fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
     Some(parse_lsof(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Parse `lsof -nP -iTCP -sTCP:LISTEN` rows. Field 0 is the command; the NAME
+/// Parse `lsof` rows from a [`LSOF_LISTEN_ARGS`] scan. Field 0 is the command; the NAME
 /// column (`*:3000`, `127.0.0.1:3000`) is followed by a `(LISTEN)` token, so we
 /// scan the row for the first field that parses as a loopback/wildcard address.
 fn parse_lsof(text: &str) -> Vec<PortHit> {
@@ -461,14 +465,36 @@ mod tests {
     /// seconds, so it must own no tty: it leads its own session.
     #[test]
     fn a_socket_probe_runs_in_its_own_session() {
-        let out = probe("sh")
-            .args(["-c", "echo $$ $(ps -o sid= -p $$)"])
+        // Asked of the kernel, not of `ps`, whose session keyword differs
+        // between Linux (`sid`) and macOS (`sess`).
+        let mut child = probe("sleep").arg("5").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: getsid only reads the session id of a live pid.
+        let (sid, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(sid, pid, "the probe is not its own session leader");
+        assert_ne!(sid, ours, "the probe shares croft's session");
+    }
+
+    /// The `-b -w` scan still finds a listener: bind one and look for it.
+    /// Skipped where lsof is not installed.
+    #[test]
+    fn the_lsof_scan_still_finds_a_loopback_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let Ok(out) = probe("lsof")
+            .args(LSOF_LISTEN_ARGS)
+            .args(["-a", "-p", &std::process::id().to_string()])
             .output()
-            .unwrap();
+        else {
+            return;
+        };
         let text = String::from_utf8_lossy(&out.stdout);
-        let ids: Vec<&str> = text.split_whitespace().collect();
-        assert_eq!(ids.len(), 2, "{text:?}");
-        assert_eq!(ids[0], ids[1], "the probe is not its own session leader");
+        assert!(
+            parse_lsof(&text).iter().any(|h| h.port == port),
+            "port {port} missing from {text:?}"
+        );
     }
 
     /// `-b` keeps lsof off stat/lstat/readlink, which stall on an
