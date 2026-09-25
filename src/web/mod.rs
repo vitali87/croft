@@ -399,6 +399,12 @@ mod tests {
             }
         };
 
+        // The host broadcasts output only to clients it has registered, so
+        // the browser types only once the roster names the terminal client.
+        // Typing on its heels raced the terminal's hello, and the echo went
+        // out before the terminal was there to receive it.
+        browser.until(|s| texts(s).contains("\"term\""));
+
         // The browser attached first, so it holds control: its keystrokes
         // reach `cat`, and both clients see the echo.
         browser.send(0x2, b"from-the-browser\r");
