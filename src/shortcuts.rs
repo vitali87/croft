@@ -167,6 +167,23 @@ fn array_close(text: &str) -> Option<usize> {
     close
 }
 
+/// The last character of code before byte `end` of `text`, and its offset:
+/// whitespace and `//` comments are skipped, so a comment after a row
+/// never reads as the row's last token.
+fn last_code_char(text: &str, end: usize) -> Option<(usize, char)> {
+    let mut starts: Vec<usize> = vec![0];
+    starts.extend(text[..end].match_indices('\n').map(|(i, _)| i + 1));
+    for &start in starts.iter().rev() {
+        let line_end = text[start..end].find('\n').map_or(end, |i| start + i);
+        let line = &text[start..line_end];
+        let code = &line[..code_end(line)];
+        if let Some((i, c)) = code.char_indices().rev().find(|(_, c)| !c.is_whitespace()) {
+            return Some((start + i, c));
+        }
+    }
+    None
+}
+
 /// Where `line`'s code ends: the start of a `//` comment outside a string,
 /// else the line's length.
 fn code_end(line: &str) -> usize {
@@ -192,7 +209,7 @@ fn code_end(line: &str) -> usize {
 
 /// Whether `line` is a single-line row binding command `id`.
 fn is_row_for(line: &str, id: &str) -> bool {
-    let t = line.trim();
+    let t = line[..code_end(line)].trim();
     let t = t.strip_suffix(',').unwrap_or(t).trim_end();
     if !(t.starts_with('{') && t.ends_with('}')) {
         return false;
@@ -210,11 +227,10 @@ pub fn unbind(json: &str, id: &str) -> String {
         .split_inclusive('\n')
         .filter(|l| !is_row_for(l, id))
         .collect();
-    if let Some(close) = array_close(&kept) {
-        let at = kept[..close].trim_end().len();
-        if kept[..at].ends_with(',') {
-            kept.remove(at - 1);
-        }
+    if let Some(close) = array_close(&kept)
+        && let Some((i, ',')) = last_code_char(&kept, close)
+    {
+        kept.remove(i);
     }
     kept
 }
@@ -237,8 +253,10 @@ pub fn rebind(json: &str, id: &str, chord: &str) -> Result<String, String> {
         .collect();
     let close =
         array_close(&kept).ok_or_else(|| String::from("keybindings.json has no [ ... ] array"))?;
-    let at = kept[..close].trim_end().len();
-    let last = kept[..at].chars().last();
+    let (at, last) = match last_code_char(&kept, close) {
+        Some((i, c)) => (i + c.len_utf8(), Some(c)),
+        None => (kept[..close].trim_end().len(), None),
+    };
     let insert = match last {
         Some('[') | Some(',') => format!("\n  {row}"),
         Some(_) => format!(",\n  {row}"),
@@ -429,5 +447,42 @@ mod tests {
             vec![("f9".to_string(), "quick_open".to_string())],
             "the comma left by the removed last row goes: {out}"
         );
+    }
+
+    const COMMENTED: &str = "[\n  { \"key\": \"f9\", \"command\": \"quick_open\" }, // keep\n  { \"key\": \"f8\", \"command\": \"open_settings\" } // last\n]\n";
+
+    #[test]
+    fn rows_with_trailing_comments_are_found_by_unbind_and_rebind() {
+        let out = unbind(COMMENTED, "open_settings");
+        assert_eq!(
+            user_bindings(&out),
+            vec![("f9".to_string(), "quick_open".to_string())],
+            "{out}"
+        );
+        let out = rebind(COMMENTED, "open_settings", "ctrl+alt+o").unwrap();
+        assert_eq!(
+            user_bindings(&out),
+            vec![
+                ("f9".to_string(), "quick_open".to_string()),
+                ("ctrl+alt+o".to_string(), "open_settings".to_string())
+            ],
+            "the old binding goes, not kept alongside: {out}"
+        );
+    }
+
+    #[test]
+    fn edits_read_the_last_code_token_past_a_trailing_comment() {
+        // Removing the final row leaves "}, // keep": the comma must go.
+        let out = unbind(COMMENTED, "open_settings");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&crate::keymap::strip_line_comments(&out))
+                .is_ok(),
+            "{out}"
+        );
+        assert!(out.contains("// keep"), "the comment stays: {out}");
+        // Adding after "} // last": the comma goes after the brace.
+        let out = rebind(COMMENTED, "toggle_sidebar", "ctrl+alt+b").unwrap();
+        assert_eq!(user_bindings(&out).len(), 3, "{out}");
+        assert!(out.contains("// last"), "{out}");
     }
 }
