@@ -162,6 +162,8 @@ A **Testing** view (the beaker icon, or `Cmd`/`Ctrl`+`K` `B`) mirrors VS Code's 
 
 Each row's play glyph runs that test or suite (a green ▷ also marks test functions in the editor gutter, click it to run), clicking a test's name jumps to its source, Enter runs everything, and `Cmd`/`Ctrl`+`K` `Enter` runs the test under the editor caret. The beaker icon wears a red badge counting failures.
 
+**Watch mode.** Each row ends in an eye: click it to watch that test or suite, and the eye in the TESTING header (or `w`, or "Testing: Toggle Watch All Tests") watches everything. While a watch is on, saving any file under the runner's root reruns the watched scope about 300 ms later. A burst of saves reruns once, and a save made while another run is going waits for it. A rerun leaves the sidebar where it is. A watched run that turns red (from green or from never having run) raises the beaker's badge and names the failing test in the status line; "Testing: Go to First Failure" jumps to its source. A run that stays red or goes green says nothing. One scope is watched at a time: clicking another eye moves the watch, and clicking the lit one turns it off.
+
 ## Tasks
 
 Zero configuration: `Cmd`/`Ctrl`+`Shift`+`B` runs the project's build task, auto-detected from the manifests the repo already has (Makefile, justfile, package.json with the right lockfile runner, Cargo.toml, pyproject.toml, and `.vscode/tasks.json` when present). "Tasks: Run Task" in the palette lists everything discovered; each task runs in its own named terminal pane, and rerunning reuses that pane.

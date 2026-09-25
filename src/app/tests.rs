@@ -49559,3 +49559,84 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+/// Watch mode (#263) end to end through the App: the eye on a test's row
+/// watches it, a save anywhere under the runner's root reruns exactly that
+/// test once the debounce passes, without moving the sidebar, and a rerun
+/// that turns red says which test failed.
+#[test]
+fn watching_a_test_reruns_it_after_a_save_and_reports_it_turning_red() {
+    use crate::testing::model::{TestCase, TestStatus};
+    use crate::testing::watch::WatchScope;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let src = tmp.path().join("lib.rs");
+    std::fs::write(&src, "fn a() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for n in ["parse::a", "parse::b"] {
+        app.testing.apply_case(TestCase {
+            name: n.into(),
+            status: TestStatus::Passed,
+        });
+    }
+    app.set_sidebar_view(SidebarView::Testing);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Find parse::a's eye where it is drawn, and click it.
+    let area = app.testing.last_area;
+    let x = area.x + area.width - 3;
+    let y = (area.y..area.y + area.height)
+        .find(|&y| {
+            app.testing.hit_at(x, y)
+                == Some(crate::widgets::testing::RowHit::ToggleWatch(
+                    WatchScope::Test("parse::a".into()),
+                ))
+        })
+        .expect("parse::a has an eye");
+    assert_eq!(term.backend().buffer()[(x, y)].symbol(), "\u{ea70}");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.testing
+            .watch
+            .is_watching(&WatchScope::Test("parse::a".into()))
+    );
+
+    // The user goes back to the files and saves one.
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.editor.open(&src).unwrap();
+    app.editor.insert_char('x');
+    app.save();
+    assert!(!app.tick_test_watch(), "not before the debounce");
+    std::thread::sleep(crate::testing::watch::DEBOUNCE + std::time::Duration::from_millis(50));
+    assert!(app.tick_test_watch());
+    assert_eq!(app.testing.status_of("parse::a"), Some(TestStatus::Running));
+    assert_eq!(app.testing.status_of("parse::b"), Some(TestStatus::Passed));
+    assert_eq!(
+        app.sidebar_view,
+        SidebarView::Explorer,
+        "a rerun never moves the sidebar"
+    );
+
+    // The rerun ends red: the status says which test, once.
+    app.testing.apply_case(TestCase {
+        name: "parse::a".into(),
+        status: TestStatus::Failed,
+    });
+    app.testing.on_finished(Some(false));
+    app.tick_test_watch();
+    assert!(
+        app.status.contains("Watched tests failed: parse::a"),
+        "{}",
+        app.status
+    );
+}
