@@ -518,6 +518,7 @@ fn push_variable_rows(
     session: &crate::dap::session::DapSession,
     expanded: &std::collections::HashSet<i64>,
     vars: &[crate::dap::session::Variable],
+    parent: i64,
     indent: u8,
 ) {
     use crate::widgets::run_debug::{DebugRow, DebugRowKind};
@@ -528,6 +529,7 @@ fn push_variable_rows(
             indent,
             kind: DebugRowKind::Variable {
                 reference: v.variables_ref,
+                parent,
                 expandable,
                 expanded: is_open,
                 name: v.name.clone(),
@@ -536,7 +538,14 @@ fn push_variable_rows(
             },
         });
         if is_open && let Some(children) = session.variables.get(&v.variables_ref) {
-            push_variable_rows(rows, session, expanded, children, indent.saturating_add(1));
+            push_variable_rows(
+                rows,
+                session,
+                expanded,
+                children,
+                v.variables_ref,
+                indent.saturating_add(1),
+            );
         }
     }
 }
@@ -1241,6 +1250,11 @@ enum MenuAction {
     FixProblemWithNavigator {
         path: PathBuf,
         item: crate::widgets::problems::ProblemItem,
+    },
+    /// VARIABLES row: break when this variable changes (#611).
+    BreakOnValueChange {
+        parent: i64,
+        name: String,
     },
     /// Editor body: one level of the call hierarchy for the symbol at buffer
     /// `(row, col)` — callers when `incoming`, callees otherwise.
@@ -3450,6 +3464,10 @@ pub struct App {
     /// Cursor's temporary breakpoint while it is armed.
     function_breakpoints: Vec<String>,
     run_to_cursor: Option<(PathBuf, usize)>,
+    /// Data breakpoints (#611): each adapter data id and the variable name
+    /// it watches, sent to the focused session. Ids are only valid for the
+    /// session that issued them.
+    data_breakpoints: Vec<(String, String)>,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -5062,6 +5080,7 @@ impl App {
             debug_temp_breakpoint: None,
             function_breakpoints: Vec::new(),
             run_to_cursor: None,
+            data_breakpoints: Vec::new(),
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
             problems_fix_started: None,
@@ -20513,6 +20532,14 @@ impl App {
                     self.refresh_inline_values();
                     changed = true;
                 }
+                DapEvent::DataBreakpointInfo {
+                    name,
+                    data_id,
+                    description,
+                } => {
+                    self.apply_data_breakpoint_info(name, data_id, description);
+                    changed = true;
+                }
                 DapEvent::Stopped { reason, .. } => {
                     // Run to Cursor's breakpoint has done its job (#611).
                     self.disarm_run_to_cursor();
@@ -20729,7 +20756,14 @@ impl App {
                 },
             });
             if let Some(vars) = session.variables.get(&scope.variables_ref) {
-                push_variable_rows(&mut rows, session, &self.debug_expanded, vars, 2);
+                push_variable_rows(
+                    &mut rows,
+                    session,
+                    &self.debug_expanded,
+                    vars,
+                    scope.variables_ref,
+                    2,
+                );
             }
         }
         rows.push(DebugRow {
@@ -22196,6 +22230,61 @@ impl App {
         }
         self.function_breakpoints.push(name.clone());
         self.push_function_breakpoints(&format!("Function breakpoint on {name}"));
+    }
+
+    /// Ask the focused session whether `name` (in container `parent`) can be
+    /// watched (#611); [`Self::apply_data_breakpoint_info`] takes the answer.
+    fn request_data_breakpoint(&mut self, parent: i64, name: &str) {
+        let Some(session) = self.debug_sessions.focused_mut() else {
+            self.status = String::from("Break on Value Change: no debug session");
+            return;
+        };
+        if !session.capabilities.data_breakpoints {
+            self.status = String::from("This debugger does not support data breakpoints");
+            return;
+        }
+        session.request_data_breakpoint_info(parent, name);
+    }
+
+    /// The adapter's answer about watching `name`: add it to the set and
+    /// send the whole set, or say why it cannot be watched.
+    fn apply_data_breakpoint_info(
+        &mut self,
+        name: String,
+        data_id: Option<String>,
+        description: String,
+    ) {
+        let Some(id) = data_id else {
+            self.status = if description.is_empty() {
+                format!("{name} cannot be watched")
+            } else {
+                format!("{name} cannot be watched: {description}")
+            };
+            return;
+        };
+        if !self.data_breakpoints.iter().any(|(d, _)| *d == id) {
+            self.data_breakpoints.push((id, name.clone()));
+        }
+        self.push_data_breakpoints();
+        self.status = format!("Breaks when {name} changes");
+    }
+
+    /// Drop every data breakpoint.
+    fn clear_data_breakpoints(&mut self) {
+        self.data_breakpoints.clear();
+        self.push_data_breakpoints();
+        self.status = String::from("Data breakpoints removed");
+    }
+
+    fn push_data_breakpoints(&mut self) {
+        let ids: Vec<String> = self
+            .data_breakpoints
+            .iter()
+            .map(|(d, _)| d.clone())
+            .collect();
+        if let Some(session) = self.debug_sessions.focused_mut() {
+            session.update_data_breakpoints(&ids);
+        }
     }
 
     /// Drop every function breakpoint.
@@ -36167,6 +36256,7 @@ impl App {
             Cmd::AddFunctionBreakpoint => self.debug_add_function_breakpoint(),
             Cmd::RemoveFunctionBreakpoints => self.clear_function_breakpoints(),
             Cmd::DebugRunToCursor => self.debug_run_to_cursor(),
+            Cmd::RemoveDataBreakpoints => self.clear_data_breakpoints(),
             Cmd::StepOver => self.debug_step("next"),
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
@@ -39141,6 +39231,25 @@ impl App {
                 // wins over the editor pane it sits beside.
                 if rect_contains(self.minimap_img_rect, m.column, m.row) {
                     self.open_minimap_menu(m.column, m.row);
+                    return;
+                }
+                // A VARIABLES row: Break on Value Change (#611).
+                if self.sidebar_view == SidebarView::RunDebug
+                    && let Some(idx) = self.run_debug.debug_row_at(m.row)
+                    && let Some(crate::widgets::run_debug::DebugRowKind::Variable {
+                        parent,
+                        name,
+                        ..
+                    }) = self.run_debug.debug_rows.get(idx).map(|r| r.kind.clone())
+                {
+                    self.context_menu = Some(ContextMenu::flat(
+                        (m.column, m.row),
+                        vec![(
+                            String::from("Break on Value Change"),
+                            MenuAction::BreakOnValueChange { parent, name },
+                        )],
+                        self.tree.root.clone(),
+                    ));
                     return;
                 }
                 // A PROBLEMS diagnostic row: Fix with Navigator (#374).
@@ -43487,6 +43596,9 @@ impl App {
                 self.open_ask_navigator((start, end), selection);
             }
             MenuAction::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            MenuAction::BreakOnValueChange { parent, name } => {
+                self.request_data_breakpoint(parent, &name);
+            }
             MenuAction::FixProblemWithNavigator { path, item } => {
                 self.fix_problem_with_navigator(path, item, Vec::new());
             }

@@ -103,6 +103,9 @@ pub enum DebugRowKind {
     /// coloured by type.
     Variable {
         reference: i64,
+        /// The variables container this one lives in: what a data
+        /// breakpoint on it is asked against (#611).
+        parent: i64,
         expandable: bool,
         expanded: bool,
         name: String,
@@ -997,6 +1000,7 @@ mod tests {
                 indent: 2,
                 kind: DebugRowKind::Variable {
                     reference: 0,
+                    parent: 0,
                     expandable: false,
                     expanded: false,
                     name: "x".into(),
@@ -1008,6 +1012,7 @@ mod tests {
                 indent: 2,
                 kind: DebugRowKind::Variable {
                     reference: 9,
+                    parent: 0,
                     expandable: true,
                     expanded: false,
                     name: "obj".into(),

@@ -65,6 +65,13 @@ pub enum DapEvent {
         /// so a watch row can render `<not available>` instead of the error.
         success: bool,
     },
+    /// A `dataBreakpointInfo` answer (#611): the id to break on when `name`
+    /// changes, or `None` with the adapter's reason when it cannot be watched.
+    DataBreakpointInfo {
+        name: String,
+        data_id: Option<String>,
+        description: String,
+    },
 }
 
 /// One breakpoint's binding status as reported by the adapter: the source file,
@@ -379,6 +386,30 @@ impl Capabilities {
             data_breakpoints: flag("supportsDataBreakpoints"),
         }
     }
+}
+
+/// Build a `dataBreakpointInfo` request (#611): can `name`, inside the
+/// variables container `parent`, be watched for changes?
+pub fn data_breakpoint_info_request(parent: i64, name: &str) -> Value {
+    json!({
+        "type": "request",
+        "command": "dataBreakpointInfo",
+        "arguments": { "variablesReference": parent, "name": name }
+    })
+}
+
+/// Build a `setDataBreakpoints` request (#611): break when any of the data
+/// ids is written. The list replaces the adapter's whole set.
+pub fn set_data_breakpoints_request(data_ids: &[String]) -> Value {
+    let bps: Vec<Value> = data_ids
+        .iter()
+        .map(|id| json!({ "dataId": id, "accessType": "write" }))
+        .collect();
+    json!({
+        "type": "request",
+        "command": "setDataBreakpoints",
+        "arguments": { "breakpoints": bps }
+    })
 }
 
 /// Build a `setFunctionBreakpoints` request (#611): break when any of the
@@ -881,6 +912,9 @@ pub struct DapSession {
     /// In-flight `evaluate` requests: request `seq` -> (context, expression), so
     /// the response can be turned into an [`DapEvent::Evaluated`].
     pending_evals: std::collections::HashMap<i64, (String, String)>,
+    /// `dataBreakpointInfo` requests awaiting an answer, by seq: the name
+    /// asked about.
+    pending_data_info: std::collections::HashMap<i64, String>,
     /// Active exception-breakpoint filter ids (debugpy: `raised`, `uncaught`).
     /// Sent on `initialized` and whenever toggled. Defaults to `uncaught` so an
     /// unhandled exception pauses the debugger instead of silently exiting.
@@ -1007,6 +1041,7 @@ impl DapSession {
             selected_frame: None,
             pending_var_refs: std::collections::HashMap::new(),
             pending_evals: std::collections::HashMap::new(),
+            pending_data_info: std::collections::HashMap::new(),
             exception_filters: vec![String::from("uncaught")],
             known_thread: None,
         }
@@ -1044,6 +1079,22 @@ impl DapSession {
     /// Evaluate `expression` in the selected frame (or globally if no frame is
     /// selected). The result arrives on a later poll as [`DapEvent::Evaluated`].
     /// `context` is typically `repl` or `watch`.
+    /// Ask whether `name` in container `parent` can be watched (#611); the
+    /// answer arrives as [`DapEvent::DataBreakpointInfo`].
+    pub fn request_data_breakpoint_info(&mut self, parent: i64, name: &str) {
+        if let Ok(seq) = self
+            .active()
+            .send(data_breakpoint_info_request(parent, name))
+        {
+            self.pending_data_info.insert(seq, name.to_string());
+        }
+    }
+
+    /// Replace the data-breakpoint set (#611).
+    pub fn update_data_breakpoints(&mut self, data_ids: &[String]) {
+        let _ = self.active().send(set_data_breakpoints_request(data_ids));
+    }
+
     pub fn evaluate(&mut self, expression: &str, context: &str) {
         let req = evaluate_request(expression, self.selected_frame, context);
         if let Ok(seq) = self.active().send(req) {
@@ -1216,6 +1267,24 @@ impl DapSession {
                 // Only stdio adapters' reports drive the hollow rendering; for a
                 // js-debug session the guard fails and the arm falls through to
                 // the no-op `_` below.
+                Some("dataBreakpointInfo") => {
+                    let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                    if let Some(name) = req_seq.and_then(|s| self.pending_data_info.remove(&s)) {
+                        let body = msg.get("body").cloned().unwrap_or(Value::Null);
+                        out.push(DapEvent::DataBreakpointInfo {
+                            name,
+                            data_id: body
+                                .get("dataId")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            description: body
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        });
+                    }
+                }
                 Some("initialize") => {
                     if let Some(body) = msg.get("body") {
                         self.capabilities = Capabilities::from_initialize(body);
@@ -1294,7 +1363,8 @@ impl DapSession {
             DapEvent::Output { .. } => {}
             DapEvent::BreakpointsUpdated
             | DapEvent::InspectionUpdated
-            | DapEvent::Evaluated { .. } => {}
+            | DapEvent::Evaluated { .. }
+            | DapEvent::DataBreakpointInfo { .. } => {}
         }
         // Suppress the parent's own `terminated` for js-debug while a child is
         // still live (the parent can wind down its bootstrap connection first).
