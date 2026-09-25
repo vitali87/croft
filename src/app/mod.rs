@@ -50040,15 +50040,15 @@ fn collab_caret_color(navigator_sites: &[u64], site: u64) -> Color {
     }
 }
 
-/// The workspace-relative key a file replicates under in a collab session
-/// (docs/MULTIPLAYER.md, Phase D). None outside the workspace: only
-/// workspace files are shared.
 /// The tree-sitter grammar for `path`, by extension: what symbol tabs
 /// (#369) parse to re-find a renamed or displaced symbol.
 fn syntax_kind_of(path: &Path) -> Option<crate::highlight::LangKind> {
     crate::highlight::lang_for_extension(path.extension()?.to_str()?)
 }
 
+/// The workspace-relative key a file replicates under in a collab session
+/// (docs/MULTIPLAYER.md, Phase D). None outside the workspace: only
+/// workspace files are shared.
 fn collab_file_key(root: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(root)
         .ok()
