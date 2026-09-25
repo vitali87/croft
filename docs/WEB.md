@@ -1,7 +1,8 @@
 # croft web: a browser client for the session host
 
-Design RFC. Nothing here has shipped; this document exists to settle the
-protocol and the trust boundary before any listener code lands.
+Design RFC, now being built. The WebSocket transport (#341) has shipped; the
+page (#342) and TLS with remote access (#343) have not. What has shipped is
+described under [The transport](#the-transport), at the end.
 
 The session host already fans one inner croft out to N clients, enforces write
 control server-side, sizes everyone to the smallest window, and survives
@@ -240,3 +241,38 @@ not make.
 - IME, which needs a browser-side prototype rather than a reading of this tree.
 - Per-browser preventability of the contested chords above, which is platform
   behaviour and should be verified per browser rather than asserted here.
+
+## The transport
+
+`croft web [WORKSPACE] [--bind ADDR]` serves the running session of a
+workspace (the one `croft attach` started) over WebSocket. It is a bridge, not
+a second host: each WebSocket connection opens its own connection to the
+session host's Unix socket, so a browser tab is an ordinary participant. It
+has its own output queue, attaches read-only unless it is first or is granted
+control in `Session: Participants`, and leaves the roster when the tab closes,
+exactly as a terminal client that detaches.
+
+**Framing.** RFC 6455 over a hand-rolled HTTP/1.1 upgrade (`src/web/ws.rs`),
+no framework and no new crates. The host's frames map one to one:
+
+| Session host frame | WebSocket message |
+|---|---|
+| `Frame::Bytes` (PTY output, keystrokes) | binary |
+| `Frame::Control` (`hello`, `resize`, `presence`, ...) | text, the same `{"t": ...}` JSON |
+
+A client opens with a text `{"t":"hello","name":...,"cols":...,"rows":...}`,
+then sends keystrokes as binary messages and `resize` as text. A text message
+the host would not accept is dropped, as the host drops malformed control
+frames. Client frames must be masked; an unmasked frame, a message over 1 MiB,
+or non-UTF-8 text closes the connection.
+
+**Trust.** The session socket is owner-only (0600); a loopback port is open to
+every local user and to any page open in the user's browser, since WebSockets
+are not bound by CORS. So:
+
+- only loopback addresses are served (`--bind` may change the port or pick
+  another loopback address, never a routable one);
+- every connection must present the per-run token printed at start-up
+  (`ws://127.0.0.1:7681/?token=...`);
+- a request that carries an `Origin` (every browser does) must come from
+  croft web's own address.

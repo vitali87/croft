@@ -91,6 +91,7 @@ mod vim;
 mod voice;
 mod vscode_extensions;
 mod vscode_theme;
+mod web;
 mod widgets;
 mod workspace;
 mod zoxide;
