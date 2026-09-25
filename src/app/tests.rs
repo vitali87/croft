@@ -49570,6 +49570,280 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     app.debug_stop();
 }
 
+/// A fake debug adapter for #611: advertises function, hit-count and data
+/// breakpoints, logs every request it receives (one JSON per line, to
+/// argv[1]), and reports `stopped` after `configurationDone` and after each
+/// `continue`. One frame, one scope (reference 7) holding `x` and `y`; `x`
+/// can be watched, `y` cannot.
+const FAKE_DAP_611: &str = r#"
+import json, sys
+log = open(sys.argv[1], "a")
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length)) if length else None
+seq = 1000
+def send(obj):
+    global seq
+    obj["seq"] = seq
+    seq += 1
+    body = json.dumps(obj).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+while True:
+    msg = read()
+    if msg is None:
+        break
+    log.write(json.dumps(msg) + "\n")
+    log.flush()
+    if msg.get("type") != "request":
+        continue
+    cmd = msg["command"]
+    body = {}
+    if cmd == "initialize":
+        body = {"supportsFunctionBreakpoints": True, "supportsHitConditionalBreakpoints": True, "supportsDataBreakpoints": True}
+    elif cmd == "setBreakpoints":
+        body = {"breakpoints": [{"verified": True, "line": b["line"]} for b in msg["arguments"]["breakpoints"]]}
+    elif cmd == "threads":
+        body = {"threads": [{"id": 1, "name": "main"}]}
+    elif cmd == "stackTrace":
+        body = {"stackFrames": [{"id": 1, "name": "main", "line": 1}], "totalFrames": 1}
+    elif cmd == "scopes":
+        body = {"scopes": [{"name": "Locals", "variablesReference": 7}]}
+    elif cmd == "variables":
+        body = {"variables": [{"name": "x", "value": "1", "variablesReference": 0}, {"name": "y", "value": "2", "variablesReference": 0}]}
+    elif cmd == "dataBreakpointInfo":
+        a = msg["arguments"]
+        if a["name"] == "x":
+            body = {"dataId": "x@%d" % a["variablesReference"], "description": "x"}
+        else:
+            body = {"dataId": None, "description": "y is a constant"}
+    send({"type": "response", "request_seq": msg["seq"], "success": True, "command": cmd, "body": body})
+    if cmd == "launch":
+        send({"type": "event", "event": "initialized"})
+    if cmd in ("configurationDone", "continue"):
+        send({"type": "event", "event": "stopped", "body": {"reason": "breakpoint", "threadId": 1}})
+"#;
+
+/// #611 data breakpoints over the real wire: right-clicking a VARIABLES row
+/// offers Break on Value Change; choosing it asks the adapter about that
+/// variable in its own container, and the data id it returns is sent in
+/// `setDataBreakpoints`. A variable the adapter cannot watch sends nothing
+/// and says why; Remove All Data Breakpoints sends an empty set.
+#[test]
+fn break_on_value_change_reaches_the_adapter_from_a_variables_row() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    if std::process::Command::new("python3")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIPPED: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("fake_dap.py");
+    std::fs::write(&script, FAKE_DAP_611).unwrap();
+    let log = tmp.path().join("requests.log");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let session = crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[script.display().to_string(), log.display().to_string()],
+        tmp.path(),
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("the fake adapter starts");
+    app.debug_sessions.push("fake", session);
+    app.set_sidebar_view(SidebarView::RunDebug);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    let requests = |cmd: &str| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|m| m["command"] == cmd)
+            .collect()
+    };
+    let variable_row = |app: &App, want: &str| {
+        app.run_debug.debug_rows.iter().position(|r| {
+            matches!(&r.kind, crate::widgets::run_debug::DebugRowKind::Variable { name, .. } if name == want)
+        })
+    };
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while variable_row(&app, "y").is_none() {
+        assert!(std::time::Instant::now() < end, "variables never arrived");
+        app.poll_dap();
+        term.draw(|f| app.render(f)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    term.draw(|f| app.render(f)).unwrap();
+    let screen_row = |app: &App, idx: usize| {
+        app.run_debug.last_debug_row_y0 + (idx - app.run_debug.debug_scroll) as u16
+    };
+    let choose = |app: &mut App, want: &str| {
+        let idx = variable_row(app, want).unwrap();
+        let y = screen_row(app, idx);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 4, y));
+        let menu = app.context_menu.as_ref().expect("a menu opened");
+        assert_eq!(menu_labels(&menu.items), vec!["Break on Value Change"]);
+        app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    };
+    let wait = |app: &mut App, cmd: &str, n: usize| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.poll_dap();
+            let got = requests(cmd);
+            if got.len() >= n {
+                return got;
+            }
+            assert!(std::time::Instant::now() < end, "no {cmd} #{n}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+
+    choose(&mut app, "x");
+    let info = wait(&mut app, "dataBreakpointInfo", 1);
+    assert_eq!(info[0]["arguments"]["name"], "x");
+    assert_eq!(info[0]["arguments"]["variablesReference"], 7);
+    let set = wait(&mut app, "setDataBreakpoints", 1);
+    assert_eq!(
+        set[0]["arguments"]["breakpoints"],
+        serde_json::json!([{"dataId": "x@7", "accessType": "write"}])
+    );
+    assert!(app.status.contains("x changes"), "{}", app.status);
+
+    // A variable the adapter cannot watch: asked about, nothing sent.
+    choose(&mut app, "y");
+    wait(&mut app, "dataBreakpointInfo", 2);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.status.contains("y is a constant") {
+        assert!(std::time::Instant::now() < end, "{}", app.status);
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(requests("setDataBreakpoints").len(), 1);
+    assert_eq!(app.data_breakpoints.len(), 1);
+
+    app.run_command(crate::widgets::command_palette::Command::RemoveDataBreakpoints);
+    let set = wait(&mut app, "setDataBreakpoints", 2);
+    assert_eq!(set[1]["arguments"]["breakpoints"], serde_json::json!([]));
+    assert!(app.data_breakpoints.is_empty());
+}
+
+/// #611 over the real wire, against the fake adapter: a function breakpoint
+/// and a hit count reach the adapter, and Run to Cursor adds its line,
+/// continues, and takes the line away again at the next stop.
+#[test]
+fn function_breakpoints_hit_counts_and_run_to_cursor_reach_the_adapter() {
+    if std::process::Command::new("python3")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIPPED: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("prog.py");
+    std::fs::write(
+        &src,
+        (1..=10)
+            .map(|i| format!("x{i} = {i}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let script = tmp.path().join("fake_dap.py");
+    std::fs::write(&script, FAKE_DAP_611).unwrap();
+    let log = tmp.path().join("requests.log");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&src).unwrap();
+    let session = crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[script.display().to_string(), log.display().to_string()],
+        tmp.path(),
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("the fake adapter starts");
+    app.debug_sessions.push("fake", session);
+    let wait_for = |app: &mut App, what: &dyn Fn(&str) -> bool| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.poll_dap();
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if what(&text) {
+                return text;
+            }
+            assert!(std::time::Instant::now() < end, "timed out; log:\n{text}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let paused = |app: &mut App| {
+        app.debug_sessions
+            .focused_mut()
+            .is_some_and(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
+    };
+    wait_for(&mut app, &|t| t.contains("\"configurationDone\""));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !paused(&mut app) {
+        assert!(std::time::Instant::now() < end, "never paused");
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    app.add_function_breakpoint(String::from("main"));
+    let text = wait_for(&mut app, &|t| t.contains("setFunctionBreakpoints"));
+    assert!(text.contains("\"name\": \"main\""), "{text}");
+
+    app.commit_breakpoint_hit_count(src.clone(), 3, ">= 5");
+    let text = wait_for(&mut app, &|t| t.contains("hitCondition"));
+    assert!(text.contains("\"hitCondition\": \">= 5\""), "{text}");
+
+    app.editor.cursor_row = 6;
+    app.debug_run_to_cursor();
+    let text = wait_for(&mut app, &|t| t.matches("\"continue\"").count() >= 1);
+    let set_bp = |t: &str| -> Vec<Vec<u64>> {
+        t.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|m| m["command"] == "setBreakpoints")
+            .map(|m| {
+                m["arguments"]["breakpoints"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|b| b["line"].as_u64())
+                    .collect()
+            })
+            .collect()
+    };
+    let before_continue = &text[..text.find("\"continue\"").unwrap()];
+    assert_eq!(
+        set_bp(before_continue).last(),
+        Some(&vec![3, 7]),
+        "line 7 armed before continuing"
+    );
+    // The adapter stops again: Run to Cursor's line goes, the user's stays.
+    let text = wait_for(&mut app, &|t| set_bp(t).last() == Some(&vec![3]));
+    assert!(set_bp(&text).len() >= 3, "{text}");
+    assert_eq!(
+        app.editor
+            .breakpoints
+            .get(&src)
+            .map(|l| l.iter().copied().collect::<Vec<_>>()),
+        Some(vec![3])
+    );
+}
+
 /// A test-built App never reads the developer's own settings layers: a
 /// preference in the real `config.json` (say, the TIMELINE hidden) must not
 /// steer app tests. Workspace layers under the test root still load.

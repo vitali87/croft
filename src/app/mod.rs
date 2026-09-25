@@ -518,6 +518,7 @@ fn push_variable_rows(
     session: &crate::dap::session::DapSession,
     expanded: &std::collections::HashSet<i64>,
     vars: &[crate::dap::session::Variable],
+    parent: i64,
     indent: u8,
 ) {
     use crate::widgets::run_debug::{DebugRow, DebugRowKind};
@@ -528,6 +529,7 @@ fn push_variable_rows(
             indent,
             kind: DebugRowKind::Variable {
                 reference: v.variables_ref,
+                parent,
                 expandable,
                 expanded: is_open,
                 name: v.name.clone(),
@@ -536,7 +538,14 @@ fn push_variable_rows(
             },
         });
         if is_open && let Some(children) = session.variables.get(&v.variables_ref) {
-            push_variable_rows(rows, session, expanded, children, indent.saturating_add(1));
+            push_variable_rows(
+                rows,
+                session,
+                expanded,
+                children,
+                v.variables_ref,
+                indent.saturating_add(1),
+            );
         }
     }
 }
@@ -1241,6 +1250,11 @@ enum MenuAction {
     FixProblemWithNavigator {
         path: PathBuf,
         item: crate::widgets::problems::ProblemItem,
+    },
+    /// VARIABLES row: break when this variable changes (#611).
+    BreakOnValueChange {
+        parent: i64,
+        name: String,
     },
     /// Editor body: one level of the call hierarchy for the symbol at buffer
     /// `(row, col)` — callers when `incoming`, callees otherwise.
@@ -2198,6 +2212,15 @@ enum PromptKind {
         path: PathBuf,
         line: usize,
     },
+    /// Debugger "Add Hit Count Breakpoint" (#611): the `hitCondition` for
+    /// the breakpoint on 1-based `line` of `path`. Same commit shape as
+    /// [`PromptKind::BreakpointCondition`].
+    BreakpointHitCount {
+        path: PathBuf,
+        line: usize,
+    },
+    /// Debugger "Add Function Breakpoint" (#611): a function name to break on.
+    FunctionBreakpoint,
     /// Debugger "Add Logpoint" / "Edit Logpoint": edit the log message for
     /// the breakpoint on 1-based `line` of `path` (`{expr}` holes are
     /// interpolated by the adapter, which prints instead of pausing). Same
@@ -3437,6 +3460,14 @@ pub struct App {
     /// showing the live buffer. `Some` at `Position::Working` is a real
     /// state: the scrubber is open and parked at the user's own edits.
     scrubber: Option<crate::scrubber::Scrubber>,
+    /// Function breakpoints (#611), sent to every session, and Run to
+    /// Cursor's temporary breakpoint while it is armed.
+    function_breakpoints: Vec<String>,
+    run_to_cursor: Option<(PathBuf, usize)>,
+    /// Data breakpoints (#611): each adapter data id and the variable name
+    /// it watches, sent to the focused session. Ids are only valid for the
+    /// session that issued them.
+    data_breakpoints: Vec<(String, String)>,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -5047,6 +5078,9 @@ impl App {
             symbol_tab: None,
             scrubber: None,
             debug_temp_breakpoint: None,
+            function_breakpoints: Vec::new(),
+            run_to_cursor: None,
+            data_breakpoints: Vec::new(),
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
             problems_fix_started: None,
@@ -18257,6 +18291,21 @@ impl App {
                 ]),
                 "Enter to set condition (blank for a plain breakpoint), Esc to cancel",
             ),
+            PromptKind::BreakpointHitCount { .. } | PromptKind::FunctionBreakpoint => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                if matches!(p.kind, PromptKind::FunctionBreakpoint) {
+                    "Enter to break when this function is entered, Esc to cancel"
+                } else {
+                    "Enter to pause once the hit count matches (5, >= 5, % 2; blank clears), Esc to cancel"
+                },
+            ),
             PromptKind::Logpoint { .. } => (
                 ratatui::text::Line::from(vec![
                     ratatui::text::Span::raw("> "),
@@ -20494,7 +20543,17 @@ impl App {
                     self.refresh_inline_values();
                     changed = true;
                 }
+                DapEvent::DataBreakpointInfo {
+                    name,
+                    data_id,
+                    description,
+                } => {
+                    self.apply_data_breakpoint_info(name, data_id, description);
+                    changed = true;
+                }
                 DapEvent::Stopped { reason, .. } => {
+                    // Run to Cursor's breakpoint has done its job (#611).
+                    self.disarm_run_to_cursor();
                     self.run_debug.feedback = Some(format!("Paused ({reason})"));
                     self.run_debug.feedback_is_error = false;
                     self.watch_baseline_pending = true;
@@ -20551,6 +20610,7 @@ impl App {
                 // this is the path a passing test takes, so it is the
                 // common one, not the exceptional one.
                 self.disarm_failure_breakpoint();
+                self.disarm_run_to_cursor();
                 self.reset_watch_runtime();
                 self.clear_inline_values();
                 // Reply to the adapter's own `terminated`/`exited` with the
@@ -20707,7 +20767,14 @@ impl App {
                 },
             });
             if let Some(vars) = session.variables.get(&scope.variables_ref) {
-                push_variable_rows(&mut rows, session, &self.debug_expanded, vars, 2);
+                push_variable_rows(
+                    &mut rows,
+                    session,
+                    &self.debug_expanded,
+                    vars,
+                    scope.variables_ref,
+                    2,
+                );
             }
         }
         rows.push(DebugRow {
@@ -21756,6 +21823,9 @@ impl App {
         };
         match result {
             Ok(session) => {
+                // Function breakpoints ride along to `initialized` (#611).
+                let mut session = session;
+                session.update_function_breakpoints(&self.function_breakpoints);
                 match slot {
                     LaunchSlot::Replace => self.debug_sessions.replace_with(&name, session),
                     LaunchSlot::Add => self.debug_sessions.push(&name, session),
@@ -22078,6 +22148,219 @@ impl App {
     /// any existing condition.
     pub fn debug_edit_condition(&mut self) {
         self.debug_edit_condition_line(self.editor.cursor_row + 1);
+    }
+
+    /// Open the hit-count editor for the cursor line (#611).
+    pub fn debug_edit_hit_count(&mut self) {
+        let line = self.editor.cursor_row + 1;
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to set a hit count breakpoint");
+            return;
+        };
+        let existing = self
+            .editor
+            .breakpoint_hit_conditions
+            .get(&path)
+            .and_then(|h| h.get(&line))
+            .cloned()
+            .unwrap_or_default();
+        let target_dir = self.tree.root.clone();
+        self.prompt = Some(Prompt {
+            label: format!("Hit Count · line {line}"),
+            buffer: existing,
+            kind: PromptKind::BreakpointHitCount { path, line },
+            target_dir,
+            error: None,
+        });
+    }
+
+    /// Create (or keep) the breakpoint on `line` and set or clear its hit
+    /// count, then push the file's breakpoints to every session.
+    fn commit_breakpoint_hit_count(&mut self, path: PathBuf, line: usize, hits: &str) {
+        self.editor
+            .breakpoints
+            .entry(path.clone())
+            .or_default()
+            .insert(line);
+        let hits = hits.trim();
+        if hits.is_empty() {
+            if let Some(h) = self.editor.breakpoint_hit_conditions.get_mut(&path) {
+                h.remove(&line);
+            }
+            self.status = format!("Plain breakpoint at line {line}");
+        } else {
+            self.editor
+                .breakpoint_hit_conditions
+                .entry(path.clone())
+                .or_default()
+                .insert(line, hits.to_string());
+            let ignored = self
+                .debug_sessions
+                .focused_mut()
+                .is_some_and(|s| !s.capabilities.hit_conditions);
+            self.status = if ignored {
+                format!("Hit count {hits} at line {line} (this debugger ignores hit counts)")
+            } else {
+                format!("Hit count {hits} at line {line}")
+            };
+        }
+        self.push_breakpoints_for(&path);
+    }
+
+    /// Send `path`'s breakpoints, as the editor now has them, to every
+    /// session (#310).
+    fn push_breakpoints_for(&mut self, path: &Path) {
+        let specs = self
+            .editor
+            .breakpoints
+            .get(path)
+            .map(|l| self.editor.source_breakpoints(path, l))
+            .unwrap_or_default();
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(path, &specs);
+        }
+    }
+
+    /// Open the function-breakpoint prompt (#611).
+    pub fn debug_add_function_breakpoint(&mut self) {
+        let target_dir = self.tree.root.clone();
+        self.prompt = Some(Prompt {
+            label: String::from("Add Function Breakpoint"),
+            buffer: String::new(),
+            kind: PromptKind::FunctionBreakpoint,
+            target_dir,
+            error: None,
+        });
+    }
+
+    /// Break on entry to `name` in every session, and in sessions started
+    /// later.
+    fn add_function_breakpoint(&mut self, name: String) {
+        if name.is_empty() || self.function_breakpoints.contains(&name) {
+            return;
+        }
+        self.function_breakpoints.push(name.clone());
+        self.push_function_breakpoints(&format!("Function breakpoint on {name}"));
+    }
+
+    /// Ask the focused session whether `name` (in container `parent`) can be
+    /// watched (#611); [`Self::apply_data_breakpoint_info`] takes the answer.
+    fn request_data_breakpoint(&mut self, parent: i64, name: &str) {
+        let Some(session) = self.debug_sessions.focused_mut() else {
+            self.status = String::from("Break on Value Change: no debug session");
+            return;
+        };
+        if !session.capabilities.data_breakpoints {
+            self.status = String::from("This debugger does not support data breakpoints");
+            return;
+        }
+        session.request_data_breakpoint_info(parent, name);
+    }
+
+    /// The adapter's answer about watching `name`: add it to the set and
+    /// send the whole set, or say why it cannot be watched.
+    fn apply_data_breakpoint_info(
+        &mut self,
+        name: String,
+        data_id: Option<String>,
+        description: String,
+    ) {
+        let Some(id) = data_id else {
+            self.status = if description.is_empty() {
+                format!("{name} cannot be watched")
+            } else {
+                format!("{name} cannot be watched: {description}")
+            };
+            return;
+        };
+        if !self.data_breakpoints.iter().any(|(d, _)| *d == id) {
+            self.data_breakpoints.push((id, name.clone()));
+        }
+        self.push_data_breakpoints();
+        self.status = format!("Breaks when {name} changes");
+    }
+
+    /// Drop every data breakpoint.
+    fn clear_data_breakpoints(&mut self) {
+        self.data_breakpoints.clear();
+        self.push_data_breakpoints();
+        self.status = String::from("Data breakpoints removed");
+    }
+
+    fn push_data_breakpoints(&mut self) {
+        let ids: Vec<String> = self
+            .data_breakpoints
+            .iter()
+            .map(|(d, _)| d.clone())
+            .collect();
+        if let Some(session) = self.debug_sessions.focused_mut() {
+            session.update_data_breakpoints(&ids);
+        }
+    }
+
+    /// Drop every function breakpoint.
+    fn clear_function_breakpoints(&mut self) {
+        self.function_breakpoints.clear();
+        self.push_function_breakpoints("Function breakpoints removed");
+    }
+
+    fn push_function_breakpoints(&mut self, done: &str) {
+        let names = self.function_breakpoints.clone();
+        let mut refused = false;
+        for session in self.debug_sessions.iter_mut() {
+            refused |= !session.update_function_breakpoints(&names);
+        }
+        self.status = if refused && !names.is_empty() {
+            format!("{done} (this debugger does not support function breakpoints)")
+        } else {
+            done.to_string()
+        };
+    }
+
+    /// Run to Cursor (#611): a temporary breakpoint at the caret line, then
+    /// continue. The breakpoint goes at the next stop, whatever stopped it,
+    /// or when the session ends; a breakpoint already on the line is the
+    /// user's and is left alone.
+    pub fn debug_run_to_cursor(&mut self) {
+        use crate::dap::session::SessionPhase;
+        let paused = self
+            .debug_sessions
+            .focused_mut()
+            .is_some_and(|s| s.phase == SessionPhase::Stopped);
+        if !paused {
+            self.status = String::from("Run to Cursor: the debugger is not paused");
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let line = self.editor.cursor_row + 1;
+        if self
+            .editor
+            .breakpoints
+            .entry(path.clone())
+            .or_default()
+            .insert(line)
+        {
+            self.run_to_cursor = Some((path.clone(), line));
+            self.push_breakpoints_for(&path);
+        }
+        self.debug_start_or_continue();
+        self.status = format!("Running to line {line}");
+    }
+
+    /// Take Run to Cursor's temporary breakpoint away again.
+    fn disarm_run_to_cursor(&mut self) {
+        let Some((path, line)) = self.run_to_cursor.take() else {
+            return;
+        };
+        if let Some(lines) = self.editor.breakpoints.get_mut(&path) {
+            lines.remove(&line);
+            if lines.is_empty() {
+                self.editor.breakpoints.remove(&path);
+            }
+        }
+        self.push_breakpoints_for(&path);
     }
 
     /// Open the breakpoint-condition editor for an explicit 1-based `line` as a
@@ -35987,6 +36270,11 @@ impl App {
             Cmd::ShowIncomingCalls => self.request_call_hierarchy_at_cursor(true),
             Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
+            Cmd::EditBreakpointHitCount => self.debug_edit_hit_count(),
+            Cmd::AddFunctionBreakpoint => self.debug_add_function_breakpoint(),
+            Cmd::RemoveFunctionBreakpoints => self.clear_function_breakpoints(),
+            Cmd::DebugRunToCursor => self.debug_run_to_cursor(),
+            Cmd::RemoveDataBreakpoints => self.clear_data_breakpoints(),
             Cmd::StepOver => self.debug_step("next"),
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
@@ -38961,6 +39249,25 @@ impl App {
                 // wins over the editor pane it sits beside.
                 if rect_contains(self.minimap_img_rect, m.column, m.row) {
                     self.open_minimap_menu(m.column, m.row);
+                    return;
+                }
+                // A VARIABLES row: Break on Value Change (#611).
+                if self.sidebar_view == SidebarView::RunDebug
+                    && let Some(idx) = self.run_debug.debug_row_at(m.row)
+                    && let Some(crate::widgets::run_debug::DebugRowKind::Variable {
+                        parent,
+                        name,
+                        ..
+                    }) = self.run_debug.debug_rows.get(idx).map(|r| r.kind.clone())
+                {
+                    self.context_menu = Some(ContextMenu::flat(
+                        (m.column, m.row),
+                        vec![(
+                            String::from("Break on Value Change"),
+                            MenuAction::BreakOnValueChange { parent, name },
+                        )],
+                        self.tree.root.clone(),
+                    ));
                     return;
                 }
                 // A PROBLEMS diagnostic row: Fix with Navigator (#374).
@@ -43307,6 +43614,9 @@ impl App {
                 self.open_ask_navigator((start, end), selection);
             }
             MenuAction::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            MenuAction::BreakOnValueChange { parent, name } => {
+                self.request_data_breakpoint(parent, &name);
+            }
             MenuAction::FixProblemWithNavigator { path, item } => {
                 self.fix_problem_with_navigator(path, item, Vec::new());
             }
@@ -45910,6 +46220,16 @@ impl App {
                 let expr = prompt.buffer.clone();
                 self.prompt = None;
                 self.commit_breakpoint_condition(path, line, &expr);
+            }
+            PromptKind::BreakpointHitCount { path, line } => {
+                let hits = prompt.buffer.clone();
+                self.prompt = None;
+                self.commit_breakpoint_hit_count(path, line, &hits);
+            }
+            PromptKind::FunctionBreakpoint => {
+                let name = prompt.buffer.trim().to_string();
+                self.prompt = None;
+                self.add_function_breakpoint(name);
             }
             PromptKind::Logpoint { path, line } => {
                 let message = prompt.buffer.clone();

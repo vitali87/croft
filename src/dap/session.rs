@@ -65,6 +65,13 @@ pub enum DapEvent {
         /// so a watch row can render `<not available>` instead of the error.
         success: bool,
     },
+    /// A `dataBreakpointInfo` answer (#611): the id to break on when `name`
+    /// changes, or `None` with the adapter's reason when it cannot be watched.
+    DataBreakpointInfo {
+        name: String,
+        data_id: Option<String>,
+        description: String,
+    },
 }
 
 /// One breakpoint's binding status as reported by the adapter: the source file,
@@ -344,6 +351,9 @@ pub struct SourceBreakpoint {
     pub line: u32,
     pub condition: Option<String>,
     pub log_message: Option<String>,
+    /// `hitCondition` (#611): pause only once the hit count satisfies it
+    /// (`5`, `>= 5`, `% 2`, as the adapter reads it).
+    pub hit_condition: Option<String>,
 }
 
 impl SourceBreakpoint {
@@ -352,8 +362,65 @@ impl SourceBreakpoint {
             line,
             condition: None,
             log_message: None,
+            hit_condition: None,
         }
     }
+}
+
+/// What the adapter said it can do, from its `initialize` response (#611).
+/// Everything is `false` until the response arrives, so an unsupported
+/// feature is refused rather than sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub function_breakpoints: bool,
+    pub hit_conditions: bool,
+    pub data_breakpoints: bool,
+}
+
+impl Capabilities {
+    pub fn from_initialize(body: &Value) -> Self {
+        let flag = |k: &str| body.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Self {
+            function_breakpoints: flag("supportsFunctionBreakpoints"),
+            hit_conditions: flag("supportsHitConditionalBreakpoints"),
+            data_breakpoints: flag("supportsDataBreakpoints"),
+        }
+    }
+}
+
+/// Build a `dataBreakpointInfo` request (#611): can `name`, inside the
+/// variables container `parent`, be watched for changes?
+pub fn data_breakpoint_info_request(parent: i64, name: &str) -> Value {
+    json!({
+        "type": "request",
+        "command": "dataBreakpointInfo",
+        "arguments": { "variablesReference": parent, "name": name }
+    })
+}
+
+/// Build a `setDataBreakpoints` request (#611): break when any of the data
+/// ids is written. The list replaces the adapter's whole set.
+pub fn set_data_breakpoints_request(data_ids: &[String]) -> Value {
+    let bps: Vec<Value> = data_ids
+        .iter()
+        .map(|id| json!({ "dataId": id, "accessType": "write" }))
+        .collect();
+    json!({
+        "type": "request",
+        "command": "setDataBreakpoints",
+        "arguments": { "breakpoints": bps }
+    })
+}
+
+/// Build a `setFunctionBreakpoints` request (#611): break when any of the
+/// named functions is entered. The list replaces the adapter's whole set.
+pub fn set_function_breakpoints_request(names: &[String]) -> Value {
+    let bps: Vec<Value> = names.iter().map(|n| json!({ "name": n })).collect();
+    json!({
+        "type": "request",
+        "command": "setFunctionBreakpoints",
+        "arguments": { "breakpoints": bps }
+    })
 }
 
 /// Build a `setBreakpoints` request body for one source file, carrying any
@@ -368,6 +435,9 @@ pub fn set_breakpoints_request(path: &Path, breakpoints: &[SourceBreakpoint]) ->
             }
             if let Some(m) = &b.log_message {
                 bp["logMessage"] = json!(m);
+            }
+            if let Some(h) = &b.hit_condition {
+                bp["hitCondition"] = json!(h);
             }
             bp
         })
@@ -811,6 +881,10 @@ pub struct DapSession {
     /// Breakpoints to push once the adapter is `initialized`, keyed by absolute
     /// file path (with optional per-breakpoint conditions).
     breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    /// Function breakpoints (#611), pushed on `initialized` when the adapter
+    /// supports them, and the adapter's capabilities.
+    function_breakpoints: Vec<String>,
+    pub capabilities: Capabilities,
     /// Thread id reported by the most recent `stopped` event.
     pub stopped_thread: Option<i64>,
     /// File + 1-based line the debugger is paused on, resolved from the
@@ -838,6 +912,9 @@ pub struct DapSession {
     /// In-flight `evaluate` requests: request `seq` -> (context, expression), so
     /// the response can be turned into an [`DapEvent::Evaluated`].
     pending_evals: std::collections::HashMap<i64, (String, String)>,
+    /// `dataBreakpointInfo` requests awaiting an answer, by seq: the name
+    /// asked about.
+    pending_data_info: std::collections::HashMap<i64, String>,
     /// Active exception-breakpoint filter ids (debugpy: `raised`, `uncaught`).
     /// Sent on `initialized` and whenever toggled. Defaults to `uncaught` so an
     /// unhandled exception pauses the debugger instead of silently exiting.
@@ -953,6 +1030,8 @@ impl DapSession {
             js_server,
             phase: SessionPhase::Initializing,
             breakpoints,
+            function_breakpoints: Vec::new(),
+            capabilities: Capabilities::default(),
             stopped_thread: None,
             current_location: None,
             unverified_breakpoints: BTreeMap::new(),
@@ -962,6 +1041,7 @@ impl DapSession {
             selected_frame: None,
             pending_var_refs: std::collections::HashMap::new(),
             pending_evals: std::collections::HashMap::new(),
+            pending_data_info: std::collections::HashMap::new(),
             exception_filters: vec![String::from("uncaught")],
             known_thread: None,
         }
@@ -994,6 +1074,22 @@ impl DapSession {
     /// Whether an exception filter id is currently active.
     pub fn has_exception_filter(&self, filter: &str) -> bool {
         self.exception_filters.iter().any(|f| f == filter)
+    }
+
+    /// Ask whether `name` in container `parent` can be watched (#611); the
+    /// answer arrives as [`DapEvent::DataBreakpointInfo`].
+    pub fn request_data_breakpoint_info(&mut self, parent: i64, name: &str) {
+        if let Ok(seq) = self
+            .active()
+            .send(data_breakpoint_info_request(parent, name))
+        {
+            self.pending_data_info.insert(seq, name.to_string());
+        }
+    }
+
+    /// Replace the data-breakpoint set (#611).
+    pub fn update_data_breakpoints(&mut self, data_ids: &[String]) {
+        let _ = self.active().send(set_data_breakpoints_request(data_ids));
     }
 
     /// Evaluate `expression` in the selected frame (or globally if no frame is
@@ -1171,6 +1267,29 @@ impl DapSession {
                 // Only stdio adapters' reports drive the hollow rendering; for a
                 // js-debug session the guard fails and the arm falls through to
                 // the no-op `_` below.
+                Some("dataBreakpointInfo") => {
+                    let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                    if let Some(name) = req_seq.and_then(|s| self.pending_data_info.remove(&s)) {
+                        let body = msg.get("body").cloned().unwrap_or(Value::Null);
+                        out.push(DapEvent::DataBreakpointInfo {
+                            name,
+                            data_id: body
+                                .get("dataId")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            description: body
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        });
+                    }
+                }
+                Some("initialize") => {
+                    if let Some(body) = msg.get("body") {
+                        self.capabilities = Capabilities::from_initialize(body);
+                    }
+                }
                 Some("setBreakpoints") if self.js_server.is_none() => {
                     let reports = breakpoint_reports(&msg);
                     if self.apply_breakpoint_reports(&reports) {
@@ -1212,6 +1331,7 @@ impl DapSession {
                 // just initialized (parent or child). `active()` already resolves
                 // to the child once it exists, and to the parent before that.
                 self.push_breakpoints();
+                self.push_function_breakpoints();
                 let t = self.active();
                 let _ = t.send(set_exception_breakpoints_request(&self.exception_filters));
                 let _ = t.send(configuration_done_request());
@@ -1243,7 +1363,8 @@ impl DapSession {
             DapEvent::Output { .. } => {}
             DapEvent::BreakpointsUpdated
             | DapEvent::InspectionUpdated
-            | DapEvent::Evaluated { .. } => {}
+            | DapEvent::Evaluated { .. }
+            | DapEvent::DataBreakpointInfo { .. } => {}
         }
         // Suppress the parent's own `terminated` for js-debug while a child is
         // still live (the parent can wind down its bootstrap connection first).
@@ -1278,6 +1399,28 @@ impl DapSession {
         for (path, lines) in &self.breakpoints {
             let _ = t.send(set_breakpoints_request(path, lines));
         }
+    }
+
+    /// Send the function-breakpoint set, when there is one the adapter can
+    /// take.
+    fn push_function_breakpoints(&mut self) {
+        if self.capabilities.function_breakpoints && !self.function_breakpoints.is_empty() {
+            let req = set_function_breakpoints_request(&self.function_breakpoints);
+            let _ = self.active().send(req);
+        }
+    }
+
+    /// Replace the function-breakpoint set (#611). Kept for a child session
+    /// that initializes later, and sent now when the adapter supports it.
+    /// Returns whether it does.
+    pub fn update_function_breakpoints(&mut self, names: &[String]) -> bool {
+        self.function_breakpoints = names.to_vec();
+        if !self.capabilities.function_breakpoints {
+            return false;
+        }
+        let req = set_function_breakpoints_request(names);
+        let _ = self.active().send(req);
+        true
     }
 
     /// Resume execution of the stopped thread.
@@ -1850,6 +1993,7 @@ mod tests {
                     line: 7,
                     condition: Some(String::from("i > 3")),
                     log_message: None,
+                    hit_condition: None,
                 },
             ],
         );
@@ -1875,11 +2019,13 @@ mod tests {
                     line: 4,
                     condition: None,
                     log_message: Some(String::from("x is {x}")),
+                    hit_condition: None,
                 },
                 SourceBreakpoint {
                     line: 9,
                     condition: Some(String::from("n > 0")),
                     log_message: Some(String::from("n={n}")),
+                    hit_condition: None,
                 },
                 SourceBreakpoint::plain(11),
             ],
@@ -2295,5 +2441,33 @@ mod tests {
         assert_eq!(line, 3);
         // debugpy echoes the launched (symlinked) path, NOT the canonical one.
         assert_eq!(loc, via_link, "debugpy must report the path as launched");
+    }
+
+    #[test]
+    fn hit_conditions_and_function_breakpoints_reach_the_wire() {
+        let mut bp = SourceBreakpoint::plain(3);
+        bp.hit_condition = Some(String::from(">= 5"));
+        let req = set_breakpoints_request(Path::new("/a.py"), &[bp, SourceBreakpoint::plain(4)]);
+        let bps = req["arguments"]["breakpoints"].as_array().unwrap();
+        assert_eq!(bps[0]["hitCondition"], ">= 5");
+        assert!(bps[1].get("hitCondition").is_none());
+        let f = set_function_breakpoints_request(&[String::from("main"), String::from("parse")]);
+        assert_eq!(f["command"], "setFunctionBreakpoints");
+        assert_eq!(f["arguments"]["breakpoints"][1]["name"], "parse");
+    }
+
+    #[test]
+    fn capabilities_come_from_the_initialize_response_and_default_off() {
+        let c = Capabilities::from_initialize(&json!({
+            "supportsFunctionBreakpoints": true,
+            "supportsHitConditionalBreakpoints": true,
+            "supportsConditionalBreakpoints": true
+        }));
+        assert!(c.function_breakpoints && c.hit_conditions);
+        assert!(!c.data_breakpoints);
+        assert_eq!(
+            Capabilities::from_initialize(&json!({})),
+            Capabilities::default()
+        );
     }
 }
