@@ -2527,6 +2527,35 @@ impl PtyTerminal {
         *self.progress.lock().unwrap()
     }
 
+    /// What is typed at the shell prompt, up to the cursor (#614): the
+    /// text from the newest OSC 133;B cell on the cursor's row. `None`
+    /// whenever the shell does not own the pane: no prompt mark, a command
+    /// running, a full-screen program, or the cursor off the prompt row.
+    pub fn prompt_input(&self) -> Option<String> {
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let cursor = term.grid().cursor.point;
+        let now = self.clock_now(&term);
+        let ms = self.marks.lock().unwrap();
+        let last = ms.last()?;
+        if !matches!(last.kind, crate::shell_integration::OscEvent::PromptEnd) {
+            return None;
+        }
+        if last.line_rec - (now - last.clock_rec) as i32 != cursor.line.0 {
+            return None;
+        }
+        let (text, cols) = row_text_and_cols(&term, cursor.line.0);
+        Some(
+            text.chars()
+                .zip(cols)
+                .filter(|&(_, c)| c >= last.col_rec && c < cursor.column.0)
+                .map(|(ch, _)| ch)
+                .collect(),
+        )
+    }
+
     /// The arrow-key bytes a plain click at screen cell (col, row) should
     /// send to walk the shell cursor to the clicked column (Ghostty's
     /// click-to-move-cursor). `Some` only when the shell is sitting at a
@@ -2834,6 +2863,19 @@ impl PtyTerminal {
     /// choose to skip this iteration.
     pub fn peek_dirty(&self) -> bool {
         self.pty_dirty.load(Ordering::Acquire)
+    }
+
+    /// The host-screen cell the cursor is drawn in, when the view is at the
+    /// live bottom (not scrolled back) and the pane has been drawn.
+    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
+        let inner = self.last_inner;
+        let term = self.term.lock();
+        if inner.width == 0 || term.grid().display_offset() != 0 {
+            return None;
+        }
+        let c = term.grid().cursor.point;
+        let (row, col) = (u16::try_from(c.line.0).ok()?, c.column.0 as u16);
+        (row < inner.height && col < inner.width).then_some((inner.x + col, inner.y + row))
     }
 
     pub fn cell_at(&self, col: u16, row: u16) -> Option<(u16, u16)> {
@@ -9303,5 +9345,30 @@ mod tests {
             "the unterminated final row must be captured; got {:?}",
             f.output
         );
+    }
+
+    #[test]
+    fn the_typed_input_is_read_only_while_the_shell_owns_the_pane() {
+        use crate::shell_integration::OscEvent;
+        let (_tmp, t) = quiet_pty();
+        feed_pty(&t, b"\r\n$ ");
+        assert_eq!(t.prompt_input(), None, "no shell integration marks");
+        t.push_mark_for_test(OscEvent::PromptStart, 0);
+        t.push_mark_for_test(OscEvent::PromptEnd, 2);
+        assert_eq!(t.prompt_input().as_deref(), Some(""));
+        feed_pty(&t, b"cargo te");
+        assert_eq!(t.prompt_input().as_deref(), Some("cargo te"));
+        // Cursor moved back: only what is left of it.
+        feed_pty(&t, b"\x1b[2D");
+        assert_eq!(t.prompt_input().as_deref(), Some("cargo "));
+        feed_pty(&t, b"\x1b[2Cst\r\n");
+        t.push_mark_for_test(OscEvent::CommandStart, 0);
+        assert_eq!(t.prompt_input(), None, "a command owns the pane");
+        t.push_mark_for_test(OscEvent::CommandEnd(Some(0)), 0);
+        feed_pty(&t, b"$ ");
+        t.push_mark_for_test(OscEvent::PromptStart, 0);
+        t.push_mark_for_test(OscEvent::PromptEnd, 2);
+        feed_pty(&t, b"vim\x1b[?1049h");
+        assert_eq!(t.prompt_input(), None, "a full-screen program");
     }
 }
