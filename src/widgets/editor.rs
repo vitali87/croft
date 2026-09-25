@@ -10430,6 +10430,14 @@ impl Editor {
         self.mirror_caret = None;
     }
 
+    /// Turn a symbol tab into an ordinary tab of its whole file while its
+    /// text stays in step with its siblings: only the clip and the pending
+    /// caret go, and the mirror state is kept.
+    pub fn drop_symbol_clip(&mut self) {
+        self.symbol_view = None;
+        self.mirror_caret = None;
+    }
+
     /// A symbol tab's visible lines as `(first, end)`, `end` exclusive,
     /// kept inside the buffer. `None` on an ordinary tab.
     pub fn symbol_clip(&self) -> Option<(usize, usize)> {

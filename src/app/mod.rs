@@ -26435,10 +26435,11 @@ impl App {
                     .is_some_and(|p| !whole_file_open(p) && !kept_paths.iter().any(|k| k == p));
             if orphan {
                 kept_paths.extend(ed.path.clone());
-                ed.leave_symbol_view();
-                // Mirrored in this pass: it is in step with its siblings,
-                // so its next edit is the source, not overwritten by them.
-                ed.mirror_seq = Some(ed.edit_seq);
+                // Its mirror state stays: it is in step with its siblings
+                // (mirrored this pass, or left to the collab session), so
+                // its next edit is the source, not overwritten by them, and
+                // folds into the undo step it already has.
+                ed.drop_symbol_clip();
                 kept_notes.push(format!(
                     "{name} is gone; its tab now shows the whole file with the unsaved edits"
                 ));
