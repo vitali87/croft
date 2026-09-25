@@ -334,10 +334,12 @@ pub struct SymbolView {
     /// to a symbol with the same name AND these, so deleting one of several
     /// `fn new` does not land the tab on another impl's.
     syntax_shape: Option<(crate::lsp::manager::OutlineKind, u16)>,
-    /// Lines from `first` to the line the tree-sitter symbol starts on. An
-    /// LSP outline's range includes doc comments and attributes, the
-    /// tree-sitter one starts at the item, so this is often not zero.
-    head: usize,
+    /// Byte offset of the line the tree-sitter symbol starts on. An LSP
+    /// outline's range includes doc comments and attributes, the tree-sitter
+    /// one starts at the item, so this is often past `range.start`. Kept as
+    /// an offset so lines added or removed above it inside the range carry
+    /// it along.
+    head_at: usize,
 }
 
 /// Where a caret was when the edit a view follows was made.
@@ -379,7 +381,10 @@ impl SymbolView {
         Self {
             syntax_name: sym.map(|s| s.name.clone()),
             syntax_shape: sym.map(|s| (s.kind, s.depth)),
-            head: sym.map_or(0, |s| s.range_start_line as usize - first),
+            head_at: sym.map_or(range.start, |s| {
+                let line = s.range_start_line as usize;
+                range_for_lines(&text, line, line).start
+            }),
             name,
             range,
             first,
@@ -425,15 +430,37 @@ impl SymbolView {
             RangeAfterEdit::At(moved) => {
                 self.range = moved;
                 (self.first, self.last) = lines_of(&text, moved);
+                self.head_at = if at + removed <= self.head_at {
+                    // Wholly before the head line's start (an insertion AT
+                    // it opens lines above it): the head moves with it.
+                    self.head_at + inserted - removed
+                } else if at < self.head_at {
+                    // The edit swallowed the head line's start.
+                    at
+                } else {
+                    self.head_at
+                }
+                .clamp(moved.start, moved.end);
                 // Only an edit on the symbol's own head line can rename it.
-                let head_line = (self.first + self.head).min(self.last);
+                let head_line = lines_of(&text, SymbolRange::new(self.head_at, self.head_at)).0;
                 let head_start = range_for_lines(&text, head_line, head_line);
                 if at >= head_start.start
                     && at <= head_start.end
                     && let Some(kind) = kind
                 {
                     let symbols = crate::outline_syntax::symbols_for(kind, text.as_bytes());
-                    if let Some(sym) = syntax_symbol_starting_at(&symbols, head_line)
+                    // The same kind of symbol at the same depth: a nested
+                    // item that now starts on this line is not a rename.
+                    let sym = symbols
+                        .iter()
+                        .filter(|s| {
+                            s.range_start_line as usize == head_line
+                                && self
+                                    .syntax_shape
+                                    .is_none_or(|shape| shape == (s.kind, s.depth))
+                        })
+                        .min_by_key(|s| s.range_end_line.saturating_sub(s.range_start_line));
+                    if let Some(sym) = sym
                         && self.syntax_name.as_deref() != Some(sym.name.as_str())
                     {
                         let renamed = self.syntax_name.is_some();
@@ -450,7 +477,31 @@ impl SymbolView {
             RangeAfterEdit::Gone => {
                 // Re-found only as the same kind of symbol at the same depth,
                 // overlapping the lines it held: another item that merely
-                // shares the name is not this symbol.
+                // shares the name is not this symbol. Those lines are carried
+                // through the edit first, since lines it added or removed
+                // above them shift where they are now.
+                let line_at = |t: &str, byte: usize| {
+                    t.as_bytes()[..byte.min(t.len())]
+                        .iter()
+                        .filter(|&&b| b == b'\n')
+                        .count()
+                };
+                let (edit_first, old_edit_last, new_edit_last) = (
+                    line_at(&self.text, at),
+                    line_at(&self.text, at + removed),
+                    line_at(&text, at + inserted),
+                );
+                let carry = |line: usize, inside: usize| {
+                    if line < edit_first {
+                        line
+                    } else if line > old_edit_last {
+                        line - old_edit_last + new_edit_last
+                    } else {
+                        inside
+                    }
+                };
+                let old_first = carry(old_first, edit_first);
+                let old_last = carry(old_last, new_edit_last);
                 let found = kind.zip(self.syntax_name.as_deref()).and_then(|(k, want)| {
                     crate::outline_syntax::symbols_for(k, text.as_bytes())
                         .into_iter()
@@ -470,7 +521,7 @@ impl SymbolView {
                             sym.range_end_line as usize,
                         );
                         (self.first, self.last) = lines_of(&text, self.range);
-                        self.head = 0;
+                        self.head_at = self.range.start;
                     }
                     None => update = ViewUpdate::Gone,
                 }
@@ -884,6 +935,41 @@ mod tests {
             ViewUpdate::Renamed(String::from("beta"))
         );
         assert_eq!((v.first, v.last), (1, 5));
+    }
+
+    /// Lines removed above the heading inside the range carry the heading
+    /// with them: an edit on what is now a nested item's line is not a
+    /// rename, and a rename on the heading's new line still is.
+    #[test]
+    fn the_heading_moves_with_lines_removed_above_it() {
+        let src = "/// Doc.\nmod m {\n    fn a() {}\n}";
+        let mut v = SymbolView::new(String::from("m"), String::from(src), 0, 3, 1, rust());
+        let undocumented = edit(src, "/// Doc.\n", "");
+        assert_eq!(
+            v.follow(undocumented.clone(), 2, rust(), None),
+            ViewUpdate::Kept
+        );
+        let nested = edit(&undocumented, "fn a", "fn ab");
+        assert_eq!(v.follow(nested.clone(), 3, rust(), None), ViewUpdate::Kept);
+        assert_eq!(
+            v.follow(edit(&nested, "mod m", "mod mm"), 4, rust(), None),
+            ViewUpdate::Renamed(String::from("m"))
+        );
+    }
+
+    /// A straddling edit that also collapses more lines above the symbol
+    /// than it has (a formatter's merged edit) still re-finds it where it
+    /// now is.
+    #[test]
+    fn a_straddling_edit_that_shifts_the_symbol_far_re_anchors_it() {
+        let src = "fn alpha(\n    a: u8,\n    b: u8,\n    c: u8,\n    d: u8,\n    e: u8,\n) {}\nfn beta() {\n    2\n}";
+        let mut v = SymbolView::new(String::from("beta"), String::from(src), 7, 9, 1, rust());
+        let formatted = "fn alpha(a: u8, b: u8, c: u8, d: u8, e: u8) {}\nfn beta() {\n    3\n}";
+        assert_eq!(
+            v.follow(String::from(formatted), 2, rust(), None),
+            ViewUpdate::Kept
+        );
+        assert_eq!((v.first, v.last), (1, 3));
     }
 
     /// The caret moves an ambiguous span to where it was typed, and leaves

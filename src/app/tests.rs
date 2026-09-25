@@ -43194,12 +43194,6 @@ fn session_capture_keeps_a_symbol_tab_only_when_it_is_the_files_last_tab() {
     );
 }
 
-/// #369: an edit on a symbol's edge lands on the side its caret is on.
-///
-/// Enter at the end of the symbol, typed in its own tab, opens a line the
-/// tab keeps showing, so the caret stays on it; Enter at the start of the
-/// symbol's first line, typed in the file's tab, opens a line above it that
-/// the clip leaves out.
 /// #369: scrolling a symbol tab stops once its last line reaches the pane's
 /// bottom; a short symbol never leaves a lone line above blank rows.
 #[test]
@@ -43217,6 +43211,70 @@ fn a_symbol_tab_never_scrolls_its_tail_off_a_pane_it_fits() {
     );
 }
 
+/// #369: multi-cursor commands in a symbol tab stay inside the symbol:
+/// Change All Occurrences matches only there, Add Cursor Above stops at its
+/// first line, and a caret that lands outside is dropped rather than
+/// stacked on the edge.
+#[test]
+fn multi_cursor_commands_stay_in_the_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 0;
+    assert_eq!(
+        app.editor.select_all_occurrences_of_word_at_cursor(),
+        1,
+        "fn a's `fn` is outside"
+    );
+    assert!(app.editor.carets.is_empty());
+    app.editor.selection = None;
+    app.editor.add_cursor_above();
+    assert!(app.editor.carets.is_empty(), "no caret above the symbol");
+    for row in [0, 1] {
+        app.editor
+            .carets
+            .push(crate::widgets::editor::EditorSelection::new(row, 0));
+    }
+    app.editor.clamp_to_symbol_view();
+    assert!(app.editor.carets.is_empty(), "outside carets are dropped");
+}
+
+/// #369: a collaborator's edit is not the symbol tab's own. A line they
+/// open at the start of the symbol's first line stays above the symbol.
+#[test]
+fn a_collaborators_edit_on_a_symbols_edge_is_not_the_tabs_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    for ed in app.editor.editors.iter_mut() {
+        ed.apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
+            start: (3, 0),
+            end: (3, 0),
+            new_text: String::from("\n"),
+        }]);
+        // The local caret sits just past the new line, where a caret that
+        // had typed it would be.
+        ed.cursor_row = 4;
+        ed.cursor_col = 0;
+        ed.collab_doc_gen = 1;
+        ed.collab_synced_seq = ed.edit_seq;
+    }
+    app.sync_symbol_views();
+    let view = app.editor.editors[1].symbol_view.as_ref().unwrap();
+    assert_eq!(
+        (view.first, view.last),
+        (4, 6),
+        "the new line is above fn b"
+    );
+}
+
+/// #369: an edit on a symbol's edge lands on the side its caret is on.
+///
+/// Enter at the end of the symbol, typed in its own tab, opens a line the
+/// tab keeps showing, so the caret stays on it; Enter at the start of the
+/// symbol's first line, typed in the file's tab, opens a line above it that
+/// the clip leaves out.
 #[test]
 fn a_line_opened_on_a_symbols_edge_goes_where_the_caret_is() {
     let tmp = tempfile::tempdir().unwrap();

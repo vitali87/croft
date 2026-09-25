@@ -26360,24 +26360,26 @@ impl App {
             let kind = ed.path.as_deref().and_then(syntax_kind_of);
             let text = ed.lines.join("\n");
             // The caret that made the edit: a sibling's, mirrored in, or
-            // this tab's own.
+            // this tab's own. A collaborator's edit, applied and pinned as
+            // synced, has no caret here and is not this tab's own.
             let caret = match ed.mirror_caret.take() {
-                Some((row, col)) => crate::symbol_range::Caret {
+                Some((row, col)) => Some(crate::symbol_range::Caret {
                     row,
                     col,
                     own: false,
-                },
-                None => crate::symbol_range::Caret {
+                }),
+                None if ed.collab_doc_gen != 0 && ed.edit_seq == ed.collab_synced_seq => None,
+                None => Some(crate::symbol_range::Caret {
                     row: ed.cursor_row,
                     col: ed.cursor_col,
                     own: true,
-                },
+                }),
             };
             let Some(view) = ed.symbol_view.as_mut() else {
                 return false;
             };
             changed = true;
-            match view.follow(text, seq, kind, Some(caret)) {
+            match view.follow(text, seq, kind, caret) {
                 crate::symbol_range::ViewUpdate::Kept => false,
                 crate::symbol_range::ViewUpdate::Renamed(old) => {
                     notes.push(format!("{old} is now {}", view.name));

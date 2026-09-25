@@ -6922,7 +6922,9 @@ impl Editor {
             return 0;
         }
         let mut occ: Vec<EditorSelection> = Vec::new();
-        for (row, line) in self.lines.iter().enumerate() {
+        // A symbol tab matches only inside its symbol.
+        let (lo, hi) = self.symbol_clip().unwrap_or((0, self.lines.len()));
+        for (row, line) in self.lines.iter().enumerate().take(hi).skip(lo) {
             let chars: Vec<char> = line.chars().collect();
             for col in find_word_occurrences(&chars, &word) {
                 occ.push(EditorSelection {
@@ -6994,7 +6996,9 @@ impl Editor {
         // Every occurrence in document order, and the set already selected
         // (the primary plus each existing caret), keyed by its start.
         let mut occ: Vec<(usize, usize)> = Vec::new();
-        for (row, line) in self.lines.iter().enumerate() {
+        // A symbol tab matches only inside its symbol.
+        let (lo, hi) = self.symbol_clip().unwrap_or((0, self.lines.len()));
+        for (row, line) in self.lines.iter().enumerate().take(hi).skip(lo) {
             let chars: Vec<char> = line.chars().collect();
             for col in find_word_occurrences(&chars, &word) {
                 occ.push((row, col));
@@ -9955,7 +9959,7 @@ impl Editor {
             .max()
             .unwrap_or(self.cursor_row);
         let target = max_row + 1;
-        if target >= self.lines.len() {
+        if target >= self.symbol_clip().map_or(self.lines.len(), |(_, end)| end) {
             return;
         }
         let col = self.cursor_col.min(self.line_char_len(target));
@@ -10078,7 +10082,7 @@ impl Editor {
             .chain(std::iter::once(self.cursor_row))
             .min()
             .unwrap_or(self.cursor_row);
-        if min_row == 0 {
+        if min_row <= self.symbol_clip().map_or(0, |(first, _)| first) {
             return;
         }
         let target = min_row - 1;
@@ -10477,7 +10481,19 @@ impl Editor {
         if let Some(sel) = self.selection.as_mut() {
             clamp_sel(sel);
         }
+        // A secondary caret outside the symbol is dropped, not clamped:
+        // clamped, several would stack on one edge and each type there.
+        self.carets.retain(|c| (first..=last).contains(&c.head.0));
         self.carets.iter_mut().for_each(clamp_sel);
+        let primary = self
+            .selection
+            .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
+        let mut seen = vec![primary];
+        self.carets.retain(|c| {
+            let fresh = !seen.contains(c);
+            seen.push(*c);
+            fresh
+        });
         if self.scroll < first || self.scroll > last {
             self.scroll = self.scroll.clamp(first, last);
             self.scroll_sub = 0;
