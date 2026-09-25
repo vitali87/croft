@@ -34680,7 +34680,8 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     // The deterministic half of #397's quick-select entry. Its sibling below
     // was measured at 3 failures in 20 runs under load, because a REAL
     // shell's prompt wraps to several rows and the pane had one row of slack;
-    // a rate is the best evidence a race allows, and it is not a test.
+    // a rate is the best evidence a race allows, and it is not a test. Both
+    // now run on a silent pane.
     //
     // This one feeds the prompt itself, so the geometry is the whole claim
     // and the machine has no say. Four rows of it, then the same park,
@@ -34688,6 +34689,15 @@ fn a_wrapped_prompt_does_not_push_the_url_off_a_maximized_pane() {
     // this fails on every machine on every run.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The pane's child writes nothing, so the grid holds only the bytes fed
+    // below: a real shell's startup prompt landing between them adds rows
+    // the geometry does not count (#641).
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "sleep",
+        &[String::from("30")],
+        tmp.path(),
+    )
+    .unwrap();
     app.focus_pane(Pane::Terminal);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     app.toggle_terminal_maximize();
@@ -36258,8 +36268,8 @@ fn workspace_settings_layer_applies_at_startup_and_reloads_live() {
     )
     .unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    // The workspace layer is later in the chain than any user layer, so
-    // these hold regardless of the developer's real ~/.config contents.
+    // The workspace layer is later in the chain than any user layer, and
+    // test builds read no user layer at all (`config_layers::user_layers_dir`).
     assert!(app.format_on_save, "committed workspace setting applies");
     assert!(!app.indent_guides_enabled);
     assert_eq!(
@@ -50245,4 +50255,150 @@ fn ctrl_alt_f9_breaks_on_a_named_variable_of_the_paused_frame() {
             assert_eq!(app.status, "No variable named nope in the paused frame");
         }
     }
+}
+
+/// A test-built App never reads the developer's own settings layers: a
+/// preference in the real `config.json` (say, the TIMELINE hidden) must not
+/// steer app tests. Workspace layers under the test root still load.
+#[test]
+fn a_test_built_app_reads_no_user_settings_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let user_dir = crate::prefs::config_dir();
+    // At startup and again on a live settings reload.
+    for when in ["startup", "reload"] {
+        if when == "reload" {
+            app.remerge_settings();
+        }
+        let leaked: Vec<_> = app
+            .settings_chain
+            .iter()
+            .filter(|p| p.starts_with(&user_dir))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{when}: user layers read under test: {leaked:?}"
+        );
+        assert!(
+            app.settings_chain
+                .contains(&crate::config_layers::workspace_config_path(tmp.path())),
+            "{when}: the workspace layer must still load: {:?}",
+            app.settings_chain
+        );
+        assert!(
+            app.settings_provenance.values().all(|k| !matches!(
+                k,
+                crate::config_layers::LayerKind::User | crate::config_layers::LayerKind::UserLocal
+            )),
+            "{when}: a setting came from a user layer: {:?}",
+            app.settings_provenance
+        );
+    }
+}
+
+/// #624 review: the tool trust gate refuses a changed tool definition with
+/// the recovery it names, and lets the first and the unchanged one through.
+#[test]
+fn the_mcp_tool_gate_refuses_a_changed_definition() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(mcp_tool_trust(tmp.path(), "ext.go", "go", "fp1"), Ok(()));
+    assert_eq!(mcp_tool_trust(tmp.path(), "ext.go", "go", "fp1"), Ok(()));
+    let err = mcp_tool_trust(tmp.path(), "ext.go", "go", "fp2").unwrap_err();
+    assert!(err.starts_with("refusing to run: the 'go' tool"), "{err}");
+    assert!(err.contains("toggle the extension off and on"), "{err}");
+}
+
+/// #624 review: toggling an extension off and on re-approves its tools, as
+/// the refusal says: turning it off forgets the fingerprints of the
+/// commands it declares, and only those, so the next run trusts afresh.
+#[test]
+fn toggling_an_extension_off_forgets_its_tool_fingerprints() {
+    const EXT: &str = r#"
+id = "tfp"
+name = "tfp"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/false"
+[[commands]]
+id = "tfp.go"
+title = "tfp: go"
+server = "srv"
+tool = "go"
+"#;
+    let other = EXT.replace("tfp", "oth");
+    let (_scratch, croft) = scratch_config(&[("tfp", EXT), ("oth", &other)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    // The panel lists the real user dir; seat the scratch extension's row.
+    // A toggle refreshes the panel from that dir, so re-seat before each.
+    let toggle_tfp = |app: &mut App| {
+        app.extensions
+            .set_items(crate::widgets::extensions::items_from_summaries(
+                crate::lsp::manifest::summaries(&[EXT]),
+                &app.disabled_extensions,
+            ));
+        let visible = app.extensions.visible_indices();
+        let pos = visible
+            .iter()
+            .position(|&i| app.extensions.items()[i].id == "tfp")
+            .expect("the tfp row is visible");
+        app.extensions.select(pos);
+        app.toggle_selected_extension();
+    };
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp1"));
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o1"));
+    toggle_tfp(&mut app);
+    assert!(app.disabled_extensions.contains("tfp"), "{}", app.status);
+    assert!(
+        crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp2"),
+        "the changed tool is approved afresh"
+    );
+    assert!(
+        !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
+        "another extension's record stays"
+    );
+    // Turning it back on keeps the new record: a further change is refused.
+    toggle_tfp(&mut app);
+    assert!(!app.disabled_extensions.contains("tfp"), "{}", app.status);
+    assert!(!crate::prefs::trust_mcp_tool_in(&croft, "tfp.go", "fp3"));
+}
+
+/// Uninstalling an extension forgets its tools' fingerprints, so a re-added
+/// newer version approves its tools afresh instead of being refused.
+#[test]
+fn uninstalling_an_extension_forgets_its_tool_fingerprints() {
+    // Only a catalog entry uninstalls, so the fixture is the bundled Time
+    // sidecar beside a hand-added extension whose record must stay.
+    const TIME: &str = include_str!("../../assets/catalog/mcp-time/extension.toml");
+    const OTH: &str = r#"
+id = "oth"
+name = "oth"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/false"
+[[commands]]
+id = "oth.go"
+title = "oth: go"
+server = "srv"
+tool = "go"
+"#;
+    let (_scratch, croft) = scratch_config(&[("mcp-time", TIME), ("oth", OTH)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "time.now", "fp1"));
+    assert!(crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o1"));
+    app.perform_extension_uninstall("mcp-time");
+    assert!(app.status.starts_with("Uninstalled"), "{}", app.status);
+    assert!(
+        crate::prefs::trust_mcp_tool_in(&croft, "time.now", "fp2"),
+        "the re-added tool is approved afresh"
+    );
+    assert!(
+        !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
+        "another extension's record stays"
+    );
 }
