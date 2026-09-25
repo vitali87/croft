@@ -30885,6 +30885,7 @@ fn participant_rows_show_role_and_size() {
         cols: 120,
         rows: 40,
         control: true,
+        version: String::new(),
     };
     let row = participant_row(&p);
     assert_eq!(row.id, "7");
@@ -30898,6 +30899,7 @@ fn participant_rows_show_role_and_size() {
         cols: 0,
         rows: 0,
         control: false,
+        version: String::new(),
     };
     let row = participant_row(&p);
     assert!(row.label.contains("read-only"));
