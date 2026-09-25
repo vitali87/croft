@@ -243,6 +243,10 @@ pub(crate) enum QuickInputPosition {
 struct PendingFileMove {
     request_id: u64,
     op: FileMove,
+    /// Each open tab's path and edit counter when the request went out. The
+    /// servers answer for that text, so a file typed into during the wait
+    /// does not take their edit: its spans would land on shifted text.
+    edit_seqs: Vec<(PathBuf, u64)>,
 }
 
 /// An Explorer rename or move, planned and validated, waiting to be
@@ -11704,12 +11708,12 @@ impl App {
                 let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
                 occ_count += crate::widgets::editor::apply_span_edits_to_lines(&mut lines, edits);
                 std::fs::write(path, lines.join("\n"))?;
-                // A diverged copy in an inactive group keeps its text; it must
-                // still see this write as an external change, even after a
-                // move re-anchors it to the new path.
-                // So must a hex or log view of it in the active group, which
-                // the edit skipped.
+                // A hex or log view of it in the active group, which the edit
+                // skipped, must see this write as an external change, even
+                // after a move re-anchors it to the new path.
                 self.editor.mark_disk_stale(path);
+                // So must a diverged copy in an inactive group, which keeps
+                // its text.
                 for group in self.editor_layout.inactive_groups_mut() {
                     group.mark_disk_stale(path);
                 }
@@ -45865,7 +45869,12 @@ impl App {
             && lsp.has_will_rename_listeners()
         {
             let request_id = lsp.request_will_rename_files(files);
-            self.pending_file_move = Some(PendingFileMove { request_id, op });
+            let edit_seqs = self.open_tab_edit_seqs();
+            self.pending_file_move = Some(PendingFileMove {
+                request_id,
+                op,
+                edit_seqs,
+            });
             self.status = String::from("Updating references before the move (Esc to skip)");
             return Ok(());
         }
@@ -45895,6 +45904,15 @@ impl App {
         self.rename_review_boxes_path(old, new);
     }
 
+    /// Every open tab's path and edit counter, in every editor group.
+    fn open_tab_edit_seqs(&self) -> Vec<(PathBuf, u64)> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|tabs| tabs.editors.iter())
+            .filter_map(|e| Some((e.path.clone()?, e.edit_seq)))
+            .collect()
+    }
+
     /// Perform a held rename or move once the servers have answered.
     pub fn drain_will_rename_files(&mut self) -> bool {
         let Some(lsp) = self.lsp.as_ref() else {
@@ -45916,7 +45934,24 @@ impl App {
         let Some(pending) = self.pending_file_move.take() else {
             return false;
         };
+        let now = self.open_tab_edit_seqs();
+        let (edits, stale): (Vec<_>, Vec<_>) = edits.into_iter().partition(|(path, _)| {
+            now.iter()
+                .filter(|(p, _)| p == path)
+                .all(|tab| pending.edit_seqs.contains(tab))
+        });
         self.finish_file_move(pending.op, Some(&edits));
+        if !stale.is_empty() {
+            self.status.push_str(&format!(
+                "; not updated in {} (changed during the wait)",
+                stale
+                    .iter()
+                    .filter_map(|(p, _)| p.file_name())
+                    .map(|n| n.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         true
     }
 

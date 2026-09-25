@@ -50079,6 +50079,43 @@ fn a_rename_edit_under_a_dirty_inactive_tab_stays_an_external_change() {
     );
 }
 
+/// #610: the servers answer for the text they were sent, so a file typed
+/// into while the move was held keeps the typing and does not take their
+/// edit at shifted positions; an untouched open file still takes it.
+#[test]
+fn a_file_edited_during_the_wait_does_not_take_the_held_edit() {
+    for typed in [false, true] {
+        let (_tmp, lib, foo, mut app) = will_rename_fixture();
+        app.editor.open_pinned(&lib).unwrap();
+        let dest = foo.parent().unwrap().join("sub");
+        std::fs::create_dir(&dest).unwrap();
+        app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+        let request_id = app.pending_file_move.as_ref().expect("held").request_id;
+        if typed {
+            app.editor.cursor_row = 0;
+            app.editor.cursor_col = 0;
+            app.editor.insert_char('x');
+        }
+        app.lsp
+            .as_ref()
+            .unwrap()
+            .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+        assert!(app.drain_will_rename_files());
+        assert!(dest.join("foo.rs").exists(), "the move still happens");
+        if typed {
+            assert_eq!(app.editor.lines[0], "xmod foo;");
+            assert!(
+                app.status
+                    .ends_with("; not updated in lib.rs (changed during the wait)"),
+                "{}",
+                app.status
+            );
+        } else {
+            assert_eq!(app.editor.lines[0], "mod bar;");
+        }
+    }
+}
+
 /// #610: Esc stops waiting, the held move goes ahead without an edit, and a
 /// late answer is ignored rather than applied to files that already moved.
 #[test]

@@ -324,7 +324,7 @@ fn start_will_rename(
 /// How long a server may take to answer `willRenameFiles` before the rename
 /// goes ahead without its edit. VS Code's `files.participants.timeout`
 /// default.
-pub const WILL_RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const WILL_RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A `textDocument/prepareRename` verdict (#254). Always answered — the
 /// rename prompt is waiting on it. `unsupported` routes the app to the
