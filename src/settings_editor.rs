@@ -147,9 +147,11 @@ mod tests {
 
     #[test]
     fn rows_cover_every_setting_with_its_kind_and_layer() {
-        let mut prefs = crate::prefs::Prefs::default();
-        prefs.auto_save = true;
-        prefs.problems_scope = String::from("open_files");
+        let prefs = crate::prefs::Prefs {
+            auto_save: true,
+            problems_scope: String::from("open_files"),
+            ..Default::default()
+        };
         let provenance = BTreeMap::from([(String::from("auto_save"), LayerKind::Workspace)]);
         let all = rows(&prefs, &provenance);
         let expected = serde_json::to_value(&prefs)

@@ -49979,3 +49979,134 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+/// An App over `tmp` whose user config lives in `cfg`, never the real one.
+fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.config_dir = cfg.to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::OpenSettingsEditor);
+    assert!(app.settings_editor.is_some(), "the editor opens");
+    app
+}
+
+fn type_query(app: &mut App, q: &str) {
+    for c in q.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
+    // #612: search a setting, Enter edits it in place, the file and the live
+    // session both change, and the row names the layer that set it.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"auto_save\": false\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    let copy = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.key == "copy_on_select")
+        .cloned()
+        .unwrap();
+    assert_eq!(copy.layer, crate::config_layers::LayerKind::Workspace);
+    type_query(&mut app, "auto save");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.key, "auto_save");
+    assert_eq!(row.value, serde_json::json!(false));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["auto_save"], serde_json::json!(true));
+    assert!(app.auto_save, "applied to the live session");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.value, serde_json::json!(true));
+    assert_eq!(row.layer, crate::config_layers::LayerKind::User);
+}
+
+#[test]
+fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.settings_editor.as_ref().unwrap().target,
+        crate::config_layers::LayerKind::Workspace
+    );
+    type_query(&mut app, "format on save");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let ws: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ws["format_on_save"], serde_json::json!(true));
+    assert!(
+        !cfg.path().join("config.json").exists(),
+        "the user layer is untouched"
+    );
+    // A key only the user may set is refused for the workspace.
+    for _ in 0.."format on save".len() {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    type_query(&mut app, "sidebar auto hide");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.contains("user"), "{}", app.status);
+    let ws = std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap();
+    assert!(!ws.contains("sidebar_auto_hide"), "{ws}");
+}
+
+#[test]
+fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::SettingValue { key }) if key == "terminal_scrollback"
+    ));
+    app.close_input_prompt();
+    app.submit_setting_value("terminal_scrollback", "lots");
+    assert!(app.status.contains("number"), "{}", app.status);
+    assert!(!cfg.path().join("config.json").exists());
+    app.submit_setting_value("terminal_scrollback", " 5000 ");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["terminal_scrollback"], serde_json::json!(5000));
+}
