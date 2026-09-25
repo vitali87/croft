@@ -2008,6 +2008,31 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_data_breakpoint_info_request_carries_the_adapters_message() {
+        let (mut session, wire) = DapSession::fake(BTreeMap::new());
+        session.capabilities.data_breakpoints = true;
+        session.request_data_breakpoint_info(7, "x");
+        let seq = wire.sent().pop().unwrap()["seq"].clone();
+        let events = deliver(
+            &mut session,
+            &wire,
+            &[
+                json!({"type": "response", "command": "dataBreakpointInfo", "success": false,
+                     "request_seq": seq, "message": "not supported here"}),
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![DapEvent::DataBreakpointInfo {
+                name: String::from("x"),
+                data_id: None,
+                description: String::from("not supported here"),
+                access_types: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
     fn run_to_cursor_adds_a_temporary_line_and_drops_it_at_the_next_stop() {
         let path = PathBuf::from("/a/b.py");
         let mut bps = BTreeMap::new();

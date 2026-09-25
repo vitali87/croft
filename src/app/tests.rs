@@ -49621,6 +49621,64 @@ fn ctrl_shift_f9_attaches_a_hit_count_and_sends_it() {
     assert_eq!(bp["hitCondition"], ">= 2");
 }
 
+/// Reopening the hit-count popup on a line that has one says "Edit" and
+/// holds the count; the gutter menu says the same. Committing it blank keeps
+/// the breakpoint and sends it without `hitCondition`.
+#[test]
+fn a_hit_count_reopens_for_editing_and_clears_to_a_plain_breakpoint() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("prog.py");
+    std::fs::write(&f, "l1\nl2\nl3\nl4\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_row = 2;
+    let wire = seat_paused_fake_session(&mut app);
+    app.debug_sessions
+        .focused_mut()
+        .unwrap()
+        .capabilities
+        .hit_conditional_breakpoints = true;
+    let chord = key(KeyCode::F(9), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    app.handle_key(chord).unwrap();
+    for c in ">= 2".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        app.editor.last_inner.x,
+        app.editor.last_inner.y + 2,
+    ));
+    let menu = app.context_menu.take().expect("a gutter menu");
+    assert!(
+        menu.items.iter().any(|e| menu_label(e) == "Edit Hit Count"),
+        "the gutter menu offers to edit the existing count"
+    );
+    app.handle_key(chord).unwrap();
+    let prompt = app.prompt.as_ref().expect("a hit-count popup");
+    assert_eq!(prompt.label, "Edit Hit Count · line 3");
+    assert_eq!(prompt.buffer, ">= 2");
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    wire.clear();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, "Plain breakpoint at line 3");
+    assert_eq!(app.editor.breakpoint_lines(&f), vec![3u32]);
+    let sent = sent_of(&wire, "setBreakpoints");
+    let bp = &sent.last().expect("the file's set is sent")["arguments"]["breakpoints"][0];
+    assert_eq!(bp["line"], 3);
+    assert!(bp.get("hitCondition").is_none(), "{bp}");
+}
+
 /// The gutter menu offers "Add Hit Count" for the clicked line, with its
 /// chord, and the popup targets that line.
 #[test]
