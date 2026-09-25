@@ -995,6 +995,8 @@ Loopback-port detection behind the PORTS panel. A stateful output-stream scraper
 
 **Subtree scoping answers only one question.** It says what should be SURFACED, never what is still UP. `poll_all_listening` is the unscoped companion the reconciliation uses, and it returns `None` (no evidence) rather than an empty set when neither tool runs.
 
+**Probes own no tty.** Every `ps`/`lsof`/`ss` the poll spawns goes through `probe`, which `setsid`s the child. The kernel prints a hung-NFS notice ("nfs server X: not responding") on the controlling tty of the process waiting on the mount, and a probe that inherited croft's tty put that text on top of the UI every few seconds. `lsof` also runs with `-b -w`, which skips the `stat` of every mounted file system that stalls on an unreachable server.
+
 ### ports.rs
 
 The panel group's PORTS tab: a registry of detected loopback ports (port, address, process, origin) fed by `port_detect.rs`, with an orange `⇄ host` marker for a forwarded remote port. It is a pure widget handling selection and click hit-testing; the App runs the open, forward, copy and stop actions.
