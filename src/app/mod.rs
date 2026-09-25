@@ -253,6 +253,15 @@ struct PendingFileMove {
     requested_at: std::time::SystemTime,
 }
 
+/// How far a file's modified time can trail the write that set it: some
+/// filesystems keep whole seconds (HFS+, ext3) or two (FAT), rounding a
+/// write just after a `willRenameFiles` request down to before it. A file
+/// counts as unwritten since the request only when its time is at least
+/// this much earlier, so a file written in the moments before the request,
+/// or stamped in the future by a skewed clock, reads as changed: its text
+/// is left alone and named, never overwritten.
+const MTIME_GRANULARITY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// One open text tab when a `willRenameFiles` request went out.
 #[derive(Debug)]
 struct TabStamp {
@@ -269,11 +278,12 @@ struct TabStamp {
 /// disk is unwritten since (`disk_unchanged`: a save clears the dirty flag
 /// but not the change); a file whose tabs all closed since fits when none
 /// of them held unsaved text and, likewise, the disk is unwritten since.
+/// `disk_unchanged` stats the file, so it runs only when those cases need it.
 fn text_unchanged_since(
     before: &[TabStamp],
     now: &[TabStamp],
     path: &Path,
-    disk_unchanged: bool,
+    disk_unchanged: impl Fn() -> bool,
 ) -> bool {
     // Sorted with the dirty flag riding along; the lists compare by
     // counter alone.
@@ -288,10 +298,10 @@ fn text_unchanged_since(
     };
     let (then, now) = (tabs(before), tabs(now));
     if then.is_empty() {
-        return disk_unchanged && now.iter().all(|(_, dirty)| !dirty);
+        return now.iter().all(|(_, dirty)| !dirty) && disk_unchanged();
     }
     if now.is_empty() {
-        return disk_unchanged && then.iter().all(|(_, dirty)| !dirty);
+        return then.iter().all(|(_, dirty)| !dirty) && disk_unchanged();
     }
     then.iter()
         .map(|(seq, _)| seq)
@@ -45994,9 +46004,11 @@ impl App {
         };
         let now = self.open_tab_edit_seqs();
         let (edits, stale): (Vec<_>, Vec<_>) = edits.into_iter().partition(|(path, _)| {
-            let disk_unchanged = std::fs::metadata(path)
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t <= pending.requested_at);
+            let disk_unchanged = || {
+                std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t + MTIME_GRANULARITY <= pending.requested_at)
+            };
             text_unchanged_since(&pending.tabs, &now, path, disk_unchanged)
         });
         // Named before the move, which may carry them to new paths.

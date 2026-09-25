@@ -49577,9 +49577,30 @@ fn will_rename_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, App) {
     let foo = root.join("foo.rs");
     std::fs::write(&lib, "mod foo;\n").unwrap();
     std::fs::write(&foo, "pub fn f() {}\n").unwrap();
+    written_long_ago(&lib);
+    written_long_ago(&foo);
     let app = App::new(root.clone()).unwrap();
     app.lsp.as_ref().unwrap().set_will_rename_listeners(true);
     (tmp, lib, foo, app)
+}
+
+/// Sets `path`'s modified time a minute back: a file written just before a
+/// `willRenameFiles` request reads as changed during the wait (its time can
+/// be rounded), so a fixture's files must look older than that.
+fn written_long_ago(path: &Path) {
+    set_mtime(
+        path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+    );
+}
+
+fn set_mtime(path: &Path, at: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
 }
 
 fn mod_foo_to_bar(request_id: u64, lib: &Path) -> crate::lsp::manager::WillRenameFilesResult {
@@ -49860,6 +49881,7 @@ fn a_mixed_finder_drop_moves_the_outside_file_and_the_workspace_path() {
 fn a_rename_edit_skips_a_diverged_copy_in_another_group() {
     let (_tmp, _lib, foo, mut app) = will_rename_fixture();
     std::fs::write(&foo, "pub fn f() {}\npub fn k() {}\n").unwrap();
+    written_long_ago(&foo);
     app.editor.open_pinned(&foo).unwrap();
     app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
     app.editor.lines.insert(0, String::from("// x"));
@@ -50151,9 +50173,9 @@ fn a_held_edit_fits_only_the_text_it_was_computed_for() {
         dirty,
     };
     let fits =
-        |before: &[TabStamp], now: &[TabStamp]| text_unchanged_since(before, now, path, true);
+        |before: &[TabStamp], now: &[TabStamp]| text_unchanged_since(before, now, path, || true);
     let written =
-        |before: &[TabStamp], now: &[TabStamp]| text_unchanged_since(before, now, path, false);
+        |before: &[TabStamp], now: &[TabStamp]| text_unchanged_since(before, now, path, || false);
     assert!(fits(
         &[tab(1, false), tab(2, true)],
         &[tab(2, true), tab(1, false)]
@@ -50187,11 +50209,11 @@ fn a_file_saved_during_the_wait_keeps_its_text() {
     let nested = root.join("src").join("lib.rs");
     std::fs::create_dir(nested.parent().unwrap()).unwrap();
     std::fs::write(&nested, "mod foo;\n").unwrap();
+    written_long_ago(&nested);
     let dest = root.join("sub");
     std::fs::create_dir(&dest).unwrap();
     app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
     let request_id = app.pending_file_move.as_ref().expect("held").request_id;
-    std::thread::sleep(std::time::Duration::from_millis(20));
     app.editor.open_pinned(&nested).unwrap();
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 0;
@@ -50219,6 +50241,37 @@ fn a_file_saved_during_the_wait_keeps_its_text() {
     );
 }
 
+/// #610: a file never opened but written by another program during the
+/// wait keeps its text and is named, even when its filesystem rounded the
+/// write's time down to before the request.
+#[test]
+fn a_file_written_elsewhere_during_the_wait_keeps_its_text() {
+    let (_tmp, lib, foo, mut app) = will_rename_fixture();
+    let dest = foo.parent().unwrap().join("sub");
+    std::fs::create_dir(&dest).unwrap();
+    app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
+    let pending = app.pending_file_move.as_ref().expect("held");
+    let (request_id, requested_at) = (pending.request_id, pending.requested_at);
+    std::fs::write(&lib, "mod foo;\n// kept\n").unwrap();
+    set_mtime(&lib, requested_at - std::time::Duration::from_secs(1));
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .answer_will_rename_files(mod_foo_to_bar(request_id, &lib));
+    assert!(app.drain_will_rename_files());
+    assert_eq!(
+        std::fs::read_to_string(&lib).unwrap(),
+        "mod foo;\n// kept\n"
+    );
+    assert!(dest.join("foo.rs").exists());
+    assert!(
+        app.status
+            .ends_with("; not updated in lib.rs (changed during the wait)"),
+        "{}",
+        app.status
+    );
+}
+
 /// #610: every file that changed during the wait is named, in the order
 /// the servers listed them.
 #[test]
@@ -50228,6 +50281,7 @@ fn every_file_changed_during_the_wait_is_named() {
     let nested = root.join("src").join("lib.rs");
     std::fs::create_dir(nested.parent().unwrap()).unwrap();
     std::fs::write(&nested, "mod foo;\n").unwrap();
+    written_long_ago(&nested);
     let dest = root.join("sub");
     std::fs::create_dir(&dest).unwrap();
     app.apply_paste_or_drop(&dest, std::slice::from_ref(&foo), ExplorerClipMode::Cut);
