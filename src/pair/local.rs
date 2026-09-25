@@ -317,6 +317,73 @@ fn ceiling_msg() -> String {
     )
 }
 
+/// One short, non-streaming `/v1/messages` call (#607): `system` and a
+/// single user message in, the reply's text out. Same credential and
+/// redirect rules as a pair turn; `deadline` bounds the whole exchange.
+#[allow(dead_code)] // called from the next layer of this change
+pub(crate) fn complete_once(
+    base_url: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let req = json!({
+        "model": model,
+        "max_tokens": 256,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    });
+    let agent = ureq3::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+    let (api_key, bearer) = auth_for(base_url, token.as_deref());
+    let mut post = agent
+        .post(format!("{base_url}/v1/messages"))
+        .config()
+        .timeout_global(Some(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ))
+        .build()
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-api-key", &api_key);
+    if let Some(bearer) = &bearer {
+        post = post.header("authorization", bearer);
+    }
+    let resp = post
+        .send(req.to_string())
+        .map_err(|e| format!("local endpoint {base_url}: {}", error_detail(&e)))?;
+    let status = resp.status().as_u16();
+    if (300..400).contains(&status) {
+        return Err(format!(
+            "local endpoint {base_url}: redirect refused (status {status})"
+        ));
+    }
+    let body = resp.into_body().read_to_string().unwrap_or_default();
+    if status >= 400 {
+        return Err(format!(
+            "local endpoint {base_url}: {}",
+            status_detail(status, &body)
+        ));
+    }
+    let v: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("local endpoint {base_url}: unreadable reply: {e}"))?;
+    Ok(v.get("content")
+        .and_then(|c| c.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<String>()
+        })
+        .unwrap_or_default())
+}
+
 /// The failure text for a transport error. HTTP statuses never land here
 /// (`http_status_as_error(false)` returns them as responses, handled by
 /// [`status_detail`]). Only the GLOBAL timeout is the turn ceiling; the 5
@@ -401,5 +468,40 @@ mod tests {
             global.contains("10 minute"),
             "the ceiling text names the enforced duration: {global}"
         );
+    }
+
+    #[test]
+    fn a_one_shot_completion_returns_the_replys_text() {
+        let body =
+            r#"{"content":[{"type":"text","text":"items"},{"type":"text","text":".len()"}]}"#;
+        let (url, server) = crate::pair::tests::serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        assert_eq!(
+            complete_once(&url, "m", "sys", "user", deadline).as_deref(),
+            Ok("items.len()")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_one_shot_completion_reports_a_refusal_or_a_redirect() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let body = r#"{"error":{"message":"model 'm' not found"}}"#;
+        let (url, server) = crate::pair::tests::serve_http_once(format!(
+            "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+        let err = complete_once(&url, "m", "sys", "user", deadline).unwrap_err();
+        assert!(err.contains("404") || err.contains("not found"), "{err}");
+        server.join().unwrap();
+        let (url, server) = crate::pair::tests::serve_http_once(String::from(
+            "HTTP/1.1 302 Found\r\nlocation: http://evil.example/\r\ncontent-length: 0\r\n\r\n",
+        ));
+        let err = complete_once(&url, "m", "sys", "user", deadline).unwrap_err();
+        assert!(err.contains("redirect"), "{err}");
+        server.join().unwrap();
     }
 }
