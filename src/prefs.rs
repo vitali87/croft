@@ -350,12 +350,23 @@ pub struct Prefs {
     pub notifications: Vec<NotificationSink>,
 }
 
+/// The `config.json` that [`Prefs::load_or_default`] reads, or `None` in
+/// test builds: the user's real `config.json` must never steer a test
+/// (#624), the same rule `config_layers::load_merged` applies to the
+/// settings layers.
+fn saved_prefs_path() -> Option<PathBuf> {
+    (!cfg!(test)).then(config_path)
+}
+
 impl Prefs {
     /// Load preferences from `config_path()`, falling back to defaults when
     /// the file is absent or unreadable. Preferences are best-effort: a
-    /// corrupt config should never block startup.
+    /// corrupt config should never block startup. Test builds always get
+    /// the defaults (see [`saved_prefs_path`]).
     pub fn load_or_default() -> Self {
-        Self::load(&config_path()).unwrap_or_default()
+        saved_prefs_path()
+            .and_then(|p| Self::load(&p).ok())
+            .unwrap_or_default()
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -448,14 +459,38 @@ pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
     prefs.save(&path)
 }
 
-/// Record (trust-on-first-use) the fingerprint of the tool a command calls,
-/// preserving other settings. Best-effort: a write failure is swallowed.
-pub fn save_mcp_tool_fingerprint(command_id: &str, fingerprint: &str) -> Result<()> {
-    let path = config_path();
+/// Trust-on-first-use check of the tool a command calls, under an explicit
+/// config dir (see [`save_mcp_consent_in`] for why the dir is a parameter).
+/// The first fingerprint seen for `command_id` is recorded, preserving other
+/// settings (best-effort: a write failure is swallowed); false when a
+/// different one was recorded before, meaning the tool definition changed.
+pub fn trust_mcp_tool_in(config_dir: &Path, command_id: &str, fingerprint: &str) -> bool {
+    let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
+    match prefs.mcp_tool_fingerprints.get(command_id) {
+        Some(prev) => prev == fingerprint,
+        None => {
+            prefs
+                .mcp_tool_fingerprints
+                .insert(command_id.to_string(), fingerprint.to_string());
+            let _ = prefs.save(&path);
+            true
+        }
+    }
+}
+
+/// Forget the recorded tool fingerprints of `command_ids`, so each tool is
+/// trusted afresh on its next run; see [`trust_mcp_tool_in`].
+pub fn forget_mcp_tool_fingerprints_in(config_dir: &Path, command_ids: &[String]) -> Result<()> {
+    let path = config_dir.join("config.json");
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    let before = prefs.mcp_tool_fingerprints.len();
     prefs
         .mcp_tool_fingerprints
-        .insert(command_id.to_string(), fingerprint.to_string());
+        .retain(|id, _| !command_ids.contains(id));
+    if prefs.mcp_tool_fingerprints.len() == before {
+        return Ok(());
+    }
     prefs.save(&path)
 }
 
@@ -689,6 +724,50 @@ pub(crate) fn config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #624: a test build reads no saved `config.json`, so the MCP
+    /// consents, the terminal warning and the extension toggles that
+    /// `load_or_default` feeds are the defaults on every machine.
+    #[test]
+    fn a_test_build_reads_no_saved_prefs() {
+        assert_eq!(saved_prefs_path(), None);
+        assert_eq!(Prefs::load_or_default(), Prefs::default());
+    }
+
+    #[test]
+    fn an_mcp_tool_is_trusted_on_first_use_and_refused_once_it_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        save_mcp_consent_in(dir, "ext").unwrap();
+        assert!(trust_mcp_tool_in(dir, "ext.cmd", "fp1"));
+        assert!(trust_mcp_tool_in(dir, "ext.cmd", "fp1"));
+        assert!(!trust_mcp_tool_in(dir, "ext.cmd", "fp2"));
+        let saved = Prefs::load(&dir.join("config.json")).unwrap();
+        assert_eq!(
+            saved
+                .mcp_tool_fingerprints
+                .get("ext.cmd")
+                .map(String::as_str),
+            Some("fp1")
+        );
+        assert!(
+            saved.mcp_consented.contains("ext"),
+            "other settings survive"
+        );
+    }
+
+    /// Forgetting a command's fingerprint re-approves its tool: the next
+    /// fingerprint seen is trusted, and other commands keep theirs.
+    #[test]
+    fn a_forgotten_fingerprint_is_trusted_afresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(trust_mcp_tool_in(dir, "ext.cmd", "fp1"));
+        assert!(trust_mcp_tool_in(dir, "other.cmd", "o1"));
+        forget_mcp_tool_fingerprints_in(dir, &[String::from("ext.cmd")]).unwrap();
+        assert!(trust_mcp_tool_in(dir, "ext.cmd", "fp2"));
+        assert!(!trust_mcp_tool_in(dir, "other.cmd", "o2"));
+    }
 
     #[test]
     fn round_trips_theme_through_disk() {

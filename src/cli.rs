@@ -68,6 +68,29 @@ pub struct Cli {
     pub command: Option<CliCommand>,
 }
 
+/// `croft hook ...`.
+#[derive(Subcommand, Debug)]
+pub enum HookAction {
+    /// Register `croft hook claude-code` as Claude Code's `PreToolUse` hook
+    /// for Edit, Write and MultiEdit. Prints the settings diff before
+    /// writing it.
+    Install {
+        /// Install into `~/.claude/settings.json` (every project).
+        #[arg(long, conflicts_with = "project")]
+        global: bool,
+        /// Install into `./.claude/settings.json` (this project; the default).
+        #[arg(long)]
+        project: bool,
+        /// Remove croft's entry instead, restoring the file install replaced
+        /// when nothing else has changed it since.
+        #[arg(long)]
+        uninstall: bool,
+    },
+    /// The hook itself: reads Claude Code's payload on stdin and answers
+    /// with the running croft's decision. Not meant to be run by hand.
+    ClaudeCode,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum CliCommand {
     /// Set macOS Terminal.app's default profile font to a Nerd Font.
@@ -314,6 +337,11 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         rebuild: bool,
     },
+    /// Route a coding agent's file edits through croft for approval (#346).
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
     /// One-time setup for the cross-compile fast path used by `croft <host>`:
     /// installs cargo-zigbuild and adds the two rustup targets croft ships
     /// binaries for (x86_64 / aarch64 musl). After this finishes, the
@@ -529,6 +557,15 @@ impl Cli {
             Some(CliCommand::Edit { path, wait }) => {
                 if let Err(e) = crate::view_ipc::edit(&path, wait, &crate::app::croft_cache_dir()) {
                     eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            Some(CliCommand::Hook { action }) => {
+                // Printed and exited, like `view`: a one-line reason, never
+                // anyhow's backtrace.
+                if let Err(e) = hook_command(action) {
+                    eprintln!("croft hook: {e}");
                     std::process::exit(1);
                 }
                 Ok(())
@@ -938,6 +975,47 @@ end tell"#
     println!("Set Terminal.app default profile font to {font} at {size}pt.");
     println!("Quit Terminal.app entirely (cmd+Q) and reopen it for the change to take effect.");
     Ok(())
+}
+
+fn hook_command(action: HookAction) -> std::result::Result<(), String> {
+    use crate::agent_hook::{self, Outcome, Scope};
+    match action {
+        HookAction::ClaudeCode => agent_hook::run_claude_code(
+            &mut std::io::stdin(),
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+            agent_hook::ANSWER_WINDOW,
+        ),
+        HookAction::Install {
+            global, uninstall, ..
+        } => {
+            let scope = if global {
+                Scope::Global
+            } else {
+                Scope::Project
+            };
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or("HOME is not set")?;
+            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+            let path = agent_hook::settings_path(scope, &home, &cwd);
+            let records = agent_hook::default_record_dir();
+            let show = |d: &str| print!("{d}");
+            let outcome = if uninstall {
+                agent_hook::uninstall(&path, &records, show)?
+            } else {
+                agent_hook::install(&path, &records, show)?
+            };
+            match (outcome, uninstall) {
+                (Outcome::Unchanged, false) => {
+                    println!("croft's hook is already in {}", path.display())
+                }
+                (Outcome::Unchanged, true) => println!("no croft hook in {}", path.display()),
+                (Outcome::Changed { .. }, _) => println!("wrote {}", path.display()),
+            }
+            Ok(())
+        }
+    }
 }
 
 fn keys_diagnostic(mouse: bool) -> Result<()> {
@@ -1754,6 +1832,32 @@ mod tests {
         let (root, open, _) = resolve_workspace(&file, Some(other.clone())).unwrap();
         assert_eq!(root, dir.path().canonicalize().unwrap());
         assert_eq!(open, Some(other));
+    }
+
+    #[test]
+    fn parses_hook_install_and_the_hook_itself() {
+        let cli =
+            Cli::try_parse_from(["croft", "hook", "install", "--global", "--uninstall"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Hook {
+                action: HookAction::Install {
+                    global: true,
+                    project: false,
+                    uninstall: true
+                }
+            })
+        ));
+        let cli = Cli::try_parse_from(["croft", "hook", "claude-code"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Hook {
+                action: HookAction::ClaudeCode
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["croft", "hook", "install", "--global", "--project"]).is_err()
+        );
     }
 
     #[test]

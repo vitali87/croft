@@ -20357,6 +20357,12 @@ impl App {
         }
         let _ =
             crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
+        // Turning an extension off forgets its tools' fingerprints, so
+        // turning it back on re-approves a tool whose definition changed.
+        if !now_enabled {
+            let ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, &id);
+            let _ = crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &ids);
+        }
         self.refresh_extensions();
         self.status = format!(
             "{} extension '{id}'",
@@ -20399,8 +20405,13 @@ impl App {
     /// Perform the confirmed uninstall (the popup's Enter path). Removes the
     /// catalog/index-installed manifest and refreshes the panel.
     fn perform_extension_uninstall(&mut self, id: &str) {
+        // Read before the manifest goes: a re-add of a newer version must
+        // approve its tools afresh, like its consent below.
+        let command_ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, id);
         match crate::mcp::catalog::uninstall_in(&self.config_dir.join("extensions"), id) {
             Ok(()) => {
+                let _ =
+                    crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &command_ids);
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
                 if self.disabled_extensions.remove(id) {
@@ -36519,11 +36530,18 @@ impl App {
         self.mcp_busy_label = Some(label.clone());
         self.status = label.clone();
         let cwd = self.workspace_root().to_path_buf();
+        let config_dir = self.config_dir.clone();
         let version = env!("CARGO_PKG_VERSION").to_string();
         let _ = std::thread::Builder::new()
             .name("mcp-cmd".into())
             .spawn(move || {
-                let _ = tx.send(run_mcp_command_blocking(&resolved, arg, &cwd, &version));
+                let _ = tx.send(run_mcp_command_blocking(
+                    &resolved,
+                    arg,
+                    &cwd,
+                    &config_dir,
+                    &version,
+                ));
             });
     }
 
@@ -52112,6 +52130,23 @@ fn resolve_mcp_program(
     }
 }
 
+/// The trust-on-first-use gate on a contributed command's MCP tool: an
+/// error naming the recovery when `fingerprint` differs from the one first
+/// recorded for `command_id` under `config_dir`.
+fn mcp_tool_trust(
+    config_dir: &Path,
+    command_id: &str,
+    tool: &str,
+    fingerprint: &str,
+) -> Result<(), String> {
+    if crate::prefs::trust_mcp_tool_in(config_dir, command_id, fingerprint) {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to run: the '{tool}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve"
+    ))
+}
+
 /// Run a resolved MCP command to completion on a worker thread: provision +
 /// spawn the server, verify the tool definition (trust-on-first-use rug-pull
 /// guard), call the tool, and return its text. Pure blocking; the caller sends
@@ -52120,6 +52155,7 @@ fn run_mcp_command_blocking(
     resolved: &crate::mcp::registry::ResolvedCommand,
     arg: Option<String>,
     cwd: &Path,
+    config_dir: &Path,
     version: &str,
 ) -> crate::mcp::McpOutcome {
     use serde_json::json;
@@ -52162,19 +52198,12 @@ fn run_mcp_command_blocking(
             ));
         }
         let fingerprint = crate::mcp::client::tool_fingerprint(&list, &resolved.tool);
-        let prefs = crate::prefs::Prefs::load_or_default();
-        match prefs.mcp_tool_fingerprints.get(&resolved.command_id) {
-            Some(prev) if prev != &fingerprint => {
-                return Err(format!(
-                    "refusing to run: the '{}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve",
-                    resolved.tool
-                ));
-            }
-            Some(_) => {}
-            None => {
-                let _ = crate::prefs::save_mcp_tool_fingerprint(&resolved.command_id, &fingerprint);
-            }
-        }
+        mcp_tool_trust(
+            config_dir,
+            &resolved.command_id,
+            &resolved.tool,
+            &fingerprint,
+        )?;
 
         let arguments = match (resolved.arg.as_ref(), arg) {
             (Some(name), Some(value)) => json!({ name.as_str(): value }),

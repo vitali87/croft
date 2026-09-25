@@ -1,4 +1,5 @@
 mod a11y;
+mod agent_hook;
 mod agent_lane;
 mod agents;
 mod ansi_text;
@@ -75,6 +76,7 @@ mod remote_connect;
 mod review_ops;
 mod review_threads;
 mod rewind;
+mod sarif;
 mod scrubber;
 mod search_editor;
 mod session;
