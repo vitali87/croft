@@ -52,7 +52,10 @@ fn lens_from(raw: &Value) -> Option<Lens> {
     let action = match command["command"].as_str() {
         Some(name) => classify(
             name,
-            command["arguments"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+            command["arguments"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
             line,
             col,
         ),
@@ -97,6 +100,25 @@ pub fn classify(command: &str, arguments: &[Value], line: usize, col: usize) -> 
     }
 }
 
+/// A lens title as shown: codicon references (`$(play)`) dropped, since
+/// the terminal has no icon font to resolve them against.
+pub fn display_title(title: &str) -> String {
+    let mut out = String::new();
+    let mut rest = title;
+    while let Some(i) = rest.find("$(") {
+        out.push_str(&rest[..i]);
+        match rest[i..].find(')') {
+            Some(j) => rest = &rest[i + j + 1..],
+            None => {
+                rest = &rest[i..];
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,11 +147,14 @@ mod tests {
         let lens = parse_lenses(&json!([{"range": {"start": {"line": 2, "character": 0},
             "end": {"line": 2, "character": 1}}, "data": 7}]))
         .remove(0);
-        let r = resolved(&lens, &json!({"range": {"start": {"line": 2, "character": 0},
+        let r = resolved(
+            &lens,
+            &json!({"range": {"start": {"line": 2, "character": 0},
             "end": {"line": 2, "character": 1}}, "command": {"title": "▶ Run Test",
             "command": "rust-analyzer.runSingle",
             "arguments": [{"label": "test parse::a", "kind": "cargo",
-                           "args": {"executableArgs": ["parse::a", "--exact"]}}]}}));
+                           "args": {"executableArgs": ["parse::a", "--exact"]}}]}}),
+        );
         assert_eq!(r.title.as_deref(), Some("▶ Run Test"));
         assert_eq!(r.action, LensAction::RunTest("parse::a".into()));
         assert_eq!(r.line, 2);
@@ -145,18 +170,34 @@ mod tests {
                 2,
             )
         };
-        assert_eq!(ra("rust-analyzer.runSingle"), LensAction::RunTest("m::t".into()));
-        assert_eq!(ra("rust-analyzer.debugSingle"), LensAction::DebugTest("m::t".into()));
+        assert_eq!(
+            ra("rust-analyzer.runSingle"),
+            LensAction::RunTest("m::t".into())
+        );
+        assert_eq!(
+            ra("rust-analyzer.debugSingle"),
+            LensAction::DebugTest("m::t".into())
+        );
         assert_eq!(
             classify("rust-analyzer.showReferences", &[], 5, 6),
             LensAction::References { line: 5, col: 6 }
         );
-        assert_eq!(classify("gopls.run_tests", &[json!({"Tests": ["TestX"]})], 0, 0), LensAction::RunTest("TestX".into()));
+        assert_eq!(
+            classify("gopls.run_tests", &[json!({"Tests": ["TestX"]})], 0, 0),
+            LensAction::RunTest("TestX".into())
+        );
         assert_eq!(classify("some.server.thing", &[], 0, 0), LensAction::None);
         assert_eq!(
             classify("rust-analyzer.runSingle", &[json!({"args": {}})], 0, 0),
             LensAction::None,
             "no test name, nothing croft can run"
         );
+    }
+
+    #[test]
+    fn titles_lose_codicon_references() {
+        assert_eq!(display_title("$(play) Run Test"), "Run Test");
+        assert_eq!(display_title("3 references"), "3 references");
+        assert_eq!(display_title("a $(x) b $(unclosed"), "a  b $(unclosed");
     }
 }

@@ -182,7 +182,7 @@ Click a segment to change it. The indentation pill opens VS Code's Select Indent
 
 ## Language servers
 
-The editor speaks LSP for completion, hover, go-to-definition / references / implementations, rename, document formatting (`Cmd`+`Opt`+`Shift`+`F`), quick fixes / code actions (`Cmd`+`.`: auto-import, fix-all, organize imports, and refactors, picked from a menu and applied as one undo step, with `codeAction/resolve` for servers that defer the edit), and diagnostics. Each is anchored at the file's own project root, so monorepo sub-projects resolve correctly.
+The editor speaks LSP for completion, hover, go-to-definition / references / implementations, rename, document formatting (`Cmd`+`Opt`+`Shift`+`F`), quick fixes / code actions (`Cmd`+`.`: auto-import, fix-all, organize imports, and refactors, picked from a menu and applied as one undo step, with `codeAction/resolve` for servers that defer the edit), and diagnostics. Each is anchored at the file's own project root, so monorepo sub-projects resolve correctly. A server's CodeLenses ("3 references", "Run Test | Debug") appear dimmed after their line's text. The ones croft can carry out are underlined: references open the references picker, and run or debug a test goes through the Testing view. The rest are shown as text. "Editor: Toggle CodeLens" hides them.
 
 Which server runs per language:
 

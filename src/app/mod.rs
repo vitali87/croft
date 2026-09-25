@@ -7043,6 +7043,7 @@ impl App {
             // silent when no server advertises a colorProvider, which is
             // what keeps the swatches from ever appearing unadvertised.
             lsp.request_document_colors(path.clone(), seq);
+            lsp.request_code_lens(path.clone(), seq);
             self.lsp_last_seen.insert(path, seq);
         }
         let closed: Vec<PathBuf> = self
@@ -8269,6 +8270,56 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Fresh CodeLens sets (#608), seq-gated like every per-document
+    /// result, onto the active editor and any other group showing the file.
+    pub fn drain_lsp_code_lens(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        while let Some(u) = lsp.drain_code_lens() {
+            updates.push(u);
+        }
+        let mut changed = false;
+        for u in updates {
+            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+                continue;
+            }
+            if self.editor.path.as_deref() == Some(u.path.as_path()) {
+                self.editor
+                    .apply_code_lens(u.path.clone(), u.lenses.clone());
+                changed = true;
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(u.path.as_path()) {
+                    group.apply_code_lens(u.path.clone(), u.lenses.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Carry out a clicked CodeLens (#608) with croft's own machinery.
+    fn run_lens_action(&mut self, action: crate::lsp::code_lens::LensAction) {
+        use crate::lsp::code_lens::LensAction;
+        match action {
+            LensAction::References { line, col } => {
+                self.focus_pane(Pane::Editor);
+                self.editor.clear_selection();
+                self.editor.cursor_row = line.min(self.editor.lines.len().saturating_sub(1));
+                // The server's column is in UTF-16 units.
+                self.editor.cursor_col = self
+                    .editor
+                    .utf16_col_to_char_pub(self.editor.cursor_row, col as u32);
+                self.request_references_at_cursor();
+            }
+            LensAction::RunTest(name) => self.run_named_test(name),
+            LensAction::DebugTest(name) => self.debug_named_test(name),
+            LensAction::None => {}
+        }
     }
 
     /// Drain document-color batches (#254) into every editor showing the
@@ -35709,6 +35760,14 @@ impl App {
                 }
                 None => self.status = String::from("No file in the active tab"),
             },
+            Cmd::ToggleCodeLens => {
+                self.editor.code_lens_enabled = !self.editor.code_lens_enabled;
+                self.status = if self.editor.code_lens_enabled {
+                    String::from("CodeLens shown")
+                } else {
+                    String::from("CodeLens hidden")
+                };
+            }
             Cmd::ReopenAsText => match self.editor.path.clone() {
                 // Merge editor (#253): back to the in-buffer marker flow.
                 // The Result buffer is deliberately discarded — it was
@@ -39409,6 +39468,20 @@ impl App {
                 // placement there serves nobody. A stale span cannot
                 // mis-fire — `resolve_conflict_at` re-validates the row
                 // against the live conflict set.
+                // A clicked CodeLens (#608): same per-frame span rule as the
+                // merge lenses below.
+                if in_editor && self.editor.diff.is_none() {
+                    let lens = self
+                        .editor
+                        .lens_action_spans
+                        .iter()
+                        .find(|(y, xs, _)| *y == m.row && xs.contains(&m.column))
+                        .map(|(_, _, action)| action.clone());
+                    if let Some(action) = lens {
+                        self.run_lens_action(action);
+                        return;
+                    }
+                }
                 if in_editor && self.editor.diff.is_none() {
                     let hit = self
                         .editor
@@ -50508,6 +50581,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let folds_changed = app.drain_lsp_folding_ranges();
         let selection_ranges_changed = app.drain_lsp_selection_ranges();
         let colors_changed = app.drain_lsp_document_colors();
+        let lens_changed = app.drain_lsp_code_lens();
         let color_pres_changed = app.drain_lsp_color_presentations();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
@@ -50609,6 +50683,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || folds_changed
             || selection_ranges_changed
             || colors_changed
+            || lens_changed
             || color_pres_changed
             || diagnostics_changed
             || progress_changed

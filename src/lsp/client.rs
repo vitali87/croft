@@ -1099,6 +1099,34 @@ impl LspClient {
             .context("code_action_resolve")
     }
 
+    /// `textDocument/codeLens` (#608), as JSON for `code_lens::parse_lenses`.
+    pub async fn code_lens(&mut self, uri: Url) -> Result<serde_json::Value> {
+        let lenses = self
+            .server
+            .code_lens(lsp_types::CodeLensParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("codeLens")?;
+        Ok(serde_json::to_value(lenses)?)
+    }
+
+    /// `codeLens/resolve` for one lens as the server sent it.
+    pub async fn code_lens_resolve(
+        &mut self,
+        lens: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let lens: lsp_types::CodeLens = serde_json::from_value(lens)?;
+        let resolved = self
+            .server
+            .code_lens_resolve(lens)
+            .await
+            .context("codeLens/resolve")?;
+        Ok(serde_json::to_value(resolved)?)
+    }
+
     /// `workspace/executeCommand`: run a command a code action asked for (some
     /// actions perform their effect through a command rather than an edit).
     pub async fn execute_command(
