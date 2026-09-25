@@ -57,6 +57,7 @@ mod plot;
 mod port_detect;
 mod prefs;
 mod problem_matchers;
+mod profiles;
 mod provenance;
 mod quick_select;
 mod quickfix;
