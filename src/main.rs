@@ -30,6 +30,7 @@ mod history;
 mod http_file;
 mod icons;
 mod import_vscode;
+mod inline_complete;
 mod install_session;
 mod iterm2;
 mod iterm2_inline;
