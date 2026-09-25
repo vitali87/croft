@@ -13,6 +13,7 @@ pub mod locate;
 pub mod model;
 pub mod parse;
 pub mod registry;
+pub mod watch;
 pub mod worker;
 
 /// Status-bar message for a run gesture refused because no enabled runner

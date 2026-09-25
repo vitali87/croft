@@ -48,7 +48,12 @@ pub enum RowHit {
     ShowCase(String),
     /// The play glyph of a suite header: run the whole suite.
     RunSuite(String),
+    /// A row's eye glyph: watch that test or suite, or stop (#263).
+    ToggleWatch(crate::testing::watch::WatchScope),
 }
+
+/// The watch toggle's glyph (codicon `eye`).
+const GLYPH_WATCH: char = '\u{ea70}';
 
 pub struct TestingPanel {
     /// All known cases, kept sorted by name; status is updated in place as
@@ -67,6 +72,13 @@ pub struct TestingPanel {
     /// A run just ended red; consumed once by the app (#358), so a failing
     /// run notifies once, not once per test.
     failed_run: bool,
+    /// A run or discovery just ended, with its `ok`; consumed once by the
+    /// app to judge a watched rerun (#263).
+    finished: Option<Option<bool>>,
+    /// Watch mode (#263): what reruns on save.
+    pub watch: crate::testing::watch::TestWatch,
+    /// The header's watch-all toggle, as last drawn.
+    pub last_watch_all: Rect,
     /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
     /// a long compile shows movement instead of a static "Discovering tests".
     progress: Option<String>,
@@ -101,6 +113,9 @@ impl TestingPanel {
             last_run_ok: None,
             run_reported_failed: false,
             failed_run: false,
+            finished: None,
+            watch: crate::testing::watch::TestWatch::default(),
+            last_watch_all: Rect::default(),
             progress: None,
             refused: false,
             prerun: Vec::new(),
@@ -148,6 +163,9 @@ impl TestingPanel {
         self.refused = false;
         self.prerun.clear();
         self.scroll = 0;
+        self.finished = None;
+        // The watched names described the old project.
+        self.watch.clear();
     }
 
     /// Update the live compile-progress line shown while busy.
@@ -255,6 +273,26 @@ impl TestingPanel {
         if ok == Some(false) {
             self.failed_run = true;
         }
+        self.finished = Some(ok);
+    }
+
+    /// Consume the run-ended latch: `Some(ok)` once per finished run.
+    pub fn take_finished(&mut self) -> Option<Option<bool>> {
+        self.finished.take()
+    }
+
+    /// The first failing case, in tree order.
+    pub fn first_failed(&self) -> Option<String> {
+        self.cases
+            .iter()
+            .find(|c| c.status == TestStatus::Failed)
+            .map(|c| c.name.clone())
+    }
+
+    /// The column of the rows' watch glyph: the last one before the
+    /// scrollbar lane. Render and hit-test both use it.
+    fn watch_col(&self) -> u16 {
+        self.last_area.x + self.last_area.width.saturating_sub(3)
     }
 
     /// Consume the failed-run latch (one notification per red run). Cleared
@@ -394,7 +432,17 @@ impl TestingPanel {
         }
         let inner_x = self.last_area.x + 1;
         let shown = (y - self.first_row_y) as usize;
-        match self.rows.get(self.scroll + shown)? {
+        let row = self.rows.get(self.scroll + shown)?;
+        if x == self.watch_col() {
+            use crate::testing::watch::WatchScope;
+            return Some(RowHit::ToggleWatch(match row {
+                RenderRow::Case(idx) => WatchScope::Test(self.cases[*idx].name.clone()),
+                RenderRow::Header(idx) => {
+                    WatchScope::Suite(self.cases[*idx].suite_and_leaf().0?.to_string())
+                }
+            }));
+        }
+        match row {
             RenderRow::Case(idx) => {
                 let name = self.cases[*idx].name.clone();
                 if x < inner_x + 4 {
@@ -497,11 +545,32 @@ impl Widget for &mut TestingPanel {
         // scrollbar (drawn at `right - 1`) has its own column and no string
         // bleeds past the panel into the neighbouring pane.
         let right = inner.x + inner.width;
-        let text_right = right.saturating_sub(1);
-        // Column budget up to the scrollbar lane. `set_stringn` clips by
-        // DISPLAY width, so a double-width (CJK) name stops at the budget
-        // instead of painting twice it and bleeding through the border.
-        let avail = |start_x: u16| text_right.saturating_sub(start_x) as usize;
+        // Column budget up to the watch glyphs, which sit just left of the
+        // scrollbar lane. `set_stringn` clips by DISPLAY width, so a
+        // double-width (CJK) name stops at the budget instead of painting
+        // twice it and bleeding through the border.
+        let watch_col = self.watch_col();
+        let avail = |start_x: u16| watch_col.saturating_sub(start_x + 1) as usize;
+        let theme = self.theme;
+        let eye = move |watched: bool| {
+            let color = if watched {
+                theme.accent()
+            } else {
+                theme.ui(COLOR_DIM)
+            };
+            (GLYPH_WATCH.to_string(), Style::default().fg(color))
+        };
+        {
+            use crate::testing::watch::WatchScope;
+            let (glyph, style) = eye(self.watch.is_watching(&WatchScope::All));
+            buf.set_string(watch_col, inner.y, glyph, style);
+            self.last_watch_all = Rect {
+                x: watch_col,
+                y: inner.y,
+                width: 1,
+                height: 1,
+            };
+        }
 
         // Summary line: busy state, the pass/fail/skip tally, or a kickoff hint.
         let (passed, failed, skipped) = self.counts();
@@ -614,6 +683,9 @@ impl Widget for &mut TestingPanel {
                             .fg(self.theme.ui(COLOR_HEADER))
                             .add_modifier(Modifier::BOLD),
                     );
+                    let scope = crate::testing::watch::WatchScope::Suite(suite.to_string());
+                    let (glyph, style) = eye(self.watch.is_watching(&scope));
+                    buf.set_string(watch_col, y, glyph, style);
                 }
                 RenderRow::Case(case_idx) => {
                     let case = &self.cases[*case_idx];
@@ -632,6 +704,9 @@ impl Widget for &mut TestingPanel {
                         avail(inner.x + 4),
                         Style::default().fg(self.theme.ui(COLOR_CASE)),
                     );
+                    let scope = crate::testing::watch::WatchScope::Test(case.name.clone());
+                    let (glyph, style) = eye(self.watch.is_watching(&scope));
+                    buf.set_string(watch_col, y, glyph, style);
                 }
             }
         }
@@ -1076,5 +1151,42 @@ mod tests {
         assert_eq!(running, ["suite_a::one", "suite_a::two"]);
         let other = p.cases.iter().find(|c| c.name == "suite_b::three").unwrap();
         assert_eq!(other.status, TestStatus::Passed, "other suites untouched");
+    }
+
+    #[test]
+    fn the_watch_column_toggles_the_row_under_it_and_names_stop_before_it() {
+        use crate::testing::watch::WatchScope;
+        let mut panel = TestingPanel::new();
+        for n in ["parse::a", "parse::b"] {
+            panel.apply_case(crate::testing::model::TestCase {
+                name: n.into(),
+                status: TestStatus::Passed,
+            });
+        }
+        let area = Rect::new(0, 0, 30, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut panel).render(area, &mut buf);
+        let eye = area.width - 3;
+        let body = panel.first_row_y;
+        assert_eq!(
+            panel.hit_at(eye, body),
+            Some(RowHit::ToggleWatch(WatchScope::Suite("parse".into())))
+        );
+        assert_eq!(
+            panel.hit_at(eye, body + 1),
+            Some(RowHit::ToggleWatch(WatchScope::Test("parse::a".into())))
+        );
+        // One column left of the eye is the row's own hit, as before.
+        assert_eq!(
+            panel.hit_at(eye - 1, body + 1),
+            Some(RowHit::ShowCase("parse::a".into()))
+        );
+        assert_eq!(panel.last_watch_all, Rect::new(eye, 1, 1, 1));
+        // A watched row's eye is drawn in the accent colour.
+        panel.watch.toggle(WatchScope::Test("parse::a".into()));
+        let mut buf = Buffer::empty(area);
+        (&mut panel).render(area, &mut buf);
+        assert_eq!(buf[(eye, body + 1)].fg, panel.theme.accent());
+        assert_ne!(buf[(eye, body + 2)].fg, panel.theme.accent());
     }
 }

@@ -19911,6 +19911,9 @@ impl App {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Enter => self.run_all_tests(),
             KeyCode::Char('r' | 'R') => self.discover_tests(),
+            KeyCode::Char('w' | 'W') => {
+                self.toggle_test_watch(crate::testing::watch::WatchScope::All)
+            }
             KeyCode::Up => self.testing.scroll_up(1),
             KeyCode::Down => self.testing.scroll_down(1),
             _ => {}
@@ -19945,6 +19948,71 @@ impl App {
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
+        }
+    }
+
+    /// Watch `scope`, or stop watching it (#263).
+    fn toggle_test_watch(&mut self, scope: crate::testing::watch::WatchScope) {
+        use crate::testing::watch::WatchScope;
+        let label = match &scope {
+            WatchScope::All => String::from("all tests"),
+            WatchScope::Suite(s) => format!("suite {s}"),
+            WatchScope::Test(t) => t.clone(),
+        };
+        self.status = if self.testing.watch.toggle(scope) {
+            format!("Watching {label}: it reruns when a file is saved")
+        } else {
+            format!("Stopped watching {label}")
+        };
+    }
+
+    /// Rerun what is watched, if a save made it due, and report a watched
+    /// run that has just turned red. A rerun leaves the sidebar where the
+    /// user has it: a save should not pull them away from what they were
+    /// doing. A red run already raises the activity-bar badge; the status
+    /// line adds which test and how to get to it.
+    fn tick_test_watch(&mut self) -> bool {
+        use crate::testing::watch::{WatchNotice, WatchScope};
+        let mut changed = false;
+        if let Some(ok) = self.testing.take_finished()
+            && self.testing.watch.finished(ok) == WatchNotice::NewlyRed
+        {
+            self.status = match self.testing.first_failed() {
+                Some(name) => {
+                    format!("Watched tests failed: {name} (Testing: Go to First Failure)")
+                }
+                None => String::from("Watched tests failed"),
+            };
+            changed = true;
+        }
+        if self.testing.watch.scope().is_none() {
+            return changed;
+        }
+        let busy = self.testing.is_busy()
+            || crate::testing::worker::runner_for(&self.active_test_root).is_none();
+        let Some(scope) = self.testing.watch.take_due(std::time::Instant::now(), busy) else {
+            return changed;
+        };
+        match scope {
+            WatchScope::All => self.test_worker.run_all(),
+            WatchScope::Suite(suite) => {
+                self.testing
+                    .start_filter(&crate::testing::suite_pattern(&suite));
+                self.test_worker.run_suite(suite);
+            }
+            WatchScope::Test(name) => {
+                self.testing.start_single(&name);
+                self.test_worker.run_one(name);
+            }
+        }
+        true
+    }
+
+    /// Jump to the first failing test's source.
+    fn go_to_first_failed_test(&mut self) {
+        match self.testing.first_failed() {
+            Some(name) => self.jump_to_test_source(name),
+            None => self.status = String::from("No failing tests"),
         }
     }
 
@@ -35709,6 +35777,10 @@ impl App {
                 }
                 None => self.status = String::from("No file in the active tab"),
             },
+            Cmd::TestingToggleWatchAll => {
+                self.toggle_test_watch(crate::testing::watch::WatchScope::All)
+            }
+            Cmd::TestingGoToFirstFailure => self.go_to_first_failed_test(),
             Cmd::ReopenAsText => match self.editor.path.clone() {
                 // Merge editor (#253): back to the in-buffer marker flow.
                 // The Result buffer is deliberately discarded — it was
@@ -40114,8 +40186,13 @@ impl App {
                     if rect_contains(self.testing.last_scrollbar, m.column, m.row) {
                         self.testing.scroll_to_bar_y(m.row);
                         self.testing_scrollbar_drag = true;
+                    } else if rect_contains(self.testing.last_watch_all, m.column, m.row) {
+                        self.toggle_test_watch(crate::testing::watch::WatchScope::All);
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
+                            Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
+                                self.toggle_test_watch(scope)
+                            }
                             Some(crate::widgets::testing::RowHit::RunCase(name)) => {
                                 self.run_test(name)
                             }
@@ -42246,6 +42323,11 @@ impl App {
         seats: crate::provenance::Provenance,
         described: Option<Vec<u8>>,
     ) {
+        // Every save lands here, so this is where a watched test scope
+        // hears about it (#263).
+        self.testing
+            .watch
+            .on_saved(path, &self.active_test_root, std::time::Instant::now());
         let root = self.history_root.clone();
         let path = path.to_path_buf();
         let tx = self.history_done_tx.clone();
@@ -50521,6 +50603,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         }
         // One notification per red run (#358), from the latch the panel
         // sets when a run ends, never per test case.
+        let watch_changed = app.tick_test_watch();
         if app.testing.take_failed_run() {
             let (passed, failed, _) = app.testing.counts();
             app.notifier.emit(
@@ -50561,6 +50644,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || mcp_changed
             || pair_changed
             || tests_changed
+            || watch_changed
             || blink_changed
             || spinner_changed
             || ext_index_changed
