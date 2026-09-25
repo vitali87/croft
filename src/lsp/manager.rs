@@ -487,14 +487,44 @@ pub struct CallSite {
     pub character: u32,
 }
 
+/// Which hierarchy a [`CallHierarchyResult`] answers: the call hierarchy's
+/// two directions, or the type hierarchy's (#613).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HierarchyKind {
+    Incoming,
+    Outgoing,
+    Supertypes,
+    Subtypes,
+}
+
+impl HierarchyKind {
+    /// What the rows are, for the status line and the empty case.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Incoming => "incoming calls",
+            Self::Outgoing => "outgoing calls",
+            Self::Supertypes => "supertypes",
+            Self::Subtypes => "subtypes",
+        }
+    }
+
+    /// The feature's name, for "not supported".
+    pub fn feature(self) -> &'static str {
+        match self {
+            Self::Incoming | Self::Outgoing => "Call hierarchy",
+            Self::Supertypes | Self::Subtypes => "Type hierarchy",
+        }
+    }
+}
+
 /// The callers or callees of the symbol at one caret position
 /// (`prepareCallHierarchy` + `callHierarchy/incomingCalls|outgoingCalls`),
-/// tagged with the request id so stale replies drop.
+/// or the supertypes or subtypes of the type there (#613), tagged with the
+/// request id so stale replies drop.
 #[derive(Debug)]
 pub struct CallHierarchyResult {
     pub request_id: u64,
-    /// True for incoming calls (callers), false for outgoing (callees).
-    pub incoming: bool,
+    pub kind: HierarchyKind,
     pub sites: Vec<CallSite>,
     /// True when no spawned server advertises `callHierarchyProvider`.
     pub unsupported: bool,
@@ -751,6 +781,13 @@ enum Cmd {
         line: u32,
         character: u32,
         incoming: bool,
+    },
+    RequestTypeHierarchy {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        supertypes: bool,
     },
     RequestRename {
         request_id: u64,
@@ -1478,6 +1515,28 @@ impl LspManager {
         id
     }
 
+    /// Fire a type-hierarchy expansion (#613), supertypes or subtypes of
+    /// the type at the caret; the reply arrives via
+    /// [`Self::drain_call_hierarchy`] tagged with the returned id.
+    pub fn request_type_hierarchy(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        supertypes: bool,
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RequestTypeHierarchy {
+            request_id: id,
+            path,
+            line,
+            character,
+            supertypes,
+        });
+        id
+    }
+
     pub fn drain_call_hierarchy(&self) -> Option<CallHierarchyResult> {
         self.calls_rx.try_recv().ok()
     }
@@ -2200,6 +2259,24 @@ async fn worker_loop(
                         line,
                         character,
                         incoming,
+                        &tx.call_hierarchy,
+                    )
+                    .await
+            }
+            Cmd::RequestTypeHierarchy {
+                request_id,
+                path,
+                line,
+                character,
+                supertypes,
+            } => {
+                state
+                    .request_type_hierarchy(
+                        request_id,
+                        path,
+                        line,
+                        character,
+                        supertypes,
                         &tx.call_hierarchy,
                     )
                     .await
@@ -4033,6 +4110,11 @@ impl WorkerState {
         incoming: bool,
         tx: &std_mpsc::Sender<CallHierarchyResult>,
     ) {
+        let kind = if incoming {
+            HierarchyKind::Incoming
+        } else {
+            HierarchyKind::Outgoing
+        };
         let Some(doc) = self.docs.get(&path) else {
             return;
         };
@@ -4049,7 +4131,7 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(CallHierarchyResult {
                 request_id,
-                incoming,
+                kind,
                 sites: Vec::new(),
                 unsupported: true,
             });
@@ -4067,7 +4149,7 @@ impl WorkerState {
                     drop(client);
                     let _ = tx.send(CallHierarchyResult {
                         request_id,
-                        incoming,
+                        kind,
                         sites: Vec::new(),
                         unsupported: false,
                     });
@@ -4102,9 +4184,87 @@ impl WorkerState {
             drop(client);
             let _ = tx.send(CallHierarchyResult {
                 request_id,
-                incoming,
+                kind,
                 sites,
                 unsupported: false,
+            });
+        });
+    }
+
+    /// Type hierarchy (#613): `prepareTypeHierarchy` at the caret, then one
+    /// level of supertypes or subtypes, delivered on the call hierarchy's
+    /// channel so the same picker shows it. lsp-types 0.95 carries no
+    /// `typeHierarchyProvider` capability to read, so each of the file's
+    /// servers is asked in turn; it is unsupported only when every one
+    /// refuses the request.
+    async fn request_type_hierarchy(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        supertypes: bool,
+        tx: &std_mpsc::Sender<CallHierarchyResult>,
+    ) {
+        let kind = if supertypes {
+            HierarchyKind::Supertypes
+        } else {
+            HierarchyKind::Subtypes
+        };
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let Some(clients) = self.clients.get(&(lang, root)) else {
+            return;
+        };
+        let servers: Vec<(String, Arc<TokioMutex<LspClient>>)> = clients
+            .iter()
+            .map(|c| (c.name.clone(), c.client.clone()))
+            .collect();
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut answered = false;
+            let mut sites = Vec::new();
+            for (server_name, client_arc) in servers {
+                let mut client = client_arc.lock().await;
+                let item = match client
+                    .prepare_type_hierarchy(uri.clone(), line, character)
+                    .await
+                {
+                    Ok(Some(mut items)) if !items.is_empty() => items.remove(0),
+                    Ok(_) => {
+                        answered = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        log_file::log(&format!(
+                            "lsp[{server_name}] prepareTypeHierarchy error: {e:#}"
+                        ));
+                        continue;
+                    }
+                };
+                answered = true;
+                match client.type_hierarchy_step(item, supertypes).await {
+                    Ok(Some(items)) => sites = type_hierarchy_sites(items),
+                    Ok(None) => {}
+                    Err(e) => log_file::log(&format!(
+                        "lsp[{server_name}] typeHierarchy/{} error: {e:#}",
+                        kind.noun()
+                    )),
+                }
+                break;
+            }
+            let _ = tx.send(CallHierarchyResult {
+                request_id,
+                kind,
+                sites,
+                unsupported: !answered,
             });
         });
     }
@@ -5582,6 +5742,22 @@ fn def_locations(resp: &GotoDefinitionResponse) -> Vec<(PathBuf, u32, u32)> {
 /// (not a `GotoDefinitionResponse`), so it gets its own mapper rather than going
 /// through `def_locations`. Locations whose URI is not a local file path are
 /// dropped (the same rule `def_locations` applies).
+/// Normalise type-hierarchy replies (#613): each type becomes a site at its
+/// name (`selection_range`).
+fn type_hierarchy_sites(items: Vec<lsp_types::TypeHierarchyItem>) -> Vec<CallSite> {
+    items
+        .into_iter()
+        .filter_map(|t| {
+            Some(CallSite {
+                path: t.uri.to_file_path().ok()?,
+                line: t.selection_range.start.line,
+                character: t.selection_range.start.character,
+                name: t.name,
+            })
+        })
+        .collect()
+}
+
 /// Normalise `callHierarchy/incomingCalls` replies: each caller becomes a
 /// site at its first reported call range (the call expression) or, when the
 /// server sends none, at the caller's own selection range.
@@ -5852,6 +6028,9 @@ fn build_client_capabilities() -> ClientCapabilities {
             // Advertise call-hierarchy and documentHighlight support so
             // servers that gate their providers on the client declaring
             // them (vtsls does for several) publish the capability.
+            type_hierarchy: Some(lsp_types::TypeHierarchyClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
             call_hierarchy: Some(lsp_types::CallHierarchyClientCapabilities {
                 dynamic_registration: Some(false),
             }),
@@ -9031,7 +9210,7 @@ while True:
             .recv_timeout(Duration::from_secs(30))
             .expect("a call-hierarchy reply must reach the drain channel");
         assert_eq!(result.request_id, 9);
-        assert!(result.incoming);
+        assert_eq!(result.kind, HierarchyKind::Incoming);
         assert!(!result.unsupported);
         assert_eq!(result.sites.len(), 1);
         assert_eq!(result.sites[0].name, "the_caller");
@@ -9041,5 +9220,146 @@ while True:
             "the site is the call expression from fromRanges"
         );
         runtime.handle().clone().block_on(state.shutdown_all());
+    }
+
+    /// A fake server answering `textDocument/prepareTypeHierarchy` with one
+    /// class and `typeHierarchy/supertypes` with its base, and refusing
+    /// `typeHierarchy/subtypes`'s sibling server request shape (#613).
+    const FAKE_LSP_TYPES: &str = r#"
+import json, sys
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+def item(uri, name, line):
+    return {"name": name, "kind": 5, "uri": uri,
+            "range": {"start": {"line": line, "character": 0},
+                      "end": {"line": line + 1, "character": 0}},
+            "selectionRange": {"start": {"line": line, "character": 6},
+                               "end": {"line": line, "character": 10}}}
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    if "id" in msg:
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "result": {"capabilities": {"typeHierarchyProvider": True}}})
+        elif method == "textDocument/prepareTypeHierarchy":
+            uri = msg["params"]["textDocument"]["uri"]
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": [item(uri, "Child", 3)]})
+        elif method == "typeHierarchy/supertypes":
+            uri = msg["params"]["item"]["uri"]
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": [item(uri, "Base", 0)]})
+        elif method == "typeHierarchy/subtypes":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "error": {"code": -32601, "message": "method not found"}})
+        else:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    if method == "exit":
+        break
+"#;
+
+    #[test]
+    fn each_hierarchy_names_its_rows_and_its_feature() {
+        assert_eq!(HierarchyKind::Supertypes.noun(), "supertypes");
+        assert_eq!(HierarchyKind::Subtypes.noun(), "subtypes");
+        assert_eq!(HierarchyKind::Incoming.noun(), "incoming calls");
+        assert_eq!(HierarchyKind::Subtypes.feature(), "Type hierarchy");
+        assert_eq!(HierarchyKind::Outgoing.feature(), "Call hierarchy");
+    }
+
+    /// Type hierarchy (#613) over the real wire: prepare, then supertypes,
+    /// delivered on the call hierarchy's channel as a `Supertypes` result.
+    #[test]
+    fn request_type_hierarchy_round_trips_through_a_server() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        let source = "class Base:\n    pass\n\nclass Child(Base):\n    pass\n";
+        std::fs::write(&file, source).expect("write demo");
+        let script = root.join("fake_types_lsp.py");
+        std::fs::write(&script, FAKE_LSP_TYPES).expect("write fake server");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-types",
+                command: "python3".into(),
+                args: vec![script.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+        };
+        let (tx, rx) = std_mpsc::channel();
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state.open_doc(file.clone(), String::from(source)).await;
+            state
+                .request_type_hierarchy(4, file.clone(), 3, 7, true, &tx)
+                .await;
+            state
+                .request_type_hierarchy(5, file.clone(), 3, 7, false, &tx)
+                .await;
+        });
+        // The two requests run as separate tasks: replies come in either
+        // order, matched by id.
+        let mut replies: Vec<CallHierarchyResult> = (0..2)
+            .map(|_| rx.recv_timeout(Duration::from_secs(30)).expect("a reply"))
+            .collect();
+        replies.sort_by_key(|r| r.request_id);
+        let down = replies.pop().unwrap();
+        let up = replies.pop().unwrap();
+        assert_eq!((up.request_id, down.request_id), (4, 5));
+        assert_eq!(up.kind, HierarchyKind::Supertypes);
+        assert!(!up.unsupported);
+        assert_eq!(up.sites.len(), 1);
+        assert_eq!(up.sites[0].name, "Base");
+        assert_eq!((up.sites[0].line, up.sites[0].character), (0, 6));
+        // Subtypes fails at the second step: the server did answer prepare,
+        // so this is "no subtypes", not "unsupported".
+        assert_eq!(down.kind, HierarchyKind::Subtypes);
+        assert!(!down.unsupported);
+        assert!(down.sites.is_empty());
     }
 }
