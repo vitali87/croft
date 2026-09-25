@@ -43078,6 +43078,91 @@ fn a_symbol_tab_mirrors_its_file_and_follows_the_symbol() {
     );
 }
 
+/// #369: Alt+Enter in the workspace-symbol picker opens the symbol tab even
+/// when the server names the file through a symlink.
+///
+/// The jump lands on the tab already open under the real path, so the
+/// landed check has to compare the two spellings by their canonical form.
+#[cfg(unix)]
+#[test]
+fn alt_enter_on_a_symlinked_symbol_still_opens_its_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let file = root.join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let link = root.join("link.rs");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.open_workspace_symbols("b");
+    app.ws_symbols_request_id = Some(1);
+    app.apply_workspace_symbols(1, vec![ws_item("b", &link, 3)], false);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT))
+        .unwrap();
+    let view = app
+        .editor
+        .symbol_view
+        .as_ref()
+        .expect("the symbol tab opened");
+    assert_eq!(view.name, "b");
+}
+
+/// #369: duplicating the symbol's last line keeps the copy inside it.
+///
+/// The copy lands below the closing brace, so the clip has to grow by the
+/// one line rather than leave the new line outside the tab.
+#[test]
+fn duplicating_a_symbols_last_line_keeps_the_copy_inside_the_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 1;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    let view = app.editor.symbol_view.as_ref().expect("symbol tab on a");
+    assert_eq!((view.first, view.last), (0, 2));
+
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.editor.duplicate_lines_down();
+    app.sync_symbol_views();
+    assert_eq!(
+        app.editor.lines[..5],
+        ["fn a() {", "    1", "}", "}", "fn b() {"]
+    );
+    let view = app.editor.symbol_view.as_ref().expect("still a symbol tab");
+    assert_eq!((view.first, view.last), (0, 3), "the clip grew by the copy");
+    assert_eq!(app.editor.cursor_row, 3, "the caret sits on the copy");
+}
+
+/// #369: saving the file's tab leaves no disk conflict on its symbol tab.
+///
+/// The symbol tab holds the same text that was just written, so the next
+/// external-change check must see it as in sync with disk instead of
+/// offering to reload over the saved edit.
+#[test]
+fn saving_the_files_tab_leaves_no_conflict_on_its_symbol_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.editors[1].dirty);
+
+    app.editor.editors[0].save_to_disk().unwrap();
+    app.sync_symbol_views();
+    assert!(
+        !app.reload_open_file_after_external_change(),
+        "the symbol tab already holds the saved text"
+    );
+    assert!(app.input_prompt.is_none(), "no reload prompt");
+    assert_eq!(app.editor.editors[1].lines[4], "    27");
+}
+
 /// #369: every way in opens the same symbol tab.
 ///
 /// `Cmd+K V` takes the symbol at the caret, and an OUTLINE row's right-click
