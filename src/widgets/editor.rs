@@ -2922,6 +2922,9 @@ pub struct Editor {
     /// same-path reloads, so the FS-sync sweep cannot flip the tab back
     /// to a preview, and clears when the tab opens a different file.
     pub force_text: bool,
+    /// Coverage marks for this file from the last coverage run (#263),
+    /// painted in the git bar's lane while shown.
+    pub coverage: Option<crate::testing::coverage::CoverageLens>,
     /// Hit-test rect for the "previous change" arrow painted in the diff
     /// header. Empty when the tab isn't a diff or the header was clipped.
     /// `App` consults this on left-click to jump to the previous hunk.
@@ -3095,6 +3098,7 @@ impl Editor {
             merge: None,
             merge_edit_row: 0,
             force_text: false,
+            coverage: None,
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
@@ -12563,6 +12567,32 @@ impl Widget for &mut Editor {
                     y,
                     "\u{2503}", // ┃ heavy vertical
                     Style::default().fg(color),
+                );
+            }
+            // Coverage lens (#263): the same lane, painted over the git bar
+            // while a coverage report is shown. Green run, red never run,
+            // amber run with a branch missed; dimmed once the file changed
+            // after the run. `Coverage: Clear` gives the lane back to git.
+            if (!wrap || row_start == 0)
+                && let Some(lens) = self.coverage.as_ref()
+                && let Some(cov) = lens.lines.get(&line_idx)
+            {
+                use crate::testing::coverage::LineCov;
+                let (rgb, glyph) = match cov {
+                    LineCov::Covered => ((0x4e, 0xc9, 0x7a), "\u{258c}"),
+                    LineCov::Uncovered => ((0xe0, 0x55, 0x55), "\u{258c}"),
+                    LineCov::Partial => ((0xe0, 0xb0, 0x40), "\u{2596}"),
+                };
+                let (r, g, b) = if lens.stale {
+                    (rgb.0 / 2, rgb.1 / 2, rgb.2 / 2)
+                } else {
+                    rgb
+                };
+                buf.set_string(
+                    inner.x + gutter_width,
+                    y,
+                    glyph,
+                    Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
                 );
             }
             // Provenance overlay (#349): the same lane, a thinner bar in the

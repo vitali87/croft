@@ -162,6 +162,8 @@ A **Testing** view (the beaker icon, or `Cmd`/`Ctrl`+`K` `B`) mirrors VS Code's 
 
 Each row's play glyph runs that test or suite (a green ▷ also marks test functions in the editor gutter, click it to run), clicking a test's name jumps to its source, Enter runs everything, and `Cmd`/`Ctrl`+`K` `Enter` runs the test under the editor caret. The beaker icon wears a red badge counting failures.
 
+**Coverage.** "Testing: Run All Tests with Coverage" runs everything with the runner's coverage tool: pytest-cov, `@vitest/coverage-v8`, jest's built-in coverage, or `cargo llvm-cov` for Rust. Every one writes LCOV, which croft reads into one model. The editor's change-bar lane then shows each executable line of a covered file: green ran, red never ran, and a short amber mark means the line ran but one of its branches never did. Once the file is edited or rewritten after the run, the marks dim so they aren't trusted for code that moved. The Ln/Col readout in the status bar adds the file's line percentage. "Coverage: Clear" drops the report and gives the lane back to git. If the tool isn't installed, croft says which one and "Testing: Install Coverage Tool" runs the install in a terminal pane: `cargo install cargo-llvm-cov`, `uv add --dev pytest-cov` (or pip), or the project's npm/pnpm/yarn for vitest.
+
 ## Tasks
 
 Zero configuration: `Cmd`/`Ctrl`+`Shift`+`B` runs the project's build task, auto-detected from the manifests the repo already has (Makefile, justfile, package.json with the right lockfile runner, Cargo.toml, pyproject.toml, and `.vscode/tasks.json` when present). "Tasks: Run Task" in the palette lists everything discovered; each task runs in its own named terminal pane, and rerunning reuses that pane.

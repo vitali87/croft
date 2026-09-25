@@ -90,7 +90,12 @@ impl Coverage {
                 ) else {
                     continue;
                 };
-                *files.entry(file.clone()).or_default().hits.entry(n).or_insert(0) += hits;
+                *files
+                    .entry(file.clone())
+                    .or_default()
+                    .hits
+                    .entry(n)
+                    .or_insert(0) += hits;
             } else if let Some(rest) = line.strip_prefix("BRDA:") {
                 let parts: Vec<&str> = rest.split(',').collect();
                 let [n, _, _, taken] = parts[..] else {
@@ -121,6 +126,32 @@ impl Coverage {
     }
 }
 
+/// One file's coverage as the editor paints it: 0-based logical lines,
+/// the file's percentage, and whether the file has changed since the run
+/// (a stale lens dims, so nobody trusts marks for code that moved).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverageLens {
+    pub lines: HashMap<usize, LineCov>,
+    pub percent: Option<f64>,
+    pub stale: bool,
+}
+
+impl Coverage {
+    /// The lens for `path`, or `None` when the run did not cover it.
+    pub fn lens(&self, path: &Path, stale: bool) -> Option<CoverageLens> {
+        let file = self.files.get(path)?;
+        Some(CoverageLens {
+            lines: file
+                .hits
+                .keys()
+                .filter_map(|&n| Some((n.checked_sub(1)? as usize, file.line(n)?)))
+                .collect(),
+            percent: file.percent(),
+            stale,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,7 +165,11 @@ mod tests {
         assert_eq!(a.line(1), Some(LineCov::Covered));
         assert_eq!(a.line(2), Some(LineCov::Uncovered));
         assert_eq!(a.line(3), Some(LineCov::Partial), "a branch never taken");
-        assert_eq!(a.line(5), Some(LineCov::Partial), "`-` is a branch never reached");
+        assert_eq!(
+            a.line(5),
+            Some(LineCov::Partial),
+            "`-` is a branch never reached"
+        );
         assert_eq!(a.line(4), None, "not executable");
         let b = &c.files[Path::new("/abs/b.rs")];
         assert_eq!(b.line(10), Some(LineCov::Uncovered));
@@ -160,5 +195,16 @@ mod tests {
         assert_eq!(x.hits.get(&1), Some(&3));
         assert_eq!(x.hits.get(&2), Some(&1));
         assert_eq!(x.hits.len(), 2);
+    }
+
+    #[test]
+    fn a_lens_is_zero_based_and_carries_the_files_percent() {
+        let c = Coverage::from_lcov(LCOV, Path::new("/w"));
+        let lens = c.lens(Path::new("/w/src/a.py"), false).unwrap();
+        assert_eq!(lens.lines.get(&0), Some(&LineCov::Covered));
+        assert_eq!(lens.lines.get(&1), Some(&LineCov::Uncovered));
+        assert_eq!(lens.lines.get(&2), Some(&LineCov::Partial));
+        assert_eq!(lens.percent, Some(75.0));
+        assert!(c.lens(Path::new("/w/other.py"), false).is_none());
     }
 }
