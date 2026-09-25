@@ -39544,13 +39544,19 @@ impl App {
                     // The item toggles, so it says which way it goes. The
                     // adapter's id decides, and it is only known after asking:
                     // a same-named variable set under another reference (a
-                    // different scope, or an earlier stop) may or may not be
-                    // this one, so the item does not claim either way.
+                    // different scope), or at an earlier stop (which may
+                    // reuse the reference number), may or may not be this
+                    // one, so the item does not claim either way.
                     let (exact, same_name) =
                         self.debug_sessions.focused().map_or((false, false), |s| {
-                            let mut named = s.data_breakpoints.iter().filter(|b| b.name == name);
-                            let same_name = named.clone().next().is_some();
-                            (named.any(|b| b.container == container), same_name)
+                            s.data_breakpoints.iter().filter(|b| b.name == name).fold(
+                                (false, false),
+                                |(exact, _), b| {
+                                    let here =
+                                        b.container == container && b.stop == s.stop_generation;
+                                    (exact || here, true)
+                                },
+                            )
                         });
                     let label = if exact {
                         "Remove Data Breakpoint"

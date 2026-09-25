@@ -421,6 +421,9 @@ pub struct DataBreakpoint {
     /// The `variablesReference` it was set under: a same-named variable in
     /// another scope is a different variable.
     pub container: i64,
+    /// The stop it was set at: a `variablesReference` is only valid while
+    /// that stop lasts, so a later stop may reuse the number.
+    pub stop: u64,
     pub access_type: Option<String>,
 }
 
@@ -919,6 +922,9 @@ pub struct DapSession {
     breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
     /// Thread id reported by the most recent `stopped` event.
     pub stopped_thread: Option<i64>,
+    /// Counts stops, so state keyed on a `variablesReference` can tell
+    /// which stop its number belongs to.
+    pub stop_generation: u64,
     /// File + 1-based line the debugger is paused on, resolved from the
     /// `stackTrace` response that follows each `stopped` event. Cleared on
     /// resume/terminate.
@@ -1085,6 +1091,7 @@ impl DapSession {
             phase: SessionPhase::Initializing,
             breakpoints,
             stopped_thread: None,
+            stop_generation: 0,
             current_location: None,
             unverified_breakpoints: BTreeMap::new(),
             stack_frames: Vec::new(),
@@ -1410,6 +1417,7 @@ impl DapSession {
                 self.stopped_thread = Some(*thread_id);
                 self.known_thread = Some(*thread_id);
                 self.phase = SessionPhase::Stopped;
+                self.stop_generation += 1;
                 self.clear_inspection();
                 let _ = self.active().send(stack_trace_request(*thread_id));
             }
@@ -1571,6 +1579,7 @@ impl DapSession {
                 data_id,
                 name,
                 container,
+                stop: self.stop_generation,
                 access_type,
             });
             true
@@ -2050,6 +2059,21 @@ mod tests {
                 access_types: Vec::new(),
             }]
         );
+    }
+
+    /// A data breakpoint remembers the stop it was set at: variable
+    /// references are only valid while the program stays suspended, so a
+    /// later stop may reuse the number for another variable.
+    #[test]
+    fn a_data_breakpoint_records_the_stop_it_was_set_at() {
+        let (mut session, wire) = DapSession::fake(BTreeMap::new());
+        deliver(&mut session, &wire, &[stopped()]);
+        let first = session.stop_generation;
+        assert!(session.toggle_data_breakpoint(String::from("x@7"), String::from("x"), 7, None));
+        assert_eq!(session.data_breakpoints[0].stop, first);
+        deliver(&mut session, &wire, &[stopped()]);
+        assert_ne!(session.stop_generation, first, "each stop is a new one");
+        assert_eq!(session.data_breakpoints[0].stop, first);
     }
 
     #[test]

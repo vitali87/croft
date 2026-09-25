@@ -50012,14 +50012,47 @@ fn right_click_on_a_variable_breaks_on_its_value_change() {
         vec!["Remove Data Breakpoint"],
         "the item says it removes the breakpoint it toggles off"
     );
-    // Set under another reference (another scope, or an earlier stop): only
-    // the adapter's id can say whether it is this variable.
+    // Set at an earlier stop under the same reference number, which that
+    // stop may have reused: only the adapter's id can say.
+    app.debug_sessions.focused_mut().unwrap().stop_generation += 1;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y));
+    let menu = app.context_menu.as_ref().expect("the menu after a stop");
+    assert_eq!(
+        menu_labels(&menu.items),
+        vec!["Toggle Break on Value Change"]
+    );
+    app.debug_sessions.focused_mut().unwrap().stop_generation -= 1;
+    // Set under another reference (another scope): likewise.
     app.debug_sessions.focused_mut().unwrap().data_breakpoints[0].container = 99;
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y));
     let menu = app.context_menu.as_ref().expect("the menu a third time");
     assert_eq!(
         menu_labels(&menu.items),
         vec!["Toggle Break on Value Change"]
+    );
+}
+
+/// With one session, a breakpoint note reaches the console unprefixed.
+#[test]
+fn a_single_sessions_breakpoint_note_is_not_prefixed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (only, wire) = crate::dap::session::DapSession::fake(Default::default());
+    let only = with_function_breakpoints(only, &[String::from("main")]);
+    app.debug_sessions.push("only", only);
+    wire.adapter
+        .send(
+            serde_json::json!({"type": "response", "command": "initialize",
+                                 "success": true, "body": {}}),
+        )
+        .unwrap();
+    wire.adapter
+        .send(serde_json::json!({"type": "event", "event": "initialized"}))
+        .unwrap();
+    app.poll_dap();
+    assert_eq!(
+        app.debug_console,
+        ["This debug adapter does not support function breakpoints; not set: main"]
     );
 }
 
