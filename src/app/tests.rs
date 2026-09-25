@@ -50275,11 +50275,17 @@ fn an_edit_makes_a_suggestion_stale_and_esc_dismisses_one() {
     assert!(app.editor.live_ghost().is_none(), "typing makes it stale");
 }
 
-/// #366's write side end to end against a fake `gh`: threads load with
-/// their GraphQL resolution, a reply and a resolve go to GitHub off the
-/// frame loop, and a pending comment is submitted with the chosen verdict.
-#[test]
-fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
+/// A git repo holding `a.rs` and a fake `gh` that answers the review
+/// calls (#366, #368): (tempdir, repo root, a.rs, gh's call log, the last
+/// review payload, the gh script).
+fn review_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     use std::os::unix::fs::PermissionsExt as _;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("repo");
@@ -50329,9 +50335,14 @@ esac
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut app = App::new(root.clone()).unwrap();
+    (tmp, root, f, log, stdin, gh)
+}
+
+/// An app on the review fixture, with git's view of the repo in place.
+fn review_app(root: &std::path::Path, f: &std::path::Path, gh: &std::path::Path) -> App {
+    let mut app = App::new(root.to_path_buf()).unwrap();
     app.review_gh = gh.display().to_string();
-    app.editor.open_pinned(&f).unwrap();
+    app.editor.open_pinned(f).unwrap();
     crate::test_budget::await_spawned(
         std::time::Duration::from_secs(5),
         "git to find the repository",
@@ -50340,7 +50351,16 @@ esac
             app.git.status().repo_root.is_some()
         },
     );
+    app
+}
 
+/// #366's write side end to end against a fake `gh`: threads load with
+/// their GraphQL resolution, a reply and a resolve go to GitHub off the
+/// frame loop, and a pending comment is submitted with the chosen verdict.
+#[test]
+fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
+    let (_tmp, root, f, log, stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
     app.load_review_threads();
     let threads = app.review_boxes.as_ref().map(|(_, t)| t.clone()).unwrap();
     assert_eq!(threads.len(), 1);
@@ -50387,4 +50407,55 @@ esac
         "{calls}"
     );
     assert!(calls.contains("resolveReviewThread"), "{calls}");
+}
+
+/// #368: the navigator's notes and pending comments are previewed, then
+/// posted as one review with the navigator's marked as AI-authored; a note
+/// off the diff lands in the summary, and posted notes leave the editor.
+#[test]
+fn comments_export_to_the_pull_request_after_a_preview() {
+    let (_tmp, root, f, _log, stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
+    app.navigator_notes.insert(
+        String::from("a.rs"),
+        vec![
+            (1, 1, String::from("b is unused")),
+            (2, 40, String::from("far")),
+        ],
+    );
+    app.review_pending
+        .push(crate::review_threads::PendingComment {
+            path: String::from("a.rs"),
+            line: 0,
+            body: String::from("mine"),
+        });
+    app.open_export_comments();
+    let picker = app.list_picker.as_ref().expect("the preview is shown");
+    assert_eq!(
+        picker.rows[0].label,
+        "Post to PR #7: 2 inline, 1 in the summary"
+    );
+    assert_eq!(picker.rows.len(), 4);
+    app.post_exported_comments();
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the post", || {
+        app.drain_review_ops();
+        app.navigator_notes.get("a.rs").is_some_and(Vec::is_empty)
+    });
+    let sent: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stdin).unwrap()).unwrap();
+    assert_eq!(sent["event"], "COMMENT");
+    let bodies: Vec<&str> = sent["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, vec!["mine", "[AI, croft navigator] b is unused"]);
+    assert!(
+        sent["body"]
+            .as_str()
+            .unwrap()
+            .contains("`a.rs:41`: [AI, croft navigator] far")
+    );
+    assert!(app.review_pending.is_empty());
 }

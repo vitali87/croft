@@ -3582,6 +3582,16 @@ pub struct App {
     /// verdict while its summary is typed, the `gh` to run, and where
     /// finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
+    /// Export to a PR (#368): the previewed comments and the navigator
+    /// notes they came from, the notes a posted export clears, and the
+    /// prefix that marks the navigator's comments as AI-authored.
+    review_export: Option<(
+        Vec<crate::review_threads::PendingComment>,
+        Vec<u64>,
+        Vec<crate::widgets::list_picker::ListRow>,
+    )>,
+    review_exported_notes: Vec<u64>,
+    review_ai_prefix: String,
     review_pr: Option<(PathBuf, String)>,
     review_nodes: std::collections::HashMap<u64, String>,
     review_verdict: Option<crate::review_threads::ReviewEvent>,
@@ -5254,6 +5264,12 @@ impl App {
             pending_code_actions: Vec::new(),
             review_boxes: None,
             review_pending: Vec::new(),
+            review_export: None,
+            review_exported_notes: Vec::new(),
+            review_ai_prefix: loaded_prefs
+                .review_ai_prefix
+                .clone()
+                .unwrap_or_else(|| String::from(crate::review_threads::DEFAULT_AI_PREFIX)),
             review_pr: None,
             review_nodes: std::collections::HashMap::new(),
             review_verdict: None,
@@ -24846,6 +24862,22 @@ impl App {
                 }
                 Outcome::Submitted { inline, folded } => {
                     self.review_pending.clear();
+                    // Exported navigator notes now live on GitHub; reload
+                    // shows them there, as threads, rather than twice.
+                    let exported = std::mem::take(&mut self.review_exported_notes);
+                    if !exported.is_empty() {
+                        for id in &exported {
+                            if let Some(host) = &self.pair_host {
+                                host.remove_note(*id);
+                            }
+                        }
+                        for list in self.navigator_notes.values_mut() {
+                            list.retain(|(id, ..)| !exported.contains(id));
+                        }
+                        if self.editor.path.is_some() {
+                            self.load_review_threads();
+                        }
+                    }
                     self.status = match folded {
                         0 => format!("Review submitted with {inline} comment(s)"),
                         n => format!(
@@ -25863,6 +25895,15 @@ impl App {
             ListPurpose::SessionParticipantAction => {
                 if let Some((verb, id)) = parse_participant_action(&row.id) {
                     self.run_participant_action(verb, id);
+                }
+            }
+            ListPurpose::ExportComments => {
+                if row.id == "post" {
+                    self.post_exported_comments();
+                } else {
+                    // A comment row is information; the preview stays up
+                    // until the post row or Esc.
+                    self.show_export_preview();
                 }
             }
             ListPurpose::ReviewVerdict => {
@@ -27427,9 +27468,16 @@ impl App {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
+        let number = self.review_pr_number(&root)?;
+        Some((root, path, rel, number))
+    }
+
+    /// The PR number for `root`'s branch, remembered for the write side, or
+    /// `None` with the reason in the status bar.
+    fn review_pr_number(&mut self, root: &Path) -> Option<String> {
         let out = std::process::Command::new(&self.review_gh)
             .args(["pr", "view", "--json", "number", "--jq", ".number"])
-            .current_dir(&root)
+            .current_dir(root)
             .output();
         let number = match out {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
@@ -27438,8 +27486,117 @@ impl App {
                 return None;
             }
         };
-        self.review_pr = Some((root.clone(), number.clone()));
-        Some((root, path, rel, number))
+        self.review_pr = Some((root.to_path_buf(), number.clone()));
+        Some(number)
+    }
+
+    /// Source Control: Export Comments to Pull Request (#368): the
+    /// navigator's notes (marked as AI-authored) and your pending comments,
+    /// previewed as a list before anything is posted.
+    fn open_export_comments(&mut self) {
+        let root = self.active_workspace_root();
+        let Some(repo_root) = self.git_worker_for_root(&root).status().repo_root.clone() else {
+            self.status = String::from("This folder is not inside a git repository");
+            return;
+        };
+        let prefix = self.review_ai_prefix.clone();
+        let mut comments = self.review_pending.clone();
+        let mut notes = Vec::new();
+        for (file, list) in &self.navigator_notes {
+            let Some(rel) = repo_relative(&repo_root, &self.tree.root.join(file)) else {
+                continue;
+            };
+            for (id, row, body) in list {
+                comments.push(crate::review_threads::PendingComment {
+                    path: rel.clone(),
+                    line: *row,
+                    body: format!("{prefix}{body}"),
+                });
+                notes.push(*id);
+            }
+        }
+        if comments.is_empty() {
+            self.status = String::from("No comments to export");
+            return;
+        }
+        let Some(number) = self.review_pr_number(&root) else {
+            return;
+        };
+        comments.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+        // The preview says which comments GitHub will take inline, so a
+        // comment folded into the summary is no surprise after posting.
+        let diff = std::process::Command::new(&self.review_gh)
+            .args(["pr", "diff", &number])
+            .current_dir(&root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let inline = comments
+            .iter()
+            .filter(|c| {
+                crate::review_threads::commentable_lines(&diff, &c.path).contains(&(c.line + 1))
+            })
+            .count();
+        let mut rows = vec![crate::widgets::list_picker::ListRow {
+            id: String::from("post"),
+            label: format!(
+                "Post to PR #{number}: {inline} inline, {} in the summary",
+                comments.len() - inline
+            ),
+        }];
+        rows.extend(comments.iter().enumerate().map(|(i, c)| {
+            crate::widgets::list_picker::ListRow {
+                id: format!("c{i}"),
+                label: format!(
+                    "  {}:{}  {}",
+                    c.path,
+                    c.line + 1,
+                    c.body.lines().next().unwrap_or_default()
+                ),
+            }
+        }));
+        self.review_export = Some((comments, notes, rows));
+        self.show_export_preview();
+    }
+
+    fn show_export_preview(&mut self) {
+        let Some((_, _, rows)) = &self.review_export else {
+            return;
+        };
+        let rows = rows.clone();
+        self.open_list_picker(
+            crate::widgets::list_picker::ListPicker::new(
+                crate::widgets::list_picker::ListPurpose::ExportComments,
+                "Export Comments to Pull Request",
+                rows,
+            ),
+            "",
+        );
+    }
+
+    /// Post the previewed export as a Comment review.
+    fn post_exported_comments(&mut self) {
+        let Some((comments, notes, _)) = self.review_export.take() else {
+            return;
+        };
+        let Some((root, number)) = self.review_pr.clone() else {
+            return;
+        };
+        self.review_exported_notes = notes;
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::Submit {
+                number,
+                event: crate::review_threads::ReviewEvent::Comment,
+                summary: String::new(),
+                pending: comments,
+            },
+            self.review_tx.clone(),
+        );
+        self.status = String::from("Posting comments…");
     }
 
     /// Load this PR's review threads onto the open file as comment boxes
@@ -37037,6 +37194,7 @@ impl App {
             Cmd::ReviewAddComment => self.open_review_comment_prompt(),
             Cmd::ReviewSubmit => self.open_review_submit(),
             Cmd::ReviewToggleResolved => self.toggle_review_thread_resolved(),
+            Cmd::ExportCommentsToPr => self.open_export_comments(),
             Cmd::ReviewDiscardPending => {
                 let n = self.review_pending.len();
                 self.review_pending.clear();
@@ -52106,6 +52264,17 @@ fn collab_caret_color(navigator_sites: &[u64], site: u64) -> Color {
     } else {
         participant_color(site)
     }
+}
+
+/// `path` relative to `repo_root` with forward slashes, as GitHub names it.
+fn repo_relative(repo_root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(repo_root).ok()?;
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 /// The workspace-relative key a file replicates under in a collab session

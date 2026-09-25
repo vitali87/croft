@@ -325,6 +325,11 @@ pub struct Prefs {
     /// means the built-in 5000. Applies to panes opened after the change.
     #[serde(default)]
     pub terminal_scrollback: usize,
+    /// What exported navigator comments start with (#368), marking them as
+    /// AI-authored on GitHub. Unset means `[AI, croft navigator] `; an
+    /// empty string turns the marker off.
+    #[serde(default)]
+    pub review_ai_prefix: Option<String>,
     /// Screen reader mode (#621): a steady caret kept on the focused text
     /// and a one-line description of each change in the status bar. Off by
     /// default.

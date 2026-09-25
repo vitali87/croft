@@ -158,6 +158,8 @@ Below the change list, a **COMMITS** section draws the repo-wide commit graph (V
 
 **Review: Load PR Comments for This File** shows the branch's PR threads as boxes under their lines, with replies folded into their thread. Type a reply into a box's field and it posts to GitHub. **Review: Resolve or Unresolve Thread** acts on the focused box, or the next one. **Review: Add Comment on This Line** adds a pending comment, shown as a box, and **Review: Submit Review** sends the pending comments as Comment, Approve or Request Changes with a summary. Comments on lines outside the diff go into the summary. **Review: Discard Pending Comments** drops them.
 
+**Source Control: Export Comments to Pull Request** posts the navigator's notes, together with your pending comments, as one review on the branch's PR. It shows a preview first, listing each comment and how many go inline versus into the summary. The navigator's comments start with `[AI, croft navigator] ` (set `review_ai_prefix` to change it, or `""` to drop it). Once posted, they leave the editor and come back as the PR's threads.
+
 ## Interactive rebase
 
 `git rebase -i` run in a croft terminal opens its plan (`git-rebase-todo`) as a croft tab, because croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait` in every pane it spawns (a sequence editor you set yourself always wins). In that tab a single key sets the caret commit's action: `p` pick, `r` reword, `e` edit, `s` squash, `f` fixup, `d` drop (with vim mode on, those keys stay vim's). `Alt`+`Up` / `Down` reorder commits. Save and close the tab and git carries on; **Rebase: Abort** in the palette empties the plan, which makes git abort. `croft edit --wait <file>` works for any tool that wants an editor it can wait on.

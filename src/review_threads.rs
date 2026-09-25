@@ -129,6 +129,11 @@ pub fn resolve_mutation(resolve: bool) -> &'static str {
     }
 }
 
+/// What an exported navigator comment starts with unless
+/// `review_ai_prefix` says otherwise, so reviewers know which comments a
+/// model wrote.
+pub const DEFAULT_AI_PREFIX: &str = "[AI, croft navigator] ";
+
 /// A comment written in croft and not yet submitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingComment {
