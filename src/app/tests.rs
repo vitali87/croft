@@ -49979,3 +49979,100 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+#[test]
+fn the_terminal_suggests_from_history_and_tab_accepts_esc_dismisses() {
+    // #614: suggestions for what is typed at the prompt; Tab types the rest,
+    // Esc hides them until the input changes.
+    use crate::shell_integration::OscEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.command_history =
+        crate::command_history::CommandHistory::load(&tmp.path().join("history.jsonl"));
+    app.command_history
+        .append(crate::command_history::HistoryEntry {
+            cmd: String::from("cargo test -q"),
+            cwd: String::new(),
+            host: String::new(),
+            exit: Some(0),
+            dur_ms: 0,
+            ts: 1,
+        });
+    app.focus_pane(Pane::Terminal);
+    let t = app.terminal();
+    t.feed_bytes_for_test(b"\r\n$ ");
+    t.push_mark_for_test(OscEvent::PromptStart, 0);
+    t.push_mark_for_test(OscEvent::PromptEnd, 2);
+    t.feed_bytes_for_test(b"cargo t");
+    app.refresh_term_suggest();
+    let s = app
+        .term_suggest
+        .as_ref()
+        .expect("suggestions for the typed input");
+    assert_eq!(s.items[0].insert, "est -q");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(screen.contains("cargo test -q"), "{screen}");
+    // Esc dismisses; the same input stays quiet, a new one brings them back.
+    // Checked before Tab: Tab writes to a live PTY, whose echo lands in the
+    // grid whenever it arrives.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.refresh_term_suggest();
+    assert!(app.term_suggest.is_none(), "dismissed for this input");
+    app.terminal().feed_bytes_for_test(b"e");
+    app.refresh_term_suggest();
+    assert!(app.term_suggest.is_some(), "a changed input suggests again");
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    let written = String::from_utf8_lossy(&app.terminal().written_bytes_for_test()).into_owned();
+    assert!(
+        written.ends_with("st -q"),
+        "Tab types the rest: {written:?}"
+    );
+    assert!(app.term_suggest.is_none());
+}
+
+#[test]
+fn no_suggestions_while_a_program_owns_the_pane() {
+    use crate::shell_integration::OscEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.command_history =
+        crate::command_history::CommandHistory::load(&tmp.path().join("history.jsonl"));
+    app.command_history
+        .append(crate::command_history::HistoryEntry {
+            cmd: String::from("vim notes.md"),
+            cwd: String::new(),
+            host: String::new(),
+            exit: Some(0),
+            dur_ms: 0,
+            ts: 1,
+        });
+    app.focus_pane(Pane::Terminal);
+    let t = app.terminal();
+    t.feed_bytes_for_test(b"\r\n$ ");
+    t.push_mark_for_test(OscEvent::PromptStart, 0);
+    t.push_mark_for_test(OscEvent::PromptEnd, 2);
+    t.feed_bytes_for_test(b"vim\r\n");
+    t.push_mark_for_test(OscEvent::CommandStart, 0);
+    t.feed_bytes_for_test(b"v");
+    app.refresh_term_suggest();
+    assert!(app.term_suggest.is_none());
+    let before = app.terminal().written_bytes_for_test().len();
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.terminal().written_bytes_for_test().len() > before,
+        "Tab still reaches the program"
+    );
+}

@@ -237,6 +237,15 @@ pub(crate) enum QuickInputPosition {
     Center,
 }
 
+/// The prompt suggestions on show (#614).
+#[derive(Debug, Clone)]
+struct TermSuggest {
+    pane: usize,
+    input: String,
+    items: Vec<crate::term_suggest::Suggestion>,
+    selected: usize,
+}
+
 /// One in-flight `textDocument/selectionRange` request (#254): the
 /// Expand Selection gesture waiting on its chains. `positions` snapshots
 /// the exact cursors the request was fired for, so a reply (or a reuse
@@ -3575,6 +3584,11 @@ pub struct App {
     /// finished command from a shell-integrated pane, with cwd / exit /
     /// duration / timestamp, persisted as JSONL under the config dir.
     pub command_history: crate::command_history::CommandHistory,
+    /// Suggestions for what is typed at the focused pane's prompt (#614).
+    term_suggest: Option<TermSuggest>,
+    /// The pane and input the user dismissed suggestions for; they stay
+    /// away until the input changes.
+    term_suggest_dismissed: Option<(usize, String)>,
     /// Ctrl+Shift+H search popup over [`Self::command_history`]. None when
     /// closed.
     pub command_history_popup: Option<crate::widgets::history_popup::HistoryPopup>,
@@ -4916,6 +4930,8 @@ impl App {
             // files so app tests that run commands or split panes can never
             // touch (or race on) the user's real history / session files;
             // tests that exercise the stores inject their own paths.
+            term_suggest: None,
+            term_suggest_dismissed: None,
             command_history: crate::command_history::CommandHistory::load(&if cfg!(test) {
                 std::env::temp_dir().join(format!(
                     "croft-test-command-history-{}.jsonl",
@@ -16995,6 +17011,7 @@ impl App {
         self.render_process_picker(frame);
         self.render_zoxide_jump(frame);
         self.render_command_history_popup(frame);
+        self.render_term_suggest(frame);
         self.render_branch_picker(frame);
         self.render_scm_menu(frame);
         self.render_input_prompt(frame);
@@ -30463,6 +30480,9 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
+        if self.handle_term_suggest_key(key) {
+            return;
+        }
         // Quick-select owns every keystroke while its labels are up.
         if self.terminal_quick_select.is_some() {
             self.handle_terminal_quick_select_key(key);
@@ -36617,6 +36637,160 @@ impl App {
             _ => fallback_popup_rect(full, 100),
         };
         crate::widgets::zoxide_jump::render_zoxide_jump(jump, rect, frame.buffer_mut(), theme);
+    }
+
+    /// Recompute the prompt suggestions for the focused pane (#614): only
+    /// while the terminal has focus and its shell sits at a prompt with
+    /// something typed; unchanged input keeps the list (and its selection).
+    pub fn refresh_term_suggest(&mut self) {
+        let pane = self.active_terminal;
+        let input = if matches!(self.focus, Pane::Terminal) && pane < self.terminals.len() {
+            self.terminal().prompt_input()
+        } else {
+            None
+        };
+        let Some(input) = input.filter(|i| !i.trim().is_empty()) else {
+            self.term_suggest = None;
+            return;
+        };
+        if self.term_suggest_dismissed.as_ref() == Some(&(pane, input.clone())) {
+            self.term_suggest = None;
+            return;
+        }
+        if self
+            .term_suggest
+            .as_ref()
+            .is_some_and(|s| s.pane == pane && s.input == input)
+        {
+            return;
+        }
+        let history: Vec<String> = self
+            .command_history
+            .search("", crate::command_history::HistoryScope::All, "", "")
+            .into_iter()
+            .map(|e| e.cmd)
+            .collect();
+        let cwd = self
+            .terminal()
+            .shell_cwd()
+            .unwrap_or_else(|| self.workspace_root().to_path_buf());
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let items = crate::term_suggest::suggest(
+            &input,
+            &history,
+            &cwd,
+            home.as_deref(),
+            &mut |dir: &Path| {
+                std::fs::read_dir(dir)
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .filter_map(|e| {
+                                let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+                                e.file_name().into_string().ok().map(|n| (n, is_dir))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
+        );
+        self.term_suggest = (!items.is_empty()).then_some(TermSuggest {
+            pane,
+            input,
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Tab accepts, Esc dismisses, Alt+Up/Down pick, while suggestions
+    /// show; `true` when the key was theirs (#614).
+    fn handle_term_suggest_key(&mut self, key: KeyEvent) -> bool {
+        self.refresh_term_suggest();
+        let Some(s) = self.term_suggest.as_mut() else {
+            return false;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Tab, m) if m.is_empty() => {
+                let insert = s.items[s.selected].insert.clone();
+                self.term_suggest = None;
+                self.terminal_mut().write_input(insert.as_bytes());
+                true
+            }
+            (KeyCode::Esc, m) if m.is_empty() => {
+                self.term_suggest_dismissed = Some((s.pane, s.input.clone()));
+                self.term_suggest = None;
+                true
+            }
+            (KeyCode::Down, m) if m == KeyModifiers::ALT => {
+                s.selected = (s.selected + 1).min(s.items.len() - 1);
+                true
+            }
+            (KeyCode::Up, m) if m == KeyModifiers::ALT => {
+                s.selected = s.selected.saturating_sub(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Draw the prompt suggestions under (or above) the cursor (#614).
+    fn render_term_suggest(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::style::{Color, Style};
+        self.refresh_term_suggest();
+        let Some(s) = self.term_suggest.as_ref() else {
+            return;
+        };
+        let Some((cx, cy)) = self.terminal().cursor_screen_pos() else {
+            return;
+        };
+        let screen = frame.area();
+        let tag = |k: crate::term_suggest::Kind| match k {
+            crate::term_suggest::Kind::History => "history",
+            crate::term_suggest::Kind::Path => "path",
+            crate::term_suggest::Kind::Flag => "flag",
+        };
+        let label_w = s
+            .items
+            .iter()
+            .map(|i| i.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let width = ((label_w + 10) as u16).clamp(20, screen.width.min(80));
+        let height = s.items.len() as u16 + 1;
+        let x = cx.min(screen.width.saturating_sub(width));
+        let y = if cy + 1 + height <= screen.height {
+            cy + 1
+        } else {
+            cy.saturating_sub(height)
+        };
+        let area = Rect::new(x, y, width, height);
+        let buf = frame.buffer_mut();
+        ratatui::widgets::Widget::render(ratatui::widgets::Clear, area, buf);
+        let bg = self.theme.ui(Color::Rgb(0x1f, 0x22, 0x2b));
+        let text = Style::default()
+            .fg(self.theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+            .bg(bg);
+        let dim = Style::default()
+            .fg(self.theme.ui(Color::Rgb(0x8a, 0x93, 0xa6)))
+            .bg(bg);
+        let sel = text.bg(self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e)));
+        let w = width as usize;
+        for (i, item) in s.items.iter().enumerate() {
+            let style = if i == s.selected { sel } else { text };
+            let t = tag(item.kind);
+            let label_room = w.saturating_sub(t.len() + 2);
+            let line = format!(" {:<label_room$}{t} ", item.label);
+            buf.set_stringn(x, y + i as u16, line, w, style);
+        }
+        buf.set_stringn(
+            x,
+            y + s.items.len() as u16,
+            format!(
+                "{:<w$}",
+                " Tab accept \u{b7} Esc dismiss \u{b7} Alt+\u{2191}\u{2193}"
+            ),
+            w,
+            dim,
+        );
     }
 
     fn render_command_history_popup(&mut self, frame: &mut ratatui::Frame) {
