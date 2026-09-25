@@ -271,6 +271,11 @@ pub struct Prefs {
     /// matching VS Code.
     #[serde(default)]
     pub copy_on_select: bool,
+    /// Ask the navigator's model for inline completions after a pause in
+    /// typing (#607). Off by default: it sends the code around the caret to
+    /// the configured model.
+    #[serde(default)]
+    pub inline_completions: bool,
     /// Opt-out for tailspin highlighting in the rendered log view (#466):
     /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
     /// are coloured on lines that carry no colour of their own. Stored as
@@ -417,6 +422,15 @@ pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String
     let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
     prefs.disabled_extensions = disabled.clone();
+    prefs.save(&path)
+}
+
+/// Persist the inline-completions switch (#607) under an explicit config
+/// dir, like the other `_in` savers.
+pub fn save_inline_completions_in(config_dir: &Path, enabled: bool) -> Result<()> {
+    let path = config_dir.join("config.json");
+    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    prefs.inline_completions = enabled;
     prefs.save(&path)
 }
 

@@ -49979,3 +49979,105 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+/// A workspace with `a.rs` open, the caret at the end of its first line,
+/// and inline completions pointed at a one-shot local endpoint answering
+/// `text`.
+fn inline_completion_fixture(text: &str) -> (tempfile::TempDir, App, std::thread::JoinHandle<()>) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "let total = \n").unwrap();
+    let body = serde_json::json!({"content": [{"type": "text", "text": text}]}).to_string();
+    let (url, server) = crate::pair::tests::serve_http_once(format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    ));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&tmp.path().join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = "let total = ".len();
+    app.inline_endpoint = Some((
+        crate::pair::Provider::Local { base_url: url },
+        Some(String::from("m")),
+    ));
+    (tmp, app, server)
+}
+
+fn wait_for_inline(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.inline_pending.is_some() {
+        app.drain_inline_completion();
+        assert!(std::time::Instant::now() < deadline, "no reply");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn an_inline_completion_shows_as_ghost_text_and_tab_accepts_it_as_the_navigators() {
+    // #607: fill-in-the-middle at the caret, painted as ghost text; Tab
+    // inserts it attributed to the navigator.
+    let (_tmp, mut app, server) = inline_completion_fixture("items.len();");
+    app.run_command(crate::widgets::command_palette::Command::TriggerInlineCompletion);
+    assert!(app.inline_pending.is_some(), "{}", app.status);
+    wait_for_inline(&mut app);
+    drop(server);
+    assert_eq!(
+        app.editor.inline_ghost,
+        Some((0, 12, String::from("items.len();")))
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(screen.contains("let total = items.len();"), "{screen}");
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "let total = items.len();");
+    assert_eq!(app.editor.inline_ghost, None);
+    assert_eq!(
+        app.editor.provenance.seat(0),
+        Some(&crate::provenance::Seat::Navigator)
+    );
+}
+
+#[test]
+fn any_other_key_discards_the_ghost_and_a_late_reply_is_dropped() {
+    let (_tmp, mut app, server) = inline_completion_fixture("items.len();");
+    app.run_command(crate::widgets::command_palette::Command::TriggerInlineCompletion);
+    // Typing before the reply lands makes it stale.
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    wait_for_inline(&mut app);
+    drop(server);
+    assert_eq!(
+        app.editor.inline_ghost, None,
+        "an answer for an older caret"
+    );
+    assert_eq!(app.editor.lines[0], "let total = x");
+    // A shown ghost goes on the next ordinary key.
+    app.editor.inline_ghost = Some((0, 13, String::from("yz")));
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.inline_ghost, None);
+    assert_eq!(app.editor.lines[0], "let total = xq");
+}
+
+#[test]
+fn inline_completions_toggle_from_the_palette() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = tmp.path().to_path_buf();
+    assert!(!app.inline_completions, "off until asked for");
+    app.run_command(crate::widgets::command_palette::Command::ToggleInlineCompletions);
+    assert!(app.inline_completions);
+    assert!(app.status.contains("on"), "{}", app.status);
+    app.run_command(crate::widgets::command_palette::Command::ToggleInlineCompletions);
+    assert!(!app.inline_completions);
+}

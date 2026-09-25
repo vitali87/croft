@@ -2089,7 +2089,7 @@ if mode == "linger":
 "#;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::collab::{ResolvedSpan, relay_serve};
     use crate::lsp::manager::is_on_path;
