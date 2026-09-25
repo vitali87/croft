@@ -238,6 +238,39 @@ fn scan_with_pos(text: &str) -> Vec<(usize, PortHit)> {
     out
 }
 
+/// `lsof` arguments shared by both socket scans. `-b` keeps lsof off
+/// `stat`/`lstat`/`readlink`, which it otherwise calls on every mounted file
+/// system at startup and which stall on an unreachable NFS server; a TCP
+/// listener row needs none of them. `-w` drops the warnings `-b` then prints.
+const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
+
+/// A socket-poll helper command, detached into its own session. The poll runs
+/// every few seconds, and the kernel prints a hung-NFS notice ("nfs server
+/// X: not responding") on the controlling tty of the process waiting on the
+/// mount: with croft's tty inherited, that text lands on top of the UI. With
+/// no controlling tty the notice goes to the system log only.
+///
+/// The null stdin only states intent (`.output()` already gives one); the
+/// session is the fix. A pre-exec hook takes std off `posix_spawn` and onto a
+/// full `fork`, a cost paid per probe on the poll thread, never the UI thread.
+fn probe(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.stdin(std::process::Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and the only call in the
+    // pre-exec hook. The forked child is never a process-group leader, so
+    // it cannot fail today; if it ever does, the spawn fails rather than
+    // silently keeping the tty.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
 /// PIDs in `root`'s process subtree (inclusive), from one `ps` snapshot. Used
 /// to scope the socket poll to the shell's own children so we don't surface
 /// every system daemon listening on loopback. Empty on `ps` failure (the poll
@@ -245,7 +278,7 @@ fn scan_with_pos(text: &str) -> Vec<(usize, PortHit)> {
 fn descendant_pids(root: i32) -> HashSet<i32> {
     let mut subtree: HashSet<i32> = HashSet::new();
     subtree.insert(root);
-    let Ok(out) = Command::new("ps").args(["-axo", "pid=,ppid="]).output() else {
+    let Ok(out) = probe("ps").args(["-axo", "pid=,ppid="]).output() else {
         return subtree;
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -292,10 +325,7 @@ pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
 /// neither tool ran, so the caller can tell "nothing is listening" from "no
 /// evidence" and leave the registry alone rather than retiring live rows.
 pub fn poll_all_listening() -> Option<HashSet<u16>> {
-    let out = Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
-        .output()
-        .ok();
+    let out = probe("lsof").args(LSOF_LISTEN_ARGS).output().ok();
     if let Some(out) = out
         && (out.status.success() || !out.stdout.is_empty())
     {
@@ -306,7 +336,7 @@ pub fn poll_all_listening() -> Option<HashSet<u16>> {
                 .collect(),
         );
     }
-    let out = Command::new("ss").args(["-tlnH"]).output().ok()?;
+    let out = probe("ss").args(["-tlnH"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -327,8 +357,9 @@ fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
         .map(|p| p.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let out = Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", &pid_arg])
+    let out = probe("lsof")
+        .args(LSOF_LISTEN_ARGS)
+        .args(["-a", "-p", &pid_arg])
         .output()
         .ok()?;
     if !out.status.success() && out.stdout.is_empty() {
@@ -337,9 +368,10 @@ fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
     Some(parse_lsof(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Parse `lsof -nP -iTCP -sTCP:LISTEN` rows. Field 0 is the command; the NAME
-/// column (`*:3000`, `127.0.0.1:3000`) is followed by a `(LISTEN)` token, so we
-/// scan the row for the first field that parses as a loopback/wildcard address.
+/// Parse `lsof` rows from a [`LSOF_LISTEN_ARGS`] scan. Field 0 is the
+/// command; the NAME column (`*:3000`, `127.0.0.1:3000`) is followed by a
+/// `(LISTEN)` token, so we scan the row for the first field that parses as a
+/// loopback/wildcard address.
 fn parse_lsof(text: &str) -> Vec<PortHit> {
     let mut out: Vec<PortHit> = Vec::new();
     for line in text.lines().skip(1) {
@@ -359,7 +391,7 @@ fn parse_lsof(text: &str) -> Vec<PortHit> {
 }
 
 fn poll_via_ss(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
-    let out = Command::new("ss").args(["-tlnpH"]).output().ok()?;
+    let out = probe("ss").args(["-tlnpH"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -431,6 +463,52 @@ fn loopback_port(addr: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A kernel notice about a hung NFS mount is printed on the controlling
+    /// tty of the process waiting on it. A socket probe runs every few
+    /// seconds, so it must own no tty: it leads its own session.
+    #[test]
+    fn a_socket_probe_runs_in_its_own_session() {
+        // Asked of the kernel, not of `ps`: macOS `ps` exposes no session id.
+        let mut child = probe("sleep").arg("5").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: getsid only reads the session id of a live pid.
+        let (sid, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(sid, pid, "the probe is not its own session leader");
+        assert_ne!(sid, ours, "the probe shares croft's session");
+    }
+
+    /// The scoped `-b -w` scan still finds a listener: bind one and look
+    /// for it through the real call site. Skipped where lsof is not
+    /// installed.
+    #[test]
+    fn the_lsof_scan_still_finds_a_loopback_listener() {
+        if probe("lsof").arg("-v").output().is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = poll_via_lsof(&HashSet::from([std::process::id() as i32])).expect("lsof ran");
+        assert!(
+            hits.iter().any(|h| h.port == port),
+            "port {port} missing from {hits:?}"
+        );
+    }
+
+    /// Every poll helper is spawned through `probe`, so none can bring the
+    /// inherited tty back.
+    #[test]
+    fn every_poll_helper_spawns_through_probe() {
+        let src = include_str!("port_detect.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert_eq!(
+            body.matches("Command::new(").count(),
+            1,
+            "only inside probe"
+        );
+    }
 
     #[test]
     fn scans_a_vite_banner_url_with_port_and_path() {
