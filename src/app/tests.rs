@@ -43848,75 +43848,74 @@ fn one_symbols_tabs_in_two_groups_keep_a_single_file_tab() {
     assert!(app.status.contains("whole file"), "{}", app.status);
 }
 
-/// #369: a method's symbol tab kept as the file's tab while the impl tab's
-/// Backspace burst deletes the method folds the rest of that burst into the
-/// undo step it already has, so one undo there walks back as far as it
-/// does in the impl tab.
-#[test]
-fn a_kept_orphan_undoes_the_burst_that_deleted_its_symbol_in_one_step() {
+/// Opens `impl S` and `fn m` as symbol tabs, closes the file tab, sends
+/// `keys` to the impl tab with the caret at row 1, `col` (they must make m
+/// go), then presses undo once in the impl tab or in the m tab (by then the
+/// file's tab); hands back the line undo left.
+fn undo_once_after_m_goes(col: usize, keys: &[KeyCode], in_kept: bool) -> String {
     fn tab(app: &App, name: &str) -> Option<usize> {
         app.editor
             .editors
             .iter()
             .position(|e| e.symbol_view.as_ref().is_some_and(|v| v.name == name))
     }
-    // Opens `impl S` and `fn m` as symbol tabs, closes the file tab, deletes
-    // m's line from the impl tab one Backspace at a time, then presses undo
-    // in the impl tab or in the m tab (now the file's tab); hands back the
-    // line undo restored.
-    fn undo_after_burst(in_kept: bool) -> String {
-        let tmp = tempfile::tempdir().unwrap();
-        let file = tmp.path().join("s.rs");
-        std::fs::write(&file, "impl S {\n    fn m() {}\n}\n").unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.editor.open_pinned(&file).unwrap();
-        for row in [1, 0] {
-            app.editor.select(0);
-            app.editor.cursor_row = row;
-            app.editor.cursor_col = 0;
-            app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
-            app.sync_symbol_views();
-        }
-        let i = app
-            .editor
-            .editors
-            .iter()
-            .position(|e| e.symbol_view.is_none())
-            .expect("the file tab");
-        app.editor.close_tab(i);
-        let imp = tab(&app, "S").expect("the impl tab");
-        app.editor.select(imp);
-        app.editor.cursor_row = 1;
-        app.editor.cursor_col = 13;
-        app.focus_pane(Pane::Editor);
-        for _ in 0..13 {
-            app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
-                .unwrap();
-        }
-        assert!(tab(&app, "m").is_none(), "m is gone");
-        let kept = app
-            .editor
-            .editors
-            .iter()
-            .position(|e| e.symbol_view.is_none())
-            .expect("the m tab became the file tab");
-        assert_eq!(app.editor.editors[kept].lines[1], "");
-        let at = if in_kept {
-            kept
-        } else {
-            tab(&app, "S").expect("the impl tab")
-        };
-        app.editor.select(at);
-        app.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER))
-            .unwrap();
-        app.editor.lines[1].clone()
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("s.rs");
+    std::fs::write(&file, "impl S {\n    fn m() {}\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    for row in [1, 0] {
+        app.editor.select(0);
+        app.editor.cursor_row = row;
+        app.editor.cursor_col = 0;
+        app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+        app.sync_symbol_views();
     }
-    let in_impl = undo_after_burst(false);
+    let i = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.symbol_view.is_none())
+        .expect("the file tab");
+    app.editor.close_tab(i);
+    let imp = tab(&app, "S").expect("the impl tab");
+    app.editor.select(imp);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = col;
+    app.focus_pane(Pane::Editor);
+    for &k in keys {
+        app.handle_key(key(k, KeyModifiers::NONE)).unwrap();
+    }
+    assert!(tab(&app, "m").is_none(), "m is gone");
+    let kept = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.symbol_view.is_none())
+        .expect("the m tab became the file tab");
+    let at = if in_kept {
+        kept
+    } else {
+        tab(&app, "S").expect("the impl tab")
+    };
+    app.editor.select(at);
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER))
+        .unwrap();
+    app.editor.lines[1].clone()
+}
+
+/// #369: a method's symbol tab kept as the file's tab while the impl tab's
+/// Backspaces delete the method keeps taking one undo step per Backspace,
+/// so one undo there walks back as far as it does in the impl tab.
+#[test]
+fn a_kept_orphan_undoes_the_backspaces_that_deleted_its_symbol_like_its_sibling() {
+    let keys = [KeyCode::Backspace; 13];
+    let in_impl = undo_once_after_m_goes(13, &keys, false);
     assert_ne!(
         in_impl, "",
         "undo in the impl tab restores part of the line"
     );
-    assert_eq!(undo_after_burst(true), in_impl);
+    assert_eq!(undo_once_after_m_goes(13, &keys, true), in_impl);
 }
 
 /// #369: a clean symbol tab whose symbol goes closes even with no file

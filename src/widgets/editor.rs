@@ -10432,7 +10432,9 @@ impl Editor {
 
     /// Turn a symbol tab into an ordinary tab of its whole file while its
     /// text stays in step with its siblings: only the clip and the pending
-    /// caret go, and the mirror state is kept.
+    /// caret go, and the mirror state is kept. Callers: only right after a
+    /// mirror pass settled the tab, or on a file a collab session keeps in
+    /// step; a tab reused for other text needs `leave_symbol_view`.
     pub fn drop_symbol_clip(&mut self) {
         self.symbol_view = None;
         self.mirror_caret = None;
@@ -15774,6 +15776,22 @@ fn tab_label(e: &Editor) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #369: a symbol tab turned into its file's tab mid-burst keeps the
+    /// step it last mirrored, so the rest of the sibling's burst folds into
+    /// it rather than taking another undo step.
+    #[test]
+    fn dropping_the_symbol_clip_keeps_folding_the_siblings_burst() {
+        let lines = |s: &[&str]| s.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let mut e = Editor::new();
+        e.lines = lines(&["fn m() {}"]);
+        e.mirror_lines_from(&lines(&["fn m() {}x"]), 7, (0, 10));
+        e.drop_symbol_clip();
+        e.mirror_lines_from(&lines(&["fn m() {}xy"]), 7, (0, 11));
+        assert_eq!(e.undo_stack.len(), 1);
+        assert!(e.undo());
+        assert_eq!(e.lines, lines(&["fn m() {}"]));
+    }
+
     /// An over-cap document reaches the hex viewer WITH a reason (#506).
     ///
     /// End to end rather than by inspection: this drives the real `open`
