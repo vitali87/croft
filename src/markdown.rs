@@ -65,6 +65,73 @@ pub struct MarkdownPreview {
     /// True when `doc_path` names a MEDIA file (#183): the rebuild
     /// dispatch probes headers instead of walking document XML.
     pub media: bool,
+    /// Scroll sync (#619): `(source line, built line)` at each block's
+    /// start, ascending in both. Empty for views with no Markdown source
+    /// (notebooks, documents, media).
+    pub source_map: SourceMap,
+    /// Frame truth, written by the editor's render: the first VISUAL row of
+    /// each built line under the current wrap, so a built line can become a
+    /// scroll offset. Cached on `wrap_key` like `anchor_rows`.
+    pub row_of_line: Vec<usize>,
+    /// A source line the next render should scroll to (#619): set when the
+    /// preview opens or a split's source pane scrolls, and resolved once the
+    /// wrap width is known.
+    pub scroll_to_source: Option<usize>,
+}
+
+impl MarkdownPreview {
+    /// The visual row showing `source_line`, when the map covers it.
+    pub fn row_for_source_line(&self, source_line: usize) -> Option<usize> {
+        let built = built_line_for_source(&self.source_map, source_line)?;
+        Some(self.row_of_line.get(built).copied().unwrap_or(built))
+    }
+
+    /// The source line under the preview's top row, when the map covers it.
+    pub fn source_line_at_top(&self) -> Option<usize> {
+        let top = self.scroll as usize;
+        let built = self
+            .row_of_line
+            .partition_point(|&r| r <= top)
+            .saturating_sub(1);
+        source_line_for_built(&self.source_map, built)
+    }
+}
+
+/// Interpolate along `map` from `from` (key `a`) to `to` (key `b`): exact at
+/// an anchor, linear between two, clamped past the ends. Linear is right
+/// for the long stretches the anchors skip, a code block or a wrapped
+/// paragraph, where source and output advance together.
+fn interpolate(map: &[(usize, usize)], x: usize, forward: bool) -> Option<usize> {
+    let key = |p: &(usize, usize)| if forward { p.0 } else { p.1 };
+    let val = |p: &(usize, usize)| if forward { p.1 } else { p.0 };
+    let first = map.first()?;
+    let i = map.partition_point(|p| key(p) <= x);
+    if i == 0 {
+        return Some(val(first));
+    }
+    let lo = &map[i - 1];
+    let Some(hi) = map.get(i) else {
+        return Some(val(lo) + (x - key(lo)));
+    };
+    let span = key(hi) - key(lo);
+    if span == 0 {
+        return Some(val(lo));
+    }
+    let out_span = val(hi).saturating_sub(val(lo));
+    Some(val(lo) + (x - key(lo)) * out_span / span)
+}
+
+/// `(source line, built line)` anchors, one per block start (#619).
+pub type SourceMap = Vec<(usize, usize)>;
+
+/// The built line that renders `source_line` (#619).
+pub fn built_line_for_source(map: &[(usize, usize)], source_line: usize) -> Option<usize> {
+    interpolate(map, source_line, true)
+}
+
+/// The source line a built line came from (#619).
+pub fn source_line_for_built(map: &[(usize, usize)], built_line: usize) -> Option<usize> {
+    interpolate(map, built_line, false)
 }
 
 /// One runnable fenced block in a rendered preview (#353): a shell (or,
@@ -687,6 +754,13 @@ struct Renderer<'r> {
     /// runnable check (#353).
     code_info: String,
     code_lines: (usize, usize),
+    /// The source line of the open block's first code line (#619): after a
+    /// fence's opener, or the block's own first line when indented.
+    code_first: usize,
+    /// `(source line, built row)` of every code line (#619). Exact anchors
+    /// inside a block, so interpolation never runs across the captured
+    /// output rows a run adds under it.
+    code_anchors: Vec<(usize, usize)>,
     runnables: Vec<MdRunnable>,
     /// Captured runs to show under their fences (#354). Empty for a
     /// document nothing has been run from, which is the common case.
@@ -833,6 +907,8 @@ impl Renderer<'_> {
                 Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi, code_fg)),
                 _ => spans.push(Span::styled(line.to_string(), Style::default().fg(code_fg))),
             }
+            self.code_anchors
+                .push((self.code_first + i, self.out.len()));
             self.out.push(Line::from(spans));
         }
         if let Some(r) = runnable {
@@ -996,6 +1072,20 @@ pub fn render_markdown_full(
     base_dir: Option<&std::path::Path>,
     outputs: BlockOutputs,
 ) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>) {
+    let (lines, images, runnables, _) =
+        render_markdown_mapped(text, theme, registry, base_dir, outputs);
+    (lines, images, runnables)
+}
+
+/// [`render_markdown_full`] plus the source map scroll sync reads (#619).
+pub fn render_markdown_mapped(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+    base_dir: Option<&std::path::Path>,
+    outputs: BlockOutputs,
+) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>, SourceMap) {
+    let mut source_map: Vec<(usize, usize)> = Vec::new();
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut r = Renderer {
@@ -1014,6 +1104,8 @@ pub fn render_markdown_full(
         code_block: None,
         code_info: String::new(),
         code_lines: (0, 0),
+        code_first: 0,
+        code_anchors: Vec::new(),
         runnables: Vec::new(),
         outputs,
         table: None,
@@ -1031,6 +1123,22 @@ pub fn render_markdown_full(
             .saturating_sub(1)
     };
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        // A block's start is an anchor: its source line, and the built line
+        // its first output lands on once the arm below has pushed any blank
+        // separator.
+        let block_start = matches!(
+            event,
+            Event::Start(
+                Tag::Heading { .. }
+                    | Tag::Paragraph
+                    | Tag::CodeBlock(_)
+                    | Tag::Item
+                    | Tag::BlockQuote(_)
+                    | Tag::Table(_)
+                    | Tag::HtmlBlock
+            ) | Event::Rule
+        );
+        let block_line = line_of(range.start);
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -1056,6 +1164,8 @@ pub fn render_markdown_full(
                         line_of(range.start),
                         line_of(range.end.saturating_sub(1)) + 1,
                     );
+                    r.code_first =
+                        r.code_lines.0 + usize::from(matches!(kind, CodeBlockKind::Fenced(_)));
                     r.code_block = Some((lang, String::new()));
                 }
                 Tag::List(start) => {
@@ -1237,6 +1347,10 @@ pub fn render_markdown_full(
             }
             _ => {}
         }
+        if block_start {
+            let row = r.out.len() + usize::from(!r.cur.is_empty());
+            source_map.push((block_line, row));
+        }
     }
     r.flush_line();
     // Trim the leading/trailing blank separators so the preview starts at
@@ -1248,6 +1362,8 @@ pub fn render_markdown_full(
         .map(|i| i.first_line + i.rows as usize)
         .max()
         .unwrap_or(0);
+    source_map.append(&mut r.code_anchors);
+    source_map.sort_unstable();
     let mut removed_front = 0usize;
     // Runnables are anchored to a row exactly as images are, so the guard
     // and the shift below have to cover both. They did not: a runnable's
@@ -1268,6 +1384,9 @@ pub fn render_markdown_full(
     for img in &mut r.images {
         img.first_line -= removed_front;
     }
+    for anchor in &mut source_map {
+        anchor.1 = anchor.1.saturating_sub(removed_front);
+    }
     for run in &mut r.runnables {
         run.first_line -= removed_front;
     }
@@ -1276,7 +1395,11 @@ pub fn render_markdown_full(
     {
         r.out.pop();
     }
-    (r.out, r.images, r.runnables)
+    // Anchors must ascend in both coordinates for interpolation; a nested
+    // block that starts on its parent's line would repeat it, so keep the
+    // first of any run that does not advance.
+    source_map.dedup_by(|b, a| b.0 <= a.0 || b.1 < a.1);
+    (r.out, r.images, r.runnables, source_map)
 }
 
 impl MarkdownPreview {
@@ -1356,6 +1479,67 @@ impl MarkdownPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_source_map_lands_each_block_on_its_rendered_line() {
+        let md = "# Title\n\nfirst para\n\n```\na\nb\nc\n```\n\n## Next\n\nlast para\n";
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        for (src, needle) in [
+            (0, "Title"),
+            (2, "first para"),
+            (10, "Next"),
+            (12, "last para"),
+        ] {
+            let built = built_line_for_source(&map, src).expect("mapped");
+            assert!(
+                line_text(&lines[built]).contains(needle),
+                "source line {src} should land on {needle:?}, got {:?}",
+                line_text(&lines[built])
+            );
+            assert_eq!(source_line_for_built(&map, built), Some(src), "and back");
+        }
+    }
+
+    #[test]
+    fn a_line_inside_a_run_fence_maps_to_its_code_not_the_output_box() {
+        let md = "```sh\necho a\necho b\necho c\n```\n\nafter\n";
+        let mut outputs = BlockOutputs::new();
+        outputs.insert(
+            0,
+            BlockOutput {
+                text: (1..=10).map(|i| format!("out{i}\n")).collect(),
+                exit: Some(0),
+                timed_out: false,
+            },
+        );
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, outputs);
+        for (src, needle) in [(1, "echo a"), (2, "echo b"), (3, "echo c"), (6, "after")] {
+            let built = built_line_for_source(&map, src).expect("mapped");
+            assert!(
+                line_text(&lines[built]).contains(needle),
+                "source line {src} should land on {needle:?}, got {:?}",
+                line_text(&lines[built])
+            );
+        }
+    }
+
+    #[test]
+    fn interpolation_is_exact_at_anchors_linear_between_and_clamped() {
+        let map = vec![(0, 0), (10, 20)];
+        assert_eq!(built_line_for_source(&map, 0), Some(0));
+        assert_eq!(built_line_for_source(&map, 5), Some(10));
+        assert_eq!(built_line_for_source(&map, 12), Some(22), "past the end");
+        assert_eq!(source_line_for_built(&map, 10), Some(5));
+        assert_eq!(built_line_for_source(&[], 3), None);
+    }
 
     fn render(text: &str) -> Vec<Line<'static>> {
         render_markdown(text, Theme::default(), &mut LangRegistry::new())
@@ -2096,6 +2280,9 @@ mod preview_selection_tests {
             notebook: false,
             doc_path: None,
             media: false,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         }
     }
 

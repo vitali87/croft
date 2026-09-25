@@ -735,3 +735,7 @@ croft pair --base-url http://box:8080 --model qwen3-coder:30b   # implies ollama
   stay orthogonal (observers still need a readable screen), so the participants
   popup names the constraining participant and humans resolve it — the same
   social contract tmux users already live with.
+
+## Sticky notes
+
+`Cmd+K N` leaves a note on a line: overlay state, never buffer content. In a `--solo` session the note replicates over the collab relay as `CollabMsg::Note`, and a guest that joins asks the owner for every note (`NotesRequest`). Every peer merges copies of a note the same way: fields from the higher `(rev, content)` copy, replies from both copies, and a deletion that no older copy can undo. So peers converge, and a concurrent reply is never lost. A note keeps the text of its line and finds that text again near where it was, so it follows the code without tracking edits. The owner (or a lone croft) keeps the notes in `~/.cache/croft/notes/`, so they survive disconnects and restarts.

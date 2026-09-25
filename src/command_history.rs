@@ -202,6 +202,25 @@ impl CommandHistory {
     }
 
     /// Search: newest first, one row per distinct command text (the newest
+    /// The command to suggest for `typed` at a prompt (#614): the newest one
+    /// that extends it, preferring, in order, one that succeeded in this
+    /// directory, one that succeeded anywhere, then any. `None` when nothing
+    /// extends it or `typed` is blank.
+    pub fn suggest(&self, typed: &str, cwd: &str, host: &str) -> Option<&str> {
+        if typed.trim().is_empty() {
+            return None;
+        }
+        let extends = |e: &&HistoryEntry| e.cmd.len() > typed.len() && e.cmd.starts_with(typed);
+        let ok = |e: &&HistoryEntry| e.exit.is_none_or(|c| c == 0);
+        let here = |e: &&HistoryEntry| e.cwd == cwd && canon_host(&e.host) == canon_host(host);
+        let newest = || self.entries.iter().rev().filter(extends);
+        newest()
+            .find(|e| ok(e) && here(e))
+            .or_else(|| newest().find(ok))
+            .or_else(|| newest().next())
+            .map(|e| e.cmd.as_str())
+    }
+
     /// occurrence wins, like atuin), case-insensitive substring `query`,
     /// narrowed by `scope` (`cwd` is the pane's current directory for
     /// [`HistoryScope::Dir`]).
@@ -259,6 +278,43 @@ mod tests {
             dur_ms: 42,
             ts,
         }
+    }
+
+    fn store(entries: Vec<HistoryEntry>) -> CommandHistory {
+        CommandHistory {
+            path: PathBuf::from("/dev/null"),
+            entries,
+            disk_lines: 0,
+        }
+    }
+
+    #[test]
+    fn a_suggestion_prefers_success_in_this_directory_then_success_then_any() {
+        let h = store(vec![
+            entry("cargo test --lib", "/p", Some(0), 1),
+            entry("cargo test --doc", "/other", Some(0), 2),
+            entry("cargo test --broken", "/p", Some(101), 3),
+        ]);
+        assert_eq!(h.suggest("cargo t", "/p", ""), Some("cargo test --lib"));
+        assert_eq!(
+            h.suggest("cargo t", "/elsewhere", ""),
+            Some("cargo test --doc"),
+            "the newest success anywhere"
+        );
+        let failed_only = store(vec![entry("make fail", "/p", Some(2), 1)]);
+        assert_eq!(
+            failed_only.suggest("make", "/p", ""),
+            Some("make fail"),
+            "then any"
+        );
+    }
+
+    #[test]
+    fn nothing_is_suggested_for_blank_input_or_an_exact_match() {
+        let h = store(vec![entry("ls -la", "/p", Some(0), 1)]);
+        assert_eq!(h.suggest("", "/p", ""), None);
+        assert_eq!(h.suggest("ls -la", "/p", ""), None, "nothing left to add");
+        assert_eq!(h.suggest("git", "/p", ""), None);
     }
 
     /// A remote FQDN that merely SHARES this machine's first DNS label is

@@ -276,7 +276,7 @@ impl SnippetSet {
 }
 
 pub fn snippets_path() -> PathBuf {
-    crate::prefs::config_dir().join("snippets.json")
+    crate::profiles::file("snippets.json")
 }
 
 /// Seeded on first "Configure User Snippets" so the user starts from a working

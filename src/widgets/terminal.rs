@@ -1323,6 +1323,16 @@ pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::path::Path>) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // `git rebase -i` opens its plan in this croft (#620), unless the user
+    // chose their own sequence editor, which always wins: an exported
+    // GIT_SEQUENCE_EDITOR here, or `sequence.editor` in git config, which
+    // `croft edit --sequence-editor` looks up in the rebasing repo itself.
+    if view_sock.is_some()
+        && std::env::var_os("GIT_SEQUENCE_EDITOR").is_none()
+        && let Ok(exe) = std::env::current_exe()
+    {
+        cmd.env("GIT_SEQUENCE_EDITOR", sequence_editor_command(&exe));
+    }
     match view_sock {
         Some(path) => cmd.env(crate::view_ipc::SOCK_ENV, path),
         // CLEARED, not merely not-added. `CommandBuilder::new` seeds itself
@@ -1335,6 +1345,13 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
         // plainly").
         None => cmd.env_remove(crate::view_ipc::SOCK_ENV),
     }
+}
+
+/// The `GIT_SEQUENCE_EDITOR` value naming this croft (#620). git runs it
+/// through the shell, so the binary's path is single-quoted.
+pub(crate) fn sequence_editor_command(exe: &std::path::Path) -> String {
+    let quoted = exe.to_string_lossy().replace('\'', r"'\''");
+    format!("'{quoted}' edit --wait --sequence-editor")
 }
 
 impl PtyTerminal {
@@ -2525,6 +2542,73 @@ impl PtyTerminal {
     /// reporting one.
     pub fn progress(&self) -> Option<(u8, u8)> {
         *self.progress.lock().unwrap()
+    }
+
+    /// What has been typed at the shell prompt, when the cursor sits at its
+    /// end (#614): `(typed, cursor screen x, cursor screen y, pane right
+    /// edge)`. `None` unless the newest shell-integration mark is the prompt
+    /// end on the cursor's own row, the view is live (not scrolled back, not
+    /// a full-screen program), and nothing is drawn right of the cursor.
+    /// That last rule is what keeps croft out of the way of a shell drawing
+    /// its own suggestion (fish, zsh-autosuggestions), which lands there.
+    pub fn prompt_tail(&self) -> Option<(String, u16, u16, u16)> {
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) || term.grid().display_offset() != 0 {
+            return None;
+        }
+        let cursor = term.grid().cursor.point;
+        let line = cursor.line.0;
+        let now = self.clock_now(&term);
+        let ms = self.marks.lock().unwrap();
+        let last = ms.last()?;
+        if !matches!(last.kind, crate::shell_integration::OscEvent::PromptEnd)
+            || last.line_rec - (now - last.clock_rec) as i32 != line
+        {
+            return None;
+        }
+        let (text, colmap) = row_text_and_cols(&term, line);
+        let cur = cursor.column.0;
+        let b_col = last.col_rec;
+        // Characters at or right of the cursor: must be none.
+        if colmap
+            .iter()
+            .zip(text.chars())
+            .any(|(&c, ch)| c >= cur && !ch.is_whitespace())
+        {
+            return None;
+        }
+        let typed: String = colmap
+            .iter()
+            .zip(text.chars())
+            .filter(|(c, _)| **c >= b_col && **c < cur)
+            .map(|(_, ch)| ch)
+            .collect();
+        let inner = self.last_inner;
+        if inner.width == 0 || line < 0 || line as u16 >= inner.height {
+            return None;
+        }
+        Some((
+            typed,
+            inner.x + cur as u16,
+            inner.y + line as u16,
+            inner.x + inner.width,
+        ))
+    }
+
+    /// The shell cursor's screen cell, when it is on screen and the program
+    /// hasn't hidden it (#621: screen reader mode parks the cursor here).
+    pub fn screen_cursor(&self) -> Option<(u16, u16)> {
+        let term = self.term.lock();
+        if !term.mode().contains(TermMode::SHOW_CURSOR) || term.grid().display_offset() != 0 {
+            return None;
+        }
+        let p = term.grid().cursor.point;
+        let inner = self.last_inner;
+        let (line, col) = (p.line.0, p.column.0 as u16);
+        if inner.width == 0 || line < 0 || line as u16 >= inner.height || col >= inner.width {
+            return None;
+        }
+        Some((inner.x + col, inner.y + line as u16))
     }
 
     /// The arrow-key bytes a plain click at screen cell (col, row) should
