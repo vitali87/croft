@@ -30,6 +30,8 @@ mod history;
 mod http_file;
 mod icons;
 mod import_vscode;
+// Used from the next layer of this change.
+#[allow(dead_code)]
 mod inline_complete;
 mod install_session;
 mod iterm2;

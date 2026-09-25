@@ -320,6 +320,7 @@ fn ceiling_msg() -> String {
 /// One short, non-streaming `/v1/messages` call (#607): `system` and a
 /// single user message in, the reply's text out. Same credential and
 /// redirect rules as a pair turn; `deadline` bounds the whole exchange.
+#[allow(dead_code)] // called from the next layer of this change
 pub(crate) fn complete_once(
     base_url: &str,
     model: &str,
