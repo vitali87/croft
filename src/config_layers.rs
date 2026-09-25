@@ -116,7 +116,8 @@ pub fn workspace_local_config_path(root: &Path) -> PathBuf {
     root.join(".croft").join("config.local.json")
 }
 
-/// Path of the machine-local user layer.
+/// Path of the machine-local user layer. Test builds read the user layers
+/// from [`user_layers_dir`] instead, so this path is not in their chain.
 pub fn user_local_config_path() -> PathBuf {
     crate::prefs::config_dir().join("config.local.json")
 }

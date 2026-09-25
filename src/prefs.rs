@@ -441,15 +441,24 @@ pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
     prefs.save(&path)
 }
 
-/// Record (trust-on-first-use) the fingerprint of the tool a command calls,
-/// preserving other settings. Best-effort: a write failure is swallowed.
-pub fn save_mcp_tool_fingerprint(command_id: &str, fingerprint: &str) -> Result<()> {
-    let path = config_path();
+/// Trust-on-first-use check of the tool a command calls, under an explicit
+/// config dir (see [`save_mcp_consent_in`] for why the dir is a parameter).
+/// The first fingerprint seen for `command_id` is recorded, preserving other
+/// settings (best-effort: a write failure is swallowed); false when a
+/// different one was recorded before, meaning the tool definition changed.
+pub fn trust_mcp_tool_in(config_dir: &Path, command_id: &str, fingerprint: &str) -> bool {
+    let path = config_dir.join("config.json");
     let mut prefs = Prefs::load(&path).unwrap_or_default();
-    prefs
-        .mcp_tool_fingerprints
-        .insert(command_id.to_string(), fingerprint.to_string());
-    prefs.save(&path)
+    match prefs.mcp_tool_fingerprints.get(command_id) {
+        Some(prev) => prev == fingerprint,
+        None => {
+            prefs
+                .mcp_tool_fingerprints
+                .insert(command_id.to_string(), fingerprint.to_string());
+            let _ = prefs.save(&path);
+            true
+        }
+    }
 }
 
 /// Persist the Customize Layout chrome choices, preserving other settings.
@@ -680,9 +689,31 @@ mod tests {
     #[test]
     fn a_test_build_reads_no_saved_prefs() {
         assert_eq!(saved_prefs_path(), None);
-        let loaded = serde_json::to_value(Prefs::load_or_default()).unwrap();
-        let default = serde_json::to_value(Prefs::default()).unwrap();
-        assert_eq!(loaded, default);
+        assert_eq!(Prefs::load_or_default(), Prefs::default());
+    }
+
+    #[test]
+    fn an_mcp_tool_is_trusted_on_first_use_and_refused_once_it_changes() {
+        let dir = std::env::temp_dir().join(format!("croft-prefs-tofu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        save_mcp_consent_in(&dir, "ext").unwrap();
+        assert!(trust_mcp_tool_in(&dir, "ext.cmd", "fp1"));
+        assert!(trust_mcp_tool_in(&dir, "ext.cmd", "fp1"));
+        assert!(!trust_mcp_tool_in(&dir, "ext.cmd", "fp2"));
+        let saved = Prefs::load(&dir.join("config.json")).unwrap();
+        assert_eq!(
+            saved
+                .mcp_tool_fingerprints
+                .get("ext.cmd")
+                .map(String::as_str),
+            Some("fp1")
+        );
+        assert!(
+            saved.mcp_consented.contains("ext"),
+            "other settings survive"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

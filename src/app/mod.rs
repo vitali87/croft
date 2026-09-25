@@ -35073,11 +35073,18 @@ impl App {
         self.mcp_busy_label = Some(label.clone());
         self.status = label.clone();
         let cwd = self.workspace_root().to_path_buf();
+        let config_dir = self.config_dir.clone();
         let version = env!("CARGO_PKG_VERSION").to_string();
         let _ = std::thread::Builder::new()
             .name("mcp-cmd".into())
             .spawn(move || {
-                let _ = tx.send(run_mcp_command_blocking(&resolved, arg, &cwd, &version));
+                let _ = tx.send(run_mcp_command_blocking(
+                    &resolved,
+                    arg,
+                    &cwd,
+                    &config_dir,
+                    &version,
+                ));
             });
     }
 
@@ -49421,6 +49428,7 @@ fn run_mcp_command_blocking(
     resolved: &crate::mcp::registry::ResolvedCommand,
     arg: Option<String>,
     cwd: &Path,
+    config_dir: &Path,
     version: &str,
 ) -> crate::mcp::McpOutcome {
     use serde_json::json;
@@ -49463,18 +49471,11 @@ fn run_mcp_command_blocking(
             ));
         }
         let fingerprint = crate::mcp::client::tool_fingerprint(&list, &resolved.tool);
-        let prefs = crate::prefs::Prefs::load_or_default();
-        match prefs.mcp_tool_fingerprints.get(&resolved.command_id) {
-            Some(prev) if prev != &fingerprint => {
-                return Err(format!(
-                    "refusing to run: the '{}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve",
-                    resolved.tool
-                ));
-            }
-            Some(_) => {}
-            None => {
-                let _ = crate::prefs::save_mcp_tool_fingerprint(&resolved.command_id, &fingerprint);
-            }
+        if !crate::prefs::trust_mcp_tool_in(config_dir, &resolved.command_id, &fingerprint) {
+            return Err(format!(
+                "refusing to run: the '{}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve",
+                resolved.tool
+            ));
         }
 
         let arguments = match (resolved.arg.as_ref(), arg) {
