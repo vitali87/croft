@@ -68,6 +68,7 @@ mod remote_connect;
 mod review_threads;
 mod rewind;
 mod scrubber;
+mod search_editor;
 mod session;
 mod session_host;
 mod session_state;

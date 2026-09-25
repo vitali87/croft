@@ -1620,6 +1620,23 @@ struct PendingFileMove {
     deadline: std::time::Instant,
 }
 
+/// A Search Editor tab's label (#615): not a file on disk, so it names the
+/// query rather than a path the save path could clobber.
+fn search_editor_label(query: &str) -> PathBuf {
+    let q: String = query.chars().take(40).collect();
+    PathBuf::from(if q.is_empty() {
+        String::from("Search Editor")
+    } else {
+        format!("Search: {q}")
+    })
+}
+
+/// A query as the status line quotes it, shortened.
+fn header_query_for_status(query: &str) -> String {
+    let q: String = query.chars().take(40).collect();
+    format!("\u{201c}{q}\u{201d}")
+}
+
 /// The longest an Explorer move waits for the servers before it goes
 /// ahead without their edit. Just past the manager's per-server timeout,
 /// so a slow server's answer still lands when it can.
@@ -3348,6 +3365,13 @@ pub struct App {
     code_lens_requested: std::collections::HashMap<PathBuf, u64>,
     /// Function breakpoints (#611), handed to each session as it launches.
     function_breakpoints: Vec<String>,
+    /// A Search Editor rerun in flight (#615): the tab it lands in, the
+    /// header it ran, and where its hits arrive.
+    search_editor_job: Option<(
+        PathBuf,
+        crate::search_editor::Header,
+        std::sync::mpsc::Receiver<Vec<crate::widgets::search::SearchHit>>,
+    )>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -4945,6 +4969,7 @@ impl App {
             md_scroll_synced: None,
             code_lens_enabled: true,
             function_breakpoints: Vec::new(),
+            search_editor_job: None,
             code_lens_requested: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
@@ -18529,6 +18554,22 @@ impl App {
             }
             // Cmd+K Shift+T: reopen the most recently closed terminal pane
             // (the browser reopen-tab convention under the Cmd+K leader).
+            // Cmd+K Shift+F / Shift+R: open the search results as a Search
+            // Editor, and re-run the active one (#615). Before the plain F
+            // and R arms; Shift+R in the terminal keeps its own meaning.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'f') => {
+                self.open_search_editor();
+                true
+            }
+            KeyCode::Char(c)
+                if shifted
+                    && plain
+                    && c.eq_ignore_ascii_case(&'r')
+                    && self.focus != Pane::Terminal =>
+            {
+                self.rerun_search_editor();
+                true
+            }
             // Cmd+K Shift+E: run the caret line's code lens (#608). Must
             // precede the plain E (reveal in Explorer) arm below.
             KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'e') => {
@@ -28964,6 +29005,13 @@ impl App {
             }
             return;
         }
+        // Search Editor (#615): Enter or F12 on a result row opens the match;
+        // anywhere else both keep their usual meaning.
+        if (key.code == KeyCode::Enter && key.modifiers.is_empty() || is_go_to_definition_key(key))
+            && self.open_search_editor_result()
+        {
+            return;
+        }
         // Go to Definition (F12) / References (Shift+F12) / Type Definition
         // (Ctrl+F12) / Implementations (Cmd+F12) / Declaration (Ctrl+Shift+F12),
         // the VS Code F12-family bindings, also need a real text buffer. All are
@@ -36376,6 +36424,8 @@ impl App {
             Cmd::ShowIncomingCalls => self.request_call_hierarchy_at_cursor(true),
             Cmd::ShowSupertypes => self.request_type_hierarchy_at_cursor(true),
             Cmd::ToggleCodeLens => self.toggle_code_lens(),
+            Cmd::OpenSearchEditor => self.open_search_editor(),
+            Cmd::RerunSearchEditor => self.rerun_search_editor(),
             Cmd::DebugAddHitCountBreakpoint => self.debug_edit_hit_condition(),
             Cmd::DebugAddFunctionBreakpoint => self.debug_add_function_breakpoint(),
             Cmd::DebugRemoveFunctionBreakpoints => self.debug_clear_function_breakpoints(),
@@ -42004,6 +42054,116 @@ impl App {
         if !cfg!(test) {
             let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
         }
+    }
+
+    /// Search: Open Results in Editor (#615, Cmd+K Shift+F): the sidebar's
+    /// query and results as a Search Editor tab.
+    fn open_search_editor(&mut self) {
+        let header = crate::search_editor::Header {
+            query: self.search.query.clone(),
+            opts: self.search.opts,
+            include: self.search.include.clone(),
+            exclude: self.search.exclude.clone(),
+        };
+        let text = crate::search_editor::render(&header, &self.search.hits, &self.tree.root);
+        let label = search_editor_label(&header.query);
+        match self.editor.open_text_buffer(&label, &text) {
+            Ok(()) => {
+                self.focus_pane(Pane::Editor);
+                self.status = if header.query.is_empty() {
+                    String::from(
+                        "Search Editor: type a query on the first line, then Cmd+K Shift+R",
+                    )
+                } else {
+                    format!("Search Editor: {} result(s)", self.search.hits.len())
+                };
+            }
+            Err(e) => self.status = format!("Search Editor: {e}"),
+        }
+    }
+
+    /// Search Editor: Rerun (#615, Cmd+K Shift+R): search again for the query
+    /// the active Search Editor's header spells, off the UI thread.
+    fn rerun_search_editor(&mut self) {
+        let Some(header) = crate::search_editor::parse_header(&self.editor.lines) else {
+            self.status = String::from("Not a Search Editor");
+            return;
+        };
+        let Some(label) = self.editor.path.clone() else {
+            return;
+        };
+        let root = self.tree.root.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let query = header.query.clone();
+        let header_query = query.clone();
+        let opts = header.opts;
+        let filter = crate::widgets::search::PathFilter::new(&header.include, &header.exclude);
+        std::thread::spawn(move || {
+            let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = hits.clone();
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            crate::widgets::search::search_workspace_streaming_filtered(
+                &root,
+                &query,
+                opts,
+                &cancel,
+                &std::collections::HashSet::new(),
+                &filter,
+                move |batch| {
+                    if let Ok(mut all) = sink.lock() {
+                        all.extend(batch);
+                    }
+                },
+            );
+            let all = hits.lock().map(|h| h.clone()).unwrap_or_default();
+            let _ = tx.send(all);
+        });
+        self.search_editor_job = Some((label, header, rx));
+        self.status = format!(
+            "Searching for {}\u{2026}",
+            header_query_for_status(&header_query)
+        );
+    }
+
+    /// Land a finished Search Editor rerun in its tab (#615).
+    pub fn drain_search_editor(&mut self) -> bool {
+        let Some((_, _, rx)) = self.search_editor_job.as_ref() else {
+            return false;
+        };
+        let Ok(hits) = rx.try_recv() else {
+            return false;
+        };
+        let (label, header, _) = self.search_editor_job.take().expect("checked");
+        let text = crate::search_editor::render(&header, &hits, &self.tree.root);
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let mut landed = false;
+        self.for_each_tab_of(&label, |tab| {
+            tab.lines = lines.clone();
+            tab.cursor_row = tab.cursor_row.min(tab.lines.len().saturating_sub(1));
+            tab.cursor_col = 0;
+            landed = true;
+        });
+        if landed {
+            self.status = format!("Search Editor: {} result(s)", hits.len());
+        }
+        landed
+    }
+
+    /// Open the match under the caret when the active tab is a Search Editor
+    /// and the caret is on a result row. Returns whether it did.
+    fn open_search_editor_result(&mut self) -> bool {
+        if !crate::search_editor::is_search_editor(&self.editor.lines) {
+            return false;
+        }
+        let Some((path, line)) = crate::search_editor::location_at(
+            &self.editor.lines,
+            self.editor.cursor_row,
+            &self.tree.root,
+        ) else {
+            return false;
+        };
+        self.go_to_definition(path, line.saturating_sub(1) as u32, 0);
+        true
     }
 
     /// Ask for the active file's code lenses once its edits have settled
@@ -51382,7 +51542,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let auto_save_changed = app.tick_auto_save();
         let live_run_changed = app.tick_live_run() | app.sync_markdown_scroll();
         app.tick_code_lens();
-        let code_lens_changed = app.drain_lsp_code_lens();
+        let code_lens_changed = app.drain_lsp_code_lens() | app.drain_search_editor();
         let connect_changed = app.poll_connect_dialog();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();

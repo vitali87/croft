@@ -49952,3 +49952,43 @@ fn run_to_cursor_without_a_session_says_so() {
     app.debug_run_to_cursor();
     assert_eq!(app.status, "Run to Cursor: no debug session");
 }
+
+// ---- Search Editor (#615) ----
+
+#[test]
+fn a_search_editor_reruns_its_header_and_opens_results() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "one\nthe needle is here\nthree\n").unwrap();
+    std::fs::write(root.join("b.txt"), "no match\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::OpenSearchEditor);
+    assert!(crate::search_editor::is_search_editor(&app.editor.lines));
+    app.editor.lines[0] = String::from("# Query: needle");
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('R'), KeyModifiers::SHIFT)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_search_editor() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let text = app.editor.lines.join("\n");
+    assert!(text.contains("1 result - 1 file"), "{text}");
+    assert!(text.contains("a.txt:"), "{text}");
+    let row = app
+        .editor
+        .lines
+        .iter()
+        .position(|l| l.contains("the needle is here"))
+        .expect("result row");
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = row;
+    app.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(root.join("a.txt").as_path())
+    );
+    assert_eq!(app.editor.cursor_row, 1, "the match's line, 0-based");
+}
