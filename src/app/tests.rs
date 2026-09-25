@@ -49979,3 +49979,90 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+#[test]
+fn profiles_are_created_switched_and_bring_their_own_settings_and_keys() {
+    // #618: a profile's settings and keybindings replace the user's while
+    // it is active, and switching back restores them.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(cfg.path().join("config.json"), "{\"auto_save\": false}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = cfg.path().to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::CreateProfile);
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::ProfileName)
+    ));
+    app.close_input_prompt();
+    std::fs::create_dir_all(cfg.path().join("profiles")).unwrap();
+    app.submit_profile_name("Python");
+    assert!(cfg.path().join("profiles/Python/config.json").is_file());
+    assert_eq!(app.active_profile, "Python", "{}", app.status);
+    let user: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(user["profile"], serde_json::json!("Python"));
+    // Give the profile a setting and a key, then switch away and back.
+    std::fs::write(
+        cfg.path().join("profiles/Python/config.json"),
+        "{\"auto_save\": true}",
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.path().join("profiles/Python/keybindings.json"),
+        "[{\"key\": \"ctrl+alt+y\", \"command\": \"quick_open\"}]",
+    )
+    .unwrap();
+    let chord = key(
+        KeyCode::Char('y'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.run_command(crate::widgets::command_palette::Command::SwitchProfile);
+    let picker = app.list_picker.as_ref().expect("the profiles are offered");
+    let ids: Vec<&str> = picker.rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["", "Python"]);
+    assert!(
+        picker.rows[1].label.contains("Python") && picker.rows[1].label.contains('\u{25cf}'),
+        "{:?}",
+        picker.rows
+    );
+    app.close_list_picker();
+    app.use_profile("", false);
+    assert_eq!(app.active_profile, "");
+    assert!(!app.auto_save, "the user's own value again");
+    assert_eq!(app.keymap.command_for(chord), None);
+    app.use_profile("Python", false);
+    assert!(app.auto_save, "the profile's value");
+    assert_eq!(
+        app.keymap.command_for(chord),
+        Some(crate::widgets::command_palette::Command::QuickOpen),
+        "the profile's keys"
+    );
+}
+
+#[test]
+fn a_workspace_can_default_to_a_profile() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    crate::profiles::create(cfg.path(), "Writing").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = cfg.path().to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::UseProfileInWorkspace);
+    assert_eq!(
+        app.list_picker.as_ref().map(|p| p.purpose),
+        Some(crate::widgets::list_picker::ListPurpose::WorkspaceProfile)
+    );
+    app.close_list_picker();
+    app.use_profile("Writing", true);
+    let ws: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ws["profile"], serde_json::json!("Writing"));
+    assert_eq!(app.active_profile, "Writing");
+    assert!(
+        !cfg.path().join("config.json").exists(),
+        "the user's file is untouched"
+    );
+}
