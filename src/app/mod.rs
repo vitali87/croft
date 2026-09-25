@@ -3979,6 +3979,9 @@ pub struct App {
     /// Whether the host's stale-image marker (#238) has already been
     /// announced, so the status hint fires once per session, not per poll.
     session_host_stale_seen: bool,
+    /// The stale-client notice the current roster warrants (#626, #652), so
+    /// it is raised once when it changes, not on every roster churn.
+    session_stale_notice: Option<String>,
     /// Multiplayer: the participant whose keystrokes are currently flowing
     /// into this croft (from the host's typing attribution frames).
     session_typist: Option<u64>,
@@ -5227,6 +5230,7 @@ impl App {
             session_channel: crate::session_host::InnerChannel::from_env(),
             session_participants: Vec::new(),
             session_host_stale_seen: false,
+            session_stale_notice: None,
             session_typist: None,
             session_carets: std::collections::HashMap::new(),
             session_presence_mtime: None,
@@ -24400,8 +24404,32 @@ impl App {
         }
         self.session_presence_mtime = mtime;
         let roster = crate::session_host::read_presence(&path).unwrap_or_default();
+        // A client older than this session is told here, in croft's own
+        // status line, never over its screen (#626, #652). The reference is
+        // the newer of this croft and its host: a host swap moves the host
+        // past this croft until an F9 reload, and a client still on the old
+        // binary is then out of date even though it matches us. Raised only
+        // when the notice changes (a client resizing churns the roster), and
+        // decided before the unchanged-roster return, since a swap can leave
+        // the roster identical while the host's version moved.
+        let host_version = crate::session_host::read_host_version(&channel.host_version);
+        let reference = crate::session_host::session_version(
+            env!("CARGO_PKG_VERSION"),
+            host_version.as_deref(),
+        );
+        let stale = crate::session_host::stale_client_notice_on_change(
+            self.session_stale_notice.as_deref(),
+            &roster,
+            reference,
+        );
+        self.session_stale_notice = crate::session_host::stale_client_notice(&roster, reference);
         if roster == self.session_participants {
-            return false;
+            // Unchanged roster: redraw only for a newly raised notice.
+            let Some(notice) = stale else {
+                return false;
+            };
+            self.status = notice;
+            return true;
         }
         let before = self.session_participants.len();
         let after = roster.len();
@@ -24413,6 +24441,9 @@ impl App {
             );
         } else if after < before {
             self.status = format!("A participant detached ({after} attached)");
+        }
+        if let Some(notice) = stale {
+            self.status = notice;
         }
         // Keep an open participants picker live without wiping the user's
         // typed filter, highlight, or scroll (any client resizing churns the
