@@ -49955,6 +49955,36 @@ fn load_two_scopes(app: &mut App) {
     s.variables.insert(12, vec![var("y")]);
 }
 
+/// An answer that lands after the program resumed and stopped again sets a
+/// breakpoint recorded at the stop the variable was read at, so the next
+/// stop's menu does not claim it.
+#[test]
+fn a_data_breakpoint_answered_after_another_stop_keeps_the_stop_it_was_asked_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let wire = seat_paused_fake_session(&mut app);
+    let session = app.debug_sessions.focused_mut().unwrap();
+    session.capabilities.data_breakpoints = true;
+    let asked_at = session.stop_generation;
+    assert!(session.request_data_breakpoint_info(12, "y"));
+    let ask = sent_of(&wire, "dataBreakpointInfo");
+    for msg in [
+        serde_json::json!({"type": "event", "event": "continued", "body": {"threadId": 1}}),
+        serde_json::json!({"type": "event", "event": "stopped",
+                           "body": {"threadId": 1, "reason": "step"}}),
+        serde_json::json!({"type": "response", "command": "dataBreakpointInfo",
+                           "success": true, "request_seq": ask[0]["seq"],
+                           "body": {"dataId": "12:y", "description": "y"}}),
+    ] {
+        wire.adapter.send(msg).unwrap();
+    }
+    app.poll_dap();
+    assert_eq!(app.status, "Breaks when y changes");
+    let session = app.debug_sessions.focused().unwrap();
+    assert_ne!(session.stop_generation, asked_at);
+    assert_eq!(session.data_breakpoints[0].stop, asked_at);
+}
+
 /// Right-clicking a VARIABLES row offers Break on Value Change; choosing it
 /// asks the adapter about that variable in its own container, and the answer
 /// sets the data breakpoint.
