@@ -216,6 +216,7 @@ pub enum Command {
     ToggleSessionRecording,
     /// Create a git worktree lane for an agent to work in (#348).
     NewWorktreeLane,
+    ReviewPullRequest,
     /// Remove the current worktree lane, refusing when it is dirty (#348).
     CloseWorktreeLane,
     /// Point the COMMITS graph at what the current lane added (#348).
@@ -432,6 +433,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::LoadReviewThreads,
     Command::ToggleSessionRecording,
     Command::NewWorktreeLane,
+    Command::ReviewPullRequest,
     Command::CloseWorktreeLane,
     Command::DiffWorktreeLane,
     Command::MarkAgentLaneReviewed,
@@ -632,6 +634,7 @@ impl Command {
             Command::LoadReviewThreads => "Review: Load PR Comments for This File",
             Command::ToggleSessionRecording => "Session: Record Terminal as Asciicast",
             Command::NewWorktreeLane => "Agent: New Worktree Lane",
+            Command::ReviewPullRequest => "Source Control: Review Pull Request",
             Command::CloseWorktreeLane => "Agent: Close Worktree Lane",
             Command::DiffWorktreeLane => "Agent: Diff Lane Against Its Base",
             Command::MarkAgentLaneReviewed => "Agents: Mark Changed Files Reviewed",
@@ -832,6 +835,7 @@ impl Command {
             Command::LoadReviewThreads => "",
             Command::ToggleSessionRecording => "",
             Command::NewWorktreeLane => "Cmd+K Shift+L",
+            Command::ReviewPullRequest => "",
             Command::CloseWorktreeLane => "",
             // No chord: the lane commands that have one are the ones you
             // reach mid-flow; a diff is deliberate and the palette is where
@@ -1032,6 +1036,7 @@ impl Command {
             Command::LoadReviewThreads => "review_load_threads",
             Command::ToggleSessionRecording => "session_toggle_recording",
             Command::NewWorktreeLane => "agent_new_worktree_lane",
+            Command::ReviewPullRequest => "review_pull_request",
             Command::CloseWorktreeLane => "agent_close_worktree_lane",
             Command::DiffWorktreeLane => "agent_diff_worktree_lane",
             Command::MarkAgentLaneReviewed => "agents_mark_reviewed",
