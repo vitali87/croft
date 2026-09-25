@@ -49559,3 +49559,74 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+#[test]
+fn a_search_editor_opens_the_sidebar_search_as_a_document_and_reruns_from_its_header() {
+    // #615: VS Code's "Open New Search Editor" and "Search Again".
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "one\nlet needle = 1;\nthree\n").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "needle and haystack\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.search.query = String::from("needle");
+        app.search.include = String::from("*.rs");
+        app.run_command(crate::widgets::command_palette::Command::SearchEditorNew);
+        let path = app.editor.path.clone().expect("a search editor opens");
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("code-search")
+        );
+        let doc = app.editor.lines.join("\n");
+        assert!(
+            doc.starts_with("# Query: needle\n# Including: *.rs\n"),
+            "{doc}"
+        );
+        assert!(
+            doc.contains("src/a.rs:\n  1   one\n  2:  let needle = 1;\n  3   three"),
+            "{doc}"
+        );
+        assert!(!doc.contains("b.txt"), "the include glob applies: {doc}");
+        // Edit the header: drop the include, search again.
+        let lines: Vec<String> = doc
+            .lines()
+            .filter(|l| !l.starts_with("# Including"))
+            .map(str::to_string)
+            .collect();
+        app.editor.replace_all_lines(lines);
+        app.run_command(crate::widgets::command_palette::Command::SearchEditorRerun);
+        let doc = app.editor.lines.join("\n");
+        assert!(doc.contains("b.txt:\n  1:  needle and haystack"), "{doc}");
+        assert!(doc.contains("2 results - 2 files"), "{doc}");
+        assert!(!app.editor.dirty, "search again leaves the document saved");
+        // Enter on a result line opens the match.
+        let row = app
+            .editor
+            .lines
+            .iter()
+            .position(|l| l.contains("let needle"))
+            .unwrap();
+        app.editor.cursor_row = row;
+        app.handle_editor_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("src/a.rs").as_path())
+        );
+        assert_eq!(app.editor.cursor_row, 1);
+    });
+}
+
+#[test]
+fn a_search_editor_needs_a_query() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::SearchEditorNew);
+        assert!(app.editor.path.is_none());
+        assert!(app.status.contains("Type a search"), "{}", app.status);
+    });
+}

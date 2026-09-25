@@ -28189,10 +28189,120 @@ impl App {
         }
     }
 
+    /// Run `q` over the workspace and render it as a Search Editor
+    /// document (#615), with the result count.
+    fn search_editor_doc(&self, q: &crate::search_editor::Query) -> (String, usize) {
+        use crate::widgets::search::{PathFilter, search_workspace_streaming_filtered};
+        let root = self.workspace_root().to_path_buf();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = hits.clone();
+        search_workspace_streaming_filtered(
+            &root,
+            &q.text,
+            q.opts,
+            &cancel,
+            &std::collections::HashSet::new(),
+            &PathFilter::new(&q.include, &q.exclude),
+            move |batch| {
+                if let Ok(mut h) = sink.lock() {
+                    h.extend(batch);
+                }
+            },
+        );
+        let hits = hits.lock().map(|h| h.clone()).unwrap_or_default();
+        let doc =
+            crate::search_editor::render(q, &root, &hits, &mut |p| std::fs::read_to_string(p).ok());
+        (doc, hits.len())
+    }
+
+    fn is_search_editor(&self) -> bool {
+        self.editor
+            .path
+            .as_ref()
+            .is_some_and(|p| p.extension().is_some_and(|e| e == "code-search"))
+    }
+
+    /// Open a Search Editor (#615) for the sidebar's current search: a
+    /// `.code-search` document in croft's cache, one per search.
+    fn open_search_editor(&mut self) {
+        if self.search.query.trim().is_empty() {
+            self.status = String::from("Type a search in the Search view first");
+            return;
+        }
+        let q = crate::search_editor::Query {
+            text: self.search.query.clone(),
+            opts: self.search.opts,
+            include: self.search.include.clone(),
+            exclude: self.search.exclude.clone(),
+            context: 1,
+        };
+        let (doc, count) = self.search_editor_doc(&q);
+        let dir = croft_cache_dir().join("search-editors");
+        let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) + 1;
+        let path = dir.join(format!("search-{n}.code-search"));
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, doc)) {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        match self.editor.open(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+                self.status = format!("{count} results \u{b7} edit the header, then Search Again");
+            }
+            Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
+    }
+
+    /// Re-run the active Search Editor from its header (#615) and save it.
+    fn rerun_search_editor(&mut self) {
+        if !self.is_search_editor() {
+            self.status = String::from("Search Again works in a Search Editor");
+            return;
+        }
+        let q = crate::search_editor::parse_header(&self.editor.lines.join("\n"));
+        if q.text.trim().is_empty() {
+            self.status = String::from("The header has no query");
+            return;
+        }
+        let (doc, count) = self.search_editor_doc(&q);
+        self.editor
+            .replace_all_lines(doc.lines().map(str::to_string).collect());
+        self.status = match self.editor.save_to_disk() {
+            Ok(_) => format!("{count} results"),
+            Err(e) => format!("{count} results; not saved: {e}"),
+        };
+    }
+
+    /// Enter on a Search Editor result line opens the match (#615); `false`
+    /// when the buffer is not a Search Editor or the line is not a result.
+    fn open_search_editor_result(&mut self) -> bool {
+        if !self.is_search_editor() {
+            return false;
+        }
+        let doc = self.editor.lines.join("\n");
+        let Some((rel, line)) = crate::search_editor::locate(&doc, self.editor.cursor_row) else {
+            return false;
+        };
+        let path = self.workspace_root().join(rel);
+        self.editor.pin_active();
+        if let Err(e) = self.open_at(&path, line.saturating_sub(1), 0) {
+            self.status = format!("Open failed: {e}");
+        }
+        true
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
         // Inline find bar (Cmd+F / Ctrl+F) eats every key while open.
         if self.editor_find.is_some() {
             self.handle_editor_find_key(key);
+            return;
+        }
+        if key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && self.open_search_editor_result()
+        {
             return;
         }
         // F7 / Shift+F7 in a buffer with merge conflicts: jump between the
@@ -35630,6 +35740,8 @@ impl App {
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
+            Cmd::SearchEditorNew => self.open_search_editor(),
+            Cmd::SearchEditorRerun => self.rerun_search_editor(),
             Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
             Cmd::NavigateBack => self.nav_back(),
