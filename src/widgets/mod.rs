@@ -24,6 +24,7 @@ pub mod output;
 pub mod ports;
 pub mod problems;
 pub mod process_picker;
+pub mod rebase_editor;
 pub mod remote;
 pub mod run_debug;
 pub mod scm_menu;
