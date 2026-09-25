@@ -30885,6 +30885,7 @@ fn participant_rows_show_role_and_size() {
         cols: 120,
         rows: 40,
         control: true,
+        version: String::new(),
     };
     let row = participant_row(&p);
     assert_eq!(row.id, "7");
@@ -30898,6 +30899,7 @@ fn participant_rows_show_role_and_size() {
         cols: 0,
         rows: 0,
         control: false,
+        version: String::new(),
     };
     let row = participant_row(&p);
     assert!(row.label.contains("read-only"));
@@ -49440,6 +49442,217 @@ fn stub_member(ends: bool) -> crate::dap::session::DapSession {
     .expect("sh spawns")
 }
 
+/// A stand-in adapter that sends each JSON DAP message in `messages`, framed
+/// with its byte length, and then idles.
+fn stub_emitting(messages: &[&str]) -> crate::dap::session::DapSession {
+    let mut script = String::new();
+    for m in messages {
+        script.push_str(&format!(
+            "printf 'Content-Length: %d\\r\\n\\r\\n%s' {} '{}'; ",
+            m.len(),
+            m
+        ));
+    }
+    script.push_str("sleep 30");
+    crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), script],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns")
+}
+
+/// Poll until `done` holds or two seconds pass.
+fn poll_until(app: &mut App, done: impl Fn(&App) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !done(app) && std::time::Instant::now() < deadline {
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// #567 item 1: a background member's program output used to be drained and
+/// dropped. It reaches the debug console, tagged with the member's name.
+#[test]
+fn a_background_members_output_reaches_the_console_with_its_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "A",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"event","event":"output","body":{"category":"stdout","output":"hello from A\n"}}"#,
+        ]),
+    );
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    poll_until(&mut app, |a| {
+        a.debug_console.iter().any(|l| l.contains("hello from A"))
+    });
+    assert!(
+        app.debug_console.iter().any(|l| l == "[A] hello from A"),
+        "console: {:?}",
+        app.debug_console
+    );
+    assert_eq!(
+        app.debug_sessions.focused_name(),
+        Some("B"),
+        "output alone does not steal focus"
+    );
+    app.debug_stop();
+}
+
+/// #567 item 1: a background member hitting a breakpoint looked hung, its
+/// `stopped` drained and dropped. With the focused member still running, the
+/// view moves to the stopped one and says so.
+#[test]
+fn a_background_stop_moves_the_view_to_the_stopped_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "A",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#,
+        ]),
+    );
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    poll_until(&mut app, |a| a.debug_sessions.focused_name() == Some("A"));
+    assert_eq!(app.debug_sessions.focused_name(), Some("A"));
+    assert!(app.status.contains("A stopped"), "status: {}", app.status);
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Paused (breakpoint)"),
+        "the stop replays through the normal handler once A is focused"
+    );
+    app.debug_stop();
+}
+
+const STOPPED_EVENT: &str =
+    r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#;
+
+/// A compound can list one configuration twice, so two members can share a
+/// name: the member that stopped is the one shown, not the first of that name.
+#[test]
+fn a_stop_shows_the_member_that_stopped_even_when_names_repeat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(false));
+    app.debug_sessions
+        .push("A", stub_emitting(&[STOPPED_EVENT]));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(2);
+    poll_until(&mut app, |a| a.debug_sessions.focused_index() != 2);
+    assert_eq!(
+        app.debug_sessions.focused_index(),
+        1,
+        "the second A stopped"
+    );
+    app.debug_stop();
+}
+
+/// A member ending in the same poll shifts the stopped member's position; the
+/// view still lands on the member that stopped.
+#[test]
+fn a_stop_lands_on_the_right_member_when_an_earlier_one_ends_alongside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Gone",
+        stub_emitting(&[r#"{"seq":1,"type":"event","event":"terminated"}"#]),
+    );
+    app.debug_sessions
+        .push("Stops", stub_emitting(&[STOPPED_EVENT]));
+    app.debug_sessions.push("Watched", stub_member(false));
+    app.debug_sessions.focus(2);
+    poll_until(&mut app, |a| {
+        a.debug_sessions.len() == 2 && a.debug_sessions.focused_name() == Some("Stops")
+    });
+    assert_eq!(app.debug_sessions.names(), vec!["Stops", "Watched"]);
+    assert_eq!(app.debug_sessions.focused_name(), Some("Stops"));
+    app.debug_stop();
+}
+
+/// The stopped member's position once members that ended in the same poll
+/// are removed: shifted past removals below it, untouched by those above,
+/// and gone if it ended itself.
+#[test]
+fn index_after_removals_shifts_past_lower_removals_only() {
+    assert_eq!(index_after_removals(2, &[]), Some(2));
+    assert_eq!(index_after_removals(2, &[0]), Some(1));
+    assert_eq!(index_after_removals(3, &[0, 1]), Some(1));
+    assert_eq!(
+        index_after_removals(1, &[2, 3]),
+        Some(1),
+        "removals above do not move it"
+    );
+    assert_eq!(index_after_removals(2, &[0, 2]), None, "it ended itself");
+}
+
+/// The switch command cycles the members, and says so when there is only one.
+#[test]
+fn switch_debug_session_cycles_the_members() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(false));
+    app.switch_debug_session();
+    assert_eq!(app.status, "Only one debug session is running");
+    app.debug_sessions.push("B", stub_member(false));
+    assert_eq!(app.debug_sessions.focused_name(), Some("B"));
+    app.switch_debug_session();
+    assert_eq!(app.debug_sessions.focused_name(), Some("A"));
+    assert!(
+        app.status.starts_with("Debugging A"),
+        "status: {}",
+        app.status
+    );
+    app.switch_debug_session();
+    assert_eq!(app.debug_sessions.focused_name(), Some("B"));
+    assert!(is_switch_debug_session_key(key(
+        KeyCode::Char('g'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    )));
+    assert!(!is_switch_debug_session_key(key(
+        KeyCode::Char('g'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    )));
+    app.debug_stop();
+}
+
+/// What a member reported in the background replays when it is switched to:
+/// a queued `stopped` drives the same handler it would have when focused.
+#[test]
+fn a_switched_to_member_replays_its_queued_stop() {
+    use crate::dap::session::DapEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(false));
+    app.debug_sessions.push("B", stub_member(false));
+    let (_, a) = app
+        .debug_sessions
+        .iter_named_mut_indexed()
+        .find(|(i, _)| *i == 0)
+        .unwrap();
+    a.backlog.push(DapEvent::Stopped {
+        thread_id: 1,
+        reason: String::from("exception"),
+    });
+    app.poll_dap();
+    assert_ne!(
+        app.run_debug.feedback.as_deref(),
+        Some("Paused (exception)"),
+        "not replayed while A is in the background"
+    );
+    app.switch_debug_session();
+    app.poll_dap();
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Paused (exception)")
+    );
+    app.debug_stop();
+}
+
 /// Poll until the set shrinks below `from` members or two seconds pass.
 fn poll_until_shrinks(app: &mut App, from: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -50401,4 +50614,55 @@ tool = "go"
         !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
         "another extension's record stays"
     );
+}
+
+const EXITED_EVENT: &str = r#"{"seq":1,"type":"event","event":"exited","body":{"exitCode":0}}"#;
+const TERMINATED_EVENT: &str = r#"{"seq":2,"type":"event","event":"terminated"}"#;
+
+/// Adapters send `exited` and then `terminated`, both of which end a member.
+/// Arriving in one poll they named the member twice, and the second removal
+/// took a live sibling with it.
+#[test]
+fn a_member_that_exits_and_terminates_in_one_poll_is_removed_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("A", stub_emitting(&[EXITED_EVENT, TERMINATED_EVENT]));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.push("C", stub_member(false));
+    app.debug_sessions.focus(2);
+    // Both messages are written before the first poll reads them.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    poll_until(&mut app, |a| {
+        !a.debug_sessions.names().contains(&String::from("A"))
+    });
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec![String::from("B"), String::from("C")]
+    );
+    app.debug_stop();
+}
+
+/// The focused member ending in the same poll a background member stops: the
+/// view used to move to the stopped member first, carrying the ending with it
+/// into the old member's backlog, so the ended member was never removed.
+#[test]
+fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("S", stub_emitting(&[STOPPED_EVENT]));
+    app.debug_sessions
+        .push("F", stub_emitting(&[TERMINATED_EVENT]));
+    app.debug_sessions.focus(1);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    poll_until(&mut app, |a| {
+        a.debug_sessions.names() == vec![String::from("S")]
+    });
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec![String::from("S")],
+        "F ended and must go"
+    );
+    app.debug_stop();
 }

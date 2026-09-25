@@ -817,6 +817,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+Shift+G",
+                description: "Switch to the next debug session of a compound",
+                handler: "is_switch_debug_session_key",
+            },
+            ShortcutEntry {
                 keys: "F9",
                 description: "Toggle a breakpoint on the cursor's line",
                 handler: "",
