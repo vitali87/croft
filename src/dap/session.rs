@@ -344,6 +344,9 @@ pub struct SourceBreakpoint {
     pub line: u32,
     pub condition: Option<String>,
     pub log_message: Option<String>,
+    /// `hitCondition` (#611): pause only once the hit count satisfies it
+    /// (`5`, `>= 5`, `% 2`, as the adapter reads it).
+    pub hit_condition: Option<String>,
 }
 
 impl SourceBreakpoint {
@@ -352,8 +355,41 @@ impl SourceBreakpoint {
             line,
             condition: None,
             log_message: None,
+            hit_condition: None,
         }
     }
+}
+
+/// What the adapter said it can do, from its `initialize` response (#611).
+/// Everything is `false` until the response arrives, so an unsupported
+/// feature is refused rather than sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub function_breakpoints: bool,
+    pub hit_conditions: bool,
+    pub data_breakpoints: bool,
+}
+
+impl Capabilities {
+    pub fn from_initialize(body: &Value) -> Self {
+        let flag = |k: &str| body.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Self {
+            function_breakpoints: flag("supportsFunctionBreakpoints"),
+            hit_conditions: flag("supportsHitConditionalBreakpoints"),
+            data_breakpoints: flag("supportsDataBreakpoints"),
+        }
+    }
+}
+
+/// Build a `setFunctionBreakpoints` request (#611): break when any of the
+/// named functions is entered. The list replaces the adapter's whole set.
+pub fn set_function_breakpoints_request(names: &[String]) -> Value {
+    let bps: Vec<Value> = names.iter().map(|n| json!({ "name": n })).collect();
+    json!({
+        "type": "request",
+        "command": "setFunctionBreakpoints",
+        "arguments": { "breakpoints": bps }
+    })
 }
 
 /// Build a `setBreakpoints` request body for one source file, carrying any
@@ -368,6 +404,9 @@ pub fn set_breakpoints_request(path: &Path, breakpoints: &[SourceBreakpoint]) ->
             }
             if let Some(m) = &b.log_message {
                 bp["logMessage"] = json!(m);
+            }
+            if let Some(h) = &b.hit_condition {
+                bp["hitCondition"] = json!(h);
             }
             bp
         })
@@ -811,6 +850,10 @@ pub struct DapSession {
     /// Breakpoints to push once the adapter is `initialized`, keyed by absolute
     /// file path (with optional per-breakpoint conditions).
     breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    /// Function breakpoints (#611), pushed on `initialized` when the adapter
+    /// supports them, and the adapter's capabilities.
+    function_breakpoints: Vec<String>,
+    pub capabilities: Capabilities,
     /// Thread id reported by the most recent `stopped` event.
     pub stopped_thread: Option<i64>,
     /// File + 1-based line the debugger is paused on, resolved from the
@@ -953,6 +996,8 @@ impl DapSession {
             js_server,
             phase: SessionPhase::Initializing,
             breakpoints,
+            function_breakpoints: Vec::new(),
+            capabilities: Capabilities::default(),
             stopped_thread: None,
             current_location: None,
             unverified_breakpoints: BTreeMap::new(),
@@ -1171,6 +1216,11 @@ impl DapSession {
                 // Only stdio adapters' reports drive the hollow rendering; for a
                 // js-debug session the guard fails and the arm falls through to
                 // the no-op `_` below.
+                Some("initialize") => {
+                    if let Some(body) = msg.get("body") {
+                        self.capabilities = Capabilities::from_initialize(body);
+                    }
+                }
                 Some("setBreakpoints") if self.js_server.is_none() => {
                     let reports = breakpoint_reports(&msg);
                     if self.apply_breakpoint_reports(&reports) {
@@ -1212,6 +1262,7 @@ impl DapSession {
                 // just initialized (parent or child). `active()` already resolves
                 // to the child once it exists, and to the parent before that.
                 self.push_breakpoints();
+                self.push_function_breakpoints();
                 let t = self.active();
                 let _ = t.send(set_exception_breakpoints_request(&self.exception_filters));
                 let _ = t.send(configuration_done_request());
@@ -1278,6 +1329,28 @@ impl DapSession {
         for (path, lines) in &self.breakpoints {
             let _ = t.send(set_breakpoints_request(path, lines));
         }
+    }
+
+    /// Send the function-breakpoint set, when there is one the adapter can
+    /// take.
+    fn push_function_breakpoints(&mut self) {
+        if self.capabilities.function_breakpoints && !self.function_breakpoints.is_empty() {
+            let req = set_function_breakpoints_request(&self.function_breakpoints);
+            let _ = self.active().send(req);
+        }
+    }
+
+    /// Replace the function-breakpoint set (#611). Kept for a child session
+    /// that initializes later, and sent now when the adapter supports it.
+    /// Returns whether it does.
+    pub fn update_function_breakpoints(&mut self, names: &[String]) -> bool {
+        self.function_breakpoints = names.to_vec();
+        if !self.capabilities.function_breakpoints {
+            return false;
+        }
+        let req = set_function_breakpoints_request(names);
+        let _ = self.active().send(req);
+        true
     }
 
     /// Resume execution of the stopped thread.
@@ -1850,6 +1923,7 @@ mod tests {
                     line: 7,
                     condition: Some(String::from("i > 3")),
                     log_message: None,
+                    hit_condition: None,
                 },
             ],
         );
@@ -1875,11 +1949,13 @@ mod tests {
                     line: 4,
                     condition: None,
                     log_message: Some(String::from("x is {x}")),
+                    hit_condition: None,
                 },
                 SourceBreakpoint {
                     line: 9,
                     condition: Some(String::from("n > 0")),
                     log_message: Some(String::from("n={n}")),
+                    hit_condition: None,
                 },
                 SourceBreakpoint::plain(11),
             ],
@@ -2295,5 +2371,33 @@ mod tests {
         assert_eq!(line, 3);
         // debugpy echoes the launched (symlinked) path, NOT the canonical one.
         assert_eq!(loc, via_link, "debugpy must report the path as launched");
+    }
+
+    #[test]
+    fn hit_conditions_and_function_breakpoints_reach_the_wire() {
+        let mut bp = SourceBreakpoint::plain(3);
+        bp.hit_condition = Some(String::from(">= 5"));
+        let req = set_breakpoints_request(Path::new("/a.py"), &[bp, SourceBreakpoint::plain(4)]);
+        let bps = req["arguments"]["breakpoints"].as_array().unwrap();
+        assert_eq!(bps[0]["hitCondition"], ">= 5");
+        assert!(bps[1].get("hitCondition").is_none());
+        let f = set_function_breakpoints_request(&[String::from("main"), String::from("parse")]);
+        assert_eq!(f["command"], "setFunctionBreakpoints");
+        assert_eq!(f["arguments"]["breakpoints"][1]["name"], "parse");
+    }
+
+    #[test]
+    fn capabilities_come_from_the_initialize_response_and_default_off() {
+        let c = Capabilities::from_initialize(&json!({
+            "supportsFunctionBreakpoints": true,
+            "supportsHitConditionalBreakpoints": true,
+            "supportsConditionalBreakpoints": true
+        }));
+        assert!(c.function_breakpoints && c.hit_conditions);
+        assert!(!c.data_breakpoints);
+        assert_eq!(
+            Capabilities::from_initialize(&json!({})),
+            Capabilities::default()
+        );
     }
 }

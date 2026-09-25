@@ -49559,3 +49559,158 @@ fn the_focused_member_ending_names_the_session_now_shown() {
     );
     app.debug_stop();
 }
+
+/// A fake debug adapter for #611: advertises function breakpoints and hit
+/// counts, logs every request it receives (one JSON per line, to argv[1]),
+/// and reports `stopped` after `configurationDone` and after each `continue`.
+const FAKE_DAP_611: &str = r#"
+import json, sys
+log = open(sys.argv[1], "a")
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length)) if length else None
+seq = 1000
+def send(obj):
+    global seq
+    obj["seq"] = seq
+    seq += 1
+    body = json.dumps(obj).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+while True:
+    msg = read()
+    if msg is None:
+        break
+    log.write(json.dumps(msg) + "\n")
+    log.flush()
+    if msg.get("type") != "request":
+        continue
+    cmd = msg["command"]
+    body = {}
+    if cmd == "initialize":
+        body = {"supportsFunctionBreakpoints": True, "supportsHitConditionalBreakpoints": True}
+    elif cmd == "setBreakpoints":
+        body = {"breakpoints": [{"verified": True, "line": b["line"]} for b in msg["arguments"]["breakpoints"]]}
+    elif cmd == "threads":
+        body = {"threads": [{"id": 1, "name": "main"}]}
+    elif cmd == "stackTrace":
+        body = {"stackFrames": [], "totalFrames": 0}
+    send({"type": "response", "request_seq": msg["seq"], "success": True, "command": cmd, "body": body})
+    if cmd == "launch":
+        send({"type": "event", "event": "initialized"})
+    if cmd in ("configurationDone", "continue"):
+        send({"type": "event", "event": "stopped", "body": {"reason": "breakpoint", "threadId": 1}})
+"#;
+
+/// #611 over the real wire, against the fake adapter: a function breakpoint
+/// and a hit count reach the adapter, and Run to Cursor adds its line,
+/// continues, and takes the line away again at the next stop.
+#[test]
+fn function_breakpoints_hit_counts_and_run_to_cursor_reach_the_adapter() {
+    if std::process::Command::new("python3")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIPPED: python3 not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("prog.py");
+    std::fs::write(
+        &src,
+        (1..=10)
+            .map(|i| format!("x{i} = {i}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let script = tmp.path().join("fake_dap.py");
+    std::fs::write(&script, FAKE_DAP_611).unwrap();
+    let log = tmp.path().join("requests.log");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&src).unwrap();
+    let session = crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[script.display().to_string(), log.display().to_string()],
+        tmp.path(),
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("the fake adapter starts");
+    app.debug_sessions.push("fake", session);
+    let wait_for = |app: &mut App, what: &dyn Fn(&str) -> bool| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.poll_dap();
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if what(&text) {
+                return text;
+            }
+            assert!(std::time::Instant::now() < end, "timed out; log:\n{text}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let paused = |app: &mut App| {
+        app.debug_sessions
+            .focused_mut()
+            .is_some_and(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
+    };
+    wait_for(&mut app, &|t| t.contains("\"configurationDone\""));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !paused(&mut app) {
+        assert!(std::time::Instant::now() < end, "never paused");
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    app.add_function_breakpoint(String::from("main"));
+    let text = wait_for(&mut app, &|t| t.contains("setFunctionBreakpoints"));
+    assert!(text.contains("\"name\": \"main\""), "{text}");
+
+    app.commit_breakpoint_hit_count(src.clone(), 3, ">= 5");
+    let text = wait_for(&mut app, &|t| t.contains("hitCondition"));
+    assert!(text.contains("\"hitCondition\": \">= 5\""), "{text}");
+
+    app.editor.cursor_row = 6;
+    app.debug_run_to_cursor();
+    let text = wait_for(&mut app, &|t| t.matches("\"continue\"").count() >= 1);
+    let set_bp = |t: &str| -> Vec<Vec<u64>> {
+        t.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|m| m["command"] == "setBreakpoints")
+            .map(|m| {
+                m["arguments"]["breakpoints"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|b| b["line"].as_u64())
+                    .collect()
+            })
+            .collect()
+    };
+    let before_continue = &text[..text.find("\"continue\"").unwrap()];
+    assert_eq!(
+        set_bp(before_continue).last(),
+        Some(&vec![3, 7]),
+        "line 7 armed before continuing"
+    );
+    // The adapter stops again: Run to Cursor's line goes, the user's stays.
+    let text = wait_for(&mut app, &|t| set_bp(t).last() == Some(&vec![3]));
+    assert!(set_bp(&text).len() >= 3, "{text}");
+    assert_eq!(
+        app.editor
+            .breakpoints
+            .get(&src)
+            .map(|l| l.iter().copied().collect::<Vec<_>>()),
+        Some(vec![3])
+    );
+}

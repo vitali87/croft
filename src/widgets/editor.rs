@@ -2426,6 +2426,9 @@ pub struct Editor {
     /// of pausing. Rendered as an amber diamond in the gutter.
     pub breakpoint_logs:
         std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
+    /// Per-breakpoint hit counts (#611), keyed like `breakpoint_conditions`.
+    pub breakpoint_hit_conditions:
+        std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
     /// Reader bookmarks (VS Code's Bookmarks extension, nvim's `m` marks),
     /// keyed by file path as 1-based line numbers — the same shape as
     /// [`breakpoints`](Self::breakpoints), so switching tabs and coming back
@@ -2972,6 +2975,7 @@ impl Editor {
             unverified_breakpoints: std::collections::HashMap::new(),
             breakpoint_conditions: std::collections::HashMap::new(),
             breakpoint_logs: std::collections::HashMap::new(),
+            breakpoint_hit_conditions: std::collections::HashMap::new(),
             bookmarks: std::collections::HashMap::new(),
             bookmark_shadow: None,
             bookmark_sync_paused: false,
@@ -3142,6 +3146,12 @@ impl Editor {
                 logs.remove(&line);
                 if logs.is_empty() {
                     self.breakpoint_logs.remove(&path);
+                }
+            }
+            if let Some(hits) = self.breakpoint_hit_conditions.get_mut(&path) {
+                hits.remove(&line);
+                if hits.is_empty() {
+                    self.breakpoint_hit_conditions.remove(&path);
                 }
             }
             false
@@ -3479,12 +3489,14 @@ impl Editor {
     ) -> Vec<crate::dap::session::SourceBreakpoint> {
         let conds = self.breakpoint_conditions.get(path);
         let logs = self.breakpoint_logs.get(path);
+        let hits = self.breakpoint_hit_conditions.get(path);
         lines
             .iter()
             .map(|&l| crate::dap::session::SourceBreakpoint {
                 line: l as u32,
                 condition: conds.and_then(|c| c.get(&l)).cloned(),
                 log_message: logs.and_then(|m| m.get(&l)).cloned(),
+                hit_condition: hits.and_then(|h| h.get(&l)).cloned(),
             })
             .collect()
     }
