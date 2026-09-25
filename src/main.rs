@@ -71,6 +71,7 @@ mod scrubber;
 mod session;
 mod session_host;
 mod session_state;
+mod settings_editor;
 mod sheet;
 mod shell_integration;
 mod snippets;
