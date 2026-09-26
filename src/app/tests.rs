@@ -52439,3 +52439,27 @@ fn a_zero_problem_count_clears_nothing_when_no_badge_was_drawn() {
     app.refresh_problems_badge();
     assert!(!app.consume_problems_badge_image_clear());
 }
+
+/// A comment written while a review is being submitted stays pending, and a
+/// second submit while the first runs is refused rather than posted twice.
+#[test]
+fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
+    let (_tmp, root, f, _log, _stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
+    app.editor.cursor_row = 0;
+    app.open_review_comment_prompt();
+    let rel = app.prompt.take().unwrap().target_dir;
+    app.add_pending_review_comment("first", rel.clone());
+    app.submit_review(String::from("Looks good"));
+    assert!(app.review_submitting);
+    app.editor.cursor_row = 1;
+    app.add_pending_review_comment("written meanwhile", rel);
+    app.submit_review(String::from("again"));
+    assert!(app.status.contains("already"), "{}", app.status);
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the submit", || {
+        app.drain_review_ops();
+        !app.review_submitting
+    });
+    let left: Vec<_> = app.review_pending.iter().map(|c| c.body.clone()).collect();
+    assert_eq!(left, vec![String::from("written meanwhile")]);
+}

@@ -15,6 +15,9 @@ use std::process::{Command, Stdio};
 pub struct Settles {
     pub notes: Vec<u64>,
     pub sticky: Vec<String>,
+    /// The pending comments this submission posted: only these leave the
+    /// pending list, so one written while it ran is kept.
+    pub pending: Vec<PendingComment>,
 }
 
 #[derive(Clone, Debug)]

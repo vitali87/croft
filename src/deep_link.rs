@@ -139,8 +139,10 @@ pub fn resolve_host(
 }
 
 /// The croft arguments that carry out `link`, once its host has been
-/// checked against the ssh config.
-pub fn argv(link: &Link) -> Vec<String> {
+/// checked against the ssh config. `home` expands a local `~`: no shell
+/// reads these arguments, so `~/proj` would otherwise name a directory
+/// called `~`.
+pub fn argv(link: &Link, home: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
     match &link.host {
         Some(h) => {
@@ -150,7 +152,19 @@ pub fn argv(link: &Link) -> Vec<String> {
         None => out.push(String::from("attach")),
     }
     if let Some(p) = &link.path {
-        out.push(p.clone());
+        out.push(match (&link.host, p.strip_prefix('~')) {
+            // The remote croft quotes its path, so `~` is never expanded
+            // there either; the login shell starts in home, so a path
+            // relative to it is the same directory.
+            (Some(_), Some("")) => String::from("."),
+            // `./` keeps `~/-x` from reading as a flag once the `~` is gone.
+            (Some(_), Some(rest)) if rest.starts_with('/') => format!(".{rest}"),
+            (None, Some(rest)) if rest.is_empty() || rest.starts_with('/') => match home {
+                Some(h) => format!("{}{rest}", h.trim_end_matches('/')),
+                None => p.clone(),
+            },
+            _ => p.clone(),
+        });
     }
     out
 }
@@ -180,14 +194,35 @@ mod tests {
         assert_eq!(l.host.as_deref(), Some("devbox"));
         assert_eq!(l.path.as_deref(), Some("/srv/app"));
         assert_eq!(l.focus, Some(Focus::Terminal));
-        assert_eq!(argv(&l), vec!["remote", "devbox", "/srv/app"]);
+        assert_eq!(argv(&l, None), vec!["remote", "devbox", "/srv/app"]);
     }
 
     #[test]
     fn a_link_without_a_host_attaches_locally() {
         let l = parse("croft://attach?path=~/my+proj").unwrap();
-        assert_eq!(argv(&l), vec!["attach", "~/my proj"]);
-        assert_eq!(argv(&parse("croft://attach").unwrap()), vec!["attach"]);
+        assert_eq!(argv(&l, None), vec!["attach", "~/my proj"]);
+        assert_eq!(
+            argv(&parse("croft://attach").unwrap(), None),
+            vec!["attach"]
+        );
+    }
+
+    #[test]
+    fn a_tilde_path_means_home_locally_and_remotely() {
+        let l = parse("croft://attach?path=~/my+proj").unwrap();
+        assert_eq!(
+            argv(&l, Some("/home/ada/")),
+            vec!["attach", "/home/ada/my proj"]
+        );
+        let l = parse("croft://attach?path=~").unwrap();
+        assert_eq!(argv(&l, Some("/home/ada")), vec!["attach", "/home/ada"]);
+        let l = parse("croft://attach?path=~bob/x").unwrap();
+        assert_eq!(argv(&l, Some("/home/ada")), vec!["attach", "~bob/x"]);
+        let mut l = parse("croft://attach?path=~/src").unwrap();
+        l.host = Some(String::from("box"));
+        assert_eq!(argv(&l, Some("/home/ada")), vec!["remote", "box", "./src"]);
+        l.path = Some(String::from("~"));
+        assert_eq!(argv(&l, None), vec!["remote", "box", "."]);
     }
 
     #[test]

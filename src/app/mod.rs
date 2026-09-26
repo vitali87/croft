@@ -3619,6 +3619,9 @@ pub struct App {
     /// typed, the `gh` to run, and where finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
     review_pending_pr: Option<(PathBuf, String)>,
+    /// A Submit Review or export is in flight; another is refused until it
+    /// reports, so the same comments are never posted twice.
+    review_submitting: bool,
     /// Sticky notes (#367): every note in the workspace, where the owner
     /// keeps them (`None` under test), and which box id is which note.
     notes: crate::sticky_notes::Notes,
@@ -5340,6 +5343,7 @@ impl App {
             review_boxes: None,
             review_pending: Vec::new(),
             review_pending_pr: None,
+            review_submitting: false,
             notes: notes_path
                 .as_deref()
                 .map(crate::sticky_notes::Notes::load)
@@ -25303,6 +25307,10 @@ impl App {
         if !self.pending_is_for(&root, &number) {
             return;
         }
+        if self.review_submitting {
+            self.status = String::from("A review is already being submitted");
+            return;
+        }
         if event == ReviewEvent::Comment && summary.is_empty() && self.review_pending.is_empty() {
             self.status = String::from("Nothing to submit: add a comment or a summary");
             return;
@@ -25315,10 +25323,14 @@ impl App {
                 event,
                 summary,
                 pending: self.review_pending.clone(),
-                settles: crate::review_ops::Settles::default(),
+                settles: crate::review_ops::Settles {
+                    pending: self.review_pending.clone(),
+                    ..Default::default()
+                },
             },
             self.review_tx.clone(),
         );
+        self.review_submitting = true;
         self.status = String::from("Submitting review…");
     }
 
@@ -25419,8 +25431,11 @@ impl App {
                     folded,
                     settles,
                 } => {
-                    self.review_pending.clear();
-                    self.review_pending_pr = None;
+                    self.review_submitting = false;
+                    self.review_pending.retain(|c| !settles.pending.contains(c));
+                    if self.review_pending.is_empty() {
+                        self.review_pending_pr = None;
+                    }
                     // Exported navigator notes now live on GitHub; reload
                     // shows them there, as threads, rather than twice.
                     // Exported sticky notes are settled: resolved for everyone.
@@ -25450,7 +25465,10 @@ impl App {
                         ),
                     };
                 }
-                Outcome::Failed(e) => self.status = e,
+                Outcome::Failed(e) => {
+                    self.review_submitting = false;
+                    self.status = e;
+                }
             }
         }
         changed
@@ -28467,6 +28485,16 @@ impl App {
         if !self.pending_is_for(&root, &number) {
             return;
         }
+        if self.review_submitting {
+            self.status = String::from("A review is already being submitted");
+            return;
+        }
+        let pending: Vec<_> = self
+            .review_pending
+            .iter()
+            .filter(|c| comments.contains(c))
+            .cloned()
+            .collect();
         crate::review_ops::spawn(
             self.review_gh.clone(),
             root,
@@ -28475,10 +28503,15 @@ impl App {
                 event: crate::review_threads::ReviewEvent::Comment,
                 summary: String::new(),
                 pending: comments,
-                settles: crate::review_ops::Settles { notes, sticky },
+                settles: crate::review_ops::Settles {
+                    notes,
+                    sticky,
+                    pending,
+                },
             },
             self.review_tx.clone(),
         );
+        self.review_submitting = true;
         self.status = String::from("Posting comments…");
     }
 
