@@ -412,7 +412,22 @@ fn run_bounded_stdout(
         let _ = stdout.by_ref().take(MAX_PROBE_STDOUT).read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
+    let started = std::time::Instant::now();
     let out = rx.recv_timeout(budget).ok();
+    // Stdout reaching EOF does not mean the child has exited: it may still
+    // be tearing down, and killing it then reports SIGKILL for a run that
+    // succeeded. So it gets the rest of the budget to exit on its own.
+    if out.is_some() {
+        while started.elapsed() < budget {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return out.map(|b| (status, String::from_utf8_lossy(&b).into_owned()));
+                }
+                Ok(None) => std::thread::sleep(EXIT_POLL_TICK),
+                Err(_) => break,
+            }
+        }
+    }
     let _ = child.kill();
     // Reap either way: on the timeout path the kill needs collecting, and on
     // the success path the child has exited but is still a zombie.

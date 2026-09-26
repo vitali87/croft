@@ -848,7 +848,8 @@ fn clicking_an_internal_pdf_link_flips_to_its_page() {
     assert_eq!(
         app.editor.pdf_page(),
         Some(2),
-        "clicking the internal link must flip the preview to page 2"
+        "clicking the internal link must flip the preview to page 2; status: {}",
+        app.status
     );
 }
 
