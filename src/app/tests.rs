@@ -52130,3 +52130,19 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     );
     app.debug_stop();
 }
+
+/// #682: the fingerprint under an image changes with any write ratatui
+/// makes inside it, and ignores writes outside it.
+#[test]
+fn the_cells_under_an_image_fingerprint_writes_inside_it_only() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
+    let before = super::cells_fingerprint(&buf, 2, 2, 5, 3);
+    buf[(15, 8)].set_symbol("x");
+    assert_eq!(super::cells_fingerprint(&buf, 2, 2, 5, 3), before);
+    buf[(3, 3)].set_symbol("x");
+    assert_ne!(super::cells_fingerprint(&buf, 2, 2, 5, 3), before);
+    // A rectangle past the edge is clamped, not a panic.
+    let _ = super::cells_fingerprint(&buf, 18, 8, 10, 10);
+}
