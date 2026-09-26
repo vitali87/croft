@@ -30667,6 +30667,10 @@ impl App {
             self.handle_archive_key(key);
             return;
         }
+        if self.editor.sarif.is_some() {
+            self.handle_sarif_key(key);
+            return;
+        }
         // Image preview tabs are read-only. PDF tabs page with every
         // navigation key (arrows, PageUp/PageDown, Space, Home/End) and with
         // the wheel; everything else is swallowed.
@@ -42593,6 +42597,32 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    // SARIF viewer (#577): click selects a row; a second
+                    // click on the selected row opens it (a result) or
+                    // folds it (a group).
+                    if let Some(view) = self.editor.sarif.as_mut() {
+                        if view.rows_visible > 0
+                            && m.row >= view.rows_top
+                            && m.row < view.rows_top + view.rows_visible
+                            && m.column >= view.list_x
+                            && m.column < view.list_x + view.list_width
+                        {
+                            let idx = view.scroll + (m.row - view.rows_top) as usize;
+                            if idx < view.rows().len() {
+                                if view.selected == idx {
+                                    if view.selected_entry().is_some() {
+                                        self.open_selected_sarif_result();
+                                    } else {
+                                        view.toggle_fold();
+                                    }
+                                } else {
+                                    view.selected = idx;
+                                }
+                            }
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
                     // Hex tab (#172): a click on a byte cell — hex grid or
                     // ASCII gutter — parks the cursor there; Shift extends
                     // the selection; a drag from here extends it live.
@@ -48247,6 +48277,151 @@ impl App {
             _ => return,
         }
         sheet_follow_cursor(sheet, current, visible);
+    }
+
+    /// SARIF viewer keys (#577). While the filter box has focus, printable
+    /// keys edit the query; otherwise they drive the list.
+    fn handle_sarif_key(&mut self, key: KeyEvent) {
+        use crate::sarif::semantics::{BaselineState, Level, SuppressionState};
+        use crate::sarif::view::{Column, Tab};
+        let Some(view) = self.editor.sarif.as_mut() else {
+            return;
+        };
+        if view.editing_query {
+            match key.code {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let mut q = view.query_text.clone();
+                    q.push(c);
+                    view.set_query(&q);
+                }
+                KeyCode::Backspace => {
+                    let mut q = view.query_text.clone();
+                    q.pop();
+                    view.set_query(&q);
+                }
+                KeyCode::Enter => view.editing_query = false,
+                KeyCode::Esc => {
+                    view.set_query("");
+                    view.editing_query = false;
+                }
+                KeyCode::Up => view.move_selection(-1),
+                KeyCode::Down => view.move_selection(1),
+                _ => {}
+            }
+            return;
+        }
+        let page = (view.rows_visible as isize).max(1);
+        let toggle = |set: &mut std::collections::HashSet<Level>, l: Level| {
+            if !set.remove(&l) {
+                set.insert(l);
+            }
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => view.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => view.move_selection(-1),
+            KeyCode::PageDown => view.move_selection(page),
+            KeyCode::PageUp => view.move_selection(-page),
+            KeyCode::Home => view.select_first(),
+            KeyCode::End => view.select_last(),
+            KeyCode::Left | KeyCode::Char('h') => view.set_fold(true),
+            KeyCode::Right | KeyCode::Char('l') => view.set_fold(false),
+            KeyCode::Char('/') => view.editing_query = true,
+            KeyCode::Esc => view.set_query(""),
+            KeyCode::Tab | KeyCode::BackTab => {
+                let order = [Tab::Locations, Tab::Rules, Tab::Logs];
+                let i = order.iter().position(|t| *t == view.tab).unwrap_or(0);
+                let step = if key.code == KeyCode::BackTab { 2 } else { 1 };
+                view.set_tab(order[(i + step) % order.len()]);
+            }
+            KeyCode::Char('s') => {
+                let order = [
+                    Column::Line,
+                    Column::Level,
+                    Column::Rule,
+                    Column::File,
+                    Column::Message,
+                ];
+                let i = order.iter().position(|c| *c == view.sort.0).unwrap_or(0);
+                view.sort_by(order[(i + 1) % order.len()]);
+                view.sort.1 = true;
+            }
+            KeyCode::Char('S') => {
+                let col = view.sort.0;
+                view.sort_by(col);
+            }
+            KeyCode::Char('c') => view.fold_all(true),
+            KeyCode::Char('e') => view.fold_all(false),
+            KeyCode::Char('1') => toggle(&mut view.filters.hidden_levels, Level::Error),
+            KeyCode::Char('2') => toggle(&mut view.filters.hidden_levels, Level::Warning),
+            KeyCode::Char('3') => toggle(&mut view.filters.hidden_levels, Level::Note),
+            KeyCode::Char('4') => toggle(&mut view.filters.hidden_levels, Level::None),
+            KeyCode::Char('u') => {
+                let set = &mut view.filters.hidden_suppressions;
+                if !set.remove(&SuppressionState::Suppressed) {
+                    set.insert(SuppressionState::Suppressed);
+                }
+            }
+            KeyCode::Char('a') => {
+                let set = &mut view.filters.hidden_baselines;
+                if !set.remove(&BaselineState::Absent) {
+                    set.insert(BaselineState::Absent);
+                }
+            }
+            KeyCode::Char('x') => view.clear_filters(),
+            KeyCode::Enter => {
+                if view.selected_entry().is_some() {
+                    self.open_selected_sarif_result();
+                } else {
+                    view.toggle_fold();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the selected SARIF result's primary location, keeping the viewer
+    /// tab: it is pinned first, so the preview open lands in a new tab
+    /// instead of replacing the list the user is working through.
+    fn open_selected_sarif_result(&mut self) {
+        use crate::sarif::region::{ColumnKind, column_kind};
+        let root = self.workspace_root().to_path_buf();
+        let Some((path, line, column, kind, uri)) = self.editor.sarif.as_ref().and_then(|v| {
+            let e = v.selected_entry()?;
+            let loaded = v.logs.get(e.log)?;
+            let run = loaded.log.runs.get(e.run)?;
+            let result = run.results.as_ref()?.get(e.result)?;
+            let physical = result.locations.first()?.physical_location.as_ref()?;
+            let artifact = physical.artifact_location.as_ref()?;
+            let mut roots = vec![root.clone()];
+            if let Some(dir) = loaded.path.parent() {
+                roots.push(dir.to_path_buf());
+            }
+            let resolver = crate::sarif::resolve::Resolver {
+                roots,
+                ..Default::default()
+            };
+            let found = resolver.resolve(run, artifact, &|p| p.is_file());
+            let region = physical.region.as_ref();
+            let line = region.and_then(|r| r.start_line).unwrap_or(1).max(1) - 1;
+            let column = region.and_then(|r| r.start_column).unwrap_or(1).max(1) - 1;
+            Some((found, line, column, column_kind(run), e.uri.clone()))
+        }) else {
+            self.status = String::from("This result has no location to open");
+            return;
+        };
+        let Some(path) = path else {
+            self.status = format!("Cannot find {uri} on this machine");
+            return;
+        };
+        self.editor.pin_active();
+        let opened = match kind {
+            ColumnKind::Utf16CodeUnits => self.open_at_utf16(&path, line as u32, column as u32),
+            ColumnKind::UnicodeCodePoints => self.open_at(&path, line as usize, column as usize),
+        };
+        self.status = match opened {
+            Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
+            Err(e) => format!("Open failed: {e}"),
+        };
     }
 
     /// Archive browser keys (#179): selection movement, Enter extracts

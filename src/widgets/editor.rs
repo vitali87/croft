@@ -2949,6 +2949,10 @@ pub struct Editor {
     /// archive; Enter extracts one member to scratch and opens it
     /// through the normal dispatch. Read-only.
     pub archive: Option<crate::archive::ArchiveView>,
+    /// SARIF results viewer (#577): every result of a `.sarif` log, grouped
+    /// and filterable; Enter opens a result's location. Read-only; "Reopen
+    /// as Text" shows the JSON.
+    pub sarif: Option<crate::sarif::view::SarifView>,
     /// Three-way merge editor (#253). UNLIKE the other view kinds this is
     /// not read-only and not in `has_non_text_view`: `lines` holds the
     /// editable Result and keeps the whole text path (LSP, undo, save);
@@ -3144,6 +3148,7 @@ impl Editor {
             hex: None,
             log: None,
             archive: None,
+            sarif: None,
             merge: None,
             merge_edit_row: 0,
             force_text: false,
@@ -4390,7 +4395,18 @@ impl Editor {
         if self.path.as_deref() != Some(path) {
             self.force_text = false;
         }
+        // Why a `.sarif` file is showing as text, when it is: the text path
+        // below reports it instead of a bare "Opened".
+        let mut sarif_refusal = None;
         if !self.force_text {
+            // SARIF results viewer (#577). A log that does not load (bad
+            // JSON, another SARIF version) opens as text with the reason.
+            if crate::sarif::view::extension_is_sarif(ext) {
+                match self.open_sarif(path) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => sarif_refusal = Some(e.to_string()),
+                }
+            }
             // Rendered ANSI log (#257): a colour-bearing log paints through
             // the theme palette instead of showing raw escapes. Sniffed, so a
             // plain .txt with pytest output routes here too; a failure falls
@@ -4710,11 +4726,15 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.sarif = None;
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
         self.diff = None;
         self.merge = None;
-        self.status = format!("Opened {}", path.display());
+        self.status = match sarif_refusal {
+            Some(why) => format!("Opened {} as text: {why}", path.display()),
+            None => format!("Opened {}", path.display()),
+        };
         // The buffer now matches disk; bump the edit seq so the LSP doc sync
         // sees the new content (an external reload lands here too, and without
         // the bump the server keeps analysing the old text and never sends
@@ -4818,6 +4838,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.sarif = None;
         self.status = format!("Opened image {}", path.display());
         Ok(())
     }
@@ -4872,6 +4893,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.sarif = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -4948,6 +4970,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.sarif = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -5010,6 +5033,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.markdown_preview = None;
+        self.sarif = None;
         self.archive = Some(view);
         self.status = format!("Opened archive {}", path.display());
         Ok(())
@@ -5065,6 +5089,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.sarif = None;
         self.markdown_preview = None;
         self.image = Some(ImageView {
             bytes: png,
@@ -5122,6 +5147,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.sarif = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
     }
@@ -5200,6 +5226,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.sarif = None;
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
     }
@@ -5215,6 +5242,7 @@ impl Editor {
             || self.image.is_some()
             || self.hex.is_some()
             || self.archive.is_some()
+            || self.sarif.is_some()
             // A rendered log's text side is an empty stub, so a save would
             // write one blank line over the file — the #185 truncation class.
             || self.log.is_some()
@@ -5306,9 +5334,64 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.archive = None;
+        self.sarif = None;
         self.hex = None;
         self.log = Some(view);
         self.status = format!("Opened {} as a rendered log", path.display());
+        Ok(())
+    }
+
+    /// Open `path` in the SARIF results viewer (#577). Fails with the
+    /// loader's explanation (position of a JSON error, an unsupported
+    /// version) so the caller can fall back to text and say why.
+    pub fn open_sarif(&mut self, path: &Path) -> Result<()> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > crate::sarif::view::MAX_LOG_BYTES {
+            anyhow::bail!("SARIF log too large to load ({} bytes)", meta.len());
+        }
+        let bytes = std::fs::read(path)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let log = crate::sarif::load::parse_log(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let view = crate::sarif::view::SarifView::open(path, log);
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
+        self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        // Same supersede-every-other-kind reset the other preview openers do.
+        self.diff = None;
+        self.merge = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        self.image = None;
+        self.sheet = None;
+        self.markdown_preview = None;
+        self.archive = None;
+        self.hex = None;
+        self.log = None;
+        let n = view.entries.len();
+        self.sarif = Some(view);
+        self.status = format!(
+            "Opened {} · {n} SARIF result{}",
+            path.display(),
+            if n == 1 { "" } else { "s" }
+        );
         Ok(())
     }
 
@@ -5408,6 +5491,7 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.archive = None;
+        self.sarif = None;
         // The render dispatch checks `log` BEFORE `hex`, so a stale log would
         // keep painting after "Reopen as Hex" reported success.
         self.log = None;
@@ -12419,6 +12503,10 @@ impl Widget for &mut Editor {
         }
         if let Some(view) = self.archive.as_mut() {
             render_archive(view, self.path.as_deref(), inner, buf, cbg, self.theme);
+            return;
+        }
+        if let Some(view) = self.sarif.as_mut() {
+            crate::sarif::render::render(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
         }
         if let Some(view) = self.log.as_mut() {
