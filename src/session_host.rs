@@ -128,6 +128,89 @@ pub struct Participant {
     pub rows: u16,
     /// Whether this client's keystrokes reach the PTY (write control).
     pub control: bool,
+    /// The client's croft version from its Hello (#626), so the inner
+    /// croft can say when a client is older than the session. Empty from
+    /// clients that send none and in rosters written by older hosts.
+    #[serde(default)]
+    pub version: String,
+}
+
+/// The status line for attached clients older than this croft, or `None`
+/// when no client that reported a version is older (#626, #652). A client
+/// that reported none (an old client) says nothing either way, and neither
+/// does a newer one: the first-attach banner already covered it, and
+/// reattaching would not help.
+pub fn stale_client_notice(roster: &[Participant], own: &str) -> Option<String> {
+    let mut older: Vec<(Vec<u64>, &str)> = roster
+        .iter()
+        .map(|p| p.version.as_str())
+        .filter(|v| version_is_older(v, own))
+        .filter_map(|v| Some((parse_version(v)?, v)))
+        .collect();
+    older.sort_unstable();
+    older.dedup();
+    let older: Vec<&str> = older.into_iter().map(|(_, v)| v).collect();
+    (!older.is_empty()).then(|| {
+        format!(
+            "Session updated to croft {own}; a client still runs {}. Detach it (Cmd+K Shift+Q) and reattach to update",
+            older.join(", ")
+        )
+    })
+}
+
+/// The stale-client notice to raise for roster `next`, given the notice
+/// `last` raised (or `None`): `None` unless the notice itself changed. A
+/// client resizing churns the roster every few hundred milliseconds, and
+/// must not re-stamp the status line over whatever the user is reading.
+pub fn stale_client_notice_on_change(
+    last: Option<&str>,
+    next: &[Participant],
+    reference: &str,
+) -> Option<String> {
+    let notice = stale_client_notice(next, reference)?;
+    (last != Some(notice.as_str())).then_some(notice)
+}
+
+/// The one client that can have asked for Session: Detach from inside the
+/// app: the sole control holder (a read-only client's keys never reach
+/// croft), or the sole client. `None` when several could have, since the
+/// typing attribution can race another writer's keys.
+pub fn sole_detach_target(roster: &[Participant]) -> Option<u64> {
+    let mut writers = roster.iter().filter(|p| p.control);
+    match (writers.next(), writers.next()) {
+        (Some(only), None) => Some(only.id),
+        (None, None) => match roster {
+            [only] => Some(only.id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The version clients are measured against: the newer of the inner croft's
+/// own and the session host's (#652). A host swap updates the host without
+/// the inner croft, and a client on the pre-swap binary is still out of date
+/// even though it matches the inner croft.
+pub fn session_version<'a>(own: &'a str, host: Option<&'a str>) -> &'a str {
+    match host {
+        Some(h) if version_is_older(own, h) => h,
+        _ => own,
+    }
+}
+
+/// A dotted version as numeric components, or `None` when any component
+/// is not a number (empty, or a pre-release suffix).
+fn parse_version(v: &str) -> Option<Vec<u64>> {
+    v.split('.').map(|c| c.parse().ok()).collect()
+}
+
+/// True when dotted version `v` sorts strictly below `own`, compared
+/// numerically per component. An empty or unparsable `v` is never older.
+fn version_is_older(v: &str, own: &str) -> bool {
+    match (parse_version(v), parse_version(own)) {
+        (Some(v), Some(own)) => v < own,
+        _ => false,
+    }
 }
 
 /// A decoded frame.
@@ -231,6 +314,30 @@ pub fn stale_marker_path(socket: &Path) -> PathBuf {
     let mut name = socket.file_name().unwrap_or_default().to_os_string();
     name.push(".host-stale");
     socket.with_file_name(name)
+}
+
+/// Sidecar holding the croft version this host process runs (#652). A host
+/// swap (#238) moves the host onto a new binary without touching the inner
+/// croft, which keeps its version until an F9 reload; this is how the inner
+/// croft learns the version a reattaching client would get.
+pub fn host_version_path(socket: &Path) -> PathBuf {
+    let mut name = socket.file_name().unwrap_or_default().to_os_string();
+    name.push(".host-version");
+    socket.with_file_name(name)
+}
+
+/// Record this host's version next to its socket. Best-effort: without it
+/// the inner croft falls back to comparing clients against itself.
+fn write_host_version(socket: &Path) {
+    let _ = std::fs::write(host_version_path(socket), env!("CARGO_PKG_VERSION"));
+}
+
+/// The version the session host at `socket` runs, as its sidecar records it.
+/// `None` when the host predates the sidecar or it cannot be read.
+pub fn read_host_version(socket_sidecar: &Path) -> Option<String> {
+    let v = std::fs::read_to_string(socket_sidecar).ok()?;
+    let v = v.trim();
+    parse_version(v).map(|_| v.to_string())
 }
 
 /// The (device, inode) pair that identifies the file currently at `path`.
@@ -739,6 +846,8 @@ fn spawn_writer(stream: Arc<Mutex<UnixStream>>, outbox: Arc<Outbox>, fd: std::os
 struct Client {
     id: u64,
     name: String,
+    /// The version the client's Hello carried (empty when it sent none).
+    version: String,
     cols: u16,
     rows: u16,
     control: bool,
@@ -866,6 +975,7 @@ pub(crate) fn serve_with_token(
     // A fresh host runs the binary currently on disk; any stale marker left
     // by a predecessor is obsolete the moment the socket answers.
     let _ = std::fs::remove_file(stale_marker_path(socket));
+    write_host_version(socket);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -922,6 +1032,7 @@ pub(crate) fn serve_with_token(
 fn run_resumed(socket: &Path, resumed: ResumedSession) -> Result<i32> {
     let _ = std::fs::remove_file(presence_path(socket));
     let _ = std::fs::remove_file(stale_marker_path(socket));
+    write_host_version(socket);
     // Reader and writer are independent dups so each side owns its fd, same
     // shape as the fresh path's clone_reader/take_writer.
     let dup = |fd: std::os::fd::RawFd| -> Result<std::fs::File> {
@@ -1024,6 +1135,7 @@ fn run_host(
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(presence_path(socket));
     let _ = std::fs::remove_file(stale_marker_path(socket));
+    let _ = std::fs::remove_file(host_version_path(socket));
     // Drop the meta sidecar too, or a later server for this workspace inherits
     // the dead session's created time and `croft ls` reports an inflated uptime.
     crate::session::remove_meta(socket);
@@ -1174,6 +1286,16 @@ fn apply_winsize(host: &Host, force_repaint: bool) {
 /// Write the roster sidecar (atomic tmp + rename, so the inner croft never
 /// reads a torn file) and broadcast it as a Presence frame.
 fn update_presence(host: &Host) {
+    // Held from the snapshot through the rename: every client thread and
+    // the output thread call this, and unserialized an older roster could
+    // land last (a participant who left, shown as attached), or one writer
+    // could truncate the shared temp file under another's rename (a torn
+    // file, read as nobody attached). Not held across the broadcast, which
+    // can prune a client and call back in here.
+    static WRITING: Mutex<()> = Mutex::new(());
+    let writing = WRITING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let participants: Vec<Participant> = {
         let clients = host.clients.lock().unwrap();
         clients
@@ -1184,6 +1306,7 @@ fn update_presence(host: &Host) {
                 cols: c.cols,
                 rows: c.rows,
                 control: c.control,
+                version: c.version.clone(),
             })
             .collect()
     };
@@ -1194,6 +1317,7 @@ fn update_presence(host: &Host) {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
+    drop(writing);
     broadcast(
         host,
         &encode_control_frame(&Control::Presence { participants }),
@@ -1239,7 +1363,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                     cols,
                     rows,
                     client_id,
-                    ..
+                    version,
                 }) if my_id.is_none() && !privileged => {
                     // Answer with our version FIRST: registration below makes
                     // this client a broadcast target, and the ServerHello must
@@ -1323,6 +1447,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                             clients.push(Client {
                                 id,
                                 name,
+                                version,
                                 cols,
                                 rows,
                                 control,
@@ -1562,6 +1687,9 @@ pub fn attach_or_create(socket: &Path, workspace: Option<&Path>, inner: &[String
             // Exit when reconnection is exhausted; this arm is exhaustiveness
             // only.
             PumpOutcome::HostSwapped => return Ok(0),
+            // attach_client reports both as Exit(0) after restoring the
+            // terminal; exhaustiveness only.
+            PumpOutcome::Detached | PumpOutcome::Disconnected => return Ok(0),
         }
     }
 }
@@ -1622,6 +1750,7 @@ fn kill_stale_server(socket: &Path) {
         let _ = std::fs::remove_file(socket);
         let _ = std::fs::remove_file(presence_path(socket));
         let _ = std::fs::remove_file(stale_marker_path(socket));
+        let _ = std::fs::remove_file(host_version_path(socket));
         crate::session::remove_meta(socket);
     }
 }
@@ -1680,6 +1809,15 @@ pub enum PumpOutcome {
     /// connection is about to drop while the socket stays bound. Internal
     /// to the attach loop, which reconnects; callers never see it.
     HostSwapped,
+    /// This client detached itself with the detach chord (#679); the
+    /// session keeps running. [`attach_client`] restores the terminal and
+    /// reports it as `Exit(0)`.
+    Detached,
+    /// The host closed the connection without an exit code: this client
+    /// was disconnected (Session: Detach, Session: Participants) or the
+    /// host died (#679). [`attach_client`] restores the terminal and
+    /// reports it as `Exit(0)`.
+    Disconnected,
 }
 
 /// How long the client waits for [`Control::ServerHello`] after its Hello.
@@ -1734,7 +1872,224 @@ pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     let result = attach_client_loop(socket, &mut stream);
     let _ = crossterm::terminal::disable_raw_mode();
-    result
+    match result {
+        // The inner croft never ran its own teardown for THIS terminal: it
+        // is still running, or died without one. Undo its modes here so the
+        // shell prompt comes back usable instead of stuck in the alternate
+        // screen with mouse reporting and enhanced keys on (#679).
+        Ok(outcome @ (PumpOutcome::Detached | PumpOutcome::Disconnected)) => {
+            let alive = crate::session::is_alive(socket);
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&client_teardown_seq());
+            let _ = writeln!(out, "{}", attach_end_note(&outcome, alive));
+            let _ = out.flush();
+            Ok(PumpOutcome::Exit(0))
+        }
+        other => other,
+    }
+}
+
+/// The escape bytes that hand a terminal back to the shell after the inner
+/// croft owned it: the same modes croft's own exit undoes (keyboard flags,
+/// cursor shape, alternate screen, mouse capture, bracketed paste, host
+/// colours), plus a visible cursor and plain SGR. Every sequence is a no-op
+/// on a terminal that never had the mode on.
+fn client_teardown_seq() -> Vec<u8> {
+    let mut seq = b"\x1b[0m\x1b]110\x07\x1b]111\x07\x1b[=0;1u".to_vec();
+    let _ = crossterm::execute!(
+        seq,
+        crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::cursor::SetCursorStyle::DefaultUserShape,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::Show,
+    );
+    seq
+}
+
+/// The line a client prints once it has left a session (#679).
+fn attach_end_note(outcome: &PumpOutcome, session_alive: bool) -> &'static str {
+    match (outcome, session_alive) {
+        (PumpOutcome::Detached, _) => {
+            "Detached from the croft session; it keeps running. Run the same command to reattach."
+        }
+        (_, true) => {
+            "Disconnected from the croft session; it keeps running. Run the same command to reattach."
+        }
+        (_, false) => "The croft session ended.",
+    }
+}
+
+/// Whether stdin has input within `wait` (false on timeout or error).
+fn stdin_readable_within(wait: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = wait.as_millis().clamp(0, i32::MAX as u128) as i32;
+    (unsafe { libc::poll(&mut pfd, 1, ms) }) > 0
+}
+
+/// `Cmd+K Shift+Q` (Session: Detach, #679) spotted in a client's own
+/// keystrokes, so a client can always leave: a read-only participant's
+/// input never reaches the inner croft, and a wedged inner croft reads
+/// nothing at all. Filtered here, before the bytes are forwarded.
+///
+/// The `Cmd+K` leader is WITHHELD until the next key decides it: forwarded
+/// at once, it would arm the inner croft's chord leader, and the next key
+/// ANY participant typed would complete a chord this client started. A
+/// leader followed by anything else is forwarded unchanged, and one left
+/// alone is released by [`Self::flush`] after [`DETACH_CHORD_HOLD`].
+///
+/// `Cmd` reaches the client only as a kitty-protocol key event (CSI 107
+/// with the super bit, which croft's keyboard flags turn on, or iTerm2's
+/// mapping that sends the same bytes), so Ctrl+K, the editor's kill-line,
+/// is never taken.
+#[derive(Default)]
+struct DetachChord {
+    /// The withheld leader, plus any release/repeat events of it.
+    leader: Vec<u8>,
+    /// An escape sequence cut off at the end of a read, completed by the
+    /// next one.
+    partial: Vec<u8>,
+}
+
+/// How long a lone `Cmd+K` is withheld before it goes to the inner croft
+/// anyway, so its chord hint still shows for a user who pauses.
+const DETACH_CHORD_HOLD: Duration = Duration::from_millis(1000);
+
+impl DetachChord {
+    /// Filter one read of stdin: the bytes to forward, and whether the
+    /// detach chord was typed (everything from it on is dropped).
+    fn feed(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
+        let mut data = std::mem::take(&mut self.partial);
+        data.extend_from_slice(input);
+        let mut out = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            let Some(len) = token_len(&data[i..]) else {
+                // Only what could still become the chord is withheld: a
+                // lone ESC is the Esc key, and must never wait for a key
+                // that may not come.
+                if may_become_chord_key(&data[i..]) {
+                    self.partial = data[i..].to_vec();
+                } else {
+                    out.append(&mut self.leader);
+                    out.extend_from_slice(&data[i..]);
+                }
+                break;
+            };
+            let token = &data[i..i + len];
+            i += len;
+            if !self.leader.is_empty() {
+                match kitty_key(token) {
+                    Some((107, mods, event)) if event != 1 && is_super_only(mods) => {
+                        self.leader.extend_from_slice(token);
+                        continue;
+                    }
+                    _ if is_detach_key(token) => {
+                        self.leader.clear();
+                        return (out, true);
+                    }
+                    _ => out.append(&mut self.leader),
+                }
+            }
+            if matches!(kitty_key(token), Some((107, mods, 1)) if is_super_only(mods)) {
+                self.leader = token.to_vec();
+            } else {
+                out.extend_from_slice(token);
+            }
+        }
+        (out, false)
+    }
+
+    /// True while bytes are withheld waiting for the next key.
+    fn holding(&self) -> bool {
+        !self.leader.is_empty() || !self.partial.is_empty()
+    }
+
+    /// Release whatever is withheld (the pause after a lone leader).
+    fn flush(&mut self) -> Vec<u8> {
+        let mut out = std::mem::take(&mut self.leader);
+        out.append(&mut self.partial);
+        out
+    }
+}
+
+/// Whether a CSI cut off at the end of a read could still turn out to be
+/// the chord's leader or second key (`CSI 107;`, `CSI 113;`, `CSI 81;`).
+fn may_become_chord_key(partial: &[u8]) -> bool {
+    let Some(body) = partial.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+    [&b"107;"[..], b"113;", b"81;"].iter().any(|code| {
+        if body.len() <= code.len() {
+            code.starts_with(body)
+        } else {
+            body.starts_with(code)
+                && body[code.len()..]
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || *b == b':' || *b == b';')
+        }
+    })
+}
+
+/// Length of the input token at the start of `data`: a whole CSI sequence,
+/// an ESC-prefixed key, or one byte. `None` when a CSI is cut off.
+fn token_len(data: &[u8]) -> Option<usize> {
+    if data[0] != 0x1b {
+        return Some(1);
+    }
+    match data.get(1) {
+        None => None,
+        Some(b'[') => data[2..]
+            .iter()
+            .position(|b| (0x40..=0x7e).contains(b))
+            .map(|p| p + 3),
+        Some(_) => Some(2),
+    }
+}
+
+/// A kitty-protocol key event `CSI code ; mods [: event] u` as
+/// `(code, mods, event)`, with `mods` and `event` defaulting to 1.
+fn kitty_key(token: &[u8]) -> Option<(u32, u32, u32)> {
+    let body = token.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?;
+    let body = std::str::from_utf8(body).ok()?;
+    let mut fields = body.split(';');
+    let code = fields.next()?.split(':').next()?.parse().ok()?;
+    let (mods, event) = match fields.next() {
+        None => (1, 1),
+        Some(m) => {
+            let mut parts = m.split(':');
+            let mods = parts.next()?.parse().ok()?;
+            let event = parts.next().map_or(Some(1), |e| e.parse().ok())?;
+            (mods, event)
+        }
+    };
+    Some((code, mods, event))
+}
+
+/// The kitty modifier bits held, ignoring Caps Lock and Num Lock.
+fn held_mods(mods: u32) -> u32 {
+    mods.saturating_sub(1) & !(64 | 128)
+}
+
+fn is_super_only(mods: u32) -> bool {
+    held_mods(mods) == 8
+}
+
+/// The chord's second key: `Q`, as plain text or as a kitty key event with
+/// Shift (and optionally Cmd still held).
+fn is_detach_key(token: &[u8]) -> bool {
+    if token == b"Q" {
+        return true;
+    }
+    matches!(
+        kitty_key(token),
+        Some((113 | 81, mods, 1)) if matches!(held_mods(mods), 1 | 9)
+    )
 }
 
 /// Pump the attach, reconnecting across host swaps (#238): a HostSwap frame
@@ -1744,9 +2099,15 @@ pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
 /// through a shared handle that reconnection re-points at the new stream.
 fn attach_client_loop(socket: &Path, stream: &mut UnixStream) -> Result<PumpOutcome> {
     let tx = Arc::new(Mutex::new(stream.try_clone().context("cloning socket")?));
+    let detaching = Arc::new(AtomicBool::new(false));
     let mut first_attach = true;
     loop {
-        match attach_client_pump(stream, &tx, first_attach)? {
+        match attach_client_pump(stream, &tx, &detaching, first_attach)? {
+            // A detach that raced the swap wins: the stdin forwarder has
+            // already stopped, so a successor connection would only hang.
+            PumpOutcome::HostSwapped if detaching.load(Ordering::SeqCst) => {
+                return Ok(PumpOutcome::Detached);
+            }
             PumpOutcome::HostSwapped => {
                 let Some(fresh) = reconnect_after_swap(socket) else {
                     // The successor never came up: from here the session is
@@ -1778,6 +2139,7 @@ fn reconnect_after_swap(socket: &Path) -> Option<UnixStream> {
 fn attach_client_pump(
     stream: &mut UnixStream,
     tx: &Arc<Mutex<UnixStream>>,
+    detaching: &Arc<AtomicBool>,
     first_attach: bool,
 ) -> Result<PumpOutcome> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -1853,21 +2215,14 @@ fn attach_client_pump(
         let _ = stream.set_read_timeout(None);
     }
     let client_version = env!("CARGO_PKG_VERSION");
-    if server_version.as_deref() != Some(client_version) && !first_attach {
-        // Reconnected across a host swap: the server is now NEWER than this
-        // still-running attach client. A one-line notice, not the
-        // interactive banner - parking a live handover on a keypress would
-        // freeze the session for a formality.
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(
-            format!(
-                "\r\nsession host updated to croft {}; detach and reattach to update this client\r\n",
-                server_version.as_deref().unwrap_or("?")
-            )
-            .as_bytes(),
-        );
-        let _ = out.flush();
-    } else if server_version.as_deref() != Some(client_version) {
+    // A reconnect across a host swap writes nothing even when the server
+    // is now NEWER than this still-running attach client: the screen
+    // belongs to the inner croft, and text printed over it survives in
+    // every cell that croft's next frames leave blank (#626, #652). The
+    // inner croft says it instead, from this client's version in the
+    // roster (`App::poll_session_presence`). Only a first attach, before
+    // the inner croft's attach repaint, may show the banner.
+    if first_attach && server_version.as_deref() != Some(client_version) {
         let mut out = std::io::stdout().lock();
         out.write_all(mismatch_banner(server_version.as_deref(), client_version).as_bytes())
             .context("writing banner")?;
@@ -1909,10 +2264,27 @@ fn attach_client_pump(
     // first for stdin bytes.
     if first_attach {
         let tx = Arc::clone(tx);
+        let detaching = Arc::clone(detaching);
         std::thread::spawn(move || {
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 16384];
+            let mut chord = DetachChord::default();
+            // A write error is not fatal: mid-swap the socket is dead only
+            // for the beat the successor host takes to adopt, and the handle
+            // is re-pointed on reconnect. The dropped bytes are what any
+            // dead transport would lose.
+            let forward = |bytes: &[u8]| {
+                if !bytes.is_empty() {
+                    let _ = tx.lock().unwrap().write_all(&encode_bytes_frame(bytes));
+                }
+            };
             loop {
+                // A withheld Cmd+K goes through after a pause, so a user
+                // who stops after the leader still gets its chord hint.
+                if chord.holding() && !stdin_readable_within(DETACH_CHORD_HOLD) {
+                    forward(&chord.flush());
+                    continue;
+                }
                 match stdin.read(&mut buf) {
                     Ok(0) | Err(_) => {
                         let _ = tx
@@ -1922,12 +2294,18 @@ fn attach_client_pump(
                         break;
                     }
                     Ok(n) => {
-                        // A write error is not fatal: mid-swap the socket is
-                        // dead only for the beat the successor host takes to
-                        // adopt, and the handle is re-pointed on reconnect.
-                        // The dropped bytes are what any dead transport
-                        // would lose.
-                        let _ = tx.lock().unwrap().write_all(&encode_bytes_frame(&buf[..n]));
+                        let (bytes, detach) = chord.feed(&buf[..n]);
+                        forward(&bytes);
+                        if detach {
+                            detaching.store(true, Ordering::SeqCst);
+                            let mut stream = tx.lock().unwrap();
+                            let _ = stream.write_all(&encode_control_frame(&Control::Detach));
+                            // Leave without waiting for the host to hang up:
+                            // a wedged host never would. The pump's read sees
+                            // the EOF and reports the detach.
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            break;
+                        }
                     }
                 }
             }
@@ -1971,10 +2349,19 @@ fn attach_client_pump(
         out.write_all(&bytes).context("writing to terminal")?;
     }
     out.flush().context("flushing terminal")?;
+    // The connection closing without an Exit frame: this client detached
+    // itself, was disconnected, or the host died (#679).
+    let closed = || {
+        if detaching.load(Ordering::SeqCst) {
+            PumpOutcome::Detached
+        } else {
+            PumpOutcome::Disconnected
+        }
+    };
     let mut buf = [0u8; 65536];
     loop {
         let n = match stream.read(&mut buf) {
-            Ok(0) => return Ok(PumpOutcome::Exit(0)),
+            Ok(0) => return Ok(closed()),
             Ok(n) => n,
             // A read timeout can survive the version phase when clearing it
             // failed (see above): an expiry on a quiet session is "nothing
@@ -1987,7 +2374,7 @@ fn attach_client_pump(
             {
                 continue;
             }
-            Err(_) => return Ok(PumpOutcome::Exit(0)),
+            Err(_) => return Ok(closed()),
         };
         for frame in reader.push(&buf[..n]) {
             match frame {
@@ -2039,6 +2426,9 @@ pub struct InnerChannel {
     /// The host's stale-image marker (#238): present once the host noticed
     /// its binary was replaced on disk while it kept running the old image.
     pub stale_marker: PathBuf,
+    /// The host's version sidecar (#652): the version a reattaching client
+    /// gets, which a host swap can move ahead of the inner croft's own.
+    pub host_version: PathBuf,
 }
 
 impl InnerChannel {
@@ -2077,6 +2467,7 @@ impl InnerChannel {
             dead: false,
             presence: presence_path(socket),
             stale_marker: stale_marker_path(socket),
+            host_version: host_version_path(socket),
         })
     }
 
@@ -3398,6 +3789,167 @@ mod tests {
         );
     }
 
+    /// Cmd+K as croft's keyboard flags (and iTerm2's mapping) send it.
+    const CMD_K: &[u8] = b"\x1b[107;9u";
+
+    #[test]
+    fn detach_chord_passes_ordinary_input_through_untouched() {
+        let mut c = DetachChord::default();
+        let input = b"ls -la\r\x1b[A\x0bQ\x1b[107;5u";
+        assert_eq!(
+            c.feed(input),
+            (input.to_vec(), false),
+            "typing, arrows, Ctrl+K (kill-line) and a lone Q are not the chord"
+        );
+        assert!(!c.holding());
+    }
+
+    #[test]
+    fn cmd_k_then_shift_q_detaches_and_forwards_nothing_of_the_chord() {
+        let mut c = DetachChord::default();
+        let mut input = b"echo".to_vec();
+        input.extend_from_slice(CMD_K);
+        input.extend_from_slice(b"Qtrailing");
+        assert_eq!(c.feed(&input), (b"echo".to_vec(), true));
+    }
+
+    #[test]
+    fn the_chord_survives_release_events_split_reads_and_lock_keys() {
+        // Leader release (REPORT_EVENT_TYPES) between the two keys, the
+        // leader cut across two reads, and Caps Lock set (mods 9 + 64).
+        let mut c = DetachChord::default();
+        assert_eq!(c.feed(b"\x1b[107;7"), (Vec::new(), false));
+        assert_eq!(c.feed(b"3u"), (Vec::new(), false));
+        assert!(c.holding(), "the leader is withheld until the next key");
+        assert_eq!(c.feed(b"\x1b[107;73:3u"), (Vec::new(), false));
+        // Cmd still held on the second key: kitty Cmd+Shift+Q.
+        assert_eq!(c.feed(b"\x1b[113;10u"), (Vec::new(), true));
+    }
+
+    #[test]
+    fn cmd_k_then_another_key_reaches_croft_unchanged() {
+        let mut c = DetachChord::default();
+        assert_eq!(c.feed(CMD_K), (Vec::new(), false));
+        let mut expected = CMD_K.to_vec();
+        expected.extend_from_slice(b"t");
+        assert_eq!(
+            c.feed(b"t"),
+            (expected, false),
+            "Cmd+K T (Color Theme) must arrive whole"
+        );
+        assert!(!c.holding());
+    }
+
+    #[test]
+    fn a_lone_escape_is_forwarded_at_once_not_held_for_the_next_key() {
+        let mut c = DetachChord::default();
+        assert_eq!(c.feed(b"\x1b"), (b"\x1b".to_vec(), false));
+        assert!(!c.holding(), "Esc must never wait for another key");
+        // A cut-off CSI that cannot become the chord goes through too.
+        assert_eq!(c.feed(b"\x1b[1;5"), (b"\x1b[1;5".to_vec(), false));
+        assert!(!c.holding());
+        // One that can is held, and timed out by flush like a lone leader.
+        assert_eq!(c.feed(b"\x1b[10"), (Vec::new(), false));
+        assert!(c.holding());
+        assert_eq!(c.flush(), b"\x1b[10".to_vec());
+    }
+
+    #[test]
+    fn a_lone_cmd_k_is_released_by_flush() {
+        let mut c = DetachChord::default();
+        assert_eq!(c.feed(CMD_K), (Vec::new(), false));
+        assert_eq!(c.flush(), CMD_K.to_vec());
+        assert!(!c.holding());
+        assert_eq!(c.feed(b"q"), (b"q".to_vec(), false));
+    }
+
+    #[test]
+    fn the_teardown_undoes_every_mode_croft_turns_on() {
+        let seq = String::from_utf8(client_teardown_seq()).unwrap();
+        for (mode, what) in [
+            ("\x1b[?1049l", "alternate screen"),
+            ("\x1b[?1000l", "mouse clicks"),
+            ("\x1b[?1003l", "mouse motion"),
+            ("\x1b[?1006l", "SGR mouse"),
+            ("\x1b[?2004l", "bracketed paste"),
+            ("\x1b[<1u", "kitty keyboard flags"),
+            ("\x1b[?25h", "cursor visibility"),
+        ] {
+            assert!(seq.contains(mode), "teardown must reset {what}: {seq:?}");
+        }
+    }
+
+    #[test]
+    fn the_end_note_says_whether_the_session_is_still_running() {
+        assert!(attach_end_note(&PumpOutcome::Detached, true).starts_with("Detached"));
+        assert!(
+            attach_end_note(&PumpOutcome::Disconnected, true).contains("keeps running"),
+            "a kicked client's session is still there to reattach"
+        );
+        assert_eq!(
+            attach_end_note(&PumpOutcome::Disconnected, false),
+            "The croft session ended."
+        );
+    }
+
+    // #679: a host that closes the connection without an Exit frame (a kick,
+    // or the host dying) must read as a disconnect, which is what makes the
+    // client restore the terminal, not as the inner croft exiting cleanly.
+    #[test]
+    fn detach_targets_only_an_unambiguous_client() {
+        let p = |id: u64, control: bool| Participant {
+            id,
+            name: String::from("x"),
+            cols: 80,
+            rows: 24,
+            control,
+            version: String::new(),
+        };
+        // The sole control holder, even beside read-only guests.
+        assert_eq!(sole_detach_target(&[p(1, false), p(2, true)]), Some(2));
+        // The sole client, whatever its control.
+        assert_eq!(sole_detach_target(&[p(7, false)]), Some(7));
+        // Two writers: the typist could be either, so no one.
+        assert_eq!(sole_detach_target(&[p(1, true), p(2, true)]), None);
+        assert_eq!(sole_detach_target(&[p(1, false), p(2, false)]), None);
+        assert_eq!(sole_detach_target(&[]), None);
+    }
+
+    #[test]
+    fn a_connection_closed_without_exit_is_a_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("kick.mux.sock");
+        let listener = crate::session::bind_socket_0600(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut reader = FrameReader::new();
+            let mut buf = [0u8; 4096];
+            'hello: loop {
+                let n = c.read(&mut buf).unwrap_or(0);
+                assert!(n > 0, "the client must Hello before anything else");
+                for f in reader.push(&buf[..n]) {
+                    if matches!(f, Frame::Control(Control::Hello { .. })) {
+                        break 'hello;
+                    }
+                }
+            }
+            c.write_all(&encode_control_frame(&Control::ServerHello {
+                version: String::from(env!("CARGO_PKG_VERSION")),
+            }))
+            .unwrap();
+            c.write_all(&encode_bytes_frame(b"SCREEN")).unwrap();
+            // The kick: the connection closes with no Exit frame.
+            drop(c);
+        });
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let outcome = attach_client_loop(&socket, &mut stream).expect("attach loop");
+        assert!(
+            matches!(outcome, PumpOutcome::Disconnected),
+            "got {outcome:?}"
+        );
+        server.join().unwrap();
+    }
+
     // The attach side of a host swap (#238): HostSwap followed by EOF must
     // reconnect and re-Hello on the same socket, not exit; the session ends
     // only on the successor's Exit frame.
@@ -3837,6 +4389,7 @@ mod tests {
             cols: 80,
             rows: 24,
             control,
+            version: String::new(),
         };
         assert!(sole_participant_lacks_control(&[p(false)]));
         assert!(!sole_participant_lacks_control(&[p(true)]));
@@ -4257,5 +4810,123 @@ mod tests {
         a.send(&encode_bytes_frame(&[0x04]));
         a.read_until(|f| matches!(f, Frame::Control(Control::Exit { .. })));
         let _ = server.join();
+    }
+
+    #[test]
+    fn an_older_client_in_the_roster_gets_one_notice_and_a_current_one_none() {
+        let p = |version: &str| Participant {
+            id: 1,
+            name: String::from("x"),
+            cols: 80,
+            rows: 24,
+            control: true,
+            version: version.into(),
+        };
+        assert_eq!(stale_client_notice(&[p("0.1.959")], "0.1.959"), None);
+        assert_eq!(
+            stale_client_notice(&[p("")], "0.1.959"),
+            None,
+            "no version, no claim"
+        );
+        let n =
+            stale_client_notice(&[p("0.1.900"), p("0.1.959"), p("0.1.900")], "0.1.959").unwrap();
+        assert!(
+            n.contains("croft 0.1.959") && n.contains("still runs 0.1.900."),
+            "{n}"
+        );
+        assert_eq!(
+            stale_client_notice(&[p("0.1.990")], "0.1.959"),
+            None,
+            "a newer client is not out of date"
+        );
+        // Numeric, not lexical: 0.1.99 < 0.1.959 and 0.1.1000 > 0.1.959.
+        assert!(stale_client_notice(&[p("0.1.99")], "0.1.959").is_some());
+        assert_eq!(stale_client_notice(&[p("0.1.1000")], "0.1.959"), None);
+        // Listed oldest first, by number rather than by string.
+        let n =
+            stale_client_notice(&[p("0.1.900"), p("0.1.1000"), p("0.1.99")], "0.1.1001").unwrap();
+        assert!(n.contains("still runs 0.1.99, 0.1.900, 0.1.1000."), "{n}");
+        // A roster written by an older host carries no version field.
+        let old: Vec<Participant> =
+            serde_json::from_str(r#"[{"id":1,"name":"x","cols":80,"rows":24,"control":true}]"#)
+                .unwrap();
+        assert_eq!(old[0].version, "");
+    }
+
+    #[test]
+    fn the_stale_notice_is_raised_once_not_on_every_roster_churn() {
+        let p = |id: u64, version: &str, cols: u16| Participant {
+            id,
+            name: String::from("x"),
+            cols,
+            rows: 24,
+            control: true,
+            version: version.into(),
+        };
+        let own = "0.1.959";
+        let old = [p(1, "0.1.900", 80)];
+        // First sight of an old client: raised.
+        let first = stale_client_notice_on_change(None, &old, own).unwrap();
+        // The same client resizing: the notice is unchanged, not re-raised.
+        assert_eq!(
+            stale_client_notice_on_change(Some(&first), &[p(1, "0.1.900", 120)], own),
+            None
+        );
+        // A second, different old version changes the notice: raised again.
+        let two = [p(1, "0.1.900", 80), p(2, "0.1.901", 80)];
+        assert!(stale_client_notice_on_change(Some(&first), &two, own).is_some());
+        // The old client reattached on the current version: nothing to say.
+        assert_eq!(
+            stale_client_notice_on_change(Some(&first), &[p(1, own, 80)], own),
+            None
+        );
+        // A host swap raises the reference under an unchanged roster: the
+        // notice changes, so it is raised even though no client moved.
+        let swapped = [p(1, own, 80)];
+        assert!(stale_client_notice_on_change(None, &swapped, "0.1.960").is_some());
+    }
+
+    #[test]
+    fn a_swapped_host_newer_than_the_inner_croft_still_flags_the_old_client() {
+        // #652 review: the host swapped to 0.1.1005 while the inner croft and
+        // the attach client both still run 0.1.1004 (no F9 yet). Measured
+        // against the host, the client is out of date.
+        let reference = session_version("0.1.1004", Some("0.1.1005"));
+        assert_eq!(reference, "0.1.1005");
+        let client = [Participant {
+            id: 1,
+            name: String::from("x"),
+            cols: 80,
+            rows: 24,
+            control: true,
+            version: String::from("0.1.1004"),
+        }];
+        let n = stale_client_notice(&client, reference).unwrap();
+        assert!(
+            n.contains("croft 0.1.1005") && n.contains("still runs 0.1.1004."),
+            "{n}"
+        );
+        // No sidecar (an older host), or a host behind the inner croft: the
+        // inner croft's own version is the reference.
+        assert_eq!(session_version("0.1.1004", None), "0.1.1004");
+        assert_eq!(session_version("0.1.1004", Some("0.1.1003")), "0.1.1004");
+    }
+
+    #[test]
+    fn the_host_version_sidecar_round_trips_and_rejects_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ab.mux.sock");
+        assert_eq!(
+            host_version_path(&socket),
+            dir.path().join("ab.mux.sock.host-version")
+        );
+        assert_eq!(read_host_version(&host_version_path(&socket)), None);
+        write_host_version(&socket);
+        assert_eq!(
+            read_host_version(&host_version_path(&socket)).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        std::fs::write(host_version_path(&socket), "not a version").unwrap();
+        assert_eq!(read_host_version(&host_version_path(&socket)), None);
     }
 }

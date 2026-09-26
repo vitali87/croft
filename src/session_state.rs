@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 /// One open editor tab, captured so a re-exec into a freshly-installed
 /// croft binary can reopen the file at the same cursor + scroll position.
 /// `unsaved_text` is `Some` only when the buffer is dirty, so an in-place
-/// update never silently drops uncommitted edits.
+/// update never silently drops uncommitted edits. `path` is `None` for an
+/// untitled buffer, which is carried only when it has unsaved text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenTabState {
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub scroll: usize,
@@ -44,7 +45,31 @@ impl SessionState {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let json = serde_json::to_string(self).context("serializing session state")?;
-        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+        // Owner-only and written aside: the file carries every dirty
+        // buffer's unsaved text, and a crash mid-write must not leave half.
+        use std::io::Write;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension(format!(
+            "json.{}.{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let write = || -> std::io::Result<()> {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut f = opts.open(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, path)
+        };
+        write().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::Error::new(e).context(format!("writing {}", path.display()))
+        })
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -81,7 +106,7 @@ mod tests {
             workspace_root: PathBuf::from("/work/repo"),
             tabs: vec![
                 OpenTabState {
-                    path: PathBuf::from("/work/repo/src/main.rs"),
+                    path: Some(PathBuf::from("/work/repo/src/main.rs")),
                     cursor_row: 12,
                     cursor_col: 4,
                     scroll: 3,
@@ -90,7 +115,7 @@ mod tests {
                     unsaved_text: None,
                 },
                 OpenTabState {
-                    path: PathBuf::from("/work/repo/README.md"),
+                    path: Some(PathBuf::from("/work/repo/README.md")),
                     cursor_row: 0,
                     cursor_col: 0,
                     scroll: 0,
@@ -108,6 +133,10 @@ mod tests {
         state.save(&path).expect("save");
         let loaded = SessionState::load(&path).expect("load");
         assert_eq!(state, loaded);
+        // It carries unsaved text: owner-only.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -676,32 +676,26 @@ fn install_remote_croft_streaming(
     Ok(())
 }
 
-/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
-/// fast path is unavailable (the reason feeds the fallback confirmation);
-/// `Err` = the fast path was attempted and broke.
-fn try_local_cross_install_streaming(
-    ssh: &SshControl,
-    lane: &crate::remote_bulk::BulkLane,
-    source_stamp: &str,
-    log_tx: &std::sync::mpsc::Sender<String>,
-) -> Result<Option<String>> {
+/// Why a local static build for `triple` can't run, or `None` when it can.
+/// Shared by the remote installer and dev containers (#617).
+pub(crate) fn cross_build_unavailable(triple: &str) -> Option<String> {
     if let Some(reason) = cross_compile_unavailable_reason() {
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
+        return Some(reason);
     }
-    let Some(triple) = remote_target_triple(ssh)? else {
-        let reason = String::from("could not detect the remote architecture");
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
-    };
     if !rust_target_installed(triple) {
-        let reason = format!(
+        return Some(format!(
             "rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
-        );
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
+        ));
     }
+    None
+}
 
+/// Cross-build a static croft for `triple` from this checkout and return the
+/// binary's path.
+pub(crate) fn cross_build_static(
+    triple: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<PathBuf> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // This build runs *concurrently* with the live remote session, whose
     // keystrokes are relayed by this same local machine. A default `-j N`
@@ -741,6 +735,36 @@ fn try_local_cross_install_streaming(
             binary.display()
         );
     }
+    Ok(binary)
+}
+
+/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
+/// fast path is unavailable (the reason feeds the fallback confirmation);
+/// `Err` = the fast path was attempted and broke.
+fn try_local_cross_install_streaming(
+    ssh: &SshControl,
+    lane: &crate::remote_bulk::BulkLane,
+    source_stamp: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<Option<String>> {
+    if let Some(reason) = cross_compile_unavailable_reason() {
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    }
+    let Some(triple) = remote_target_triple(ssh)? else {
+        let reason = String::from("could not detect the remote architecture");
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    };
+    if !rust_target_installed(triple) {
+        let reason = format!(
+            "rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
+        );
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    }
+
+    let binary = cross_build_static(triple, log_tx)?;
 
     let mkdir = ssh.background_shell("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
     let mkdir_status =
@@ -1120,6 +1144,10 @@ impl Drop for DropPump {
     }
 }
 
+/// How long a window without a pull's file waits before answering it as
+/// missing, so an attached window that has the file claims it first.
+const MISSING_PULL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn run_pump(
     host: String,
     socket: PathBuf,
@@ -1133,7 +1161,37 @@ fn run_pump(
             break;
         }
         let Ok(line) = line else { break };
-        match parse_relay_request(&line) {
+        let request = parse_relay_request(&line);
+        // Two local windows attached to one session tail the same log. The
+        // first to claim a request handles it; without this every window
+        // ran every open, forward and pull, one browser tab each (#648).
+        //
+        // A pull names a file on ONE computer: when two computers are
+        // attached, only the one that has it may claim it, or the other
+        // would claim it, fail, and leave the file's owner nothing to do.
+        //
+        // A file on NEITHER computer still needs an answer, or the remote
+        // waits out its whole timeout: after a grace period that lets the
+        // owner claim it first, whoever claims it now says it is missing.
+        if let Some(RelayRequest::Pull { id, src }) = &request
+            && !Path::new(src).exists()
+        {
+            let (host, socket, inbox_dir) = (host.clone(), socket.clone(), inbox_dir.clone());
+            let (id, src) = (id.clone(), src.clone());
+            thread::spawn(move || {
+                thread::sleep(MISSING_PULL_GRACE);
+                if ssh_exec(&host, &socket, &claim_command(&inbox_dir, &id)) {
+                    handle_pull_request(&host, &socket, &inbox_dir, &id, &src);
+                }
+            });
+            continue;
+        }
+        if let Some(id) = request.as_ref().and_then(RelayRequest::id)
+            && !ssh_exec(&host, &socket, &claim_command(&inbox_dir, id))
+        {
+            continue;
+        }
+        match request {
             Some(RelayRequest::Pull { id, src }) => {
                 handle_pull_request(&host, &socket, &inbox_dir, &id, &src);
             }
@@ -1384,6 +1442,21 @@ enum RelayRequest {
     },
 }
 
+impl RelayRequest {
+    /// The id a pump claims before acting. `Unforward` has none: each pump
+    /// tears down only a tunnel it holds, so every pump may see it.
+    fn id(&self) -> Option<&str> {
+        match self {
+            Self::Pull { id, .. }
+            | Self::Clipboard { id }
+            | Self::Copy { id }
+            | Self::Open { id, .. }
+            | Self::Forward { id, .. } => Some(id),
+            Self::Unforward { .. } => None,
+        }
+    }
+}
+
 fn parse_relay_request(line: &str) -> Option<RelayRequest> {
     let line = line.trim();
     let mut parts = line.split('\t');
@@ -1450,9 +1523,57 @@ fn url_is_safe_to_open(url: &str) -> bool {
         .any(|c| c == '\0' || c == '\n' || c == '\r' || c == '\t')
 }
 
+/// Whether a pull may send `src`. The request comes from the remote's
+/// relay log, which any process running as the remote user can append to,
+/// so it is not proof the user dropped that file. A drag from Finder names
+/// a visible file; credentials live under hidden paths (`~/.ssh`,
+/// `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.config/...`). So a path that is
+/// not absolute, or that resolves (through `..` or symlinks) to anything
+/// under a hidden component, is refused.
+fn pull_source_allowed(src: &Path) -> bool {
+    use std::path::Component;
+    let hidden = |p: &Path| {
+        p.components().any(|c| match c {
+            Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+            Component::ParentDir => true,
+            _ => false,
+        })
+    };
+    if !src.is_absolute() || hidden(src) {
+        return false;
+    }
+    std::fs::canonicalize(src).is_ok_and(|real| !hidden(&real))
+}
+
+/// The local `tar` arguments that pack a pulled `basename` from `parent`.
+/// Hidden entries are excluded: [`pull_source_allowed`] vets only the named
+/// path, and a pulled folder (`~`, say) would otherwise carry its `.ssh`
+/// along. `--` keeps a name starting with `-` from reading as an option.
+/// Both GNU tar and bsdtar match `.*` against each path component.
+fn pull_tar_args(parent: &Path, basename: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["-c", "-f", "-", "--exclude", ".*", "-C"]
+        .iter()
+        .map(Into::into)
+        .collect();
+    args.push(parent.into());
+    args.push("--".into());
+    args.push(basename.into());
+    args
+}
+
 fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str, src: &str) {
     let src_path = PathBuf::from(src);
     let dest_dir = format!("{inbox_dir}/{request_id}");
+    if src_path.exists() && !pull_source_allowed(&src_path) {
+        write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("refusing to send a hidden path: {}", src_path.display()),
+        );
+        return;
+    }
     if !src_path.exists() {
         write_relay_err(
             host,
@@ -1483,12 +1604,7 @@ fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
     // destination, which kept failing on freshly-mkdir'd dirs.
     let mut tar = match Command::new("tar")
         .env("COPYFILE_DISABLE", "1")
-        .arg("-c")
-        .arg("-f")
-        .arg("-")
-        .arg("-C")
-        .arg(parent)
-        .arg(basename)
+        .args(pull_tar_args(parent, basename))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -1601,6 +1717,17 @@ fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The remote command that claims request `id` for this pump: `mkdir` is
+/// atomic, so of several pumps exactly one succeeds.
+fn claim_command(inbox_dir: &str, id: &str) -> String {
+    let claims = format!("{inbox_dir}/.claims");
+    format!(
+        "mkdir -p {} && mkdir {}",
+        shell_quote(&claims),
+        shell_quote(&format!("{claims}/{id}"))
+    )
 }
 
 /// Hand `url` to the local platform opener (`open` on macOS, `xdg-open` on
@@ -3910,6 +4037,80 @@ Host !blocked *.internal
     }
 
     #[test]
+    fn a_pulled_folder_leaves_its_hidden_entries_behind() {
+        let dir = tempfile::Builder::new()
+            .prefix("croft-pull")
+            .tempdir()
+            .unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("docs/.git")).unwrap();
+        std::fs::write(home.join(".ssh/id"), "key").unwrap();
+        std::fs::write(home.join("docs/.git/cfg"), "x").unwrap();
+        std::fs::write(home.join("docs/a.txt"), "a").unwrap();
+        std::fs::write(home.join("-dash"), "d").unwrap();
+        let list = |parent: &Path, name: &str| {
+            let packed = Command::new("tar")
+                .args(super::pull_tar_args(parent, std::ffi::OsStr::new(name)))
+                .output()
+                .unwrap();
+            assert!(
+                packed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&packed.stderr)
+            );
+            let mut listing = Command::new("tar")
+                .args(["-t", "-f", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            listing
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&packed.stdout)
+                .unwrap();
+            String::from_utf8(listing.wait_with_output().unwrap().stdout).unwrap()
+        };
+        let names = list(dir.path(), "home");
+        assert!(
+            names.contains("home/docs/a.txt") && names.contains("home/-dash"),
+            "{names}"
+        );
+        assert!(
+            !names.contains(".ssh") && !names.contains(".git"),
+            "{names}"
+        );
+        assert_eq!(list(&home, "-dash").trim(), "-dash");
+    }
+
+    #[test]
+    fn a_pull_refuses_hidden_paths_and_links_into_them() {
+        // Not `tempdir()`: its `.tmpXXXX` name is itself hidden.
+        let dir = tempfile::Builder::new()
+            .prefix("croft-pull")
+            .tempdir()
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(root.join("-notes.txt"), "hi").unwrap();
+        std::os::unix::fs::symlink(root.join(".ssh/id_ed25519"), root.join("key")).unwrap();
+        assert!(super::pull_source_allowed(&root.join("-notes.txt")));
+        assert!(!super::pull_source_allowed(&root.join(".ssh/id_ed25519")));
+        assert!(
+            !super::pull_source_allowed(&root.join("key")),
+            "a link into .ssh"
+        );
+        assert!(!super::pull_source_allowed(
+            &root.join("x/../.ssh/id_ed25519")
+        ));
+        assert!(!super::pull_source_allowed(Path::new("relative.txt")));
+    }
+
+    #[test]
     fn parse_relay_request_pulls_have_id_and_path() {
         match super::parse_relay_request("pull\tabc-123\t/Users/v/foo.txt") {
             Some(super::RelayRequest::Pull { id, src }) => {
@@ -4136,6 +4337,32 @@ Host !blocked *.internal
         assert!(
             ensure_call < cargo_install,
             "the C toolchain must be ensured before `cargo install` runs"
+        );
+    }
+
+    #[test]
+    fn a_relay_request_is_claimed_by_exactly_one_pump() {
+        // `mkdir` without -p on the id: the second pump's mkdir fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox").display().to_string();
+        let run = |cmd: String| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(run(claim_command(&inbox, "open-1-2")));
+        assert!(
+            !run(claim_command(&inbox, "open-1-2")),
+            "a second claim loses"
+        );
+        assert!(run(claim_command(&inbox, "open-1-3")));
+        assert_eq!(
+            super::parse_relay_request("open\topen-1\thttps://x/")
+                .and_then(|r| r.id().map(str::to_string)),
+            Some(String::from("open-1"))
         );
     }
 

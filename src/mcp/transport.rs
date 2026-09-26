@@ -96,7 +96,10 @@ impl McpTransport {
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            // Null, not piped: nothing read the pipe, and a server logging
+            // over ~64 KiB there (MCP puts logs on stderr) blocked on the
+            // write and stopped answering.
+            .stderr(Stdio::null());
         // Detach into its own session before exec (mirrors the DAP transport):
         // a sidecar must never be able to touch croft's controlling tty. MCP
         // rides the piped stdio, so the detach loses nothing.
@@ -144,6 +147,8 @@ impl McpTransport {
     /// backstop.
     pub fn kill(&mut self) {
         let _ = self.child.kill();
+        // Reaped, or every finished server lingers as a zombie.
+        let _ = self.child.wait();
     }
 }
 
@@ -229,6 +234,20 @@ mod tests {
         // The blank and the noise line are skipped; the valid message survives.
         assert_eq!(d.next_message().unwrap()["id"], 7);
         assert!(d.next_message().is_none());
+    }
+
+    #[test]
+    fn a_server_logging_heavily_to_stderr_still_answers() {
+        let cwd = std::env::temp_dir();
+        let env = BTreeMap::new();
+        let script = r#"head -c 300000 /dev/zero >&2; echo '{"jsonrpc":"2.0","id":1,"result":{}}'"#;
+        let t = McpTransport::spawn("sh", &["-c".to_string(), script.to_string()], &cwd, &env)
+            .expect("spawn stand-in server");
+        let msg = t
+            .incoming
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the reply arrives past 300 KB of stderr");
+        assert_eq!(msg["id"], 1);
     }
 
     /// A sidecar must not share croft's controlling terminal — `spawn` `setsid`s

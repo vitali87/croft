@@ -55,6 +55,9 @@ pub struct FileTree {
     /// root path. Swapped in by the app whenever a lane or a seat changes;
     /// a root with no entry paints as before.
     pub root_badges: Arc<HashMap<PathBuf, String>>,
+    /// Unresolved sticky notes per file (#367), painted as a count after
+    /// the name.
+    pub note_counts: Arc<HashMap<PathBuf, usize>>,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -112,6 +115,7 @@ impl FileTree {
             theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
             agent_touched: Arc::default(),
+            note_counts: Arc::default(),
             root_badges: Arc::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
@@ -1116,21 +1120,62 @@ mod android_trash {
 /// (same name) returns Ok with the original path unchanged so the user
 /// can hit Enter on the prompt without typing.
 pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
+    let target = rename_target(parent, old_path, new_name)?;
+    if target != old_path {
+        std::fs::rename(old_path, &target)?;
+    }
+    Ok(target)
+}
+
+/// Whether renaming `old_path` to `new_name` in `parent` only respells the
+/// same entry on a case-insensitive volume (macOS by default), where
+/// `README.md` "exists" while `readme.md` is renamed to it. True only when
+/// the directory does not list `new_name` as an entry of its own (so a
+/// separate file, or a hard link to the same file, is still a clash) and
+/// the name resolves to the entry being renamed.
+fn is_case_only_respelling(parent: &Path, old_path: &Path, new_name: &str) -> bool {
+    let listed = std::fs::read_dir(parent).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
+    });
+    if listed {
+        return false;
+    }
+    let target = parent.join(new_name);
+    match (
+        std::fs::symlink_metadata(&target),
+        std::fs::symlink_metadata(old_path),
+    ) {
+        #[cfg(unix)]
+        (Ok(a), Ok(b)) => {
+            use std::os::unix::fs::MetadataExt;
+            a.dev() == b.dev() && a.ino() == b.ino()
+        }
+        // No inode to compare: a name the directory does not list that
+        // still resolves can only be the same entry respelled.
+        #[cfg(not(unix))]
+        (Ok(_), Ok(_)) => true,
+        _ => false,
+    }
+}
+
+/// Where [`rename_in`] would put `old_path`, with the same validation and
+/// without touching the disk, so a caller can ask language servers about
+/// the rename before it happens (#610).
+pub fn rename_target(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
     let trimmed = new_name.trim();
     if let Err(msg) = validate_new_name(trimmed) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     }
     let target = parent.join(trimmed);
-    if target == old_path {
-        return Ok(target);
-    }
-    if target.exists() {
+    if target != old_path && target.exists() && !is_case_only_respelling(parent, old_path, trimmed)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("{} already exists", target.display()),
         ));
     }
-    std::fs::rename(old_path, &target)?;
     Ok(target)
 }
 
@@ -1589,6 +1634,12 @@ impl Widget for &mut FileTree {
                     spans.push(Span::styled(
                         format!(" {AGENT_DOT}"),
                         Style::default().fg(self.theme.ui(Color::Yellow)),
+                    ));
+                }
+                if let Some(n) = self.note_counts.get(&node.path) {
+                    spans.push(Span::styled(
+                        format!(" \u{270e}{n}"),
+                        Style::default().fg(self.theme.ui(Color::Gray)),
                     ));
                 }
             }
@@ -2989,6 +3040,26 @@ mod tests {
         // Both originals must still exist intact.
         assert!(a.exists());
         assert!(b.exists());
+    }
+
+    #[test]
+    fn a_hard_link_under_the_new_name_is_still_a_clash() {
+        // A second directory entry for the same file is a separate name:
+        // renaming onto it would succeed without moving anything.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("readme.md");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::hard_link(&a, tmp.path().join("README.md")).unwrap();
+        for err in [
+            rename_target(tmp.path(), &a, "README.md").unwrap_err(),
+            rename_in(tmp.path(), &a, "README.md").unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        assert!(a.exists());
+        // On a case-sensitive volume a name nothing answers to is no
+        // respelling of anything.
+        assert!(!is_case_only_respelling(tmp.path(), &a, "Readme.md"));
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub struct ImageOverlay<L> {
     displayed: bool,
     dirty: bool,
     clear: ClearLatch,
+    /// Fingerprint of the text cells under the image when it was last sent
+    /// (see [`Self::needs_emit`]).
+    under: Option<u64>,
 }
 
 impl<L> Default for ImageOverlay<L> {
@@ -31,6 +34,7 @@ impl<L> Default for ImageOverlay<L> {
             displayed: false,
             dirty: false,
             clear: ClearLatch::default(),
+            under: None,
         }
     }
 }
@@ -47,14 +51,40 @@ impl<L: PartialEq> ImageOverlay<L> {
     pub fn set(&mut self, image: String, layout: L) {
         self.image = Some(image);
         self.layout = Some(layout);
+        self.under = None;
     }
 
     pub fn set_image(&mut self, image: String) {
         self.image = Some(image);
+        self.under = None;
     }
 
     pub fn set_layout(&mut self, layout: L) {
         self.layout = Some(layout);
+        self.under = None;
+    }
+
+    /// Whether the post-frame blit must send the image again, given a
+    /// fingerprint of the text cells beneath it this frame. A picture is
+    /// megabytes of escape sequence, so it goes out only when it could be
+    /// missing from the screen: never shown, replaced, moved, wiped, or
+    /// written over since it was sent (the cells beneath it changed). Every
+    /// other frame, a keystroke or a cursor blink, sends nothing, which is
+    /// what keeps an image cheap over SSH (#682).
+    pub fn needs_emit(&self, under: u64) -> bool {
+        !self.displayed || self.under != Some(under)
+    }
+
+    /// Record that the image was sent over cells with fingerprint `under`.
+    pub fn mark_sent_over(&mut self, under: u64) {
+        self.displayed = true;
+        self.under = Some(under);
+    }
+
+    /// Forget what was sent: the next frame sends the image again. For a
+    /// screen wipe, or a frame that held the image back (a modal over it).
+    pub fn forget_sent(&mut self) {
+        self.under = None;
     }
 
     pub fn has_image(&self) -> bool {
@@ -95,6 +125,7 @@ impl<L: PartialEq> ImageOverlay<L> {
 
     pub fn invalidate_layout(&mut self) {
         self.layout = None;
+        self.under = None;
     }
 
     pub fn disable(&mut self) {
@@ -244,6 +275,14 @@ pub struct ActivityOverlay {
     /// shift (terminal resize, or any change that recenters the bar) and
     /// evict iTerm2's stale OSC-1337 image layer before re-emitting.
     last_positions: Vec<(u16, u16)>,
+    /// Fingerprint of the cells around each icon when it was last sent, in
+    /// `last_positions` order: iTerm2 only evicts an icon under traffic next
+    /// to it, so the keepalive re-sends only icons whose ring changed (#682).
+    neighbourhood: Vec<u64>,
+    /// What each icon slot last sent: its cell and a hash of its image.
+    /// A dirty flush re-sends only slots that differ (a badge count or a
+    /// hover swap), not the whole bar; empty means send everything (#682).
+    sent: Vec<((u16, u16), u64)>,
     clear: ClearLatch,
 }
 
@@ -285,6 +324,42 @@ impl ActivityOverlay {
         self.last_emit = Some(std::time::Instant::now());
     }
 
+    /// Whether the cells around icon `i` changed since it was sent.
+    pub fn neighbourhood_changed(&self, i: usize, around: &[u64]) -> bool {
+        self.neighbourhood.get(i) != around.get(i) || around.get(i).is_none()
+    }
+
+    pub fn set_neighbourhood(&mut self, around: Vec<u64>) {
+        self.neighbourhood = around;
+    }
+
+    pub fn was_sent(&self, cell: (u16, u16), image: u64) -> bool {
+        self.sent.contains(&(cell, image))
+    }
+
+    pub fn nothing_sent(&self) -> bool {
+        self.sent.is_empty()
+    }
+
+    pub fn set_sent(&mut self, sent: Vec<((u16, u16), u64)>) {
+        self.sent = sent;
+    }
+
+    /// The screen was wiped or the icons evicted: send them all next time.
+    pub fn forget_sent(&mut self) {
+        self.sent.clear();
+    }
+
+    /// Whether the dirty flag (a full re-send) is up.
+    pub fn dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Where the icons were last painted.
+    pub fn last_positions(&self) -> &[(u16, u16)] {
+        &self.last_positions
+    }
+
     /// Arm a one-shot `terminal.clear()` (consumed by the main loop's clear
     /// chain) so iTerm2 evicts the cached OSC-1337 icon bitmaps. Needed
     /// whenever a reflow could leave a stale image layer that a plain SGR
@@ -300,8 +375,13 @@ impl ActivityOverlay {
     /// True when the icons were emitted before at a *different* set of cells.
     /// A first emit (or one after `forget_positions`) reports `false` so the
     /// caller paints rather than looping on an eviction it doesn't need.
+    ///
+    /// Only an icon that vanished or shifted counts: its old image would be
+    /// left behind. One that newly appeared (a count badge showing up when a
+    /// file turns dirty) moves nothing, and treating it as a move wiped the
+    /// whole screen on iTerm2 on the first keystroke into a file (#682).
     pub fn positions_moved(&self, positions: &[(u16, u16)]) -> bool {
-        !self.last_positions.is_empty() && self.last_positions != positions
+        self.last_positions.iter().any(|p| !positions.contains(p))
     }
 
     pub fn store_positions(&mut self, positions: Vec<(u16, u16)>) {
@@ -310,11 +390,6 @@ impl ActivityOverlay {
 
     pub fn forget_positions(&mut self) {
         self.last_positions.clear();
-    }
-
-    #[cfg(test)]
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
     }
 }
 
@@ -346,4 +421,51 @@ pub struct OverlayManager {
     pub run_debug: CellOverlay,
     pub problems_badge: CellOverlay,
     pub activity: ActivityOverlay,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActivityOverlay, ImageOverlay};
+
+    /// #682: iTerm2's icon keepalive waits for traffic next to the icons.
+    #[test]
+    fn the_icon_keepalive_waits_for_the_cells_around_the_icons_to_change() {
+        let mut a = ActivityOverlay::default();
+        assert!(a.neighbourhood_changed(0, &[1, 1]), "never sent");
+        a.set_neighbourhood(vec![1, 1]);
+        assert!(
+            !a.neighbourhood_changed(0, &[1, 1]),
+            "idle: nothing to outlast"
+        );
+        assert!(
+            !a.neighbourhood_changed(0, &[1, 2]),
+            "only the other icon's ring changed"
+        );
+        assert!(
+            a.neighbourhood_changed(1, &[1, 2]),
+            "this icon's ring was repainted"
+        );
+    }
+
+    /// #682: a large image is sent once and then only when it could be
+    /// missing: replaced, moved, written over, wiped or held back.
+    #[test]
+    fn an_image_is_sent_again_only_when_it_could_be_missing() {
+        let mut o: ImageOverlay<u8> = ImageOverlay::default();
+        o.set(String::from("img"), 1);
+        assert!(o.needs_emit(7), "never shown");
+        o.mark_sent_over(7);
+        assert!(!o.needs_emit(7), "a keystroke elsewhere sends nothing");
+        assert!(o.needs_emit(8), "the cells beneath it were written over");
+        o.mark_sent_over(8);
+        o.set_layout(2);
+        assert!(o.needs_emit(8), "moved");
+        o.mark_sent_over(8);
+        o.forget_sent();
+        assert!(o.needs_emit(8), "the screen was wiped");
+        o.mark_sent_over(8);
+        o.request_clear();
+        assert!(o.consume_clear());
+        assert!(o.needs_emit(8), "cleared images are shown again");
+    }
 }

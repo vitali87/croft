@@ -318,8 +318,19 @@ enum RawInitialize {}
 
 impl lsp_types::request::Request for RawInitialize {
     type Params = serde_json::Value;
-    type Result = lsp_types::InitializeResult;
+    // Raw, because `lsp-types` 0.95 has no `typeHierarchyProvider` field and
+    // would drop it (#613); the typed result is parsed from this value.
+    type Result = serde_json::Value;
     const METHOD: &'static str = "initialize";
+}
+
+/// Whether a raw `initialize` result advertises `typeHierarchyProvider`
+/// (#613): `true` or an options object, but not `false` or `null`.
+fn advertises_type_hierarchy(init: &serde_json::Value) -> bool {
+    match init.pointer("/capabilities/typeHierarchyProvider") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => false,
+        Some(_) => true,
+    }
 }
 
 /// Declare the workspace diagnostics capability under BOTH names (#533).
@@ -345,7 +356,11 @@ fn with_spec_workspace_diagnostics(mut params: serde_json::Value) -> serde_json:
 
 pub struct LspClient {
     server: ServerSocket,
+    /// A clone of `server` for requests; see [`LspRequests`].
+    requests: LspRequests,
     capabilities: ServerCapabilities,
+    /// See [`LspClient::supports_type_hierarchy`].
+    type_hierarchy: bool,
     name: String,
     // Holds the process so kill_on_drop only fires when this client is
     // dropped, not when spawn() returns. Without this the server is
@@ -475,13 +490,20 @@ impl LspClient {
             .request::<RawInitialize>(with_spec_workspace_diagnostics(params))
             .await
             .context("lsp initialize")?;
+        let type_hierarchy = advertises_type_hierarchy(&init);
+        let init: lsp_types::InitializeResult =
+            serde_json::from_value(init).context("parse initialize result")?;
         server
             .initialized(InitializedParams {})
             .context("lsp initialized notification")?;
 
         Ok(Self {
+            requests: LspRequests {
+                server: server.clone(),
+            },
             server,
             capabilities: init.capabilities,
+            type_hierarchy,
             name,
             child,
             mainloop_task,
@@ -494,6 +516,12 @@ impl LspClient {
 
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
+    }
+
+    /// Whether the server advertised `typeHierarchyProvider` (#613), which
+    /// [`ServerCapabilities`] cannot carry in `lsp-types` 0.95.
+    pub fn supports_type_hierarchy(&self) -> bool {
+        self.type_hierarchy
     }
 
     pub fn server_mut(&mut self) -> &mut ServerSocket {
@@ -511,6 +539,11 @@ impl LspClient {
     /// user of that client, including `open_doc` on the worker loop.
     pub fn detached_server(&self) -> ServerSocket {
         self.server.clone()
+    }
+
+    /// The request methods on their own, to await with the client unlocked.
+    pub fn requests(&self) -> LspRequests {
+        self.requests.clone()
     }
 
     pub fn did_open(
@@ -564,6 +597,60 @@ impl LspClient {
             .context("did_close")
     }
 
+    /// `textDocument/codeLens` (#608), on a detached server handle so the
+    /// client's lock isn't held while the server answers.
+    pub async fn code_lens_on(
+        mut server: ServerSocket,
+        uri: Url,
+    ) -> Result<Option<Vec<lsp_types::CodeLens>>> {
+        server
+            .code_lens(lsp_types::CodeLensParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("codeLens")
+    }
+
+    /// `codeLens/resolve` (#608): fill in a lens's command, on a detached
+    /// server handle.
+    pub async fn code_lens_resolve_on(
+        mut server: ServerSocket,
+        lens: lsp_types::CodeLens,
+    ) -> Result<lsp_types::CodeLens> {
+        server
+            .code_lens_resolve(lens)
+            .await
+            .context("codeLens/resolve")
+    }
+
+    /// `workspace/didRenameFiles` (#610): tell the server the move happened.
+    pub fn did_rename_files(&mut self, files: Vec<lsp_types::FileRename>) -> Result<()> {
+        self.server
+            .did_rename_files(lsp_types::RenameFilesParams { files })
+            .context("didRenameFiles")
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.server.shutdown(()).await.context("lsp shutdown")?;
+        self.server.exit(()).context("lsp exit")?;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.child.wait()).await;
+        Ok(())
+    }
+}
+
+/// The request half of an [`LspClient`]: a clone of its server socket,
+/// cheap to take while the client's lock is held and awaited after it is
+/// released. A server may take long to answer, or never answer, and holding
+/// the client lock across that await stalled every other user of the client
+/// behind it, the document syncs of every language included.
+#[derive(Clone)]
+pub struct LspRequests {
+    server: ServerSocket,
+}
+
+impl LspRequests {
     pub async fn completion(
         &mut self,
         uri: Url,
@@ -824,6 +911,53 @@ impl LspClient {
             .context("prepareCallHierarchy")
     }
 
+    /// `textDocument/prepareTypeHierarchy` (#613): resolve the type at a
+    /// position into the item the `typeHierarchy/*` requests take.
+    pub async fn prepare_type_hierarchy(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+        self.server
+            .prepare_type_hierarchy(lsp_types::TypeHierarchyPrepareParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .context("prepareTypeHierarchy")
+    }
+
+    /// `typeHierarchy/supertypes` or `typeHierarchy/subtypes` of `item`.
+    pub async fn type_hierarchy(
+        &mut self,
+        item: lsp_types::TypeHierarchyItem,
+        supertypes: bool,
+    ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+        if supertypes {
+            self.server
+                .supertypes(lsp_types::TypeHierarchySupertypesParams {
+                    item,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+                .context("typeHierarchy/supertypes")
+        } else {
+            self.server
+                .subtypes(lsp_types::TypeHierarchySubtypesParams {
+                    item,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+                .context("typeHierarchy/subtypes")
+        }
+    }
+
     /// `callHierarchy/incomingCalls`: everyone who calls `item`.
     pub async fn incoming_calls(
         &mut self,
@@ -1044,6 +1178,18 @@ impl LspClient {
             .context("rename")
     }
 
+    /// `workspace/willRenameFiles` (#610): the edit a server wants applied
+    /// before `files` move, typically the imports that name them.
+    pub async fn will_rename_files(
+        &mut self,
+        files: Vec<lsp_types::FileRename>,
+    ) -> Result<Option<WorkspaceEdit>> {
+        self.server
+            .will_rename_files(lsp_types::RenameFilesParams { files })
+            .await
+            .context("willRenameFiles")
+    }
+
     /// `textDocument/prepareRename`: validate the position and get the
     /// exact renameable range / placeholder before prompting (#254). An
     /// `Err` carries the server's own refusal message — the fail-fast
@@ -1250,12 +1396,18 @@ impl LspClient {
             .await
             .context("semantic_tokens_range")
     }
+}
 
-    pub async fn shutdown(&mut self) -> Result<()> {
-        self.server.shutdown(()).await.context("lsp shutdown")?;
-        self.server.exit(()).context("lsp exit")?;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.child.wait()).await;
-        Ok(())
+impl std::ops::Deref for LspClient {
+    type Target = LspRequests;
+    fn deref(&self) -> &LspRequests {
+        &self.requests
+    }
+}
+
+impl std::ops::DerefMut for LspClient {
+    fn deref_mut(&mut self) -> &mut LspRequests {
+        &mut self.requests
     }
 }
 
@@ -1397,6 +1549,21 @@ mod tests {
             !sem_flag.load(Ordering::Relaxed),
             "the semantic-token flag must stay untouched"
         );
+    }
+
+    #[test]
+    fn type_hierarchy_is_read_from_the_raw_initialize_result() {
+        let caps = |v: serde_json::Value| serde_json::json!({ "capabilities": v });
+        assert!(advertises_type_hierarchy(&caps(
+            serde_json::json!({"typeHierarchyProvider": true})
+        )));
+        assert!(advertises_type_hierarchy(&caps(
+            serde_json::json!({"typeHierarchyProvider": {}})
+        )));
+        assert!(!advertises_type_hierarchy(&caps(
+            serde_json::json!({"typeHierarchyProvider": false})
+        )));
+        assert!(!advertises_type_hierarchy(&caps(serde_json::json!({}))));
     }
 
     #[test]

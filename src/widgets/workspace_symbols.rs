@@ -182,7 +182,7 @@ pub fn render_workspace_symbols(
     picker.last_rect = rect;
     Widget::render(Clear, rect, buf);
     let title = Span::styled(
-        " Go to Symbol in Workspace — Esc to close, ↑/↓ to navigate, Enter to go ",
+        " Go to Symbol in Workspace — Esc to close, ↑/↓ to navigate, Enter to go, Alt+Enter to open as its own tab ",
         Style::default()
             .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),

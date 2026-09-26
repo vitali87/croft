@@ -240,8 +240,31 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
         .delimiter(delim)
         .from_reader(bytes);
     let mut rows: Vec<Vec<String>> = Vec::new();
+    // The reader skips blank lines, so a single-column file lost every
+    // empty value on the first save. They come back as empty rows. A
+    // record's position is where the reader started looking for it, before
+    // the blank lines it skipped, so those are the line breaks it opens with.
     for record in reader.records() {
         let r = record?;
+        let start = r.position().map_or(0, |p| p.byte() as usize);
+        let mut rest = bytes.get(start..).unwrap_or_default();
+        // After a CRLF record the reader stops past the `\r`, so the `\n`
+        // it starts on still belongs to that record's terminator.
+        if start > 0 && bytes[start - 1] == b'\r' {
+            rest = rest.strip_prefix(b"\n").unwrap_or(rest);
+        }
+        let mut blanks = 0usize;
+        while let Some(tail) = rest
+            .strip_prefix(b"\r\n")
+            .or_else(|| rest.strip_prefix(b"\n"))
+        {
+            rest = tail;
+            blanks += 1;
+        }
+        // Not before the first record, which becomes the header row.
+        if !rows.is_empty() {
+            rows.extend(std::iter::repeat_n(Vec::new(), blanks));
+        }
         rows.push(r.iter().map(|s| s.to_string()).collect());
     }
     let (headers, body) = split_header(rows);
@@ -342,19 +365,38 @@ impl SheetData {
 
 /// Serialize the sheet back to delimited bytes: the header row first
 /// (it is the file's own row 0, split off at parse), then the body,
-/// quoted per csv rules with the delimiter the file was READ with.
-pub fn serialize_delimited(data: &SheetData, delim: u8) -> Vec<u8> {
-    let mut w = csv::WriterBuilder::new()
-        .delimiter(delim)
-        .flexible(true)
-        .from_writer(Vec::new());
+/// quoted per csv rules with the delimiter the file was READ with. `crlf`
+/// keeps a CRLF file CRLF: rewritten with LF, editing one cell made the
+/// whole file a diff.
+pub fn serialize_delimited(data: &SheetData, delim: u8, crlf: bool) -> Vec<u8> {
+    let terminator = if crlf {
+        csv::Terminator::CRLF
+    } else {
+        csv::Terminator::Any(b'\n')
+    };
+    let mut out = Vec::new();
+    let mut write = |record: &[String]| {
+        // A row with no fields is a blank line the file had (see
+        // `parse_delimited`); the writer would emit `""` for it instead.
+        if record.is_empty() {
+            out.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+            return;
+        }
+        let mut w = csv::WriterBuilder::new()
+            .delimiter(delim)
+            .flexible(true)
+            .terminator(terminator)
+            .from_writer(&mut out);
+        let _ = w.write_record(record);
+        let _ = w.flush();
+    };
     if !data.headers.is_empty() {
-        let _ = w.write_record(&data.headers);
+        write(&data.headers);
     }
     for r in &data.rows {
-        let _ = w.write_record(r);
+        write(r);
     }
-    w.into_inner().unwrap_or_default()
+    out
 }
 
 /// Outcome of an xlsx edit save (#178).
@@ -406,8 +448,8 @@ pub fn save_xlsx_edits(
             cell.set_value_bool(true);
         } else if value.eq_ignore_ascii_case("false") {
             cell.set_value_bool(false);
-        } else if !value.is_empty() && value.parse::<f64>().is_ok() {
-            cell.set_value_number(value.parse::<f64>().expect("checked"));
+        } else if let Some(n) = xlsx_number(&value) {
+            cell.set_value_number(n);
         } else {
             cell.set_value_string(value);
         }
@@ -418,6 +460,24 @@ pub fn save_xlsx_edits(
         written,
         formula_skipped,
     })
+}
+
+/// The number an edited cell's text is stored as, or None to store it as
+/// text. `f64::from_str` alone is too eager: it takes `nan` and `inf`
+/// (and `1e400` becomes infinity), which Excel reports as a corrupt file,
+/// and a zip code like `02134` would lose its leading zero.
+fn xlsx_number(value: &str) -> Option<f64> {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    let plain = !digits.is_empty()
+        && digits.starts_with(|c: char| c.is_ascii_digit())
+        && digits
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '-' | '+'));
+    let leading_zero = digits.len() > 1 && digits.starts_with('0') && !digits.starts_with("0.");
+    if !plain || leading_zero {
+        return None;
+    }
+    value.parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
 /// 1-based column index to A1 letters (1 -> A, 27 -> AA).
@@ -619,12 +679,54 @@ mod tests {
         assert_eq!(d.headers, vec!["a", "b", "c"]);
         d.set_cell(0, 2, String::from("x,y"));
         assert_eq!(d.cell(0, 2), "x,y", "short row grew to hold the cell");
-        let out = super::serialize_delimited(&d, b',');
+        let out = super::serialize_delimited(&d, b',', false);
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "a,b,c\n1,2,\"x,y\"\n",
             "delimiter-bearing cells are quoted, header row survives"
         );
+    }
+
+    #[test]
+    fn blank_lines_survive_a_save() {
+        let src = b"name\nann\n\nbob\n\n\n\"x\ny\"\n";
+        let d = super::parse_delimited(src, b',', "S").unwrap();
+        assert_eq!(d.rows.len(), 6, "{:?}", d.rows);
+        let out = super::serialize_delimited(&d, b',', false);
+        assert_eq!(out, src.to_vec(), "{}", String::from_utf8_lossy(&out));
+        let lead = super::parse_delimited(b"\n\nh\n1\n", b',', "S").unwrap();
+        assert_eq!(lead.headers, vec!["h"]);
+        let crlf = b"a,b\r\n1,2\r\n\r\n3,4\r\n";
+        let d = super::parse_delimited(crlf, b',', "S").unwrap();
+        assert_eq!(super::serialize_delimited(&d, b',', true), crlf.to_vec());
+    }
+
+    #[test]
+    fn a_crlf_file_saves_as_crlf() {
+        let d = super::parse_delimited(b"a,b\r\n1,2\r\n", b',', "S").unwrap();
+        let out = super::serialize_delimited(&d, b',', true);
+        assert_eq!(String::from_utf8(out).unwrap(), "a,b\r\n1,2\r\n");
+    }
+
+    #[test]
+    fn only_plain_finite_numbers_are_stored_as_xlsx_numbers() {
+        assert_eq!(super::xlsx_number("42"), Some(42.0));
+        assert_eq!(super::xlsx_number("-0.5"), Some(-0.5));
+        assert_eq!(super::xlsx_number("0"), Some(0.0));
+        assert_eq!(super::xlsx_number("1.5e3"), Some(1500.0));
+        for text in [
+            "02134",
+            "nan",
+            "inf",
+            "-infinity",
+            "1e400",
+            "+5",
+            "",
+            ".5",
+            "1-2",
+        ] {
+            assert_eq!(super::xlsx_number(text), None, "{text}");
+        }
     }
 
     #[test]
@@ -642,7 +744,7 @@ mod tests {
         assert_eq!(d.headers, vec!["a", "b"]);
         assert_eq!(d.cell(1, 1), "4");
         assert!(!d.delete_col(9), "out of range refuses");
-        let out = super::serialize_delimited(&d, b',');
+        let out = super::serialize_delimited(&d, b',', false);
         assert_eq!(String::from_utf8(out).unwrap(), "a,b\n1,2\n3,4\n");
     }
 
@@ -655,7 +757,7 @@ mod tests {
         assert_eq!(d.headers, vec![String::new()], "the header cell exists");
         d.insert_row(0);
         d.set_cell(0, 0, String::from("v"));
-        let out = super::serialize_delimited(&d, b',');
+        let out = super::serialize_delimited(&d, b',', false);
         let again = super::parse_delimited(&out, b',', "S").unwrap();
         assert_eq!(again.rows.len(), 1, "the body row survives the reopen");
         assert_eq!(again.cell(0, 0), "v");
@@ -665,7 +767,7 @@ mod tests {
     fn tsv_round_trips_with_its_own_delimiter() {
         let mut d = super::parse_delimited(b"x\ty\n1\t2\n", b'\t', "S").unwrap();
         d.set_cell(0, 0, String::from("9"));
-        let out = super::serialize_delimited(&d, b'\t');
+        let out = super::serialize_delimited(&d, b'\t', false);
         assert_eq!(String::from_utf8(out).unwrap(), "x\ty\n9\t2\n");
     }
 

@@ -303,81 +303,112 @@ fn run_one(host: &str, command: &str, timeout: Duration) -> HostResult {
     let secs = timeout.as_secs().max(1);
     let mut args = vec![String::from("-o"), format!("ConnectTimeout={secs}")];
     args.extend(fleet_ssh_args(host, command));
-    let spawned = std::process::Command::new("ssh")
-        .args(&args)
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.args(&args);
+    run_killable(cmd, host, timeout)
+}
+
+/// Run `cmd` for `host`, collecting stdout and stderr, and kill it if it
+/// outlives `timeout`.
+fn run_killable(mut cmd: std::process::Command, host: &str, timeout: Duration) -> HostResult {
+    use std::io::Read;
+    let result = |output: String, exit: Option<i32>| HostResult {
+        host: host.to_string(),
+        output,
+        exit,
+    };
+    let spawned = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();
     let mut child = match spawned {
         Ok(c) => c,
-        Err(e) => {
-            return HostResult {
-                host: host.to_string(),
-                output: format!("could not run ssh: {e}"),
-                exit: None,
-            };
-        }
+        Err(e) => return result(format!("could not run ssh: {e}"), None),
     };
+    // Both pipes drain on their own threads WHILE the child runs. Read only
+    // after exit, a command printing more than a pipe buffer (~64 KiB, any
+    // `journalctl`) blocked on the write, never exited, and was killed at
+    // the deadline with all its output lost.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
     // Poll rather than block, so the child can be killed when its time is
     // up. `wait_with_output` would consume the child and leave no handle to
     // kill, which is how the abandoned processes accumulated.
     let deadline = std::time::Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 // Reaped, so the process does not linger as a zombie.
                 let _ = child.wait();
-                return HostResult {
-                    host: host.to_string(),
-                    output: String::from("timed out"),
-                    exit: None,
-                };
+                return result(String::from("timed out"), None);
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => {
-                return HostResult {
-                    host: host.to_string(),
-                    output: format!("could not wait on ssh: {e}"),
-                    exit: None,
-                };
-            }
+            Err(e) => return result(format!("could not wait on ssh: {e}"), None),
         }
-    }
-    let out = child.wait_with_output();
-    match out {
-        Ok(o) => {
-            // stdout AND stderr: a command that failed usually said why on
-            // stderr, and a tile showing an empty box for a failure tells
-            // the user nothing they can act on.
-            let mut text = String::from_utf8_lossy(&o.stdout).trim_end().to_string();
-            let err = String::from_utf8_lossy(&o.stderr);
-            let err = err.trim_end();
-            if !err.is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(err);
-            }
-            HostResult {
-                host: host.to_string(),
-                output: text,
-                exit: o.status.code(),
-            }
+    };
+    // A descendant the command left running can hold a pipe open past the
+    // exit, so the readers get a short grace rather than a join.
+    let grace = Duration::from_millis(500);
+    let out = stdout.recv_timeout(grace).unwrap_or_default();
+    let err = stderr.recv_timeout(grace).unwrap_or_default();
+    // stdout AND stderr: a command that failed usually said why on
+    // stderr, and a tile showing an empty box for a failure tells
+    // the user nothing they can act on.
+    let mut text = String::from_utf8_lossy(&out).trim_end().to_string();
+    let err = String::from_utf8_lossy(&err);
+    let err = err.trim_end();
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
         }
-        Err(e) => HostResult {
-            host: host.to_string(),
-            output: format!("could not run ssh: {e}"),
-            exit: None,
-        },
+        text.push_str(err);
     }
+    result(text, status.code())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_printing_more_than_a_pipe_buffer_completes() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "head -c 300000 /dev/zero | tr '\\0' x; echo oops >&2"]);
+        let r = run_killable(cmd, "h", Duration::from_secs(20));
+        assert_eq!(
+            r.exit,
+            Some(0),
+            "{}",
+            &r.output[r.output.len().saturating_sub(80)..]
+        );
+        assert!(r.output.starts_with("xxxx"));
+        assert!(r.output.ends_with("\noops"));
+        assert_eq!(r.output.len(), 300_000 + "\noops".len());
+    }
 
     fn groups(pairs: &[(&str, &[&str])]) -> std::collections::BTreeMap<String, Vec<String>> {
         pairs

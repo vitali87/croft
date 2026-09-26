@@ -34,6 +34,50 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_FILE: &str = "update-check.json";
 const STAGE_DIR: &str = "staged";
 
+/// Where the running binary came from, as far as upgrading it is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallSource {
+    /// Inside a Homebrew Cellar: Homebrew owns the file, and `brew upgrade`
+    /// is the only upgrade that keeps its records true.
+    Homebrew,
+    /// Anything else (cargo, binstall, a release archive, a source build):
+    /// croft may stage and swap the binary itself.
+    SelfManaged,
+}
+
+/// What a Homebrew user runs instead of croft's own updater.
+pub const BREW_UPGRADE: &str = "brew upgrade croft";
+
+/// Classify `exe`, the canonical path of the running binary (symlinks such
+/// as `/opt/homebrew/bin/croft` already resolved into the Cellar).
+pub fn install_source(exe: &Path) -> InstallSource {
+    // Homebrew keeps every formula at `<prefix>/Cellar/<formula>/<version>/`,
+    // on every prefix it supports (/opt/homebrew, /usr/local, linuxbrew), so
+    // a `Cellar/croft` pair of components is the signature, not the prefix.
+    let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    // The whole `Cellar/croft/<version>/bin/croft` tail: a source checkout
+    // that happens to sit under a `Cellar/croft` directory is not brew's.
+    let owned = parts.len() >= 5
+        && parts[parts.len() - 5] == "Cellar"
+        && parts[parts.len() - 4] == "croft"
+        && parts[parts.len() - 2] == "bin"
+        && parts[parts.len() - 1] == "croft";
+    if owned {
+        InstallSource::Homebrew
+    } else {
+        InstallSource::SelfManaged
+    }
+}
+
+/// The running binary's install source, resolving symlinks first so the
+/// `bin/croft` link Homebrew puts on PATH is traced into the Cellar.
+pub fn current_install_source() -> InstallSource {
+    std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map(|p| install_source(&p))
+        .unwrap_or(InstallSource::SelfManaged)
+}
+
 /// The on-disk memory of the check, one small JSON file in the cache dir.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CheckCache {
@@ -355,6 +399,37 @@ fn apply_staged_at(staged: &Path, target: &Path, tmp: &Path) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_binary_in_a_homebrew_cellar_is_homebrew_owned() {
+        for p in [
+            "/opt/homebrew/Cellar/croft/0.1.961/bin/croft",
+            "/usr/local/Cellar/croft/0.1.961/bin/croft",
+            "/home/linuxbrew/.linuxbrew/Cellar/croft/0.1.961/bin/croft",
+        ] {
+            assert_eq!(install_source(Path::new(p)), InstallSource::Homebrew, "{p}");
+        }
+    }
+
+    #[test]
+    fn other_installs_are_self_managed() {
+        for p in [
+            "/Users/me/.cargo/bin/croft",
+            "/usr/local/bin/croft",
+            // Another formula's Cellar is not ours, and a folder merely named
+            // Cellar outside a Homebrew layout is not Homebrew.
+            "/opt/homebrew/Cellar/other/1.0/bin/croft",
+            "/Users/me/Cellar/notes/croft",
+            "/Users/me/Cellar/croft/target/release/croft",
+            "/Users/me/code/croft/target/release/croft",
+        ] {
+            assert_eq!(
+                install_source(Path::new(p)),
+                InstallSource::SelfManaged,
+                "{p}"
+            );
+        }
+    }
 
     #[test]
     fn versions_parse_with_or_without_the_v_and_compare_numerically() {

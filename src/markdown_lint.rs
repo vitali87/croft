@@ -39,15 +39,22 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
             let c = t.chars().next().filter(|&c| c == '`' || c == '~');
             c.map(|c| (c, t.chars().take_while(|&x| x == c).count()))
                 .filter(|&(_, n)| n >= 3)
+                .map(|(c, n)| (c, n, &t[n..]))
         } else {
             None
         };
         let is_fence_line = match (in_fence, fence) {
-            (None, Some((c, n))) => {
+            // A backtick fence's info string cannot hold a backtick, so
+            // "```ls``` lists files" is inline code, not an opener.
+            (None, Some((c, n, info))) if !(c == '`' && info.contains('`')) => {
                 in_fence = Some((c, n));
                 true
             }
-            (Some((oc, on)), Some((c, n))) if oc == c && n >= on => {
+            // A closer carries nothing after its run: "```js" inside a
+            // ``` block is content, not the end of it.
+            (Some((oc, on)), Some((c, n, rest)))
+                if oc == c && n >= on && rest.trim().is_empty() =>
+            {
                 in_fence = None;
                 true
             }
@@ -213,6 +220,21 @@ fn diag(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_code_at_a_line_start_does_not_open_a_fence() {
+        let d = lint("```ls``` lists files.\n\n#Bad\n");
+        assert!(
+            !d.is_empty(),
+            "the heading after inline code is still linted"
+        );
+        let d = lint("```\n```js\n#NotLinted\n```\n\n#Bad\n");
+        assert_eq!(
+            d.len(),
+            1,
+            "an info line inside a block does not close it: {d:?}"
+        );
+    }
 
     #[test]
     fn flags_a_second_top_level_heading() {

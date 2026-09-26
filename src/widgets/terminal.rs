@@ -4,6 +4,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection as TracerSelection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::ClipboardType;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, TermMode};
@@ -140,8 +141,9 @@ impl Selection {
 }
 
 /// Listener for events the embedded `Term` emits. Most variants (title
-/// changes, cursor-blink toggles, clipboard load/store, child exit, etc.)
-/// are owned by the outer croft TUI and ignored here, but two of them
+/// changes, cursor-blink toggles, clipboard load, child exit, etc.)
+/// are owned by the outer croft TUI and ignored here. A clipboard STORE
+/// (OSC 52 copy) is latched for the app to deliver (#678). Two more
 /// MUST be reflected back into the shell's stdin or interactive TUIs
 /// running inside the embedded terminal hang waiting for replies:
 ///
@@ -166,6 +168,9 @@ pub struct VoidListener {
     /// Latched when the child rings BEL (`\a`); the app drains it via
     /// [`PtyTerminal::take_bell`] to surface the bell in the UI.
     bell: Option<Arc<AtomicBool>>,
+    /// The newest OSC 52 clipboard store from the child (#678); drained by
+    /// [`PtyTerminal::take_clipboard_store`].
+    clipboard: Option<Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 impl EventListener for VoidListener {
@@ -174,6 +179,18 @@ impl EventListener for VoidListener {
             AlacEvent::Bell => {
                 if let Some(bell) = self.bell.as_ref() {
                     bell.store(true, Ordering::Release);
+                }
+            }
+            // A program copying through OSC 52: Claude Code, tmux, nvim.
+            // Over SSH it is their ONLY way to copy (a remote box has no
+            // clipboard tool), so dropping it broke copy on a remote while
+            // the same program copied fine locally through pbcopy (#678).
+            // Only the clipboard, never the primary selection: X's
+            // select-to-copy buffer has no counterpart on the user's side,
+            // and writing it into the clipboard would clobber real copies.
+            AlacEvent::ClipboardStore(ClipboardType::Clipboard, text) => {
+                if let Some(clip) = self.clipboard.as_ref() {
+                    *clip.lock().unwrap() = Some(text);
                 }
             }
             AlacEvent::PtyWrite(text) => {
@@ -458,21 +475,18 @@ pub struct PtyTerminal {
     /// The coding agent seated in this pane, when the foreground process is
     /// one (#344), carried between samples so a transition can be told.
     agent: Option<crate::agents::AgentLane>,
-    /// Tracks whether the inner program has enabled DECSET 2004 (bracketed
-    /// paste). Sniffed off the byte stream; not all parsers expose it.
-    bracketed_paste_enabled: Arc<AtomicBool>,
     /// Listening loopback ports the reader thread scraped out of the output
     /// stream (`http://localhost:PORT` banners, `listening on :PORT` lines).
     /// The app drains this each tick to feed the PORTS panel and the toast.
     port_rx: std::sync::mpsc::Receiver<crate::port_detect::PortHit>,
     master: Box<dyn MasterPty + Send>,
-    /// Shared between this struct's user-input path (`write_input`,
-    /// `paste_*`, `cd_into`) and the background responder thread that
-    /// ships alacritty's reply bytes (`PtyWrite`, `TextAreaSizeRequest`)
-    /// back to the shell's stdin. portable-pty rejects a second
-    /// `take_writer` call, so there is exactly one underlying writer
-    /// and both paths funnel through this mutex.
-    writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    /// Bytes for the child's stdin, written by this pane's writer thread.
+    /// The user-input path (`write_input`, `paste_*`, `cd_into`, mouse
+    /// reports) and the responder that ships alacritty's replies both send
+    /// here: portable-pty hands out one writer, and a blocking `write_all`
+    /// on the UI thread froze all of croft when a large paste met a program
+    /// that was not reading its stdin.
+    input_tx: std::sync::mpsc::Sender<Vec<u8>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     /// The PTY reader thread's handle, joined in `Drop` after the child is
     /// killed so a dropped terminal never leaves a live shell + blocked
@@ -501,6 +515,10 @@ pub struct PtyTerminal {
     /// shell's own rc startup — the state `cwd_seed_is_safe` treats as
     /// still seedable (#94).
     input_seen: bool,
+    /// When input was last written, in the same clock as `last_output_ms`:
+    /// until output newer than this arrives, the screen does not yet show
+    /// what was typed (#614).
+    last_input_ms: u64,
     /// True for a `new_running` pane: the child is a launched program
     /// (a task, run-active-file, a debug attach), not an interactive
     /// shell. Such a pane is doing work the user asked for even though
@@ -596,6 +614,9 @@ pub struct PtyTerminal {
     /// Latched by the event listener when the child rings BEL; drained by
     /// [`Self::take_bell`].
     bell: Arc<AtomicBool>,
+    /// Latched by the event listener when the child copies through OSC 52
+    /// (#678); drained by [`Self::take_clipboard_store`].
+    clipboard_store: Arc<std::sync::Mutex<Option<String>>>,
     /// OSC 133 semantic prompt marks recorded by the reader thread, in
     /// arrival order. Positions are stored as `(grid line, history size)`
     /// at record time; [`Self::command_marks`] translates to current grid
@@ -1323,6 +1344,16 @@ pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::path::Path>) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // `git rebase -i` opens its plan in this croft (#620), unless the user
+    // chose their own sequence editor, which always wins: an exported
+    // GIT_SEQUENCE_EDITOR here, or `sequence.editor` in git config, which
+    // `croft edit --sequence-editor` looks up in the rebasing repo itself.
+    if view_sock.is_some()
+        && std::env::var_os("GIT_SEQUENCE_EDITOR").is_none()
+        && let Some(exe) = std::env::current_exe().ok().and_then(live_exe)
+    {
+        cmd.env("GIT_SEQUENCE_EDITOR", sequence_editor_command(&exe));
+    }
     match view_sock {
         Some(path) => cmd.env(crate::view_ipc::SOCK_ENV, path),
         // CLEARED, not merely not-added. `CommandBuilder::new` seeds itself
@@ -1335,6 +1366,33 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
         // plainly").
         None => cmd.env_remove(crate::view_ipc::SOCK_ENV),
     }
+}
+
+/// Milliseconds since the epoch, the clock `last_output_ms` keeps.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `exe` as a path that still runs. Once an update renames a new binary
+/// over the running one, Linux reports it as `.../croft (deleted)`, which
+/// no shell can start; the new binary at the same path can, and `croft
+/// edit` is the same command in both.
+fn live_exe(exe: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    if exe.exists() {
+        return Some(exe);
+    }
+    let replaced = std::path::PathBuf::from(exe.to_str()?.strip_suffix(" (deleted)")?);
+    replaced.exists().then_some(replaced)
+}
+
+/// The `GIT_SEQUENCE_EDITOR` value naming this croft (#620). git runs it
+/// through the shell, so the binary's path is single-quoted.
+pub(crate) fn sequence_editor_command(exe: &std::path::Path) -> String {
+    let quoted = exe.to_string_lossy().replace('\'', r"'\''");
+    format!("'{quoted}' edit --wait --sequence-editor")
 }
 
 impl PtyTerminal {
@@ -1411,20 +1469,30 @@ impl PtyTerminal {
     /// [`row_text_and_cols`]), so match positions are char indices, not grid
     /// columns.
     pub fn grid_lines(&self) -> (Vec<String>, i32) {
+        let (lines, _, top) = self.grid_lines_wrapped();
+        (lines, top)
+    }
+
+    /// [`Self::grid_lines`] plus, per row, whether it soft-wraps into the
+    /// next, read under the same lock: redaction joins wrapped rows, since a
+    /// secret split across two rows matches neither on its own.
+    pub fn grid_lines_wrapped(&self) -> (Vec<String>, Vec<bool>, i32) {
         let term = self.term.lock();
         if term.columns() == 0 {
-            return (Vec::new(), 0);
+            return (Vec::new(), Vec::new(), 0);
         }
         let top = term.grid().topmost_line().0;
         let bottom = term.screen_lines() as i32 - 1;
         let mut lines = Vec::new();
+        let mut wraps = Vec::new();
         let mut l = top;
         while l <= bottom {
             let (s, _cols) = row_text_and_cols(&term, l);
             lines.push(s.trim_end().to_string());
+            wraps.push(l < bottom && row_wraps(&term, l));
             l += 1;
         }
-        (lines, top)
+        (lines, wraps, top)
     }
 
     /// Every readable grid row as `(plain, coloured)`: the plain text
@@ -1440,6 +1508,15 @@ impl PtyTerminal {
     /// those cells, which the plain twin drops, so the two forms can differ
     /// in length there); every row that set a style ends with a reset.
     pub fn grid_lines_ansi(&self) -> Vec<(String, String)> {
+        self.grid_lines_ansi_wrapped()
+            .into_iter()
+            .map(|(plain, ansi, _)| (plain, ansi))
+            .collect()
+    }
+
+    /// [`Self::grid_lines_ansi`] plus whether each row soft-wraps into the
+    /// next (see [`Self::grid_lines_wrapped`]).
+    pub fn grid_lines_ansi_wrapped(&self) -> Vec<(String, String, bool)> {
         let term = self.term.lock();
         if term.columns() == 0 {
             return Vec::new();
@@ -1497,7 +1574,7 @@ impl PtyTerminal {
             if styled {
                 out.push_str("\x1b[0m");
             }
-            lines.push((plain, out));
+            lines.push((plain, out, l < bottom && row_wraps(&term, l)));
             l += 1;
         }
         lines
@@ -1774,9 +1851,17 @@ impl PtyTerminal {
         let shell_pid = child.process_id().map(|p| p as i32);
         drop(pair.slave);
 
-        let writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>> = Arc::new(std::sync::Mutex::new(
-            pair.master.take_writer().context("take writer")?,
-        ));
+        let mut writer: Box<dyn Write + Send> = pair.master.take_writer().context("take writer")?;
+        let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // Ends once every sender is gone (the pane and its responder), or
+        // when the child stops taking input.
+        std::thread::spawn(move || {
+            while let Ok(bytes) = input_rx.recv() {
+                if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
 
         let term_size = TermSize::new(cols as usize, rows as usize);
@@ -1793,10 +1878,12 @@ impl PtyTerminal {
         let size_shared = Arc::new(std::sync::Mutex::new((cols, rows)));
         let (response_tx, response_rx) = std::sync::mpsc::channel::<String>();
         let bell = Arc::new(AtomicBool::new(false));
+        let clipboard_store = Arc::new(std::sync::Mutex::new(None));
         let listener = VoidListener {
             pty_response_tx: Some(response_tx),
             size: Some(size_shared.clone()),
             bell: Some(bell.clone()),
+            clipboard: Some(clipboard_store.clone()),
         };
         let mut term = Term::new(cfg, &term_size, listener);
         // Before the reader thread exists, so nothing the child writes can
@@ -1806,17 +1893,11 @@ impl PtyTerminal {
         }
         let term = Arc::new(FairMutex::new(term));
         let term_for_thread = term.clone();
-        let writer_for_responder = writer.clone();
+        let input_for_responder = input_tx.clone();
 
         std::thread::spawn(move || {
             while let Ok(text) = response_rx.recv() {
-                let Ok(mut w) = writer_for_responder.lock() else {
-                    break;
-                };
-                if w.write_all(text.as_bytes()).is_err() {
-                    break;
-                }
-                if w.flush().is_err() {
+                if input_for_responder.send(text.into_bytes()).is_err() {
                     break;
                 }
             }
@@ -1836,8 +1917,6 @@ impl PtyTerminal {
                 .unwrap_or(0),
         ));
         let last_output_ms_for_thread = last_output_ms.clone();
-        let bracketed_paste_enabled = Arc::new(AtomicBool::new(false));
-        let bracketed_paste_for_thread = bracketed_paste_enabled.clone();
         let (port_tx, port_rx) = std::sync::mpsc::channel::<crate::port_detect::PortHit>();
 
         if let Some(label) = run_label.as_deref() {
@@ -1939,7 +2018,6 @@ impl PtyTerminal {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        sniff_bracketed_paste_mode(&buf[..n], &bracketed_paste_for_thread);
                         port_sniffer.sniff(&buf[..n], &port_tx);
                         // Shell-integration marks: split the advance at each
                         // OSC 133 so the cursor can be sampled exactly where
@@ -2208,10 +2286,9 @@ impl PtyTerminal {
             pty_pending_bytes,
             last_output_ms,
             agent: None,
-            bracketed_paste_enabled,
             port_rx,
             master: pair.master,
-            writer,
+            input_tx,
             _child: child,
             reader_thread: Some(reader_thread),
             reader_shutdown: Some(shutdown_w),
@@ -2221,6 +2298,7 @@ impl PtyTerminal {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             input_seen: false,
+            last_input_ms: 0,
             run_pane: script_mode,
             manual_name_seen: false,
             cols,
@@ -2245,6 +2323,7 @@ impl PtyTerminal {
             search_opts: crate::widgets::search::SearchOpts::default(),
             current_match: None,
             bell,
+            clipboard_store,
             marks,
             osc7_cwd,
             osc7_host,
@@ -2443,6 +2522,14 @@ impl PtyTerminal {
         self.bell.swap(false, Ordering::AcqRel)
     }
 
+    /// The text the child last copied through OSC 52 since the previous
+    /// call, if any (drains the latch). Only the newest copy survives a
+    /// tick: the clipboard holds one value, so older ones were overwritten
+    /// anyway.
+    pub fn take_clipboard_store(&self) -> Option<String> {
+        self.clipboard_store.lock().unwrap().take()
+    }
+
     /// The pane's foreground process group leader pid (what owns the tty now):
     /// the shell at a prompt, or a running command. `None` if unavailable.
     pub fn foreground_pid(&self) -> Option<i32> {
@@ -2464,6 +2551,12 @@ impl PtyTerminal {
     /// Set the foreground-process label (from the off-loop refresh).
     pub fn set_auto_label(&mut self, label: String) {
         self.auto_label = label;
+    }
+
+    /// Whether input was written that the shell has not echoed yet, so the
+    /// prompt line on screen lags what was typed.
+    pub fn awaiting_echo(&self) -> bool {
+        self.last_input_ms > self.last_output_ms.load(Ordering::Relaxed)
     }
 
     /// How long since the PTY last produced output; a pane that never has is
@@ -2525,6 +2618,73 @@ impl PtyTerminal {
     /// reporting one.
     pub fn progress(&self) -> Option<(u8, u8)> {
         *self.progress.lock().unwrap()
+    }
+
+    /// What has been typed at the shell prompt, when the cursor sits at its
+    /// end (#614): `(typed, cursor screen x, cursor screen y, pane right
+    /// edge)`. `None` unless the newest shell-integration mark is the prompt
+    /// end on the cursor's own row, the view is live (not scrolled back, not
+    /// a full-screen program), and nothing is drawn right of the cursor.
+    /// That last rule is what keeps croft out of the way of a shell drawing
+    /// its own suggestion (fish, zsh-autosuggestions), which lands there.
+    pub fn prompt_tail(&self) -> Option<(String, u16, u16, u16)> {
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) || term.grid().display_offset() != 0 {
+            return None;
+        }
+        let cursor = term.grid().cursor.point;
+        let line = cursor.line.0;
+        let now = self.clock_now(&term);
+        let ms = self.marks.lock().unwrap();
+        let last = ms.last()?;
+        if !matches!(last.kind, crate::shell_integration::OscEvent::PromptEnd)
+            || last.line_rec - (now - last.clock_rec) as i32 != line
+        {
+            return None;
+        }
+        let (text, colmap) = row_text_and_cols(&term, line);
+        let cur = cursor.column.0;
+        let b_col = last.col_rec;
+        // Characters at or right of the cursor: must be none.
+        if colmap
+            .iter()
+            .zip(text.chars())
+            .any(|(&c, ch)| c >= cur && !ch.is_whitespace())
+        {
+            return None;
+        }
+        let typed: String = colmap
+            .iter()
+            .zip(text.chars())
+            .filter(|(c, _)| **c >= b_col && **c < cur)
+            .map(|(_, ch)| ch)
+            .collect();
+        let inner = self.last_inner;
+        if inner.width == 0 || line < 0 || line as u16 >= inner.height {
+            return None;
+        }
+        Some((
+            typed,
+            inner.x + cur as u16,
+            inner.y + line as u16,
+            inner.x + inner.width,
+        ))
+    }
+
+    /// The shell cursor's screen cell, when it is on screen and the program
+    /// hasn't hidden it (#621: screen reader mode parks the cursor here).
+    pub fn screen_cursor(&self) -> Option<(u16, u16)> {
+        let term = self.term.lock();
+        if !term.mode().contains(TermMode::SHOW_CURSOR) || term.grid().display_offset() != 0 {
+            return None;
+        }
+        let p = term.grid().cursor.point;
+        let inner = self.last_inner;
+        let (line, col) = (p.line.0, p.column.0 as u16);
+        if inner.width == 0 || line < 0 || line as u16 >= inner.height || col >= inner.width {
+            return None;
+        }
+        Some((inner.x + col, inner.y + line as u16))
     }
 
     /// The arrow-key bytes a plain click at screen cell (col, row) should
@@ -2738,7 +2898,10 @@ impl PtyTerminal {
             return None;
         }
         let line = vr as i32 - term.grid().display_offset() as i32;
-        let (text, colmap) = row_text_and_cols(&term, line);
+        let (_, colmap) = row_text_and_cols(&term, line);
+        // Matched over the logical line, as the painter masks it: a secret
+        // a soft wrap cut in two is found from a click on either half.
+        let (text, offset) = logical_row_text(&term, line);
         drop(term);
         // The clicked column as a char index: a wide char's spacer column
         // resolves to the wide char itself (the `line_text_at` rule).
@@ -2748,7 +2911,7 @@ impl PtyTerminal {
         // char index - never back into a token. The `rposition` only ever
         // steps back for a wide char's spacer column, which is the wide
         // char itself.
-        let ci = colmap.iter().rposition(|&gc| gc <= vc)?;
+        let ci = offset + colmap.iter().rposition(|&gc| gc <= vc)?;
         crate::triggers::redact_spans(&text, &set)
             .into_iter()
             .find(|s| ci >= s.start && ci < s.start + s.len)
@@ -3525,15 +3688,13 @@ impl PtyTerminal {
     pub fn write_input(&mut self, data: &[u8]) {
         self.reset_scrollback();
         self.input_seen = true;
+        self.last_input_ms = now_ms();
         #[cfg(test)]
         self.written_for_test
             .lock()
             .unwrap()
             .extend_from_slice(data);
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(data);
-            let _ = w.flush();
-        }
+        let _ = self.input_tx.send(data.to_vec());
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -3601,10 +3762,7 @@ impl PtyTerminal {
             .lock()
             .unwrap()
             .extend_from_slice(&report);
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(&report);
-            let _ = w.flush();
-        }
+        let _ = self.input_tx.send(report);
         self.input_seen = true;
         self.pty_dirty.store(true, Ordering::Release);
         true
@@ -3623,9 +3781,19 @@ impl PtyTerminal {
     /// are added only if the inner program asked for them; otherwise the
     /// payload is sent raw so simple shells don't see literal `\e[200~`.
     pub fn paste_input(&mut self, payload: &[u8]) {
-        if self.bracketed_paste_enabled.load(Ordering::Acquire) {
+        // The terminal's own mode, as its parser tracked it: the byte
+        // sniffer missed a `\e[?2004h` split across two reads, a combined
+        // `\e[?1049;2004h` and a reset, and pasted line by line into a shell
+        // that had asked for bracketed paste.
+        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        if bracketed {
             self.write_input(b"\x1b[200~");
-            self.write_input(payload);
+            // No ESC inside the brackets, as xterm and VS Code do: pasted
+            // text holding `\e[201~` would close the paste early, and the
+            // shell would run what follows it (`ls\e[201~rm -rf ~\r`). Any
+            // program in a pane can plant that on the clipboard via OSC 52.
+            let clean: Vec<u8> = payload.iter().copied().filter(|&b| b != 0x1b).collect();
+            self.write_input(&clean);
             self.write_input(b"\x1b[201~");
         } else {
             self.write_input(payload);
@@ -3893,6 +4061,43 @@ impl Drop for PtyTerminal {
     }
 }
 
+/// The logical line grid row `line_idx` belongs to (its soft-wrapped
+/// neighbours joined, at most 64 rows either way) and the char offset of
+/// that row's text within it, both in `row_text_and_cols` terms.
+pub fn logical_row_text(term: &Term<VoidListener>, line_idx: i32) -> (String, usize) {
+    const REACH: i32 = 64;
+    let top = term.grid().topmost_line().0;
+    let bottom = term.screen_lines() as i32 - 1;
+    let mut start = line_idx;
+    while start > top && line_idx - start < REACH && row_wraps(term, start - 1) {
+        start -= 1;
+    }
+    let mut end = line_idx;
+    while end < bottom && end - line_idx < REACH && row_wraps(term, end) {
+        end += 1;
+    }
+    let mut joined = String::new();
+    let mut offset = 0;
+    for l in start..=end {
+        let (s, _) = row_text_and_cols(term, l);
+        if l == line_idx {
+            offset = joined.chars().count();
+        }
+        joined.push_str(&s);
+    }
+    (joined, offset)
+}
+
+/// Whether grid row `line_idx` soft-wraps into the next (WRAPLINE on its
+/// last cell).
+pub fn row_wraps(term: &Term<VoidListener>, line_idx: i32) -> bool {
+    let cols = term.columns();
+    cols > 0
+        && term.grid()[Point::new(Line(line_idx), Column(cols - 1))]
+            .flags
+            .contains(Flags::WRAPLINE)
+}
+
 /// Walk the visible grid from (sr, sc) to (er, ec) inclusive, joining
 /// cell contents row-by-row, trimming trailing whitespace per row, and
 /// inserting `\n` between rows. Coordinates are viewport-relative;
@@ -4151,23 +4356,28 @@ pub fn extract_selection_text(
             } else {
                 line.push(c);
             }
-        }
-        let trimmed = line.trim_end();
-        out.push_str(trimmed);
-        if line_idx != er {
-            // A soft-wrapped row (WRAPLINE on its last cell) continues the
-            // same logical line: no separator, so copied text, the durable
-            // command history, and the sticky header all see the line the
-            // user actually typed — a '\n' here corrupted stored commands
-            // and re-ran only their first fragment on paste. A hard row
-            // break keeps the newline.
-            let wrapped = cols > 0
-                && term.grid()[Point::new(Line(line_idx), Column(cols - 1))]
-                    .flags
-                    .contains(Flags::WRAPLINE);
-            if !wrapped {
-                out.push('\n');
+            // Combining marks ride on the cell after its base char: `café`
+            // typed as `e` + U+0301 copied as `cafe` without them.
+            if let Some(marks) = cell.zerowidth() {
+                line.extend(marks.iter());
             }
+        }
+        // A soft-wrapped row (WRAPLINE on its last cell) continues the
+        // same logical line: no separator, so copied text, the durable
+        // command history, and the sticky header all see the line the user
+        // actually typed — a '\n' here corrupted stored commands and re-ran
+        // only their first fragment on paste. A hard row break keeps the
+        // newline. Only a hard break is trimmed: a space in a wrapped row's
+        // last column is part of the line (`echo abcd efg` in ten columns
+        // copied as `echo abcdefg`).
+        let wrapped = line_idx != er
+            && cols > 0
+            && term.grid()[Point::new(Line(line_idx), Column(cols - 1))]
+                .flags
+                .contains(Flags::WRAPLINE);
+        out.push_str(if wrapped { &line } else { line.trim_end() });
+        if line_idx != er && !wrapped {
+            out.push('\n');
         }
         line_idx += 1;
     }
@@ -4298,25 +4508,6 @@ pub fn format_cd_command(path: &std::path::Path) -> Vec<u8> {
     }
     out.extend_from_slice(b"'\n");
     out
-}
-
-/// Walk a chunk of PTY output and toggle the bracketed-paste flag when
-/// we see `\e[?2004h` (set) / `\e[?2004l` (reset).
-pub fn sniff_bracketed_paste_mode(chunk: &[u8], flag: &AtomicBool) {
-    let needle_set: &[u8] = b"\x1b[?2004h";
-    let needle_reset: &[u8] = b"\x1b[?2004l";
-    let mut i = 0;
-    while i < chunk.len() {
-        if chunk[i..].starts_with(needle_set) {
-            flag.store(true, Ordering::Release);
-            i += needle_set.len();
-        } else if chunk[i..].starts_with(needle_reset) {
-            flag.store(false, Ordering::Release);
-            i += needle_reset.len();
-        } else {
-            i += 1;
-        }
-    }
 }
 
 /// Build the OSC 52 escape sequence that asks the host terminal to put
@@ -4682,9 +4873,21 @@ impl Widget for &mut PtyTerminal {
                 // real text, the cell shows a mask glyph. Counted per span
                 // for the status chip; nothing is masked while revealing.
                 if !reveal_redactions {
-                    for s in crate::triggers::redact_spans(&text, &trigger_set) {
-                        redacted_spans += 1;
-                        for k in s.start..s.start + s.len {
+                    // Over the logical line: a secret the soft wrap cut in
+                    // two matches on neither row alone.
+                    let (logical, offset) = logical_row_text(&term, row_line_idx);
+                    let row_len = text.chars().count();
+                    for s in crate::triggers::redact_spans(&logical, &trigger_set) {
+                        let (lo, hi) =
+                            (s.start.max(offset), (s.start + s.len).min(offset + row_len));
+                        if lo >= hi {
+                            continue;
+                        }
+                        // Counted on the row it starts on, once.
+                        if s.start >= offset {
+                            redacted_spans += 1;
+                        }
+                        for k in lo - offset..hi - offset {
                             if let Some(&col) = colmap.get(k) {
                                 let cell = paint[col].get_or_insert(TrigCell {
                                     fg: None,
@@ -5110,6 +5313,17 @@ pub fn cell_in_selection(row: i32, col: u16, sr: i32, sc: u16, er: i32, ec: u16)
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_replaced_binary_still_names_a_runnable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("croft");
+        std::fs::write(&bin, b"").unwrap();
+        let deleted = std::path::PathBuf::from(format!("{} (deleted)", bin.display()));
+        assert_eq!(live_exe(deleted), Some(bin.clone()));
+        assert_eq!(live_exe(bin.clone()), Some(bin));
+        assert_eq!(live_exe(dir.path().join("gone (deleted)")), None);
+    }
+
     /// The zsh the shim tests drive, or an ANNOUNCED skip on a machine
     /// without one (#52). CI provisions zsh, so the gate holds where it
     /// matters; on a zsh-less dev box these tests must skip with a reason
@@ -5462,6 +5676,7 @@ mod tests {
             pty_response_tx: Some(tx),
             size: Some(Arc::new(std::sync::Mutex::new((80, 24)))),
             bell: None,
+            clipboard: None,
         };
         let cfg = Config::default();
         let size = TermSize::new(80, 24);
@@ -5491,6 +5706,7 @@ mod tests {
             pty_response_tx: Some(tx),
             size: Some(size),
             bell: None,
+            clipboard: None,
         };
         let cfg = Config::default();
         let term_size = TermSize::new(120, 40);
@@ -5545,19 +5761,62 @@ mod tests {
     }
 
     #[test]
-    fn sniff_bracketed_paste_mode_toggles_on_set_and_reset() {
-        let flag = AtomicBool::new(false);
-        sniff_bracketed_paste_mode(b"prompt> \x1b[?2004h", &flag);
-        assert!(flag.load(Ordering::Acquire));
-        sniff_bracketed_paste_mode(b"\x1b[?2004l\nbye", &flag);
-        assert!(!flag.load(Ordering::Acquire));
+    fn a_large_write_to_a_child_not_reading_never_blocks_the_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("stty raw -echo; sleep 3")],
+            tmp.path(),
+        )
+        .unwrap();
+        let big = vec![b'x'; 1 << 20];
+        let started = std::time::Instant::now();
+        term.write_input(&big);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the write went to the pane's writer thread, not the caller"
+        );
     }
 
     #[test]
-    fn sniff_bracketed_paste_mode_ignores_unrelated_dec_modes() {
-        let flag = AtomicBool::new(false);
-        sniff_bracketed_paste_mode(b"\x1b[?25h\x1b[?1049h", &flag);
-        assert!(!flag.load(Ordering::Acquire));
+    fn a_secret_cut_by_a_soft_wrap_is_masked_on_both_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        term.resize(30, 10);
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        term.feed_bytes_for_test(format!("\x1b[2J\x1b[Hexport GH={token}\r\n").as_bytes());
+        let set = crate::triggers::TriggerSet::default().with_builtin_redactions();
+        let (lines, wraps, _) = term.grid_lines_wrapped();
+        let masked = crate::triggers::mask_rows(&lines, &wraps, &set);
+        let all: String = masked.concat();
+        assert!(
+            !all.contains("ghp_") && !all.contains("0123456789"),
+            "{masked:?}"
+        );
+        let t = term.term.lock();
+        let first = (0..t.screen_lines() as i32)
+            .find(|&l| row_text_and_cols(&t, l).0.contains("export"))
+            .unwrap();
+        let (logical, offset) = logical_row_text(&t, first + 1);
+        assert!(logical.contains(token), "{logical}");
+        assert_eq!(offset, 30);
+    }
+
+    #[test]
+    fn a_paste_cannot_close_its_own_brackets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        // The mode as the parser tracks it (the reader keeps one parser, so
+        // a sequence split across reads lands too).
+        term.feed_bytes_for_test(b"prompt \x1b[?1049;2004h");
+        term.paste_input(b"ls\x1b[201~rm -rf ~\r");
+        let written = term.written_bytes_for_test();
+        let tail = &written[written.len() - b"\x1b[200~ls[201~rm -rf ~\r\x1b[201~".len()..];
+        assert_eq!(tail, b"\x1b[200~ls[201~rm -rf ~\r\x1b[201~");
+        // And no brackets once the program turns the mode off.
+        term.feed_bytes_for_test(b"\x1b[?2004l");
+        term.paste_input(b"x");
+        assert!(term.written_bytes_for_test().ends_with(b"\x1b[201~x"));
     }
 
     #[test]
@@ -7581,6 +7840,35 @@ mod tests {
         );
     }
 
+    /// #678: a program in the pane copying through OSC 52 (Claude Code over
+    /// SSH has no other way) must reach the app, once, and only for the
+    /// clipboard: a primary-selection store is not a copy the user made.
+    #[test]
+    fn osc52_clipboard_store_is_latched_for_the_app_and_selection_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        // "aGVsbG8=" is "hello"; the primary-selection store ("p") comes
+        // first so a leak of it would be overwritten into a false pass only
+        // if it were accepted AND ordered last.
+        let script = "printf '\\033]52;c;aGVsbG8=\\007\\033]52;p;bm9wZQ==\\007DONE\\n'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        wait_for_grid(&term, |ls| {
+            ls.iter()
+                .any(|l| l.contains("DONE") && !l.contains("printf"))
+        });
+        assert_eq!(
+            term.take_clipboard_store().as_deref(),
+            Some("hello"),
+            "the clipboard store must be latched, and the selection store ignored"
+        );
+        assert_eq!(
+            term.take_clipboard_store(),
+            None,
+            "take_clipboard_store drains the latch"
+        );
+    }
+
     /// #257: the colour export round-trips through the log parser: the
     /// text is what the pane showed and the coloured run keeps its colour
     /// and weight, as the 16 symbolic slots the theme resolves.
@@ -7929,6 +8217,16 @@ mod tests {
         feed(&mut t, b"hello world");
         let txt = extract_selection_text(&t, 0, 6, 0, 10);
         assert_eq!(txt, "world");
+    }
+
+    #[test]
+    fn copying_keeps_a_space_at_a_wrap_and_combining_marks() {
+        let mut t = fresh_term(10, 5);
+        feed(&mut t, b"echo abcd efg");
+        assert_eq!(extract_selection_text(&t, 0, 0, 1, 9), "echo abcd efg");
+        let mut t = fresh_term(20, 5);
+        feed(&mut t, "cafe\u{301}".as_bytes());
+        assert_eq!(extract_selection_text(&t, 0, 0, 0, 19), "cafe\u{301}");
     }
 
     #[test]

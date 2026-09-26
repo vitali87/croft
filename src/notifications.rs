@@ -134,9 +134,14 @@ impl Notification {
             workspace: path.clone(),
             host: host.to_string(),
             link: format!(
-                "croft://attach?host={}&path={}",
+                "croft://attach?host={}&path={}{}",
                 encode(host),
-                encode(&path)
+                encode(&path),
+                // What waits is in a terminal: land there.
+                match event {
+                    Event::TestsFailed { .. } => "",
+                    _ => "&focus=terminal",
+                }
             ),
         }
     }
@@ -639,7 +644,7 @@ mod tests {
         assert_eq!(n.host, "box.local");
         assert_eq!(
             n.link,
-            "croft://attach?host=box.local&path=/home/t/my%20proj"
+            "croft://attach?host=box.local&path=/home/t/my%20proj&focus=terminal"
         );
         let n = Notification::new(
             &Event::TestsFailed {

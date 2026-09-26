@@ -155,9 +155,11 @@ impl SshAuth {
         }
     }
 
-    pub fn respond_password(&mut self, password: &str) {
+    /// Type `answer` into ssh's current prompt and press Enter: a password
+    /// or passphrase, a 2FA code, or `yes`/`no` to a host-key question.
+    pub fn respond_to_prompt(&mut self, answer: &str) {
         if let Some(w) = self.writer.as_mut() {
-            let _ = w.write_all(password.as_bytes());
+            let _ = w.write_all(answer.as_bytes());
             let _ = w.write_all(b"\r");
             let _ = w.flush();
         }

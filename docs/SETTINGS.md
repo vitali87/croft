@@ -87,7 +87,7 @@ allowlist — appearance and editor/terminal behavior:
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`.
 
 Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `fleet_groups`, `lane_agent`,
-`mcp_tool_fingerprints`, `host_accents`, `notifications`, and any future key not explicitly
+`mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `locale`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.
 
@@ -149,3 +149,22 @@ the notification in `CROFT_TITLE`, `CROFT_BODY`, `CROFT_LINK`, and
 queue and one retry for transient failures; what finally fails appears in
 the **Notifications** OUTPUT channel, naming only a URL's host. The key is
 user-config only, and a webhook's headers belong in `config.local.json`.
+
+## Profiles
+
+A profile is a named set of settings, keybindings and snippets you can switch between (for example "Python" and "Writing"). **Profiles: Switch Profile** in the palette lists them:
+
+* **New Profile from Current Setup** copies the settings, keybindings and snippets now in effect into a new profile and switches to it.
+* Choosing a profile (or **Default**) switches to it. Keybindings and snippets apply at once; settings apply the next time croft starts.
+* **Use the Active Profile for This Workspace** writes `.croft/profile`, so this folder always opens with that profile, whatever the global choice.
+
+Profiles live in `~/.config/croft/profiles/<name>/`. History, macros and sessions are shared by every profile.
+
+
+## Accessibility and language
+
+* `"screen_reader": true` (or **Accessibility: Toggle Screen Reader Mode**, also in Settings) stops the caret blinking and keeps the real cursor on the focused text: the editor caret, the shell cursor in a terminal, or the status bar when a picker, menu or the Explorer has focus. The status bar then describes each change in one line: the line the caret moved to, the diagnostic under it, the highlighted completion, palette entry or file, focus changes and status messages. Terminal screen readers (VoiceOver, Orca, NVDA over WSL) read it from there.
+* `"screen_reader_command": "spd-say"` (or `"say"` on macOS) also speaks each line through that program, with the line as its last argument.
+* `"locale": "de"` picks the UI language; unset, croft follows `LC_ALL`, `LC_MESSAGES` or `LANG`. Menus, palette titles and status messages are translated where the catalog has an entry, and the palette matches queries in either language. German (`de`) and Spanish (`es`) ship as starter catalogs. For another language or to fix a translation, run `croft locale-template <lang> > ~/.config/croft/locales/<lang>.json` and fill in the values; entries there override the built-in ones. A key with `{}` is a pattern: `"Saved {}": "Gespeichert: {}"`.
+
+All three are user-config only.

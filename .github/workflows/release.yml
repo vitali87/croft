@@ -162,6 +162,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Keyless signing: cosign exchanges the job's OIDC token for a
+      # short-lived Sigstore certificate naming this workflow and tag, so
+      # there is no signing key to store, rotate or leak.
+      id-token: write
     # Only a tag publishes. A workflow_dispatch run builds and stops, which is
     # how you prove the matrix works without cutting a release.
     if: startsWith(github.ref, 'refs/tags/v')
@@ -223,6 +227,23 @@ jobs:
           # hashes the bytes that actually arrived.
           sha256sum -c SHA256SUMS
 
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Sign the checksum file, not each archive: every archive is bound to
+      # SHA256SUMS by its sum, so one signature covers the four. The bundle
+      # carries the signature, the certificate and the transparency-log
+      # proof, which is everything `cosign verify-blob` needs offline.
+      - name: Sign SHA256SUMS
+        run: |
+          cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+          # Verify with the same identity a user will check, so a signature
+          # that would not verify for them never ships.
+          cosign verify-blob \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/SHA256SUMS
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -232,7 +253,7 @@ jobs:
           notes="src/release_notes/$version.md"
           if [ -f "$notes" ]; then
             gh release create "$tag" --title "$tag" --notes-file "$notes" \
-              dist/croft-*.tar.gz dist/SHA256SUMS
+              dist/croft-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
           else
             # Every shipped version has a notes file by the release-hygiene
             # gate, so a missing one means the tag does not match any version
@@ -240,3 +261,64 @@ jobs:
             echo "no src/release_notes/$version.md for tag $tag" >&2
             exit 1
           fi
+
+  homebrew:
+    name: bump the Homebrew formula
+    # After publish, so the archives the formula points at already exist.
+    needs: publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Render the formula from the published SHA256SUMS
+        # The release's own SHA256SUMS, the file cosign signed, so the formula
+        # cannot vouch for bytes the release does not. The generator refuses
+        # a SHA256SUMS missing any of the four archives (#375).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release download "$tag" --pattern SHA256SUMS --dir dist
+          python3 scripts/homebrew_formula.py "${tag#v}" dist/SHA256SUMS > croft.rb
+          ruby -c croft.rb
+          cat croft.rb
+
+      - name: Open a pull request against the tap
+        # The tap is its own repository, so github.token cannot push to it:
+        # HOMEBREW_TAP_TOKEN is a fine-grained token with contents and pull
+        # requests write on vitali87/homebrew-croft only. Until it is set the
+        # release still ships; this says what is missing instead of failing
+        # a release whose archives are already public.
+        env:
+          TAP: vitali87/homebrew-croft
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set; the formula for ${GITHUB_REF#refs/tags/} was rendered above but not proposed to $TAP"
+            exit 0
+          fi
+          version="${GITHUB_REF#refs/tags/v}"
+          branch="croft-$version"
+          gh repo clone "$TAP" tap -- --depth 1
+          cd tap
+          mkdir -p Formula
+          cp ../croft.rb Formula/croft.rb
+          if git diff --quiet -- Formula/croft.rb && git ls-files --error-unmatch Formula/croft.rb >/dev/null 2>&1; then
+            echo "Formula/croft.rb already describes $version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Formula/croft.rb
+          git commit -m "croft $version"
+          # gh's credential helper, not a token in the remote URL, so the
+          # token never lands in .git/config or the log.
+          gh auth setup-git
+          git push origin "$branch"
+          gh pr create --repo "$TAP" --head "$branch" \
+            --title "croft $version" \
+            --body "Formula for croft $version, rendered by vitali87/croft's release workflow from the release's signed SHA256SUMS."
