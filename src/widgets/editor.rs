@@ -3482,10 +3482,6 @@ impl Editor {
             .unwrap_or(0)
     }
 
-    /// Record the text the open file's bookmarks describe, ahead of an edit
-    /// (called from [`push_undo`](Self::push_undo), which every user edit
-    /// passes through before it mutates). A no-op when the file has no marks
-    /// or the shadow already belongs to this file.
     /// Whether `path` has any line-keyed breakpoint state to carry through
     /// edits (see [`Self::sync_bookmarks_to_buffer`]).
     fn has_breakpoints_in(&self, path: &Path) -> bool {
@@ -3495,6 +3491,10 @@ impl Editor {
             || self.breakpoint_hit_conditions.contains_key(path)
     }
 
+    /// Record the text the open file's bookmarks describe, ahead of an edit
+    /// (called from [`push_undo`](Self::push_undo), which every user edit
+    /// passes through before it mutates). A no-op when the file has no marks
+    /// or the shadow already belongs to this file.
     fn seed_bookmark_shadow(&mut self) {
         let Some(path) = self.path.as_ref() else {
             return;
@@ -12347,16 +12347,6 @@ fn is_wrap_break_after(c: char) -> bool {
         )
 }
 
-/// Soft-wrap a logical line into visual segments for word-wrap mode.
-///
-/// Each segment is a half-open `(start_char, end_char)` range over `chars`;
-/// the segments tile the line with no gaps or overlaps, so the inverse maps
-/// (cursor -> screen, click -> cursor) stay exact. Breaks after the last
-/// break-after character at or before `width` when one exists (word wrap), and
-/// hard-breaks a single token longer than `width` at the column. A line that
-/// already fits, an empty line, or `width == 0` yields one segment so the line
-/// still occupies a row. Mirrors VS Code's monospace wrap: pick the rightmost
-/// break opportunity within the column, else split the over-long token.
 /// Screen cells a char takes in the editor: its display width, with a tab
 /// drawn as one cell (the editor paints tabs as a single glyph).
 fn char_cells(c: char) -> usize {
@@ -12371,6 +12361,16 @@ fn cells_of(chars: &[char]) -> usize {
     chars.iter().map(|&c| char_cells(c)).sum()
 }
 
+/// Soft-wrap a logical line into visual segments for word-wrap mode.
+///
+/// Each segment is a half-open `(start_char, end_char)` range over `chars`;
+/// the segments tile the line with no gaps or overlaps, so the inverse maps
+/// (cursor -> screen, click -> cursor) stay exact. Breaks after the last
+/// break-after character at or before `width` when one exists (word wrap), and
+/// hard-breaks a single token longer than `width` at the column. A line that
+/// already fits, an empty line, or `width == 0` yields one segment so the line
+/// still occupies a row. Mirrors VS Code's monospace wrap: pick the rightmost
+/// break opportunity within the column, else split the over-long token.
 fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
     if width == 0 || chars.len() <= width && cells_of(chars) <= width {
         return vec![(0, chars.len())];
