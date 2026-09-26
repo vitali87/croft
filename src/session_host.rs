@@ -1270,6 +1270,16 @@ fn apply_winsize(host: &Host, force_repaint: bool) {
 /// Write the roster sidecar (atomic tmp + rename, so the inner croft never
 /// reads a torn file) and broadcast it as a Presence frame.
 fn update_presence(host: &Host) {
+    // Held from the snapshot through the rename: every client thread and
+    // the output thread call this, and unserialized an older roster could
+    // land last (a participant who left, shown as attached), or one writer
+    // could truncate the shared temp file under another's rename (a torn
+    // file, read as nobody attached). Not held across the broadcast, which
+    // can prune a client and call back in here.
+    static WRITING: Mutex<()> = Mutex::new(());
+    let writing = WRITING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let participants: Vec<Participant> = {
         let clients = host.clients.lock().unwrap();
         clients
@@ -1291,6 +1301,7 @@ fn update_presence(host: &Host) {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
+    drop(writing);
     broadcast(
         host,
         &encode_control_frame(&Control::Presence { participants }),

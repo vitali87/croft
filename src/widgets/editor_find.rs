@@ -245,9 +245,15 @@ pub fn expand_replacement(
 }
 
 /// Translate VS Code's regex-replacement escapes (`\n`, `\t`, `\r`, `\\`)
-/// into their characters; unknown escapes pass through untouched. Literal
-/// (non-regex) replacements are never unescaped.
+/// into their characters, unknown escapes passing through, and braces the
+/// numbered capture references. Literal (non-regex) replacements are never
+/// unescaped.
 fn unescape_replacement(replacement: &str) -> String {
+    crate::widgets::search::brace_group_refs(&unescape_escapes(replacement))
+}
+
+/// The escape half of [`unescape_replacement`].
+fn unescape_escapes(replacement: &str) -> String {
     let mut out = String::with_capacity(replacement.len());
     let mut it = replacement.chars();
     while let Some(c) = it.next() {
@@ -493,6 +499,29 @@ pub fn render_editor_find(
 mod tests {
     use super::*;
 
+    #[test]
+    fn non_ascii_case_folds_neither_panic_nor_shift_the_replacement() {
+        let opts = SearchOpts::default();
+        let lines = vec![String::from("ẞ foo İ"), String::from("\u{212A} foo İİ")];
+        assert_eq!(count_matches(&lines, "foo", opts), 2);
+        let (out, n) = replace_all_in_lines(&lines, "foo", "X", opts).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(out, vec!["ẞ X İ".to_string(), "\u{212A} X İİ".to_string()]);
+    }
+
+    #[test]
+    fn a_numbered_group_followed_by_a_word_character_still_expands() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let (out, _) =
+            replace_all_in_lines(&[String::from("foo bar")], "(foo)", "$1_old", opts).unwrap();
+        assert_eq!(out, vec!["foo_old bar".to_string()]);
+        let (out, _) = replace_all_in_lines(&[String::from("foo")], "foo", "$$1", opts).unwrap();
+        assert_eq!(out, vec!["$1".to_string()]);
+    }
+
     fn lines(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| s.to_string()).collect()
     }
@@ -502,9 +531,7 @@ mod tests {
         // The find bar's count, paint, and navigation all enumerate via
         // split_for_highlight; Replace All must not rewrite text they
         // never showed. Zero-width regex matches are skipped by the
-        // highlighter, and the literal scanner bails on lines whose
-        // lowercasing changes byte length (Kelvin sign) — both used to be
-        // rewritten anyway.
+        // highlighter, and used to be rewritten anyway.
         let re_opts = SearchOpts {
             use_regex: true,
             ..SearchOpts::default()
@@ -522,15 +549,14 @@ mod tests {
             "an all-zero-width pattern replaces nothing"
         );
         let lit = SearchOpts::default();
-        // U+212A KELVIN SIGN: lowercasing shrinks the line's byte length,
-        // so the literal scanner bails and paints nothing on this line.
+        // U+212A KELVIN SIGN: lowercasing changes its byte length, so the
+        // line is matched on its own bytes by case folding; the highlighter
+        // shows the match and Replace All rewrites exactly that.
         let kelvin = "300\u{212A}";
+        let segs = split_for_highlight(kelvin, "k", lit);
+        assert!(segs.iter().any(|(t, m)| *m && t == "\u{212A}"), "{segs:?}");
         let (out, n) = replace_all_in_lines(&lines(&[kelvin]), "k", "x", lit).unwrap();
-        assert_eq!(
-            (out, n),
-            (lines(&[kelvin]), 0),
-            "a line the highlighter cannot show matches on is left untouched"
-        );
+        assert_eq!((out, n), (lines(&["300x"]), 1));
     }
 
     #[test]
