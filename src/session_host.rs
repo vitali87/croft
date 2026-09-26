@@ -128,6 +128,73 @@ pub struct Participant {
     pub rows: u16,
     /// Whether this client's keystrokes reach the PTY (write control).
     pub control: bool,
+    /// The client's croft version from its Hello (#626), so the inner
+    /// croft can say when a client is older than the session. Empty from
+    /// clients that send none and in rosters written by older hosts.
+    #[serde(default)]
+    pub version: String,
+}
+
+/// The status line for attached clients older than this croft, or `None`
+/// when no client that reported a version is older (#626, #652). A client
+/// that reported none (an old client) says nothing either way, and neither
+/// does a newer one: the first-attach banner already covered it, and
+/// reattaching would not help.
+pub fn stale_client_notice(roster: &[Participant], own: &str) -> Option<String> {
+    let mut older: Vec<(Vec<u64>, &str)> = roster
+        .iter()
+        .map(|p| p.version.as_str())
+        .filter(|v| version_is_older(v, own))
+        .filter_map(|v| Some((parse_version(v)?, v)))
+        .collect();
+    older.sort_unstable();
+    older.dedup();
+    let older: Vec<&str> = older.into_iter().map(|(_, v)| v).collect();
+    (!older.is_empty()).then(|| {
+        format!(
+            "Session updated to croft {own}; a client still runs {}. Detach and reattach it to update",
+            older.join(", ")
+        )
+    })
+}
+
+/// The stale-client notice to raise for roster `next`, given the notice
+/// `last` raised (or `None`): `None` unless the notice itself changed. A
+/// client resizing churns the roster every few hundred milliseconds, and
+/// must not re-stamp the status line over whatever the user is reading.
+pub fn stale_client_notice_on_change(
+    last: Option<&str>,
+    next: &[Participant],
+    reference: &str,
+) -> Option<String> {
+    let notice = stale_client_notice(next, reference)?;
+    (last != Some(notice.as_str())).then_some(notice)
+}
+
+/// The version clients are measured against: the newer of the inner croft's
+/// own and the session host's (#652). A host swap updates the host without
+/// the inner croft, and a client on the pre-swap binary is still out of date
+/// even though it matches the inner croft.
+pub fn session_version<'a>(own: &'a str, host: Option<&'a str>) -> &'a str {
+    match host {
+        Some(h) if version_is_older(own, h) => h,
+        _ => own,
+    }
+}
+
+/// A dotted version as numeric components, or `None` when any component
+/// is not a number (empty, or a pre-release suffix).
+fn parse_version(v: &str) -> Option<Vec<u64>> {
+    v.split('.').map(|c| c.parse().ok()).collect()
+}
+
+/// True when dotted version `v` sorts strictly below `own`, compared
+/// numerically per component. An empty or unparsable `v` is never older.
+fn version_is_older(v: &str, own: &str) -> bool {
+    match (parse_version(v), parse_version(own)) {
+        (Some(v), Some(own)) => v < own,
+        _ => false,
+    }
 }
 
 /// A decoded frame.
@@ -231,6 +298,30 @@ pub fn stale_marker_path(socket: &Path) -> PathBuf {
     let mut name = socket.file_name().unwrap_or_default().to_os_string();
     name.push(".host-stale");
     socket.with_file_name(name)
+}
+
+/// Sidecar holding the croft version this host process runs (#652). A host
+/// swap (#238) moves the host onto a new binary without touching the inner
+/// croft, which keeps its version until an F9 reload; this is how the inner
+/// croft learns the version a reattaching client would get.
+pub fn host_version_path(socket: &Path) -> PathBuf {
+    let mut name = socket.file_name().unwrap_or_default().to_os_string();
+    name.push(".host-version");
+    socket.with_file_name(name)
+}
+
+/// Record this host's version next to its socket. Best-effort: without it
+/// the inner croft falls back to comparing clients against itself.
+fn write_host_version(socket: &Path) {
+    let _ = std::fs::write(host_version_path(socket), env!("CARGO_PKG_VERSION"));
+}
+
+/// The version the session host at `socket` runs, as its sidecar records it.
+/// `None` when the host predates the sidecar or it cannot be read.
+pub fn read_host_version(socket_sidecar: &Path) -> Option<String> {
+    let v = std::fs::read_to_string(socket_sidecar).ok()?;
+    let v = v.trim();
+    parse_version(v).map(|_| v.to_string())
 }
 
 /// The (device, inode) pair that identifies the file currently at `path`.
@@ -739,6 +830,8 @@ fn spawn_writer(stream: Arc<Mutex<UnixStream>>, outbox: Arc<Outbox>, fd: std::os
 struct Client {
     id: u64,
     name: String,
+    /// The version the client's Hello carried (empty when it sent none).
+    version: String,
     cols: u16,
     rows: u16,
     control: bool,
@@ -866,6 +959,7 @@ pub(crate) fn serve_with_token(
     // A fresh host runs the binary currently on disk; any stale marker left
     // by a predecessor is obsolete the moment the socket answers.
     let _ = std::fs::remove_file(stale_marker_path(socket));
+    write_host_version(socket);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -922,6 +1016,7 @@ pub(crate) fn serve_with_token(
 fn run_resumed(socket: &Path, resumed: ResumedSession) -> Result<i32> {
     let _ = std::fs::remove_file(presence_path(socket));
     let _ = std::fs::remove_file(stale_marker_path(socket));
+    write_host_version(socket);
     // Reader and writer are independent dups so each side owns its fd, same
     // shape as the fresh path's clone_reader/take_writer.
     let dup = |fd: std::os::fd::RawFd| -> Result<std::fs::File> {
@@ -1024,6 +1119,7 @@ fn run_host(
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(presence_path(socket));
     let _ = std::fs::remove_file(stale_marker_path(socket));
+    let _ = std::fs::remove_file(host_version_path(socket));
     // Drop the meta sidecar too, or a later server for this workspace inherits
     // the dead session's created time and `croft ls` reports an inflated uptime.
     crate::session::remove_meta(socket);
@@ -1184,6 +1280,7 @@ fn update_presence(host: &Host) {
                 cols: c.cols,
                 rows: c.rows,
                 control: c.control,
+                version: c.version.clone(),
             })
             .collect()
     };
@@ -1239,7 +1336,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                     cols,
                     rows,
                     client_id,
-                    ..
+                    version,
                 }) if my_id.is_none() && !privileged => {
                     // Answer with our version FIRST: registration below makes
                     // this client a broadcast target, and the ServerHello must
@@ -1328,6 +1425,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                             clients.push(Client {
                                 id,
                                 name,
+                                version,
                                 cols,
                                 rows,
                                 control,
@@ -1627,6 +1725,7 @@ fn kill_stale_server(socket: &Path) {
         let _ = std::fs::remove_file(socket);
         let _ = std::fs::remove_file(presence_path(socket));
         let _ = std::fs::remove_file(stale_marker_path(socket));
+        let _ = std::fs::remove_file(host_version_path(socket));
         crate::session::remove_meta(socket);
     }
 }
@@ -1858,21 +1957,14 @@ fn attach_client_pump(
         let _ = stream.set_read_timeout(None);
     }
     let client_version = env!("CARGO_PKG_VERSION");
-    if server_version.as_deref() != Some(client_version) && !first_attach {
-        // Reconnected across a host swap: the server is now NEWER than this
-        // still-running attach client. A one-line notice, not the
-        // interactive banner - parking a live handover on a keypress would
-        // freeze the session for a formality.
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(
-            format!(
-                "\r\nsession host updated to croft {}; detach and reattach to update this client\r\n",
-                server_version.as_deref().unwrap_or("?")
-            )
-            .as_bytes(),
-        );
-        let _ = out.flush();
-    } else if server_version.as_deref() != Some(client_version) {
+    // A reconnect across a host swap writes nothing even when the server
+    // is now NEWER than this still-running attach client: the screen
+    // belongs to the inner croft, and text printed over it survives in
+    // every cell that croft's next frames leave blank (#626, #652). The
+    // inner croft says it instead, from this client's version in the
+    // roster (`App::poll_session_presence`). Only a first attach, before
+    // the inner croft's attach repaint, may show the banner.
+    if first_attach && server_version.as_deref() != Some(client_version) {
         let mut out = std::io::stdout().lock();
         out.write_all(mismatch_banner(server_version.as_deref(), client_version).as_bytes())
             .context("writing banner")?;
@@ -2044,6 +2136,9 @@ pub struct InnerChannel {
     /// The host's stale-image marker (#238): present once the host noticed
     /// its binary was replaced on disk while it kept running the old image.
     pub stale_marker: PathBuf,
+    /// The host's version sidecar (#652): the version a reattaching client
+    /// gets, which a host swap can move ahead of the inner croft's own.
+    pub host_version: PathBuf,
 }
 
 impl InnerChannel {
@@ -2082,6 +2177,7 @@ impl InnerChannel {
             dead: false,
             presence: presence_path(socket),
             stale_marker: stale_marker_path(socket),
+            host_version: host_version_path(socket),
         })
     }
 
@@ -3914,6 +4010,7 @@ mod tests {
             cols: 80,
             rows: 24,
             control,
+            version: String::new(),
         };
         assert!(sole_participant_lacks_control(&[p(false)]));
         assert!(!sole_participant_lacks_control(&[p(true)]));
@@ -4334,5 +4431,123 @@ mod tests {
         a.send(&encode_bytes_frame(&[0x04]));
         a.read_until(|f| matches!(f, Frame::Control(Control::Exit { .. })));
         let _ = server.join();
+    }
+
+    #[test]
+    fn an_older_client_in_the_roster_gets_one_notice_and_a_current_one_none() {
+        let p = |version: &str| Participant {
+            id: 1,
+            name: String::from("x"),
+            cols: 80,
+            rows: 24,
+            control: true,
+            version: version.into(),
+        };
+        assert_eq!(stale_client_notice(&[p("0.1.959")], "0.1.959"), None);
+        assert_eq!(
+            stale_client_notice(&[p("")], "0.1.959"),
+            None,
+            "no version, no claim"
+        );
+        let n =
+            stale_client_notice(&[p("0.1.900"), p("0.1.959"), p("0.1.900")], "0.1.959").unwrap();
+        assert!(
+            n.contains("croft 0.1.959") && n.contains("still runs 0.1.900."),
+            "{n}"
+        );
+        assert_eq!(
+            stale_client_notice(&[p("0.1.990")], "0.1.959"),
+            None,
+            "a newer client is not out of date"
+        );
+        // Numeric, not lexical: 0.1.99 < 0.1.959 and 0.1.1000 > 0.1.959.
+        assert!(stale_client_notice(&[p("0.1.99")], "0.1.959").is_some());
+        assert_eq!(stale_client_notice(&[p("0.1.1000")], "0.1.959"), None);
+        // Listed oldest first, by number rather than by string.
+        let n =
+            stale_client_notice(&[p("0.1.900"), p("0.1.1000"), p("0.1.99")], "0.1.1001").unwrap();
+        assert!(n.contains("still runs 0.1.99, 0.1.900, 0.1.1000."), "{n}");
+        // A roster written by an older host carries no version field.
+        let old: Vec<Participant> =
+            serde_json::from_str(r#"[{"id":1,"name":"x","cols":80,"rows":24,"control":true}]"#)
+                .unwrap();
+        assert_eq!(old[0].version, "");
+    }
+
+    #[test]
+    fn the_stale_notice_is_raised_once_not_on_every_roster_churn() {
+        let p = |id: u64, version: &str, cols: u16| Participant {
+            id,
+            name: String::from("x"),
+            cols,
+            rows: 24,
+            control: true,
+            version: version.into(),
+        };
+        let own = "0.1.959";
+        let old = [p(1, "0.1.900", 80)];
+        // First sight of an old client: raised.
+        let first = stale_client_notice_on_change(None, &old, own).unwrap();
+        // The same client resizing: the notice is unchanged, not re-raised.
+        assert_eq!(
+            stale_client_notice_on_change(Some(&first), &[p(1, "0.1.900", 120)], own),
+            None
+        );
+        // A second, different old version changes the notice: raised again.
+        let two = [p(1, "0.1.900", 80), p(2, "0.1.901", 80)];
+        assert!(stale_client_notice_on_change(Some(&first), &two, own).is_some());
+        // The old client reattached on the current version: nothing to say.
+        assert_eq!(
+            stale_client_notice_on_change(Some(&first), &[p(1, own, 80)], own),
+            None
+        );
+        // A host swap raises the reference under an unchanged roster: the
+        // notice changes, so it is raised even though no client moved.
+        let swapped = [p(1, own, 80)];
+        assert!(stale_client_notice_on_change(None, &swapped, "0.1.960").is_some());
+    }
+
+    #[test]
+    fn a_swapped_host_newer_than_the_inner_croft_still_flags_the_old_client() {
+        // #652 review: the host swapped to 0.1.1005 while the inner croft and
+        // the attach client both still run 0.1.1004 (no F9 yet). Measured
+        // against the host, the client is out of date.
+        let reference = session_version("0.1.1004", Some("0.1.1005"));
+        assert_eq!(reference, "0.1.1005");
+        let client = [Participant {
+            id: 1,
+            name: String::from("x"),
+            cols: 80,
+            rows: 24,
+            control: true,
+            version: String::from("0.1.1004"),
+        }];
+        let n = stale_client_notice(&client, reference).unwrap();
+        assert!(
+            n.contains("croft 0.1.1005") && n.contains("still runs 0.1.1004."),
+            "{n}"
+        );
+        // No sidecar (an older host), or a host behind the inner croft: the
+        // inner croft's own version is the reference.
+        assert_eq!(session_version("0.1.1004", None), "0.1.1004");
+        assert_eq!(session_version("0.1.1004", Some("0.1.1003")), "0.1.1004");
+    }
+
+    #[test]
+    fn the_host_version_sidecar_round_trips_and_rejects_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ab.mux.sock");
+        assert_eq!(
+            host_version_path(&socket),
+            dir.path().join("ab.mux.sock.host-version")
+        );
+        assert_eq!(read_host_version(&host_version_path(&socket)), None);
+        write_host_version(&socket);
+        assert_eq!(
+            read_host_version(&host_version_path(&socket)).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        std::fs::write(host_version_path(&socket), "not a version").unwrap();
+        assert_eq!(read_host_version(&host_version_path(&socket)), None);
     }
 }

@@ -57,6 +57,13 @@ pub(crate) fn collab_socket_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.collab.sock", socket_name(workspace)))
 }
 
+/// Socket a running croft answers agent edit approvals on (#346): `croft
+/// hook claude-code` connects here for the workspace enclosing its cwd.
+/// Same keying as the other workspace sockets.
+pub(crate) fn hook_socket_path(workspace: &Path) -> PathBuf {
+    sessions_dir().join(format!("{}.hook.sock", socket_name(workspace)))
+}
+
 fn meta_path(socket: &Path) -> PathBuf {
     socket.with_extension("json")
 }

@@ -264,6 +264,7 @@ mod tests {
                     cols,
                     rows,
                     control: i == 0,
+                    version: String::new(),
                 })
                 .collect(),
         })
