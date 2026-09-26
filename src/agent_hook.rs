@@ -356,9 +356,24 @@ pub fn install(
     let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
     std::fs::write(record_path(record_dir, settings), json)
         .map_err(|e| format!("cannot record the install: {e}"))?;
-    std::fs::write(settings, &after)
+    write_replacing(settings, &after)
         .map_err(|e| format!("cannot write {}: {e}", settings.display()))?;
     Ok(Outcome::Changed { diff: d })
+}
+
+/// Replace `path`'s contents by writing aside and renaming: a kill or a full
+/// disk mid-write must not truncate the user's Claude Code settings. A
+/// symlinked settings file is written through, so the link survives.
+fn write_replacing(path: &Path, text: &str) -> std::io::Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let tmp = target.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, text)?;
+    if let Ok(meta) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, &target).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Remove croft's entry from `settings`. When the file is still exactly
@@ -390,7 +405,7 @@ pub fn uninstall(
     let d = diff(settings, Some(&current), restored.as_deref());
     show(&d);
     match &restored {
-        Some(text) => std::fs::write(settings, text),
+        Some(text) => write_replacing(settings, text),
         None => std::fs::remove_file(settings),
     }
     .map_err(|e| format!("cannot write {}: {e}", settings.display()))?;

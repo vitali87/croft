@@ -3455,9 +3455,9 @@ pub struct App {
     /// Terminal command suggestions (#614): on or off, and the one painted
     /// this frame as (pane index, the text Right arrow would type).
     term_suggest_enabled: bool,
-    term_suggestion: Option<(usize, String)>,
+    term_suggestion: Option<(usize, String, String)>,
     /// The command whose new shortcut the next keystroke records (#612).
-    recording_shortcut: Option<crate::widgets::command_palette::Command>,
+    recording_shortcut: Option<(crate::widgets::command_palette::Command, std::time::Instant)>,
     /// Inline AI suggestions (#607): off until the user turns them on, since
     /// they send code to a model. The worker, the backend it was started
     /// for, the request in flight (id plus what it answers for), and the
@@ -3648,6 +3648,9 @@ pub struct App {
         Vec<crate::widgets::list_picker::ListRow>,
     )>,
     review_export_sticky: Vec<String>,
+    /// The PR the export preview named: posting goes there, even if a
+    /// thread load answered for another PR in between.
+    review_export_pr: Option<(PathBuf, String)>,
     review_ai_prefix: String,
     review_pr: Option<(PathBuf, String)>,
     review_nodes: std::collections::HashMap<u64, String>,
@@ -5365,6 +5368,7 @@ impl App {
             notes_shown_gen: 0,
             review_export: None,
             review_export_sticky: Vec::new(),
+            review_export_pr: None,
             review_ai_prefix: loaded_prefs
                 .review_ai_prefix
                 .clone()
@@ -10288,12 +10292,13 @@ impl App {
         if !responded {
             return false;
         }
+        let peek = std::mem::take(&mut self.references_want_peek);
         if unsupported {
             self.status =
                 String::from("Go to References: not supported by this file's language server");
             return true;
         }
-        if std::mem::take(&mut self.references_want_peek) && !targets.is_empty() {
+        if peek && !targets.is_empty() {
             self.peek_refs = Some((targets, 0));
             self.show_peeked_reference();
             return true;
@@ -11731,6 +11736,11 @@ impl App {
     /// `⇧F12` keybinding. The server almost always returns many uses, which
     /// `drain_lsp_references` then offers as a picker.
     fn request_references_at_cursor(&mut self) {
+        // A request not sent (no path, no server) must not leave the last
+        // one's id, or Peek would arm itself on it and a later plain Go to
+        // References would open in the peek popup.
+        self.references_request_id = None;
+        self.references_want_peek = false;
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
@@ -19514,7 +19524,11 @@ impl App {
             return Ok(());
         }
         // Keyboard Shortcuts editor (#612): the next key is the new chord.
-        if let Some(cmd) = self.recording_shortcut.take() {
+        // Only the key that answers the prompt: once the user has clicked
+        // away or let it sit, a later Cmd+S must save, not become a binding.
+        if let Some((cmd, at)) = self.recording_shortcut.take()
+            && at.elapsed() < SHORTCUT_RECORD_WINDOW
+        {
             self.record_shortcut(cmd, key);
             return Ok(());
         }
@@ -20055,6 +20069,11 @@ impl App {
                         return Ok(());
                     }
                 }
+                // Settle edits that landed since the last pass first (an
+                // LSP rename or quick fix applied to the file's tab): with
+                // two tabs changed at once, the keystroke's tab would be
+                // copied over the other and erase that edit.
+                self.sync_symbol_views();
                 self.handle_editor_key(key);
                 // Settle the clip on this edit before clamping the caret to
                 // it: a line opened at the symbol's end grows the clip, so
@@ -25524,10 +25543,30 @@ impl App {
                         ),
                     };
                 }
-                Outcome::Failed(e) => {
+                Outcome::Threads {
+                    root,
+                    number,
+                    path,
+                    rel,
+                    threads,
+                    states,
+                } => self.show_review_threads(root, number, path, rel, threads, states),
+                Outcome::ExportReady {
+                    root,
+                    number,
+                    comments,
+                    notes,
+                    inline,
+                } => self.show_export_ready(root, number, comments, notes, inline),
+                Outcome::NoPr => {
+                    self.status = String::from("No PR for this branch — check it out first");
+                }
+                Outcome::SubmitFailed(e) => {
                     self.review_submitting = false;
                     self.status = e;
                 }
+                // A failed reply or load leaves a submission in flight alone.
+                Outcome::Failed(e) => self.status = e,
             }
         }
         changed
@@ -26624,7 +26663,7 @@ impl App {
                     .strip_prefix("kb:")
                     .and_then(crate::widgets::command_palette::Command::from_id)
                 {
-                    self.recording_shortcut = Some(cmd);
+                    self.recording_shortcut = Some((cmd, std::time::Instant::now()));
                     self.status = format!(
                         "Press the new shortcut for \u{201c}{}\u{201d} (a function key or a chord with Cmd/Ctrl/Alt; Esc cancels)",
                         cmd.title()
@@ -28374,6 +28413,14 @@ impl App {
     /// in, the file, its repo-relative path, the branch's PR number), or
     /// `None` with the reason in the status bar.
     fn review_context(&mut self) -> Option<(PathBuf, PathBuf, String, String)> {
+        let (root, path, rel) = self.review_file_context()?;
+        let number = self.review_pr_number(&root)?;
+        Some((root, path, rel, number))
+    }
+
+    /// [`Self::review_context`] without the PR number, which costs a `gh`
+    /// call: the root, the file and its repo-relative path.
+    fn review_file_context(&mut self) -> Option<(PathBuf, PathBuf, String)> {
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Open a file from the PR first");
             return None;
@@ -28407,8 +28454,7 @@ impl App {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        let number = self.review_pr_number(&root)?;
-        Some((root, path, rel, number))
+        Some((root, path, rel))
     }
 
     /// The PR number for `root`'s branch, remembered for the write side, or
@@ -28475,26 +28521,30 @@ impl App {
             self.status = String::from("No comments to export");
             return;
         }
-        let Some(number) = self.review_pr_number(&root) else {
-            return;
-        };
         comments.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-        // The preview says which comments GitHub will take inline, so a
-        // comment folded into the summary is no surprise after posting.
-        let diff = std::process::Command::new(&self.review_gh)
-            .args(["pr", "diff", &number])
-            .current_dir(&root)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        let inline = comments
-            .iter()
-            .filter(|c| {
-                crate::review_threads::commentable_lines(&diff, &c.path).contains(&(c.line + 1))
-            })
-            .count();
+        // Finding the PR and reading its diff are `gh` calls, which can take
+        // as long as the network does: off the frame loop, the preview
+        // opens when they answer.
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::ExportPreview { comments, notes },
+            self.review_tx.clone(),
+        );
+        self.status = String::from("Preparing the export\u{2026}");
+    }
+
+    /// Open the export preview once its PR and diff are known.
+    fn show_export_ready(
+        &mut self,
+        root: PathBuf,
+        number: String,
+        comments: Vec<crate::review_threads::PendingComment>,
+        notes: Vec<u64>,
+        inline: usize,
+    ) {
+        self.review_pr = Some((root.clone(), number.clone()));
+        self.review_export_pr = Some((root, number.clone()));
         let mut rows = vec![crate::widgets::list_picker::ListRow {
             id: String::from("post"),
             label: format!(
@@ -28537,7 +28587,7 @@ impl App {
         let Some((comments, notes, _)) = self.review_export.take() else {
             return;
         };
-        let Some((root, number)) = self.review_pr.clone() else {
+        let Some((root, number)) = self.review_export_pr.take() else {
             return;
         };
         let sticky = std::mem::take(&mut self.review_export_sticky);
@@ -28582,79 +28632,31 @@ impl App {
     /// would put them against unrelated code — the same failure as placing
     /// an outdated thread silently, arriving through the other axis.
     fn load_review_threads(&mut self) {
-        let Some((root, path, rel, number)) = self.review_context() else {
+        let Some((root, path, rel)) = self.review_file_context() else {
             return;
         };
-        let api = std::process::Command::new(&self.review_gh)
-            .args([
-                "api",
-                &format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments"),
-                "--paginate",
-            ])
-            .current_dir(&root)
-            .output();
-        let json = match api {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-            Ok(o) => {
-                // gh's own message names the problem — a missing scope, a
-                // rate limit — far better than anything invented here.
-                let err = String::from_utf8_lossy(&o.stderr);
-                self.status = format!(
-                    "Could not read the PR's comments: {}",
-                    err.trim().lines().next().unwrap_or("gh failed")
-                );
-                return;
-            }
-            Err(e) => {
-                self.status = format!("Could not run gh: {e}");
-                return;
-            }
-        };
-        let mut threads: Vec<crate::review_threads::Thread> =
-            crate::review_threads::parse_threads(&json)
-                .into_iter()
-                .filter(|t| t.path == rel)
-                .collect();
-        // Resolution and the node id Resolve needs live only in GraphQL.
-        // Best effort: without it every thread reads as unresolved, the safe
-        // default, and Resolve says why it can't act.
-        // Every page: a PR past 100 threads would otherwise show the rest
-        // as unresolved and leave them without the id Resolve needs.
-        let mut states = std::collections::HashMap::new();
-        let mut after: Option<String> = None;
-        loop {
-            let mut args = vec![
-                String::from("api"),
-                String::from("graphql"),
-                String::from("-F"),
-                String::from("owner={owner}"),
-                String::from("-F"),
-                String::from("repo={repo}"),
-                String::from("-F"),
-                format!("number={number}"),
-                String::from("-f"),
-                format!("query={}", crate::review_threads::THREADS_QUERY),
-            ];
-            if let Some(cursor) = &after {
-                args.push(String::from("-f"));
-                args.push(format!("after={cursor}"));
-            }
-            let Some(page) = std::process::Command::new(&self.review_gh)
-                .args(&args)
-                .current_dir(&root)
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            else {
-                break;
-            };
-            states.extend(crate::review_threads::parse_thread_states(&page));
-            match crate::review_threads::next_page(&page) {
-                Some(cursor) if after.as_deref() != Some(cursor.as_str()) => after = Some(cursor),
-                _ => break,
-            }
-        }
+        // `gh` over the network, several calls for a big PR: off the frame
+        // loop. The threads come back keyed to `path`, the file asked about.
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::LoadThreads { path, rel },
+            self.review_tx.clone(),
+        );
+        self.status = String::from("Loading review comments\u{2026}");
+    }
+
+    /// Show threads read by [`Self::load_review_threads`].
+    fn show_review_threads(
+        &mut self,
+        root: PathBuf,
+        number: String,
+        path: PathBuf,
+        rel: String,
+        mut threads: Vec<crate::review_threads::Thread>,
+        states: std::collections::HashMap<u64, (String, bool)>,
+    ) {
+        self.review_pr = Some((root, number));
         for t in &mut threads {
             if let Some((node, resolved)) = states.get(&t.id) {
                 t.resolved = *resolved;
@@ -28671,13 +28673,9 @@ impl App {
             .count();
         // Stored against the file they describe; the render derives each
         // box's row and title from the buffer as it is at that moment.
-        // `path` is the binding taken at the top of this function, so the
-        // threads are keyed to the file the `gh` query was actually about
-        // rather than to whatever `editor.path` says afterwards. Today those
-        // cannot differ — the event loop is single-threaded and `gh` blocks
-        // it, so no keystroke is handled mid-call — but keying to the
-        // queried file is the property that matters, and it stops being
-        // free the moment this moves off the main thread.
+        // `path` is the file the `gh` query was about, carried through the
+        // worker, not whatever `editor.path` says now: the user may have
+        // switched tabs while it ran.
         self.review_boxes = Some((path, threads.clone()));
         self.status = match outdated {
             0 => format!("{} review comments on {rel}", threads.len()),
@@ -32622,8 +32620,10 @@ impl App {
         // painted after it (#614), as in fish; anywhere else it moves.
         if key.code == KeyCode::Right
             && key.modifiers.is_empty()
-            && let Some((pane, rest)) = self.term_suggestion.take()
+            && let Some((pane, typed, rest)) = self.term_suggestion.take()
             && pane == self.active_terminal
+            && !self.terminal().awaiting_echo()
+            && self.terminal().prompt_tail().is_some_and(|t| t.0 == typed)
         {
             self.terminal_mut().write_input(rest.as_bytes());
             return;
@@ -40640,6 +40640,10 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        // A click means the user moved on from a pending shortcut prompt.
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
+            self.status = String::from("Shortcut unchanged");
+        }
         // On-screen keyboard taps outrank every other gate - including the
         // modal overlays - because the OSK is how Termux users type into
         // those modals. Its band is laid out disjoint from all panes, so
@@ -44469,6 +44473,11 @@ impl App {
         let Some(term) = self.terminals.get(idx) else {
             return;
         };
+        // Typed keys not echoed yet: the line on screen is behind, and a
+        // suggestion for it would be accepted after the keys that followed.
+        if term.awaiting_echo() {
+            return;
+        }
         let Some((typed, x, y, right)) = term.prompt_tail() else {
             return;
         };
@@ -44487,7 +44496,7 @@ impl App {
         frame
             .buffer_mut()
             .set_string(x, y, &shown, Style::default().fg(self.theme.ignored_fg()));
-        self.term_suggestion = Some((idx, rest));
+        self.term_suggestion = Some((idx, typed, rest));
     }
 
     /// Terminal: Toggle Command Suggestions (#614).
@@ -49193,7 +49202,7 @@ impl App {
         mode: ExplorerClipMode,
     ) {
         if matches!(mode, ExplorerClipMode::Copy) {
-            self.apply_paste_or_drop(dest_dir, paths, mode);
+            let _ = self.apply_paste_or_drop(dest_dir, paths, mode);
             return;
         }
         let renames = paths
@@ -49264,31 +49273,34 @@ impl App {
         true
     }
 
-    /// Apply the servers' edits, run the move, then tell the servers it
-    /// happened. Edits go first because they name the files at their old
-    /// paths.
+    /// Run the move, then apply the servers' edits and tell the servers it
+    /// happened. The move goes first: a move that fails (a folder into its
+    /// own child, a name already taken) must not leave every importer
+    /// rewritten to a path that does not exist. The edits name files at
+    /// their old paths, so they are carried to where the move put them.
     fn finish_file_move(
         &mut self,
         pending: PendingFileMove,
         edits: Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)>,
     ) {
-        let updated = if edits.is_empty() {
-            None
-        } else {
-            match self.apply_rename_edits(&edits) {
-                Ok((files, _)) => Some(files),
-                Err(e) => {
-                    self.status = format!("Could not update references: {e}");
-                    None
-                }
-            }
-        };
-        let moved = self.run_file_move(pending.op);
-        if moved && let Some(lsp) = self.lsp.as_mut() {
-            lsp.did_rename_files(pending.renames);
+        if !self.run_file_move(pending.op) {
+            return;
         }
-        if moved && let Some(files) = updated {
-            self.status = format!("{}, references updated in {files} file(s)", self.status);
+        let moved_status = self.status.clone();
+        if !edits.is_empty() {
+            let edits: Vec<_> = edits
+                .into_iter()
+                .map(|(path, e)| (moved_path(&path, &pending.renames), e))
+                .collect();
+            match self.apply_rename_edits(&edits) {
+                Ok((files, _)) => {
+                    self.status = format!("{moved_status}, references updated in {files} file(s)");
+                }
+                Err(e) => self.status = format!("{moved_status}; could not update references: {e}"),
+            }
+        }
+        if let Some(lsp) = self.lsp.as_mut() {
+            lsp.did_rename_files(pending.renames);
         }
     }
 
@@ -49296,8 +49308,7 @@ impl App {
     fn run_file_move(&mut self, op: FileMove) -> bool {
         match op {
             FileMove::Paste { dest_dir, paths } => {
-                self.apply_paste_or_drop(&dest_dir, &paths, ExplorerClipMode::Cut);
-                true
+                self.apply_paste_or_drop(&dest_dir, &paths, ExplorerClipMode::Cut)
             }
             FileMove::Rename {
                 parent,
@@ -49329,7 +49340,13 @@ impl App {
 
     /// Shared implementation for explorer paste and drag-drop. `mode`
     /// distinguishes a move (Cut/drag) from a copy (Copy/Alt-drag).
-    fn apply_paste_or_drop(&mut self, dest_dir: &Path, paths: &[PathBuf], mode: ExplorerClipMode) {
+    /// Returns whether every item landed.
+    fn apply_paste_or_drop(
+        &mut self,
+        dest_dir: &Path,
+        paths: &[PathBuf],
+        mode: ExplorerClipMode,
+    ) -> bool {
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         affected.insert(dest_dir.to_path_buf());
         let mut placed: Vec<PathBuf> = Vec::new();
@@ -49392,6 +49409,7 @@ impl App {
                 self.status_path(dest_dir)
             );
         }
+        errors.is_empty()
     }
 
     fn open_create_prompt(&mut self, kind: CreateKind, target_dir: PathBuf) {
@@ -53081,6 +53099,19 @@ fn reexec_binary_path(local_install: Option<&crate::update_watch::SelfInstall>) 
         return p;
     }
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("croft"))
+}
+
+/// How long a Keyboard Shortcuts prompt waits for its chord.
+const SHORTCUT_RECORD_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Where `path` is after `renames` ran: under a moved file or folder, its
+/// new place; anywhere else, unchanged.
+fn moved_path(path: &Path, renames: &[crate::lsp::manager::FileRenameOp]) -> PathBuf {
+    renames
+        .iter()
+        .find_map(|r| path.strip_prefix(&r.old).ok().map(|rest| r.new.join(rest)))
+        .map(|p| p.components().collect())
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn sidebar_view_label(view: SidebarView) -> &'static str {
