@@ -19,11 +19,12 @@
 //! final caret, `${1:name}` a placeholder. [`parse_body`] turns it into the
 //! literal text to insert plus the ordered stop positions the editor drives.
 //!
-//! ponytail: supported tab-stop syntax is `$N`, `${N}`, `${N:placeholder}` and
-//! the `\$` / `\\` escapes. Not supported (name the ceiling, add on demand):
-//! choices `${1|a,b|}`, variables (`$TM_FILENAME`), transforms, and live
-//! mirroring of a repeated `$N` (the placeholder text is duplicated, but only
-//! the first occurrence is a navigable stop).
+//! ponytail: supported tab-stop syntax is `$N`, `${N}`, nested
+//! `${N:placeholder}`, choices `${N|a,b|}` (the first option is inserted) and
+//! the `\$` / `\}` / `\\` escapes. Not supported (name the ceiling, add on
+//! demand): variables (`$TM_FILENAME`), transforms, and live mirroring of a
+//! repeated `$N` (the placeholder text is duplicated, but only the first
+//! occurrence is a navigable stop).
 
 use std::path::{Path, PathBuf};
 
@@ -49,105 +50,152 @@ pub struct ParsedBody {
 }
 
 /// Parse a VS Code snippet body into the text to insert and its tab stops.
+///
+/// Language servers send the same syntax for snippet completions, so it
+/// follows the LSP grammar: placeholders nest (`${1:foo(${2:x})}`), a choice
+/// inserts its first option (`${1|one,two|}`), and only `\$`, `\}` and `\\`
+/// are escapes - any other backslash is text, as in `printf("%d\n", $1)`.
 pub fn parse_body(body: &str) -> ParsedBody {
-    let mut text = String::new();
-    let mut stops: Vec<TabStop> = Vec::new();
-    let mut seen: Vec<u32> = Vec::new();
-    let mut pos = 0usize; // char offset into `text`
+    let mut p = Parser {
+        text: String::new(),
+        pos: 0,
+        stops: Vec::new(),
+        seen: Vec::new(),
+    };
     let mut chars = body.chars().peekable();
+    p.seq(&mut chars, false);
+    let mut stops = p.stops;
+    // Ascending by number, but `$0` (the final caret) always sorts last.
+    stops.sort_by_key(|s| if s.num == 0 { u32::MAX } else { s.num });
+    ParsedBody {
+        text: p.text,
+        stops,
+    }
+}
 
+type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+
+struct Parser {
+    text: String,
+    /// Char offset into `text`.
+    pos: usize,
+    stops: Vec<TabStop>,
+    seen: Vec<u32>,
+}
+
+impl Parser {
+    fn push(&mut self, c: char) {
+        self.text.push(c);
+        self.pos += 1;
+    }
+
+    /// A stop at `offset` spanning `len` chars. A repeated `$N` duplicates
+    /// its text, but only the first occurrence is a navigable stop.
+    fn stop(&mut self, num: u32, offset: usize, len: usize) {
+        if !self.seen.contains(&num) {
+            self.seen.push(num);
+            self.stops.push(TabStop { num, offset, len });
+        }
+    }
+
+    /// Text up to the end, or inside a placeholder up to its closing `}`
+    /// (consumed).
+    fn seq(&mut self, chars: &mut Chars, in_placeholder: bool) {
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.peek() {
+                    Some(&n) if matches!(n, '$' | '}' | '\\') => {
+                        chars.next();
+                        self.push(n);
+                    }
+                    _ => self.push('\\'),
+                },
+                '}' if in_placeholder => return,
+                '$' => self.dollar(chars),
+                _ => self.push(c),
+            }
+        }
+    }
+
+    /// What follows a `$`: a stop, a placeholder, a choice, or a literal `$`.
+    fn dollar(&mut self, chars: &mut Chars) {
+        let mut look = chars.clone();
+        let braced = look.peek() == Some(&'{');
+        if braced {
+            look.next();
+        }
+        let mut digits = String::new();
+        while let Some(&d) = look.peek().filter(|d| d.is_ascii_digit()) {
+            digits.push(d);
+            look.next();
+        }
+        let Ok(num) = digits.parse::<u32>() else {
+            self.push('$');
+            return;
+        };
+        if !braced {
+            *chars = look;
+            self.stop(num, self.pos, 0);
+            return;
+        }
+        match look.next() {
+            Some('}') => {
+                *chars = look;
+                self.stop(num, self.pos, 0);
+            }
+            Some(':') => {
+                *chars = look;
+                let start = self.pos;
+                self.seq(chars, true);
+                self.stop(num, start, self.pos - start);
+            }
+            Some('|') => {
+                let Some(first) = choice_first(&mut look) else {
+                    self.push('$');
+                    return;
+                };
+                *chars = look;
+                let start = self.pos;
+                for c in first.chars() {
+                    self.push(c);
+                }
+                self.stop(num, start, self.pos - start);
+            }
+            // Malformed `${N…`: not a stop, the `$` is literal.
+            _ => self.push('$'),
+        }
+    }
+}
+
+/// The first option of a choice, reading past its closing `|}`. `\,`,
+/// `\|` and `\\` escape inside it. `None` when the choice is unterminated.
+fn choice_first(chars: &mut Chars) -> Option<String> {
+    let mut first = String::new();
+    let mut in_first = true;
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
-                // `\$` and `\\` escape the next char; a trailing lone `\` is literal.
-                if let Some(&next) = chars.peek() {
-                    chars.next();
-                    text.push(next);
-                    pos += 1;
-                } else {
-                    text.push('\\');
-                    pos += 1;
-                }
-            }
-            '$' => {
-                // Look ahead on a clone so a `$` that turns out not to introduce
-                // a tab stop (e.g. `$foo`, `${bar}`) leaves the real iterator
-                // untouched and the `$` is emitted literally.
-                let mut look = chars.clone();
-                if let Some((num, placeholder)) = try_parse_stop(&mut look) {
-                    chars = look;
-                    let ph_len = placeholder.chars().count();
-                    // Mirror dedup: the placeholder text is duplicated at every
-                    // occurrence, but only the first `$N` is a navigable stop.
-                    if !seen.contains(&num) {
-                        seen.push(num);
-                        stops.push(TabStop {
-                            num,
-                            offset: pos,
-                            len: ph_len,
-                        });
+                let n = match chars.peek() {
+                    Some(&n) if matches!(n, ',' | '|' | '\\') => {
+                        chars.next();
+                        n
                     }
-                    text.push_str(&placeholder);
-                    pos += ph_len;
-                } else {
-                    text.push('$');
-                    pos += 1;
+                    _ => '\\',
+                };
+                if in_first {
+                    first.push(n);
                 }
             }
-            _ => {
-                text.push(c);
-                pos += 1;
+            ',' => in_first = false,
+            '|' if chars.peek() == Some(&'}') => {
+                chars.next();
+                return Some(first);
             }
+            _ if in_first => first.push(c),
+            _ => {}
         }
     }
-
-    // Ascending by number, but `$0` (the final caret) always sorts last.
-    stops.sort_by_key(|s| if s.num == 0 { u32::MAX } else { s.num });
-    ParsedBody { text, stops }
-}
-
-/// Parse a tab stop starting just after a `$`, from a *lookahead* iterator the
-/// caller commits only on success: `N`, `{N}`, or `{N:placeholder}`. Returns
-/// `(number, placeholder_text)`, or `None` when what follows is not a stop (so
-/// the `$` is literal and nothing is consumed).
-fn try_parse_stop(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<(u32, String)> {
-    let braced = chars.peek() == Some(&'{');
-    if braced {
-        chars.next(); // consume '{'
-    }
-    let mut digits = String::new();
-    while let Some(&d) = chars.peek() {
-        if d.is_ascii_digit() {
-            digits.push(d);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    let num: u32 = digits.parse().ok()?; // empty digits -> None
-
-    let mut placeholder = String::new();
-    if braced {
-        match chars.peek() {
-            Some(&':') => {
-                chars.next(); // consume ':'
-                // Read to the closing '}' (no nesting, per the ceiling).
-                while let Some(&pc) = chars.peek() {
-                    chars.next();
-                    if pc == '}' {
-                        break;
-                    }
-                    placeholder.push(pc);
-                }
-            }
-            Some(&'}') => {
-                chars.next(); // bare `${N}`
-            }
-            // Malformed `${N…` with no `:` or `}`: not a stop, leave `$` literal.
-            _ => return None,
-        }
-    }
-    Some((num, placeholder))
+    None
 }
 
 /// Convert a char offset within a block of text to a (line delta, column)
@@ -305,6 +353,40 @@ pub const TEMPLATE: &str = r#"// croft user snippets. Keyed by name; each has a 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsp_snippets_keep_backslashes_nest_placeholders_and_pick_a_choice() {
+        let p = parse_body(r#"printf("%d\n", $1)"#);
+        assert_eq!(p.text, r#"printf("%d\n", )"#);
+        let p = parse_body("${1:foo(${2:x})}$0");
+        assert_eq!(p.text, "foo(x)");
+        assert_eq!(
+            p.stops[0],
+            TabStop {
+                num: 1,
+                offset: 0,
+                len: 6
+            }
+        );
+        assert_eq!(
+            p.stops[1],
+            TabStop {
+                num: 2,
+                offset: 4,
+                len: 1
+            }
+        );
+        let p = parse_body(r"${1|one,two|} \$5 \} a\b");
+        assert_eq!(p.text, "one $5 } a\\b");
+        assert_eq!(
+            p.stops[0],
+            TabStop {
+                num: 1,
+                offset: 0,
+                len: 3
+            }
+        );
+    }
 
     #[test]
     fn parses_single_bare_stop() {

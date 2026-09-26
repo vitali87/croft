@@ -475,9 +475,6 @@ pub struct PtyTerminal {
     /// The coding agent seated in this pane, when the foreground process is
     /// one (#344), carried between samples so a transition can be told.
     agent: Option<crate::agents::AgentLane>,
-    /// Tracks whether the inner program has enabled DECSET 2004 (bracketed
-    /// paste). Sniffed off the byte stream; not all parsers expose it.
-    bracketed_paste_enabled: Arc<AtomicBool>,
     /// Listening loopback ports the reader thread scraped out of the output
     /// stream (`http://localhost:PORT` banners, `listening on :PORT` lines).
     /// The app drains this each tick to feed the PORTS panel and the toast.
@@ -1899,8 +1896,6 @@ impl PtyTerminal {
                 .unwrap_or(0),
         ));
         let last_output_ms_for_thread = last_output_ms.clone();
-        let bracketed_paste_enabled = Arc::new(AtomicBool::new(false));
-        let bracketed_paste_for_thread = bracketed_paste_enabled.clone();
         let (port_tx, port_rx) = std::sync::mpsc::channel::<crate::port_detect::PortHit>();
 
         if let Some(label) = run_label.as_deref() {
@@ -2002,7 +1997,6 @@ impl PtyTerminal {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        sniff_bracketed_paste_mode(&buf[..n], &bracketed_paste_for_thread);
                         port_sniffer.sniff(&buf[..n], &port_tx);
                         // Shell-integration marks: split the advance at each
                         // OSC 133 so the cursor can be sampled exactly where
@@ -2271,7 +2265,6 @@ impl PtyTerminal {
             pty_pending_bytes,
             last_output_ms,
             agent: None,
-            bracketed_paste_enabled,
             port_rx,
             master: pair.master,
             writer,
@@ -3770,9 +3763,19 @@ impl PtyTerminal {
     /// are added only if the inner program asked for them; otherwise the
     /// payload is sent raw so simple shells don't see literal `\e[200~`.
     pub fn paste_input(&mut self, payload: &[u8]) {
-        if self.bracketed_paste_enabled.load(Ordering::Acquire) {
+        // The terminal's own mode, as its parser tracked it: the byte
+        // sniffer missed a `\e[?2004h` split across two reads, a combined
+        // `\e[?1049;2004h` and a reset, and pasted line by line into a shell
+        // that had asked for bracketed paste.
+        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        if bracketed {
             self.write_input(b"\x1b[200~");
-            self.write_input(payload);
+            // No ESC inside the brackets, as xterm and VS Code do: pasted
+            // text holding `\e[201~` would close the paste early, and the
+            // shell would run what follows it (`ls\e[201~rm -rf ~\r`). Any
+            // program in a pane can plant that on the clipboard via OSC 52.
+            let clean: Vec<u8> = payload.iter().copied().filter(|&b| b != 0x1b).collect();
+            self.write_input(&clean);
             self.write_input(b"\x1b[201~");
         } else {
             self.write_input(payload);
@@ -4298,20 +4301,27 @@ pub fn extract_selection_text(
             } else {
                 line.push(c);
             }
+            // Combining marks ride on the cell after its base char: `café`
+            // typed as `e` + U+0301 copied as `cafe` without them.
+            if let Some(marks) = cell.zerowidth() {
+                line.extend(marks.iter());
+            }
         }
-        let trimmed = line.trim_end();
-        out.push_str(trimmed);
+        // A soft-wrapped row (WRAPLINE on its last cell) continues the
+        // same logical line: no separator, so copied text, the durable
+        // command history, and the sticky header all see the line the user
+        // actually typed — a '\n' here corrupted stored commands and re-ran
+        // only their first fragment on paste. A hard row break keeps the
+        // newline. Only a hard break is trimmed: a space in a wrapped row's
+        // last column is part of the line (`echo abcd efg` in ten columns
+        // copied as `echo abcdefg`).
+        let wrapped = line_idx != er
+            && cols > 0
+            && term.grid()[Point::new(Line(line_idx), Column(cols - 1))]
+                .flags
+                .contains(Flags::WRAPLINE);
+        out.push_str(if wrapped { &line } else { line.trim_end() });
         if line_idx != er {
-            // A soft-wrapped row (WRAPLINE on its last cell) continues the
-            // same logical line: no separator, so copied text, the durable
-            // command history, and the sticky header all see the line the
-            // user actually typed — a '\n' here corrupted stored commands
-            // and re-ran only their first fragment on paste. A hard row
-            // break keeps the newline.
-            let wrapped = cols > 0
-                && term.grid()[Point::new(Line(line_idx), Column(cols - 1))]
-                    .flags
-                    .contains(Flags::WRAPLINE);
             if !wrapped {
                 out.push('\n');
             }
@@ -4445,25 +4455,6 @@ pub fn format_cd_command(path: &std::path::Path) -> Vec<u8> {
     }
     out.extend_from_slice(b"'\n");
     out
-}
-
-/// Walk a chunk of PTY output and toggle the bracketed-paste flag when
-/// we see `\e[?2004h` (set) / `\e[?2004l` (reset).
-pub fn sniff_bracketed_paste_mode(chunk: &[u8], flag: &AtomicBool) {
-    let needle_set: &[u8] = b"\x1b[?2004h";
-    let needle_reset: &[u8] = b"\x1b[?2004l";
-    let mut i = 0;
-    while i < chunk.len() {
-        if chunk[i..].starts_with(needle_set) {
-            flag.store(true, Ordering::Release);
-            i += needle_set.len();
-        } else if chunk[i..].starts_with(needle_reset) {
-            flag.store(false, Ordering::Release);
-            i += needle_reset.len();
-        } else {
-            i += 1;
-        }
-    }
 }
 
 /// Build the OSC 52 escape sequence that asks the host terminal to put
@@ -5705,19 +5696,20 @@ mod tests {
     }
 
     #[test]
-    fn sniff_bracketed_paste_mode_toggles_on_set_and_reset() {
-        let flag = AtomicBool::new(false);
-        sniff_bracketed_paste_mode(b"prompt> \x1b[?2004h", &flag);
-        assert!(flag.load(Ordering::Acquire));
-        sniff_bracketed_paste_mode(b"\x1b[?2004l\nbye", &flag);
-        assert!(!flag.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn sniff_bracketed_paste_mode_ignores_unrelated_dec_modes() {
-        let flag = AtomicBool::new(false);
-        sniff_bracketed_paste_mode(b"\x1b[?25h\x1b[?1049h", &flag);
-        assert!(!flag.load(Ordering::Acquire));
+    fn a_paste_cannot_close_its_own_brackets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        // The mode as the parser tracks it (the reader keeps one parser, so
+        // a sequence split across reads lands too).
+        term.feed_bytes_for_test(b"prompt \x1b[?1049;2004h");
+        term.paste_input(b"ls\x1b[201~rm -rf ~\r");
+        let written = term.written_bytes_for_test();
+        let tail = &written[written.len() - b"\x1b[200~ls[201~rm -rf ~\r\x1b[201~".len()..];
+        assert_eq!(tail, b"\x1b[200~ls[201~rm -rf ~\r\x1b[201~");
+        // And no brackets once the program turns the mode off.
+        term.feed_bytes_for_test(b"\x1b[?2004l");
+        term.paste_input(b"x");
+        assert!(term.written_bytes_for_test().ends_with(b"\x1b[201~x"));
     }
 
     #[test]
@@ -8118,6 +8110,16 @@ mod tests {
         feed(&mut t, b"hello world");
         let txt = extract_selection_text(&t, 0, 6, 0, 10);
         assert_eq!(txt, "world");
+    }
+
+    #[test]
+    fn copying_keeps_a_space_at_a_wrap_and_combining_marks() {
+        let mut t = fresh_term(10, 5);
+        feed(&mut t, b"echo abcd efg");
+        assert_eq!(extract_selection_text(&t, 0, 0, 1, 9), "echo abcd efg");
+        let mut t = fresh_term(20, 5);
+        feed(&mut t, "cafe\u{301}".as_bytes());
+        assert_eq!(extract_selection_text(&t, 0, 0, 0, 19), "cafe\u{301}");
     }
 
     #[test]

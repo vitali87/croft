@@ -6359,6 +6359,27 @@ fn welcome_tagline_constant_is_present() {
 }
 
 #[test]
+fn modified_terminal_keys_keep_their_modifiers() {
+    let k = |c, m| key_to_bytes(key(c, m), false);
+    assert_eq!(k(KeyCode::Backspace, KeyModifiers::ALT), b"\x1b\x7f");
+    assert_eq!(k(KeyCode::Char(' '), KeyModifiers::CONTROL), vec![0x00]);
+    assert_eq!(k(KeyCode::Char('/'), KeyModifiers::CONTROL), vec![0x1f]);
+    assert_eq!(
+        k(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        b"\x1b\x01"
+    );
+    assert_eq!(k(KeyCode::Left, KeyModifiers::CONTROL), b"\x1b[1;5D");
+    assert_eq!(k(KeyCode::Right, KeyModifiers::SHIFT), b"\x1b[1;2C");
+    assert_eq!(k(KeyCode::Home, KeyModifiers::CONTROL), b"\x1b[1;5H");
+    assert_eq!(k(KeyCode::Delete, KeyModifiers::CONTROL), b"\x1b[3;5~");
+    // Alt alone on Left/Right stays readline's word motion.
+    assert_eq!(k(KeyCode::Left, KeyModifiers::ALT), b"\x1bb");
+}
+
+#[test]
 fn key_to_bytes_arrows() {
     assert_eq!(
         key_to_bytes(key(KeyCode::Up, KeyModifiers::NONE), false),
@@ -37165,6 +37186,7 @@ fn a_stale_color_presentation_pick_is_refused_after_a_buffer_change() {
             start: (0, 11),
             end: (0, 18),
             new_text: String::from("rgb(255, 0, 0)"),
+            utf16: false,
         }],
     )];
     app.pending_color_context = Some((path.clone(), app.editor.edit_seq));
@@ -43071,6 +43093,7 @@ fn a_rename_landing_before_a_keystroke_in_a_symbol_tab_is_kept() {
             start: (0, 3),
             end: (0, 4),
             new_text: String::from("renamed"),
+            utf16: false,
         }],
     )];
     app.apply_rename_edits(&edits).unwrap();
@@ -44036,6 +44059,7 @@ fn a_collaborators_edit_on_a_symbols_edge_is_not_the_tabs_own() {
             start: (3, 0),
             end: (3, 0),
             new_text: String::from("\n"),
+            utf16: false,
         }]);
         // The local caret sits just past the new line, where a caret that
         // had typed it would be.
@@ -51168,6 +51192,7 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
             start: (0, 7),
             end: (0, 11),
             new_text: String::from("helpers"),
+            utf16: false,
         }],
     )];
     app.finish_file_move(pending, edits);
@@ -51199,6 +51224,7 @@ fn a_failed_move_leaves_the_importers_alone_and_edits_follow_a_moved_file() {
                 start: (0, 4),
                 end: (0, 7),
                 new_text: String::from("pkg::sub::pkg"),
+                utf16: false,
             }],
         )]
     };

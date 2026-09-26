@@ -3623,6 +3623,7 @@ impl WorkerState {
                                 start: (start.0 as usize, start.1 as usize),
                                 end: (end.0 as usize, end.1 as usize),
                                 new_text: p.label.clone(),
+                                utf16: true,
                             }),
                         }
                         for te in p.additional_text_edits.iter().flatten() {
@@ -5304,6 +5305,7 @@ fn text_edit_to_span(te: &TextEdit) -> TextSpanEdit {
         ),
         end: (te.range.end.line as usize, te.range.end.character as usize),
         new_text: te.new_text.clone(),
+        utf16: true,
     }
 }
 

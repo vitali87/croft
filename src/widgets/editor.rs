@@ -1938,13 +1938,33 @@ pub struct TextSpanEdit {
     pub start: (usize, usize),
     pub end: (usize, usize),
     pub new_text: String,
+    /// The columns are UTF-16 code units, as a language server sends them,
+    /// not chars. Converted against the lines at apply time: read as char
+    /// columns, every edit after an emoji on its line landed off by one per
+    /// astral character, and a rename wrote `xrenamed+ 1` over `x + 1`.
+    pub utf16: bool,
 }
 
 /// Apply `edits` to `lines` (char-indexed coords), bottom-to-top so an
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
+    // Every edit names the ORIGINAL text, so its UTF-16 columns convert
+    // against the lines as they are before any edit lands.
+    let col = |row: usize, c: usize| lines.get(row).map_or(c, |l| utf16_to_char_col(l, c as u32));
+    let converted: Vec<TextSpanEdit> = edits
+        .iter()
+        .map(|e| match e.utf16 {
+            true => TextSpanEdit {
+                start: (e.start.0, col(e.start.0, e.start.1)),
+                end: (e.end.0, col(e.end.0, e.end.1)),
+                new_text: e.new_text.clone(),
+                utf16: false,
+            },
+            false => e.clone(),
+        })
+        .collect();
+    let mut order: Vec<&TextSpanEdit> = converted.iter().collect();
     order.sort_by_key(|e| std::cmp::Reverse(e.start));
     let mut applied = 0;
     for e in order {
@@ -20240,11 +20260,13 @@ mod tests {
                 start: (0, 0),
                 end: (0, 3),
                 new_text: "baz".to_string(),
+                utf16: false,
             },
             TextSpanEdit {
                 start: (0, 8),
                 end: (0, 11),
                 new_text: "baz".to_string(),
+                utf16: false,
             },
         ];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
@@ -20266,6 +20288,7 @@ mod tests {
             start: (0, 0),
             end: (3, 9),
             new_text: "import logging\nimport re\nimport typing\n\nimport pandas".to_string(),
+            utf16: false,
         }];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
         assert_eq!(
@@ -20289,6 +20312,7 @@ mod tests {
             start: (0, 2),
             end: (0, 4),
             new_text: "C\nD".to_string(),
+            utf16: false,
         }];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
         assert_eq!(lines, vec!["abC".to_string(), "Def".to_string()]);
@@ -20302,11 +20326,13 @@ mod tests {
                 start: (0, 0),
                 end: (0, 4),
                 new_text: "label".to_string(),
+                utf16: false,
             },
             TextSpanEdit {
                 start: (1, 6),
                 end: (1, 10),
                 new_text: "label".to_string(),
+                utf16: false,
             },
         ];
         assert_eq!(e.apply_span_edits(&edits), 2);
@@ -21997,6 +22023,22 @@ mod tests {
         e.lossy_save_armed = true;
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
         assert!(!e.decode_lossy);
+    }
+
+    #[test]
+    fn a_language_servers_utf16_columns_land_after_an_emoji() {
+        let mut lines = vec![String::from("let s = \"😀\"; x + 1")];
+        let n = apply_span_edits_to_lines(
+            &mut lines,
+            &[TextSpanEdit {
+                start: (0, 14),
+                end: (0, 15),
+                new_text: String::from("renamed"),
+                utf16: true,
+            }],
+        );
+        assert_eq!(n, 1);
+        assert_eq!(lines[0], "let s = \"😀\"; renamed + 1");
     }
 
     #[test]
