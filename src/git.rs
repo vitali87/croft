@@ -1493,7 +1493,7 @@ pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
             author_time = rest.trim().parse().unwrap_or(now);
         } else if let Some(rest) = raw.strip_prefix("summary ") {
             summary = rest.to_string();
-        } else if raw.starts_with('\t') {
+        } else if let Some(content) = raw.strip_prefix('\t') {
             // The content line closes a group: emit the accumulated blame.
             if let Some(full) = hash.take() {
                 let uncommitted = full.chars().all(|c| c == '0');
@@ -1503,7 +1503,7 @@ pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
                     author: std::mem::take(&mut author),
                     age_secs: now - author_time,
                     uncommitted,
-                    text: Some(raw[1..].to_string()),
+                    text: Some(content.to_string()),
                 });
             }
         } else if let Some(h) = raw.split(' ').next() {
