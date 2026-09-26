@@ -171,6 +171,22 @@ pub fn stale_client_notice_on_change(
     (last != Some(notice.as_str())).then_some(notice)
 }
 
+/// The one client that can have asked for Session: Detach from inside the
+/// app: the sole control holder (a read-only client's keys never reach
+/// croft), or the sole client. `None` when several could have, since the
+/// typing attribution can race another writer's keys.
+pub fn sole_detach_target(roster: &[Participant]) -> Option<u64> {
+    let mut writers = roster.iter().filter(|p| p.control);
+    match (writers.next(), writers.next()) {
+        (Some(only), None) => Some(only.id),
+        (None, None) => match roster {
+            [only] => Some(only.id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The version clients are measured against: the newer of the inner croft's
 /// own and the session host's (#652). A host swap updates the host without
 /// the inner croft, and a client on the pre-swap binary is still out of date
@@ -2087,6 +2103,11 @@ fn attach_client_loop(socket: &Path, stream: &mut UnixStream) -> Result<PumpOutc
     let mut first_attach = true;
     loop {
         match attach_client_pump(stream, &tx, &detaching, first_attach)? {
+            // A detach that raced the swap wins: the stdin forwarder has
+            // already stopped, so a successor connection would only hang.
+            PumpOutcome::HostSwapped if detaching.load(Ordering::SeqCst) => {
+                return Ok(PumpOutcome::Detached);
+            }
             PumpOutcome::HostSwapped => {
                 let Some(fresh) = reconnect_after_swap(socket) else {
                     // The successor never came up: from here the session is
@@ -3874,6 +3895,26 @@ mod tests {
     // #679: a host that closes the connection without an Exit frame (a kick,
     // or the host dying) must read as a disconnect, which is what makes the
     // client restore the terminal, not as the inner croft exiting cleanly.
+    #[test]
+    fn detach_targets_only_an_unambiguous_client() {
+        let p = |id: u64, control: bool| Participant {
+            id,
+            name: String::from("x"),
+            cols: 80,
+            rows: 24,
+            control,
+            version: String::new(),
+        };
+        // The sole control holder, even beside read-only guests.
+        assert_eq!(sole_detach_target(&[p(1, false), p(2, true)]), Some(2));
+        // The sole client, whatever its control.
+        assert_eq!(sole_detach_target(&[p(7, false)]), Some(7));
+        // Two writers: the typist could be either, so no one.
+        assert_eq!(sole_detach_target(&[p(1, true), p(2, true)]), None);
+        assert_eq!(sole_detach_target(&[p(1, false), p(2, false)]), None);
+        assert_eq!(sole_detach_target(&[]), None);
+    }
+
     #[test]
     fn a_connection_closed_without_exit_is_a_disconnect() {
         let dir = tempfile::tempdir().unwrap();

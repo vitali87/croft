@@ -24464,27 +24464,23 @@ impl App {
         self.open_list_picker(picker, "No participants yet");
     }
 
-    /// Session: Detach (#679): disconnect the client that asked, which is
-    /// the one whose keystrokes reached croft last (the host announces the
-    /// typist before its bytes). The session keeps running, and the client
-    /// restores its terminal on the way out.
+    /// Session: Detach (#679): disconnect the client that asked, when only
+    /// one client can have (see `sole_detach_target`). The session keeps
+    /// running, and the client restores its terminal on the way out.
     fn detach_session_client(&mut self) {
         if self.session_channel.is_none() {
             self.status =
                 String::from("Not attached to a persistent session: nothing to detach from");
             return;
         }
-        // The Typing frame for the key that ran this is already on the
-        // channel; take it now rather than on the next tick.
-        self.poll_session_typing();
-        let sole = match self.session_participants.as_slice() {
-            [only] => Some(only.id),
-            _ => None,
-        };
-        let target = self.session_typist.or(sole);
-        let Some(id) = target else {
+        // Only a control holder's keys reach croft, so with one control
+        // holder (or one client) the invoker is known. With several, the
+        // typing attribution can race another writer's keys, so refuse
+        // rather than disconnect the wrong client: the chord, caught by the
+        // attach client itself, always detaches its own client.
+        let Some(id) = crate::session_host::sole_detach_target(&self.session_participants) else {
             self.status = String::from(
-                "Could not tell which client asked to detach; use Session: Participants (Cmd+K A)",
+                "Several clients can type here: press Cmd+K Shift+Q in the client to leave, or use Session: Participants (Cmd+K A)",
             );
             return;
         };
