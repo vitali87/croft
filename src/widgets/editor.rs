@@ -6772,6 +6772,12 @@ impl Editor {
             let shift = typed - sess.cur_len as isize;
             if shift != 0 {
                 let after = sess.anchor.1 + sess.cur_len;
+                // Stops nested inside the placeholder just replaced
+                // (`${1:foo(${2:x})}`) name text that is gone: drop them, or
+                // the next Tab selects whatever now sits at their offset.
+                let anchor = sess.anchor;
+                sess.stops
+                    .retain(|s| !(s.0 == anchor.0 && s.1 >= anchor.1 && s.1 < after));
                 for s in sess.stops.iter_mut() {
                     if s.0 == sess.anchor.0 && s.1 >= after {
                         s.1 = (s.1 as isize + shift).max(0) as usize;
@@ -16269,6 +16275,20 @@ mod tests {
         );
         // The last stop ends the session.
         assert!(!e.snippet_active());
+    }
+
+    #[test]
+    fn replacing_an_outer_placeholder_drops_the_stops_nested_in_it() {
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        assert_eq!(e.selection_text(), "foo(x)");
+        e.insert_str("bar");
+        assert!(e.snippet_next());
+        assert_eq!(
+            e.selection_text(),
+            "z",
+            "the nested $2 went with its placeholder"
+        );
     }
 
     /// On-type formatting (#254) keys off real keystrokes only: the typed
