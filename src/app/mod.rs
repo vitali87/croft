@@ -3032,6 +3032,10 @@ pub struct App {
     /// `<=` the image's pixel height for short files). Click mapping divides by
     /// this, not the full strip height, so clicks land on the right line.
     minimap_content_h: u32,
+    /// When the minimap image was last baked, and whether an edit since then
+    /// is waiting for the next bake (see [`MINIMAP_EDIT_REBAKE`]).
+    minimap_baked_at: Option<std::time::Instant>,
+    minimap_edit_pending: bool,
     /// A left-drag is panning the view via the minimap strip.
     minimap_drag: bool,
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
@@ -4232,6 +4236,9 @@ const MINIMAP_WIDTH_CELLS: u16 = 6;
 /// Minimum editor-text width that must remain after carving the strip; below
 /// this the minimap is suppressed so the code never gets squeezed to nothing.
 const MINIMAP_MIN_EDITOR_WIDTH: u16 = 44;
+/// While only the text changes, the minimap image is re-baked at most this
+/// often: each bake is a fresh PNG of the whole strip (#682).
+const MINIMAP_EDIT_REBAKE: std::time::Duration = std::time::Duration::from_millis(300);
 /// Maximum pixel height per source line in the minimap. Only kicks in for very
 /// short files: it caps a six-line file to a compact sliver instead of
 /// stretching those lines down the whole strip. Any file long enough that its
@@ -4998,6 +5005,8 @@ impl App {
             minimap_base: None,
             minimap_img_rect: Rect::default(),
             minimap_content_h: 0,
+            minimap_baked_at: None,
+            minimap_edit_pending: false,
             minimap_drag: false,
             clipboard_reader: read_system_clipboard,
             is_relay_session: !cfg!(test) && std::env::var_os("CROFT_RELAY_KEY").is_some(),
@@ -6366,6 +6375,12 @@ impl App {
         })
     }
 
+    /// Only iTerm2 evicts cached images, so only there do the activity
+    /// icons need re-sending while nothing changed.
+    fn activity_keepalive_allowed(&self) -> bool {
+        self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::ITerm2
+    }
+
     /// Post-draw flush of the activity-bar icons. Re-emits the pre-encoded
     /// OSC-1337 image bytes each frame (ratatui doesn't track image cells, so
     /// neighbouring SGR traffic can evict them from iTerm2's cache) — but
@@ -6380,10 +6395,11 @@ impl App {
     /// clean set at the new cells.
     pub fn flush_activity_image_overlays(&mut self) {
         use std::io::Write;
-        // The keepalive re-emit fights iTerm2's image-cache eviction; the sixel
-        // cell buffer doesn't evict, so its icons re-emit only when dirty.
-        let allow_keepalive =
-            self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Sixel;
+        // The keepalive re-emit fights iTerm2's image-cache eviction. Neither
+        // the sixel cell buffer nor Kitty's image layer evicts, so there the
+        // icons re-emit only when dirty: on Kitty the keepalive cost about
+        // 13 KB every two seconds, idle, over SSH (#682).
+        let allow_keepalive = self.activity_keepalive_allowed();
         if !self.overlays.activity.should_refresh(allow_keepalive) {
             return;
         }
@@ -47532,6 +47548,38 @@ impl App {
                     desired.cell_h,
                 )
         });
+        // Typing re-bakes the whole strip image, several kilobytes a key
+        // over SSH (#682). While only the text changed, the strip catches up
+        // at most every `MINIMAP_EDIT_REBAKE`; `tick_minimap` redraws once
+        // the wait is over so the last edit always lands.
+        let text_only = !placement_moved
+            && self.overlays.minimap.layout().is_some_and(|prev| {
+                (
+                    prev.top,
+                    prev.rows,
+                    prev.side,
+                    prev.bg,
+                    prev.selection,
+                    prev.doc,
+                ) == (
+                    desired.top,
+                    desired.rows,
+                    desired.side,
+                    desired.bg,
+                    desired.selection,
+                    desired.doc,
+                )
+            });
+        if text_only
+            && self
+                .minimap_baked_at
+                .is_some_and(|t| t.elapsed() < MINIMAP_EDIT_REBAKE)
+        {
+            self.minimap_edit_pending = true;
+            return;
+        }
+        self.minimap_edit_pending = false;
+        self.minimap_baked_at = Some(std::time::Instant::now());
         if placement_moved {
             self.overlays.minimap.request_clear_if_displayed();
         }
@@ -47606,6 +47654,15 @@ impl App {
             );
             self.overlays.minimap.set(osc, desired);
         }
+    }
+
+    /// True once a deferred minimap bake is due, so the loop redraws and
+    /// the strip shows the last edit.
+    pub fn tick_minimap(&mut self) -> bool {
+        self.minimap_edit_pending
+            && self
+                .minimap_baked_at
+                .is_none_or(|t| t.elapsed() >= MINIMAP_EDIT_REBAKE)
     }
 
     fn disable_minimap_image(&mut self) {
@@ -54071,7 +54128,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
-        let live_run_changed = app.tick_live_run() | app.sync_markdown_scroll();
+        let live_run_changed =
+            app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
         let code_lens_changed = app.drain_lsp_code_lens()
             | app.drain_search_editor()

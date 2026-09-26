@@ -52294,3 +52294,65 @@ fn only_cell_buffer_protocols_resend_an_image_when_text_beneath_changes() {
         app.image_underlays(&busy).terminal
     );
 }
+
+/// #682: typing re-bakes the minimap at most every `MINIMAP_EDIT_REBAKE`,
+/// and the deferred bake still lands once the wait is over.
+#[test]
+fn minimap_rebakes_for_typing_at_most_every_few_hundred_ms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cell_pixel = Some((8, 16));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.editor.lines = (0..80).map(|i| format!("line {i}")).collect();
+    let strip = ratatui::layout::Rect {
+        x: 100,
+        y: 1,
+        width: 6,
+        height: 40,
+    };
+    app.update_minimap_overlay(strip);
+    let first = app.minimap_image_payload().map(|(o, _)| o.to_string());
+    assert!(first.is_some());
+    app.editor.lines[0] = String::from("changed");
+    app.editor.edit_seq += 1;
+    app.update_minimap_overlay(strip);
+    assert_eq!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        first,
+        "a keystroke right after a bake waits"
+    );
+    assert!(!app.tick_minimap(), "not due yet");
+    app.minimap_baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
+    assert!(app.tick_minimap(), "the wait is over: redraw");
+    app.update_minimap_overlay(strip);
+    assert_ne!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        first,
+        "the deferred edit is baked"
+    );
+    assert!(!app.tick_minimap());
+    // Scrolling is not held back.
+    app.editor.scroll = 5;
+    let before = app.minimap_image_payload().map(|(o, _)| o.to_string());
+    app.update_minimap_overlay(strip);
+    assert_ne!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        before
+    );
+}
+
+/// #682: only iTerm2 needs the idle icon keepalive.
+#[test]
+fn only_iterm2_keeps_the_activity_icons_alive() {
+    use crate::iterm2_inline::InlineImageProtocol;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for (p, want) in [
+        (InlineImageProtocol::ITerm2, true),
+        (InlineImageProtocol::Kitty, false),
+        (InlineImageProtocol::Sixel, false),
+    ] {
+        app.inline_protocol = p;
+        assert_eq!(app.activity_keepalive_allowed(), want, "{p:?}");
+    }
+}
