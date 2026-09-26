@@ -48,6 +48,7 @@ impl SessionState {
         // Owner-only and written aside: the file carries every dirty
         // buffer's unsaved text, and a crash mid-write must not leave half.
         use std::io::Write;
+        #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
         let tmp = path.with_extension(format!(
             "json.{}.{:?}.tmp",
@@ -56,11 +57,11 @@ impl SessionState {
         ));
         let _ = std::fs::remove_file(&tmp);
         let write = || -> std::io::Result<()> {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut f = opts.open(&tmp)?;
             f.write_all(json.as_bytes())?;
             f.sync_all()?;
             std::fs::rename(&tmp, path)

@@ -127,22 +127,90 @@ mod linux {
     ///
     /// Tries `wl-paste`, then `xclip`, then `xsel`.
     pub fn read_string() -> Option<String> {
-        read_via(&["wl-paste"])
-            .or_else(|| read_via(&["xclip", "-selection", "clipboard", "-o"]))
-            .or_else(|| read_via(&["xsel", "--clipboard", "--output"]))
+        // `--no-newline`: wl-paste appends `\n` to text otherwise. `--type
+        // text`: any text type, never an image's bytes when an image is on
+        // the clipboard.
+        // One deadline for the whole paste, fallbacks included: a fresh
+        // budget per program let three hung readers freeze croft for 6s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        read_via(&["wl-paste", "--no-newline", "--type", "text"], deadline)
+            .or_else(|| read_via(&["xclip", "-selection", "clipboard", "-o"], deadline))
+            .or_else(|| read_via(&["xsel", "--clipboard", "--output"], deadline))
     }
 
-    fn read_via(argv: &[&str]) -> Option<String> {
-        let out = Command::new(argv[0])
-            .args(&argv[1..])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
+    fn read_via(argv: &[&str], deadline: std::time::Instant) -> Option<String> {
+        use std::io::Read;
+        // Bounded by `deadline`, through the program's exit: a paste runs on
+        // the UI thread, and a clipboard owner that never answers (a hung X
+        // client holding the selection) would freeze croft for as long as
+        // xclip waits on it.
+        if std::time::Instant::now() >= deadline {
             return None;
         }
-        Some(String::from_utf8_lossy(&out.stdout).to_string())
+        let mut child = Command::new(argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        let give_up = |child: &mut std::process::Child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok(bytes) = rx.recv_timeout(left) else {
+            give_up(&mut child);
+            return None;
+        };
+        // Stdout closing is not exiting: a program can close it and keep
+        // running, so the wait is bounded too.
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => {
+                    give_up(&mut child);
+                    return None;
+                }
+            }
+        };
+        if !status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn a_clipboard_reader_that_never_answers_is_given_up_on() {
+            let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let started = std::time::Instant::now();
+            assert_eq!(super::read_via(&["sh", "-c", "sleep 30"], deadline()), None);
+            // Closing stdout and staying alive is bounded too.
+            assert_eq!(
+                super::read_via(&["sh", "-c", "exec 1>&-; sleep 30"], deadline()),
+                None
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            // A spent deadline starts nothing.
+            let past = std::time::Instant::now();
+            assert_eq!(super::read_via(&["sh", "-c", "printf foo"], past), None);
+            assert_eq!(
+                super::read_via(&["sh", "-c", "printf foo"], deadline()).as_deref(),
+                Some("foo")
+            );
+        }
     }
 }
 

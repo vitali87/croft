@@ -15203,6 +15203,28 @@ impl EditorTabs {
         self.close_tab(self.active)
     }
 
+    /// Close every tab showing `path` or a file under it (a deleted file or
+    /// folder), except tabs with unsaved edits: those stay open, dirty, so
+    /// the edits can still be saved (recreating the file) or discarded.
+    /// Returns how many dirty tabs were kept.
+    pub fn close_clean_tabs_under(&mut self, path: &Path) -> usize {
+        let mut kept = 0;
+        let mut i = self.editors.len();
+        while i > 0 {
+            i -= 1;
+            let e = &self.editors[i];
+            if !e.path.as_deref().is_some_and(|p| p.starts_with(path)) {
+                continue;
+            }
+            if e.dirty {
+                kept += 1;
+            } else {
+                self.close_tab(i);
+            }
+        }
+        kept
+    }
+
     /// Close the tab at `idx`. When more than one tab is open the tab is
     /// removed and `self.active` is shifted so it still points at a valid
     /// tab. When this is the last remaining tab it is reset to the blank
@@ -16701,6 +16723,26 @@ mod tests {
         assert!(
             e.current_line_blame_annotation().is_none(),
             "a.rs blame painted on b.rs while its own fetch was still in flight"
+        );
+    }
+
+    #[test]
+    fn deleting_closes_clean_tabs_under_the_path_and_keeps_dirty_ones() {
+        let mut tabs = EditorTabs::new();
+        tabs.add_tab_with_path(PathBuf::from("/w/dir/a.rs"));
+        tabs.add_tab_with_path(PathBuf::from("/w/dir/sub/b.rs"));
+        tabs.editors[2].dirty = true;
+        tabs.add_tab_with_path(PathBuf::from("/w/other.rs"));
+        tabs.add_tab_with_path(PathBuf::from("/w/dirt.rs"));
+        assert_eq!(tabs.close_clean_tabs_under(Path::new("/w/dir")), 1);
+        let left: Vec<_> = tabs.editors.iter().filter_map(|e| e.path.clone()).collect();
+        assert_eq!(
+            left,
+            vec![
+                PathBuf::from("/w/dir/sub/b.rs"),
+                PathBuf::from("/w/other.rs"),
+                PathBuf::from("/w/dirt.rs"),
+            ]
         );
     }
 
