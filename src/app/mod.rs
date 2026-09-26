@@ -3466,6 +3466,7 @@ pub struct App {
     inline_worker: Option<crate::inline_complete::Worker>,
     inline_config: Option<crate::inline_complete::Config>,
     inline_job: Option<(u64, PathBuf, u64, usize, usize)>,
+    inline_asked: Option<(PathBuf, u64, usize, usize)>,
     inline_next_id: u64,
     /// Where recorded shortcuts are written: the user's keybindings.json,
     /// or under test a scratch file, so a test run never edits the real one.
@@ -5156,6 +5157,7 @@ impl App {
             inline_worker: None,
             inline_config: None,
             inline_job: None,
+            inline_asked: None,
             inline_next_id: 0,
             keybindings_file: if cfg!(test) {
                 std::env::temp_dir().join(format!(
@@ -35952,8 +35954,17 @@ impl App {
     /// second, which then times out with its tunnel already up.
     fn relay_request_id(kind: &str) -> String {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // A per-run nonce as well as the pid: claims outlive the process in
+        // the relay dir, and a later croft reusing this pid (after a reboot,
+        // in a container) would find every one of its ids already claimed.
+        static NONCE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        let nonce = NONCE.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        });
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{kind}-{}-{n}", std::process::id())
+        format!("{kind}-{}-{nonce:x}-{n}", std::process::id())
     }
 
     /// Ask the local launcher (via the drop relay) to forward `port` home over
@@ -44081,6 +44092,7 @@ impl App {
             self.inline_enabled = false;
             self.editor.ghost = None;
             self.inline_job = None;
+            self.inline_asked = None;
             self.status = String::from("Inline suggestions: off");
             return;
         }
@@ -44157,6 +44169,13 @@ impl App {
             .ghost
             .as_ref()
             .is_some_and(|g| (g.0, g.1, g.2) == (row, col, seq))
+            // Asked already at this caret and edit: an empty answer, an
+            // error or an Esc'd ghost must not send the request again on
+            // the next tick, which looped hundreds of paid calls a second.
+            || self
+                .inline_asked
+                .as_ref()
+                .is_some_and(|a| a.0 == path && (a.1, a.2, a.3) == (seq, row, col))
             || self
                 .inline_job
                 .as_ref()
@@ -44181,6 +44200,7 @@ impl App {
             config: config.clone(),
             prompt: crate::inline_complete::prompt(&ed.lines, row, col),
         });
+        self.inline_asked = Some((path.clone(), seq, row, col));
         self.inline_job = Some((id, path, seq, row, col));
         changed
     }
@@ -44453,7 +44473,9 @@ impl App {
             )
             .any(|t| t.path.as_deref().is_some_and(is_it));
         if open {
-            crate::view_ipc::ViewReply::Ok
+            crate::view_ipc::ViewReply::Err {
+                message: String::from(crate::view_ipc::PROBE_OPEN),
+            }
         } else {
             crate::view_ipc::ViewReply::Err {
                 message: String::from(crate::view_ipc::PROBE_CLOSED),

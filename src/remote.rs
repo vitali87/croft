@@ -1144,6 +1144,10 @@ impl Drop for DropPump {
     }
 }
 
+/// How long a window without a pull's file waits before answering it as
+/// missing, so an attached window that has the file claims it first.
+const MISSING_PULL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn run_pump(
     host: String,
     socket: PathBuf,
@@ -1165,9 +1169,21 @@ fn run_pump(
         // A pull names a file on ONE computer: when two computers are
         // attached, only the one that has it may claim it, or the other
         // would claim it, fail, and leave the file's owner nothing to do.
-        if let Some(RelayRequest::Pull { src, .. }) = &request
+        //
+        // A file on NEITHER computer still needs an answer, or the remote
+        // waits out its whole timeout: after a grace period that lets the
+        // owner claim it first, whoever claims it now says it is missing.
+        if let Some(RelayRequest::Pull { id, src }) = &request
             && !Path::new(src).exists()
         {
+            let (host, socket, inbox_dir) = (host.clone(), socket.clone(), inbox_dir.clone());
+            let (id, src) = (id.clone(), src.clone());
+            thread::spawn(move || {
+                thread::sleep(MISSING_PULL_GRACE);
+                if ssh_exec(&host, &socket, &claim_command(&inbox_dir, &id)) {
+                    handle_pull_request(&host, &socket, &inbox_dir, &id, &src);
+                }
+            });
             continue;
         }
         if let Some(id) = request.as_ref().and_then(RelayRequest::id)

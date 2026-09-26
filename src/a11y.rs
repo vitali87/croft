@@ -111,6 +111,14 @@ impl Announcer {
         let Some(program) = words.next() else {
             return;
         };
+        // A line starting with `-` (a file named `--output-file=x`) would
+        // read as the speech program's own option; a leading space is
+        // silent and keeps it text.
+        let line = if line.starts_with('-') {
+            format!(" {line}")
+        } else {
+            line.to_string()
+        };
         self.child = std::process::Command::new(program)
             .args(words)
             .arg(line)

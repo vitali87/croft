@@ -55,9 +55,13 @@ pub fn install_source(exe: &Path) -> InstallSource {
     // on every prefix it supports (/opt/homebrew, /usr/local, linuxbrew), so
     // a `Cellar/croft` pair of components is the signature, not the prefix.
     let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
-    let owned = parts
-        .windows(2)
-        .any(|w| w[0] == "Cellar" && w[1] == "croft");
+    // The whole `Cellar/croft/<version>/bin/croft` tail: a source checkout
+    // that happens to sit under a `Cellar/croft` directory is not brew's.
+    let owned = parts.len() >= 5
+        && parts[parts.len() - 5] == "Cellar"
+        && parts[parts.len() - 4] == "croft"
+        && parts[parts.len() - 2] == "bin"
+        && parts[parts.len() - 1] == "croft";
     if owned {
         InstallSource::Homebrew
     } else {
@@ -416,6 +420,7 @@ mod tests {
             // Cellar outside a Homebrew layout is not Homebrew.
             "/opt/homebrew/Cellar/other/1.0/bin/croft",
             "/Users/me/Cellar/notes/croft",
+            "/Users/me/Cellar/croft/target/release/croft",
             "/Users/me/code/croft/target/release/croft",
         ] {
             assert_eq!(

@@ -188,7 +188,7 @@ pub fn text_range(region: &Region, lines: &Lines, kind: ColumnKind) -> Option<Te
     let offset = region.char_offset.filter(|&o| o >= 0)?;
     let length = region.char_length.unwrap_or(0).max(0);
     let (start, c1) = offset_pos(lines, offset as usize, kind);
-    let (end, c2) = offset_pos(lines, (offset + length) as usize, kind);
+    let (end, c2) = offset_pos(lines, offset.saturating_add(length) as usize, kind);
     Some(TextRange {
         start,
         end,
