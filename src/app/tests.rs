@@ -10632,12 +10632,10 @@ fn cmd_k_shift_a_never_kicks_the_current_typist() {
     }
 }
 
-/// The palette entry cannot tell which window pressed Enter: typing
-/// attribution is per loop iteration and can lag the keys. Only a
-/// write-control holder's keys reach the app, so a sole holder is the
-/// asker; with several, or a stale typist, it must not guess.
+/// The palette's Session: Detach refuses up front when several
+/// participants hold write control: either could have pressed Enter.
 #[test]
-fn detach_target_is_the_sole_write_control_holder() {
+fn several_write_holders_counts_only_control() {
     let p = |id, control| crate::session_host::Participant {
         id,
         name: format!("p{id}"),
@@ -10646,15 +10644,10 @@ fn detach_target_is_the_sole_write_control_holder() {
         control,
         version: String::new(),
     };
-    assert_eq!(detach_target(&[p(1, true), p(2, false)]), Some(1));
-    assert_eq!(detach_target(&[p(2, false), p(7, true)]), Some(7));
-    assert_eq!(
-        detach_target(&[p(1, true), p(2, true)]),
-        None,
-        "two holders: either could have asked"
-    );
-    assert_eq!(detach_target(&[p(2, false)]), None);
-    assert_eq!(detach_target(&[]), None);
+    assert!(!several_write_holders(&[p(1, true), p(2, false)]));
+    assert!(several_write_holders(&[p(1, true), p(2, true)]));
+    assert!(!several_write_holders(&[p(2, false)]));
+    assert!(!several_write_holders(&[]));
 }
 
 /// #679: a detached client must leave the shell usable: the inner croft

@@ -88,6 +88,13 @@ pub enum Control {
     /// pump exits as on a detach). Honored from a control-holding client or
     /// the inner channel.
     Kick { id: u64 },
+    /// Inner channel only (#679, the palette's Session: Detach): detach the
+    /// window that asked. The app cannot name it (typing attribution and
+    /// its roster both lag the keys), but the host's state is live: the
+    /// asker holds write control and wrote last, so the host detaches its
+    /// sole holder when that holder is also the last writer, and otherwise
+    /// does nothing. Older hosts drop the unknown variant.
+    DetachWriter,
     /// A client asks for write control for itself, carrying no id: the host
     /// resolves the requester, so a client never needs to learn its own id.
     /// Granted only when NOBODY holds control (#235) — the claim exists so a
@@ -1650,6 +1657,9 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                 Frame::Control(Control::Kick { id: target }) => {
                     kick(host, privileged, my_id, target);
                 }
+                Frame::Control(Control::DetachWriter) if privileged => {
+                    detach_sole_writer(host);
+                }
                 Frame::Control(Control::Claim) => {
                     if let Some(id) = my_id {
                         set_control(host, privileged, my_id, id, true);
@@ -1792,6 +1802,23 @@ fn kick(host: &Host, privileged: bool, requester: Option<u64>, target: u64) {
         // until its deadline expired.
         c.outbox.kill();
         shutdown_now(c.fd);
+    }
+}
+
+/// [`Control::DetachWriter`]: kick the sole write-control holder if it is
+/// also the last writer, else nothing.
+fn detach_sole_writer(host: &Host) {
+    let last = *host.last_writer.lock().unwrap();
+    let target = {
+        let clients = host.clients.lock().unwrap();
+        let mut holders = clients.iter().filter(|c| c.control);
+        match (holders.next(), holders.next()) {
+            (Some(only), None) if Some(only.id) == last => Some(only.id),
+            _ => None,
+        }
+    };
+    if let Some(id) = target {
+        kick(host, true, None, id);
     }
 }
 
@@ -2418,6 +2445,17 @@ impl InnerChannel {
         let ok = write_frame_blocking(
             &mut self.stream,
             &encode_control_frame(&Control::Kick { id }),
+        );
+        self.dead |= !ok;
+        ok
+    }
+
+    /// Ask the host to detach the window that asked (#679): see
+    /// [`Control::DetachWriter`].
+    pub fn detach_writer(&mut self) -> bool {
+        let ok = write_frame_blocking(
+            &mut self.stream,
+            &encode_control_frame(&Control::DetachWriter),
         );
         self.dead |= !ok;
         ok
@@ -3989,6 +4027,132 @@ mod tests {
         a.read_until(|f| {
             matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
         });
+    }
+
+    /// Two clients with the owner holding control; returns them with the
+    /// owner's and guest's ids and an authenticated inner channel.
+    fn owner_and_guest(socket: &Path) -> (TestClient, TestClient, (u64, u64), InnerChannel) {
+        let mut owner = TestClient::connect(socket, "owner", 80, 24);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut guest = TestClient::connect(socket, "guest", 80, 24);
+        let frames = guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let ps = roster(&frames).unwrap();
+        let id_of = |name: &str| ps.iter().find(|p| p.name == name).unwrap().id;
+        let ids = (id_of("owner"), id_of("guest"));
+        let channel = InnerChannel::connect(socket, TEST_TOKEN).expect("channel");
+        (owner, guest, ids, channel)
+    }
+
+    /// Block until the channel sees a typing marker: proof the host has
+    /// taken in the bytes that caused it.
+    fn await_typing(channel: &mut InnerChannel) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(id) = channel.drain_typing().last().copied() {
+                return id;
+            }
+            assert!(Instant::now() < deadline, "no typing marker arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Assert `client`'s connection stays open for a second: a kick shows up
+    /// as EOF on its own socket, whatever the roster says meanwhile.
+    fn assert_still_attached(client: &mut TestClient, why: &str) {
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut buf = [0u8; 65536];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match client.stream.read(&mut buf) {
+                Ok(0) => panic!("{why}"),
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("{why}: {e}"),
+            }
+        }
+    }
+
+    /// Wait for a roster of `len` on `client` and return it.
+    fn roster_of_len(client: &mut TestClient, len: usize) -> Vec<Participant> {
+        let frames = client.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == len)
+        });
+        roster(&frames).unwrap()
+    }
+
+    /// #679, palette Session: Detach: the host, whose roster is live,
+    /// detaches its sole write-control holder when that holder wrote last.
+    #[test]
+    fn detach_writer_detaches_the_sole_holder_that_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let (mut owner, mut guest, (owner_id, _), mut channel) = owner_and_guest(&socket);
+
+        owner.send(&encode_bytes_frame(b"\r"));
+        assert_eq!(await_typing(&mut channel), owner_id);
+        assert!(channel.detach_writer());
+        let ps = roster_of_len(&mut guest, 1);
+        assert_eq!(ps[0].name, "guest", "only the owner detached");
+    }
+
+    /// With two holders the host cannot tell which one asked: nothing
+    /// happens. The grant that follows on the same channel is ordered after
+    /// the request, so its roster shows whether the request acted.
+    #[test]
+    fn detach_writer_refuses_when_several_hold_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let (mut owner, mut guest, (owner_id, guest_id), mut channel) = owner_and_guest(&socket);
+
+        assert!(channel.set_control(guest_id, true));
+        guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().all(|p| p.control))
+        });
+        owner.send(&encode_bytes_frame(b"\r"));
+        assert_eq!(await_typing(&mut channel), owner_id);
+        assert!(channel.detach_writer());
+        assert_still_attached(&mut owner, "the owner was detached with two holders");
+        assert_still_attached(&mut guest, "the guest was detached with two holders");
+    }
+
+    /// A sole holder who is not the last writer did not ask: the writer lost
+    /// control since, so the request is refused rather than hitting them.
+    #[test]
+    fn detach_writer_refuses_a_holder_that_did_not_write_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let (mut owner, mut guest, (owner_id, guest_id), mut channel) = owner_and_guest(&socket);
+
+        owner.send(&encode_bytes_frame(b"\r"));
+        assert_eq!(await_typing(&mut channel), owner_id);
+        assert!(channel.set_control(guest_id, true));
+        assert!(channel.set_control(owner_id, false));
+        guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.name == "owner" && !p.control))
+        });
+        assert!(channel.detach_writer());
+        assert_still_attached(
+            &mut guest,
+            "the sole holder was detached without writing last",
+        );
+        assert_still_attached(&mut owner, "the former writer was detached");
     }
 
     #[test]

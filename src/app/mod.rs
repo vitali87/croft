@@ -24310,23 +24310,25 @@ impl App {
         self.open_list_picker(picker, "No participants yet");
     }
 
-    /// Session: Detach from the palette (#679): disconnect the client that
-    /// asked, leaving the session running. See [`detach_target`] for how
-    /// the asker is found, and why it is sometimes refused; the chord has
-    /// no such limit, because the host matches it in the sender's own
-    /// byte stream.
+    /// Session: Detach from the palette (#679): disconnect the window that
+    /// asked, leaving the session running. The host picks it (see
+    /// [`crate::session_host::Control::DetachWriter`]) and refuses when
+    /// several participants hold write control; the chord has no such
+    /// limit, because the host matches it in the sender's own byte stream.
     fn detach_session_client(&mut self) {
         let Some(channel) = self.session_channel.as_mut() else {
             self.status = String::from(NOT_A_SESSION_TO_DETACH);
             return;
         };
-        let Some(id) = detach_target(&self.session_participants) else {
+        // The host re-checks against its live state; this cached check only
+        // answers the common refusal without a round trip.
+        if several_write_holders(&self.session_participants) {
             self.status = String::from(
                 "Several participants can type here: press Cmd+K Shift+A in the window to detach",
             );
             return;
-        };
-        if !channel.kick(id) {
+        }
+        if !channel.detach_writer() {
             self.status = String::from("Session host unreachable");
         }
     }
@@ -24425,7 +24427,7 @@ impl App {
         if !self.session_host_stale_seen && channel.stale_marker.exists() {
             self.session_host_stale_seen = true;
             self.status = String::from(
-                "Session host runs a pre-update binary; every participant runs Session: Detach from the palette and reattaches to pick up the update",
+                "Session host runs a pre-update binary; every participant closes its window and attaches again to pick up the update",
             );
         }
         let path = channel.presence.clone();
@@ -48963,17 +48965,10 @@ fn takeover_mode_seq() -> Vec<u8> {
 /// Status for Session: Detach outside a persistent session (#679).
 const NOT_A_SESSION_TO_DETACH: &str = "Nothing to detach from: this is not a persistent session";
 
-/// Which client the palette's Session: Detach disconnects (#679): the
-/// sole write-control holder, else nobody. Only a holder's keys reach the
-/// app, so a sole holder pressed the Enter. The typist would not do: its
-/// attribution is drained per loop iteration and can lag the keys, so it
-/// may name another holder, or one who already left.
-fn detach_target(roster: &[crate::session_host::Participant]) -> Option<u64> {
-    let mut holders = roster.iter().filter(|p| p.control);
-    match (holders.next(), holders.next()) {
-        (Some(only), None) => Some(only.id),
-        _ => None,
-    }
+/// Whether more than one participant holds write control, in which case
+/// the palette's Session: Detach cannot tell which window asked (#679).
+fn several_write_holders(roster: &[crate::session_host::Participant]) -> bool {
+    roster.iter().filter(|p| p.control).nth(1).is_some()
 }
 
 /// The inverse of [`takeover_mode_seq`]: the modes croft hands back when it
