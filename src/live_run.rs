@@ -391,6 +391,17 @@ impl Drop for ReportFile {
     }
 }
 
+/// Kill the run and everything it started (its process group, on unix).
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
 /// How much of a failed run's stderr is kept for its error line.
 const STDERR_TAIL: usize = 16 * 1024;
 
@@ -403,7 +414,8 @@ fn run(job: &Job) -> Result<Report, String> {
         .filter(|p| p.is_dir())
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
-    let mut child = Command::new(&job.python)
+    let mut cmd = Command::new(&job.python);
+    cmd
         .arg("-c")
         .arg(INSTRUMENTER)
         .arg(&job.path)
@@ -414,15 +426,27 @@ fn run(job: &Job) -> Result<Report, String> {
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Its own process group, so the kill below also takes down anything the
+    // script started (a server, `sleep` in a subprocess): otherwise every
+    // re-run on a pause in typing would leave another one behind.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Live Run: cannot start {}: {e}", job.python.display()))?;
     let mut source = job.lines.join("\n");
     source.push('\n');
+    // Written from its own thread: an interpreter that never reads stdin
+    // would block a large buffer's write forever, before the kill deadline
+    // below even starts. A write error means it exited; stderr says why.
     if let Some(mut stdin) = child.stdin.take() {
-        // A write error means the interpreter already exited; its stderr
-        // below says why.
-        let _ = stdin.write_all(source.as_bytes());
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(source.as_bytes());
+        });
     }
     // Drained while the script runs: one that writes more than a pipe
     // holds would otherwise block on stderr until the deadline killed it.
@@ -450,7 +474,7 @@ fn run(job: &Job) -> Result<Report, String> {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_group(&mut child);
                 let _ = child.wait();
                 return Err(format!(
                     "Live Run: killed after {}s (a call ignored the interrupt)",

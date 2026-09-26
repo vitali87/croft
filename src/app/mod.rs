@@ -1655,6 +1655,16 @@ fn search_editor_label(query: &str) -> PathBuf {
     })
 }
 
+/// Whether a tab is a Search Editor by its label, not just by its text: a
+/// real file that happens to open with `# Query: ` must keep its Enter key,
+/// and must never have a rerun overwrite it.
+fn is_search_editor_tab(path: Option<&Path>) -> bool {
+    path.is_some_and(|p| {
+        let p = p.to_string_lossy();
+        p == "Search Editor" || p.starts_with("Search: ")
+    })
+}
+
 /// A query as the status line quotes it, shortened.
 fn header_query_for_status(query: &str) -> String {
     let q: String = query.chars().take(40).collect();
@@ -3619,6 +3629,9 @@ pub struct App {
     /// typed, the `gh` to run, and where finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
     review_pending_pr: Option<(PathBuf, String)>,
+    /// A Submit Review or export is in flight; another is refused until it
+    /// reports, so the same comments are never posted twice.
+    review_submitting: bool,
     /// Sticky notes (#367): every note in the workspace, where the owner
     /// keeps them (`None` under test), and which box id is which note.
     notes: crate::sticky_notes::Notes,
@@ -5340,6 +5353,7 @@ impl App {
             review_boxes: None,
             review_pending: Vec::new(),
             review_pending_pr: None,
+            review_submitting: false,
             notes: notes_path
                 .as_deref()
                 .map(crate::sticky_notes::Notes::load)
@@ -25303,6 +25317,10 @@ impl App {
         if !self.pending_is_for(&root, &number) {
             return;
         }
+        if self.review_submitting {
+            self.status = String::from("A review is already being submitted");
+            return;
+        }
         if event == ReviewEvent::Comment && summary.is_empty() && self.review_pending.is_empty() {
             self.status = String::from("Nothing to submit: add a comment or a summary");
             return;
@@ -25315,10 +25333,14 @@ impl App {
                 event,
                 summary,
                 pending: self.review_pending.clone(),
-                settles: crate::review_ops::Settles::default(),
+                settles: crate::review_ops::Settles {
+                    pending: self.review_pending.clone(),
+                    ..Default::default()
+                },
             },
             self.review_tx.clone(),
         );
+        self.review_submitting = true;
         self.status = String::from("Submitting review…");
     }
 
@@ -25419,8 +25441,11 @@ impl App {
                     folded,
                     settles,
                 } => {
-                    self.review_pending.clear();
-                    self.review_pending_pr = None;
+                    self.review_submitting = false;
+                    self.review_pending.retain(|c| !settles.pending.contains(c));
+                    if self.review_pending.is_empty() {
+                        self.review_pending_pr = None;
+                    }
                     // Exported navigator notes now live on GitHub; reload
                     // shows them there, as threads, rather than twice.
                     // Exported sticky notes are settled: resolved for everyone.
@@ -25450,7 +25475,10 @@ impl App {
                         ),
                     };
                 }
-                Outcome::Failed(e) => self.status = e,
+                Outcome::Failed(e) => {
+                    self.review_submitting = false;
+                    self.status = e;
+                }
             }
         }
         changed
@@ -28467,6 +28495,16 @@ impl App {
         if !self.pending_is_for(&root, &number) {
             return;
         }
+        if self.review_submitting {
+            self.status = String::from("A review is already being submitted");
+            return;
+        }
+        let pending: Vec<_> = self
+            .review_pending
+            .iter()
+            .filter(|c| comments.contains(c))
+            .cloned()
+            .collect();
         crate::review_ops::spawn(
             self.review_gh.clone(),
             root,
@@ -28475,10 +28513,15 @@ impl App {
                 event: crate::review_threads::ReviewEvent::Comment,
                 summary: String::new(),
                 pending: comments,
-                settles: crate::review_ops::Settles { notes, sticky },
+                settles: crate::review_ops::Settles {
+                    notes,
+                    sticky,
+                    pending,
+                },
             },
             self.review_tx.clone(),
         );
+        self.review_submitting = true;
         self.status = String::from("Posting comments…");
     }
 
@@ -44516,7 +44559,10 @@ impl App {
     /// Search Editor: Rerun (#615, Cmd+K Shift+R): search again for the query
     /// the active Search Editor's header spells, off the UI thread.
     fn rerun_search_editor(&mut self) {
-        let Some(header) = crate::search_editor::parse_header(&self.editor.lines) else {
+        let header = is_search_editor_tab(self.editor.path.as_deref())
+            .then(|| crate::search_editor::parse_header(&self.editor.lines))
+            .flatten();
+        let Some(header) = header else {
             self.status = String::from("Not a Search Editor");
             return;
         };
@@ -44583,7 +44629,9 @@ impl App {
     /// Open the match under the caret when the active tab is a Search Editor
     /// and the caret is on a result row. Returns whether it did.
     fn open_search_editor_result(&mut self) -> bool {
-        if !crate::search_editor::is_search_editor(&self.editor.lines) {
+        if !is_search_editor_tab(self.editor.path.as_deref())
+            || !crate::search_editor::is_search_editor(&self.editor.lines)
+        {
             return false;
         }
         let Some((path, line)) = crate::search_editor::location_at(

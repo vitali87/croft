@@ -120,10 +120,18 @@ pub fn parse_header(lines: &[String]) -> Option<Header> {
 /// number, under the nearest `path:` heading above it.
 pub fn location_at(lines: &[String], row: usize, root: &Path) -> Option<(PathBuf, usize)> {
     let line_no = parse_result_line(lines.get(row)?)?;
-    let heading = lines[..row]
+    // Only the header is skipped, not every `#` line: `#notes.md:` is a
+    // file heading like any other.
+    let header_end = 1 + lines
+        .iter()
+        .skip(1)
+        .take_while(|l| l.starts_with("# "))
+        .count();
+    let heading = lines
+        .get(header_end..row)?
         .iter()
         .rev()
-        .find(|l| !l.starts_with(' ') && l.ends_with(':') && !l.starts_with('#'))?;
+        .find(|l| !l.starts_with(' ') && l.ends_with(':'))?;
     let rel = heading.strip_suffix(':')?;
     let path = Path::new(rel);
     let path = if path.is_absolute() {
@@ -215,6 +223,18 @@ mod tests {
         );
         assert_eq!(location_at(&ls, 4, root), None, "a heading is not a result");
         assert_eq!(location_at(&ls, 0, root), None, "nor is the header");
+    }
+
+    #[test]
+    fn a_file_named_with_a_leading_hash_is_a_heading_too() {
+        let hits = vec![hit("/p/a.rs", 3, "x"), hit("/p/#b.rs", 7, "x")];
+        let text = render(&Header::default(), &hits, Path::new("/p"));
+        let ls = lines(&text);
+        let row = ls.iter().rposition(|l| l.starts_with("  7:")).unwrap();
+        assert_eq!(
+            location_at(&ls, row, Path::new("/p")),
+            Some((PathBuf::from("/p/#b.rs"), 7))
+        );
     }
 
     #[test]

@@ -785,7 +785,10 @@ fn open_link(url: &str) -> Result<()> {
     }
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(crate::deep_link::argv(&link));
+    cmd.args(crate::deep_link::argv(
+        &link,
+        std::env::var("HOME").ok().as_deref(),
+    ));
     if let Some(focus) = link.focus {
         cmd.env("CROFT_FOCUS", focus.as_str());
     }
