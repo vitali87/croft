@@ -933,7 +933,7 @@ impl Command {
             Command::OpenWorkspaceOnSshHost => "",
             Command::ScrubHistory => "",
             Command::FleetRun => "",
-            Command::OpenAsSymbolTab => "",
+            Command::OpenAsSymbolTab => "Cmd+K Shift+V",
             Command::LoadReviewThreads => "",
             Command::ReviewAddComment => "",
             Command::ReviewSubmit => "",
