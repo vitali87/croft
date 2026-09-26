@@ -4284,11 +4284,17 @@ impl Editor {
     /// Number of visual rows a logical line occupies. Avoids allocating the
     /// segment vector for the common case of a line that already fits.
     fn line_visual_rows(&self, line: usize, width: usize) -> usize {
+        // A line inside a collapsed fold is not drawn: no rows. Counted, it
+        // put Down/Up onto the hidden line (which then unfolded) and threw
+        // the scrollbar and wheel off by the hidden rows.
+        if self.is_line_hidden(line) {
+            return 0;
+        }
         if width == 0 {
             return 1;
         }
         let len = self.line_char_len(line);
-        if len <= width {
+        if len <= width && self.lines.get(line).is_none_or(|l| l.is_ascii()) {
             1
         } else {
             self.line_segments(line, width).len()
@@ -4300,6 +4306,9 @@ impl Editor {
     /// (totals, viewport top, cursor row, decomposition) speaks group rows
     /// so boxes shift everything below them consistently.
     fn group_visual_rows(&self, line: usize, width: usize) -> usize {
+        if self.is_line_hidden(line) {
+            return 0;
+        }
         self.line_visual_rows(line, width) + self.box_rows_at_line(line, width)
     }
 
@@ -4379,6 +4388,9 @@ impl Editor {
     fn logical_pos_at_visual_row(&self, target: usize, width: usize) -> (usize, usize) {
         let mut acc = 0;
         for line in 0..self.lines.len() {
+            if self.is_line_hidden(line) {
+                continue;
+            }
             let segs = self.line_segments(line, width);
             let group = segs.len() + self.box_rows_at_line(line, width);
             if acc + group > target {
@@ -4399,7 +4411,7 @@ impl Editor {
         let mut acc = 0;
         for line in 0..self.lines.len() {
             let segs = self.line_visual_rows(line, width);
-            let group = segs + self.box_rows_at_line(line, width);
+            let group = self.group_visual_rows(line, width);
             if acc + group > target {
                 return target - acc >= segs;
             }
@@ -8348,6 +8360,8 @@ impl Editor {
     /// already inside the span being built is skipped: an inner fold's range is
     /// contained by its outer's, so it can add nothing.
     fn rebuild_hidden_ranges(&mut self) {
+        // Hidden lines take no wrap rows, so the cached totals change too.
+        self.wrap_total_cache.clear();
         #[cfg(test)]
         FOLD_RANGE_REBUILDS.with(|c| c.set(c.get() + 1));
         let mut out: Vec<(usize, usize)> = Vec::new();
@@ -12333,18 +12347,45 @@ fn is_wrap_break_after(c: char) -> bool {
 /// already fits, an empty line, or `width == 0` yields one segment so the line
 /// still occupies a row. Mirrors VS Code's monospace wrap: pick the rightmost
 /// break opportunity within the column, else split the over-long token.
+/// Screen cells a char takes in the editor: its display width, with a tab
+/// drawn as one cell (the editor paints tabs as a single glyph).
+fn char_cells(c: char) -> usize {
+    if c == '\t' {
+        1
+    } else {
+        unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+}
+
+fn cells_of(chars: &[char]) -> usize {
+    chars.iter().map(|&c| char_cells(c)).sum()
+}
+
 fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
-    if width == 0 || chars.len() <= width {
+    if width == 0 || chars.len() <= width && cells_of(chars) <= width {
         return vec![(0, chars.len())];
     }
     let mut segs = Vec::new();
     let mut start = 0;
     while start < chars.len() {
-        if chars.len() - start <= width {
+        if cells_of(&chars[start..]) <= width {
             segs.push((start, chars.len()));
             break;
         }
-        let limit = start + width;
+        // The hard limit counts CELLS, as the renderer clips: counted in
+        // chars, a row of wide (CJK) characters was twice as wide as the
+        // pane and its second half was never shown on any row. At least one
+        // char per row, so a char wider than the pane cannot stall.
+        let mut limit = start;
+        let mut used = 0;
+        while limit < chars.len() {
+            let w = char_cells(chars[limit]);
+            if used + w > width && limit > start {
+                break;
+            }
+            used += w;
+            limit += 1;
+        }
         // Scan back from the hard limit for the rightmost break-after char;
         // `i` is the char count, so the char sits at `chars[i - 1]` and the
         // segment becomes `[start, i)`. Stop at `start + 1` so a break right
@@ -13333,9 +13374,16 @@ impl Widget for &mut Editor {
             // same code paints both modes.
             let raw = &self.lines[line_idx];
             let line_len = self.line_char_len(line_idx);
-            let row_width = (row_end - row_start) as u16;
             let byte_start = byte_index_of_char(raw, row_start);
             let byte_end = byte_index_of_char(raw, row_end);
+            // A wrapped row's width in CELLS, which is what the painters clip
+            // by: its char count cut a row of wide characters in half.
+            let row_width = if wrap {
+                let cells: usize = raw[byte_start..byte_end].chars().map(char_cells).sum();
+                cells.max(row_end - row_start).min(text_width as usize) as u16
+            } else {
+                (row_end - row_start) as u16
+            };
             let visible_raw = &raw[byte_start..byte_end];
             let seg_bytes = byte_end - byte_start;
             let empty: Vec<HiSpan> = Vec::new();
@@ -14328,7 +14376,14 @@ impl Editor {
             // its last cell (end of line / blank line — where the user is
             // about to type). Bail only when the cell would fall outside the
             // text column: past the pane edge or onto the vertical scrollbar.
-            let visible_col = self.cursor_col - start;
+            // In cells, as the row was painted: wide characters before the
+            // caret push it right by two each.
+            let visible_col: usize = self.lines[self.cursor_row]
+                .chars()
+                .skip(start)
+                .take(self.cursor_col - start)
+                .map(char_cells)
+                .sum();
             let x = text_x as usize + visible_col;
             let right = (self.last_inner.x + self.last_inner.width)
                 .saturating_sub(u16::from(self.last_scrollbar.width > 0))
@@ -23128,6 +23183,57 @@ mod tests {
         // the slash rather than mid-segment.
         let segs = wrap_segments(&chars("abc/defgh"), 6);
         assert_eq!(segs, vec![(0, 4), (4, 9)]);
+    }
+
+    #[test]
+    fn wrap_segments_count_wide_characters_as_two_cells() {
+        let line: String = std::iter::repeat_n('漢', 60).collect();
+        let segs = wrap_segments(&chars(&line), 30);
+        assert_eq!(segs.len(), 4, "{segs:?}");
+        assert!(segs.iter().all(|&(s, e)| e - s == 15), "{segs:?}");
+        // A char wider than the pane still makes progress.
+        assert_eq!(wrap_segments(&chars("漢漢"), 1), vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn down_in_wrap_mode_steps_over_a_collapsed_fold() {
+        let mut e = editor_with("fn a() {\n    one\n    two\n}\nafter");
+        e.wrap_override = Some(true);
+        e.last_inner = Rect::new(0, 0, 40, 10);
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1) && e.is_line_hidden(2));
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.move_down();
+        assert!(
+            !e.is_line_hidden(e.cursor_row),
+            "landed on hidden line {}",
+            e.cursor_row
+        );
+        assert!(e.is_line_hidden(1), "the fold stays collapsed");
+    }
+
+    #[test]
+    fn a_wrapped_cjk_line_shows_every_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.md");
+        let text: String = (0..60)
+            .map(|i| char::from_u32(0x4e00 + i).unwrap())
+            .collect();
+        std::fs::write(&p, &text).unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        e.wrap_override = Some(true);
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        let shown: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        for c in text.chars() {
+            assert!(shown.contains(c), "{c} missing from the wrapped render");
+        }
     }
 
     #[test]
