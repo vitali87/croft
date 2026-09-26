@@ -387,10 +387,22 @@ pub fn split_for_highlight(line: &str, needle: &str, opts: SearchOpts) -> Vec<(S
     } else {
         (line.to_lowercase(), needle.to_lowercase())
     };
-    // If lowercasing changed the byte length (rare Unicode edge case) we
-    // can't safely map `haystack` indices back into `line`, so bail out
-    // without highlights.
-    if haystack.len() != line.len() || search_for.is_empty() {
+    // Lowercasing that changes any character's byte length (`ẞ`, `İ`, the
+    // Kelvin sign) shifts every offset after it, even when the total length
+    // happens to come out equal: those lines go through the regex path,
+    // whose case folding matches on the original bytes.
+    let shifts = |t: &str| {
+        t.chars()
+            .any(|c| c.to_lowercase().map(char::len_utf8).sum::<usize>() != c.len_utf8())
+    };
+    if !opts.case_sensitive && (shifts(line) || shifts(needle)) {
+        let literal = SearchOpts {
+            use_regex: true,
+            ..opts
+        };
+        return split_for_highlight_regex(line, &regex::escape(needle), literal);
+    }
+    if search_for.is_empty() {
         return vec![(line.to_string(), false)];
     }
     let mut out: Vec<(String, bool)> = Vec::new();
@@ -707,6 +719,10 @@ fn build_replace_regex(query: &str, opts: SearchOpts) -> Option<regex::Regex> {
     if !opts.case_sensitive {
         pattern.push_str("(?i)");
     }
+    // The search that found the hits matches line by line, so `^` and `$`
+    // mean a line's ends here too (CRLF-aware), not the whole file's: `^foo`
+    // replaced only the first of the lines the preview listed.
+    pattern.push_str("(?mR)");
     if opts.whole_word {
         pattern.push_str("\\b(?:");
         pattern.push_str(&body);
@@ -715,6 +731,37 @@ fn build_replace_regex(query: &str, opts: SearchOpts) -> Option<regex::Regex> {
         pattern.push_str(&body);
     }
     regex::Regex::new(&pattern).ok()
+}
+
+/// `replacement` with each numbered capture reference braced (`$1_old` to
+/// `${1}_old`). The regex crate reads `$1_old` as a group NAMED `1_old`,
+/// which expands to nothing and deletes the match; VS Code reads group 1
+/// then `_old`. `$$` stays a literal dollar.
+pub fn brace_group_refs(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'$') {
+            chars.next();
+            out.push_str("$$");
+            continue;
+        }
+        let mut digits = String::new();
+        while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+            digits.push(d);
+            chars.next();
+        }
+        if digits.is_empty() {
+            out.push('$');
+        } else {
+            out.push_str(&format!("${{{digits}}}"));
+        }
+    }
+    out
 }
 
 /// Replace every match of `query` (honouring `opts`) in `content` with
@@ -736,7 +783,8 @@ pub fn replace_in_text(
         return Some((content.to_string(), 0));
     }
     let out = if opts.use_regex {
-        re.replace_all(content, replacement).into_owned()
+        re.replace_all(content, brace_group_refs(replacement).as_str())
+            .into_owned()
     } else {
         // Literal replacement: escape `$` so the substituted text is inserted
         // verbatim rather than parsed as a capture reference.
@@ -759,7 +807,8 @@ pub fn expand_replacement(
         return replacement.to_string();
     };
     if opts.use_regex {
-        re.replace(matched, replacement).into_owned()
+        re.replace(matched, brace_group_refs(replacement).as_str())
+            .into_owned()
     } else {
         replacement.to_string()
     }
@@ -2202,6 +2251,26 @@ impl Widget for &mut SearchPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_regex_replace_honours_line_anchors_and_group_suffixes() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(
+            replace_in_text("foo\nfoo\n", "^foo", "x", opts),
+            Some((String::from("x\nx\n"), 2))
+        );
+        assert_eq!(
+            replace_in_text("a foo\r\nb foo\r\n", "foo$", "x", opts),
+            Some((String::from("a x\r\nb x\r\n"), 2))
+        );
+        assert_eq!(
+            replace_in_text("foo", "(foo)", "$1_old", opts).map(|r| r.0),
+            Some(String::from("foo_old"))
+        );
+    }
     use std::fs;
     use tempfile::TempDir;
 
