@@ -44739,6 +44739,77 @@ fn a_re_root_drops_the_previous_workspaces_review_queue() {
     assert!(!app.tree.is_agent_touched(&inside));
 }
 
+/// #345: the AGENT LANE rows are each agent then its files, unreviewed
+/// first, labelled relative to the workspace root.
+#[test]
+fn agent_lane_rows_list_each_agent_then_its_files_unreviewed_first() {
+    use crate::widgets::agent_lane::LaneRow;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let a = root.join("src/a.rs");
+    let b = root.join("src/b.rs");
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    assert!(
+        app.agent_lane_panel_rows().is_empty(),
+        "nothing to show before any agent wrote"
+    );
+    let working = vec![String::from("claude")];
+    app.agent_ledger.record_write(&a, 1, &working);
+    app.agent_ledger.record_write(&b, 2, &working);
+    app.agent_ledger.mark_reviewed("claude", &a, 1, None);
+    let rows = app.agent_lane_panel_rows();
+    assert_eq!(
+        rows[0],
+        LaneRow::Agent {
+            name: String::from("claude"),
+            unreviewed: 1
+        }
+    );
+    let files: Vec<(String, bool)> = rows[1..]
+        .iter()
+        .map(|r| match r {
+            LaneRow::File {
+                label, unreviewed, ..
+            } => (label.clone(), *unreviewed),
+            other => panic!("expected a file row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec![
+            (String::from("src/b.rs"), true),
+            (String::from("src/a.rs"), false)
+        ]
+    );
+}
+
+/// #345: Cmd+K V shows the section, open, even after it was hidden from the
+/// ⋯ menu; with no agent activity it says so instead.
+#[test]
+fn cmd_k_v_shows_the_agent_lane_section_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let f = root.join("x.rs");
+    std::fs::write(&f, "x").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.show_agent_lane_section();
+    assert!(app.status.contains("no agent"), "status: {}", app.status);
+
+    app.agent_ledger
+        .record_write(&f, 1, &[String::from("claude")]);
+    if app.explorer_views.is_visible(ExplorerView::AgentLane) {
+        app.toggle_explorer_view(ExplorerView::AgentLane);
+    }
+    assert!(app.agent_lane_panel.collapsed);
+    app.show_agent_lane_section();
+    assert!(app.explorer_views.is_visible(ExplorerView::AgentLane));
+    assert!(!app.agent_lane_panel.collapsed);
+    assert_eq!(app.sidebar_view, SidebarView::Explorer);
+}
+
 /// #345: the agent lane attributes workspace writes to whichever agents
 /// were WORKING when they landed, keeps a review baseline per file, and
 /// never blames an agent for the user's own saves.

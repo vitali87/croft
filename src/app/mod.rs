@@ -82,16 +82,18 @@ pub enum ExplorerView {
     Outline,
     Timeline,
     Dependencies,
+    AgentLane,
 }
 
 impl ExplorerView {
     /// Every view, in stacking order — the order the ⋯ menu lists them.
-    pub const ALL: [ExplorerView; 5] = [
+    pub const ALL: [ExplorerView; 6] = [
         ExplorerView::OpenEditors,
         ExplorerView::Folders,
         ExplorerView::Outline,
         ExplorerView::Timeline,
         ExplorerView::Dependencies,
+        ExplorerView::AgentLane,
     ];
 
     /// Menu / section-header label, matching VS Code's wording. Dependencies is
@@ -104,6 +106,7 @@ impl ExplorerView {
             ExplorerView::Outline => "Outline",
             ExplorerView::Timeline => "Timeline",
             ExplorerView::Dependencies => "Dependencies",
+            ExplorerView::AgentLane => "Agent Lane",
         }
     }
 }
@@ -133,6 +136,7 @@ impl ExplorerViewVisibility {
             ExplorerView::Outline => self.flags.outline,
             ExplorerView::Timeline => self.flags.timeline,
             ExplorerView::Dependencies => self.flags.dependencies,
+            ExplorerView::AgentLane => self.flags.agent_lane,
         }
     }
 
@@ -144,6 +148,7 @@ impl ExplorerViewVisibility {
             ExplorerView::Outline => &mut self.flags.outline,
             ExplorerView::Timeline => &mut self.flags.timeline,
             ExplorerView::Dependencies => &mut self.flags.dependencies,
+            ExplorerView::AgentLane => &mut self.flags.agent_lane,
         };
         *slot = !*slot;
         *slot
@@ -2594,6 +2599,8 @@ pub struct App {
     /// The Explorer's TIMELINE section: the active file's git history, fetched
     /// off-thread via [`crate::git::file_history`]. See [`TimelinePanel`].
     pub timeline: TimelinePanel,
+    /// The Explorer's AGENT LANE section (#345).
+    pub agent_lane_panel: crate::widgets::agent_lane::AgentLanePanel,
     /// The Explorer's DEPENDENCIES section: the workspace's packages, resolved
     /// off-thread per detected ecosystem. See [`DependenciesPanel`].
     pub dependencies: DependenciesPanel,
@@ -4844,6 +4851,7 @@ impl App {
             outline,
             open_editors,
             timeline,
+            agent_lane_panel: crate::widgets::agent_lane::AgentLanePanel::new(),
             dependencies,
             dep_ecosystems,
             explorer_views,
@@ -11177,6 +11185,52 @@ impl App {
         );
     }
 
+    /// The AGENT LANE rows (#345): each agent that changed files, then those
+    /// files as the ledger orders them (unreviewed first), labelled relative
+    /// to their workspace root.
+    fn agent_lane_panel_rows(&self) -> Vec<crate::widgets::agent_lane::LaneRow> {
+        use crate::widgets::agent_lane::LaneRow;
+        let mut rows = Vec::new();
+        for agent in self.agent_ledger.agents() {
+            rows.push(LaneRow::Agent {
+                name: agent.to_string(),
+                unreviewed: self.agent_ledger.unreviewed_count(agent),
+            });
+            for file in self.agent_ledger.lane(agent) {
+                let label = self
+                    .roots
+                    .owning_root(&file.path)
+                    .and_then(|root| file.path.strip_prefix(root).ok())
+                    .unwrap_or(&file.path)
+                    .display()
+                    .to_string();
+                rows.push(LaneRow::File {
+                    agent: agent.to_string(),
+                    path: file.path.clone(),
+                    label,
+                    unreviewed: file.unreviewed(),
+                });
+            }
+        }
+        rows
+    }
+
+    /// Cmd+K V (#345): make the AGENT LANE section visible and open, on the
+    /// Explorer, or say there is nothing in it yet.
+    fn show_agent_lane_section(&mut self) {
+        if self.agent_ledger.agents().is_empty() {
+            self.status = String::from("Agent Lane: no agent has changed a file yet");
+            return;
+        }
+        if !self.explorer_views.is_visible(ExplorerView::AgentLane) {
+            self.toggle_explorer_view(ExplorerView::AgentLane);
+        }
+        self.agent_lane_panel.collapsed = false;
+        self.show_tree = true;
+        self.set_sidebar_view(SidebarView::Explorer);
+        self.focus_pane(Pane::Tree);
+    }
+
     /// Lay out and paint the Explorer's visible stacked sub-views top-to-bottom
     /// inside `area` (the region above the SYSTEM footer). Folders (the file
     /// tree) is the flexible region that absorbs leftover rows; every other
@@ -11188,6 +11242,9 @@ impl App {
         self.outline.last_area = Rect::default();
         self.timeline.last_area = Rect::default();
         self.dependencies.last_area = Rect::default();
+        self.agent_lane_panel.last_area = Rect::default();
+        let lane_rows = self.agent_lane_panel_rows();
+        self.agent_lane_panel.set_rows(lane_rows);
 
         let folders_visible = self.explorer_views.is_visible(ExplorerView::Folders);
         if !folders_visible {
@@ -11210,12 +11267,18 @@ impl App {
             if !self.explorer_views.is_visible(v) || !self.explorer_view_available(v) {
                 continue;
             }
+            // Offered in the ⋯ menu always, but drawn only once an agent has
+            // changed something: an empty lane would cost rows for nothing.
+            if v == ExplorerView::AgentLane && self.agent_lane_panel.rows().is_empty() {
+                continue;
+            }
             let h = match v {
                 ExplorerView::Folders => 0,
                 ExplorerView::OpenEditors => self.open_editors.desired_height(area.height),
                 ExplorerView::Outline => self.outline.desired_height(area.height),
                 ExplorerView::Timeline => self.timeline.desired_height(area.height),
                 ExplorerView::Dependencies => self.dependencies.desired_height(area.height),
+                ExplorerView::AgentLane => self.agent_lane_panel.desired_height(area.height),
             };
             heights.push((v, h));
         }
@@ -11273,6 +11336,7 @@ impl App {
                 ExplorerView::Outline => frame.render_widget(&mut self.outline, rect),
                 ExplorerView::Timeline => frame.render_widget(&mut self.timeline, rect),
                 ExplorerView::Dependencies => frame.render_widget(&mut self.dependencies, rect),
+                ExplorerView::AgentLane => frame.render_widget(&mut self.agent_lane_panel, rect),
             }
         }
     }
@@ -15453,6 +15517,8 @@ impl App {
         self.timeline.focus_gradient = gradient;
         self.timeline.theme = self.theme;
         self.timeline.focused = explorer_focused;
+        self.agent_lane_panel.theme = self.theme;
+        self.agent_lane_panel.focused = explorer_focused;
         self.commit_graph.focus_gradient = gradient;
         self.commit_graph.theme = self.theme;
         self.commit_graph.focused =
@@ -16168,6 +16234,7 @@ impl App {
             self.outline.hover_pointer = panel_pointer;
             self.open_editors.hover_pointer = panel_pointer;
             self.timeline.hover_pointer = panel_pointer;
+            self.agent_lane_panel.hover_pointer = panel_pointer;
             self.dependencies.hover_pointer = panel_pointer;
             self.extensions.hover_pointer = panel_pointer;
             self.commit_graph.hover_pointer = panel_pointer;
@@ -19211,6 +19278,11 @@ impl App {
             // Cmd+K B: show the Testing view (B for the beaker icon). Cmd+Shift+T
             // — VS Code's Testing-ish chord — is already croft's focus-Terminal
             // chord, so the Cmd+K leader hosts this the way it hosts Zen (Cmd+K Z).
+            // Cmd+K V (#345): show the AGENT LANE section, open.
+            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'v') => {
+                self.show_agent_lane_section();
+                true
+            }
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'b') => {
                 self.open_testing_view();
                 true
@@ -41720,6 +41792,21 @@ impl App {
                         && let Some((path, hash)) = self.timeline.diff_target(idx)
                     {
                         self.open_timeline_diff(path, hash);
+                    }
+                    return;
+                }
+                // AGENT LANE (#345): the header collapses it; a file row opens
+                // that file's diff against its reviewed snapshot.
+                if rect_contains(self.agent_lane_panel.last_area, m.column, m.row) {
+                    if self.agent_lane_panel.hit_header(m.column, m.row) {
+                        self.agent_lane_panel.toggle_collapse();
+                    } else if let Some(crate::widgets::agent_lane::LaneRow::File {
+                        agent,
+                        path,
+                        ..
+                    }) = self.agent_lane_panel.row_at(m.row).cloned()
+                    {
+                        self.diff_agent_lane_row(&agent, &path);
                     }
                     return;
                 }
