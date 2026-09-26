@@ -4952,6 +4952,48 @@ fn drain_reports_writes_in_a_workspace_under_a_noise_named_ancestor() {
     );
 }
 
+/// A directory made after the watcher started is watched too: on Linux
+/// every directory needs its own watch, installed once at startup, so a
+/// write inside a new folder used to go unreported.
+#[test]
+fn writes_inside_a_directory_made_after_startup_are_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    for _ in 1..=FS_SYNC_TICKS {
+        app.try_install_pending_init();
+        let _ = app.fs_watch.drain(&mut app.tree, &app.editor);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let dir = root.join("newdir");
+    std::fs::create_dir(&dir).unwrap();
+    let early = dir.join("early.rs");
+    std::fs::write(&early, b"1").unwrap();
+    let mut changed: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
+    for _ in 1..=FS_SYNC_TICKS {
+        changed.extend(app.fs_watch.drain(&mut app.tree, &app.editor).changed_files);
+        if changed.contains(&early) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(changed.contains(&early), "{changed:?}");
+    let late = dir.join("late.rs");
+    std::fs::write(&late, b"2").unwrap();
+    for _ in 1..=FS_SYNC_TICKS {
+        changed.extend(app.fs_watch.drain(&mut app.tree, &app.editor).changed_files);
+        if changed.contains(&late) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        changed.contains(&late),
+        "the new folder is watched: {changed:?}"
+    );
+}
+
 #[test]
 fn fs_watcher_prunes_noise_dirs_nested_below_the_workspace_root() {
     // Regression for the freeze when the workspace root is a *parent of

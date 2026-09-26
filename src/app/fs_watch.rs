@@ -247,6 +247,7 @@ impl FsWatch {
             return out;
         };
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut new_dirs: Vec<PathBuf> = Vec::new();
         while let Ok(result) = rx.try_recv() {
             out.got_any = true;
             let events = match result {
@@ -258,7 +259,11 @@ impl FsWatch {
                     out.rescan_dropped_events = true;
                 }
                 let mutates_content = event_mutates_content(&ev.event.kind);
+                let arrives = arrives_at_path(&ev.event.kind);
                 for path in &ev.event.paths {
+                    if arrives && path.is_dir() && !self.is_noise_event_path(path) {
+                        new_dirs.push(path.clone());
+                    }
                     if mutates_content && editor.matches_open_path(path) {
                         out.touched_open_file = true;
                     }
@@ -287,6 +292,7 @@ impl FsWatch {
                 }
             }
         }
+        self.watch_new_dirs(new_dirs, &mut out);
         if !affected.is_empty() {
             for dir in affected.iter().rev() {
                 if let Some(idx) = tree.index_of_dir(dir) {
@@ -302,6 +308,57 @@ impl FsWatch {
             out.finder_relevant = affected.iter().any(|p| !self.is_noise_event_path(p));
         }
         out
+    }
+
+    /// Watch directories that appeared after the watcher started (a
+    /// `mkdir`, a `git checkout`, `rm -rf build && mkdir build`). Linux
+    /// watches one directory at a time, installed once at startup, so
+    /// without this nothing inside a new directory was ever reported. Files
+    /// already in it may have been written before its watch existed, so
+    /// they count as changed.
+    fn watch_new_dirs(&mut self, dirs: Vec<PathBuf>, out: &mut FsDrain) {
+        if dirs.is_empty() || cfg!(target_os = "macos") {
+            // FSEvents streams are recursive: a new directory under one is
+            // already covered.
+            return;
+        }
+        let (root, canon) = (self.watch_root.clone(), self.canon_watch_root.clone());
+        let noise = |p: &Path| {
+            is_noise_path_under_root(p, if p.starts_with(&root) { &root } else { &canon })
+        };
+        let Some(watcher) = self._watcher.as_mut() else {
+            out.rescan_dropped_events = true;
+            return;
+        };
+        // Bounded per drain: a huge tree unpacked at once falls back to the
+        // poll and says the ledger may be short.
+        let mut budget = 2_000usize;
+        let mut stack = dirs;
+        while let Some(dir) = stack.pop() {
+            if budget == 0 {
+                out.rescan_dropped_events = true;
+                return;
+            }
+            budget -= 1;
+            let _ = watcher.watch(&dir, notify::RecursiveMode::NonRecursive);
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.filter_map(Result::ok) {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    let name = path.file_name().unwrap_or_default();
+                    if !FS_WATCH_PROTECTED_NAMES.iter().any(|n| name == *n) && !noise(&path) {
+                        stack.push(path);
+                    }
+                } else if ft.is_file() && !noise(&path) {
+                    out.changed_files.insert(path);
+                }
+            }
+        }
     }
 
     /// Whether the next `poll` would do any work. `drain_fs_events` runs every
@@ -699,6 +756,17 @@ fn removes_a_directory(kind: &notify::EventKind) -> bool {
     use notify::EventKind;
     use notify::event::RemoveKind;
     matches!(kind, EventKind::Remove(RemoveKind::Folder))
+}
+
+/// A path that now exists where it did not: created, or renamed onto.
+fn arrives_at_path(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::{ModifyKind, RenameMode};
+    matches!(
+        kind,
+        EventKind::Create(_)
+            | EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both))
+    )
 }
 
 fn event_mutates_content(kind: &notify::EventKind) -> bool {

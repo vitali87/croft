@@ -312,10 +312,24 @@ pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), Stri
 /// keeps the first answer.
 fn relative_to_base(base: &Path, base_canon: &Path, target: &Path) -> String {
     let direct = relative_or_absolute(base, target);
+    let target_canon = target.canonicalize().ok();
     if !Path::new(&direct).is_absolute() {
-        return direct;
+        // A `..` walk is resolved by the OS AFTER following any symlink in
+        // `base`: from `~/link/ws` (link -> /data/x), `../../other` opens
+        // `/data/other`, not `~/other`. Keep the spelling only when it
+        // reopens the same directory; otherwise save the folder absolute.
+        let reopens = match &target_canon {
+            Some(want) => base.join(&direct).canonicalize().ok().as_ref() == Some(want),
+            // A folder not on disk cannot be checked; keep its spelling.
+            None => true,
+        };
+        return if reopens {
+            direct
+        } else {
+            target.display().to_string()
+        };
     }
-    let Ok(target_canon) = target.canonicalize() else {
+    let Some(target_canon) = target_canon else {
         return direct;
     };
     let via_canon = relative_or_absolute(base_canon, &target_canon);
@@ -366,6 +380,20 @@ pub fn is_workspace_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_folder_is_not_saved_through_a_symlinked_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("data/x/ws")).unwrap();
+        std::fs::create_dir_all(home.join("other")).unwrap();
+        std::os::unix::fs::symlink(home.join("data/x"), home.join("link")).unwrap();
+        let base = home.join("link/ws");
+        let saved = relative_to_base(&base, &base.canonicalize().unwrap(), &home.join("other"));
+        let reopened = base.join(&saved).canonicalize().unwrap();
+        assert_eq!(reopened, home.join("other"), "saved as {saved}");
+    }
 
     #[test]
     fn a_single_root_set_answers_primary_with_it() {
