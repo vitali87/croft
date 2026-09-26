@@ -354,8 +354,13 @@ impl ActivityOverlay {
     /// True when the icons were emitted before at a *different* set of cells.
     /// A first emit (or one after `forget_positions`) reports `false` so the
     /// caller paints rather than looping on an eviction it doesn't need.
+    ///
+    /// Only an icon that vanished or shifted counts: its old image would be
+    /// left behind. One that newly appeared (a count badge showing up when a
+    /// file turns dirty) moves nothing, and treating it as a move wiped the
+    /// whole screen on iTerm2 on the first keystroke into a file (#682).
     pub fn positions_moved(&self, positions: &[(u16, u16)]) -> bool {
-        !self.last_positions.is_empty() && self.last_positions != positions
+        self.last_positions.iter().any(|p| !positions.contains(p))
     }
 
     pub fn store_positions(&mut self, positions: Vec<(u16, u16)>) {

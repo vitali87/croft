@@ -560,3 +560,102 @@ fn view_from_an_empty_pipe_says_nothing_arrived() {
         "and it must not create the staging directory either"
     );
 }
+
+/// #682 end to end: croft over a pty with an image protocol on (iTerm2's,
+/// forced) must not stream images on every keystroke. Before the fix, 20
+/// keystrokes in a file cost about 175 KB of escape output (the minimap and
+/// chrome images re-sent each frame); now they cost a few KB. The budget
+/// sits between the two so a regression fails loudly without being flaky.
+#[cfg(unix)]
+#[test]
+fn typing_with_images_on_does_not_stream_images_per_keystroke() {
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join("a.rs");
+    std::fs::write(&file, "fn main() {\n    println!(\"hi\");\n}\n".repeat(300)).unwrap();
+
+    let (mut master, mut slave) = (0, 0);
+    let ws = libc::winsize {
+        ws_row: 50,
+        ws_col: 160,
+        ws_xpixel: 160 * 9,
+        ws_ypixel: 50 * 18,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &ws,
+            )
+        },
+        0
+    );
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    let bin = assert_cmd::cargo::cargo_bin("croft");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("a.rs")
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .env("TERM", "xterm-256color")
+        .env("TERM_PROGRAM", "iTerm.app")
+        .env("CROFT_FORCE_INLINE_IMAGES", "1")
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    drop(slave);
+    unsafe {
+        let flags = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let mut pty = unsafe { std::fs::File::from_raw_fd(master) };
+    let mut tty = pty.try_clone().unwrap();
+    let mut drain = |for_: Duration| {
+        let mut n = 0usize;
+        let mut buf = [0u8; 1 << 16];
+        let end = Instant::now() + for_;
+        while Instant::now() < end {
+            match pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => break,
+            }
+        }
+        n
+    };
+    // Let it start, then dismiss any first-run popup and let that settle.
+    let started = drain(Duration::from_secs(8));
+    assert!(started > 1000, "croft drew nothing ({started} bytes)");
+    use std::io::Write;
+    tty.write_all(b"\x1b").unwrap();
+    drain(Duration::from_secs(2));
+    let mut typed = 0;
+    for _ in 0..20 {
+        tty.write_all(b"x").unwrap();
+        typed += drain(Duration::from_millis(80));
+    }
+    typed += drain(Duration::from_secs(1));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        typed < 50_000,
+        "20 keystrokes wrote {typed} bytes: images are being re-sent per frame"
+    );
+}
