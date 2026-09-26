@@ -394,7 +394,19 @@ impl Prefs {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self).context("serializing prefs")?;
-        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+        // Written aside and renamed in: a reader on another thread (the MCP
+        // worker's fingerprint check) must never see a truncated file, and a
+        // crash mid-write must not leave one.
+        let tmp = path.with_extension(format!(
+            "json.{}.{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("replacing {}", path.display())
+        })
     }
 
     pub fn theme(&self) -> Theme {
@@ -442,10 +454,22 @@ pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
     prefs.save(&path)
 }
 
+/// The settings file under `config_dir`. The real config dir means the
+/// active profile's file (#618), which is what startup reads; saving
+/// consent or disabled extensions to the base file instead let a revoked
+/// consent survive a restart under a profile.
+fn prefs_file_in(config_dir: &Path) -> PathBuf {
+    if config_dir == self::config_dir() {
+        config_path()
+    } else {
+        config_dir.join("config.json")
+    }
+}
+
 /// Persist the set of disabled extension ids, preserving other settings.
 /// Best-effort: a write failure is swallowed by the caller.
 pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String>) -> Result<()> {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disabled_extensions = disabled.clone();
     prefs.save(&path)
@@ -455,7 +479,7 @@ pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String
 /// dir it was built with, so a test can point it at a scratch dir instead
 /// of mutating the process-wide environment (which races sibling tests).
 pub fn save_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
     prefs.mcp_consented.insert(ext_id.to_string());
     prefs.save(&path)
@@ -464,7 +488,7 @@ pub fn save_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
 /// Forget a recorded first-run consent under an explicit config dir; see
 /// [`save_mcp_consent_in`] for why the dir is a parameter.
 pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
     if !prefs.mcp_consented.remove(ext_id) {
         return Ok(());
@@ -478,7 +502,7 @@ pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
 /// settings (best-effort: a write failure is swallowed); false when a
 /// different one was recorded before, meaning the tool definition changed.
 pub fn trust_mcp_tool_in(config_dir: &Path, command_id: &str, fingerprint: &str) -> bool {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     // An unreadable config can't vouch for a fingerprint, and saving over
     // it would lose every other setting: refuse the call instead.
     let Ok(mut prefs) = Prefs::load_for_update(&path) else {
@@ -499,7 +523,7 @@ pub fn trust_mcp_tool_in(config_dir: &Path, command_id: &str, fingerprint: &str)
 /// Forget the recorded tool fingerprints of `command_ids`, so each tool is
 /// trusted afresh on its next run; see [`trust_mcp_tool_in`].
 pub fn forget_mcp_tool_fingerprints_in(config_dir: &Path, command_ids: &[String]) -> Result<()> {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
     let before = prefs.mcp_tool_fingerprints.len();
     prefs
@@ -741,6 +765,27 @@ pub(crate) fn config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_prefs_replaces_the_file_and_leaves_no_temp_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        save_mcp_consent_in(dir.path(), "ext").unwrap();
+        assert!(
+            Prefs::load_for_update(&path)
+                .unwrap()
+                .mcp_consented
+                .contains("ext")
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.json")]);
+        assert_eq!(prefs_file_in(dir.path()), path);
+    }
 
     /// #624: a test build reads no saved `config.json`, so the MCP
     /// consents, the terminal warning and the extension toggles that

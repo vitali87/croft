@@ -1349,7 +1349,7 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
     // `croft edit --sequence-editor` looks up in the rebasing repo itself.
     if view_sock.is_some()
         && std::env::var_os("GIT_SEQUENCE_EDITOR").is_none()
-        && let Ok(exe) = std::env::current_exe()
+        && let Some(exe) = std::env::current_exe().ok().and_then(live_exe)
     {
         cmd.env("GIT_SEQUENCE_EDITOR", sequence_editor_command(&exe));
     }
@@ -1365,6 +1365,18 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
         // plainly").
         None => cmd.env_remove(crate::view_ipc::SOCK_ENV),
     }
+}
+
+/// `exe` as a path that still runs. Once an update renames a new binary
+/// over the running one, Linux reports it as `.../croft (deleted)`, which
+/// no shell can start; the new binary at the same path can, and `croft
+/// edit` is the same command in both.
+fn live_exe(exe: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    if exe.exists() {
+        return Some(exe);
+    }
+    let replaced = std::path::PathBuf::from(exe.to_str()?.strip_suffix(" (deleted)")?);
+    replaced.exists().then_some(replaced)
 }
 
 /// The `GIT_SEQUENCE_EDITOR` value naming this croft (#620). git runs it
@@ -5224,6 +5236,17 @@ pub fn cell_in_selection(row: i32, col: u16, sr: i32, sc: u16, er: i32, ec: u16)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_binary_still_names_a_runnable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("croft");
+        std::fs::write(&bin, b"").unwrap();
+        let deleted = std::path::PathBuf::from(format!("{} (deleted)", bin.display()));
+        assert_eq!(live_exe(deleted), Some(bin.clone()));
+        assert_eq!(live_exe(bin.clone()), Some(bin));
+        assert_eq!(live_exe(dir.path().join("gone (deleted)")), None);
+    }
 
     /// The zsh the shim tests drive, or an ANNOUNCED skip on a machine
     /// without one (#52). CI provisions zsh, so the gate holds where it
