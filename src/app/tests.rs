@@ -51566,6 +51566,31 @@ fn fake_messages_endpoint(text: &'static str) -> (String, std::sync::mpsc::Recei
 }
 
 #[test]
+fn a_failed_inline_suggestion_is_not_asked_again_until_the_caret_moves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "let x = \n");
+    app.inline_config = Some(crate::inline_complete::Config {
+        backend: crate::inline_complete::Backend::Claude {
+            base_url: String::from("http://127.0.0.1:1"),
+            api_key: String::from("test-key"),
+        },
+        model: String::from("claude-opus-5"),
+    });
+    app.inline_worker = Some(crate::inline_complete::Worker::spawn());
+    app.inline_enabled = true;
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 8;
+    app.editor.last_edit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    let first = app.inline_next_id;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        app.tick_inline_complete();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(app.inline_next_id - first, 1, "one request for one caret");
+}
+
+#[test]
 fn an_inline_suggestion_appears_after_a_pause_and_tab_takes_it() {
     let (url, requests) = fake_messages_endpoint("1 + 1;");
     let tmp = tempfile::tempdir().unwrap();

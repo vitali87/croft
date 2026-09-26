@@ -3466,6 +3466,7 @@ pub struct App {
     inline_worker: Option<crate::inline_complete::Worker>,
     inline_config: Option<crate::inline_complete::Config>,
     inline_job: Option<(u64, PathBuf, u64, usize, usize)>,
+    inline_asked: Option<(PathBuf, u64, usize, usize)>,
     inline_next_id: u64,
     /// Where recorded shortcuts are written: the user's keybindings.json,
     /// or under test a scratch file, so a test run never edits the real one.
@@ -5156,6 +5157,7 @@ impl App {
             inline_worker: None,
             inline_config: None,
             inline_job: None,
+            inline_asked: None,
             inline_next_id: 0,
             keybindings_file: if cfg!(test) {
                 std::env::temp_dir().join(format!(
@@ -44081,6 +44083,7 @@ impl App {
             self.inline_enabled = false;
             self.editor.ghost = None;
             self.inline_job = None;
+            self.inline_asked = None;
             self.status = String::from("Inline suggestions: off");
             return;
         }
@@ -44157,6 +44160,13 @@ impl App {
             .ghost
             .as_ref()
             .is_some_and(|g| (g.0, g.1, g.2) == (row, col, seq))
+            // Asked already at this caret and edit: an empty answer, an
+            // error or an Esc'd ghost must not send the request again on
+            // the next tick, which looped hundreds of paid calls a second.
+            || self
+                .inline_asked
+                .as_ref()
+                .is_some_and(|a| a.0 == path && (a.1, a.2, a.3) == (seq, row, col))
             || self
                 .inline_job
                 .as_ref()
@@ -44181,6 +44191,7 @@ impl App {
             config: config.clone(),
             prompt: crate::inline_complete::prompt(&ed.lines, row, col),
         });
+        self.inline_asked = Some((path.clone(), seq, row, col));
         self.inline_job = Some((id, path, seq, row, col));
         changed
     }
