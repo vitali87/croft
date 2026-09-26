@@ -152,7 +152,7 @@ pub fn stale_client_notice(roster: &[Participant], own: &str) -> Option<String> 
     let older: Vec<&str> = older.into_iter().map(|(_, v)| v).collect();
     (!older.is_empty()).then(|| {
         format!(
-            "Session updated to croft {own}; a client still runs {}. Detach and reattach it to update",
+            "Session updated to croft {own}; a client still runs {}. Detach it (Cmd+K Shift+Q) and reattach to update",
             older.join(", ")
         )
     })
@@ -169,6 +169,22 @@ pub fn stale_client_notice_on_change(
 ) -> Option<String> {
     let notice = stale_client_notice(next, reference)?;
     (last != Some(notice.as_str())).then_some(notice)
+}
+
+/// The one client that can have asked for Session: Detach from inside the
+/// app: the sole control holder (a read-only client's keys never reach
+/// croft), or the sole client. `None` when several could have, since the
+/// typing attribution can race another writer's keys.
+pub fn sole_detach_target(roster: &[Participant]) -> Option<u64> {
+    let mut writers = roster.iter().filter(|p| p.control);
+    match (writers.next(), writers.next()) {
+        (Some(only), None) => Some(only.id),
+        (None, None) => match roster {
+            [only] => Some(only.id),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The version clients are measured against: the newer of the inner croft's
@@ -1671,6 +1687,9 @@ pub fn attach_or_create(socket: &Path, workspace: Option<&Path>, inner: &[String
             // Exit when reconnection is exhausted; this arm is exhaustiveness
             // only.
             PumpOutcome::HostSwapped => return Ok(0),
+            // attach_client reports both as Exit(0) after restoring the
+            // terminal; exhaustiveness only.
+            PumpOutcome::Detached | PumpOutcome::Disconnected => return Ok(0),
         }
     }
 }
@@ -1790,6 +1809,15 @@ pub enum PumpOutcome {
     /// connection is about to drop while the socket stays bound. Internal
     /// to the attach loop, which reconnects; callers never see it.
     HostSwapped,
+    /// This client detached itself with the detach chord (#679); the
+    /// session keeps running. [`attach_client`] restores the terminal and
+    /// reports it as `Exit(0)`.
+    Detached,
+    /// The host closed the connection without an exit code: this client
+    /// was disconnected (Session: Detach, Session: Participants) or the
+    /// host died (#679). [`attach_client`] restores the terminal and
+    /// reports it as `Exit(0)`.
+    Disconnected,
 }
 
 /// How long the client waits for [`Control::ServerHello`] after its Hello.
@@ -1844,7 +1872,224 @@ pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     let result = attach_client_loop(socket, &mut stream);
     let _ = crossterm::terminal::disable_raw_mode();
-    result
+    match result {
+        // The inner croft never ran its own teardown for THIS terminal: it
+        // is still running, or died without one. Undo its modes here so the
+        // shell prompt comes back usable instead of stuck in the alternate
+        // screen with mouse reporting and enhanced keys on (#679).
+        Ok(outcome @ (PumpOutcome::Detached | PumpOutcome::Disconnected)) => {
+            let alive = crate::session::is_alive(socket);
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&client_teardown_seq());
+            let _ = writeln!(out, "{}", attach_end_note(&outcome, alive));
+            let _ = out.flush();
+            Ok(PumpOutcome::Exit(0))
+        }
+        other => other,
+    }
+}
+
+/// The escape bytes that hand a terminal back to the shell after the inner
+/// croft owned it: the same modes croft's own exit undoes (keyboard flags,
+/// cursor shape, alternate screen, mouse capture, bracketed paste, host
+/// colours), plus a visible cursor and plain SGR. Every sequence is a no-op
+/// on a terminal that never had the mode on.
+fn client_teardown_seq() -> Vec<u8> {
+    let mut seq = b"\x1b[0m\x1b]110\x07\x1b]111\x07\x1b[=0;1u".to_vec();
+    let _ = crossterm::execute!(
+        seq,
+        crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::cursor::SetCursorStyle::DefaultUserShape,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::Show,
+    );
+    seq
+}
+
+/// The line a client prints once it has left a session (#679).
+fn attach_end_note(outcome: &PumpOutcome, session_alive: bool) -> &'static str {
+    match (outcome, session_alive) {
+        (PumpOutcome::Detached, _) => {
+            "Detached from the croft session; it keeps running. Run the same command to reattach."
+        }
+        (_, true) => {
+            "Disconnected from the croft session; it keeps running. Run the same command to reattach."
+        }
+        (_, false) => "The croft session ended.",
+    }
+}
+
+/// Whether stdin has input within `wait` (false on timeout or error).
+fn stdin_readable_within(wait: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = wait.as_millis().clamp(0, i32::MAX as u128) as i32;
+    (unsafe { libc::poll(&mut pfd, 1, ms) }) > 0
+}
+
+/// `Cmd+K Shift+Q` (Session: Detach, #679) spotted in a client's own
+/// keystrokes, so a client can always leave: a read-only participant's
+/// input never reaches the inner croft, and a wedged inner croft reads
+/// nothing at all. Filtered here, before the bytes are forwarded.
+///
+/// The `Cmd+K` leader is WITHHELD until the next key decides it: forwarded
+/// at once, it would arm the inner croft's chord leader, and the next key
+/// ANY participant typed would complete a chord this client started. A
+/// leader followed by anything else is forwarded unchanged, and one left
+/// alone is released by [`Self::flush`] after [`DETACH_CHORD_HOLD`].
+///
+/// `Cmd` reaches the client only as a kitty-protocol key event (CSI 107
+/// with the super bit, which croft's keyboard flags turn on, or iTerm2's
+/// mapping that sends the same bytes), so Ctrl+K, the editor's kill-line,
+/// is never taken.
+#[derive(Default)]
+struct DetachChord {
+    /// The withheld leader, plus any release/repeat events of it.
+    leader: Vec<u8>,
+    /// An escape sequence cut off at the end of a read, completed by the
+    /// next one.
+    partial: Vec<u8>,
+}
+
+/// How long a lone `Cmd+K` is withheld before it goes to the inner croft
+/// anyway, so its chord hint still shows for a user who pauses.
+const DETACH_CHORD_HOLD: Duration = Duration::from_millis(1000);
+
+impl DetachChord {
+    /// Filter one read of stdin: the bytes to forward, and whether the
+    /// detach chord was typed (everything from it on is dropped).
+    fn feed(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
+        let mut data = std::mem::take(&mut self.partial);
+        data.extend_from_slice(input);
+        let mut out = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            let Some(len) = token_len(&data[i..]) else {
+                // Only what could still become the chord is withheld: a
+                // lone ESC is the Esc key, and must never wait for a key
+                // that may not come.
+                if may_become_chord_key(&data[i..]) {
+                    self.partial = data[i..].to_vec();
+                } else {
+                    out.append(&mut self.leader);
+                    out.extend_from_slice(&data[i..]);
+                }
+                break;
+            };
+            let token = &data[i..i + len];
+            i += len;
+            if !self.leader.is_empty() {
+                match kitty_key(token) {
+                    Some((107, mods, event)) if event != 1 && is_super_only(mods) => {
+                        self.leader.extend_from_slice(token);
+                        continue;
+                    }
+                    _ if is_detach_key(token) => {
+                        self.leader.clear();
+                        return (out, true);
+                    }
+                    _ => out.append(&mut self.leader),
+                }
+            }
+            if matches!(kitty_key(token), Some((107, mods, 1)) if is_super_only(mods)) {
+                self.leader = token.to_vec();
+            } else {
+                out.extend_from_slice(token);
+            }
+        }
+        (out, false)
+    }
+
+    /// True while bytes are withheld waiting for the next key.
+    fn holding(&self) -> bool {
+        !self.leader.is_empty() || !self.partial.is_empty()
+    }
+
+    /// Release whatever is withheld (the pause after a lone leader).
+    fn flush(&mut self) -> Vec<u8> {
+        let mut out = std::mem::take(&mut self.leader);
+        out.append(&mut self.partial);
+        out
+    }
+}
+
+/// Whether a CSI cut off at the end of a read could still turn out to be
+/// the chord's leader or second key (`CSI 107;`, `CSI 113;`, `CSI 81;`).
+fn may_become_chord_key(partial: &[u8]) -> bool {
+    let Some(body) = partial.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+    [&b"107;"[..], b"113;", b"81;"].iter().any(|code| {
+        if body.len() <= code.len() {
+            code.starts_with(body)
+        } else {
+            body.starts_with(code)
+                && body[code.len()..]
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || *b == b':' || *b == b';')
+        }
+    })
+}
+
+/// Length of the input token at the start of `data`: a whole CSI sequence,
+/// an ESC-prefixed key, or one byte. `None` when a CSI is cut off.
+fn token_len(data: &[u8]) -> Option<usize> {
+    if data[0] != 0x1b {
+        return Some(1);
+    }
+    match data.get(1) {
+        None => None,
+        Some(b'[') => data[2..]
+            .iter()
+            .position(|b| (0x40..=0x7e).contains(b))
+            .map(|p| p + 3),
+        Some(_) => Some(2),
+    }
+}
+
+/// A kitty-protocol key event `CSI code ; mods [: event] u` as
+/// `(code, mods, event)`, with `mods` and `event` defaulting to 1.
+fn kitty_key(token: &[u8]) -> Option<(u32, u32, u32)> {
+    let body = token.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?;
+    let body = std::str::from_utf8(body).ok()?;
+    let mut fields = body.split(';');
+    let code = fields.next()?.split(':').next()?.parse().ok()?;
+    let (mods, event) = match fields.next() {
+        None => (1, 1),
+        Some(m) => {
+            let mut parts = m.split(':');
+            let mods = parts.next()?.parse().ok()?;
+            let event = parts.next().map_or(Some(1), |e| e.parse().ok())?;
+            (mods, event)
+        }
+    };
+    Some((code, mods, event))
+}
+
+/// The kitty modifier bits held, ignoring Caps Lock and Num Lock.
+fn held_mods(mods: u32) -> u32 {
+    mods.saturating_sub(1) & !(64 | 128)
+}
+
+fn is_super_only(mods: u32) -> bool {
+    held_mods(mods) == 8
+}
+
+/// The chord's second key: `Q`, as plain text or as a kitty key event with
+/// Shift (and optionally Cmd still held).
+fn is_detach_key(token: &[u8]) -> bool {
+    if token == b"Q" {
+        return true;
+    }
+    matches!(
+        kitty_key(token),
+        Some((113 | 81, mods, 1)) if matches!(held_mods(mods), 1 | 9)
+    )
 }
 
 /// Pump the attach, reconnecting across host swaps (#238): a HostSwap frame
@@ -1854,9 +2099,15 @@ pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
 /// through a shared handle that reconnection re-points at the new stream.
 fn attach_client_loop(socket: &Path, stream: &mut UnixStream) -> Result<PumpOutcome> {
     let tx = Arc::new(Mutex::new(stream.try_clone().context("cloning socket")?));
+    let detaching = Arc::new(AtomicBool::new(false));
     let mut first_attach = true;
     loop {
-        match attach_client_pump(stream, &tx, first_attach)? {
+        match attach_client_pump(stream, &tx, &detaching, first_attach)? {
+            // A detach that raced the swap wins: the stdin forwarder has
+            // already stopped, so a successor connection would only hang.
+            PumpOutcome::HostSwapped if detaching.load(Ordering::SeqCst) => {
+                return Ok(PumpOutcome::Detached);
+            }
             PumpOutcome::HostSwapped => {
                 let Some(fresh) = reconnect_after_swap(socket) else {
                     // The successor never came up: from here the session is
@@ -1888,6 +2139,7 @@ fn reconnect_after_swap(socket: &Path) -> Option<UnixStream> {
 fn attach_client_pump(
     stream: &mut UnixStream,
     tx: &Arc<Mutex<UnixStream>>,
+    detaching: &Arc<AtomicBool>,
     first_attach: bool,
 ) -> Result<PumpOutcome> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -2012,10 +2264,27 @@ fn attach_client_pump(
     // first for stdin bytes.
     if first_attach {
         let tx = Arc::clone(tx);
+        let detaching = Arc::clone(detaching);
         std::thread::spawn(move || {
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 16384];
+            let mut chord = DetachChord::default();
+            // A write error is not fatal: mid-swap the socket is dead only
+            // for the beat the successor host takes to adopt, and the handle
+            // is re-pointed on reconnect. The dropped bytes are what any
+            // dead transport would lose.
+            let forward = |bytes: &[u8]| {
+                if !bytes.is_empty() {
+                    let _ = tx.lock().unwrap().write_all(&encode_bytes_frame(bytes));
+                }
+            };
             loop {
+                // A withheld Cmd+K goes through after a pause, so a user
+                // who stops after the leader still gets its chord hint.
+                if chord.holding() && !stdin_readable_within(DETACH_CHORD_HOLD) {
+                    forward(&chord.flush());
+                    continue;
+                }
                 match stdin.read(&mut buf) {
                     Ok(0) | Err(_) => {
                         let _ = tx
@@ -2025,12 +2294,18 @@ fn attach_client_pump(
                         break;
                     }
                     Ok(n) => {
-                        // A write error is not fatal: mid-swap the socket is
-                        // dead only for the beat the successor host takes to
-                        // adopt, and the handle is re-pointed on reconnect.
-                        // The dropped bytes are what any dead transport
-                        // would lose.
-                        let _ = tx.lock().unwrap().write_all(&encode_bytes_frame(&buf[..n]));
+                        let (bytes, detach) = chord.feed(&buf[..n]);
+                        forward(&bytes);
+                        if detach {
+                            detaching.store(true, Ordering::SeqCst);
+                            let mut stream = tx.lock().unwrap();
+                            let _ = stream.write_all(&encode_control_frame(&Control::Detach));
+                            // Leave without waiting for the host to hang up:
+                            // a wedged host never would. The pump's read sees
+                            // the EOF and reports the detach.
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            break;
+                        }
                     }
                 }
             }
@@ -2074,10 +2349,19 @@ fn attach_client_pump(
         out.write_all(&bytes).context("writing to terminal")?;
     }
     out.flush().context("flushing terminal")?;
+    // The connection closing without an Exit frame: this client detached
+    // itself, was disconnected, or the host died (#679).
+    let closed = || {
+        if detaching.load(Ordering::SeqCst) {
+            PumpOutcome::Detached
+        } else {
+            PumpOutcome::Disconnected
+        }
+    };
     let mut buf = [0u8; 65536];
     loop {
         let n = match stream.read(&mut buf) {
-            Ok(0) => return Ok(PumpOutcome::Exit(0)),
+            Ok(0) => return Ok(closed()),
             Ok(n) => n,
             // A read timeout can survive the version phase when clearing it
             // failed (see above): an expiry on a quiet session is "nothing
@@ -2090,7 +2374,7 @@ fn attach_client_pump(
             {
                 continue;
             }
-            Err(_) => return Ok(PumpOutcome::Exit(0)),
+            Err(_) => return Ok(closed()),
         };
         for frame in reader.push(&buf[..n]) {
             match frame {
@@ -3503,6 +3787,167 @@ mod tests {
             resume_from(only_listener("999999")).is_err(),
             "an fd that did not survive the exec must refuse"
         );
+    }
+
+    /// Cmd+K as croft's keyboard flags (and iTerm2's mapping) send it.
+    const CMD_K: &[u8] = b"\x1b[107;9u";
+
+    #[test]
+    fn detach_chord_passes_ordinary_input_through_untouched() {
+        let mut c = DetachChord::default();
+        let input = b"ls -la\r\x1b[A\x0bQ\x1b[107;5u";
+        assert_eq!(
+            c.feed(input),
+            (input.to_vec(), false),
+            "typing, arrows, Ctrl+K (kill-line) and a lone Q are not the chord"
+        );
+        assert!(!c.holding());
+    }
+
+    #[test]
+    fn cmd_k_then_shift_q_detaches_and_forwards_nothing_of_the_chord() {
+        let mut c = DetachChord::default();
+        let mut input = b"echo".to_vec();
+        input.extend_from_slice(CMD_K);
+        input.extend_from_slice(b"Qtrailing");
+        assert_eq!(c.feed(&input), (b"echo".to_vec(), true));
+    }
+
+    #[test]
+    fn the_chord_survives_release_events_split_reads_and_lock_keys() {
+        // Leader release (REPORT_EVENT_TYPES) between the two keys, the
+        // leader cut across two reads, and Caps Lock set (mods 9 + 64).
+        let mut c = DetachChord::default();
+        assert_eq!(c.feed(b"\x1b[107;7"), (Vec::new(), false));
+        assert_eq!(c.feed(b"3u"), (Vec::new(), false));
+        assert!(c.holding(), "the leader is withheld until the next key");
+        assert_eq!(c.feed(b"\x1b[107;73:3u"), (Vec::new(), false));
+        // Cmd still held on the second key: kitty Cmd+Shift+Q.
+        assert_eq!(c.feed(b"\x1b[113;10u"), (Vec::new(), true));
+    }
+
+    #[test]
+    fn cmd_k_then_another_key_reaches_croft_unchanged() {
+        let mut c = DetachChord::default();
+        assert_eq!(c.feed(CMD_K), (Vec::new(), false));
+        let mut expected = CMD_K.to_vec();
+        expected.extend_from_slice(b"t");
+        assert_eq!(
+            c.feed(b"t"),
+            (expected, false),
+            "Cmd+K T (Color Theme) must arrive whole"
+        );
+        assert!(!c.holding());
+    }
+
+    #[test]
+    fn a_lone_escape_is_forwarded_at_once_not_held_for_the_next_key() {
+        let mut c = DetachChord::default();
+        assert_eq!(c.feed(b"\x1b"), (b"\x1b".to_vec(), false));
+        assert!(!c.holding(), "Esc must never wait for another key");
+        // A cut-off CSI that cannot become the chord goes through too.
+        assert_eq!(c.feed(b"\x1b[1;5"), (b"\x1b[1;5".to_vec(), false));
+        assert!(!c.holding());
+        // One that can is held, and timed out by flush like a lone leader.
+        assert_eq!(c.feed(b"\x1b[10"), (Vec::new(), false));
+        assert!(c.holding());
+        assert_eq!(c.flush(), b"\x1b[10".to_vec());
+    }
+
+    #[test]
+    fn a_lone_cmd_k_is_released_by_flush() {
+        let mut c = DetachChord::default();
+        assert_eq!(c.feed(CMD_K), (Vec::new(), false));
+        assert_eq!(c.flush(), CMD_K.to_vec());
+        assert!(!c.holding());
+        assert_eq!(c.feed(b"q"), (b"q".to_vec(), false));
+    }
+
+    #[test]
+    fn the_teardown_undoes_every_mode_croft_turns_on() {
+        let seq = String::from_utf8(client_teardown_seq()).unwrap();
+        for (mode, what) in [
+            ("\x1b[?1049l", "alternate screen"),
+            ("\x1b[?1000l", "mouse clicks"),
+            ("\x1b[?1003l", "mouse motion"),
+            ("\x1b[?1006l", "SGR mouse"),
+            ("\x1b[?2004l", "bracketed paste"),
+            ("\x1b[<1u", "kitty keyboard flags"),
+            ("\x1b[?25h", "cursor visibility"),
+        ] {
+            assert!(seq.contains(mode), "teardown must reset {what}: {seq:?}");
+        }
+    }
+
+    #[test]
+    fn the_end_note_says_whether_the_session_is_still_running() {
+        assert!(attach_end_note(&PumpOutcome::Detached, true).starts_with("Detached"));
+        assert!(
+            attach_end_note(&PumpOutcome::Disconnected, true).contains("keeps running"),
+            "a kicked client's session is still there to reattach"
+        );
+        assert_eq!(
+            attach_end_note(&PumpOutcome::Disconnected, false),
+            "The croft session ended."
+        );
+    }
+
+    // #679: a host that closes the connection without an Exit frame (a kick,
+    // or the host dying) must read as a disconnect, which is what makes the
+    // client restore the terminal, not as the inner croft exiting cleanly.
+    #[test]
+    fn detach_targets_only_an_unambiguous_client() {
+        let p = |id: u64, control: bool| Participant {
+            id,
+            name: String::from("x"),
+            cols: 80,
+            rows: 24,
+            control,
+            version: String::new(),
+        };
+        // The sole control holder, even beside read-only guests.
+        assert_eq!(sole_detach_target(&[p(1, false), p(2, true)]), Some(2));
+        // The sole client, whatever its control.
+        assert_eq!(sole_detach_target(&[p(7, false)]), Some(7));
+        // Two writers: the typist could be either, so no one.
+        assert_eq!(sole_detach_target(&[p(1, true), p(2, true)]), None);
+        assert_eq!(sole_detach_target(&[p(1, false), p(2, false)]), None);
+        assert_eq!(sole_detach_target(&[]), None);
+    }
+
+    #[test]
+    fn a_connection_closed_without_exit_is_a_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("kick.mux.sock");
+        let listener = crate::session::bind_socket_0600(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut reader = FrameReader::new();
+            let mut buf = [0u8; 4096];
+            'hello: loop {
+                let n = c.read(&mut buf).unwrap_or(0);
+                assert!(n > 0, "the client must Hello before anything else");
+                for f in reader.push(&buf[..n]) {
+                    if matches!(f, Frame::Control(Control::Hello { .. })) {
+                        break 'hello;
+                    }
+                }
+            }
+            c.write_all(&encode_control_frame(&Control::ServerHello {
+                version: String::from(env!("CARGO_PKG_VERSION")),
+            }))
+            .unwrap();
+            c.write_all(&encode_bytes_frame(b"SCREEN")).unwrap();
+            // The kick: the connection closes with no Exit frame.
+            drop(c);
+        });
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let outcome = attach_client_loop(&socket, &mut stream).expect("attach loop");
+        assert!(
+            matches!(outcome, PumpOutcome::Disconnected),
+            "got {outcome:?}"
+        );
+        server.join().unwrap();
     }
 
     // The attach side of a host swap (#238): HostSwap followed by EOF must
