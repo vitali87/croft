@@ -8802,9 +8802,10 @@ impl Editor {
         self.push_undo(EditKind::DeleteLines);
         self.clear_selection();
         let n = count.max(1);
-        let start = self.cursor_row;
-        // A count on a symbol tab stops at the symbol's last line.
-        let limit = self.symbol_clip().map_or(self.lines.len(), |(_, e)| e);
+        // On a symbol tab the lines deleted stay inside the symbol: a count
+        // stops at its last line, and a caret above it starts at its first.
+        let (first, limit) = self.symbol_clip().unwrap_or((0, self.lines.len()));
+        let start = self.cursor_row.max(first);
         let end = (start + n).min(limit).max(start + 1).min(self.lines.len());
         let yanked = self.lines_slice_text(start, end - start);
         self.lines.drain(start..end);
@@ -9024,14 +9025,15 @@ impl Editor {
     /// within one of its undo steps (a typing burst) fold into one step
     /// here, so undo in this tab walks back as far as it would there.
     /// `source_caret` is where the sibling's caret sits after the edit.
+    /// Returns whether the text changed.
     pub fn mirror_lines_from(
         &mut self,
         new_lines: &[String],
         source_step: u64,
         source_caret: (usize, usize),
-    ) {
+    ) -> bool {
         if self.lines == new_lines || new_lines.is_empty() {
-            return;
+            return false;
         }
         let prefix = self
             .lines
@@ -9080,6 +9082,7 @@ impl Editor {
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
         self.mark_buffer_changed();
         self.recompute_highlights();
+        true
     }
 
     /// Start a fresh tab from a sibling's unsaved text, without an undo step:

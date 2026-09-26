@@ -886,6 +886,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Show outgoing calls: everything the function at the caret calls, each entry jumping to the callee's definition",
                 handler: "",
             },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+V",
+                description: "Open the symbol at the caret in its own tab: it shows only that function or class and follows it as the file changes",
+                handler: "",
+            },
         ],
     },
     ShortcutGroup {

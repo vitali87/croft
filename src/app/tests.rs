@@ -42980,6 +42980,91 @@ fn painted(app: &mut App) -> String {
     all
 }
 
+/// #369: a file and its symbol tab count edits apart, but one of them
+/// speaks for the file to the language server: the active tab. Judged
+/// each against the one record, they took turns resending the whole text
+/// on every tick.
+#[test]
+fn one_tab_speaks_for_a_file_to_the_language_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 5;
+    for _ in 0..3 {
+        app.editor.insert_char('1');
+    }
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    assert!(app.editor.symbol_view.is_some(), "the symbol tab is active");
+    let path = app.editor.path.clone().unwrap();
+    assert_ne!(
+        app.editor.editors[0].edit_seq, app.editor.edit_seq,
+        "the tabs' counters differ"
+    );
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        app.sync_lsp();
+        seen.push(app.lsp_last_seen.get(&path).copied());
+    }
+    let active = Some(app.editor.edit_seq);
+    assert_eq!(seen, vec![active, active, active], "no tick resends");
+}
+
+/// #369: vim operators in a symbol tab stay inside its symbol. `dgg` from
+/// the symbol's second line and `db` at its first column used to reach the
+/// hidden lines above it.
+#[test]
+fn vim_operators_in_a_symbol_tab_stay_inside_its_symbol() {
+    let above = ["fn a() {", "    1", "}"];
+    for (keys, row) in [("dgg", 4), ("d5k", 4), ("db", 3)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+        app.sync_symbol_views();
+        assert!(app.editor.symbol_view.is_some());
+        app.focus = Pane::Editor;
+        app.vim.enabled = true;
+        app.editor.cursor_row = row;
+        app.editor.cursor_col = 0;
+        vim_feed_str(&mut app, keys);
+        assert_eq!(app.editor.lines[..3], above, "{keys} kept `a`");
+    }
+}
+
+/// #369: two symbols that start on one line get a tab each, and opening
+/// either again focuses its own tab.
+#[test]
+fn symbols_starting_on_one_line_get_a_tab_each() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("one.rs");
+    std::fs::write(&file, "impl S { fn m() {} }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("S".into(), 0, 0);
+    app.editor.select(0);
+    app.open_symbol_tab_for("m".into(), 0, 0);
+    let names = |app: &App| -> Vec<String> {
+        app.editor
+            .editors
+            .iter()
+            .filter_map(|e| e.symbol_view.as_ref().map(|v| v.name.clone()))
+            .collect()
+    };
+    let mut both = names(&app);
+    both.sort();
+    assert_eq!(both, vec!["S", "m"]);
+    app.editor.select(0);
+    app.open_symbol_tab_for("S".into(), 0, 0);
+    assert_eq!(names(&app).len(), 2, "reopening S focused its tab");
+    assert_eq!(
+        app.editor.symbol_view.as_ref().map(|v| v.name.as_str()),
+        Some("S")
+    );
+}
+
 /// #369: a symbol tab is a tab of its own that shows only its symbol.
 ///
 /// Opened beside the file's tab, titled by the symbol, holding the whole

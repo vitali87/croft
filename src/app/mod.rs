@@ -7200,7 +7200,19 @@ impl App {
         // before the server finishes its ~1.8s cold analysis. See
         // `crate::lsp::semantic_cache`.
         let mut cache_hits: Vec<(PathBuf, std::sync::Arc<Vec<String>>, Vec<u32>)> = Vec::new();
-        for tab in self.editor.iter_tabs() {
+        // A file and its symbol tabs (#369) share one group, each tab with
+        // its own `edit_seq`. One tab speaks for the path: the active tab
+        // when it holds that file (replies are applied where the seq
+        // matches), else the first. Judging each against the one
+        // `lsp_last_seen` entry made them take turns resending the whole
+        // text on every tick.
+        let active = self.editor.active_index();
+        let active_path = self
+            .editor
+            .path
+            .clone()
+            .filter(|_| !self.editor.has_non_text_view());
+        for (i, tab) in self.editor.iter_tabs().enumerate() {
             if tab.has_non_text_view() {
                 continue;
             }
@@ -7211,7 +7223,12 @@ impl App {
             if crate::lsp::Language::from_extension(ext).is_none() {
                 continue;
             }
-            current.insert(path.clone());
+            if i != active && active_path.as_ref() == Some(path) {
+                continue;
+            }
+            if !current.insert(path.clone()) {
+                continue;
+            }
             let seq = tab.edit_seq;
             let prev = self.lsp_last_seen.get(path).copied();
             match prev {
@@ -27805,16 +27822,18 @@ impl App {
             .position(|(_, ed)| ed.mirror_seq.is_some_and(|seq| seq != ed.edit_seq))
             .or_else(|| members.iter().position(|(_, ed)| ed.mirror_seq.is_some()))
             .unwrap_or(0);
-        let lines = members[source].1.lines.clone();
+        // Lent out for the pass rather than cloned: this runs after every
+        // editor key on a file with a symbol tab.
+        let lines = std::mem::take(&mut members[source].1.lines);
         let step = members[source].1.undo_step_id;
         let caret = (members[source].1.cursor_row, members[source].1.cursor_col);
         let mut changed = false;
         for (i, (_, ed)) in members.iter_mut().enumerate() {
-            if i != source && ed.lines != lines {
-                ed.mirror_lines_from(&lines, step, caret);
-                changed = true;
+            if i != source {
+                changed |= ed.mirror_lines_from(&lines, step, caret);
             }
         }
+        members[source].1.lines = lines;
         // Every member now holds the same text, so one that is clean (just
         // saved, or undone back to its saved state) proves they all match
         // the file on disk.
@@ -28018,7 +28037,8 @@ impl App {
 
     /// Open lines `first..=last` of the active file as a symbol tab named
     /// `name`, placed after the active tab, or focus the symbol tab already
-    /// showing that symbol. The new tab starts from the live buffer, unsaved
+    /// showing that symbol (same first line and name: two symbols can
+    /// start on one line). The new tab starts from the live buffer, unsaved
     /// edits included, and keeps the caret if it sits inside the symbol.
     pub(crate) fn open_symbol_tab_for(&mut self, name: String, first: usize, last: usize) {
         let Some(path) = self.editor.path.clone() else {
@@ -28031,7 +28051,10 @@ impl App {
         }
         if let Some(i) = self.editor.editors.iter().position(|ed| {
             ed.path.as_deref() == Some(path.as_path())
-                && ed.symbol_view.as_ref().is_some_and(|v| v.first == first)
+                && ed
+                    .symbol_view
+                    .as_ref()
+                    .is_some_and(|v| v.first == first && v.name == name)
         }) {
             self.editor.select(i);
             self.focus_pane(Pane::Editor);
@@ -31306,8 +31329,16 @@ impl App {
 
     fn vim_operate_lines(&mut self, op: crate::vim::Op, start_row: usize, count: usize) {
         use crate::vim::Op;
-        self.editor.cursor_row = start_row.min(self.editor.lines.len().saturating_sub(1));
-        let n = count.max(1);
+        // A symbol tab's operator stays inside its symbol (#369): `dgg`
+        // from its second line reaches its first line, not the file's.
+        let (lo, hi) = self
+            .editor
+            .symbol_clip()
+            .unwrap_or((0, self.editor.lines.len().max(1)));
+        let first = start_row.clamp(lo, hi - 1);
+        let end = (start_row + count.max(1)).clamp(first + 1, hi);
+        self.editor.cursor_row = first;
+        let n = end - first;
         match op {
             Op::Delete => {
                 let text = self.editor.delete_lines(n);
@@ -31379,6 +31410,15 @@ impl App {
     /// leaving the cursor at `start` and entering Insert mode for a change.
     fn vim_apply_operator_to_selection(&mut self, op: crate::vim::Op, start: (usize, usize)) {
         use crate::vim::Op;
+        // A motion can leave a symbol tab's lines (`db` at its first
+        // column); the operator covers only the part inside them (#369).
+        let start = self.clamp_to_symbol_clip(start);
+        if let Some(sel) = self.editor.selection {
+            self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+                anchor: self.clamp_to_symbol_clip(sel.anchor),
+                head: self.clamp_to_symbol_clip(sel.head),
+            });
+        }
         let text = self.editor.selection_text();
         copy_to_clipboard(&text);
         match op {
@@ -31395,6 +31435,17 @@ impl App {
                 self.vim.enter_insert_mode();
                 self.status = String::from("-- INSERT --");
             }
+        }
+    }
+
+    /// `pos` pulled inside a symbol tab's lines: above them to the first
+    /// line's start, below them to the last line's end. Unchanged on an
+    /// ordinary tab.
+    fn clamp_to_symbol_clip(&self, pos: (usize, usize)) -> (usize, usize) {
+        match self.editor.symbol_clip() {
+            Some((first, _)) if pos.0 < first => (first, 0),
+            Some((_, end)) if pos.0 >= end => (end - 1, self.vim_line_len(end - 1)),
+            _ => pos,
         }
     }
 
