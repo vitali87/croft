@@ -24014,12 +24014,17 @@ impl App {
         });
     }
 
-    fn finish_clone(&mut self, result: Result<PathBuf, String>) {
+    fn finish_clone(&mut self, result: Result<PathBuf, String>, origin: &Path) {
         match result {
             Ok(dest) => {
                 self.log_git("clone", &Ok(format!("into {}", dest.display())));
                 self.status = format!("Cloned into {}", self.status_path(&dest));
-                self.change_workspace_root(dest);
+                // Opened only if the user is still where the clone started:
+                // one who has moved to another folder meanwhile is not
+                // pulled out of it when the clone lands.
+                if self.tree.root == origin {
+                    self.change_workspace_root(dest);
+                }
             }
             Err(err) => {
                 self.log_git("clone", &Err(err.clone()));
@@ -24239,6 +24244,12 @@ impl App {
         use crate::widgets::list_picker::ListPurpose;
         use crate::widgets::scm_menu::ScmAction;
         self.scm_menu.close();
+        // Nothing else touches the repository while a push, pull or fetch
+        // runs in the background: a commit or branch switch under it fights
+        // over `index.lock`, and a pull would land on the switched branch.
+        if !matches!(action, ScmAction::ShowGitOutput) && self.git_net_busy() {
+            return;
+        }
         match action {
             ScmAction::Pull => self.pull_source_control(),
             ScmAction::Push => self.push_source_control(),
@@ -24504,9 +24515,10 @@ impl App {
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| self.tree.root.clone());
+                let origin = self.tree.root.clone();
                 self.spawn_git_net("clone", move || {
                     let r = crate::git::clone_into(&parent, &value);
-                    Box::new(move |app: &mut App| app.finish_clone(r))
+                    Box::new(move |app: &mut App| app.finish_clone(r, &origin))
                 });
             }
             InputPurpose::RenameBranch => {
@@ -27304,6 +27316,9 @@ impl App {
 
     /// Resolve the branch-picker selection per its open purpose.
     fn apply_branch_picker_selection(&mut self) {
+        if self.git_net_busy() {
+            return;
+        }
         let Some(picker) = self.branch_picker.as_ref() else {
             return;
         };
@@ -30081,6 +30096,38 @@ impl App {
                 dirty: ed.dirty,
                 unsaved_text,
             });
+        }
+        // The other editor groups too: their tabs are not in `self.editor`,
+        // and a relaunch dropped the unsaved text of every split but the
+        // focused one. Only dirty tabs are carried; a file already captured
+        // (the same file open in two splits) keeps the dirty copy.
+        for group in self.editor_layout.inactive_groups() {
+            for ed in &group.editors {
+                if ed.has_non_text_view() || !ed.dirty {
+                    continue;
+                }
+                let unsaved = Some(ed.lines.join("\n"));
+                if let Some(existing) = ed
+                    .path
+                    .as_ref()
+                    .and_then(|p| tabs.iter_mut().find(|t| t.path.as_ref() == Some(p)))
+                {
+                    if !existing.dirty {
+                        existing.dirty = true;
+                        existing.unsaved_text = unsaved;
+                    }
+                    continue;
+                }
+                tabs.push(crate::session_state::OpenTabState {
+                    path: ed.path.clone(),
+                    cursor_row: ed.cursor_row,
+                    cursor_col: ed.cursor_col,
+                    scroll: ed.scroll,
+                    scroll_col: ed.scroll_col,
+                    dirty: true,
+                    unsaved_text: unsaved,
+                });
+            }
         }
         if let Some(path) = active_path
             && let Some(i) = tabs.iter().position(|t| t.path.as_ref() == Some(&path))

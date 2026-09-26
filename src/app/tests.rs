@@ -20760,6 +20760,33 @@ fn session_state_preserves_unsaved_buffer_contents() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "saved\n");
 }
 
+/// A relaunch carries the unsaved text of every split, not just the
+/// focused one.
+#[test]
+fn session_state_keeps_unsaved_edits_from_every_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let c = tmp.path().join("c.txt");
+    std::fs::write(&a, "a\n").unwrap();
+    std::fs::write(&c, "c\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.lines = vec![String::from("edited a")];
+    app.editor.dirty = true;
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    // The focused (right) group moves to another file and closes its copy.
+    app.editor.open_pinned(&c).unwrap();
+    app.editor.close_tab(0);
+    let state = app.capture_session_state();
+    let tab = state
+        .tabs
+        .iter()
+        .find(|t| t.path.as_ref() == Some(&a))
+        .expect("the left split's dirty tab is carried");
+    assert_eq!(tab.unsaved_text.as_deref(), Some("edited a"));
+}
+
 /// A self-update must not drop the only copy of unsaved text: neither an
 /// untitled buffer's nor that of a file deleted while the update ran.
 #[test]

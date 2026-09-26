@@ -478,6 +478,11 @@ impl DiffData {
         // or Haskell comment) and must be shown, not skipped as noise.
         let mut in_header = true;
         for line in raw.split('\n') {
+            // A merge commit's combined diff (`git show <merge>`) starts each
+            // file with `diff --cc` / `diff --combined`: headers follow it too.
+            if line.starts_with("diff --cc ") || line.starts_with("diff --combined ") {
+                in_header = true;
+            }
             if line.starts_with("diff --git") || line.starts_with("@@") {
                 in_header = line.starts_with("diff --git");
                 flush(&mut pending_remove, &mut pending_add, &mut rows);
@@ -2867,6 +2872,18 @@ mod tests {
                 || s.starts_with("+++ b/")),
             "index / --- / +++ noise must be skipped from right_lines: {:?}",
             d.right_lines
+        );
+    }
+
+    #[test]
+    fn combined_diff_headers_after_the_first_file_are_still_skipped() {
+        let raw = "diff --cc a.rs\nindex 1,2..3\n--- a/a.rs\n+++ b/a.rs\n@@@ -1,1 -1,1 +1,1 @@@\n  x\ndiff --cc b.rs\nindex 4,5..6\n--- a/b.rs\n+++ b/b.rs\n@@@ -1,1 -1,1 +1,1 @@@\n  y\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("m"), raw);
+        let all: Vec<&String> = d.left_lines.iter().chain(&d.right_lines).collect();
+        assert!(
+            !all.iter()
+                .any(|l| l.contains("a/b.rs") || l.contains("index 4")),
+            "{all:?}"
         );
     }
 
