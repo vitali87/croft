@@ -299,6 +299,16 @@ pub struct Prefs {
     /// host, a box you only ever tunnel through. User layers only.
     #[serde(default)]
     pub remote_offer_excluded_hosts: Vec<String>,
+    /// Hosts (ssh config aliases, matched case-insensitively) that config
+    /// sync (#262) never pushes to: the per-host `sync_config = off`. A shared
+    /// box, or one whose keybindings are deliberately different. User layers
+    /// only: a workspace must not be able to switch sync on or off.
+    #[serde(default)]
+    pub config_sync_excluded_hosts: Vec<String>,
+    /// Syncable files, by name (`"keybindings.json"`), that never travel to
+    /// any remote (#262): the per-file escape. User layers only.
+    #[serde(default)]
+    pub config_sync_excluded_files: Vec<String>,
     /// Named sets of SSH hosts for "Terminal: Fleet Run" (#363), so a fleet
     /// can be named once rather than retyped per run.
     ///

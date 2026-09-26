@@ -115,6 +115,32 @@ pub fn local_files() -> Vec<(Syncable, PathBuf)> {
         .collect()
 }
 
+/// Whether `host` is one config sync never pushes to (#262): the user's
+/// `config_sync_excluded_hosts`, matched case-insensitively like the other
+/// per-host lists (ssh aliases are not case-sensitive in practice).
+pub fn host_excluded(host: &str, excluded: &[String]) -> bool {
+    excluded.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
+/// Split `files` into what travels and the names the user excluded with
+/// `config_sync_excluded_files` (#262), so the push can say what it skipped
+/// rather than leave a missing file looking like a failed one.
+pub fn apply_exclusions(
+    files: Vec<(Syncable, PathBuf)>,
+    excluded: &[String],
+) -> (Vec<(Syncable, PathBuf)>, Vec<&'static str>) {
+    let mut keep = Vec::new();
+    let mut skipped = Vec::new();
+    for (s, p) in files {
+        if excluded.iter().any(|e| e == s.name) {
+            skipped.push(s.name);
+        } else {
+            keep.push((s, p));
+        }
+    }
+    (keep, skipped)
+}
+
 /// The rsync destination for `name` on `host`, as an rsync remote spec.
 ///
 /// `.config/croft` rather than `$XDG_CONFIG_HOME`: rsync gets no shell on
@@ -211,6 +237,32 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "macros.json" && !s.hot_reloads),
             "macros.json has no reload arm, so it must not claim one"
+        );
+    }
+
+    /// #262: the per-host opt-out, case-insensitive like the other lists.
+    #[test]
+    fn an_excluded_host_is_matched_case_insensitively() {
+        let excluded = vec![String::from("Shared-Box")];
+        assert!(host_excluded("shared-box", &excluded));
+        assert!(!host_excluded("dev", &excluded));
+        assert!(!host_excluded("shared-box", &[]));
+    }
+
+    /// #262: the per-file escape keeps the named file home and reports it.
+    #[test]
+    fn excluded_files_stay_home_and_are_named() {
+        let files: Vec<(Syncable, PathBuf)> = SYNCABLE
+            .iter()
+            .map(|s| (*s, PathBuf::from(s.name)))
+            .collect();
+        let (keep, skipped) = apply_exclusions(files, &[String::from("keybindings.json")]);
+        assert_eq!(skipped, vec!["keybindings.json"]);
+        assert!(keep.iter().all(|(s, _)| s.name != "keybindings.json"));
+        assert_eq!(
+            keep.len(),
+            SYNCABLE.len() - 1,
+            "only the excluded one stays"
         );
     }
 }

@@ -2225,7 +2225,25 @@ fn sync_workspace_lock(source: &Path, log: impl Fn(String)) {
 /// outcome is reported so a silent no-op is distinguishable from a silent
 /// success.
 fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
-    let files = crate::config_sync::local_files();
+    // User layers only: a workspace must not decide what leaves the laptop.
+    let prefs = crate::config_layers::load_merged(None).prefs;
+    if crate::config_sync::host_excluded(&ssh.host, &prefs.config_sync_excluded_hosts) {
+        log(format!(
+            "Config sync: off for {} (config_sync_excluded_hosts)",
+            ssh.host
+        ));
+        return;
+    }
+    let (files, skipped) = crate::config_sync::apply_exclusions(
+        crate::config_sync::local_files(),
+        &prefs.config_sync_excluded_files,
+    );
+    if !skipped.is_empty() {
+        log(format!(
+            "Config sync: not pushing {} (config_sync_excluded_files)",
+            skipped.join(", ")
+        ));
+    }
     if files.is_empty() {
         return;
     }
