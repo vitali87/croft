@@ -848,7 +848,8 @@ fn clicking_an_internal_pdf_link_flips_to_its_page() {
     assert_eq!(
         app.editor.pdf_page(),
         Some(2),
-        "clicking the internal link must flip the preview to page 2"
+        "clicking the internal link must flip the preview to page 2; status: {}",
+        app.status
     );
 }
 
@@ -6356,6 +6357,27 @@ fn welcome_tagline_constant_is_present() {
     assert!(WELCOME_TAGLINE.contains("LIGHTWEIGHT"));
     assert!(WELCOME_TAGLINE.contains("BLAZINGLY FAST"));
     assert!(WELCOME_TAGLINE.contains("DEVELOPERS"));
+}
+
+#[test]
+fn modified_terminal_keys_keep_their_modifiers() {
+    let k = |c, m| key_to_bytes(key(c, m), false);
+    assert_eq!(k(KeyCode::Backspace, KeyModifiers::ALT), b"\x1b\x7f");
+    assert_eq!(k(KeyCode::Char(' '), KeyModifiers::CONTROL), vec![0x00]);
+    assert_eq!(k(KeyCode::Char('/'), KeyModifiers::CONTROL), vec![0x1f]);
+    assert_eq!(
+        k(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        b"\x1b\x01"
+    );
+    assert_eq!(k(KeyCode::Left, KeyModifiers::CONTROL), b"\x1b[1;5D");
+    assert_eq!(k(KeyCode::Right, KeyModifiers::SHIFT), b"\x1b[1;2C");
+    assert_eq!(k(KeyCode::Home, KeyModifiers::CONTROL), b"\x1b[1;5H");
+    assert_eq!(k(KeyCode::Delete, KeyModifiers::CONTROL), b"\x1b[3;5~");
+    // Alt alone on Left/Right stays readline's word motion.
+    assert_eq!(k(KeyCode::Left, KeyModifiers::ALT), b"\x1bb");
 }
 
 #[test]
@@ -20505,8 +20527,8 @@ fn session_state_round_trip_reopens_tabs_at_saved_cursor_and_active() {
     let state = app.capture_session_state();
     assert_eq!(state.tabs.len(), 2);
     assert_eq!(
-        state.tabs[state.active_tab].path.as_path(),
-        file_a.as_path()
+        state.tabs[state.active_tab].path.as_deref(),
+        Some(file_a.as_path())
     );
 
     let mut restored = App::new(tmp.path().to_path_buf()).unwrap();
@@ -20538,7 +20560,11 @@ fn session_state_preserves_unsaved_buffer_contents() {
     app.editor.editors[idx].dirty = true;
 
     let state = app.capture_session_state();
-    let tab = state.tabs.iter().find(|t| t.path == file).unwrap();
+    let tab = state
+        .tabs
+        .iter()
+        .find(|t| t.path.as_ref() == Some(&file))
+        .unwrap();
     assert!(tab.dirty);
     assert_eq!(tab.unsaved_text.as_deref(), Some("edited unsaved"));
 
@@ -20554,6 +20580,42 @@ fn session_state_preserves_unsaved_buffer_contents() {
     assert_eq!(ed.lines, vec![String::from("edited unsaved")]);
     // On-disk file must be untouched by the capture/restore.
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "saved\n");
+}
+
+/// A self-update must not drop the only copy of unsaved text: neither an
+/// untitled buffer's nor that of a file deleted while the update ran.
+#[test]
+fn session_state_keeps_unsaved_untitled_and_unreadable_buffers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("gone.txt");
+    std::fs::write(&file, "saved\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.lines = vec![String::from("scratch notes")];
+    app.editor.dirty = true;
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.lines = vec![String::from("edited gone")];
+    app.editor.dirty = true;
+    let state = app.capture_session_state();
+    assert_eq!(state.tabs.len(), 2);
+    std::fs::remove_file(&file).unwrap();
+
+    let mut restored = App::new(tmp.path().to_path_buf()).unwrap();
+    restored.apply_session_state(&state);
+    let eds = &restored.editor.editors;
+    let untitled = eds.iter().find(|e| e.path.is_none()).unwrap();
+    assert!(untitled.dirty);
+    assert_eq!(untitled.lines, vec![String::from("scratch notes")]);
+    let gone = eds
+        .iter()
+        .find(|e| e.path.as_deref() == Some(file.as_path()))
+        .unwrap();
+    assert!(gone.dirty);
+    assert_eq!(gone.lines, vec![String::from("edited gone")]);
+    assert_eq!(eds.len(), 2, "the blank initial tab is reused");
+
+    // A blank untitled buffer is not carried.
+    let blank = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(blank.capture_session_state().tabs.is_empty());
 }
 
 #[test]
@@ -37165,6 +37227,7 @@ fn a_stale_color_presentation_pick_is_refused_after_a_buffer_change() {
             start: (0, 11),
             end: (0, 18),
             new_text: String::from("rgb(255, 0, 0)"),
+            utf16: false,
         }],
     )];
     app.pending_color_context = Some((path.clone(), app.editor.edit_seq));
@@ -43071,6 +43134,7 @@ fn a_rename_landing_before_a_keystroke_in_a_symbol_tab_is_kept() {
             start: (0, 3),
             end: (0, 4),
             new_text: String::from("renamed"),
+            utf16: false,
         }],
     )];
     app.apply_rename_edits(&edits).unwrap();
@@ -43929,7 +43993,7 @@ fn session_capture_keeps_a_symbol_tab_only_when_it_is_the_files_last_tab() {
     app.editor.dirty = true;
     let state = app.capture_session_state();
     assert_eq!(state.tabs.len(), 1);
-    assert_eq!(state.tabs[0].path, file);
+    assert_eq!(state.tabs[0].path.as_ref(), Some(&file));
     assert!(
         state.tabs[0]
             .unsaved_text
@@ -44036,6 +44100,7 @@ fn a_collaborators_edit_on_a_symbols_edge_is_not_the_tabs_own() {
             start: (3, 0),
             end: (3, 0),
             new_text: String::from("\n"),
+            utf16: false,
         }]);
         // The local caret sits just past the new line, where a caret that
         // had typed it would be.
@@ -44175,7 +44240,7 @@ fn session_capture_keeps_one_tab_for_orphaned_symbol_tabs_of_a_file() {
     assert_eq!(app.editor.editors.len(), 2);
     let state = app.capture_session_state();
     assert_eq!(state.tabs.len(), 1);
-    assert_eq!(state.tabs[0].path, file);
+    assert_eq!(state.tabs[0].path.as_ref(), Some(&file));
 }
 
 /// #369: deleting a symbol tab's whole symbol closes the tab while a tab of
@@ -49875,17 +49940,20 @@ fn one_drain_answers_every_client_already_waiting() {
     std::fs::write(&first, "one").unwrap();
     std::fs::write(&second, "two").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Production's 20ms is shorter than one file open under a loaded full
+    // suite, and then the drain rightly defers client 1 to the next frame.
+    // Stretched, a drain that stops after the first client still fails.
+    app.view_drain_budget =
+        crate::test_budget::spawn_budget(crate::test_budget::tests::VIEW_DRAIN_BASE);
     let sock = seat_view_listener(&mut app, tmp.path());
 
     let mut clients = Vec::new();
     for target in [&first, &second] {
         let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
-        // A read timeout, so losing FAILS rather than hangs. Whether both are
-        // served in one drain rests on production's 20ms budget, which no
-        // test scale can stretch: if the first open costs most of it, the
-        // drain returns having served client 0, the assert below still passes
-        // because something opened, and an untimed `read_line` on client 1
-        // blocks forever. That is a CI timeout with no message, which two
+        // A read timeout, so losing FAILS rather than hangs: a drain that
+        // serves only client 0 still passes the assert below, because
+        // something opened, and an untimed `read_line` on client 1 would then
+        // block forever. That is a CI timeout with no message, which two
         // other tests in this file go out of their way to avoid.
         c.set_read_timeout(Some(crate::test_budget::spawn_budget(
             crate::test_budget::tests::VIEW_DRAIN_BASE,
@@ -51168,6 +51236,7 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
             start: (0, 7),
             end: (0, 11),
             new_text: String::from("helpers"),
+            utf16: false,
         }],
     )];
     app.finish_file_move(pending, edits);
@@ -51186,6 +51255,35 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
 }
 
 #[test]
+fn moving_files_and_folders_carries_every_open_tab_along() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("dir")).unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    std::fs::write(root.join("a.txt"), "a").unwrap();
+    std::fs::write(root.join("dir/b.txt"), "b").unwrap();
+    std::fs::write(root.join("c.txt"), "c").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&root.join("a.txt")).unwrap();
+    app.editor.open_in_new_tab(&root.join("dir/b.txt")).unwrap();
+    app.editor.open_in_new_tab(&root.join("c.txt")).unwrap();
+    // c.txt is active; a.txt and dir/b.txt sit in background tabs.
+    assert!(app.apply_paste_or_drop(
+        &root.join("dest"),
+        &[root.join("a.txt"), root.join("dir")],
+        ExplorerClipMode::Cut
+    ));
+    let paths: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(paths.contains(&root.join("dest/a.txt")), "{paths:?}");
+    assert!(paths.contains(&root.join("dest/dir/b.txt")), "{paths:?}");
+}
+
+#[test]
 fn a_failed_move_leaves_the_importers_alone_and_edits_follow_a_moved_file() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -51199,6 +51297,7 @@ fn a_failed_move_leaves_the_importers_alone_and_edits_follow_a_moved_file() {
                 start: (0, 4),
                 end: (0, 7),
                 new_text: String::from("pkg::sub::pkg"),
+                utf16: false,
             }],
         )]
     };

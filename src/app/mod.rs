@@ -2375,6 +2375,7 @@ struct Prompt {
 struct PendingDiscard {
     rel_path: String,
     untracked: bool,
+    staged: bool,
 }
 
 /// A revert-hunk request waiting on its confirm popup. Holds the
@@ -3151,6 +3152,10 @@ pub struct App {
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
     view_listener: Option<std::os::unix::net::UnixListener>,
+    /// How long one frame may spend serving `croft view` clients (see
+    /// `drain_view_requests`). A field so a test on a loaded machine can
+    /// stretch it: the fixed 20ms is shorter than one file open there.
+    view_drain_budget: std::time::Duration,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -5070,6 +5075,7 @@ impl App {
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
             view_listener,
+            view_drain_budget: std::time::Duration::from_millis(20),
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -26359,6 +26365,7 @@ impl App {
                     start: (sr, sc),
                     end: (er, ec),
                     new_text: s.inserted.clone(),
+                    utf16: false,
                 }]);
             }
             // Echo suppression: apply_span_edits bumped edit_seq, which would
@@ -27298,24 +27305,20 @@ impl App {
     /// the diff caret. Sets a status message and returns `None` when the
     /// active tab isn't a working-tree diff or no hunk is at the cursor.
     fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
-        let root = self.tree.root.clone();
         let built = match self.editor.diff.as_ref() {
             None => Err("Hunk actions work inside a Source Control diff"),
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control")
             }
-            Some(diff) => match diff.right_path.strip_prefix(&root) {
-                Err(_) => Err("File is outside the workspace"),
-                Ok(rel) => {
-                    let rel = rel.to_string_lossy().to_string();
-                    match diff.hunk_range_at(diff.action_row()) {
-                        None => Err("No change hunk at the cursor"),
-                        Some(range) => {
-                            let patch = diff.hunk_patch(&rel, range);
-                            Ok((rel, patch))
-                        }
+            Some(diff) => match self.repo_relative_path(&diff.right_path) {
+                None => Err("File is outside the repository"),
+                Some(rel) => match diff.hunk_range_at(diff.action_row()) {
+                    None => Err("No change hunk at the cursor"),
+                    Some(range) => {
+                        let patch = diff.hunk_patch(&rel, range);
+                        Ok((rel, patch))
                     }
-                }
+                },
             },
         };
         match built {
@@ -27332,7 +27335,6 @@ impl App {
     /// `None` when there is no selection spanning a changed row, so the
     /// caller falls back to the whole-hunk action.
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
-        let root = self.tree.root.clone();
         let diff = self.editor.diff.as_ref()?;
         if !diff.left_is_git_head {
             return None;
@@ -27341,11 +27343,33 @@ impl App {
         if !sel.has_area() {
             return None;
         }
-        let rel = diff.right_path.strip_prefix(&root).ok()?;
-        let rel = rel.to_string_lossy().to_string();
+        let rel = self.repo_relative_path(&diff.right_path)?;
         let (start, end) = sel.normalized();
         let patch = diff.selected_lines_patch(&rel, (start.0, end.0))?;
         Some((rel, patch))
+    }
+
+    /// `path` relative to the repository top level, where `git apply` runs
+    /// (#139's convention). Relative to the WORKSPACE, a workspace opened on
+    /// `repo/sub` sent `x` for `sub/x`, and every hunk action failed or hit
+    /// a same-named file at the top level.
+    fn repo_relative_path(&self, path: &Path) -> Option<String> {
+        let root = self.scm_root();
+        let rel = match path.strip_prefix(&root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => path
+                .canonicalize()
+                .ok()?
+                .strip_prefix(root.canonicalize().ok()?)
+                .ok()?
+                .to_path_buf(),
+        };
+        Some(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
     }
 
     /// Cycle the open diff's ignore-whitespace mode (off → leading → all).
@@ -27674,9 +27698,17 @@ impl App {
             return;
         };
         let untracked = matches!(entry.kind, ChangeKind::Untracked);
+        let staged = matches!(
+            entry.kind,
+            ChangeKind::StagedAdded
+                | ChangeKind::StagedModified
+                | ChangeKind::StagedDeleted
+                | ChangeKind::StagedRenamed
+        );
         self.pending_discard = Some(PendingDiscard {
             rel_path: entry.path,
             untracked,
+            staged,
         });
     }
 
@@ -27684,7 +27716,7 @@ impl App {
         let Some(pd) = self.pending_discard.take() else {
             return;
         };
-        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked) {
+        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked, pd.staged) {
             Ok(()) => {
                 self.status = format!("Discarded {}", pd.rel_path);
                 self.active_git_bypass_debounce();
@@ -29746,17 +29778,20 @@ impl App {
             if ed.has_non_text_view() {
                 continue;
             }
-            let Some(path) = ed.path.clone() else {
+            // An untitled buffer has no file to reopen, so it is carried only
+            // for its unsaved text; a blank one would reappear as clutter.
+            if ed.path.is_none() && !ed.dirty {
                 continue;
-            };
+            }
+            let path = ed.path.clone();
             // A symbol tab is a view over its file's tab (#369): the file tab
             // carries the text, so only an orphaned symbol tab is kept, as a
             // plain file tab, to keep its unsaved edits.
-            if ed.symbol_view.is_some()
+            if let Some(path) = path.clone().filter(|_| ed.symbol_view.is_some())
                 && (self.editor.find_tab_with_path(&path).is_some()
-                    || tabs
-                        .iter()
-                        .any(|t: &crate::session_state::OpenTabState| t.path == path))
+                    || tabs.iter().any(|t: &crate::session_state::OpenTabState| {
+                        t.path.as_ref() == Some(&path)
+                    }))
             {
                 if idx == self.editor.active_index() {
                     active_path = Some(path);
@@ -29782,7 +29817,7 @@ impl App {
             });
         }
         if let Some(path) = active_path
-            && let Some(i) = tabs.iter().position(|t| t.path == path)
+            && let Some(i) = tabs.iter().position(|t| t.path.as_ref() == Some(&path))
         {
             active_tab = i;
         }
@@ -29799,20 +29834,30 @@ impl App {
 
     fn apply_session_state(&mut self, state: &crate::session_state::SessionState) {
         for tab in &state.tabs {
-            if self.editor.open_pinned(&tab.path).is_err() {
-                continue;
-            }
-            let Some(ed) = self
-                .editor
-                .editors
-                .iter_mut()
-                .find(|e| e.path.as_deref() == Some(tab.path.as_path()))
-            else {
+            let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
+            let opened = tab
+                .path
+                .as_deref()
+                .is_some_and(|p| self.editor.open_pinned(p).is_ok());
+            let ed = if opened {
+                let path = tab.path.as_deref();
+                self.editor
+                    .editors
+                    .iter_mut()
+                    .find(|e| e.path.as_deref() == path)
+            } else if unsaved.is_some() {
+                // An untitled buffer, or a file that can no longer be read
+                // (deleted, permissions changed while the update ran): the
+                // unsaved text is the only copy, so it comes back (below) as a
+                // dirty tab rather than being dropped.
+                Some(self.editor.open_unreadable_tab(tab.path.clone()))
+            } else {
+                None
+            };
+            let Some(ed) = ed else {
                 continue;
             };
-            if tab.dirty
-                && let Some(text) = &tab.unsaved_text
-            {
+            if let Some(text) = unsaved {
                 ed.lines = text.split('\n').map(str::to_string).collect();
                 if ed.lines.is_empty() {
                     ed.lines.push(String::new());
@@ -33989,7 +34034,7 @@ impl App {
         if self.view_listener.is_none() {
             return false;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let deadline = std::time::Instant::now() + self.view_drain_budget;
         let mut changed = false;
         loop {
             // Do not accept what we cannot serve. `read_line_by_deadline`
@@ -43843,6 +43888,11 @@ impl App {
                 // consent to the lossy write, so retrying here would just
                 // re-refuse every tick.
                 && !e.encoding_loss
+                // A merge with conflicts still open: its Result holds only
+                // the base text there, and writing it would drop both
+                // sides from disk. Complete Merge (or an explicit Cmd+S) is
+                // the user's call.
+                && !e.merge.as_ref().is_some_and(|m| m.unresolved_count() > 0)
                 && !(guest
                     && e.path
                         .as_ref()
@@ -44568,6 +44618,7 @@ impl App {
                 start: (row, 0),
                 end: (row, line.chars().count()),
                 new_text: new_line,
+                utf16: false,
             }]);
         self.editor.cursor_row = (row + 1).min(self.editor.lines.len().saturating_sub(1));
         self.editor.cursor_col = 0;
@@ -44599,6 +44650,7 @@ impl App {
                 start: (0, 0),
                 end: (end, end_col),
                 new_text: String::new(),
+                utf16: false,
             }]);
         self.save();
         self.run_command(crate::widgets::command_palette::Command::CloseEditor);
@@ -45824,6 +45876,13 @@ impl App {
     fn prompt_encoding_loss(&mut self) {
         self.editor.lossy_save_armed = true;
         let chars = self.editor.unmappable_chars();
+        if chars.is_empty() && self.editor.decode_lossy {
+            self.status = format!(
+                "Not saved: this file has bytes that are not valid {}, shown as \u{fffd} - press Cmd+S again to write them as \u{fffd} (irreversible), or Reopen with Encoding via the status bar",
+                self.editor.encoding.name()
+            );
+            return;
+        }
         let shown: String = chars.iter().map(|c| format!("{c} ")).collect();
         self.status = format!(
             "Not saved: {} cannot represent {}- press Cmd+S again to replace them with &#…; references (irreversible), or switch encoding via the status bar",
@@ -49361,7 +49420,9 @@ impl App {
             };
             match result {
                 Ok(p) => {
-                    if matches!(mode, ExplorerClipMode::Cut) && self.editor.matches_open_path(src) {
+                    // Every tab, not just the active one: a background tab of
+                    // a moved file kept the old path and recreated it on save.
+                    if matches!(mode, ExplorerClipMode::Cut) {
                         self.editor.rename_open_path(src, &p);
                         self.rename_review_boxes_path(src, &p);
                     }
@@ -53436,61 +53497,96 @@ fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
     use KeyCode::*;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let cursor =
-        |app: &'static [u8], normal: &'static [u8]| if app_cursor { app } else { normal }.to_vec();
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // xterm's modifier parameter: 1 + Shift 1 + Alt 2 + Ctrl 4. A modified
+    // cursor or editing key carries it (`Ctrl+Left` is `\e[1;5D`); sending
+    // the plain sequence dropped the modifier, so word motion and selection
+    // bindings in shells and editors never fired.
+    let m = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    let cursor = |app: &'static [u8], normal: &'static [u8], fin: char| {
+        if m > 1 {
+            format!("\x1b[1;{m}{fin}").into_bytes()
+        } else if app_cursor {
+            app.to_vec()
+        } else {
+            normal.to_vec()
+        }
+    };
+    let tilde = |n: u8| {
+        if m > 1 {
+            format!("\x1b[{n};{m}~").into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        }
+    };
+    let esc_if_alt = |mut v: Vec<u8>| {
+        if alt && !v.is_empty() {
+            v.insert(0, 0x1b);
+        }
+        v
+    };
     match key.code {
-        Enter => vec![b'\r'],
+        Enter => esc_if_alt(vec![b'\r']),
         Tab => vec![b'\t'],
         BackTab => b"\x1b[Z".to_vec(),
-        Backspace => vec![0x7f],
+        // Alt+Backspace deletes a word in readline; Ctrl+Backspace sends ^H.
+        Backspace => esc_if_alt(vec![if ctrl { 0x08 } else { 0x7f }]),
         Esc => vec![0x1b],
-        Up => cursor(b"\x1bOA", b"\x1b[A"),
-        Down => cursor(b"\x1bOB", b"\x1b[B"),
-        Right if alt => b"\x1bf".to_vec(),
-        Left if alt => b"\x1bb".to_vec(),
-        Right => cursor(b"\x1bOC", b"\x1b[C"),
-        Left => cursor(b"\x1bOD", b"\x1b[D"),
-        Home => cursor(b"\x1bOH", b"\x1b[H"),
-        End => cursor(b"\x1bOF", b"\x1b[F"),
-        PageUp => b"\x1b[5~".to_vec(),
-        PageDown => b"\x1b[6~".to_vec(),
-        Insert => b"\x1b[2~".to_vec(),
-        Delete => b"\x1b[3~".to_vec(),
+        // Alt alone on Left/Right keeps readline's word motion (`\eb`/`\ef`),
+        // which every shell binds; other modifiers use the xterm form.
+        Right if alt && !ctrl && !shift => b"\x1bf".to_vec(),
+        Left if alt && !ctrl && !shift => b"\x1bb".to_vec(),
+        Up => cursor(b"\x1bOA", b"\x1b[A", 'A'),
+        Down => cursor(b"\x1bOB", b"\x1b[B", 'B'),
+        Right => cursor(b"\x1bOC", b"\x1b[C", 'C'),
+        Left => cursor(b"\x1bOD", b"\x1b[D", 'D'),
+        Home => cursor(b"\x1bOH", b"\x1b[H", 'H'),
+        End => cursor(b"\x1bOF", b"\x1b[F", 'F'),
+        PageUp => tilde(5),
+        PageDown => tilde(6),
+        Insert => tilde(2),
+        Delete => tilde(3),
         F(n) => match n {
-            1 => b"\x1bOP".to_vec(),
-            2 => b"\x1bOQ".to_vec(),
-            3 => b"\x1bOR".to_vec(),
-            4 => b"\x1bOS".to_vec(),
-            5 => b"\x1b[15~".to_vec(),
-            6 => b"\x1b[17~".to_vec(),
-            7 => b"\x1b[18~".to_vec(),
-            8 => b"\x1b[19~".to_vec(),
-            9 => b"\x1b[20~".to_vec(),
-            10 => b"\x1b[21~".to_vec(),
-            11 => b"\x1b[23~".to_vec(),
-            12 => b"\x1b[24~".to_vec(),
+            1..=4 => {
+                let fin = b"PQRS"[usize::from(n - 1)] as char;
+                if m > 1 {
+                    format!("\x1b[1;{m}{fin}").into_bytes()
+                } else {
+                    format!("\x1bO{fin}").into_bytes()
+                }
+            }
+            5 => tilde(15),
+            6 => tilde(17),
+            7 => tilde(18),
+            8 => tilde(19),
+            9 => tilde(20),
+            10 => tilde(21),
+            11 => tilde(23),
+            12 => tilde(24),
             _ => Vec::new(),
         },
         Char(c) => {
             if ctrl {
                 let lc = c.to_ascii_lowercase();
-                if lc.is_ascii_lowercase() {
-                    return vec![(lc as u8) - b'a' + 1];
-                }
-                match c {
-                    '@' => vec![0x00],
-                    '\\' => vec![0x1c],
-                    ']' => vec![0x1d],
-                    _ => Vec::new(),
-                }
-            } else if alt {
-                let mut v = vec![0x1b];
-                let mut buf = [0u8; 4];
-                v.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                v
+                let byte = if lc.is_ascii_lowercase() {
+                    Some((lc as u8) - b'a' + 1)
+                } else {
+                    match c {
+                        ' ' | '@' | '2' => Some(0x00),
+                        '[' | '3' => Some(0x1b),
+                        '\\' | '4' => Some(0x1c),
+                        ']' | '5' => Some(0x1d),
+                        '^' | '6' => Some(0x1e),
+                        '/' | '_' | '7' => Some(0x1f),
+                        '8' | '?' => Some(0x7f),
+                        _ => None,
+                    }
+                };
+                // Ctrl+Alt+letter is ESC then the control byte.
+                byte.map_or_else(Vec::new, |b| esc_if_alt(vec![b]))
             } else {
                 let mut buf = [0u8; 4];
-                c.encode_utf8(&mut buf).as_bytes().to_vec()
+                esc_if_alt(c.encode_utf8(&mut buf).as_bytes().to_vec())
             }
         }
         _ => Vec::new(),

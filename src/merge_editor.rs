@@ -229,8 +229,23 @@ impl MergeView {
             return;
         }
         let delta = buffer_len as isize - self.synced_len as isize;
+        let base_len = self.base.len();
         for c in self.conflicts.iter_mut() {
-            if c.contains_result_row(edit_row) {
+            // An empty region sits AT the row of the line after it, so an
+            // edit to that next line read as an edit inside the conflict:
+            // it was marked resolved, and Complete Merge dropped both sides.
+            // Only text inserted at that row goes into an empty region.
+            // An empty region with no base text after it (a conflict at the
+            // end of the file, or a whole-file one) has no next line: the row
+            // it sits at is the buffer's filler line, so typing there IS
+            // typing into the conflict.
+            let trailing = c.base_start + c.base.len() >= base_len;
+            let inside = if c.result_len == 0 {
+                c.result_start == edit_row && (delta > 0 || trailing)
+            } else {
+                c.contains_result_row(edit_row)
+            };
+            if inside {
                 c.result_len = (c.result_len as isize + delta).max(0) as usize;
                 c.state = ConflictState::Manual;
             } else if c.result_start > edit_row {
@@ -638,6 +653,38 @@ mod tests {
         // An edit outside every region resolves nothing further.
         view.sync_with_buffer(result.len() + 1, 2, 0);
         assert_eq!(view.resolved_count(), 1);
+    }
+
+    #[test]
+    fn editing_the_line_after_an_empty_region_leaves_it_unresolved() {
+        // No base side (markers without diff3): the Result holds nothing for
+        // the conflict, so its region is empty and sits at `b`'s row.
+        let base = lines(&["a", "b"]);
+        let ours = lines(&["a", "o", "b"]);
+        let theirs = lines(&["a", "t", "b"]);
+        let (mut view, result) = MergeView::new(base, ours, theirs, false);
+        assert_eq!(view.conflicts.len(), 1);
+        assert_eq!(view.conflicts[0].result_len, 0);
+        let row = view.conflicts[0].result_start;
+        // Typing into `b` changes no line count.
+        view.sync_with_buffer(result.len(), 1, row);
+        assert_eq!(view.unresolved_count(), 1, "still a conflict");
+        // Text inserted at that row does go into the region.
+        view.sync_with_buffer(result.len() + 1, 2, row);
+        assert_eq!(view.unresolved_count(), 0);
+    }
+
+    #[test]
+    fn typing_into_an_empty_trailing_region_resolves_it() {
+        // A whole-file conflict with no base: the Result is one empty line,
+        // and the region sits at it with no line after.
+        let (mut view, _) = MergeView::new(vec![], lines(&["o"]), lines(&["t"]), false);
+        assert_eq!(view.conflicts.len(), 1);
+        let row = view.conflicts[0].result_start;
+        // A keystroke on that line: no line count change.
+        let len = view.synced_len;
+        view.sync_with_buffer(len, 1, row);
+        assert_eq!(view.unresolved_count(), 0);
     }
 
     #[test]

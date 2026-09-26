@@ -2150,7 +2150,13 @@ async fn worker_loop(
                                 let mut client = managed.client.lock().await;
                                 // Graceful LSP shutdown+exit; the transport's
                                 // kill_on_drop reaps a server that ignores it.
-                                let _ = client.shutdown().await;
+                                // Bounded: a server that never answers
+                                // `shutdown` must not wedge the worker loop.
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    client.shutdown(),
+                                )
+                                .await;
                                 log_file::log(&format!(
                                     "lsp retire: {} for removed workspace folder {}",
                                     managed.name,
@@ -2533,7 +2539,9 @@ impl WorkerState {
         let mut tasks = Vec::with_capacity(clients.len());
         for client in clients {
             tasks.push(tokio::spawn(async move {
-                let _ = client.lock().await.shutdown().await;
+                let mut client = client.lock().await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.shutdown())
+                    .await;
             }));
         }
         for t in tasks {
@@ -2964,7 +2972,7 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.completion(uri, line, character).await;
             drop(client);
             let (is_incomplete, items): (Option<bool>, Vec<CompletionItem>) = match resp {
@@ -3064,7 +3072,7 @@ impl WorkerState {
             let mut signatures = Vec::new();
             let mut active_signature = 0;
             for (name, client_arc) in &candidates {
-                let mut client = client_arc.lock().await;
+                let mut client = client_arc.lock().await.requests();
                 let resp = client.signature_help(uri.clone(), line, character).await;
                 drop(client);
                 let (sigs, active) = match resp {
@@ -3136,7 +3144,7 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.hover(uri, line, character).await;
             drop(client);
             let text = match resp {
@@ -3216,7 +3224,7 @@ impl WorkerState {
                 if *delay > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
                 }
-                let mut client = client_arc.lock().await;
+                let mut client = client_arc.lock().await.requests();
                 let resp = client.semantic_tokens_full(uri.clone()).await;
                 drop(client);
                 data = match resp {
@@ -3282,7 +3290,7 @@ impl WorkerState {
         };
         let tx = tx.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.inlay_hints(uri, line_count).await;
             drop(client);
             let hints = match resp {
@@ -3331,7 +3339,7 @@ impl WorkerState {
         };
         let tx = tx.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.document_links(uri).await;
             drop(client);
             let links = match resp {
@@ -3497,7 +3505,7 @@ impl WorkerState {
         };
         let tx = tx.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.folding_ranges(uri).await;
             drop(client);
             let ranges = match resp {
@@ -3544,7 +3552,7 @@ impl WorkerState {
         };
         let tx = tx.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.document_color(uri).await;
             drop(client);
             let colors = match resp {
@@ -3607,7 +3615,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.color_presentations(uri, lsp_color, start, end).await;
             drop(client);
             let presentations = match resp {
@@ -3623,6 +3631,7 @@ impl WorkerState {
                                 start: (start.0 as usize, start.1 as usize),
                                 end: (end.0 as usize, end.1 as usize),
                                 new_text: p.label.clone(),
+                                utf16: true,
                             }),
                         }
                         for te in p.additional_text_edits.iter().flatten() {
@@ -3684,7 +3693,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client
                 .semantic_tokens_range(uri, start_line, end_line)
                 .await;
@@ -3758,7 +3767,7 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.definition(uri, line, character).await;
             drop(client);
             let target = match resp {
@@ -3816,7 +3825,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.document_symbol(uri).await;
             drop(client);
             let symbols = match resp {
@@ -3882,7 +3891,7 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.declaration(uri, line, character).await;
             drop(client);
             let target = match resp {
@@ -3951,7 +3960,7 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.type_definition(uri, line, character).await;
             drop(client);
             let target = match resp {
@@ -4020,7 +4029,7 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.implementation(uri, line, character).await;
             drop(client);
             let targets = match resp {
@@ -4088,7 +4097,7 @@ impl WorkerState {
         tokio::spawn(async move {
             let mut symbols: Vec<WorkspaceSymbolItem> = Vec::new();
             for (server_name, client_arc) in picked {
-                let mut client = client_arc.lock().await;
+                let mut client = client_arc.lock().await.requests();
                 let resp = client.workspace_symbols(query.clone()).await;
                 drop(client);
                 match resp {
@@ -4156,7 +4165,7 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.references(uri, line, character).await;
             drop(client);
             let targets = match resp {
@@ -4215,7 +4224,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.document_highlight(uri, line, character).await;
             drop(client);
             let items = match resp {
@@ -4269,7 +4278,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.linked_editing_range(uri, line, character).await;
             drop(client);
             let ranges = match resp {
@@ -4343,7 +4352,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.selection_ranges(uri, lsp_positions).await;
             drop(client);
             let (unsupported, chains) = match resp {
@@ -4412,7 +4421,7 @@ impl WorkerState {
         };
         let tx = tx.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let item = match client.prepare_call_hierarchy(uri, line, character).await {
                 Ok(Some(mut items)) if !items.is_empty() => items.remove(0),
                 Ok(_) => {
@@ -4505,7 +4514,7 @@ impl WorkerState {
         };
         let tx = tx.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let item = match client.prepare_type_hierarchy(uri, line, character).await {
                 Ok(Some(mut items)) if !items.is_empty() => items.remove(0),
                 Ok(_) => {
@@ -4597,7 +4606,7 @@ impl WorkerState {
             let mut combined: Vec<CodeActionItem> = Vec::new();
             let mut any_ran = false;
             for (server_name, client_arc) in servers {
-                let mut client = client_arc.lock().await;
+                let mut client = client_arc.lock().await.requests();
                 let resp = client.code_action(uri.clone(), range, diags.clone()).await;
                 drop(client);
                 match resp {
@@ -4676,7 +4685,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resolved = client.code_action_resolve(action).await;
             drop(client);
             let items = match resolved {
@@ -4723,7 +4732,7 @@ impl WorkerState {
             return;
         };
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             if let Err(e) = client.execute_command(command, arguments).await {
                 log_file::log(&format!("lsp[{server_name}] execute_command error: {e:#}"));
             }
@@ -4773,7 +4782,7 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.rename(uri, line, character, new_name).await;
             drop(client);
             let edits = match resp {
@@ -4845,7 +4854,8 @@ impl WorkerState {
             let mut edits = Vec::new();
             for (name, client_arc, files) in targets {
                 let resp = tokio::time::timeout(WILL_RENAME_TIMEOUT, async {
-                    client_arc.lock().await.will_rename_files(files).await
+                    let mut requests = client_arc.lock().await.requests();
+                    requests.will_rename_files(files).await
                 })
                 .await;
                 match resp {
@@ -4914,7 +4924,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.prepare_rename(uri, line, character).await;
             drop(client);
             let (error, target, fallback) = match resp {
@@ -5005,7 +5015,7 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client.formatting(uri, tab_size, insert_spaces).await;
             drop(client);
             let edits = match resp {
@@ -5071,7 +5081,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client
                 .on_type_formatting(
                     uri,
@@ -5140,7 +5150,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await;
+            let mut client = client_arc.lock().await.requests();
             let resp = client
                 .range_formatting(uri, start.0, start.1, end.0, end.1, tab_size, insert_spaces)
                 .await;
@@ -5304,6 +5314,7 @@ fn text_edit_to_span(te: &TextEdit) -> TextSpanEdit {
         ),
         end: (te.range.end.line as usize, te.range.end.character as usize),
         new_text: te.new_text.clone(),
+        utf16: true,
     }
 }
 
@@ -5788,7 +5799,11 @@ fn spawn_workspace_pull_within(
             // future pulls: one leak per client, not one per refresh.
             let resp = match tokio::time::timeout(
                 ceiling,
-                LspClient::workspace_diagnostics_on(server, target.identifier.clone(), previous),
+                crate::lsp::client::LspRequests::workspace_diagnostics_on(
+                    server,
+                    target.identifier.clone(),
+                    previous,
+                ),
             )
             .await
             {

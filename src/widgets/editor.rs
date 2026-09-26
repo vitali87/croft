@@ -1938,13 +1938,33 @@ pub struct TextSpanEdit {
     pub start: (usize, usize),
     pub end: (usize, usize),
     pub new_text: String,
+    /// The columns are UTF-16 code units, as a language server sends them,
+    /// not chars. Converted against the lines at apply time: read as char
+    /// columns, every edit after an emoji on its line landed off by one per
+    /// astral character, and a rename wrote `xrenamed+ 1` over `x + 1`.
+    pub utf16: bool,
 }
 
 /// Apply `edits` to `lines` (char-indexed coords), bottom-to-top so an
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
+    // Every edit names the ORIGINAL text, so its UTF-16 columns convert
+    // against the lines as they are before any edit lands.
+    let col = |row: usize, c: usize| lines.get(row).map_or(c, |l| utf16_to_char_col(l, c as u32));
+    let converted: Vec<TextSpanEdit> = edits
+        .iter()
+        .map(|e| match e.utf16 {
+            true => TextSpanEdit {
+                start: (e.start.0, col(e.start.0, e.start.1)),
+                end: (e.end.0, col(e.end.0, e.end.1)),
+                new_text: e.new_text.clone(),
+                utf16: false,
+            },
+            false => e.clone(),
+        })
+        .collect();
+    let mut order: Vec<&TextSpanEdit> = converted.iter().collect();
     order.sort_by_key(|e| std::cmp::Reverse(e.start));
     let mut applied = 0;
     for e in order {
@@ -2363,6 +2383,9 @@ struct SnippetSession {
     anchor: (usize, usize),
     /// Placeholder length (chars) of the current stop, selected on landing.
     cur_len: usize,
+    /// The placeholder's text on landing, to tell an edit from a plain Tab
+    /// when the replacement happens to be the same length.
+    cur_text: String,
     /// Remaining stops to visit, in order: `(row, col, placeholder_len)`.
     stops: std::collections::VecDeque<(usize, usize, usize)>,
 }
@@ -2781,6 +2804,16 @@ pub struct Editor {
     /// Whether the file on disk began with a byte-order mark. `decode` strips
     /// it, so without remembering it every save silently dropped it.
     bom: bool,
+    /// Whether the file on disk ended with a line break. The buffer keeps
+    /// no line for it (a trailing newline is not a line of its own), so
+    /// without remembering it every save stripped it: `a\nb\n` came back
+    /// as `a\nb`.
+    final_newline: bool,
+    /// Whether decoding the file met bytes invalid in its encoding, now
+    /// shown as U+FFFD. Saving writes those as `EF BF BD`, destroying the
+    /// original bytes, so it takes the same explicit consent as an encoding
+    /// that cannot represent the text.
+    pub decode_lossy: bool,
     /// Indentation guides (VS Code `editor.guides.indentation`): dim vertical
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
@@ -3103,6 +3136,8 @@ impl Editor {
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
             bom: false,
+            final_newline: false,
+            decode_lossy: false,
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
@@ -4616,7 +4651,10 @@ impl Editor {
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
-        let text = enc.decode(&bytes).0.into_owned();
+        let (decoded, _, decode_lossy) = enc.decode(&bytes);
+        let text = decoded.into_owned();
+        self.decode_lossy = decode_lossy;
+        self.final_newline = text.ends_with(['\n', '\r']);
         // Detect the file's line-ending style before normalisation so a save
         // preserves it (and the status bar reports it). A single `\r\n` marks
         // the file CRLF, matching VS Code's "files.eol auto" heuristic.
@@ -5255,7 +5293,7 @@ impl Editor {
     /// provenance map to the text it describes (#349). `None` when the
     /// encoding cannot represent the text, since a save would refuse it too.
     pub fn bytes_for_disk(&self) -> Option<Vec<u8>> {
-        let content = self.lines.join(self.eol.sequence());
+        let content = self.content_for_disk();
         let (encoded, had_errors) = self.encode_for_disk(&content);
         (!had_errors).then_some(encoded)
     }
@@ -6515,12 +6553,14 @@ impl Editor {
         // in when the file carries one, returning what it actually used. Take
         // that, or the buffer would hold text decoded one way while claiming to
         // be another — and the save would then re-encode it wrongly.
-        let (decoded, used, _) = enc.decode(&bytes);
+        let (decoded, used, decode_lossy) = enc.decode(&bytes);
         let text = decoded.into_owned();
         self.encoding = used;
+        self.decode_lossy = decode_lossy;
         // Re-sniff against the bytes just read: reinterpreting the file under a
         // new encoding must not carry the previous one's BOM answer over.
         self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
+        self.final_newline = text.ends_with(['\n', '\r']);
         self.eol = if text.contains("\r\n") {
             LineEnding::Crlf
         } else {
@@ -6715,6 +6755,7 @@ impl Editor {
             self.snippet = Some(SnippetSession {
                 anchor: (first.0, first.1),
                 cur_len: first.2,
+                cur_text: self.span_text(first.0, first.1, first.2),
                 stops: abs,
             });
         }
@@ -6733,6 +6774,17 @@ impl Editor {
         if self.cursor_row == sess.anchor.0 {
             let typed = self.cursor_col as isize - sess.anchor.1 as isize;
             let shift = typed - sess.cur_len as isize;
+            let now = self.span_text(sess.anchor.0, sess.anchor.1, typed.max(0) as usize);
+            if now != sess.cur_text {
+                // Stops nested inside the placeholder just replaced
+                // (`${1:foo(${2:x})}`) name text that is gone: drop them, or
+                // the next Tab selects whatever now sits at their offset,
+                // a same-length replacement included.
+                let after = sess.anchor.1 + sess.cur_len;
+                let anchor = sess.anchor;
+                sess.stops
+                    .retain(|s| !(s.0 == anchor.0 && s.1 >= anchor.1 && s.1 < after));
+            }
             if shift != 0 {
                 let after = sess.anchor.1 + sess.cur_len;
                 for s in sess.stops.iter_mut() {
@@ -6749,9 +6801,18 @@ impl Editor {
         if !sess.stops.is_empty() {
             sess.anchor = (next.0, next.1);
             sess.cur_len = next.2;
+            sess.cur_text = self.span_text(next.0, next.1, next.2);
             self.snippet = Some(sess);
         }
         true
+    }
+
+    /// `len` chars of row `row` from char column `col`, clamped to the line.
+    fn span_text(&self, row: usize, col: usize, len: usize) -> String {
+        self.lines
+            .get(row)
+            .map(|l| l.chars().skip(col).take(len).collect())
+            .unwrap_or_default()
     }
 
     /// Move the caret to a resolved tab stop, selecting its placeholder text so
@@ -8696,6 +8757,16 @@ impl Editor {
         out
     }
 
+    /// The text a save writes: the lines joined with the file's EOL, and
+    /// the final newline the file had. An emptied buffer writes nothing.
+    fn content_for_disk(&self) -> String {
+        let mut content = self.lines.join(self.eol.sequence());
+        if self.final_newline && !content.is_empty() {
+            content.push_str(self.eol.sequence());
+        }
+        content
+    }
+
     fn write_buffer_to_disk(&mut self) -> Result<SaveOutcome> {
         // Preview tabs (image/PDF, sheet, diff, hex) hold the whole-
         // buffer-swap PLACEHOLDER in `lines`, not the file's content:
@@ -8711,16 +8782,20 @@ impl Editor {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No file open"))?
             .clone();
-        let content = self.lines.join(self.eol.sequence());
+        let content = self.content_for_disk();
         let (encoded, had_errors) = self.encode_for_disk(&content);
         // The single choke point every save funnels through, so no caller can
         // route around the guard. The consent flag survives a failed write
         // (the user still consented) and is cleared only once the bytes land.
-        if had_errors && !self.lossy_save_armed {
+        // The decode's replacement characters are only a loss while they are
+        // still in the text: a buffer rewritten past them saves freely.
+        let writes_replacements = self.decode_lossy && content.contains('\u{fffd}');
+        if (had_errors || writes_replacements) && !self.lossy_save_armed {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
         }
         std::fs::write(&path, encoded)?;
+        self.decode_lossy = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.dirty = false;
@@ -9566,7 +9641,10 @@ impl Editor {
             // element IS the final newline. An empty buffer is left alone:
             // a zero-byte file has no last line to terminate.
             let empty_buffer = self.lines.len() == 1 && self.lines[0].is_empty();
-            if !empty_buffer && !self.lines.last().is_some_and(String::is_empty) {
+            if !empty_buffer
+                && !self.final_newline
+                && !self.lines.last().is_some_and(String::is_empty)
+            {
                 self.push_undo(EditKind::InsertFinalNewline);
                 self.lines.push(String::new());
                 self.mark_buffer_changed();
@@ -14967,8 +15045,21 @@ impl EditorTabs {
     /// path so subsequent saves and the tab label track the new name.
     pub fn rename_open_path(&mut self, old: &Path, new: &Path) {
         for e in &mut self.editors {
-            if e.path.as_deref() == Some(old) {
-                e.path = Some(new.to_path_buf());
+            // Under a moved folder too: a tab of `dir/a.rs` follows `dir` to
+            // its new place, or its next save recreates the old path.
+            let moved = e
+                .path
+                .as_deref()
+                .and_then(|p| p.strip_prefix(old).ok())
+                .map(|rest| {
+                    if rest.as_os_str().is_empty() {
+                        new.to_path_buf()
+                    } else {
+                        new.join(rest)
+                    }
+                });
+            if let Some(moved) = moved {
+                e.path = Some(moved);
                 // Re-anchor the disk stamp to the new path so the rename
                 // isn't mistaken for an external content change on the next
                 // FS-sync sweep.
@@ -14989,6 +15080,25 @@ impl EditorTabs {
         self.editors[self.active].focused = false;
         self.active = pos;
         Ok(())
+    }
+
+    /// Insert a pinned tab for `path` without reading it (None: untitled),
+    /// reusing the blank initial tab. The caller fills the buffer: this is
+    /// for text whose only copy is in memory, like a session handoff's
+    /// unsaved edits to a file that can no longer be opened.
+    pub fn open_unreadable_tab(&mut self, path: Option<PathBuf>) -> &mut Editor {
+        if !self.is_blank_initial() {
+            let mut e = Editor::new();
+            e.focused = self.editors[self.active].focused;
+            let pos = self.active + 1;
+            self.editors.insert(pos, e);
+            self.editors[self.active].focused = false;
+            self.active = pos;
+        }
+        let e = &mut self.editors[self.active];
+        e.path = path;
+        e.preview = false;
+        e
     }
 
     /// Test-only / disk-less helper: insert a tab whose path is set but
@@ -16215,6 +16325,31 @@ mod tests {
         );
         // The last stop ends the session.
         assert!(!e.snippet_active());
+    }
+
+    #[test]
+    fn replacing_an_outer_placeholder_drops_the_stops_nested_in_it() {
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        assert_eq!(e.selection_text(), "foo(x)");
+        e.insert_str("bar");
+        assert!(e.snippet_next());
+        assert_eq!(
+            e.selection_text(),
+            "z",
+            "the nested $2 went with its placeholder"
+        );
+        // A same-length replacement is still a replacement.
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        e.insert_str("barbaz");
+        assert!(e.snippet_next());
+        assert_eq!(e.selection_text(), "z");
+        // A plain Tab through an untouched placeholder keeps the nested stop.
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        assert!(e.snippet_next());
+        assert_eq!(e.selection_text(), "x");
     }
 
     /// On-type formatting (#254) keys off real keystrokes only: the typed
@@ -20209,11 +20344,13 @@ mod tests {
                 start: (0, 0),
                 end: (0, 3),
                 new_text: "baz".to_string(),
+                utf16: false,
             },
             TextSpanEdit {
                 start: (0, 8),
                 end: (0, 11),
                 new_text: "baz".to_string(),
+                utf16: false,
             },
         ];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
@@ -20235,6 +20372,7 @@ mod tests {
             start: (0, 0),
             end: (3, 9),
             new_text: "import logging\nimport re\nimport typing\n\nimport pandas".to_string(),
+            utf16: false,
         }];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
         assert_eq!(
@@ -20258,6 +20396,7 @@ mod tests {
             start: (0, 2),
             end: (0, 4),
             new_text: "C\nD".to_string(),
+            utf16: false,
         }];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
         assert_eq!(lines, vec!["abC".to_string(), "Def".to_string()]);
@@ -20271,11 +20410,13 @@ mod tests {
                 start: (0, 0),
                 end: (0, 4),
                 new_text: "label".to_string(),
+                utf16: false,
             },
             TextSpanEdit {
                 start: (1, 6),
                 end: (1, 10),
                 new_text: "label".to_string(),
+                utf16: false,
             },
         ];
         assert_eq!(e.apply_span_edits(&edits), 2);
@@ -21531,8 +21672,8 @@ mod tests {
             .read_to_end(&mut raw)
             .unwrap();
         assert_eq!(
-            raw, b"alpha\r\nbeta",
-            "save re-applies CRLF, no trailing EOL"
+            raw, b"alpha\r\nbeta\r\n",
+            "save re-applies CRLF, final newline included"
         );
     }
 
@@ -21928,6 +22069,63 @@ mod tests {
     }
 
     #[test]
+    fn saving_keeps_the_files_final_newline() {
+        for (disk, want) in [
+            ("a\nb\n", "xa\nb\n"),
+            ("a\r\nb\r\n", "xa\r\nb\r\n"),
+            ("a\n\n", "xa\n\n"),
+            ("a", "xa"),
+        ] {
+            let tmp = NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), disk).unwrap();
+            let mut e = Editor::new();
+            e.open(tmp.path()).unwrap();
+            e.insert_char('x');
+            e.save_to_disk().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(tmp.path()).unwrap(),
+                want,
+                "from {disk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_over_invalid_bytes_asks_first() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"caf\xe9 ok\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert!(e.decode_lossy, "a lone 0xE9 is not UTF-8");
+        e.insert_char('x');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::EncodingLoss);
+        assert_eq!(
+            std::fs::read(tmp.path()).unwrap(),
+            b"caf\xe9 ok\n",
+            "untouched"
+        );
+        e.lossy_save_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(!e.decode_lossy);
+    }
+
+    #[test]
+    fn a_language_servers_utf16_columns_land_after_an_emoji() {
+        let mut lines = vec![String::from("let s = \"😀\"; x + 1")];
+        let n = apply_span_edits_to_lines(
+            &mut lines,
+            &[TextSpanEdit {
+                start: (0, 14),
+                end: (0, 15),
+                new_text: String::from("renamed"),
+                utf16: true,
+            }],
+        );
+        assert_eq!(n, 1);
+        assert_eq!(lines[0], "let s = \"😀\"; renamed + 1");
+    }
+
+    #[test]
     fn save_round_trips_content() {
         let tmp = NamedTempFile::new().unwrap();
         let mut e = Editor::new();
@@ -22253,7 +22451,7 @@ mod tests {
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
         assert_eq!(
             std::fs::read(tmp.path()).unwrap(),
-            b"&#26085;&#26412;&#35486; costs 5\x80",
+            b"&#26085;&#26412;&#35486; costs 5\x80\n",
             "consent writes encoding_rs' references, and € as the 0x80 byte"
         );
         assert!(!e.encoding_loss);
@@ -22271,7 +22469,7 @@ mod tests {
         e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
         e.lines = vec![String::from("café")];
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
-        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9");
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9\n");
         assert!(e.unmappable_chars().is_empty());
         // The same text in UTF-8 is always representable.
         let mut u = Editor::new();
