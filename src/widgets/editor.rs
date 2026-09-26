@@ -8763,7 +8763,10 @@ impl Editor {
         // The single choke point every save funnels through, so no caller can
         // route around the guard. The consent flag survives a failed write
         // (the user still consented) and is cleared only once the bytes land.
-        if (had_errors || self.decode_lossy) && !self.lossy_save_armed {
+        // The decode's replacement characters are only a loss while they are
+        // still in the text: a buffer rewritten past them saves freely.
+        let writes_replacements = self.decode_lossy && content.contains('\u{fffd}');
+        if (had_errors || writes_replacements) && !self.lossy_save_armed {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
         }

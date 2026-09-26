@@ -4321,10 +4321,8 @@ pub fn extract_selection_text(
                 .flags
                 .contains(Flags::WRAPLINE);
         out.push_str(if wrapped { &line } else { line.trim_end() });
-        if line_idx != er {
-            if !wrapped {
-                out.push('\n');
-            }
+        if line_idx != er && !wrapped {
+            out.push('\n');
         }
         line_idx += 1;
     }

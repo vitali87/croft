@@ -53528,7 +53528,7 @@ fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
         Delete => tilde(3),
         F(n) => match n {
             1..=4 => {
-                let fin = [b'P', b'Q', b'R', b'S'][usize::from(n - 1)] as char;
+                let fin = b"PQRS"[usize::from(n - 1)] as char;
                 if m > 1 {
                     format!("\x1b[1;{m}{fin}").into_bytes()
                 } else {
