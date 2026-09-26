@@ -3455,9 +3455,9 @@ pub struct App {
     /// Terminal command suggestions (#614): on or off, and the one painted
     /// this frame as (pane index, the text Right arrow would type).
     term_suggest_enabled: bool,
-    term_suggestion: Option<(usize, String)>,
+    term_suggestion: Option<(usize, String, String)>,
     /// The command whose new shortcut the next keystroke records (#612).
-    recording_shortcut: Option<crate::widgets::command_palette::Command>,
+    recording_shortcut: Option<(crate::widgets::command_palette::Command, std::time::Instant)>,
     /// Inline AI suggestions (#607): off until the user turns them on, since
     /// they send code to a model. The worker, the backend it was started
     /// for, the request in flight (id plus what it answers for), and the
@@ -10288,12 +10288,13 @@ impl App {
         if !responded {
             return false;
         }
+        let peek = std::mem::take(&mut self.references_want_peek);
         if unsupported {
             self.status =
                 String::from("Go to References: not supported by this file's language server");
             return true;
         }
-        if std::mem::take(&mut self.references_want_peek) && !targets.is_empty() {
+        if peek && !targets.is_empty() {
             self.peek_refs = Some((targets, 0));
             self.show_peeked_reference();
             return true;
@@ -11731,6 +11732,11 @@ impl App {
     /// `⇧F12` keybinding. The server almost always returns many uses, which
     /// `drain_lsp_references` then offers as a picker.
     fn request_references_at_cursor(&mut self) {
+        // A request not sent (no path, no server) must not leave the last
+        // one's id, or Peek would arm itself on it and a later plain Go to
+        // References would open in the peek popup.
+        self.references_request_id = None;
+        self.references_want_peek = false;
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
@@ -19507,7 +19513,11 @@ impl App {
             return Ok(());
         }
         // Keyboard Shortcuts editor (#612): the next key is the new chord.
-        if let Some(cmd) = self.recording_shortcut.take() {
+        // Only the key that answers the prompt: once the user has clicked
+        // away or let it sit, a later Cmd+S must save, not become a binding.
+        if let Some((cmd, at)) = self.recording_shortcut.take()
+            && at.elapsed() < SHORTCUT_RECORD_WINDOW
+        {
             self.record_shortcut(cmd, key);
             return Ok(());
         }
@@ -20048,6 +20058,11 @@ impl App {
                         return Ok(());
                     }
                 }
+                // Settle edits that landed since the last pass first (an
+                // LSP rename or quick fix applied to the file's tab): with
+                // two tabs changed at once, the keystroke's tab would be
+                // copied over the other and erase that edit.
+                self.sync_symbol_views();
                 self.handle_editor_key(key);
                 // Settle the clip on this edit before clamping the caret to
                 // it: a line opened at the symbol's end grows the clip, so
@@ -26577,7 +26592,7 @@ impl App {
                     .strip_prefix("kb:")
                     .and_then(crate::widgets::command_palette::Command::from_id)
                 {
-                    self.recording_shortcut = Some(cmd);
+                    self.recording_shortcut = Some((cmd, std::time::Instant::now()));
                     self.status = format!(
                         "Press the new shortcut for \u{201c}{}\u{201d} (a function key or a chord with Cmd/Ctrl/Alt; Esc cancels)",
                         cmd.title()
@@ -32575,8 +32590,10 @@ impl App {
         // painted after it (#614), as in fish; anywhere else it moves.
         if key.code == KeyCode::Right
             && key.modifiers.is_empty()
-            && let Some((pane, rest)) = self.term_suggestion.take()
+            && let Some((pane, typed, rest)) = self.term_suggestion.take()
             && pane == self.active_terminal
+            && !self.terminal().awaiting_echo()
+            && self.terminal().prompt_tail().is_some_and(|t| t.0 == typed)
         {
             self.terminal_mut().write_input(rest.as_bytes());
             return;
@@ -40592,6 +40609,10 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        // A click means the user moved on from a pending shortcut prompt.
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
+            self.status = String::from("Shortcut unchanged");
+        }
         // On-screen keyboard taps outrank every other gate - including the
         // modal overlays - because the OSK is how Termux users type into
         // those modals. Its band is laid out disjoint from all panes, so
@@ -44421,6 +44442,11 @@ impl App {
         let Some(term) = self.terminals.get(idx) else {
             return;
         };
+        // Typed keys not echoed yet: the line on screen is behind, and a
+        // suggestion for it would be accepted after the keys that followed.
+        if term.awaiting_echo() {
+            return;
+        }
         let Some((typed, x, y, right)) = term.prompt_tail() else {
             return;
         };
@@ -44439,7 +44465,7 @@ impl App {
         frame
             .buffer_mut()
             .set_string(x, y, &shown, Style::default().fg(self.theme.ignored_fg()));
-        self.term_suggestion = Some((idx, rest));
+        self.term_suggestion = Some((idx, typed, rest));
     }
 
     /// Terminal: Toggle Command Suggestions (#614).
@@ -49145,7 +49171,7 @@ impl App {
         mode: ExplorerClipMode,
     ) {
         if matches!(mode, ExplorerClipMode::Copy) {
-            self.apply_paste_or_drop(dest_dir, paths, mode);
+            let _ = self.apply_paste_or_drop(dest_dir, paths, mode);
             return;
         }
         let renames = paths
@@ -49216,31 +49242,34 @@ impl App {
         true
     }
 
-    /// Apply the servers' edits, run the move, then tell the servers it
-    /// happened. Edits go first because they name the files at their old
-    /// paths.
+    /// Run the move, then apply the servers' edits and tell the servers it
+    /// happened. The move goes first: a move that fails (a folder into its
+    /// own child, a name already taken) must not leave every importer
+    /// rewritten to a path that does not exist. The edits name files at
+    /// their old paths, so they are carried to where the move put them.
     fn finish_file_move(
         &mut self,
         pending: PendingFileMove,
         edits: Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)>,
     ) {
-        let updated = if edits.is_empty() {
-            None
-        } else {
-            match self.apply_rename_edits(&edits) {
-                Ok((files, _)) => Some(files),
-                Err(e) => {
-                    self.status = format!("Could not update references: {e}");
-                    None
-                }
-            }
-        };
-        let moved = self.run_file_move(pending.op);
-        if moved && let Some(lsp) = self.lsp.as_mut() {
-            lsp.did_rename_files(pending.renames);
+        if !self.run_file_move(pending.op) {
+            return;
         }
-        if moved && let Some(files) = updated {
-            self.status = format!("{}, references updated in {files} file(s)", self.status);
+        let moved_status = self.status.clone();
+        if !edits.is_empty() {
+            let edits: Vec<_> = edits
+                .into_iter()
+                .map(|(path, e)| (moved_path(&path, &pending.renames), e))
+                .collect();
+            match self.apply_rename_edits(&edits) {
+                Ok((files, _)) => {
+                    self.status = format!("{moved_status}, references updated in {files} file(s)");
+                }
+                Err(e) => self.status = format!("{moved_status}; could not update references: {e}"),
+            }
+        }
+        if let Some(lsp) = self.lsp.as_mut() {
+            lsp.did_rename_files(pending.renames);
         }
     }
 
@@ -49248,8 +49277,7 @@ impl App {
     fn run_file_move(&mut self, op: FileMove) -> bool {
         match op {
             FileMove::Paste { dest_dir, paths } => {
-                self.apply_paste_or_drop(&dest_dir, &paths, ExplorerClipMode::Cut);
-                true
+                self.apply_paste_or_drop(&dest_dir, &paths, ExplorerClipMode::Cut)
             }
             FileMove::Rename {
                 parent,
@@ -49281,7 +49309,13 @@ impl App {
 
     /// Shared implementation for explorer paste and drag-drop. `mode`
     /// distinguishes a move (Cut/drag) from a copy (Copy/Alt-drag).
-    fn apply_paste_or_drop(&mut self, dest_dir: &Path, paths: &[PathBuf], mode: ExplorerClipMode) {
+    /// Returns whether every item landed.
+    fn apply_paste_or_drop(
+        &mut self,
+        dest_dir: &Path,
+        paths: &[PathBuf],
+        mode: ExplorerClipMode,
+    ) -> bool {
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         affected.insert(dest_dir.to_path_buf());
         let mut placed: Vec<PathBuf> = Vec::new();
@@ -49344,6 +49378,7 @@ impl App {
                 self.status_path(dest_dir)
             );
         }
+        errors.is_empty()
     }
 
     fn open_create_prompt(&mut self, kind: CreateKind, target_dir: PathBuf) {
@@ -53033,6 +53068,19 @@ fn reexec_binary_path(local_install: Option<&crate::update_watch::SelfInstall>) 
         return p;
     }
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("croft"))
+}
+
+/// How long a Keyboard Shortcuts prompt waits for its chord.
+const SHORTCUT_RECORD_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Where `path` is after `renames` ran: under a moved file or folder, its
+/// new place; anywhere else, unchanged.
+fn moved_path(path: &Path, renames: &[crate::lsp::manager::FileRenameOp]) -> PathBuf {
+    renames
+        .iter()
+        .find_map(|r| path.strip_prefix(&r.old).ok().map(|rest| r.new.join(rest)))
+        .map(|p| p.components().collect())
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn sidebar_view_label(view: SidebarView) -> &'static str {

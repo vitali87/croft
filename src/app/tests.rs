@@ -43014,6 +43014,59 @@ fn one_tab_speaks_for_a_file_to_the_language_server() {
     assert_eq!(seen, vec![active, active, active], "no tick resends");
 }
 
+/// An LSP edit applied to the file's tab while its symbol tab is active
+/// survives the next keystroke in the symbol tab: both tabs changed, and
+/// the keystroke's tab used to be copied over the rename.
+#[test]
+fn a_rename_landing_before_a_keystroke_in_a_symbol_tab_is_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.focus = Pane::Editor;
+    let edits = vec![(
+        file.clone(),
+        vec![crate::widgets::editor::TextSpanEdit {
+            start: (0, 3),
+            end: (0, 4),
+            new_text: String::from("renamed"),
+        }],
+    )];
+    app.apply_rename_edits(&edits).unwrap();
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ))
+    .unwrap();
+    app.sync_symbol_views();
+    let file_tab = app
+        .editor
+        .editors
+        .iter()
+        .find(|t| t.symbol_view.is_none() && t.path.as_deref() == Some(file.as_path()))
+        .expect("the file's own tab");
+    assert!(
+        file_tab.lines[0].contains("renamed"),
+        "{:?}",
+        file_tab.lines
+    );
+    assert!(
+        file_tab.lines.iter().any(|l| l.contains('x')),
+        "{:?}",
+        file_tab.lines
+    );
+}
+
+#[test]
+fn peek_references_with_nothing_to_ask_does_not_arm_on_a_stale_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.editor.path.is_none());
+    app.references_request_id = Some(7);
+    app.peek_references_at_cursor();
+    assert!(!app.references_want_peek);
+    assert_eq!(app.references_request_id, None);
+}
+
 /// A file of three functions with a symbol tab on the middle one, `b`
 /// (lines 3 to 5), active, and vim on.
 fn vim_symbol_tab_on_b(tmp: &tempfile::TempDir) -> App {
@@ -51091,6 +51144,67 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
 }
 
 #[test]
+fn a_failed_move_leaves_the_importers_alone_and_edits_follow_a_moved_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("pkg/sub")).unwrap();
+    std::fs::write(root.join("main.rs"), "use pkg;\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    let edit = |path: PathBuf| {
+        vec![(
+            path,
+            vec![crate::widgets::editor::TextSpanEdit {
+                start: (0, 4),
+                end: (0, 7),
+                new_text: String::from("pkg::sub::pkg"),
+            }],
+        )]
+    };
+    // A folder into its own child: refused, and main.rs must not change.
+    let pending = PendingFileMove {
+        request_id: 1,
+        op: FileMove::Paste {
+            dest_dir: root.join("pkg/sub"),
+            paths: vec![root.join("pkg")],
+        },
+        renames: vec![crate::lsp::manager::FileRenameOp {
+            old: root.join("pkg"),
+            new: root.join("pkg/sub/pkg"),
+            is_dir: true,
+        }],
+        deadline: std::time::Instant::now(),
+    };
+    app.finish_file_move(pending, edit(root.join("main.rs")));
+    assert_eq!(
+        std::fs::read_to_string(root.join("main.rs")).unwrap(),
+        "use pkg;\n"
+    );
+    assert!(root.join("pkg/sub").is_dir());
+
+    // An edit to a file inside the moved folder lands at its new place.
+    std::fs::write(root.join("pkg/lib.rs"), "use pkg;\n").unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    let pending = PendingFileMove {
+        request_id: 2,
+        op: FileMove::Paste {
+            dest_dir: root.join("dest"),
+            paths: vec![root.join("pkg")],
+        },
+        renames: vec![crate::lsp::manager::FileRenameOp {
+            old: root.join("pkg"),
+            new: root.join("dest/pkg"),
+            is_dir: true,
+        }],
+        deadline: std::time::Instant::now(),
+    };
+    app.finish_file_move(pending, edit(root.join("pkg/lib.rs")));
+    assert_eq!(
+        std::fs::read_to_string(root.join("dest/pkg/lib.rs")).unwrap(),
+        "use pkg::sub::pkg;\n"
+    );
+}
+
+#[test]
 fn a_pending_move_goes_ahead_at_its_deadline_without_an_answer() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -51440,7 +51554,7 @@ fn recording_a_shortcut_writes_it_and_takes_effect_at_once() {
     app.keybindings_file = tmp.path().join("keybindings.json");
     app.open_keyboard_shortcuts();
     let cmd = crate::widgets::command_palette::Command::ToggleLiveRun;
-    app.recording_shortcut = Some(cmd);
+    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
     // Plain typing is refused and ends the recording.
     app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
         .unwrap();
@@ -51450,7 +51564,7 @@ fn recording_a_shortcut_writes_it_and_takes_effect_at_once() {
         app.status
     );
     assert!(!app.keybindings_file.exists());
-    app.recording_shortcut = Some(cmd);
+    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
     app.handle_key(key(
         KeyCode::Char('j'),
         KeyModifiers::CONTROL | KeyModifiers::ALT,
@@ -51471,11 +51585,41 @@ fn escape_leaves_the_shortcut_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.keybindings_file = tmp.path().join("keybindings.json");
-    app.recording_shortcut = Some(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.recording_shortcut = Some((
+        crate::widgets::command_palette::Command::ToggleLiveRun,
+        std::time::Instant::now(),
+    ));
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.status, "Shortcut unchanged");
     assert!(!app.keybindings_file.exists());
+}
+
+#[test]
+fn a_stale_or_clicked_away_shortcut_prompt_records_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keybindings_file = tmp.path().join("keybindings.json");
+    let cmd = crate::widgets::command_palette::Command::ToggleLiveRun;
+    let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    app.recording_shortcut = Some((cmd, long_ago));
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(
+        !app.keybindings_file.exists(),
+        "a late chord is not recorded"
+    );
+    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.recording_shortcut.is_none(),
+        "a click cancels the prompt"
+    );
 }
 
 // ---- Profiles (#618) ----
@@ -51568,6 +51712,22 @@ fn fake_messages_endpoint(text: &'static str) -> (String, std::sync::mpsc::Recei
         let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
     });
     (url, rx)
+}
+
+/// #614: a key typed after a suggestion was painted makes it stale; Right
+/// before the echo arrives moves the cursor instead of typing the old
+/// suggestion's rest after the new key.
+#[test]
+fn right_does_not_accept_a_terminal_suggestion_the_typing_outran() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.term_suggestion = Some((0, String::from("g"), String::from("it status")));
+    app.handle_terminal_key(key(KeyCode::Char('i'), KeyModifiers::NONE));
+    app.term_suggestion = Some((0, String::from("g"), String::from("it status")));
+    app.handle_terminal_key(key(KeyCode::Right, KeyModifiers::NONE));
+    let written = String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).into_owned();
+    assert!(!written.contains("it status"), "{written:?}");
 }
 
 #[test]
