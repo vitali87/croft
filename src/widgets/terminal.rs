@@ -1932,9 +1932,16 @@ impl PtyTerminal {
         let marks_for_thread = marks.clone();
         let images = Arc::new(std::sync::Mutex::new(Vec::<StoredImage>::new()));
         let images_for_thread = images.clone();
-        let rewind = Arc::new(std::sync::Mutex::new(crate::rewind::RewindBuffer::new(
-            crate::rewind::DEFAULT_CAPACITY_BYTES,
-        )));
+        // One budget shared by every pane (#694), re-read per spawn like the
+        // scrollback so a settings edit applies without a relaunch. Setting
+        // it re-splits the budget over the panes already open; registering
+        // then trims them to the smaller share before this pane records.
+        let rewind_budget = crate::rewind::budget();
+        rewind_budget.set_total(crate::rewind::configured_budget_bytes(
+            crate::prefs::Prefs::load_or_default().terminal_rewind_mb,
+            crate::rewind::running_over_ssh(),
+        ));
+        let rewind = rewind_budget.register();
         let rewind_for_thread = rewind.clone();
         // MONOTONIC, not the wall clock. Every read the buffer offers —
         // `span_ms`, `replay_from`, the orphan-keyframe sweep — assumes the
@@ -4052,6 +4059,10 @@ impl Drop for PtyTerminal {
         // `self.term` (holding its channel sender) drops with this struct.
         let _ = self._child.kill();
         let _ = self._child.wait();
+        // Free the rewind buffer now and hand its share of the budget back
+        // to the other panes (#694). Not left to the Arc: the reader thread
+        // holds a clone until it is joined below.
+        crate::rewind::budget().release(&self.rewind);
         // Wake the reader (POLLHUP on its shutdown fd) and join it. EOF alone
         // is not a reliable wake: see `wait_pty_readable`.
         drop(self.reader_shutdown.take());
@@ -5881,6 +5892,34 @@ mod tests {
             "the reader thread parsed output without recording it: {} bytes held",
             rb.bytes()
         );
+    }
+
+    /// #694: closing a pane frees its rewind buffer at once and leaves the
+    /// shared budget, rather than waiting on the last handle to drop.
+    ///
+    /// Asserted on a clone of the handle, standing in for the reader thread's
+    /// copy: that clone is exactly what kept a closed pane's buffer alive.
+    #[test]
+    fn closing_a_pane_frees_its_rewind_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        term.write_input(b"echo FREED_$(echo soon)\n");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(2000),
+            "the shell to print the needle",
+            || term.visible_text().contains("FREED_soon"),
+        );
+        let handle = term.rewind().clone();
+        assert!(
+            !handle.lock().unwrap().is_empty(),
+            "precondition: the pane recorded output"
+        );
+        assert!(handle.lock().unwrap().capacity() > 0);
+
+        drop(term);
+        let rb = handle.lock().unwrap();
+        assert!(rb.is_empty(), "a closed pane kept {} bytes", rb.bytes());
+        assert_eq!(rb.capacity(), 0, "a closed pane kept its share");
     }
 
     /// Output arriving BEFORE an OSC 133 mark must be recorded too.

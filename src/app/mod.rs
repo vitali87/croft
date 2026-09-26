@@ -3750,6 +3750,14 @@ pub struct App {
     /// the local cross-build writes when it finishes shipping a newer
     /// binary, so the running croft can re-exec into it in place.
     update_watch: Option<crate::update_watch::UpdateWatch>,
+    /// True while this croft has stopped its language servers because a
+    /// source build of croft is compiling on the same host (#694), so the
+    /// servers are restarted once it ends. Only a remote-launched croft
+    /// ever sets it.
+    lsp_paused_for_build: bool,
+    /// When the build marker was last checked: it is a file read, so at
+    /// most once a second rather than every loop iteration.
+    build_marker_checked: Option<std::time::Instant>,
     /// One-shot startup probe (#242): does the repo this binary was built
     /// from now sit at a different commit/dirty state than the binary has
     /// baked in? Local-only — a remote-launched croft is re-stamped by its
@@ -5205,6 +5213,8 @@ impl App {
             connect_auth: None,
             install_session: None,
             update_watch: None,
+            lsp_paused_for_build: false,
+            build_marker_checked: None,
             drift_probe: None,
             local_drift: None,
             self_install: None,
@@ -29611,6 +29621,89 @@ impl App {
         ));
     }
 
+    /// Stop the language servers while croft compiles itself on this host,
+    /// and start them again once it is done (#694).
+    ///
+    /// The remote source build writes a marker while it runs. On an 8 GB
+    /// host a compile next to rust-analyzer exhausted memory, and the OOM
+    /// killer then took whatever was largest — croft, or a terminal pane.
+    /// Only a remote-launched croft watches: the build is the fallback of
+    /// `croft remote`'s update, and a local croft never runs one under it.
+    fn poll_source_build_marker(&mut self) -> bool {
+        if self.update_watch.is_none() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .build_marker_checked
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1))
+        {
+            return false;
+        }
+        self.build_marker_checked = Some(now);
+        let building =
+            crate::update_watch::source_build_running(&croft_cache_dir(), process_is_alive);
+        self.apply_source_build_state(building)
+    }
+
+    /// Pause or resume the language servers for a source build that has
+    /// started (`true`) or ended (`false`). Split from the polling so tests
+    /// drive it without a marker file or the 1 Hz gate.
+    fn apply_source_build_state(&mut self, building: bool) -> bool {
+        match (building, self.lsp_paused_for_build) {
+            (true, false) => {
+                // Nothing running is nothing to pause, and nothing to restart
+                // later either: a manager that failed to start stays down.
+                if self.lsp.is_none() {
+                    return false;
+                }
+                // Dropping the manager shuts its servers down (its Drop
+                // waits up to 3 s for them), which is what frees the memory.
+                self.lsp = None;
+                self.lsp_paused_for_build = true;
+                // Re-open every tab against the servers that come back. The
+                // diagnostics are kept: they are still the best answer until
+                // the restarted servers publish fresh ones.
+                self.lsp_last_seen.clear();
+                self.lsp_progress.clear();
+                let msg = "Language servers stopped while croft builds its update on this host";
+                crate::output::push("Language Servers", crate::output::OutputLevel::Info, msg);
+                self.status = String::from(msg);
+                true
+            }
+            (false, true) => {
+                self.lsp_paused_for_build = false;
+                self.lsp = match crate::lsp::LspManager::new(self.workspace_root().to_path_buf()) {
+                    Ok(m) => {
+                        m.set_extra_roots(
+                            self.roots.iter().skip(1).map(Path::to_path_buf).collect(),
+                        );
+                        Some(m)
+                    }
+                    Err(e) => {
+                        let msg = format!("Language servers could not restart: {e}");
+                        crate::output::push(
+                            "Language Servers",
+                            crate::output::OutputLevel::Error,
+                            &msg,
+                        );
+                        self.status = msg;
+                        None
+                    }
+                };
+                self.lsp_last_seen.clear();
+                self.lsp_progress.clear();
+                crate::output::push(
+                    "Language Servers",
+                    crate::output::OutputLevel::Info,
+                    "Update build finished; language servers restarted",
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Start the one-shot local drift probe (#242) on a locally-launched
     /// croft. A remote-launched croft skips it: its binary is re-stamped by
     /// the launching machine on every connect, and its baked manifest dir
@@ -29758,6 +29851,7 @@ impl App {
 
     pub fn poll_update_watch(&mut self) -> bool {
         let mut changed = self.poll_drift_probe();
+        changed |= self.poll_source_build_marker();
         changed |= self.poll_update_check();
         // Three producers share one event vocabulary; each event keeps its
         // origin so a drift rebuild's failure is never charged to the
@@ -53056,9 +53150,7 @@ const TERMINAL_RAIL_W: u16 = 3 + TERMINAL_RAIL_LABEL_W;
 /// remote shell). Used to throttle PTY-driven redraws further so the SSH
 /// pipe never saturates and starves input handling on the same thread.
 fn is_remote_session() -> bool {
-    std::env::var_os("SSH_CONNECTION").is_some()
-        || std::env::var_os("SSH_TTY").is_some()
-        || std::env::var_os("SSH_CLIENT").is_some()
+    crate::rewind::running_over_ssh()
 }
 
 /// Status-line advisory for a remote croft session that will not survive an

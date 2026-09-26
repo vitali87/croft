@@ -2995,19 +2995,57 @@ CROFT_JOBS=$(( ( $(nproc 2>/dev/null || echo 2) + 1 ) / 2 ))
 # is typing into a shell that shares these cores, RAM, and disk. Half the
 # cores still wrecks a small VPS, so drop to one compile job and put all
 # codegen IO in the idle class; the update simply takes longer.
+CROFT_LIVE=""
 if pgrep -x croft >/dev/null 2>&1; then
   CROFT_JOBS=1
+  CROFT_LIVE=1
+fi
+# nice and ionice ration CPU and IO, not memory (#694). Each rustc job on
+# croft costs well over a GB, so on a host under 16 GB two of them next to
+# rust-analyzer were enough to wake the OOM killer, which then took croft or
+# a terminal pane. Below that, compile one crate at a time.
+CROFT_MEM_KB=$(awk '/^MemTotal:/ {{ print $2 }}' /proc/meminfo 2>/dev/null || true)
+CROFT_AVAIL_KB=$(awk '/^MemAvailable:/ {{ print $2 }}' /proc/meminfo 2>/dev/null || true)
+if [ -n "$CROFT_MEM_KB" ] && [ "$CROFT_MEM_KB" -lt 16777216 ]; then
+  CROFT_JOBS=1
+fi
+if [ -n "$CROFT_AVAIL_KB" ] && [ "$CROFT_AVAIL_KB" -lt 2097152 ]; then
+  echo "croft: only $(( CROFT_AVAIL_KB / 1024 )) MB of memory available; building with one job under a memory cap" >&2
+fi
+# And cap the build's memory outright where systemd can: the compile runs
+# in its own scope limited to 60% of RAM with no swap, so if it outgrows
+# that it is the BUILD the kernel kills, inside its scope, and never croft
+# or a shell. Probed first, because a user manager or a delegated memory
+# controller is not a given on a server; without one the build runs uncapped
+# but still single-job on a small host.
+CROFT_MEMCAP=""
+if [ -n "$CROFT_MEM_KB" ] && command -v systemd-run >/dev/null 2>&1 \
+  && systemd-run --user --scope --quiet -p MemoryMax=64M -p MemorySwapMax=0 true >/dev/null 2>&1; then
+  CROFT_MEMCAP="systemd-run --user --scope --quiet -p MemoryMax=$(( CROFT_MEM_KB * 6 / 10 ))K -p MemorySwapMax=0"
 fi
 CROFT_NICE=""
 if command -v nice >/dev/null 2>&1; then CROFT_NICE="nice -n 19"; fi
 CROFT_IONICE=""
 if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
+# Tell a croft running on this box that a compile is under way, so it stops
+# its own language servers (rust-analyzer alone held 2.4 GB in the OOM that
+# prompted #694) and restarts them once the marker goes. The marker holds
+# this shell's PID so a build killed before its trap runs leaves a marker
+# croft can see is stale, instead of language servers paused for good.
+mkdir -p "$HOME/.cache/croft"
+printf %s "$$" > "$HOME/.cache/croft/building"
+trap 'rm -f "$HOME/.cache/croft/building"' EXIT
+if [ -n "$CROFT_LIVE" ]; then
+  # croft polls the marker once a second, and a server gets up to three
+  # seconds to shut down cleanly: let both finish before the first rustc.
+  sleep 5
+fi
 # eval, because this script runs under the remote user's login shell and
 # zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
 # try to run a command literally named "nice -n 19". eval re-parses the
 # assembled line, which splits correctly under both sh/bash and zsh.
-eval "$CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
-mkdir -p "$HOME/.cache/croft"
+eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
+rm -f "$HOME/.cache/croft/building"
 printf %s {stamp} > "$HOME/.cache/croft/install-stamp"
 rm -f "$HOME/.cache/croft/updating"
 "#,
@@ -4274,6 +4312,42 @@ Host !blocked *.internal
         let gate = command.find("pgrep -x croft").unwrap();
         let install = command.find("cargo install --path").unwrap();
         assert!(gate < install, "the session check must precede the compile");
+    }
+
+    // #694: nice/ionice ration CPU and IO but not memory, and a two-job
+    // compile beside rust-analyzer OOM-killed croft on 8 GB hosts. The
+    // build must drop to one job below 16 GB, run memory-capped where
+    // systemd allows it, and flag itself so a live croft stops its language
+    // servers — all before the compile starts.
+    #[test]
+    fn remote_install_compile_is_memory_bounded() {
+        let command = remote_install_command("abc123");
+        let install = command.find("cargo install --path").unwrap();
+        let before = |needle: &str| {
+            let at = command
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?}"));
+            assert!(at < install, "{needle:?} must come before the compile");
+        };
+        before("/proc/meminfo");
+        before("-lt 16777216");
+        before("systemd-run --user --scope");
+        before("MemoryMax=");
+        before("MemorySwapMax=0");
+        before("> \"$HOME/.cache/croft/building\"");
+        before("trap 'rm -f \"$HOME/.cache/croft/building\"' EXIT");
+        assert!(
+            command.contains(r#"eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
+            "the memory cap must wrap the compile itself"
+        );
+        // The marker goes as soon as the compile does, so language servers
+        // are not held back through the rest of the install.
+        let cleared = command
+            .rfind("rm -f \"$HOME/.cache/croft/building\"")
+            .unwrap();
+        assert!(cleared > install);
+        // The PID the marker holds is what lets croft ignore a stale one.
+        assert!(command.contains("printf %s \"$$\" > \"$HOME/.cache/croft/building\""));
     }
 
     // A backgrounded install's log lines died with the connect dialog,

@@ -48,6 +48,29 @@ impl UpdateWatch {
     }
 }
 
+/// The marker the remote source build writes while it compiles (#694),
+/// relative to `~/.cache/croft`. It holds the build shell's PID.
+pub const BUILD_MARKER_FILE: &str = "building";
+
+/// True while a source build of croft is compiling on this host.
+///
+/// The build removes the marker when it ends, from an `EXIT` trap as well,
+/// but a shell killed outright never runs its trap. So the marker counts
+/// only while the PID in it is alive (`alive` is the caller's probe, so
+/// tests need no real process): a stale one must not keep croft's language
+/// servers stopped for good. A marker without a usable PID counts as none.
+pub fn source_build_running(cache_dir: &std::path::Path, alive: impl Fn(u32) -> bool) -> bool {
+    let Ok(text) = std::fs::read_to_string(cache_dir.join(BUILD_MARKER_FILE)) else {
+        return false;
+    };
+    match text.trim().parse::<u32>() {
+        // 0 would probe the caller's own process group, and anything past
+        // i32::MAX is not a pid at all.
+        Ok(pid) if pid != 0 && i32::try_from(pid).is_ok() => alive(pid),
+        _ => false,
+    }
+}
+
 /// One-shot background probe answering: does the repo this binary was
 /// installed from now sit at a different commit/dirty state than the binary
 /// has baked in? The local half of the deploy-verification story (#242) —
@@ -663,6 +686,39 @@ mod tests {
         assert!(wait_for(&watch, UpdateEvent::InProgress));
         std::fs::remove_file(dir.join(MARKER_FILE)).unwrap();
         assert!(wait_for(&watch, UpdateEvent::Failed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #694: the build marker pauses language servers only while the build
+    /// that wrote it is alive.
+    #[test]
+    fn a_build_marker_counts_only_while_its_pid_is_alive() {
+        let dir = scratch_dir("build-marker");
+        let alive = |pid: u32| pid == 4242;
+        assert!(
+            !source_build_running(&dir, alive),
+            "no marker means no build"
+        );
+
+        std::fs::write(dir.join(BUILD_MARKER_FILE), "4242\n").unwrap();
+        assert!(source_build_running(&dir, alive), "a live build must count");
+
+        // A build killed before its EXIT trap ran leaves the file behind.
+        std::fs::write(dir.join(BUILD_MARKER_FILE), "999").unwrap();
+        assert!(
+            !source_build_running(&dir, alive),
+            "a stale marker must not keep the servers stopped"
+        );
+
+        // Junk, 0 (the caller's process group) and non-pids never count,
+        // and are never even probed.
+        for junk in ["", "abc", "0", "4294967295"] {
+            std::fs::write(dir.join(BUILD_MARKER_FILE), junk).unwrap();
+            assert!(
+                !source_build_running(&dir, |_| true),
+                "marker {junk:?} must not count as a build"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

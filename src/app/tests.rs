@@ -52898,3 +52898,34 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     let left: Vec<_> = app.review_pending.iter().map(|c| c.body.clone()).collect();
     assert_eq!(left, vec![String::from("written meanwhile")]);
 }
+
+/// #694: a source build of croft on this host stops the language servers
+/// for its duration and restarts them after, since a compile next to
+/// rust-analyzer is what exhausted memory on small remotes.
+#[test]
+fn a_source_build_pauses_the_language_servers_and_its_end_restarts_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.lsp.is_some(), "precondition: a manager is running");
+
+    assert!(app.apply_source_build_state(true));
+    assert!(app.lsp.is_none(), "the servers must stop for the build");
+    assert!(
+        !app.apply_source_build_state(true),
+        "a build still running changes nothing"
+    );
+
+    assert!(app.apply_source_build_state(false));
+    assert!(
+        app.lsp.is_some(),
+        "the servers must come back once the build ends"
+    );
+    assert!(!app.apply_source_build_state(false));
+
+    // Nothing running is nothing to pause, and nothing to start later: a
+    // manager that failed to start is not brought up by an unrelated build.
+    app.lsp = None;
+    assert!(!app.apply_source_build_state(true));
+    assert!(!app.apply_source_build_state(false));
+    assert!(app.lsp.is_none());
+}
