@@ -326,7 +326,7 @@ pub struct Prefs {
     #[serde(default)]
     pub terminal_scrollback: usize,
     /// Memory, in megabytes, that terminal rewind (#357) may hold across ALL
-    /// panes together (#694). Unset means 256 locally and 64 on a remote
+    /// panes together (#694). Unset means 128 locally and 32 on a remote
     /// host; `0` turns rewind recording off. Applies from the next pane
     /// opened, and re-splits the budget across the panes already open.
     #[serde(default)]

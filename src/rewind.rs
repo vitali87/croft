@@ -66,13 +66,13 @@ use std::sync::{Arc, Mutex, Weak};
 /// ten busy panes was 640 MiB before a single keyframe — and nothing replays
 /// the buffer yet, so every byte of it was pure cost. The budget is split
 /// evenly across live panes by [`RewindBudget`].
-pub const DEFAULT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+pub const DEFAULT_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 
 /// The shared budget on a remote host (an SSH session), in bytes.
 ///
 /// Remotes are where croft was OOM-killed: small VPSes running croft next
 /// to rust-analyzer and builds, where the whole machine may have 8 GB.
-pub const REMOTE_DEFAULT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+pub const REMOTE_DEFAULT_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 /// The largest `terminal_rewind_mb` honoured. A typo of a few extra zeros
 /// must not hand the rewind buffer the machine.
