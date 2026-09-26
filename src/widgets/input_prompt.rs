@@ -204,7 +204,10 @@ pub fn render_input_prompt(
     buf: &mut Buffer,
     theme: crate::theme::Theme,
 ) {
-    let width = (screen.width.saturating_mul(6) / 10).clamp(30, 90.min(screen.width));
+    let width = (screen.width.saturating_mul(6) / 10)
+        .max(30)
+        .min(90)
+        .min(screen.width);
     let height: u16 = 5;
     let rect = Rect {
         x: screen.x + (screen.width.saturating_sub(width)) / 2,

@@ -236,14 +236,14 @@ fn sqlite_pages_step_at_batch_boundaries() {
     app.editor.open(&p).unwrap();
     let view = app.editor.sheet.as_ref().unwrap();
     assert_eq!(view.sheets[0].row_count(), 500);
-    assert!(view.sheets[0].name.contains("rows 1-500 of 700"));
+    assert!(view.sheets[0].name.contains("rows 1-500, more follow"));
 
     app.handle_sheet_key(key(KeyCode::End, KeyModifiers::SUPER));
     app.handle_sheet_key(key(KeyCode::PageDown, KeyModifiers::NONE));
     let view = app.editor.sheet.as_ref().unwrap();
     assert_eq!(view.sheets[0].row_count(), 200, "second page loaded");
     assert!(
-        view.sheets[0].name.contains("rows 501-700 of 700"),
+        view.sheets[0].name.ends_with("rows 501-700"),
         "{}",
         view.sheets[0].name
     );
@@ -513,6 +513,37 @@ fn terminal_warning_renders_inside_a_narrow_frame_without_panicking() {
     let backend = ratatui::backend::TestBackend::new(8, 3);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
+}
+
+/// Overlays on a terminal smaller than their minimum size: `clamp(40, w)`
+/// panics when the width is under 40, and a confirm dialog's 50-column
+/// floor built a rect outside the buffer. A phone in portrait or a small
+/// tmux split is enough.
+#[test]
+fn overlays_render_on_a_tiny_terminal_without_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let draw = |app: &mut App, w: u16, h: u16| {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    };
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_command_palette();
+    draw(&mut app, 36, 20);
+    draw(&mut app, 80, 9);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_finder();
+    draw(&mut app, 36, 20);
+    draw(&mut app, 80, 9);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: String::from("a.txt"),
+        untracked: false,
+        staged: false,
+    });
+    draw(&mut app, 45, 12);
+    draw(&mut app, 45, 5);
+    draw(&mut app, 8, 3);
 }
 
 #[test]
@@ -12460,6 +12491,47 @@ fn bounded_output_gives_up_on_a_command_that_hangs() {
     .unwrap();
     assert!(status.success());
     assert_eq!(out, b"42");
+}
+
+/// A completion is accepted by the server's own edit: TypeScript's `?.foo`
+/// replaces the `.` before the word (croft produced `a.?.foo`), letters
+/// typed since the request go too, and an auto-import lands with it.
+#[test]
+fn a_completion_applies_its_text_edit_and_additional_edits() {
+    use crate::widgets::editor::TextSpanEdit;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.lines = vec![String::from("a.f")];
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    let item = crate::lsp::CompletionItem {
+        label: String::from("foo"),
+        // Requested at `a.` (col 2); `f` was typed since.
+        text_edit: Some(TextSpanEdit {
+            start: (0, 1),
+            end: (0, 2),
+            new_text: String::from("?.foo"),
+            utf16: true,
+        }),
+        additional_edits: vec![TextSpanEdit {
+            start: (0, 0),
+            end: (0, 0),
+            new_text: String::from("import { x } from 'x';\n"),
+            utf16: true,
+        }],
+        ..Default::default()
+    };
+    assert!(app.accept_completion_edit(&item));
+    assert_eq!(
+        app.editor.lines,
+        vec![
+            String::from("import { x } from 'x';"),
+            String::from("a?.foo")
+        ]
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 6));
+    // No text edit: the prefix path takes over.
+    assert!(!app.accept_completion_edit(&crate::lsp::CompletionItem::default()));
 }
 
 #[test]

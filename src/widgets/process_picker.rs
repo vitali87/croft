@@ -76,9 +76,9 @@ pub fn render_process_picker(
     theme: crate::theme::Theme,
 ) {
     let width = area.width.saturating_mul(7) / 10;
-    let width = width.clamp(40, 110.min(area.width));
+    let width = width.max(40).min(110).min(area.width);
     let height = area.height.saturating_mul(6) / 10;
-    let height = height.clamp(8, area.height);
+    let height = height.max(8).min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 4;
     let rect = Rect {

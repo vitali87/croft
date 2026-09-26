@@ -196,8 +196,13 @@ pub fn render_list_picker(
     buf: &mut Buffer,
     theme: crate::theme::Theme,
 ) {
-    let width = (screen.width.saturating_mul(6) / 10).clamp(36, 96.min(screen.width));
-    let height = (screen.height.saturating_mul(6) / 10).clamp(8, screen.height);
+    let width = (screen.width.saturating_mul(6) / 10)
+        .max(36)
+        .min(96)
+        .min(screen.width);
+    let height = (screen.height.saturating_mul(6) / 10)
+        .max(8)
+        .min(screen.height);
     let rect = Rect {
         x: screen.x + (screen.width.saturating_sub(width)) / 2,
         y: screen.y + (screen.height.saturating_sub(height)) / 4,

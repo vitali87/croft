@@ -4433,6 +4433,16 @@ impl Editor {
     }
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
+        // A FIFO, socket or device blocks the first read until some other
+        // process writes to it, freezing the UI thread indefinitely; none of
+        // them is a document. (Directories and missing paths go on to the
+        // handling they always had.)
+        if let Ok(meta) = std::fs::metadata(path)
+            && !meta.is_file()
+            && !meta.is_dir()
+        {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         // The Reopen-as-Text override is PER TAB and per file: a path
         // change is a different document, which routes normally again.
@@ -12240,7 +12250,7 @@ fn byte_index_of_char(line: &str, chars_in: usize) -> usize {
 /// positions count UTF-16 code units; the editor lays out by character, so a
 /// line containing astral-plane characters (which take two UTF-16 units) needs
 /// this conversion. An offset past the line clamps to the line's char length.
-fn utf16_to_char_col(line: &str, u16_off: u32) -> usize {
+pub(crate) fn utf16_to_char_col(line: &str, u16_off: u32) -> usize {
     let mut units: u32 = 0;
     for (char_idx, ch) in line.chars().enumerate() {
         if units >= u16_off {
@@ -16733,6 +16743,26 @@ mod tests {
             e.current_line_blame_annotation().is_none(),
             "a.rs blame painted on b.rs while its own fetch was still in flight"
         );
+    }
+
+    #[test]
+    fn opening_a_fifo_is_refused_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skipping: mkfifo unavailable");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut e = Editor::new();
+            let _ = tx.send(e.open(&fifo).map_err(|e| e.to_string()));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open returned instead of blocking on the pipe");
+        assert!(result.unwrap_err().contains("not a regular file"));
     }
 
     #[test]

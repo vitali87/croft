@@ -114,9 +114,12 @@ impl CompletionPopup {
     /// `calX` -> `calc_n_gram` correctly, where simply appending would
     /// leave the X behind).
     pub fn selected_label(&self) -> Option<String> {
+        // The edit's text before the label: rust-analyzer sends a snippet
+        // only in `textEdit`, and the label alone dropped its `($0)`.
         self.selected_item().map(|item| {
             item.insert_text
                 .clone()
+                .or_else(|| item.text_edit.as_ref().map(|e| e.new_text.clone()))
                 .unwrap_or_else(|| item.label.clone())
         })
     }
@@ -261,6 +264,7 @@ mod tests {
             filter_text: None,
             kind: None,
             is_snippet: false,
+            ..Default::default()
         }
     }
 
@@ -346,6 +350,7 @@ mod tests {
                 filter_text: None,
                 kind: None,
                 is_snippet: false,
+                ..Default::default()
             }],
             "",
         );
@@ -362,6 +367,7 @@ mod tests {
                 filter_text: Some("matchme".into()),
                 kind: None,
                 is_snippet: false,
+                ..Default::default()
             }],
             "match",
         );

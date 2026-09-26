@@ -12832,6 +12832,55 @@ impl App {
     /// chars and Backspace pass through to the editor and refresh the
     /// popup's filter prefix in place; if no items match the new prefix
     /// the popup dismisses on the next tick.
+    /// Accept a completion by the server's own edit: its range, from where
+    /// it starts to the caret (so letters typed since the request go too),
+    /// becomes its text, then its additional edits (auto-imports) apply.
+    /// False when the item has no usable edit, for the prefix fallback.
+    fn accept_completion_edit(&mut self, item: &crate::lsp::CompletionItem) -> bool {
+        let Some(te) = &item.text_edit else {
+            return false;
+        };
+        let row = self.editor.cursor_row;
+        if te.start.0 != row || te.end.0 != row || te.new_text.contains('\n') {
+            return false;
+        }
+        let Some(line) = self.editor.lines.get(row) else {
+            return false;
+        };
+        let start = if te.utf16 {
+            crate::widgets::editor::utf16_to_char_col(line, te.start.1 as u32)
+        } else {
+            te.start.1
+        };
+        let caret = self.editor.cursor_col;
+        if start > caret {
+            return false;
+        }
+        self.editor
+            .apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
+                start: (row, start),
+                end: (row, caret),
+                new_text: te.new_text.clone(),
+                utf16: false,
+            }]);
+        self.editor.cursor_col = start + te.new_text.chars().count();
+        if !item.additional_edits.is_empty() {
+            // Imports land before the caret: it moves down by the rows the
+            // edits ending before the completed word add (their positions
+            // are the document's before any edit, per the spec).
+            let rows_added: isize = item
+                .additional_edits
+                .iter()
+                .filter(|e| e.end <= (row, te.start.1))
+                .map(|e| e.new_text.matches('\n').count() as isize - (e.end.0 - e.start.0) as isize)
+                .sum();
+            self.editor.apply_span_edits(&item.additional_edits);
+            self.editor.cursor_row = (row as isize + rows_added).max(0) as usize;
+        }
+        self.editor.clamp_cursor();
+        true
+    }
+
     fn handle_completion_popup_key(&mut self, key: KeyEvent) -> bool {
         if self.completion_popup.is_none() {
             return false;
@@ -12863,8 +12912,17 @@ impl App {
                     .completion_popup
                     .as_ref()
                     .is_some_and(|p| p.selected_is_snippet());
+                let item = self
+                    .completion_popup
+                    .as_ref()
+                    .and_then(|p| p.selected_item().cloned());
                 self.completion_popup = None;
                 self.completion_request_id = None;
+                if let Some(item) = item.filter(|_| !is_snippet)
+                    && self.accept_completion_edit(&item)
+                {
+                    return true;
+                }
                 if let Some(t) = text {
                     if is_snippet {
                         // The body carries $1/$0 tab stops; expand_snippet
@@ -17885,7 +17943,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -17895,6 +17953,9 @@ impl App {
             width,
             height,
         };
+        // Clipped to the frame: a terminal narrower or shorter than the
+        // dialog's minimum made a rect outside the buffer, which panics.
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -17956,7 +18017,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -17966,6 +18027,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -18022,7 +18084,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let prompt = format!(
             "Replace {occurrences} occurrence(s) across {files} file(s) with \"{}\"?",
             self.search.replace
@@ -18040,6 +18102,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -18083,7 +18146,7 @@ impl App {
             return;
         }
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 7;
         let rect = Rect {
             x: (area.width.saturating_sub(width)) / 2 + area.x,
@@ -18091,6 +18154,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -18143,7 +18207,7 @@ impl App {
             return;
         }
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 7;
         let rect = Rect {
             x: (area.width.saturating_sub(width)) / 2 + area.x,
@@ -18151,6 +18215,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -18213,7 +18278,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let inner_w = width.saturating_sub(4) as usize;
         let shown: Vec<String> = block
             .code
@@ -18240,6 +18305,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let (title, accent) = if block.destructive {
             (
                 " RUN THIS BLOCK? IT LOOKS DESTRUCTIVE ",
@@ -18323,6 +18389,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00));
         let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         let block = ratatui::widgets::Block::default()
@@ -18408,7 +18475,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -18418,6 +18485,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00))))
@@ -18709,7 +18777,7 @@ impl App {
     fn render_prompt(&self, frame: &mut ratatui::Frame) {
         let Some(p) = &self.prompt else { return };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(40, 80);
+        let width = area.width.saturating_sub(8).clamp(40, 80).min(area.width);
         let height = if p.error.is_some() { 6 } else { 5 };
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -18719,6 +18787,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let grad = self.popup_gradient();
         let cursor_fg = if grad {
             rgb_color(GRAD_TL)
@@ -49111,9 +49180,9 @@ impl App {
             return;
         }
         match crate::sqlite_view::table_page(&path, &table, next) {
-            Ok((headers, rows, total)) if !rows.is_empty() || next == 0 => {
+            Ok((headers, rows, more)) if !rows.is_empty() || next == 0 => {
                 let got = rows.len();
-                let label = crate::sqlite_view::page_label(&table, next, got, total);
+                let label = crate::sqlite_view::page_label(&table, next, got, more);
                 view.sheets[idx] = crate::sheet::sheet_data_from_parts(label, headers, rows);
                 if delta < 0 {
                     let last = view.sheets[idx].row_count().saturating_sub(1);
@@ -51466,6 +51535,7 @@ fn snippet_completion_item(snip: &crate::snippets::Snippet) -> crate::lsp::Compl
         filter_text: Some(snip.prefix.clone()),
         kind: Some(lsp_types::CompletionItemKind::SNIPPET),
         is_snippet: true,
+        ..Default::default()
     }
 }
 
