@@ -1170,7 +1170,7 @@ pub fn render_shortcuts_modal(
     theme: crate::theme::Theme,
 ) {
     let width = area.width.saturating_mul(8) / 10;
-    let width = width.max(40).min(110).min(area.width);
+    let width = width.clamp(40, 110).min(area.width);
     let height = area.height.saturating_mul(8) / 10;
     let height = height.max(10).min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;

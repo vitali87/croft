@@ -197,8 +197,7 @@ pub fn render_list_picker(
     theme: crate::theme::Theme,
 ) {
     let width = (screen.width.saturating_mul(6) / 10)
-        .max(36)
-        .min(96)
+        .clamp(36, 96)
         .min(screen.width);
     let height = (screen.height.saturating_mul(6) / 10)
         .max(8)
