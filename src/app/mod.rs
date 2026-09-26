@@ -689,6 +689,7 @@ struct SidebarAreas {
 /// state. Encoded once in `App::init_graphics` (no PNG re-encoding per
 /// frame) and rewritten under the activity-bar block after every ratatui
 /// frame draw, since ratatui's bg-clear overdraws the image.
+#[cfg_attr(test, derive(Default))]
 pub struct ActivityBarImages {
     explorer_active: String,
     explorer_inactive: String,
@@ -3036,6 +3037,13 @@ pub struct App {
     /// is waiting for the next bake (see [`MINIMAP_EDIT_REBAKE`]).
     minimap_baked_at: Option<std::time::Instant>,
     minimap_edit_pending: bool,
+    /// The buffer ratatui drew last, and what each small chrome image (the
+    /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
+    /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
+    /// checked in a frame (the image was hidden) are dropped.
+    drawn_buffer: Option<ratatui::buffer::Buffer>,
+    chrome_sent: std::collections::HashMap<&'static str, u64>,
+    chrome_seen: std::collections::HashSet<&'static str>,
     /// A left-drag is panning the view via the minimap strip.
     minimap_drag: bool,
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
@@ -5014,6 +5022,9 @@ impl App {
             minimap_content_h: 0,
             minimap_baked_at: None,
             minimap_edit_pending: false,
+            drawn_buffer: None,
+            chrome_sent: std::collections::HashMap::new(),
+            chrome_seen: std::collections::HashSet::new(),
             minimap_drag: false,
             clipboard_reader: read_system_clipboard,
             is_relay_session: !cfg!(test) && std::env::var_os("CROFT_RELAY_KEY").is_some(),
@@ -5817,9 +5828,18 @@ impl App {
             self.overlays.run_debug.clear_emitted();
             return;
         }
-        let Some(osc) = self.overlays.run_debug.image() else {
+        let Some(osc) = self.overlays.run_debug.image().map(str::to_owned) else {
             return;
         };
+        let at = Rect {
+            x: cx,
+            y: cy,
+            width: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
+            height: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
+        };
+        if !self.chrome_image_due("run_debug", &osc, at) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -5869,9 +5889,18 @@ impl App {
             self.overlays.problems_badge.clear_emitted();
             return;
         }
-        let Some(osc) = self.overlays.problems_badge.image() else {
+        let Some(osc) = self.overlays.problems_badge.image().map(str::to_owned) else {
             return;
         };
+        let at = Rect {
+            x: cx,
+            y: cy,
+            width: crate::iterm2_inline::count_badge_cells_w(self.problems_badge_count),
+            height: 1,
+        };
+        if !self.chrome_image_due("problems_badge", &osc, at) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -5950,9 +5979,12 @@ impl App {
                 self.overlays.hero.set(osc, desired);
             }
         }
-        let Some(osc) = self.overlays.hero.image() else {
+        let Some(osc) = self.overlays.hero.image().map(str::to_owned) else {
             return;
         };
+        if !self.chrome_image_due("hero", &osc, hero) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -5992,9 +6024,18 @@ impl App {
         let Some((cx, cy)) = self.remote.last_image_cell else {
             return;
         };
-        let Some(osc) = self.overlays.ssh.image() else {
+        let Some(osc) = self.overlays.ssh.image().map(str::to_owned) else {
             return;
         };
+        let at = Rect {
+            x: cx,
+            y: cy,
+            width: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_W,
+            height: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_H,
+        };
+        if !self.chrome_image_due("ssh", &osc, at) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -7105,8 +7146,11 @@ impl App {
         }
         self.problems_badge_count = count;
         if count == 0 {
+            // Clear the screen only if a badge was actually drawn: at start-up
+            // and on every graphics re-init the count goes from unknown to 0,
+            // and on iTerm2 a needless clear is a whole-screen repaint.
             self.overlays.problems_badge.clear_image();
-            self.overlays.problems_badge.request_clear();
+            self.clear_problems_badge_if_emitted();
             return;
         }
         if let Some(img) = self.build_count_badge_image(
@@ -54017,9 +54061,45 @@ impl App {
         }
     }
 
+    /// Whether a small chrome image must be sent this frame (#682). These
+    /// used to go out after every redraw, so a keystroke re-sent each one
+    /// over SSH. Now one goes out when it is new, changed or moved, and on
+    /// iTerm2 and Sixel also when the cells around it were repainted (iTerm2
+    /// evicts an image under neighbouring traffic, and a cell-buffer picture
+    /// is erased by writes into it). Kitty keeps images on their own layer.
+    fn chrome_image_due(&mut self, key: &'static str, image: &str, at: Rect) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        image.hash(&mut h);
+        (at.x, at.y, at.width, at.height).hash(&mut h);
+        if self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Kitty
+            && let Some(buf) = &self.drawn_buffer
+        {
+            cells_fingerprint(
+                buf,
+                at.x.saturating_sub(1),
+                at.y.saturating_sub(1),
+                at.width.saturating_add(2),
+                at.height.saturating_add(2),
+            )
+            .hash(&mut h);
+        }
+        let sig = h.finish();
+        self.chrome_seen.insert(key);
+        self.chrome_sent.insert(key, sig) != Some(sig)
+    }
+
+    /// Drop the record of chrome images that were not on screen this frame,
+    /// so they are sent again when they come back.
+    fn end_chrome_flush(&mut self) {
+        let seen = std::mem::take(&mut self.chrome_seen);
+        self.chrome_sent.retain(|k, _| seen.contains(k));
+    }
+
     /// The screen was wiped or its images evicted: every large image is
     /// sent again on the next flush.
     fn forget_sent_images(&mut self) {
+        self.chrome_sent.clear();
         for side in 0..2 {
             self.overlays.editor[side].forget_sent();
         }
@@ -54387,6 +54467,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.render(f);
             })?;
             let mut underlays = app.image_underlays(drawn.buffer);
+            app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -54404,6 +54485,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     app.render(f);
                 })?;
                 underlays = app.image_underlays(drawn.buffer);
+                app.drawn_buffer = Some(drawn.buffer.clone());
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
@@ -54550,6 +54632,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.flush_problems_badge_overlay();
             app.flush_no_repo_hero_overlay();
             app.flush_ssh_empty_state_overlay();
+            app.end_chrome_flush();
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.

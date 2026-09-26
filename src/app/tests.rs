@@ -52374,3 +52374,64 @@ fn the_minimap_png_is_small() {
     assert!(png.len() < 1500, "{} bytes", png.len());
     assert!(image::load_from_memory(&png).is_ok());
 }
+
+/// #682: small chrome images go out when new, changed, moved, back from
+/// hiding, or (iTerm2) repainted around; not on every frame.
+#[test]
+fn a_chrome_image_is_sent_only_when_it_could_be_missing() {
+    use crate::iterm2_inline::InlineImageProtocol;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let at = Rect::new(2, 2, 3, 1);
+    let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
+    app.drawn_buffer = Some(buf.clone());
+    app.inline_protocol = InlineImageProtocol::ITerm2;
+    assert!(app.chrome_image_due("k", "img", at), "new");
+    app.end_chrome_flush();
+    assert!(!app.chrome_image_due("k", "img", at), "unchanged frame");
+    app.end_chrome_flush();
+    assert!(app.chrome_image_due("k", "img2", at), "changed");
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "moved"
+    );
+    app.end_chrome_flush();
+    buf[(2, 2)].set_symbol("x");
+    app.drawn_buffer = Some(buf.clone());
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "a neighbour repainted on iTerm2"
+    );
+    app.end_chrome_flush();
+    app.end_chrome_flush();
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "back after a frame hidden"
+    );
+    app.end_chrome_flush();
+    app.inline_protocol = InlineImageProtocol::Kitty;
+    assert!(app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)));
+    app.end_chrome_flush();
+    buf[(2, 3)].set_symbol("y");
+    app.drawn_buffer = Some(buf);
+    assert!(
+        !app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "Kitty ignores neighbours"
+    );
+}
+
+/// A PROBLEMS count that goes to zero clears the screen only if a badge was
+/// drawn: start-up and graphics re-inits no longer wipe the screen.
+#[test]
+fn a_zero_problem_count_clears_nothing_when_no_badge_was_drawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays
+        .activity
+        .set_images(super::ActivityBarImages::default());
+    app.problems_badge_count = usize::MAX;
+    app.refresh_problems_badge();
+    assert!(!app.consume_problems_badge_image_clear());
+}
