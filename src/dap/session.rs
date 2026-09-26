@@ -1415,13 +1415,23 @@ impl DapSession {
     /// Run to Cursor (#611): add a one-stop breakpoint at 1-based `line` of
     /// `path` and resume.
     pub fn run_to_cursor(&mut self, path: &Path, line: u32) {
-        let mut set = self.breakpoints.get(path).cloned().unwrap_or_default();
-        if !set.iter().any(|b| b.line == line) {
-            set.push(SourceBreakpoint::plain(line));
+        // A second Run to Cursor before the first stopped withdraws the
+        // first one's line, or it would stay behind with no gutter mark.
+        if let Some((old, _)) = self.run_to.take()
+            && old != path
+        {
+            let own = self.breakpoints.get(&old).cloned().unwrap_or_default();
+            let _ = self.active().send(set_breakpoints_request(&old, &own));
         }
-        let _ = self.active().send(set_breakpoints_request(path, &set));
         self.run_to = Some((path.to_path_buf(), line));
+        let own = self.breakpoints.get(path).cloned().unwrap_or_default();
+        let set = self.with_run_to(path, &own);
+        let _ = self.active().send(set_breakpoints_request(path, &set));
         self.continue_execution();
+    }
+
+    fn with_run_to(&self, path: &Path, own: &[SourceBreakpoint]) -> Vec<SourceBreakpoint> {
+        with_run_to(self.run_to.as_ref(), path, own)
     }
 
     /// Break when a variable changes (#611): ask the adapter for the data id
@@ -1465,9 +1475,9 @@ impl DapSession {
         // Kept current so Run to Cursor can restore exactly this set.
         self.breakpoints
             .insert(path.to_path_buf(), breakpoints.to_vec());
-        let _ = self
-            .active()
-            .send(set_breakpoints_request(path, breakpoints));
+        // A pending Run to Cursor in this file keeps its line.
+        let set = self.with_run_to(path, breakpoints);
+        let _ = self.active().send(set_breakpoints_request(path, &set));
     }
 
     /// Step over (`next`), into (`stepIn`), or out (`stepOut`).
@@ -1671,8 +1681,48 @@ mod session_set_tests {
     }
 }
 
+/// `own` plus a pending Run to Cursor line when it is in `path`, as a plain
+/// breakpoint: a logpoint, condition or hit count already on that line would
+/// let the program run straight past it.
+fn with_run_to(
+    run_to: Option<&(PathBuf, u32)>,
+    path: &Path,
+    own: &[SourceBreakpoint],
+) -> Vec<SourceBreakpoint> {
+    let mut set = own.to_vec();
+    if let Some((target, line)) = run_to
+        && target == path
+    {
+        set.retain(|b| b.line != *line);
+        set.push(SourceBreakpoint::plain(*line));
+    }
+    set
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_to_cursor_stops_even_on_a_logpoint_line() {
+        let src = PathBuf::from("/w/app.py");
+        let logpoint = SourceBreakpoint {
+            line: 9,
+            condition: None,
+            log_message: Some(String::from("x")),
+            hit_condition: None,
+        };
+        let target = (src.clone(), 9);
+        let set = with_run_to(Some(&target), &src, std::slice::from_ref(&logpoint));
+        assert_eq!(set, vec![SourceBreakpoint::plain(9)]);
+        assert_eq!(
+            with_run_to(
+                Some(&target),
+                Path::new("/w/other.py"),
+                std::slice::from_ref(&logpoint)
+            ),
+            vec![logpoint]
+        );
+    }
+
     use super::*;
 
     #[test]

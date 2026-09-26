@@ -462,6 +462,21 @@ impl SymbolView {
             own: caret.is_some_and(|c| c.own),
             opens_line: text.as_bytes()[..at + inserted].ends_with(b"\n") && inserted > 0,
         };
+        // An own insertion past the range's end but still on its last line
+        // (another tab typed after the closing `}` first) is typed at the
+        // symbol's end as the user sees it: reach the range to it, so Enter
+        // there grows the symbol rather than landing outside the clip.
+        if origin.own
+            && removed == 0
+            && inserted > 0
+            && at > self.range.end
+            && self
+                .text
+                .get(self.range.end..at)
+                .is_some_and(|gap| !gap.contains('\n'))
+        {
+            self.range = SymbolRange::new(self.range.start, at);
+        }
         let (old_first, old_last) = (self.first, self.last);
         let mut update = ViewUpdate::Kept;
         match self
@@ -960,6 +975,28 @@ mod tests {
         let mut v = beta_view();
         assert_eq!(v.follow(opened, 2, rust(), there(7, 0)), ViewUpdate::Kept);
         assert_eq!((v.first, v.last), (4, 6));
+    }
+
+    /// A foreign tab typing after the closing `}` leaves the range short of
+    /// the line's end; Enter at that end from the symbol's own tab still
+    /// grows it.
+    #[test]
+    fn own_enter_after_foreign_text_on_the_last_line_still_grows_it() {
+        let mut v = beta_view();
+        let typed = format!("{SRC} // x");
+        assert_eq!(
+            v.follow(typed.clone(), 2, rust(), there(6, 6)),
+            ViewUpdate::Kept
+        );
+        assert_eq!((v.first, v.last), (4, 6));
+        let opened = format!("{typed}\n");
+        let own = Some(Caret {
+            row: 7,
+            col: 0,
+            own: true,
+        });
+        assert_eq!(v.follow(opened, 3, rust(), own), ViewUpdate::Kept);
+        assert_eq!((v.first, v.last), (4, 7));
     }
 
     /// Enter at the start of the heading, typed in the symbol's own tab,

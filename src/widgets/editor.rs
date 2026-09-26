@@ -3479,6 +3479,8 @@ impl Editor {
             Some((shadow_path, old)) if shadow_path == path => {
                 if old.len() != self.lines.len() {
                     *set = shift_bookmark_lines(set, &old, &self.lines);
+                } else {
+                    *set = follow_moved_bookmark_lines(set, &old, &self.lines);
                 }
                 old
             }
@@ -9072,6 +9074,17 @@ impl Editor {
                 self.selection = None;
             }
         }
+        // Extra carets follow the same rule as the selection.
+        self.carets.retain_mut(|c| {
+            let (lo, hi) = (c.anchor.0.min(c.head.0), c.anchor.0.max(c.head.0));
+            if lo >= old_end {
+                c.anchor.0 = shift(c.anchor.0);
+                c.head.0 = shift(c.head.0);
+                true
+            } else {
+                hi < prefix
+            }
+        });
         self.mirror_caret = Some(source_caret);
         self.lines
             .splice(prefix..old_end, new_lines[prefix..new_end].iter().cloned());
@@ -12191,6 +12204,43 @@ fn shift_bookmark_lines(
         .collect()
 }
 
+/// Marks after an edit that kept the line count: a marked line whose text
+/// now sits, once, elsewhere in the changed span moved there (Move Line
+/// Up/Down, a swap, undoing either); any other mark keeps its row, as a
+/// line edited in place does.
+fn follow_moved_bookmark_lines(
+    marks: &std::collections::BTreeSet<usize>,
+    old: &[String],
+    new: &[String],
+) -> std::collections::BTreeSet<usize> {
+    let Some(first) = old.iter().zip(new).position(|(a, b)| a != b) else {
+        return marks.clone();
+    };
+    let last = old.len()
+        - 1
+        - old
+            .iter()
+            .rev()
+            .zip(new.iter().rev())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+    marks
+        .iter()
+        .map(|&line| {
+            let row = line - 1;
+            if !(first..=last).contains(&row) || old.get(row) == new.get(row) {
+                return line;
+            }
+            let text = &old[row];
+            let mut hits = (first..=last).filter(|&j| &new[j] == text);
+            match (hits.next(), hits.next()) {
+                (Some(j), None) => j + 1,
+                _ => line,
+            }
+        })
+        .collect()
+}
+
 /// Shift highlight spans left by `byte_start`, dropping spans that fall
 /// entirely before the cut and clamping spans straddling the cut.
 /// Split file text into buffer lines the way the LSP spec / VS Code / Zed do:
@@ -13888,7 +13938,7 @@ impl Editor {
         if let Some(line) = md.scroll_to_source.take()
             && let Some(row) = md.row_for_source_line(line)
         {
-            md.scroll = (row as u16).min(max_scroll);
+            md.scroll = row.min(usize::from(max_scroll)) as u16;
         }
         md.last_area = text_area;
         para.scroll((md.scroll, 0)).render(text_area, buf);
@@ -16947,6 +16997,37 @@ mod tests {
         assert_eq!(e.bookmarked_lines(), vec![4]);
         assert_eq!(e.toggle_bookmark(), Some(false), "second toggle clears it");
         assert!(e.bookmarked_lines().is_empty());
+    }
+
+    #[test]
+    fn a_bookmark_moves_with_its_line_on_move_line_down_and_back() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 3;
+        e.toggle_bookmark();
+        e.move_lines_down();
+        assert_eq!(e.lines[4], "line 4");
+        assert_eq!(e.bookmarked_lines(), vec![5]);
+        e.move_lines_up();
+        assert_eq!(e.bookmarked_lines(), vec![4]);
+        // An in-place edit keeps the mark on its row.
+        e.cursor_col = 0;
+        e.insert_char('x');
+        assert_eq!(e.bookmarked_lines(), vec![4]);
+    }
+
+    #[test]
+    fn mirrored_edits_above_move_the_extra_carets_too() {
+        let (mut e, _f) = bookmark_editor(5);
+        e.cursor_row = 4;
+        e.carets = vec![EditorSelection {
+            anchor: (3, 0),
+            head: (3, 0),
+        }];
+        let mut new = e.lines.clone();
+        new.drain(0..2);
+        assert!(e.mirror_lines_from(&new, 1, (0, 0)));
+        assert_eq!(e.cursor_row, 2);
+        assert_eq!(e.carets[0].head, (1, 0));
     }
 
     #[test]

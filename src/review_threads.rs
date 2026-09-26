@@ -181,15 +181,27 @@ impl ReviewEvent {
 pub fn commentable_lines(diff: &str, path: &str) -> std::collections::HashSet<usize> {
     let mut out = std::collections::HashSet::new();
     let mut in_file = false;
+    // Between `diff --git` and the first hunk: only there is `+++ ` a file
+    // header. Inside a hunk it is an added line that reads `++ ...`.
+    let mut in_header = false;
     let mut line = 0usize;
     for l in diff.lines() {
-        if let Some(rest) = l.strip_prefix("+++ ") {
-            in_file = rest.strip_prefix("b/").unwrap_or(rest) == path;
-            continue;
-        }
         if l.starts_with("diff --git ") {
             in_file = false;
+            in_header = true;
+            line = 0;
             continue;
+        }
+        if in_header && let Some(rest) = l.strip_prefix("+++ ") {
+            let name = diff_path(rest);
+            in_file = name.strip_prefix("b/").unwrap_or(&name) == path;
+            continue;
+        }
+        // Every file's first hunk ends its header, the skipped files' too:
+        // otherwise an added `+++ b/x` line inside one would read as a
+        // header and point its later hunks at `x`.
+        if l.starts_with("@@ ") {
+            in_header = false;
         }
         if !in_file {
             continue;
@@ -220,6 +232,46 @@ pub fn commentable_lines(diff: &str, path: &str) -> std::collections::HashSet<us
         }
     }
     out
+}
+
+/// A path as a diff header writes it: git ends a name holding a space with
+/// a tab, and C-quotes one with a quote, backslash or non-ASCII byte
+/// (`"b/caf\303\251.rs"`).
+fn diff_path(raw: &str) -> String {
+    let raw = raw.trim_end_matches('\t');
+    let Some(inner) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return raw.to_string();
+    };
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut it = inner.bytes().peekable();
+    while let Some(b) = it.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match it.next() {
+            Some(d @ b'0'..=b'7') => {
+                let mut v = u32::from(d - b'0');
+                for _ in 0..2 {
+                    if let Some(&n @ b'0'..=b'7') = it.peek() {
+                        v = v * 8 + u32::from(n - b'0');
+                        it.next();
+                    }
+                }
+                bytes.push(v as u8);
+            }
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'r') => bytes.push(b'\r'),
+            Some(b'a') => bytes.push(7),
+            Some(b'b') => bytes.push(8),
+            Some(b'f') => bytes.push(12),
+            Some(b'v') => bytes.push(11),
+            Some(c) => bytes.push(c),
+            None => bytes.push(b'\\'),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// The body of `POST /pulls/N/reviews`. Pending comments on lines the diff
@@ -364,6 +416,19 @@ impl Thread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_paths_with_spaces_non_ascii_and_plus_lines_are_read_right() {
+        let spaced = "diff --git a/my file.rs b/my file.rs\n--- a/my file.rs\t\n+++ b/my file.rs\t\n@@ -1,1 +1,2 @@\n a\n+b\n";
+        assert_eq!(commentable_lines(spaced, "my file.rs").len(), 2);
+        let quoted = "diff --git \"a/caf\\303\\251.rs\" \"b/caf\\303\\251.rs\"\n--- \"a/caf\\303\\251.rs\"\n+++ \"b/caf\\303\\251.rs\"\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+        assert_eq!(commentable_lines(quoted, "café.rs").len(), 1);
+        let plus = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,3 @@\n a\n+++ b\n+c\n";
+        let got = commentable_lines(plus, "x");
+        assert_eq!(got, [1, 2, 3].into_iter().collect());
+        let other = "diff --git a/o b/o\n--- a/o\n+++ b/o\n@@ -1,1 +1,2 @@\n a\n+++ b/target.rs\n@@ -9,1 +10,1 @@\n z\n";
+        assert!(commentable_lines(other, "target.rs").is_empty());
+    }
 
     /// A CURRENT line anchors trustworthily; an OUTDATED one is anchored but
     /// marked.

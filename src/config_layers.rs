@@ -136,7 +136,11 @@ fn user_layers_dir() -> PathBuf {
     if cfg!(test) {
         std::env::temp_dir().join(format!("croft-test-config-{}", std::process::id()))
     } else {
-        crate::prefs::config_dir()
+        // The active profile's dir (#618), which is where every settings
+        // change is saved; reading the bare config dir dropped them all.
+        crate::profiles::file("config.json")
+            .parent()
+            .map_or_else(crate::prefs::config_dir, Path::to_path_buf)
     }
 }
 
