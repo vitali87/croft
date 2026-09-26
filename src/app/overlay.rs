@@ -275,10 +275,10 @@ pub struct ActivityOverlay {
     /// shift (terminal resize, or any change that recenters the bar) and
     /// evict iTerm2's stale OSC-1337 image layer before re-emitting.
     last_positions: Vec<(u16, u16)>,
-    /// Fingerprint of the cells around the icons when they were last sent:
-    /// iTerm2 only evicts an icon under traffic next to it, so the
-    /// keepalive runs only after those cells changed (#682).
-    neighbourhood: Option<u64>,
+    /// Fingerprint of the cells around each icon when it was last sent, in
+    /// `last_positions` order: iTerm2 only evicts an icon under traffic next
+    /// to it, so the keepalive re-sends only icons whose ring changed (#682).
+    neighbourhood: Vec<u64>,
     clear: ClearLatch,
 }
 
@@ -320,13 +320,18 @@ impl ActivityOverlay {
         self.last_emit = Some(std::time::Instant::now());
     }
 
-    /// Whether the cells around the icons changed since they were sent.
-    pub fn neighbourhood_changed(&self, around: u64) -> bool {
-        self.neighbourhood != Some(around)
+    /// Whether the cells around icon `i` changed since it was sent.
+    pub fn neighbourhood_changed(&self, i: usize, around: &[u64]) -> bool {
+        self.neighbourhood.get(i) != around.get(i) || around.get(i).is_none()
     }
 
-    pub fn set_neighbourhood(&mut self, around: u64) {
-        self.neighbourhood = Some(around);
+    pub fn set_neighbourhood(&mut self, around: Vec<u64>) {
+        self.neighbourhood = around;
+    }
+
+    /// Whether the dirty flag (a full re-send) is up.
+    pub fn dirty(&self) -> bool {
+        self.dirty
     }
 
     /// Where the icons were last painted.
@@ -359,11 +364,6 @@ impl ActivityOverlay {
 
     pub fn forget_positions(&mut self) {
         self.last_positions.clear();
-    }
-
-    #[cfg(test)]
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
     }
 }
 
@@ -405,10 +405,20 @@ mod tests {
     #[test]
     fn the_icon_keepalive_waits_for_the_cells_around_the_icons_to_change() {
         let mut a = ActivityOverlay::default();
-        assert!(a.neighbourhood_changed(1), "never sent");
-        a.set_neighbourhood(1);
-        assert!(!a.neighbourhood_changed(1), "idle: nothing to outlast");
-        assert!(a.neighbourhood_changed(2), "a neighbour was repainted");
+        assert!(a.neighbourhood_changed(0, &[1, 1]), "never sent");
+        a.set_neighbourhood(vec![1, 1]);
+        assert!(
+            !a.neighbourhood_changed(0, &[1, 1]),
+            "idle: nothing to outlast"
+        );
+        assert!(
+            !a.neighbourhood_changed(0, &[1, 2]),
+            "only the other icon's ring changed"
+        );
+        assert!(
+            a.neighbourhood_changed(1, &[1, 2]),
+            "this icon's ring was repainted"
+        );
     }
 
     /// #682: a large image is sent once and then only when it could be

@@ -11664,7 +11664,7 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         "the clear request must be one-shot — consuming twice in a row returns false",
     );
     assert!(
-        app.overlays.activity.is_dirty(),
+        app.overlays.activity.dirty(),
         "resize must also re-mark the icons dirty so the post-draw flush re-emits them after the clear",
     );
 }
@@ -11728,7 +11728,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     // First emit at one layout: records the positions, arms no clear.
     place(&mut app, 2);
     app.overlays.activity.mark_dirty();
-    app.flush_activity_image_overlays(0);
+    app.flush_activity_image_overlays(&[]);
     assert!(
         !app.consume_activity_image_clear(),
         "the first emit has no prior positions to compare, so it must not arm a clear",
@@ -11736,7 +11736,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     // A resize recenters the bar — every icon row shifts by one.
     place(&mut app, 3);
     app.overlays.activity.mark_dirty();
-    app.flush_activity_image_overlays(0);
+    app.flush_activity_image_overlays(&[]);
     assert!(
         app.consume_activity_image_clear(),
         "icons that moved since the last emit must arm one terminal.clear() to evict the stale image layer",
@@ -14884,7 +14884,7 @@ fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
         app.consume_shortcuts_image_clear(),
         "Esc must also arm terminal.clear() so the modal's text cells get wiped and the activity bar / welcome wordmark / hero icons can be re-emitted cleanly"
     );
-    assert!(app.overlays.activity.is_dirty());
+    assert!(app.overlays.activity.dirty());
     assert!(app.overlays.welcome.is_dirty());
     assert!(app.overlays.hero.is_dirty());
 }
@@ -25159,7 +25159,7 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     // Baseline: no hover, icons already emitted (clean).
     app.hovered_activity_icon = None;
     app.overlays.activity.mark_emitted();
-    assert!(!app.overlays.activity.is_dirty());
+    assert!(!app.overlays.activity.dirty());
     let moved = |col: u16, row: u16| crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
         column: col,
@@ -25170,7 +25170,7 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     app.handle_mouse(moved(0, 5));
     assert_eq!(app.hovered_activity_icon, Some(ActivityIcon::Search));
     assert!(
-        app.overlays.activity.is_dirty(),
+        app.overlays.activity.dirty(),
         "entering an icon re-emits the swapped image"
     );
     // Drifting within the same icon costs nothing: no re-dirty.
@@ -25178,14 +25178,14 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     app.handle_mouse(moved(1, 4));
     assert_eq!(app.hovered_activity_icon, Some(ActivityIcon::Search));
     assert!(
-        !app.overlays.activity.is_dirty(),
+        !app.overlays.activity.dirty(),
         "drifting within one icon does not re-emit"
     );
     // Leaving the bar clears the hover and re-emits the resting icon.
     app.handle_mouse(moved(40, 20));
     assert_eq!(app.hovered_activity_icon, None);
     assert!(
-        app.overlays.activity.is_dirty(),
+        app.overlays.activity.dirty(),
         "leaving the icon re-emits its resting variant"
     );
 }
