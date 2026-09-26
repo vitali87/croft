@@ -348,7 +348,25 @@ pub struct Prefs {
     /// a command or post to a URL.
     #[serde(default)]
     pub notifications: Vec<NotificationSink>,
+    /// The file as it was read, kept so a save rewrites only what changed.
+    #[serde(skip)]
+    pub(crate) source: SourceDoc,
 }
+
+/// The raw `config.json` object a [`Prefs`] was loaded from. The settings
+/// loader reads keys this struct has no field for (`extends`, the
+/// `macos` / `linux` / `android` blocks, settings of newer versions), so a
+/// save that wrote the struct back alone deleted them. Ignored by equality:
+/// two `Prefs` with the same settings are equal wherever they came from.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceDoc(Option<serde_json::Map<String, serde_json::Value>>);
+
+impl PartialEq for SourceDoc {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for SourceDoc {}
 
 /// The `config.json` that [`Prefs::load_or_default`] reads, or `None` in
 /// test builds: the user's real `config.json` must never steer a test
@@ -372,7 +390,20 @@ impl Prefs {
     pub fn load(path: &Path) -> Result<Self> {
         let json =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&json).context("parsing prefs")
+        Self::parse(&json).context("parsing prefs")
+    }
+
+    /// Parse a `config.json`, which is JSONC like every other settings file
+    /// croft reads: the layer loader accepts comments and trailing commas,
+    /// so a strict parse here threw away every setting in a file that
+    /// merely had a comment, re-enabling disabled extensions among others.
+    fn parse(json: &str) -> serde_json::Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(&crate::tasks::strip_jsonc(json))?;
+        let mut prefs: Self = serde_json::from_value(value.clone())?;
+        if let serde_json::Value::Object(map) = value {
+            prefs.source = SourceDoc(Some(map));
+        }
+        Ok(prefs)
     }
 
     /// The preferences a read-modify-write starts from: defaults only when
@@ -381,8 +412,7 @@ impl Prefs {
     /// other settings with defaults.
     pub fn load_for_update(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(json) => serde_json::from_str(&crate::tasks::strip_jsonc(&json))
-                .with_context(|| format!("parsing {}", path.display())),
+            Ok(json) => Self::parse(&json).with_context(|| format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -393,7 +423,7 @@ impl Prefs {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let json = serde_json::to_string_pretty(self).context("serializing prefs")?;
+        let json = serde_json::to_string_pretty(&self.document()?).context("serializing prefs")?;
         // Written aside and renamed in: a reader on another thread (the MCP
         // worker's fingerprint check) must never see a truncated file, and a
         // crash mid-write must not leave one.
@@ -408,6 +438,35 @@ impl Prefs {
             let _ = std::fs::remove_file(&tmp);
             format!("replacing {}", path.display())
         })
+    }
+
+    /// What [`Prefs::save`] writes: the loaded file with only the settings
+    /// that changed since it was read replaced, so keys this struct does not
+    /// model survive. A value is compared against the file's own typed view,
+    /// so an untouched setting is left exactly as the user wrote it.
+    fn document(&self) -> Result<serde_json::Value> {
+        let current = serde_json::to_value(self).context("serializing prefs")?;
+        let Some(mut doc) = self.source.0.clone() else {
+            return Ok(current);
+        };
+        let loaded: Self = serde_json::from_value(serde_json::Value::Object(doc.clone()))
+            .context("re-reading prefs")?;
+        let loaded = serde_json::to_value(&loaded).context("serializing prefs")?;
+        if let (serde_json::Value::Object(current), serde_json::Value::Object(loaded)) =
+            (current, loaded)
+        {
+            // A setting cleared to a value that is skipped when serialized
+            // must leave the file too, or the old value would load again.
+            for key in loaded.keys().filter(|k| !current.contains_key(*k)) {
+                doc.remove(key);
+            }
+            for (key, value) in current {
+                if loaded.get(&key) != Some(&value) {
+                    doc.insert(key, value);
+                }
+            }
+        }
+        Ok(serde_json::Value::Object(doc))
     }
 
     pub fn theme(&self) -> Theme {
@@ -791,6 +850,39 @@ pub(crate) fn config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_one_setting_keeps_keys_prefs_does_not_model_and_accepts_jsonc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+  // shared base
+  "extends": "base.json",
+  "macos": {"theme": "light"},
+  "future_setting": 7,
+  "theme": "dark",
+  "osk_split": true,
+}"#,
+        )
+        .unwrap();
+        // A comment and trailing comma no longer reset everything.
+        assert!(Prefs::load(&path).unwrap().osk_split);
+        save_mcp_consent_in(dir.path(), "ext").unwrap();
+        set_disable_secret_redaction(&path, true).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["extends"], "base.json");
+        assert_eq!(doc["macos"]["theme"], "light");
+        assert_eq!(doc["future_setting"], 7);
+        assert_eq!(doc["theme"], "dark");
+        assert_eq!(doc["osk_split"], true);
+        assert_eq!(doc["disable_secret_redaction"], true);
+        let prefs = Prefs::load(&path).unwrap();
+        assert!(prefs.mcp_consented.contains("ext"));
+        assert!(prefs.disable_secret_redaction);
+    }
 
     #[test]
     fn saving_prefs_replaces_the_file_and_leaves_no_temp_behind() {

@@ -222,12 +222,8 @@ impl Notes {
     }
 
     pub fn load(path: &Path) -> Self {
-        let notes: Vec<Note> = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
         Self {
-            notes,
+            notes: read_store(path),
             next: 0,
             generation: 1,
         }
@@ -236,9 +232,28 @@ impl Notes {
     /// Write every note, tombstones included: a guest that reconnects after
     /// a restart still holds its copy of a deleted note, and only the
     /// tombstone stops that copy bringing the note back.
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    ///
+    /// The store on disk is merged in first, under a lock: two windows on
+    /// one workspace each wrote their own list over the other's, and a note
+    /// added in one vanished when the other saved. This window picks the
+    /// other's notes up in the same step.
+    pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+        }
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("json.lock"))?;
+        // SAFETY: flock on a descriptor this function owns; released when
+        // `lock` is dropped at the end of the call.
+        unsafe {
+            libc::flock(lock.as_raw_fd(), libc::LOCK_EX);
+        }
+        for note in read_store(path) {
+            self.merge(note);
         }
         // Written aside and renamed in, so a crash mid-write never leaves a
         // truncated file that `load` reads as no notes at all.
@@ -250,9 +265,50 @@ impl Notes {
     }
 }
 
+/// The notes in the store at `path`; none when it does not exist. A store
+/// that does not parse is moved aside to `.bak` first, so the next save
+/// writes a fresh file instead of replacing the only copy of those notes.
+fn read_store(path: &Path) -> Vec<Note> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    match serde_json::from_str(&text) {
+        Ok(notes) => notes,
+        Err(_) => {
+            let _ = std::fs::rename(path, path.with_extension("json.bak"));
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_windows_saving_keep_each_others_notes_and_a_bad_store_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("n.json");
+        let mut a = Notes::load(&path);
+        let mut b = Notes::load(&path);
+        let x = a.add("ann", "f.rs", 1, "x", "from a");
+        a.save(&path).unwrap();
+        let y = b.add("bob", "f.rs", 2, "y", "from b");
+        b.save(&path).unwrap();
+        let disk = Notes::load(&path);
+        assert!(disk.get(&x.id).is_some() && disk.get(&y.id).is_some());
+        assert!(b.get(&x.id).is_some(), "b picked up a's note");
+
+        std::fs::write(&path, "{ not json").unwrap();
+        let mut c = Notes::load(&path);
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.bak")).unwrap(),
+            "{ not json"
+        );
+        c.add("cy", "f.rs", 3, "z", "new");
+        c.save(&path).unwrap();
+        assert!(path.with_extension("json.bak").exists());
+    }
 
     fn lines(s: &[&str]) -> Vec<String> {
         s.iter().map(|l| l.to_string()).collect()

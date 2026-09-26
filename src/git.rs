@@ -229,6 +229,26 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Keep a git child from prompting on croft's terminal. A push or pull
+/// needing a password or an ssh passphrase opened `/dev/tty`, drew over
+/// the full-screen UI and waited for input croft never passed on. With no
+/// terminal prompt and no controlling tty, git and ssh fail at once with a
+/// message the panel shows; credential helpers and agents still work.
+fn never_prompt(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and the only call in the
+    // pre-exec hook; the forked child is never a process-group leader, so
+    // the call always succeeds.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
 /// Run a mutating git subcommand and return a human-readable summary.
 ///
 /// Shared by every operation the Source Control panel invokes
@@ -253,6 +273,7 @@ fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
     );
     let mut cmd = Command::new("git");
     cmd.args(["-C", path_str]).args(args);
+    never_prompt(&mut cmd);
     let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
@@ -852,8 +873,10 @@ pub fn push_current_branch(root: &Path) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let output = Command::new("git")
-        .args(["-C", path_str, "push"])
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", path_str, "push"]);
+    never_prompt(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -988,7 +1011,46 @@ pub fn parse_file_history(out: &str, now: i64) -> Vec<FileHistoryEntry> {
 /// Raw `git show <hash> -- <rel_path>` text: the file's diff in that commit,
 /// for opening a TIMELINE entry in the side-by-side diff viewer.
 pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<String, String> {
-    diff_text(root, &["show", hash, "--", rel_path])
+    let has_diff = |raw: &str| raw.lines().any(|l| l.starts_with("diff --git"));
+    let raw = diff_text(root, &["show", hash, "--", rel_path])?;
+    if has_diff(&raw) {
+        return Ok(raw);
+    }
+    // The TIMELINE lists history with `--follow`, so a commit from before a
+    // rename touched the file under its OLD name, and showing it under the
+    // current one was an empty diff. The follow walk says what it was called.
+    match path_at_commit(root, hash, rel_path) {
+        Some(old) if old != rel_path => diff_text(root, &["show", hash, "--", &old]),
+        _ => Ok(raw),
+    }
+}
+
+/// The name `rel_path` had in commit `hash`, from the same `--follow` walk
+/// [`file_history`] lists. None when the commit is not in that history.
+fn path_at_commit(root: &Path, hash: &str, rel_path: &str) -> Option<String> {
+    let out = run_git(
+        root,
+        &[
+            "log",
+            "--follow",
+            "--name-only",
+            "--format=%x1e%H",
+            "--",
+            rel_path,
+        ],
+    )
+    .ok()?;
+    out.split('\x1e').find_map(|record| {
+        let mut lines = record.lines();
+        let full = lines.next()?.trim();
+        if hash.is_empty() || !full.starts_with(hash) {
+            return None;
+        }
+        lines
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(unquote_porcelain_path)
+    })
 }
 
 /// The whole commit as text — header, message, diffstat, and full patch —
@@ -1755,7 +1817,9 @@ pub fn clone_into(parent: &Path, url: &str) -> Result<PathBuf, String> {
     let dest = parent.join(&name);
     // run_mutation runs with `-C <parent>`, so the bare `<name>` clones into
     // parent/<name>.
-    run_mutation(parent, &["clone", url, &name]).map(|_| dest)
+    // `--`: a URL starting with `-` (`--upload-pack=<command>`) is
+    // otherwise an option, and that one runs a command.
+    run_mutation(parent, &["clone", "--", url, &name]).map(|_| dest)
 }
 
 // --- Commit variants -----------------------------------------------------
@@ -3540,6 +3604,39 @@ mod tests {
             out.contains("+three"),
             "diff vs branch must include the new +three line: {out}"
         );
+    }
+
+    #[test]
+    fn a_commit_from_before_a_rename_shows_its_diff_under_the_old_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(p.join("old.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "add"]);
+        std::fs::write(p.join("old.txt"), "one\ntwo\nthree\nFOUR\n").unwrap();
+        git(&["commit", "-qam", "edit"]);
+        let edit = git(&["rev-parse", "--short", "HEAD"]);
+        git(&["mv", "old.txt", "new.txt"]);
+        git(&["commit", "-qm", "rename"]);
+        let diff = show_commit_file_diff(p, &edit, "new.txt").unwrap();
+        assert!(diff.contains("+FOUR"), "{diff}");
     }
 
     #[test]

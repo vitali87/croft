@@ -12359,11 +12359,62 @@ fn delete_branch_via_the_menu_opens_the_branch_picker_in_delete_mode() {
     assert_eq!(app.branch_purpose, crate::app::BranchPurpose::Delete);
 }
 
+/// Drain the network git operation in flight until it lands.
+fn wait_for_git_net(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the network git operation",
+        || {
+            app.drain_git_net();
+            app.git_net_job.is_none()
+        },
+    );
+}
+
+/// A push runs on a worker: the call returns with the operation in flight,
+/// a second one is refused while it runs, and the result lands on a drain.
+#[test]
+fn a_push_runs_off_the_ui_thread_and_reports_when_it_lands() {
+    let tmp = make_committed_repo();
+    let bare = tempfile::tempdir().unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    git(bare.path(), &["init", "-q", "--bare"]);
+    git(
+        tmp.path(),
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    git(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
+    std::fs::write(tmp.path().join("seed.txt"), b"two\n").unwrap();
+    git(tmp.path(), &["commit", "-qam", "two"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.push_source_control();
+    assert!(app.git_net_job.is_some(), "the push is in flight");
+    app.pull_source_control();
+    assert!(app.status.contains("still running"), "{}", app.status);
+    wait_for_git_net(&mut app);
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    let remote_head = git(bare.path(), &["rev-parse", "main"]).stdout;
+    let local_head = git(tmp.path(), &["rev-parse", "HEAD"]).stdout;
+    assert_eq!(remote_head, local_head);
+}
+
 #[test]
 fn dispatching_fetch_records_a_line_in_the_git_output_log() {
     let tmp = make_committed_repo();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Fetch);
+    wait_for_git_net(&mut app);
     assert!(
         app.git_output_log.iter().any(|l| l.contains("fetch")),
         "every dispatched git op must append to the git output log; saw {:?}",
@@ -12855,6 +12906,8 @@ fn ctrl_enter_in_source_control_commits_and_pushes() {
     app.source_control.message = "fix: bump seed".to_string();
     app.source_control.message_cursor = app.source_control.message.chars().count();
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::CONTROL));
+    // The push runs on a worker.
+    wait_for_git_net(&mut app);
     // Verify the remote received the commit (its log now reports two
     // commits — the initial push + our new one).
     let log = std::process::Command::new("git")

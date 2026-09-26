@@ -783,11 +783,12 @@ impl Keymap {
 /// it wins over any other command's use of the same chord. Edited line by
 /// line so the user's comments and layout survive; `src` of `None` (no file
 /// yet) starts a fresh one. Falls back to a structured rewrite when the line
-/// edit would not parse.
-pub fn rebind_text(src: Option<&str>, command: &str, chord: &str) -> String {
+/// edit would not parse. None when `src` itself does not parse: a rewrite
+/// from nothing would replace every binding the user wrote with this one.
+pub fn rebind_text(src: Option<&str>, command: &str, chord: &str) -> Option<String> {
     let entry = format!("{{\"key\": \"{chord}\", \"command\": \"{command}\"}}");
     let Some(src) = src.filter(|s| !s.trim().is_empty()) else {
-        return format!("[\n  {entry}\n]\n");
+        return Some(format!("[\n  {entry}\n]\n"));
     };
     let quoted = format!("\"{command}\"");
     let names_command = |line: &str| {
@@ -816,15 +817,14 @@ pub fn rebind_text(src: Option<&str>, command: &str, chord: &str) -> String {
             text.push('\n');
         }
         if parsed_ok(&text) {
-            return text;
+            return Some(text);
         }
     }
     // Structured fallback: comments are lost, the bindings are not.
-    let mut rows: Vec<serde_json::Value> =
-        serde_json::from_str(&strip_line_comments(src)).unwrap_or_default();
+    let mut rows: Vec<serde_json::Value> = serde_json::from_str(&strip_line_comments(src)).ok()?;
     rows.retain(|r| r.get("command").and_then(|c| c.as_str()) != Some(command));
     rows.push(serde_json::json!({ "key": chord, "command": command }));
-    serde_json::to_string_pretty(&rows).unwrap_or_default() + "\n"
+    Some(serde_json::to_string_pretty(&rows).ok()? + "\n")
 }
 
 pub fn keybindings_path() -> PathBuf {
@@ -864,7 +864,7 @@ mod tests {
     fn rebinding_keeps_comments_and_replaces_the_commands_old_entry() {
         use super::*;
         let src = "// my bindings\n[\n  {\"key\": \"alt+j\", \"command\": \"toggle_live_run\"},\n  // keep me\n  {\"key\": \"f7\", \"command\": \"toggle_word_wrap\"}\n]\n";
-        let out = rebind_text(Some(src), "toggle_live_run", "ctrl+alt+l");
+        let out = rebind_text(Some(src), "toggle_live_run", "ctrl+alt+l").unwrap();
         assert!(
             out.contains("// my bindings") && out.contains("// keep me"),
             "{out}"
@@ -883,12 +883,19 @@ mod tests {
     }
 
     #[test]
+    fn rebinding_refuses_a_file_that_does_not_parse() {
+        use super::*;
+        let src = "/* mine */\n[{\"key\":\"ctrl+a\",\"command\":\"save_file\"}]\n";
+        assert_eq!(rebind_text(Some(src), "close_tab", "ctrl+w"), None);
+    }
+
+    #[test]
     fn rebinding_starts_a_file_when_there_is_none() {
         use super::*;
-        let out = rebind_text(None, "toggle_live_run", "f8");
+        let out = rebind_text(None, "toggle_live_run", "f8").unwrap();
         let map = Keymap::from_json(&out);
         assert_eq!(map.chord_for(Command::ToggleLiveRun).as_deref(), Some("f8"));
-        let empty = rebind_text(Some("[]\n"), "toggle_live_run", "f8");
+        let empty = rebind_text(Some("[]\n"), "toggle_live_run", "f8").unwrap();
         assert_eq!(
             Keymap::from_json(&empty)
                 .chord_for(Command::ToggleLiveRun)

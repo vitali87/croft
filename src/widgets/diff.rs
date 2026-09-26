@@ -473,25 +473,31 @@ impl DiffData {
             pending_remove.clear();
             pending_add.clear();
         };
+        // `---` / `+++` / `index` are file headers only before a file's
+        // first hunk. Inside one, `--- x` is a removed `-- x` (an SQL, Lua
+        // or Haskell comment) and must be shown, not skipped as noise.
+        let mut in_header = true;
         for line in raw.split('\n') {
             if line.starts_with("diff --git") || line.starts_with("@@") {
+                in_header = line.starts_with("diff --git");
                 flush(&mut pending_remove, &mut pending_add, &mut rows);
                 let i = left_lines.len();
                 let j = right_lines.len();
                 left_lines.push(line.to_string());
                 right_lines.push(line.to_string());
                 rows.push(DiffRow::Equal { left: i, right: j });
-            } else if line.starts_with("index ")
-                || line.starts_with("--- ")
-                || line.starts_with("+++ ")
-                || line == "---"
-                || line == "+++"
-                || line.starts_with("\\ No newline")
-                || line.starts_with("new file mode")
-                || line.starts_with("deleted file mode")
-                || line.starts_with("similarity index")
-                || line.starts_with("rename from")
-                || line.starts_with("rename to")
+            } else if line.starts_with("\\ No newline")
+                || (in_header
+                    && (line.starts_with("index ")
+                        || line.starts_with("--- ")
+                        || line.starts_with("+++ ")
+                        || line == "---"
+                        || line == "+++"
+                        || line.starts_with("new file mode")
+                        || line.starts_with("deleted file mode")
+                        || line.starts_with("similarity index")
+                        || line.starts_with("rename from")
+                        || line.starts_with("rename to")))
             {
                 // Header / metadata noise — skip; the `diff --git` line
                 // already names the file pair.
@@ -1640,10 +1646,36 @@ fn parse_hunk_new_start(text: &str) -> Option<usize> {
 }
 
 /// The new-side path from a `diff --git a/<old> b/<new>` header line.
-fn parse_diff_git_new_path(text: &str) -> Option<&str> {
+///
+/// git quotes a path holding non-ASCII or special bytes (`"b/\303\244.txt"`
+/// under the default `core.quotepath`), and an unquoted path may itself
+/// contain ` b/`, so the first ` b/` is only the answer when nothing better
+/// is known: the common unrenamed case, `a/P b/P`, is split at its middle.
+fn parse_diff_git_new_path(text: &str) -> Option<String> {
     let rest = text.strip_prefix("diff --git ")?;
+    if rest.ends_with('"') {
+        // The new side is the last quoted token; its opening quote is the
+        // last `"` not escaped and not the final one.
+        let bytes = rest.as_bytes();
+        let open = (0..rest.len() - 1).rev().find(|&i| {
+            bytes[i] == b'"'
+                && bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 0
+                && (i == 0 || bytes[i - 1] == b' ')
+        })?;
+        let path = crate::git::unquote_porcelain_path(&rest[open..]);
+        return path.strip_prefix("b/").map(str::to_string);
+    }
+    if let Some(p) = rest.strip_prefix("a/")
+        && p.len() >= 3
+        && (p.len() - 3) % 2 == 0
+    {
+        let n = (p.len() - 3) / 2;
+        if p.is_char_boundary(n) && &p[n..n + 3] == " b/" && p[..n] == p[n + 3..] {
+            return Some(p[n + 3..].to_string());
+        }
+    }
     let idx = rest.find(" b/")?;
-    Some(&rest[idx + 3..])
+    Some(rest[idx + 3..].to_string())
 }
 
 /// Run a line-level diff over `left` vs `right` and emit one DiffRow per
@@ -2835,6 +2867,33 @@ mod tests {
                 || s.starts_with("+++ b/")),
             "index / --- / +++ noise must be skipped from right_lines: {:?}",
             d.right_lines
+        );
+    }
+
+    #[test]
+    fn a_removed_line_starting_with_dashes_inside_a_hunk_is_shown() {
+        let raw = "diff --git a/q.sql b/q.sql\n--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1,1 @@\n--- old comment\n select 1;\n";
+        let d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        assert!(
+            d.left_lines.iter().any(|s| s == "-- old comment"),
+            "{:?}",
+            d.left_lines
+        );
+    }
+
+    #[test]
+    fn the_new_path_is_read_from_quoted_and_space_b_slash_headers() {
+        assert_eq!(
+            parse_diff_git_new_path(r#"diff --git "a/\303\244.txt" "b/\303\244.txt""#).as_deref(),
+            Some("\u{e4}.txt")
+        );
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/my b/x b/my b/x").as_deref(),
+            Some("my b/x")
+        );
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/old.rs b/new.rs").as_deref(),
+            Some("new.rs")
         );
     }
 
