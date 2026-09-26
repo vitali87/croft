@@ -239,6 +239,26 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
 /// surface stderr when stdout is empty and vice-versa. On failure we
 /// surface whichever stream carries the message verbatim, so the panel
 /// shows the host's exact reason (e.g. "fatal: 'x' is not a commit").
+/// Keep a git child from prompting on croft's terminal. A push or pull
+/// needing a password or an ssh passphrase opened `/dev/tty`, drew over
+/// the full-screen UI and waited for input croft never passed on. With no
+/// terminal prompt and no controlling tty, git and ssh fail at once with a
+/// message the panel shows; credential helpers and agents still work.
+fn never_prompt(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and the only call in the
+    // pre-exec hook; the forked child is never a process-group leader, so
+    // the call always succeeds.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
 fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
     let path_str = root
         .to_str()
@@ -253,6 +273,7 @@ fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
     );
     let mut cmd = Command::new("git");
     cmd.args(["-C", path_str]).args(args);
+    never_prompt(&mut cmd);
     let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
@@ -852,8 +873,10 @@ pub fn push_current_branch(root: &Path) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let output = Command::new("git")
-        .args(["-C", path_str, "push"])
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", path_str, "push"]);
+    never_prompt(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1755,7 +1778,9 @@ pub fn clone_into(parent: &Path, url: &str) -> Result<PathBuf, String> {
     let dest = parent.join(&name);
     // run_mutation runs with `-C <parent>`, so the bare `<name>` clones into
     // parent/<name>.
-    run_mutation(parent, &["clone", url, &name]).map(|_| dest)
+    // `--`: a URL starting with `-` (`--upload-pack=<command>`) is
+    // otherwise an option, and that one runs a command.
+    run_mutation(parent, &["clone", "--", url, &name]).map(|_| dest)
 }
 
 // --- Commit variants -----------------------------------------------------

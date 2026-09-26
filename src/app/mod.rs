@@ -1538,6 +1538,10 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
 
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
 /// task runs in a terminal pane, and the FinishedCommand sweep decides.
+/// What a network git operation's worker hands back: the UI-thread half
+/// of the operation, applied to the app when it arrives.
+type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
+
 struct PendingDebugLaunch {
     /// Uid of the pane the task command was written to.
     pane: u64,
@@ -2700,6 +2704,9 @@ pub struct App {
     /// The file blame has been fetched (or is in flight) for; reset to `None`
     /// on HEAD move so the annotation refreshes after a commit / checkout.
     blame_fetched: Option<PathBuf>,
+    /// The network git operation in flight (push, pull, fetch, clone...),
+    /// named for the status line, and where its finisher arrives.
+    git_net_job: Option<(String, std::sync::mpsc::Receiver<GitNetDone>)>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
     /// The provenance lens (#349): who typed each line, in the gutter and
@@ -4918,6 +4925,7 @@ impl App {
             blame_rx,
             blame_tx,
             blame_fetched: None,
+            git_net_job: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
@@ -22100,7 +22108,9 @@ impl App {
             ));
             return;
         };
-        let command = task.command.clone();
+        let command = self
+            .task_command_line(&task)
+            .unwrap_or_else(|_| task.command.clone());
         let Some(pane) = self.run_project_task(task) else {
             // run_project_task already reported why the pane failed.
             return;
@@ -22282,7 +22292,9 @@ impl App {
             ));
             return;
         };
-        let command = task.command.clone();
+        let command = self
+            .task_command_line(&task)
+            .unwrap_or_else(|_| task.command.clone());
         let Some(pane) = self.run_project_task(task) else {
             // run_project_task already reported why the pane failed.
             return;
@@ -22329,7 +22341,9 @@ impl App {
                 ));
                 return;
             };
-            let command = task.command.clone();
+            let command = self
+                .task_command_line(&task)
+                .unwrap_or_else(|_| task.command.clone());
             let Some(pane) = self.run_project_task(task) else {
                 // run_project_task already reported why the pane failed.
                 return;
@@ -23675,7 +23689,15 @@ impl App {
     /// "Push" item so users can ship already-committed work without
     /// having to type a no-op commit message first.
     pub fn push_source_control(&mut self) {
-        match crate::git::push_current_branch(&self.scm_root()) {
+        let root = self.scm_root();
+        self.spawn_git_net("push", move || {
+            let r = crate::git::push_current_branch(&root);
+            Box::new(move |app: &mut App| app.finish_push(r))
+        });
+    }
+
+    fn finish_push(&mut self, result: Result<String, String>) {
+        match result {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pushed".to_string()
@@ -23698,7 +23720,15 @@ impl App {
     /// Pull the current branch from its upstream. Sibling of
     /// `push_source_control`, reached from the commit dropdown's "Pull".
     pub fn pull_source_control(&mut self) {
-        match crate::git::pull_current_branch(&self.scm_root()) {
+        let root = self.scm_root();
+        self.spawn_git_net("pull", move || {
+            let r = crate::git::pull_current_branch(&root);
+            Box::new(move |app: &mut App| app.finish_pull(r))
+        });
+    }
+
+    fn finish_pull(&mut self, result: Result<String, String>) {
+        match result {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pulled".to_string()
@@ -23723,7 +23753,17 @@ impl App {
     /// pull short-circuits (we never push on top of an unmerged tree); a
     /// successful pull followed by a failed push reports both halves.
     pub fn sync_source_control(&mut self) {
-        let pull_summary = match crate::git::pull_current_branch(&self.scm_root()) {
+        let root = self.scm_root();
+        self.spawn_git_net("sync", move || {
+            let pull = crate::git::pull_current_branch(&root);
+            // Never push on top of a failed pull.
+            let push = pull.is_ok().then(|| crate::git::push_current_branch(&root));
+            Box::new(move |app: &mut App| app.finish_sync(pull, push))
+        });
+    }
+
+    fn finish_sync(&mut self, pull: Result<String, String>, push: Option<Result<String, String>>) {
+        let pull_summary = match pull {
             Ok(s) => s,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("sync: pull failed: {err}"));
@@ -23735,7 +23775,7 @@ impl App {
                 return;
             }
         };
-        match crate::git::push_current_branch(&self.scm_root()) {
+        match push.unwrap_or_else(|| Err(String::from("push did not run"))) {
             Ok(push_summary) => {
                 self.source_control.commit_feedback = Some(format!(
                     "synced (pulled: {pull_summary} | pushed: {push_summary})"
@@ -23860,6 +23900,83 @@ impl App {
         self.refresh_source_control();
     }
 
+    /// Run a network git operation (push, pull, fetch, clone...) on a
+    /// worker thread. Run inline, a slow remote or a large clone froze the
+    /// whole UI until git returned. `job` runs off the UI thread and returns
+    /// the half that updates the app, which `drain_git_net` applies. One at
+    /// a time: two pushes racing each other help nobody.
+    fn spawn_git_net(&mut self, what: &str, job: impl FnOnce() -> GitNetDone + Send + 'static) {
+        if self.git_net_busy() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.git_net_job = Some((what.to_string(), rx));
+        self.status = format!("Git: {what}\u{2026}");
+    }
+
+    /// Whether a network git operation is still running, saying so.
+    fn git_net_busy(&mut self) -> bool {
+        let Some((running, _)) = &self.git_net_job else {
+            return false;
+        };
+        self.status = format!("Git: {running} is still running");
+        true
+    }
+
+    /// [`spawn_git_net`] for an operation whose result is reported by
+    /// [`run_scm_op`].
+    fn spawn_scm_op(
+        &mut self,
+        label: &'static str,
+        ok_prefix: &'static str,
+        op: impl FnOnce(&Path) -> Result<String, String> + Send + 'static,
+    ) {
+        let root = self.scm_root();
+        self.spawn_git_net(label, move || {
+            let r = op(&root);
+            Box::new(move |app: &mut App| app.run_scm_op(label, r, ok_prefix))
+        });
+    }
+
+    fn finish_clone(&mut self, result: Result<PathBuf, String>) {
+        match result {
+            Ok(dest) => {
+                self.log_git("clone", &Ok(format!("into {}", dest.display())));
+                self.status = format!("Cloned into {}", self.status_path(&dest));
+                self.change_workspace_root(dest);
+            }
+            Err(err) => {
+                self.log_git("clone", &Err(err.clone()));
+                self.source_control.commit_feedback = Some(format!("clone failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Clone failed: {err}");
+            }
+        }
+    }
+
+    /// Apply a finished network git operation. True when one landed.
+    fn drain_git_net(&mut self) -> bool {
+        let Some((what, rx)) = &self.git_net_job else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(done) => {
+                self.git_net_job = None;
+                done(self);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.status = format!("Git: {what} ended without a result");
+                self.git_net_job = None;
+                true
+            }
+        }
+    }
+
     pub fn stage_all_source_control(&mut self) {
         let r = crate::git::stage_all(&self.scm_root());
         self.run_scm_op("add -A", r, "Staged all");
@@ -23943,6 +24060,9 @@ impl App {
     }
 
     fn commit_and_sync_source_control(&mut self) {
+        if self.git_net_busy() {
+            return;
+        }
         let Some(message) = self.require_commit_message() else {
             return;
         };
@@ -23965,8 +24085,9 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         };
-        let r = crate::git::publish_branch(&self.scm_root(), &branch);
-        self.run_scm_op("push -u origin", r, "Published");
+        self.spawn_scm_op("push -u origin", "Published", move |root| {
+            crate::git::publish_branch(root, &branch)
+        });
     }
 
     /// Open the read-only "Git Output" log in an editor tab (VS Code's Git
@@ -24055,8 +24176,7 @@ impl App {
             )),
             ScmAction::CheckoutTo => self.open_branch_picker_for(BranchPurpose::Checkout),
             ScmAction::Fetch => {
-                let r = crate::git::fetch_all(&self.scm_root());
-                self.run_scm_op("fetch --all --prune", r, "Fetched");
+                self.spawn_scm_op("fetch --all --prune", "Fetched", crate::git::fetch_all);
             }
             ScmAction::ShowGitOutput => self.show_git_output(),
             ScmAction::Commit => self.commit_source_control(),
@@ -24070,13 +24190,15 @@ impl App {
             ScmAction::DiscardAll => self.request_discard_all_source_control(),
             ScmAction::Sync => self.sync_source_control(),
             ScmAction::PullRebase => {
-                let r = crate::git::pull_rebase(&self.scm_root());
-                self.run_scm_op("pull --rebase", r, "Pulled (rebase)");
+                self.spawn_scm_op("pull --rebase", "Pulled (rebase)", crate::git::pull_rebase);
             }
             ScmAction::PushTo => self.open_push_to_remote_picker(),
             ScmAction::PushForce => {
-                let r = crate::git::push_force(&self.scm_root());
-                self.run_scm_op("push --force-with-lease", r, "Force-pushed");
+                self.spawn_scm_op(
+                    "push --force-with-lease",
+                    "Force-pushed",
+                    crate::git::push_force,
+                );
             }
             ScmAction::PublishBranch => self.publish_branch_source_control(),
             ScmAction::CreateBranch => self.open_branch_picker_for(BranchPurpose::Checkout),
@@ -24309,19 +24431,10 @@ impl App {
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| self.tree.root.clone());
-                match crate::git::clone_into(&parent, &value) {
-                    Ok(dest) => {
-                        self.log_git("clone", &Ok(format!("into {}", dest.display())));
-                        self.status = format!("Cloned into {}", self.status_path(&dest));
-                        self.change_workspace_root(dest);
-                    }
-                    Err(err) => {
-                        self.log_git("clone", &Err(err.clone()));
-                        self.source_control.commit_feedback = Some(format!("clone failed: {err}"));
-                        self.source_control.commit_feedback_is_error = true;
-                        self.status = format!("Clone failed: {err}");
-                    }
-                }
+                self.spawn_git_net("clone", move || {
+                    let r = crate::git::clone_into(&parent, &value);
+                    Box::new(move |app: &mut App| app.finish_clone(r))
+                });
             }
             InputPurpose::RenameBranch => {
                 self.close_input_prompt();
@@ -26491,8 +26604,10 @@ impl App {
                 self.run_scm_op("tag -d", r, "Deleted tag");
             }
             ListPurpose::PushToRemote => {
-                let r = crate::git::push_to_remote(&self.scm_root(), &row.id);
-                self.run_scm_op("push", r, "Pushed");
+                let remote = row.id.clone();
+                self.spawn_scm_op("push", "Pushed", move |root| {
+                    crate::git::push_to_remote(root, &remote)
+                });
             }
             ListPurpose::MergeConflict => {
                 let res = match row.id.as_str() {
@@ -26978,6 +27093,16 @@ impl App {
     /// Run a task in its named pane. Returns the pane's uid so a caller can
     /// correlate the task's FinishedCommand (the preLaunchTask gate, #250);
     /// `None` when no pane could be started (already reported in `status`).
+    /// The line `run_project_task` types for `task`: tasks.json variables
+    /// expanded against the active workspace and file. The preLaunchTask
+    /// gate matches the pane's finished command against this same line.
+    fn task_command_line(&self, task: &crate::tasks::Task) -> Result<String, String> {
+        task.command_line(&crate::dap::configs::SubstCtx {
+            workspace_folder: self.active_workspace_root(),
+            file: self.editor.path.clone(),
+        })
+    }
+
     pub fn run_project_task(&mut self, task: crate::tasks::Task) -> Option<u64> {
         let pane_name = format!("Task: {}", task.label);
         // The task's problemMatcher (#252), translated up front so both the
@@ -26991,7 +27116,14 @@ impl App {
         // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
         // half-typed command that would otherwise concatenate and run
         // (same rule `format_cd_command` pins for the cd seed).
-        let command = format!("\x05\x15{}\r", task.command);
+        let line = match self.task_command_line(&task) {
+            Ok(line) => line,
+            Err(e) => {
+                self.status = format!("Task \u{201c}{}\u{201d} not run: {e}", task.label);
+                return None;
+            }
+        };
+        let command = format!("\x05\x15{line}\r");
         self.last_task = Some(task.clone());
         // Reuse only a pane whose shell is standing exactly where this
         // task will run: after a re-root the old pane's label still
@@ -27242,6 +27374,11 @@ impl App {
     }
 
     pub fn commit_and_push_source_control(&mut self) {
+        // Checked before committing: a commit whose push is then refused
+        // would leave the user thinking it had been pushed.
+        if self.git_net_busy() {
+            return;
+        }
         let message = self.source_control.message.trim().to_string();
         if message.is_empty() {
             self.source_control.commit_feedback = Some(String::from("Empty commit message"));
@@ -27259,7 +27396,18 @@ impl App {
         };
         self.source_control.clear_message();
         self.status = format!("Committed: {commit_summary}");
-        match crate::git::push_current_branch(&self.scm_root()) {
+        let root = self.scm_root();
+        self.spawn_git_net("push", move || {
+            let r = crate::git::push_current_branch(&root);
+            Box::new(move |app: &mut App| app.finish_commit_and_push(commit_summary, r))
+        });
+        self.active_git_bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    fn finish_commit_and_push(&mut self, commit_summary: String, push: Result<String, String>) {
+        match push {
             Ok(push_summary) => {
                 let combined = if push_summary.is_empty() {
                     commit_summary
@@ -44162,8 +44310,23 @@ impl App {
         let chord = crate::keymap::Chord::from_event(key).to_config_string();
         let previous = self.keymap.command_for(key).filter(|c| *c != cmd);
         let path = self.keybindings_file.clone();
-        let src = std::fs::read_to_string(&path).ok();
-        let text = crate::keymap::rebind_text(src.as_deref(), cmd.id(), &chord);
+        // Only a missing file starts fresh: one that exists but cannot be
+        // read would otherwise be overwritten with this single binding.
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.status = format!("Could not read {}: {e}", path.display());
+                return;
+            }
+        };
+        let Some(text) = crate::keymap::rebind_text(src.as_deref(), cmd.id(), &chord) else {
+            self.status = format!(
+                "{} does not parse; fix it before recording a shortcut",
+                path.display()
+            );
+            return;
+        };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -44860,6 +45023,7 @@ impl App {
                     is_build: false,
                     is_default: false,
                     problem_matcher: None,
+                    vscode: None,
                 });
             }
             crate::code_lens::LensAction::DebugAt(line) => {
@@ -54531,7 +54695,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
-        let blame_changed = app.drain_blame();
+        let blame_changed = app.drain_blame() | app.drain_git_net();
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();

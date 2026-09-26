@@ -1523,9 +1523,41 @@ fn url_is_safe_to_open(url: &str) -> bool {
         .any(|c| c == '\0' || c == '\n' || c == '\r' || c == '\t')
 }
 
+/// Whether a pull may send `src`. The request comes from the remote's
+/// relay log, which any process running as the remote user can append to,
+/// so it is not proof the user dropped that file. A drag from Finder names
+/// a visible file; credentials live under hidden paths (`~/.ssh`,
+/// `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.config/...`). So a path that is
+/// not absolute, or that resolves (through `..` or symlinks) to anything
+/// under a hidden component, is refused.
+fn pull_source_allowed(src: &Path) -> bool {
+    use std::path::Component;
+    let hidden = |p: &Path| {
+        p.components().any(|c| match c {
+            Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+            Component::ParentDir => true,
+            _ => false,
+        })
+    };
+    if !src.is_absolute() || hidden(src) {
+        return false;
+    }
+    std::fs::canonicalize(src).is_ok_and(|real| !hidden(&real))
+}
+
 fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str, src: &str) {
     let src_path = PathBuf::from(src);
     let dest_dir = format!("{inbox_dir}/{request_id}");
+    if src_path.exists() && !pull_source_allowed(&src_path) {
+        write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("refusing to send a hidden path: {}", src_path.display()),
+        );
+        return;
+    }
     if !src_path.exists() {
         write_relay_err(
             host,
@@ -1561,7 +1593,8 @@ fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
         .arg("-")
         .arg("-C")
         .arg(parent)
-        .arg(basename)
+        // `./`-prefixed: a name starting with `-` is otherwise an option.
+        .arg(Path::new(".").join(basename))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -3991,6 +4024,30 @@ Host !blocked *.internal
         assert!(!is_transport_failure(Some(1)));
         assert!(!is_transport_failure(Some(101)));
         assert!(!is_transport_failure(None));
+    }
+
+    #[test]
+    fn a_pull_refuses_hidden_paths_and_links_into_them() {
+        // Not `tempdir()`: its `.tmpXXXX` name is itself hidden.
+        let dir = tempfile::Builder::new()
+            .prefix("croft-pull")
+            .tempdir()
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(root.join("-notes.txt"), "hi").unwrap();
+        std::os::unix::fs::symlink(root.join(".ssh/id_ed25519"), root.join("key")).unwrap();
+        assert!(super::pull_source_allowed(&root.join("-notes.txt")));
+        assert!(!super::pull_source_allowed(&root.join(".ssh/id_ed25519")));
+        assert!(
+            !super::pull_source_allowed(&root.join("key")),
+            "a link into .ssh"
+        );
+        assert!(!super::pull_source_allowed(
+            &root.join("x/../.ssh/id_ed25519")
+        ));
+        assert!(!super::pull_source_allowed(Path::new("relative.txt")));
     }
 
     #[test]

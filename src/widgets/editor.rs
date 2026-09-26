@@ -5536,7 +5536,13 @@ impl Editor {
                     Some(d) => d,
                     None => anyhow::bail!("No worksheet"),
                 };
-                let bytes = crate::sheet::serialize_delimited(data, delim);
+                // The file's own line ending, read from its first line.
+                let crlf = std::fs::read(&path).is_ok_and(|b| {
+                    b.iter()
+                        .position(|&c| c == b'\n')
+                        .is_some_and(|i| i > 0 && b[i - 1] == b'\r')
+                });
+                let bytes = crate::sheet::serialize_delimited(data, delim, crlf);
                 std::fs::write(&path, &bytes)
                     .map_err(|e| anyhow::anyhow!("Sheet save failed: {e}"))?;
                 view.dirty = false;

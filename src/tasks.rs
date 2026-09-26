@@ -38,6 +38,68 @@ pub struct Task {
     /// array); `problem_matchers::from_tasks_json` translates it when the
     /// task runs (#252). Always None for convention-derived sources.
     pub problem_matcher: Option<serde_json::Value>,
+    /// A tasks.json entry's parts, kept apart so `${...}` variables are
+    /// expanded and arguments quoted when the task runs; `command` is only
+    /// its display line then. None for convention-derived sources.
+    pub vscode: Option<VscodeCommand>,
+}
+
+/// The runnable parts of a tasks.json entry (see [`Task::command_line`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VscodeCommand {
+    pub command: String,
+    pub args: Vec<String>,
+    /// `options.cwd`.
+    pub cwd: Option<String>,
+    /// `options.env`, in file order.
+    pub env: Vec<(String, String)>,
+}
+
+impl Task {
+    /// The line to type into the task's shell. A tasks.json entry gets its
+    /// `${workspaceFolder}` / `${file}` variables expanded (the shell would
+    /// otherwise expand them to nothing and run `/scripts/build.sh`), each
+    /// argument with whitespace quoted (`"fix bug"` stays one word), and
+    /// `options.cwd` / `options.env` applied in a subshell, so the pane's
+    /// own directory and environment are left alone. Err names a variable
+    /// that cannot be expanded.
+    pub fn command_line(&self, ctx: &crate::dap::configs::SubstCtx) -> Result<String, String> {
+        let Some(v) = &self.vscode else {
+            return Ok(self.command.clone());
+        };
+        let sub = |s: &str| crate::dap::configs::substitute(s, ctx);
+        let mut line = sub(&v.command)?;
+        // A program path that a variable filled with spaces is still one
+        // word; a command written as a shell line is left as written.
+        if !v.command.contains(char::is_whitespace) && line.contains(char::is_whitespace) {
+            line = quote_word(&line);
+        }
+        for arg in &v.args {
+            let arg = sub(arg)?;
+            line.push(' ');
+            if arg.is_empty() || arg.contains(char::is_whitespace) {
+                line.push_str(&quote_word(&arg));
+            } else {
+                line.push_str(&arg);
+            }
+        }
+        let mut setup = Vec::new();
+        if let Some(cwd) = &v.cwd {
+            setup.push(format!("cd {}", quote_word(&sub(cwd)?)));
+        }
+        for (key, value) in &v.env {
+            setup.push(format!("export {key}={}", quote_word(&sub(value)?)));
+        }
+        if setup.is_empty() {
+            return Ok(line);
+        }
+        Ok(format!("({} && {line})", setup.join(" && ")))
+    }
+}
+
+/// `s` as one single-quoted POSIX shell word.
+fn quote_word(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Every task the workspace's manifests declare, in source priority
@@ -84,12 +146,42 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
         .iter()
         .filter_map(|t| {
             let command = t.get("command")?.as_str()?;
+            let args: Vec<String> = t
+                .get("args")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|a| a.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let options = t.get("options");
+            let vscode = VscodeCommand {
+                command: command.to_string(),
+                args: args.clone(),
+                cwd: options
+                    .and_then(|o| o.get("cwd"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string),
+                env: options
+                    .and_then(|o| o.get("env"))
+                    .and_then(|e| e.as_object())
+                    .map(|e| {
+                        e.iter()
+                            .filter(|(k, _)| {
+                                !k.is_empty()
+                                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                    && !k.starts_with(|c: char| c.is_ascii_digit())
+                            })
+                            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
             let mut line = command.to_string();
-            if let Some(args) = t.get("args").and_then(|a| a.as_array()) {
-                for a in args.iter().filter_map(|a| a.as_str()) {
-                    line.push(' ');
-                    line.push_str(a);
-                }
+            for a in &args {
+                line.push(' ');
+                line.push_str(a);
             }
             // VS Code labels a label-less entry by its full command line,
             // not the bare program: three label-less `npm` entries must
@@ -116,6 +208,7 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
                 is_build,
                 is_default,
                 problem_matcher: t.get("problemMatcher").cloned(),
+                vscode: Some(vscode),
             })
         })
         .collect()
@@ -155,6 +248,7 @@ fn makefile_tasks(root: &Path) -> Vec<Task> {
             is_build: name == "build" || name == "all",
             is_default: false,
             problem_matcher: None,
+            vscode: None,
         });
     }
     out
@@ -192,6 +286,7 @@ fn justfile_tasks(root: &Path) -> Vec<Task> {
             is_build: name == "build",
             is_default: false,
             problem_matcher: None,
+            vscode: None,
         });
     }
     out
@@ -226,6 +321,7 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
             is_build: name == "build",
             is_default: false,
             problem_matcher: None,
+            vscode: None,
         })
         .collect()
 }
@@ -248,6 +344,7 @@ fn cargo_tasks(root: &Path) -> Vec<Task> {
         is_build,
         is_default: false,
         problem_matcher: None,
+        vscode: None,
     })
     .collect()
 }
@@ -271,6 +368,7 @@ fn pyproject_tasks(root: &Path) -> Vec<Task> {
                 is_build: false,
                 is_default: false,
                 problem_matcher: None,
+                vscode: None,
             });
         }
     }
@@ -282,6 +380,7 @@ fn pyproject_tasks(root: &Path) -> Vec<Task> {
             is_build: false,
             is_default: false,
             problem_matcher: None,
+            vscode: None,
         });
     }
     out
@@ -399,12 +498,50 @@ fn dedup(tasks: Vec<Task>) -> Vec<Task> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn commands(root: &Path) -> Vec<String> {
         discover_tasks(root)
             .into_iter()
             .map(|t| t.command)
             .collect()
+    }
+
+    #[test]
+    fn a_tasks_json_line_expands_variables_quotes_args_and_applies_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{"tasks": [
+                {"label": "build", "command": "${workspaceFolder}/scripts/build.sh",
+                 "args": ["-m", "fix bug", "${file}"],
+                 "options": {"cwd": "${workspaceFolder}/web", "env": {"MODE": "it's"}}},
+                {"label": "plain", "command": "npm run lint"}
+            ]}"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let ctx = crate::dap::configs::SubstCtx {
+            workspace_folder: PathBuf::from("/my work"),
+            file: Some(PathBuf::from("/my work/a.rs")),
+        };
+        let build = tasks.iter().find(|t| t.label == "build").unwrap();
+        assert_eq!(
+            build.command_line(&ctx).unwrap(),
+            "(cd '/my work/web' && export MODE='it'\\''s' && \
+             '/my work/scripts/build.sh' -m 'fix bug' '/my work/a.rs')"
+        );
+        let plain = tasks.iter().find(|t| t.label == "plain").unwrap();
+        assert_eq!(plain.command_line(&ctx).unwrap(), "npm run lint");
+        let no_file = crate::dap::configs::SubstCtx {
+            workspace_folder: PathBuf::from("/w"),
+            file: None,
+        };
+        assert!(
+            build.command_line(&no_file).is_err(),
+            "${{file}} with no file"
+        );
     }
 
     #[test]
