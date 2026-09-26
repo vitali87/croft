@@ -50,7 +50,17 @@ Then open a new terminal â€” or run `. "$HOME/.cargo/env"` in the current one â€
 
 ## Install
 
-Prebuilt binaries, no toolchain and no compile:
+With [Homebrew](https://brew.sh) on macOS or Linux, no toolchain and no compile:
+
+```bash
+brew install vitali87/croft/croft
+```
+
+Upgrade with `brew upgrade croft`; croft's own updater (F9) leaves a Homebrew
+install to brew. Each release updates the formula, and it installs the same
+prebuilt archives as below.
+
+Or prebuilt binaries through cargo:
 
 ```bash
 cargo binstall croft-software
