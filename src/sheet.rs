@@ -240,8 +240,31 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
         .delimiter(delim)
         .from_reader(bytes);
     let mut rows: Vec<Vec<String>> = Vec::new();
+    // The reader skips blank lines, so a single-column file lost every
+    // empty value on the first save. They come back as empty rows. A
+    // record's position is where the reader started looking for it, before
+    // the blank lines it skipped, so those are the line breaks it opens with.
     for record in reader.records() {
         let r = record?;
+        let start = r.position().map_or(0, |p| p.byte() as usize);
+        let mut rest = bytes.get(start..).unwrap_or_default();
+        // After a CRLF record the reader stops past the `\r`, so the `\n`
+        // it starts on still belongs to that record's terminator.
+        if start > 0 && bytes[start - 1] == b'\r' {
+            rest = rest.strip_prefix(b"\n").unwrap_or(rest);
+        }
+        let mut blanks = 0usize;
+        while let Some(tail) = rest
+            .strip_prefix(b"\r\n")
+            .or_else(|| rest.strip_prefix(b"\n"))
+        {
+            rest = tail;
+            blanks += 1;
+        }
+        // Not before the first record, which becomes the header row.
+        if !rows.is_empty() {
+            rows.extend(std::iter::repeat_n(Vec::new(), blanks));
+        }
         rows.push(r.iter().map(|s| s.to_string()).collect());
     }
     let (headers, body) = split_header(rows);
@@ -351,18 +374,29 @@ pub fn serialize_delimited(data: &SheetData, delim: u8, crlf: bool) -> Vec<u8> {
     } else {
         csv::Terminator::Any(b'\n')
     };
-    let mut w = csv::WriterBuilder::new()
-        .delimiter(delim)
-        .flexible(true)
-        .terminator(terminator)
-        .from_writer(Vec::new());
+    let mut out = Vec::new();
+    let mut write = |record: &[String]| {
+        // A row with no fields is a blank line the file had (see
+        // `parse_delimited`); the writer would emit `""` for it instead.
+        if record.is_empty() {
+            out.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+            return;
+        }
+        let mut w = csv::WriterBuilder::new()
+            .delimiter(delim)
+            .flexible(true)
+            .terminator(terminator)
+            .from_writer(&mut out);
+        let _ = w.write_record(record);
+        let _ = w.flush();
+    };
     if !data.headers.is_empty() {
-        let _ = w.write_record(&data.headers);
+        write(&data.headers);
     }
     for r in &data.rows {
-        let _ = w.write_record(r);
+        write(r);
     }
-    w.into_inner().unwrap_or_default()
+    out
 }
 
 /// Outcome of an xlsx edit save (#178).
@@ -651,6 +685,20 @@ mod tests {
             "a,b,c\n1,2,\"x,y\"\n",
             "delimiter-bearing cells are quoted, header row survives"
         );
+    }
+
+    #[test]
+    fn blank_lines_survive_a_save() {
+        let src = b"name\nann\n\nbob\n\n\n\"x\ny\"\n";
+        let d = super::parse_delimited(src, b',', "S").unwrap();
+        assert_eq!(d.rows.len(), 6, "{:?}", d.rows);
+        let out = super::serialize_delimited(&d, b',', false);
+        assert_eq!(out, src.to_vec(), "{}", String::from_utf8_lossy(&out));
+        let lead = super::parse_delimited(b"\n\nh\n1\n", b',', "S").unwrap();
+        assert_eq!(lead.headers, vec!["h"]);
+        let crlf = b"a,b\r\n1,2\r\n\r\n3,4\r\n";
+        let d = super::parse_delimited(crlf, b',', "S").unwrap();
+        assert_eq!(super::serialize_delimited(&d, b',', true), crlf.to_vec());
     }
 
     #[test]

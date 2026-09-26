@@ -1469,20 +1469,30 @@ impl PtyTerminal {
     /// [`row_text_and_cols`]), so match positions are char indices, not grid
     /// columns.
     pub fn grid_lines(&self) -> (Vec<String>, i32) {
+        let (lines, _, top) = self.grid_lines_wrapped();
+        (lines, top)
+    }
+
+    /// [`Self::grid_lines`] plus, per row, whether it soft-wraps into the
+    /// next, read under the same lock: redaction joins wrapped rows, since a
+    /// secret split across two rows matches neither on its own.
+    pub fn grid_lines_wrapped(&self) -> (Vec<String>, Vec<bool>, i32) {
         let term = self.term.lock();
         if term.columns() == 0 {
-            return (Vec::new(), 0);
+            return (Vec::new(), Vec::new(), 0);
         }
         let top = term.grid().topmost_line().0;
         let bottom = term.screen_lines() as i32 - 1;
         let mut lines = Vec::new();
+        let mut wraps = Vec::new();
         let mut l = top;
         while l <= bottom {
             let (s, _cols) = row_text_and_cols(&term, l);
             lines.push(s.trim_end().to_string());
+            wraps.push(l < bottom && row_wraps(&term, l));
             l += 1;
         }
-        (lines, top)
+        (lines, wraps, top)
     }
 
     /// Every readable grid row as `(plain, coloured)`: the plain text
@@ -1498,6 +1508,15 @@ impl PtyTerminal {
     /// those cells, which the plain twin drops, so the two forms can differ
     /// in length there); every row that set a style ends with a reset.
     pub fn grid_lines_ansi(&self) -> Vec<(String, String)> {
+        self.grid_lines_ansi_wrapped()
+            .into_iter()
+            .map(|(plain, ansi, _)| (plain, ansi))
+            .collect()
+    }
+
+    /// [`Self::grid_lines_ansi`] plus whether each row soft-wraps into the
+    /// next (see [`Self::grid_lines_wrapped`]).
+    pub fn grid_lines_ansi_wrapped(&self) -> Vec<(String, String, bool)> {
         let term = self.term.lock();
         if term.columns() == 0 {
             return Vec::new();
@@ -1555,7 +1574,7 @@ impl PtyTerminal {
             if styled {
                 out.push_str("\x1b[0m");
             }
-            lines.push((plain, out));
+            lines.push((plain, out, l < bottom && row_wraps(&term, l)));
             l += 1;
         }
         lines
@@ -4058,6 +4077,43 @@ impl Drop for PtyTerminal {
 /// contiguously (`"日本語"`, never `"日 本 語"`). `cols[i]` is the grid
 /// column the i-th char starts at, so highlight painters can map a match's
 /// char range back onto grid cells.
+/// The logical line grid row `line_idx` belongs to (its soft-wrapped
+/// neighbours joined, at most 64 rows either way) and the char offset of
+/// that row's text within it, both in `row_text_and_cols` terms.
+pub fn logical_row_text(term: &Term<VoidListener>, line_idx: i32) -> (String, usize) {
+    const REACH: i32 = 64;
+    let top = term.grid().topmost_line().0;
+    let bottom = term.screen_lines() as i32 - 1;
+    let mut start = line_idx;
+    while start > top && line_idx - start < REACH && row_wraps(term, start - 1) {
+        start -= 1;
+    }
+    let mut end = line_idx;
+    while end < bottom && end - line_idx < REACH && row_wraps(term, end) {
+        end += 1;
+    }
+    let mut joined = String::new();
+    let mut offset = 0;
+    for l in start..=end {
+        let (s, _) = row_text_and_cols(term, l);
+        if l == line_idx {
+            offset = joined.chars().count();
+        }
+        joined.push_str(&s);
+    }
+    (joined, offset)
+}
+
+/// Whether grid row `line_idx` soft-wraps into the next (WRAPLINE on its
+/// last cell).
+pub fn row_wraps(term: &Term<VoidListener>, line_idx: i32) -> bool {
+    let cols = term.columns();
+    cols > 0
+        && term.grid()[Point::new(Line(line_idx), Column(cols - 1))]
+            .flags
+            .contains(Flags::WRAPLINE)
+}
+
 pub fn row_text_and_cols(term: &Term<VoidListener>, line_idx: i32) -> (String, Vec<usize>) {
     let ncols = term.columns();
     let mut s = String::with_capacity(ncols);
@@ -4814,9 +4870,21 @@ impl Widget for &mut PtyTerminal {
                 // real text, the cell shows a mask glyph. Counted per span
                 // for the status chip; nothing is masked while revealing.
                 if !reveal_redactions {
-                    for s in crate::triggers::redact_spans(&text, &trigger_set) {
-                        redacted_spans += 1;
-                        for k in s.start..s.start + s.len {
+                    // Over the logical line: a secret the soft wrap cut in
+                    // two matches on neither row alone.
+                    let (logical, offset) = logical_row_text(&term, row_line_idx);
+                    let row_len = text.chars().count();
+                    for s in crate::triggers::redact_spans(&logical, &trigger_set) {
+                        let (lo, hi) =
+                            (s.start.max(offset), (s.start + s.len).min(offset + row_len));
+                        if lo >= hi {
+                            continue;
+                        }
+                        // Counted on the row it starts on, once.
+                        if s.start >= offset {
+                            redacted_spans += 1;
+                        }
+                        for k in lo - offset..hi - offset {
                             if let Some(&col) = colmap.get(k) {
                                 let cell = paint[col].get_or_insert(TrigCell {
                                     fg: None,
@@ -5705,6 +5773,30 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "the write went to the pane's writer thread, not the caller"
         );
+    }
+
+    #[test]
+    fn a_secret_cut_by_a_soft_wrap_is_masked_on_both_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        term.resize(30, 10);
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        term.feed_bytes_for_test(format!("\x1b[2J\x1b[Hexport GH={token}\r\n").as_bytes());
+        let set = crate::triggers::TriggerSet::default().with_builtin_redactions();
+        let (lines, wraps, _) = term.grid_lines_wrapped();
+        let masked = crate::triggers::mask_rows(&lines, &wraps, &set);
+        let all: String = masked.concat();
+        assert!(
+            !all.contains("ghp_") && !all.contains("0123456789"),
+            "{masked:?}"
+        );
+        let t = term.term.lock();
+        let first = (0..t.screen_lines() as i32)
+            .find(|&l| row_text_and_cols(&t, l).0.contains("export"))
+            .unwrap();
+        let (logical, offset) = logical_row_text(&t, first + 1);
+        assert!(logical.contains(token), "{logical}");
+        assert_eq!(offset, 30);
     }
 
     #[test]

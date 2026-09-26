@@ -192,8 +192,14 @@ impl AgentTable {
     /// named like a built-in replaces it; a row with no usable regex still
     /// badges the pane (it just never reads as waiting).
     pub fn from_json(json: &str) -> Self {
+        // Row by row, so one malformed row (or a trailing comma) no longer
+        // drops every agent the user added.
         let rows: Vec<AgentRow> =
-            serde_json::from_str(&crate::keymap::strip_line_comments(json)).unwrap_or_default();
+            serde_json::from_str::<Vec<serde_json::Value>>(&crate::tasks::strip_jsonc(json))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| serde_json::from_value(r).ok())
+                .collect();
         let mut table = Self::builtin();
         for row in rows {
             let name = row.name.trim().to_lowercase();

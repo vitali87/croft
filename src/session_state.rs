@@ -45,7 +45,30 @@ impl SessionState {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let json = serde_json::to_string(self).context("serializing session state")?;
-        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+        // Owner-only and written aside: the file carries every dirty
+        // buffer's unsaved text, and a crash mid-write must not leave half.
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension(format!(
+            "json.{}.{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, path)
+        };
+        write().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::Error::new(e).context(format!("writing {}", path.display()))
+        })
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -109,6 +132,10 @@ mod tests {
         state.save(&path).expect("save");
         let loaded = SessionState::load(&path).expect("load");
         assert_eq!(state, loaded);
+        // It carries unsaved text: owner-only.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

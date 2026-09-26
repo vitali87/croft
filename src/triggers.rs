@@ -86,6 +86,12 @@ pub struct Trigger {
 #[derive(Clone, Debug, Default)]
 pub struct TriggerSet {
     pub triggers: Vec<Trigger>,
+    /// The rules that came from the user's file (the built-in redactions
+    /// come first in `triggers` when they are on), for the reload status.
+    pub user_rules: usize,
+    /// What was wrong with the user's file: it did not parse at all, or
+    /// some rows were skipped. None when every row loaded.
+    pub problem: Option<String>,
 }
 
 /// One highlight span on a row, in char indices (the render colmap
@@ -178,9 +184,27 @@ impl TriggerSet {
     }
 
     pub fn from_json(json: &str) -> Self {
-        let rows: Vec<TriggerRow> =
-            serde_json::from_str(&crate::keymap::strip_line_comments(json)).unwrap_or_default();
-        let triggers = rows
+        // Row by row, and JSONC like the template it starts from: parsed
+        // as one unit, a trailing comma or one row with `"enabled": "false"`
+        // dropped EVERY rule the user wrote, redact rules included, while
+        // the reload status still counted the built-ins as active.
+        let rows: Vec<serde_json::Value> =
+            match serde_json::from_str(&crate::tasks::strip_jsonc(json)) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return Self {
+                        problem: Some(format!("triggers.json does not parse ({e})")),
+                        ..Self::default()
+                    };
+                }
+            };
+        let total = rows.len();
+        let rows: Vec<TriggerRow> = rows
+            .into_iter()
+            .filter_map(|r| serde_json::from_value(r).ok())
+            .collect();
+        let mut skipped = total - rows.len();
+        let triggers: Vec<Trigger> = rows
             .into_iter()
             .filter(|r| r.enabled)
             .filter_map(|r| {
@@ -192,8 +216,12 @@ impl TriggerSet {
                     "redact" => TriggerAction::Redact,
                     _ => return None,
                 };
+                let Ok(regex) = Regex::new(&r.regex) else {
+                    skipped += 1;
+                    return None;
+                };
                 Some(Trigger {
-                    regex: Regex::new(&r.regex).ok()?,
+                    regex,
                     action,
                     fg: r.fg.as_deref().and_then(parse_hex),
                     bg: r.bg.as_deref().and_then(parse_hex),
@@ -203,7 +231,16 @@ impl TriggerSet {
                 })
             })
             .collect();
-        Self { triggers }
+        Self {
+            user_rules: triggers.len(),
+            triggers,
+            problem: (skipped > 0).then(|| {
+                format!(
+                    "{skipped} row{} of triggers.json skipped",
+                    if skipped == 1 { "" } else { "s" }
+                )
+            }),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -356,6 +393,32 @@ pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
 /// rules marked `"copy": "masked"` (the clipboard path); `false` masks
 /// everything (the scrollback dump, and anything else that leaves the
 /// pane as bytes). Returns the input untouched when nothing matches.
+/// [`mask_text`] over terminal rows, where `wraps[i]` says row `i`
+/// soft-wraps into row `i + 1`. Wrapped rows are masked as the one logical
+/// line they are, then split back, so a token the wrap cut in two (a JWT is
+/// wider than most panes) is masked on both rows.
+pub fn mask_rows(rows: &[String], wraps: &[bool], set: &TriggerSet) -> Vec<String> {
+    if !set.has_redactions() {
+        return rows.to_vec();
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    let mut i = 0;
+    while i < rows.len() {
+        let mut j = i;
+        while j + 1 < rows.len() && wraps.get(j).copied().unwrap_or(false) {
+            j += 1;
+        }
+        let joined: String = rows[i..=j].concat();
+        let masked = mask_text(&joined, set, false);
+        let mut chars = masked.chars();
+        for row in &rows[i..=j] {
+            out.push(chars.by_ref().take(row.chars().count()).collect());
+        }
+        i = j + 1;
+    }
+    out
+}
+
 pub fn mask_text(text: &str, set: &TriggerSet, copy_only: bool) -> String {
     if !set.has_redactions() {
         return text.to_string();
@@ -632,6 +695,27 @@ mod tests {
 
     fn set(json: &str) -> TriggerSet {
         TriggerSet::from_json(json)
+    }
+
+    #[test]
+    fn one_bad_row_or_a_trailing_comma_keeps_the_other_rules() {
+        let set = TriggerSet::from_json(
+            r#"[
+  // mine
+  { "regex": "x-api-key: (\\S+)", "action": "redact" },
+  { "regex": "boom", "action": "highlight", "enabled": "false" },
+  { "action": "highlight" },
+  { "regex": "(", "action": "highlight" },
+]"#,
+        );
+        assert_eq!(set.user_rules, 1);
+        assert_eq!(
+            set.problem.as_deref(),
+            Some("3 rows of triggers.json skipped")
+        );
+        let broken = TriggerSet::from_json("[{");
+        assert_eq!(broken.user_rules, 0);
+        assert!(broken.problem.unwrap().contains("does not parse"));
     }
 
     #[test]

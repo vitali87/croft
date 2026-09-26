@@ -13967,18 +13967,18 @@ impl App {
                     // ALT_SCREEN guard of its own, so the check lives here.
                     Vec::new()
                 } else {
-                    let (lines, _) = t.grid_lines();
+                    let (lines, wraps, _) = t.grid_lines_wrapped();
                     let end = lines
                         .iter()
                         .rposition(|l| !l.trim().is_empty())
                         .map_or(0, |i| i + 1);
-                    let start = end.saturating_sub(crate::terminal_session::TRANSCRIPT_LINES);
+                    // Masked before the cut, over wrapped rows joined, so a
+                    // secret straddling a wrap (or the cut) is still masked.
                     // Persisted to disk and replayed next launch: every
                     // redact rule applies (#360), as for the dump.
-                    lines[start..end]
-                        .iter()
-                        .map(|l| crate::triggers::mask_text(l, &triggers, false))
-                        .collect()
+                    let masked = crate::triggers::mask_rows(&lines[..end], &wraps, &triggers);
+                    let start = end.saturating_sub(crate::terminal_session::TRANSCRIPT_LINES);
+                    masked[start..end].to_vec()
                 },
             })
             .collect();
@@ -19791,8 +19791,7 @@ impl App {
                 // drift rebuild, or a remote install): bare F9 re-execs
                 // into it. `run()` swaps the staged binary in first when
                 // that is the one that landed.
-                self.pending_reexec = true;
-                self.quit = true;
+                self.arm_reexec();
             } else if self.f9_update_armed() && self.update_status == UpdateStatus::Idle {
                 // The drift hint is armed (#242): bare F9 rebuilds and
                 // reinstalls the local croft in the background.
@@ -25338,7 +25337,7 @@ impl App {
 
     /// The owner (or a lone croft) writes the notes; a guest's copy lives
     /// with the owner.
-    fn save_notes(&self, session: Option<&crate::collab::CollabSession>) {
+    fn save_notes(&mut self, session: Option<&crate::collab::CollabSession>) {
         if session.is_some_and(|s| s.role == crate::collab::CollabRole::Guest) {
             return;
         }
@@ -27087,12 +27086,6 @@ impl App {
         );
     }
 
-    /// Run `task` in its own named terminal pane. Rerunning a task whose
-    /// pane sits idle at a prompt writes the command into that pane
-    /// instead of stacking a new one; a busy pane gets a fresh sibling.
-    /// Run a task in its named pane. Returns the pane's uid so a caller can
-    /// correlate the task's FinishedCommand (the preLaunchTask gate, #250);
-    /// `None` when no pane could be started (already reported in `status`).
     /// The line `run_project_task` types for `task`: tasks.json variables
     /// expanded against the active workspace and file. The preLaunchTask
     /// gate matches the pane's finished command against this same line.
@@ -27103,6 +27096,12 @@ impl App {
         })
     }
 
+    /// Run `task` in its own named terminal pane. Rerunning a task whose
+    /// pane sits idle at a prompt writes the command into that pane
+    /// instead of stacking a new one; a busy pane gets a fresh sibling.
+    /// Run a task in its named pane. Returns the pane's uid so a caller can
+    /// correlate the task's FinishedCommand (the preLaunchTask gate, #250);
+    /// `None` when no pane could be started (already reported in `status`).
     pub fn run_project_task(&mut self, task: crate::tasks::Task) -> Option<u64> {
         let pane_name = format!("Task: {}", task.label);
         // The task's problemMatcher (#252), translated up front so both the
@@ -29916,6 +29915,29 @@ impl App {
         }
     }
 
+    /// Quit into the freshly installed binary, but only once the session,
+    /// with every dirty buffer's unsaved text, is safely on disk: the
+    /// relaunch used to go ahead when the save failed (a full disk, an
+    /// unwritable cache) and those edits were gone.
+    fn arm_reexec(&mut self) {
+        // Tests arm the relaunch too, and must not write into the real cache.
+        let path = if cfg!(test) {
+            std::env::temp_dir().join(format!(
+                "croft-test-session-{}-{:?}.json",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+        } else {
+            crate::session_state::handoff_path()
+        };
+        if let Err(e) = self.capture_session_state().save(&path) {
+            self.status = format!("Relaunch cancelled: could not save the session ({e:#})");
+            return;
+        }
+        self.pending_reexec = true;
+        self.quit = true;
+    }
+
     pub fn capture_session_state(&self) -> crate::session_state::SessionState {
         let mut tabs = Vec::new();
         let mut active_tab = 0;
@@ -32188,10 +32210,10 @@ impl App {
         // Plain and coloured rows come from ONE grid read, so a redact rule
         // is applied to the row it matches and never to a neighbour that
         // shifted in while a second read was taken.
-        let rows_both = self.terminal().grid_lines_ansi();
+        let rows_both = self.terminal().grid_lines_ansi_wrapped();
         let last = rows_both
             .iter()
-            .rposition(|(plain, _)| !plain.trim().is_empty())
+            .rposition(|(plain, _, _)| !plain.trim().is_empty())
             .map_or(0, |i| i + 1);
         let pane = self.terminal().label();
         let pane = if pane.is_empty() { "terminal" } else { pane };
@@ -32203,8 +32225,12 @@ impl App {
         let mut plain_rows: Vec<String> = Vec::with_capacity(last);
         let mut rows: Vec<String> = Vec::with_capacity(last);
         let mut fallback_reason: Option<String> = None;
-        for (plain, ansi) in &rows_both[..last] {
-            let masked = crate::triggers::mask_text(plain, &self.triggers, false);
+        // Wrapped rows are masked as the logical line they form, so a secret
+        // cut by a soft wrap is masked on both rows.
+        let plains: Vec<String> = rows_both[..last].iter().map(|r| r.0.clone()).collect();
+        let wraps: Vec<bool> = rows_both[..last].iter().map(|r| r.2).collect();
+        let masked_rows = crate::triggers::mask_rows(&plains, &wraps, &self.triggers);
+        for ((plain, ansi, _), masked) in rows_both[..last].iter().zip(masked_rows) {
             rows.push(if masked == *plain {
                 ansi.clone()
             } else {
@@ -34953,8 +34979,7 @@ impl App {
                 // The popup describes the staged release: only ITS
                 // readiness may fire it, never a drift rebuild's.
                 if self.staged_update_binary().is_some() {
-                    self.pending_reexec = true;
-                    self.quit = true;
+                    self.arm_reexec();
                 }
             }
         }
@@ -45653,10 +45678,16 @@ impl App {
             );
         } else if path == crate::triggers::triggers_path() {
             self.triggers = load_trigger_set(self.secret_redaction);
-            self.status = format!(
-                "Triggers reloaded ({} active)",
-                self.triggers.triggers.len()
-            );
+            self.status = match &self.triggers.problem {
+                Some(problem) => format!(
+                    "Triggers reloaded ({} of your rules active; {problem})",
+                    self.triggers.user_rules
+                ),
+                None => format!(
+                    "Triggers reloaded ({} of your rules active)",
+                    self.triggers.user_rules
+                ),
+            };
         } else if path == crate::problem_matchers::matchers_path()
             || path == crate::problem_matchers::workspace_matchers_path(self.workspace_root())
         {
@@ -54022,10 +54053,19 @@ pub fn run(
     // Restore the tabs / layout carried across a self-update re-exec, then
     // delete the handoff file so a later normal launch starts clean.
     if let Some(session_path) = restore_session.as_ref() {
-        if let Ok(state) = crate::session_state::SessionState::load(session_path) {
-            app.apply_session_state(&state);
+        match crate::session_state::SessionState::load(session_path) {
+            Ok(state) => {
+                app.apply_session_state(&state);
+                let _ = std::fs::remove_file(session_path);
+            }
+            // Kept: it may hold the only copy of unsaved text.
+            Err(e) => {
+                app.status = format!(
+                    "Could not restore the session ({e:#}); it is kept at {}",
+                    session_path.display()
+                );
+            }
         }
-        let _ = std::fs::remove_file(session_path);
     }
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
     // window. "Move/Copy into New Window" launches the new window this way so it
@@ -54185,6 +54225,8 @@ pub fn run(
     if app.pending_reexec {
         let state = app.capture_session_state();
         let session_path = crate::session_state::handoff_path();
+        // Saved once already when the relaunch was armed; this refresh is
+        // best-effort, and a failure leaves that copy in place.
         let _ = state.save(&session_path);
         use std::os::unix::process::CommandExt;
         // A staged release (#333) is swapped over the installed binary

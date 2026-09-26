@@ -334,14 +334,18 @@ pub fn send(req: &ResolvedRequest, timeout: Duration) -> Result<HttpResponse, St
     let status = resp.status();
     let status_text = resp.status_text().to_string();
     let http_version = resp.http_version().to_string();
-    let headers: Vec<(String, String)> = resp
-        .headers_names()
-        .into_iter()
-        .map(|n| {
-            let v = resp.header(&n).unwrap_or("").to_string();
-            (n, v)
-        })
-        .collect();
+    // `headers_names` lists a repeated header once per line while `header`
+    // returns only its first value, so two `Set-Cookie`s showed the first
+    // one twice. Each name once, with every value it carries.
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for n in resp.headers_names() {
+        if seen.insert(n.clone()) {
+            for v in resp.all(&n) {
+                headers.push((n.clone(), v.to_string()));
+            }
+        }
+    }
     let mut body = Vec::new();
     let mut reader = resp.into_reader().take(RESPONSE_CAP_BYTES as u64 + 1);
     reader
@@ -456,6 +460,38 @@ pub fn response_doc(raw_request_line: &str, resp: &HttpResponse) -> (&'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repeated_response_header_keeps_every_value() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\nset-cookie: a=1\r\nset-cookie: b=2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+        });
+        let resp = send(
+            &ResolvedRequest {
+                method: String::from("GET"),
+                url: format!("http://127.0.0.1:{port}/"),
+                headers: Vec::new(),
+                body: None,
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let cookies: Vec<_> = resp
+            .headers
+            .iter()
+            .filter(|(n, _)| n == "set-cookie")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+    }
 
     const THREE: &str = "\
 # users, with a token from the env file
