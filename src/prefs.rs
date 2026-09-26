@@ -402,7 +402,8 @@ impl Prefs {
             std::process::id(),
             std::thread::current().id()
         ));
-        std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+        write_keeping_mode(&tmp, path, json.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, path).with_context(|| {
             let _ = std::fs::remove_file(&tmp);
             format!("replacing {}", path.display())
@@ -452,6 +453,31 @@ pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
     let mut prefs = Prefs::load_for_update(&path)?;
     prefs.explorer_views = views;
     prefs.save(&path)
+}
+
+/// Write `bytes` to `tmp`, created no more readable than `dest` already is
+/// (0600 when `dest` is new): the file replaces `dest`, which may hold
+/// notification headers, and must not widen to the umask's 0644.
+fn write_keeping_mode(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mode = std::fs::metadata(dest).map_or(0o600, |m| m.permissions().mode() & 0o777);
+        opts.mode(mode);
+        mode
+    };
+    let mut file = opts.open(tmp)?;
+    // `mode` at creation is still narrowed by the umask, and a leftover tmp
+    // keeps its old mode: set it outright.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    file.write_all(bytes)
 }
 
 /// The settings file under `config_dir`. The real config dir means the
@@ -785,6 +811,19 @@ mod tests {
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("config.json")]);
         assert_eq!(prefs_file_in(dir.path()), path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_prefs_keeps_a_private_config_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        save_mcp_consent_in(dir.path(), "ext").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     /// #624: a test build reads no saved `config.json`, so the MCP

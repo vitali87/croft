@@ -197,11 +197,16 @@ pub fn commentable_lines(diff: &str, path: &str) -> std::collections::HashSet<us
             in_file = name.strip_prefix("b/").unwrap_or(&name) == path;
             continue;
         }
+        // Every file's first hunk ends its header, the skipped files' too:
+        // otherwise an added `+++ b/x` line inside one would read as a
+        // header and point its later hunks at `x`.
+        if l.starts_with("@@ ") {
+            in_header = false;
+        }
         if !in_file {
             continue;
         }
         if let Some(h) = l.strip_prefix("@@ ") {
-            in_header = false;
             // `@@ -a,b +c,d @@`: new-side hunk starts at c.
             line = h
                 .split_whitespace()
@@ -421,6 +426,8 @@ mod tests {
         let plus = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,3 @@\n a\n+++ b\n+c\n";
         let got = commentable_lines(plus, "x");
         assert_eq!(got, [1, 2, 3].into_iter().collect());
+        let other = "diff --git a/o b/o\n--- a/o\n+++ b/o\n@@ -1,1 +1,2 @@\n a\n+++ b/target.rs\n@@ -9,1 +10,1 @@\n z\n";
+        assert!(commentable_lines(other, "target.rs").is_empty());
     }
 
     /// A CURRENT line anchors trustworthily; an OUTDATED one is anchored but

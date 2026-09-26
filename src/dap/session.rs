@@ -2219,6 +2219,36 @@ while True:
     }
 
     #[test]
+    fn zz_probe_run_to_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("fake_dap.py");
+        std::fs::write(&script, FAKE_DAP).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let src = tmp.path().join("app.py");
+        let other = tmp.path().join("other.py");
+        let mut bps = BTreeMap::new();
+        bps.insert(src.clone(), vec![SourceBreakpoint { line: 9, condition: None, log_message: Some(String::from("x")), hit_condition: None }]);
+        let mut session = DapSession::launch_with("python3", &[script.display().to_string(), log.display().to_string()], tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}), bps).unwrap();
+        poll_until(&mut session, &log, |r| r.iter().any(|q| q["command"] == "configurationDone"));
+        while session.stopped_thread.is_none() { session.poll(); }
+        session.run_to_cursor(&src, 9);
+        poll_until(&mut session, &log, |r| r.iter().filter(|q| q["command"] == "setBreakpoints").count() >= 2);
+        let sets: Vec<Value> = requests(&log).into_iter().filter(|q| q["command"] == "setBreakpoints").collect();
+        eprintln!("RUNTO SET: {}", sets[1]["arguments"]["breakpoints"]);
+        // two run-to-cursors before a stop (stopped_thread stays Some while running)
+        session.run_to_cursor(&other, 5);
+        session.run_to_cursor(&src, 20);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        session.poll();
+        for q in requests(&log).into_iter().filter(|q| q["command"] == "setBreakpoints") {
+            eprintln!("SET {} {}", q["arguments"]["source"]["path"], q["arguments"]["breakpoints"]);
+        }
+        eprintln!("stopped_thread after continue: {:?}", session.stopped_thread);
+        session.disconnect();
+    }
+
+    #[test]
     fn set_breakpoints_request_carries_log_messages() {
         // A logpoint is a breakpoint with a `logMessage`: the adapter prints
         // the interpolated text instead of pausing. Condition and logMessage
