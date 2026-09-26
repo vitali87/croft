@@ -52024,7 +52024,7 @@ fn only_the_submissions_own_failure_ends_it() {
 /// off the diff lands in the summary, and posted notes leave the editor.
 #[test]
 fn comments_export_to_the_pull_request_after_a_preview() {
-    let (_tmp, root, f, _log, stdin, gh) = review_fixture();
+    let (_tmp, root, f, log, stdin, gh) = review_fixture();
     let mut app = review_app(&root, &f, &gh);
     app.navigator_notes.insert(
         String::from("a.rs"),
@@ -52050,6 +52050,9 @@ fn comments_export_to_the_pull_request_after_a_preview() {
         "Post to PR #7: 2 inline, 1 in the summary"
     );
     assert_eq!(picker.rows.len(), 4);
+    // A thread load answering for another PR meanwhile does not redirect
+    // the post away from the PR the preview named.
+    app.review_pr = Some((root.clone(), String::from("8")));
     app.post_exported_comments();
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the post", || {
         app.drain_review_ops();
@@ -52072,6 +52075,11 @@ fn comments_export_to_the_pull_request_after_a_preview() {
             .contains("`a.rs:41`: [AI, croft navigator] far")
     );
     assert!(app.review_pending.is_empty());
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        log.contains("pulls/7/reviews") && !log.contains("pulls/8/"),
+        "{log}"
+    );
 }
 
 /// #367: a sticky note hangs under its line as a box, follows the line when

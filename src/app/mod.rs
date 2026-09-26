@@ -3648,6 +3648,9 @@ pub struct App {
         Vec<crate::widgets::list_picker::ListRow>,
     )>,
     review_export_sticky: Vec<String>,
+    /// The PR the export preview named: posting goes there, even if a
+    /// thread load answered for another PR in between.
+    review_export_pr: Option<(PathBuf, String)>,
     review_ai_prefix: String,
     review_pr: Option<(PathBuf, String)>,
     review_nodes: std::collections::HashMap<u64, String>,
@@ -5365,6 +5368,7 @@ impl App {
             notes_shown_gen: 0,
             review_export: None,
             review_export_sticky: Vec::new(),
+            review_export_pr: None,
             review_ai_prefix: loaded_prefs
                 .review_ai_prefix
                 .clone()
@@ -28492,7 +28496,8 @@ impl App {
         notes: Vec<u64>,
         inline: usize,
     ) {
-        self.review_pr = Some((root, number.clone()));
+        self.review_pr = Some((root.clone(), number.clone()));
+        self.review_export_pr = Some((root, number.clone()));
         let mut rows = vec![crate::widgets::list_picker::ListRow {
             id: String::from("post"),
             label: format!(
@@ -28535,7 +28540,7 @@ impl App {
         let Some((comments, notes, _)) = self.review_export.take() else {
             return;
         };
-        let Some((root, number)) = self.review_pr.clone() else {
+        let Some((root, number)) = self.review_export_pr.take() else {
             return;
         };
         let sticky = std::mem::take(&mut self.review_export_sticky);
