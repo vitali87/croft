@@ -1242,6 +1242,20 @@ enum MenuAction {
         path: PathBuf,
         item: crate::widgets::problems::ProblemItem,
     },
+    /// OUTLINE row: open lines `first..=last` of the Outline's file as a
+    /// symbol tab named `name` (#369).
+    OpenSymbolTab {
+        path: PathBuf,
+        name: String,
+        first: usize,
+        last: usize,
+    },
+    /// OUTLINE row: jump to the symbol, as a left click does.
+    GoToOutlineSymbol {
+        path: PathBuf,
+        line: u32,
+        col: u32,
+    },
     /// Editor body: one level of the call hierarchy for the symbol at buffer
     /// `(row, col)` — callers when `incoming`, callees otherwise.
     ShowCallsAt {
@@ -1394,6 +1408,8 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::AskNavigatorSelection { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorAboutCapture => Some("n"),
         MenuAction::FixProblemWithNavigator { .. } => None,
+        MenuAction::OpenSymbolTab { .. } => Some("⌘K ⇧V"),
+        MenuAction::GoToOutlineSymbol { .. } => Some("Enter"),
         MenuAction::ShowCallsAt { incoming: true, .. } => Some("⌘K H"),
         MenuAction::ShowCallsAt {
             incoming: false, ..
@@ -3625,10 +3641,6 @@ pub struct App {
     /// the header's size — so a session resized mid-recording plays back
     /// with every later frame wrapped at the wrong width.
     recorded_size: (u16, u16),
-    /// The symbol a symbol tab is showing (#369): its name and the byte
-    /// range it spans, which follows edits through
-    /// `SymbolRange::after_edit`. `None` when no symbol tab is open.
-    symbol_tab: Option<(String, PathBuf, crate::symbol_range::SymbolRange)>,
     /// The open history scrubber (#371), or `None` when the editor is
     /// showing the live buffer. `Some` at `Position::Working` is a real
     /// state: the scrubber is open and parked at the user's own edits.
@@ -4231,9 +4243,13 @@ struct MinimapBase {
     rgba: Vec<u8>,
     w: u32,
     h: u32,
-    /// (path, edit_seq, canvas_w_px, canvas_h_px, bg) — a change rebakes.
-    sig: (Option<PathBuf>, u64, u32, u32, (u8, u8, u8)),
+    /// (path, edit_seq, canvas_w_px, canvas_h_px, bg, lines drawn) — a
+    /// change rebakes. The lines drawn tell a symbol tab (#369) from its
+    /// file's tab.
+    sig: MinimapSig,
 }
+
+type MinimapSig = (Option<PathBuf>, u64, u32, u32, (u8, u8, u8), (usize, usize));
 
 /// Re-emit key for the minimap overlay. Differs from the base sig: the
 /// viewport fields move on scroll (recomposite, no rebake), the cell fields
@@ -4253,6 +4269,13 @@ pub struct MinimapLayout {
     bg: (u8, u8, u8),
     /// Active selection `(start_row, end_row)`; a change recomposites the band.
     selection: Option<(usize, usize)>,
+    /// Which document and which of its lines the strip draws: a hash of
+    /// the path (no per-frame allocation) and the drawn span, so switching
+    /// between two tabs whose other fields agree (two same-length symbol
+    /// tabs, #369, or two same-length files) still re-emits. A tab without
+    /// a path is only ever the empty fallback left by closing the last
+    /// tab, whose strip is the same for every one.
+    doc: (u64, (usize, usize)),
 }
 
 /// One socket-poll result. `hits` is the pane-subtree scan that decides what to
@@ -5307,7 +5330,6 @@ impl App {
             review_rx,
             recording: None,
             recorded_size: (0, 0),
-            symbol_tab: None,
             scrubber: None,
             debug_temp_breakpoint: None,
             debug_temp_note: None,
@@ -6520,48 +6542,6 @@ impl App {
     fn sync_open_file_poll_mtime(&mut self) {
         let paths = self.open_tab_paths();
         self.fs_watch.sync_open_file_mtime(&paths);
-        self.drop_symbol_tab_if_file_changed();
-    }
-
-    /// Close a symbol tab once the editor is showing a different file (#369).
-    ///
-    /// The range is BYTE offsets into ONE buffer, so it cannot survive the
-    /// move: `follow_symbol_tab_edit` would apply the new file's edits
-    /// against the old file's offsets and walk the range somewhere
-    /// meaningless rather than reporting `Gone`.
-    ///
-    /// Keyed on the ACTIVE path after the change, not on a path passed in.
-    /// `open_at` looked like the chokepoint and is not - search hits, a
-    /// quick-open pick with no line hint, file-tree clicks, reopen-closed-tab
-    /// and plain `editor.select` all reach another file without it, and
-    /// `select` carries no path a guard could inspect. Every one of those
-    /// paths does reach `sync_open_file_poll_mtime`.
-    ///
-    /// A plain comparison is enough, and a canonicalising fallback was tried
-    /// and removed. `go_to_definition` does arrive with the server's
-    /// realpath-resolved URI while the tab stored whatever the user opened -
-    /// but `open_preview` resolves through `find_tab_matching`, which
-    /// canonicalises, so it selects the ALREADY-OPEN tab and `editor.path`
-    /// keeps its original spelling. The two sides therefore cannot diverge
-    /// FOR THE SAME FILE - they diverge freely when the file really changes,
-    /// which is the point - because the tab's path is a copy of
-    /// `editor.path` and `find_tab_matching` canonicalises before selecting.
-    /// The field itself is not canonical. A canonicalising branch was
-    /// therefore unreachable: three attempts to
-    /// write a test that entered it all failed, and a mutation deleting it
-    /// survived, which is what proved it dead rather than merely untested.
-    fn drop_symbol_tab_if_file_changed(&mut self) {
-        let Some((_, tab_path, _)) = self.symbol_tab.as_ref() else {
-            return;
-        };
-        let Some(active) = self.editor.path.as_deref() else {
-            // No file open at all: nothing for the range to describe.
-            self.symbol_tab = None;
-            return;
-        };
-        if tab_path.as_path() != active {
-            self.symbol_tab = None;
-        }
     }
 
     /// Every file backing an open tab, across all editor groups. The poll
@@ -7231,7 +7211,19 @@ impl App {
         // before the server finishes its ~1.8s cold analysis. See
         // `crate::lsp::semantic_cache`.
         let mut cache_hits: Vec<(PathBuf, std::sync::Arc<Vec<String>>, Vec<u32>)> = Vec::new();
-        for tab in self.editor.iter_tabs() {
+        // A file and its symbol tabs (#369) share one group, each tab with
+        // its own `edit_seq`. One tab speaks for the path: the active tab
+        // when it holds that file (replies are applied where the seq
+        // matches), else the first. Judging each against the one
+        // `lsp_last_seen` entry made them take turns resending the whole
+        // text on every tick.
+        let active = self.editor.active_index();
+        let active_path = self
+            .editor
+            .path
+            .clone()
+            .filter(|_| !self.editor.has_non_text_view());
+        for (i, tab) in self.editor.iter_tabs().enumerate() {
             if tab.has_non_text_view() {
                 continue;
             }
@@ -7242,7 +7234,12 @@ impl App {
             if crate::lsp::Language::from_extension(ext).is_none() {
                 continue;
             }
-            current.insert(path.clone());
+            if i != active && active_path.as_ref() == Some(path) {
+                continue;
+            }
+            if !current.insert(path.clone()) {
+                continue;
+            }
             let seq = tab.edit_seq;
             let prev = self.lsp_last_seen.get(path).copied();
             match prev {
@@ -15315,12 +15312,6 @@ impl App {
         if self.editor.focused {
             self.poke_cursor();
         }
-        // Group focus changes the active FILE without opening anything and
-        // without a path (#369): `focus_editor_group` and
-        // `move_active_editor` swap another group into `self.editor`, so
-        // neither the open-based sync nor a path-argument guard sees them.
-        // Every focus change lands here, so this is the one place that does.
-        self.drop_symbol_tab_if_file_changed();
     }
 
     fn sync_focus_flags(&mut self) {
@@ -19100,6 +19091,13 @@ impl App {
                 self.request_call_hierarchy_at_cursor(true);
                 true
             }
+            // Cmd+K Shift+V: view the symbol at the caret in a tab of its
+            // own (#369; croft binding, VS Code has no such command). Must
+            // precede Live Run's case-insensitive Cmd+K V arm.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'v') => {
+                self.open_symbol_tab();
+                true
+            }
             // Cmd+K P: pin / unpin the active tab. This chord was Cmd+K
             // Shift+Enter (and Keep Open bare Cmd+K Enter) — both silently
             // SHADOWED the later, documented Cmd+K Enter run-test-at-cursor
@@ -19927,6 +19925,12 @@ impl App {
                     }
                 }
                 self.handle_editor_key(key);
+                // Settle the clip on this edit before clamping the caret to
+                // it: a line opened at the symbol's end grows the clip, so
+                // the caret on it is inside, not past it (#369).
+                self.sync_symbol_views();
+                // A symbol tab's caret never leaves its symbol (#369).
+                self.editor.clamp_to_symbol_view();
                 self.poke_cursor();
             }
             Pane::Terminal => match self.bottom_panel_tab {
@@ -26165,23 +26169,6 @@ impl App {
             ed.collab_synced_seq = ed.edit_seq;
             ed.collab_doc_gen = doc_gen;
         };
-        // A symbol tab is a view over a byte range, so a remote edit moves it
-        // too (#369). Outside the closure because the tab belongs to the app
-        // rather than to one editor.
-        // Only when the tab is anchored to THIS file. The range is a byte
-        // offset into one buffer, so an edit to any other file would shift,
-        // resize or close it against offsets that mean nothing there — a
-        // collaborator typing in `other.rs` would move a tab pointed at
-        // `main.rs`, or announce that its symbol is gone.
-        if self
-            .symbol_tab
-            .as_ref()
-            .is_some_and(|(_, p, _)| p.as_path() == path)
-        {
-            for span in spans {
-                self.follow_symbol_tab_edit(span.at, span.deleted, span.inserted.len());
-            }
-        }
         for ed in self.editor.editors.iter_mut() {
             if ed.path.as_deref() == Some(path.as_path()) {
                 apply(ed);
@@ -27795,50 +27782,290 @@ impl App {
             format!("Scrubbing {n} commits — arrows step, Home returns to your working tree");
     }
 
-    /// Follow an edit with the open symbol tab's range (#369).
+    /// Keep symbol tabs (#369) and the other tabs of their files in step.
+    /// Runs once per tick; returns true when anything visible changed.
     ///
-    /// A symbol tab is a VIEW over a byte range rather than a copy, so an
-    /// edit that is not reported here leaves the tab pointing at bytes that
-    /// have moved — showing the wrong text under the right title, which is
-    /// worse than showing nothing.
-    ///
-    /// **Wired only to the collab span path today**, which is the one place
-    /// an edit already arrives as `(at, deleted, inserted)`. Local typing,
-    /// backspace, paste, undo and formatting all mutate the buffer through
-    /// line/column APIs that do not report a byte span, so a tab opened
-    /// while those run would go stale — which is why the tab VIEW is not
-    /// built yet and this ships as the tracking layer alone. Giving the
-    /// editor a byte-span edit signal is the next piece of #369, and doing
-    /// it before there is a view to break is deliberate: the alternative is
-    /// a tab that is right for remote edits and silently wrong for the
-    /// user's own.
-    ///
-    /// A symbol the edit removed or straddled CLOSES the tab with a notice,
-    /// rather than re-anchoring to half a function glued to whatever
-    /// followed it.
-    pub(crate) fn follow_symbol_tab_edit(&mut self, at: usize, removed: usize, inserted: usize) {
-        let Some((name, path, range)) = self.symbol_tab.take() else {
-            return;
-        };
-        match range.after_edit(at, removed, inserted) {
-            crate::symbol_range::RangeAfterEdit::At(moved) => {
-                self.symbol_tab = Some((name, path, moved));
-            }
-            crate::symbol_range::RangeAfterEdit::Gone => {
-                self.status = format!("Closed the {name} tab: that symbol is gone");
+    /// A symbol tab holds the whole file, as a split does, and like a split
+    /// it is a buffer of its own. So the tabs of a file that has a symbol tab
+    /// MIRROR each other here: the one edited since the last pass (the
+    /// focused one first, when several were) is copied into the rest, and
+    /// saving any of them clears the dirty dot on all. A file that is live in
+    /// a collab session is left to the session, which converges its panes
+    /// already. Then each symbol tab follows the edit so its clip stays on
+    /// its symbol, and closes once the symbol is gone (or, holding unsaved
+    /// text no whole-file tab holds, turns into a tab of the whole file).
+    pub(crate) fn sync_symbol_views(&mut self) -> bool {
+        let paths = self.symbol_view_paths();
+        if paths.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for path in &paths {
+            if !self.symbol_path_is_live(path) {
+                changed |= self.mirror_symbol_siblings(path);
             }
         }
+        changed | self.follow_symbol_views()
+    }
+
+    /// Every path some symbol tab shows, once each.
+    fn symbol_view_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for group in std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups()) {
+            for ed in &group.editors {
+                if ed.symbol_view.is_some()
+                    && let Some(p) = ed.path.as_ref()
+                    && !paths.contains(p)
+                {
+                    paths.push(p.clone());
+                }
+            }
+        }
+        paths
+    }
+
+    /// A file live in a collab session: its tabs follow the session, not
+    /// each other, so [`Self::sync_symbol_views`] leaves them alone.
+    fn symbol_path_is_live(&self, path: &Path) -> bool {
+        self.collab.as_ref().is_some_and(|session| {
+            collab_file_key(&self.tree.root, path).is_some_and(|f| session.is_live(&f))
+        })
+    }
+
+    /// Mirror the text tabs of `path` against each other; see
+    /// [`Self::sync_symbol_views`].
+    fn mirror_symbol_siblings(&mut self, path: &Path) -> bool {
+        let active = self.editor.active_index();
+        let mut members: Vec<(bool, &mut crate::widgets::editor::Editor)> = self
+            .editor
+            .editors
+            .iter_mut()
+            .enumerate()
+            .map(|(i, ed)| (i == active, ed))
+            .chain(
+                self.editor_layout
+                    .inactive_groups_mut()
+                    .into_iter()
+                    .flat_map(|g| g.editors.iter_mut().map(|ed| (false, ed))),
+            )
+            .filter(|(_, ed)| ed.path.as_deref() == Some(path) && !ed.has_non_text_view())
+            .collect();
+        members.sort_by_key(|(focused, _)| !*focused);
+        let settled = members
+            .iter()
+            .all(|(_, ed)| ed.mirror_seq == Some(ed.edit_seq));
+        let mixed_dirty =
+            members.iter().any(|(_, ed)| ed.dirty) && members.iter().any(|(_, ed)| !ed.dirty);
+        if settled && !mixed_dirty {
+            return false;
+        }
+        // The source is a buffer edited since the last pass. A tab that has
+        // never been mirrored (`None`) may hold older text, such as a fresh
+        // open from disk beside unsaved edits, so it is a source only when
+        // nothing else can be.
+        let source = members
+            .iter()
+            .position(|(_, ed)| ed.mirror_seq.is_some_and(|seq| seq != ed.edit_seq))
+            .or_else(|| members.iter().position(|(_, ed)| ed.mirror_seq.is_some()))
+            .unwrap_or(0);
+        // Lent out for the pass rather than cloned: this runs after every
+        // editor key on a file with a symbol tab.
+        let lines = std::mem::take(&mut members[source].1.lines);
+        let step = members[source].1.undo_step_id;
+        let caret = (members[source].1.cursor_row, members[source].1.cursor_col);
+        let mut changed = false;
+        for (i, (_, ed)) in members.iter_mut().enumerate() {
+            if i != source {
+                changed |= ed.mirror_lines_from(&lines, step, caret);
+            }
+        }
+        members[source].1.lines = lines;
+        // Every member now holds the same text, so one that is clean (just
+        // saved, or undone back to its saved state) proves they all match
+        // the file on disk.
+        if members.iter().any(|(_, ed)| !ed.dirty) {
+            for (_, ed) in members.iter_mut().filter(|(_, ed)| ed.dirty) {
+                ed.mark_clean_like_sibling();
+                changed = true;
+            }
+        }
+        for (_, ed) in members.iter_mut() {
+            ed.mirror_seq = Some(ed.edit_seq);
+        }
+        changed
+    }
+
+    /// Move every symbol tab's clip with the edits since its last look, and
+    /// close the tabs whose symbol is gone, except an orphan with unsaved
+    /// text, which turns into a tab of the whole file.
+    fn follow_symbol_views(&mut self) -> bool {
+        let mut changed = false;
+        let mut notes: Vec<String> = Vec::new();
+        let mut follow = |ed: &mut crate::widgets::editor::Editor| -> bool {
+            let seq = ed.edit_seq;
+            if ed.symbol_view.as_ref().is_none_or(|v| v.seen_seq == seq) {
+                return false;
+            }
+            let kind = ed.path.as_deref().and_then(syntax_kind_of);
+            let text = ed.lines.join("\n");
+            // The caret that made the edit: a sibling's, mirrored in, or
+            // this tab's own. A collaborator's edit, applied and pinned as
+            // synced, has no caret here and is not this tab's own.
+            let caret = match ed.mirror_caret.take() {
+                Some((row, col)) => Some(crate::symbol_range::Caret {
+                    row,
+                    col,
+                    own: false,
+                }),
+                None if ed.collab_doc_gen != 0 && ed.edit_seq == ed.collab_synced_seq => None,
+                None => Some(crate::symbol_range::Caret {
+                    row: ed.cursor_row,
+                    col: ed.cursor_col,
+                    own: true,
+                }),
+            };
+            let Some(view) = ed.symbol_view.as_mut() else {
+                return false;
+            };
+            changed = true;
+            match view.follow(text, seq, kind, caret) {
+                crate::symbol_range::ViewUpdate::Kept => false,
+                crate::symbol_range::ViewUpdate::Renamed(old) => {
+                    notes.push(format!("{old} is now {}", view.name));
+                    false
+                }
+                crate::symbol_range::ViewUpdate::Gone => true,
+            }
+        };
+        let gone_here: Vec<usize> = (0..self.editor.editors.len())
+            .filter(|&i| follow(&mut self.editor.editors[i]))
+            .collect();
+        let mut gone_inactive: Vec<Vec<usize>> = Vec::new();
+        for group in self.editor_layout.inactive_groups_mut() {
+            gone_inactive.push(
+                (0..group.editors.len())
+                    .filter(|&i| follow(&mut group.editors[i]))
+                    .collect(),
+            );
+        }
+        // A gone symbol tab holding unsaved text that no tab of the whole
+        // file also holds (its file tab was closed) becomes that file tab
+        // instead of closing, or its edits, in and out of the clip, would
+        // be lost with it.
+        let mut kept_paths: Vec<PathBuf> = Vec::new();
+        // Said last, so the status (the last note) names the kept edits
+        // even when a sibling tab of the same symbol closed beside it.
+        let mut kept_notes: Vec<String> = Vec::new();
+        let mut keep = |ed: &mut crate::widgets::editor::Editor,
+                        whole_file_open: &dyn Fn(&Path) -> bool|
+         -> bool {
+            let name = ed
+                .symbol_view
+                .as_ref()
+                .map(|v| v.name.clone())
+                .unwrap_or_default();
+            let orphan = ed.dirty
+                && ed
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| !whole_file_open(p) && !kept_paths.iter().any(|k| k == p));
+            if orphan {
+                kept_paths.extend(ed.path.clone());
+                // Its mirror state stays: it is in step with its siblings
+                // (mirrored this pass, or left to the collab session), so
+                // its next edit is the source, not overwritten by them, and
+                // folds into the undo step it already has.
+                ed.drop_symbol_clip();
+                kept_notes.push(format!(
+                    "{name} is gone; its tab now shows the whole file with the unsaved edits"
+                ));
+            } else {
+                notes.push(format!("Closed the {name} tab: that symbol is gone"));
+            }
+            orphan
+        };
+        let any_gone = !gone_here.is_empty() || gone_inactive.iter().any(|g| !g.is_empty());
+        let whole_file_tabs: Vec<PathBuf> = if any_gone {
+            std::iter::once(&self.editor)
+                .chain(self.editor_layout.inactive_groups())
+                .flat_map(|g| g.editors.iter())
+                .filter(|e| e.symbol_view.is_none() && !e.has_non_text_view())
+                .filter_map(|e| e.path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let whole_file_open = |p: &Path| whole_file_tabs.iter().any(|w| w == p);
+        let gone_here: Vec<usize> = gone_here
+            .into_iter()
+            .filter(|&i| !keep(&mut self.editor.editors[i], &whole_file_open))
+            .collect();
+        for (g, group) in self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .enumerate()
+        {
+            gone_inactive[g].retain(|&i| !keep(&mut group.editors[i], &whole_file_open));
+        }
+        notes.extend(kept_notes);
+        for &i in gone_here.iter().rev() {
+            self.editor.close_tab(i);
+        }
+        // A group this emptied folds away, as closing its last tab by hand
+        // would; one the user left blank on purpose stays.
+        let pre_blank: Vec<bool> = self
+            .editor_layout
+            .inactive_groups()
+            .iter()
+            .map(|g| g.is_blank_initial())
+            .collect();
+        let mut doomed = Vec::new();
+        for (g, group) in self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .enumerate()
+        {
+            for &i in gone_inactive[g].iter().rev() {
+                group.close_tab(i);
+            }
+            if !gone_inactive[g].is_empty() && group.is_blank_initial() && !pre_blank[g] {
+                doomed.push(g);
+            }
+        }
+        if !doomed.is_empty() {
+            self.editor_layout.prune_inactive_at(&doomed);
+        }
+        if let Some(note) = notes.pop() {
+            self.status = note;
+        }
+        changed
+    }
+
+    /// The outline of the ACTIVE buffer: the Outline view's symbols when they
+    /// describe this file, else a tree-sitter outline of the live text (the
+    /// Outline may be hidden, or still waiting on its language server).
+    fn active_file_symbols(&self, path: &Path) -> Vec<crate::lsp::manager::OutlineSymbol> {
+        if self.outline.path() == Some(path) && !self.outline.symbols().is_empty() {
+            return self.outline.symbols().to_vec();
+        }
+        self.compute_syntax_outline(path)
     }
 
     /// Open the symbol under the cursor as its own tab (#369).
     ///
     /// The INNERMOST enclosing symbol, so opening from inside a method shows
-    /// the method rather than its `impl` — the enclosing block is almost
+    /// the method rather than its `impl`: the enclosing block is almost
     /// never what was meant.
     fn open_symbol_tab(&mut self) {
-        let line = self.editor.cursor_row as u32;
-        let symbols = self.outline.symbols();
-        let Some(sym) = crate::symbol_range::enclosing_symbol(symbols, line) else {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Save this buffer before opening a symbol from it");
+            return;
+        };
+        let line = self.editor.cursor_row;
+        let symbols = self.active_file_symbols(&path);
+        let Some(sym) = crate::symbol_range::enclosing_symbol(&symbols, line as u32) else {
             self.status = if symbols.is_empty() {
                 String::from("No symbols for this file yet")
             } else {
@@ -27846,42 +28073,83 @@ impl App {
             };
             return;
         };
-        let name = sym.name.clone();
-        let (first, last) = (sym.range_start_line as usize, sym.range_end_line as usize);
-        // Converted to BYTES once, here. `SymbolRange` tracks bytes because
-        // that is what an edit reports, and holding lines as well would be
-        // two representations that can disagree the moment one is updated
-        // and the other is not.
-        let start: usize = self
-            .editor
-            .lines
-            .iter()
-            .take(first)
-            .map(|l| l.len() + 1)
-            .sum();
-        let mut len: usize = self
-            .editor
-            .lines
-            .iter()
-            .skip(first)
-            .take(last + 1 - first)
-            .map(|l| l.len() + 1)
-            .sum();
-        // The `+ 1` is a SEPARATOR between lines, not a terminator: croft's
-        // offset model gives an N-line buffer no trailing newline. Charging
-        // one to the final line puts `end` a byte past the buffer, which
-        // panics anything that slices by the range — and makes an append at
-        // true EOF read as INSIDE the symbol rather than below it.
-        if last + 1 >= self.editor.lines.len() {
-            len = len.saturating_sub(1);
-        }
-        let range = crate::symbol_range::SymbolRange::new(start, start + len);
+        let (name, first, last) = (
+            sym.name.clone(),
+            sym.range_start_line as usize,
+            sym.range_end_line as usize,
+        );
+        self.open_symbol_tab_for(name, first, last);
+    }
+
+    /// Open lines `first..=last` of the active file as a symbol tab named
+    /// `name`, placed after the active tab, or focus the symbol tab already
+    /// showing that symbol, matched by its tree-sitter identity: two
+    /// symbols can start on one line, and pickers spell some symbols and
+    /// their first lines differently. The new tab starts from the live
+    /// buffer, unsaved edits included, and keeps the caret if it sits
+    /// inside the symbol.
+    pub(crate) fn open_symbol_tab_for(&mut self, name: String, first: usize, last: usize) {
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Save this buffer before opening a symbol from it");
             return;
         };
-        self.symbol_tab = Some((name.clone(), path, range));
-        self.status = format!("{name}: {} bytes", range.len());
+        if self.editor.has_non_text_view() {
+            self.status = String::from("Symbol tabs open from a text editor");
+            return;
+        }
+        let identity = crate::symbol_range::syntax_identity(
+            &self.editor.lines.join("\n"),
+            syntax_kind_of(&path),
+            &name,
+            first,
+            last,
+        );
+        if let Some(i) = self.editor.editors.iter().position(|ed| {
+            ed.path.as_deref() == Some(path.as_path())
+                && ed
+                    .symbol_view
+                    .as_ref()
+                    .is_some_and(|v| v.shows(&name, first, identity.as_ref()))
+        }) {
+            self.editor.select(i);
+            self.focus_pane(Pane::Editor);
+            return;
+        }
+        let lines = self.editor.lines.clone();
+        let dirty = self.editor.dirty;
+        let caret = (self.editor.cursor_row, self.editor.cursor_col);
+        if let Err(e) = self.editor.open_in_new_tab(&path) {
+            self.status = format!("Could not open {}: {e}", path.display());
+            return;
+        }
+        let kind = syntax_kind_of(&path);
+        let active = self.editor.active_index();
+        let ed = &mut self.editor.editors[active];
+        if ed.lines != lines {
+            ed.seed_unsaved(lines, dirty);
+        }
+        let last = last.min(ed.lines.len().saturating_sub(1));
+        let first = first.min(last);
+        let view = crate::symbol_range::SymbolView::new(
+            name.clone(),
+            ed.lines.join("\n"),
+            first,
+            last,
+            ed.edit_seq,
+            kind,
+        );
+        ed.symbol_view = Some(view);
+        ed.preview = false;
+        if (first..=last).contains(&caret.0) {
+            (ed.cursor_row, ed.cursor_col) = caret;
+        } else {
+            (ed.cursor_row, ed.cursor_col) = (first, 0);
+        }
+        ed.scroll = first;
+        ed.clamp_to_symbol_view();
+        self.sync_open_file_poll_mtime();
+        self.focus_pane(Pane::Editor);
+        self.status = format!("Opened {name} as its own tab");
     }
 
     /// Start or stop recording the active terminal as an asciicast (#356).
@@ -29291,6 +29559,7 @@ impl App {
     pub fn capture_session_state(&self) -> crate::session_state::SessionState {
         let mut tabs = Vec::new();
         let mut active_tab = 0;
+        let mut active_path: Option<PathBuf> = None;
         for (idx, ed) in self.editor.editors.iter().enumerate() {
             // Only plain text file tabs survive a re-exec; diff / sheet /
             // image tabs are derived views with no path to reopen from.
@@ -29300,6 +29569,20 @@ impl App {
             let Some(path) = ed.path.clone() else {
                 continue;
             };
+            // A symbol tab is a view over its file's tab (#369): the file tab
+            // carries the text, so only an orphaned symbol tab is kept, as a
+            // plain file tab, to keep its unsaved edits.
+            if ed.symbol_view.is_some()
+                && (self.editor.find_tab_with_path(&path).is_some()
+                    || tabs
+                        .iter()
+                        .any(|t: &crate::session_state::OpenTabState| t.path == path))
+            {
+                if idx == self.editor.active_index() {
+                    active_path = Some(path);
+                }
+                continue;
+            }
             if idx == self.editor.active_index() {
                 active_tab = tabs.len();
             }
@@ -29317,6 +29600,11 @@ impl App {
                 dirty: ed.dirty,
                 unsaved_text,
             });
+        }
+        if let Some(path) = active_path
+            && let Some(i) = tabs.iter().position(|t| t.path == path)
+        {
+            active_tab = i;
         }
         crate::session_state::SessionState {
             workspace_root: self.workspace_root().to_path_buf(),
@@ -31096,8 +31384,16 @@ impl App {
 
     fn vim_operate_lines(&mut self, op: crate::vim::Op, start_row: usize, count: usize) {
         use crate::vim::Op;
-        self.editor.cursor_row = start_row.min(self.editor.lines.len().saturating_sub(1));
-        let n = count.max(1);
+        // A symbol tab's operator stays inside its symbol (#369): `dgg`
+        // from its second line reaches its first line, not the file's.
+        let (lo, hi) = self
+            .editor
+            .symbol_clip()
+            .unwrap_or((0, self.editor.lines.len().max(1)));
+        let first = start_row.clamp(lo, hi - 1);
+        let end = (start_row + count.max(1)).clamp(first + 1, hi);
+        self.editor.cursor_row = first;
+        let n = end - first;
         match op {
             Op::Delete => {
                 let text = self.editor.delete_lines(n);
@@ -31169,6 +31465,15 @@ impl App {
     /// leaving the cursor at `start` and entering Insert mode for a change.
     fn vim_apply_operator_to_selection(&mut self, op: crate::vim::Op, start: (usize, usize)) {
         use crate::vim::Op;
+        // A motion can leave a symbol tab's lines (`db` at its first
+        // column); the operator covers only the part inside them (#369).
+        let start = self.clamp_to_symbol_clip(start);
+        if let Some(sel) = self.editor.selection {
+            self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+                anchor: self.clamp_to_symbol_clip(sel.anchor),
+                head: self.clamp_to_symbol_clip(sel.head),
+            });
+        }
         let text = self.editor.selection_text();
         copy_to_clipboard(&text);
         match op {
@@ -31185,6 +31490,17 @@ impl App {
                 self.vim.enter_insert_mode();
                 self.status = String::from("-- INSERT --");
             }
+        }
+    }
+
+    /// `pos` pulled inside a symbol tab's lines: above them to the first
+    /// line's start, below them to the last line's end. Unchanged on an
+    /// ordinary tab.
+    fn clamp_to_symbol_clip(&self, pos: (usize, usize)) -> (usize, usize) {
+        match self.editor.symbol_clip() {
+            Some((first, _)) if pos.0 < first => (first, 0),
+            Some((_, end)) if pos.0 >= end => (end - 1, self.vim_line_len(end - 1)),
+            _ => pos,
         }
     }
 
@@ -31623,7 +31939,7 @@ impl App {
     fn close_tabs_with_path_everywhere(&mut self, path: &Path) {
         // `close_tab` on a group's last tab leaves a blank editor with no
         // path, so the search finds nothing more and the loop ends.
-        while let Some(idx) = self.editor.find_tab_with_path(path) {
+        while let Some(idx) = self.editor.find_any_tab_with_path(path) {
             self.editor.close_tab(idx);
         }
         // The prune names the groups THIS close emptied, by position: a
@@ -31644,7 +31960,7 @@ impl App {
             .enumerate()
         {
             let mut closed_here = false;
-            while let Some(idx) = group.find_tab_with_path(path) {
+            while let Some(idx) = group.find_any_tab_with_path(path) {
                 group.close_tab(idx);
                 closed_here = true;
             }
@@ -36324,6 +36640,24 @@ impl App {
         };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_workspace_symbols(),
+            // Alt+Enter: go, then view that symbol in a tab of its own (#369).
+            (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
+                let target = picker.selected_item().map(|i| i.path.clone());
+                self.jump_to_workspace_symbol_selection();
+                // The server's path may be spelled differently from the
+                // tab's (a symlink, `..`): a landed jump is the same file.
+                let landed = match (target, self.editor.path.as_ref()) {
+                    (Some(t), Some(p)) => {
+                        &t == p
+                            || std::fs::canonicalize(&t)
+                                .is_ok_and(|t| std::fs::canonicalize(p).is_ok_and(|p| p == t))
+                    }
+                    _ => false,
+                };
+                if landed {
+                    self.open_symbol_tab();
+                }
+            }
             (KeyCode::Enter, _) => self.jump_to_workspace_symbol_selection(),
             (KeyCode::Up, _) => picker.select_prev(),
             (KeyCode::Down, _) => picker.select_next(),
@@ -39377,7 +39711,11 @@ impl App {
         state.query = new_query;
         let opts = state.opts;
         state.set_match_count(
-            crate::widgets::editor_find::count_matches(&self.editor.lines, &state.query, opts),
+            crate::widgets::editor_find::count_matches(
+                self.editor.find_scope().0,
+                &state.query,
+                opts,
+            ),
             false,
         );
         if state.query.is_empty() {
@@ -39386,18 +39724,11 @@ impl App {
             self.editor.set_search_highlight(None, opts);
             return;
         }
-        self.editor
-            .set_search_highlight(Some(state.query.clone()), opts);
+        let query = state.query.clone();
+        self.editor.set_search_highlight(Some(query.clone()), opts);
         let from_row = self.editor.cursor_row;
         let from_col = self.editor.cursor_col;
-        if let Some(m) = crate::widgets::editor_find::find_next_match(
-            &self.editor.lines,
-            &state.query,
-            opts,
-            from_row,
-            from_col,
-            false,
-        ) {
+        if let Some(m) = self.editor_find_step(true, &query, opts, from_row, from_col, false) {
             self.jump_editor_to_match(m);
         }
         self.refresh_editor_find_index();
@@ -39420,8 +39751,8 @@ impl App {
         }
         let opts = state.opts;
         let needle = state.query.clone();
-        if let Some(m) = crate::widgets::editor_find::find_next_match(
-            &self.editor.lines,
+        if let Some(m) = self.editor_find_step(
+            true,
             &needle,
             opts,
             self.editor.cursor_row,
@@ -39454,8 +39785,8 @@ impl App {
         }
         let opts = state.opts;
         let needle = state.query.clone();
-        if let Some(m) = crate::widgets::editor_find::find_prev_match(
-            &self.editor.lines,
+        if let Some(m) = self.editor_find_step(
+            false,
             &needle,
             opts,
             self.editor.cursor_row,
@@ -39618,17 +39949,41 @@ impl App {
         self.editor.ensure_cursor_col_visible();
     }
 
+    /// The next (`forward`) or previous find-bar match from `(row, col)`,
+    /// searching and wrapping within a symbol tab's symbol only (#369).
+    fn editor_find_step(
+        &self,
+        forward: bool,
+        needle: &str,
+        opts: crate::widgets::search::SearchOpts,
+        row: usize,
+        col: usize,
+        skip_current: bool,
+    ) -> Option<crate::widgets::editor_find::MatchPos> {
+        let (scope, first) = self.editor.find_scope();
+        let row = row.saturating_sub(first).min(scope.len().saturating_sub(1));
+        let step = if forward {
+            crate::widgets::editor_find::find_next_match
+        } else {
+            crate::widgets::editor_find::find_prev_match
+        };
+        let mut m = step(scope, needle, opts, row, col, skip_current)?;
+        m.row += first;
+        Some(m)
+    }
+
     fn refresh_editor_find_index(&mut self) {
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
         let opts = state.opts;
         let needle = state.query.clone();
+        let (scope, first) = self.editor.find_scope();
         state.match_index = crate::widgets::editor_find::match_index_at(
-            &self.editor.lines,
+            scope,
             &needle,
             opts,
-            self.editor.cursor_row,
+            self.editor.cursor_row.saturating_sub(first),
             self.editor.cursor_col,
         );
     }
@@ -39769,12 +40124,16 @@ impl App {
         self.editor.set_search_highlight(Some(needle.clone()), opts);
         if let Some(s) = self.editor_find.as_mut() {
             s.set_match_count(
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts),
+                crate::widgets::editor_find::count_matches(
+                    self.editor.find_scope().0,
+                    &needle,
+                    opts,
+                ),
                 false,
             );
         }
-        if let Some(m) = crate::widgets::editor_find::find_next_match(
-            &self.editor.lines,
+        if let Some(m) = self.editor_find_step(
+            true,
             &needle,
             opts,
             self.editor.cursor_row,
@@ -39799,14 +40158,17 @@ impl App {
             return;
         }
         let (needle, replacement, opts) = (state.query.clone(), state.replace.clone(), state.opts);
-        let Some((new_lines, n)) = crate::widgets::editor_find::replace_all_in_lines(
-            &self.editor.lines,
-            &needle,
-            &replacement,
-            opts,
-        ) else {
+        // A symbol tab replaces within its symbol only (#369).
+        let (scope, first) = self.editor.find_scope();
+        let scope_end = first + scope.len();
+        let Some((replaced, n)) =
+            crate::widgets::editor_find::replace_all_in_lines(scope, &needle, &replacement, opts)
+        else {
             return;
         };
+        let mut new_lines = self.editor.lines[..first].to_vec();
+        new_lines.extend(replaced);
+        new_lines.extend_from_slice(&self.editor.lines[scope_end..]);
         if n == 0 {
             self.status = String::from("Replace All: no matches");
             return;
@@ -39818,7 +40180,11 @@ impl App {
             // matches, and a hard zero would read "No results" over a body
             // still painted full of highlights.
             s.set_match_count(
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &needle, opts),
+                crate::widgets::editor_find::count_matches(
+                    self.editor.find_scope().0,
+                    &needle,
+                    opts,
+                ),
                 false,
             );
             s.match_index = None;
@@ -40737,6 +41103,43 @@ impl App {
                             String::from("Fix with Navigator"),
                             MenuAction::FixProblemWithNavigator { path, item },
                         )],
+                        self.tree.root.clone(),
+                    ));
+                    return;
+                }
+                // An OUTLINE row: go to the symbol, or open it as its own
+                // tab (#369).
+                if rect_contains(self.outline.last_area, m.column, m.row)
+                    && let Some(idx) = self.outline.row_at(m.row)
+                    && let Some((path, line, col)) = self.outline.jump_target(idx)
+                    && let Some(sym) = self.outline.symbols().get(idx)
+                {
+                    let (name, first, last) = (
+                        sym.name.clone(),
+                        sym.range_start_line as usize,
+                        sym.range_end_line as usize,
+                    );
+                    self.context_menu = Some(ContextMenu::flat(
+                        (m.column, m.row),
+                        vec![
+                            (
+                                String::from("Go to Symbol"),
+                                MenuAction::GoToOutlineSymbol {
+                                    path: path.clone(),
+                                    line,
+                                    col,
+                                },
+                            ),
+                            (
+                                String::from("Open Symbol in Its Own Tab"),
+                                MenuAction::OpenSymbolTab {
+                                    path,
+                                    name,
+                                    first,
+                                    last,
+                                },
+                            ),
+                        ],
                         self.tree.root.clone(),
                     ));
                     return;
@@ -43134,9 +43537,11 @@ impl App {
         // active — which wrote an unrequested file and left this one dirty.
         if self.editor.path.as_deref() == Some(path.as_path()) {
             self.write_current_to_disk();
-            return;
+        } else {
+            self.write_tab_to_disk(&path);
         }
-        self.write_tab_to_disk(&path);
+        // As in `save`: the file's other tabs hold the text just written.
+        self.sync_symbol_views();
     }
 
     /// Flip `editor.formatOnSave`, persist it, and report the new state.
@@ -43191,6 +43596,20 @@ impl App {
         // in a second buffer with a different map.
         let mut saved_paths: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> =
             Vec::new();
+        // The tabs of a file with a symbol tab mirror each other (#369), so
+        // they hold one text: the first write saves them all, and writing a
+        // second would read the first as an external change. Settle them
+        // before the sweep (which may close a symbol tab, so before any tab
+        // index is taken) and mark the rest clean after it. A file live in a
+        // collab session is not mirrored, so each of its tabs saves itself:
+        // on the owner the second write then meets the first one's stamp and
+        // reports a disk conflict, as two split panes of a live file do.
+        let settled = self.sync_symbol_views();
+        let mirrored: Vec<PathBuf> = self
+            .symbol_view_paths()
+            .into_iter()
+            .filter(|p| !self.symbol_path_is_live(p))
+            .collect();
         // The tab that still holds focus is not saved by the focus-change
         // mode: only buffers that LOST focus are written.
         let keep_focused =
@@ -43226,6 +43645,7 @@ impl App {
         // "name (encoding)" per refused tab: the refusal message names each
         // tab's OWN encoding, which need not be the active tab's.
         let mut lossy: Vec<String> = Vec::new();
+        let mut lossy_paths: Vec<PathBuf> = Vec::new();
         let mut sweep = |editors: &mut [crate::widgets::editor::Editor], skip: Option<usize>| {
             for (i, e) in editors
                 .iter_mut()
@@ -43233,6 +43653,11 @@ impl App {
                 .filter(|(i, e)| Some(*i) != skip && due(e))
             {
                 let _ = i;
+                if e.path.as_ref().is_some_and(|p| {
+                    mirrored.contains(p) && saved_paths.iter().any(|(q, ..)| q == p)
+                }) {
+                    continue;
+                }
                 // `save_to_disk` re-checks the disk and flags (never
                 // overwrites) an external change; auto save must not
                 // arm the force-overwrite path an explicit Cmd+S offers.
@@ -43249,8 +43674,14 @@ impl App {
                     // the ONLY chance to tell the user: the FS sweep's
                     // prompt fires on the transition into disk_conflict,
                     // which this save just consumed.
+                    // A mirrored sibling holds the same text and stamp, so it
+                    // meets the same outcome: each file is reported once.
                     Ok(crate::widgets::editor::SaveOutcome::DiskConflict) => {
-                        conflicted.extend(e.path.clone());
+                        if let Some(p) = e.path.clone()
+                            && !conflicted.contains(&p)
+                        {
+                            conflicted.push(p);
+                        }
                     }
                     // Same transition-only reporting as the conflict arm:
                     // the latch just set removes the tab from `due`, so
@@ -43258,7 +43689,11 @@ impl App {
                     // saving. Never arms the lossy write — consent is the
                     // explicit path's alone.
                     Ok(crate::widgets::editor::SaveOutcome::EncodingLoss) => {
-                        if let Some(name) = e.path.as_ref().and_then(|p| p.file_name()) {
+                        if let Some(p) = e.path.as_ref()
+                            && !lossy_paths.contains(p)
+                            && let Some(name) = p.file_name()
+                        {
+                            lossy_paths.push(p.clone());
                             lossy.push(format!(
                                 "{} ({})",
                                 name.to_string_lossy(),
@@ -43273,6 +43708,9 @@ impl App {
         sweep(&mut self.editor.editors, keep_focused);
         for group in self.editor_layout.inactive_groups_mut() {
             sweep(&mut group.editors, None);
+        }
+        if !saved_paths.is_empty() {
+            self.sync_symbol_views();
         }
         let had_conflicts = !conflicted.is_empty();
         if had_conflicts {
@@ -43291,7 +43729,7 @@ impl App {
         if saved_paths.is_empty() {
             // A conflict-only (or refusal-only) tick still changed the UI:
             // returning false would defer it to the next incidental redraw.
-            return had_conflicts || had_lossy;
+            return settled || had_conflicts || had_lossy;
         }
         // Mirror the explicit-save path: a config file written by auto save
         // must take effect exactly like one written by Cmd+S — including one
@@ -44559,6 +44997,17 @@ impl App {
     }
 
     fn save(&mut self) {
+        self.save_active_tab();
+        // The saved text is every same-file tab's text: settle them now, so
+        // none reads as dirty or as changed on disk before the next tick
+        // (#369). A format-on-save write lands later and settles them in
+        // `complete_pending_save`.
+        self.sync_symbol_views();
+    }
+
+    /// Save only the active tab; its same-file siblings are left as they
+    /// are. Callers go through [`Self::save`].
+    fn save_active_tab(&mut self) {
         // A hex tab with pending overwrites saves through its own byte
         // path (#173) — never `write_buffer_to_disk`, whose #185 guard
         // refuses every preview kind. Same disk-conflict double-press
@@ -46081,6 +46530,22 @@ impl App {
             MenuAction::FixProblemWithNavigator { path, item } => {
                 self.fix_problem_with_navigator(path, item, Vec::new());
             }
+            MenuAction::OpenSymbolTab {
+                path,
+                name,
+                first,
+                last,
+            } => {
+                // Go to the symbol first: the tab opens from the file's own
+                // tab, which may not be the one showing.
+                self.go_to_definition(path.clone(), first as u32, 0);
+                if self.editor.path.as_deref() == Some(path.as_path()) {
+                    self.open_symbol_tab_for(name, first, last);
+                }
+            }
+            MenuAction::GoToOutlineSymbol { path, line, col } => {
+                self.go_to_definition(path, line, col);
+            }
             MenuAction::ShowCallsAt { row, col, incoming } => {
                 self.editor.cursor_row = row;
                 self.editor.cursor_col = col;
@@ -47013,11 +47478,26 @@ impl App {
         let cell_w = strip.width;
         let cell_h = strip.height;
         let bg = self.theme.editor_bg_rgb();
-        let top = self.editor.scroll;
+        // A symbol tab's minimap draws only its symbol (#369), so rows
+        // count from the symbol's first line.
+        let span = self.editor.minimap_span();
+        let (first, end) = span;
+        let top = self.editor.scroll.saturating_sub(first);
         let rows = self.editor.visible_rows();
-        let total = self.editor.lines.len();
+        let total = end - first;
         let edit_seq = self.editor.edit_seq;
-        let selection = self.editor.selection_rows();
+        // A selection is only drawn where it meets the drawn lines.
+        let selection = self
+            .editor
+            .selection_rows()
+            .filter(|&(s, e)| s < end && e >= first)
+            .map(|(s, e)| (s.max(first) - first, e.min(end - 1) - first));
+        let doc = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.editor.path.hash(&mut h);
+            (h.finish(), span)
+        };
         let desired = MinimapLayout {
             cell_x: strip.x,
             cell_y: strip.y,
@@ -47030,6 +47510,7 @@ impl App {
             side: self.minimap_side,
             bg,
             selection,
+            doc,
         };
         if self.overlays.minimap.layout_matches(&desired) {
             return;
@@ -47063,7 +47544,14 @@ impl App {
         // Luminance picks the default text color and the viewport tint so the
         // box reads on either theme.
         let light = 0.299 * bg.0 as f32 + 0.587 * bg.1 as f32 + 0.114 * bg.2 as f32 > 140.0;
-        let sig = (self.editor.path.clone(), edit_seq, canvas_w, canvas_h, bg);
+        let sig = (
+            self.editor.path.clone(),
+            edit_seq,
+            canvas_w,
+            canvas_h,
+            bg,
+            span,
+        );
         if self.minimap_base.as_ref().map(|b| &b.sig) != Some(&sig) {
             let fg = if light {
                 (0x38, 0x3a, 0x41)
@@ -47231,14 +47719,15 @@ impl App {
     /// click lands on the line actually under the cursor.
     fn minimap_scroll_to_row(&mut self, row: u16) {
         let r = self.minimap_img_rect;
-        let total = self.editor.lines.len();
+        let (first, end) = self.editor.minimap_span();
+        let total = end - first;
         if r.height == 0 || total == 0 {
             return;
         }
         let ch_px = self.cell_pixel.map(|(_, h)| h).unwrap_or(1).max(1);
         let dy_px = (row.saturating_sub(r.y)) as u32 * ch_px;
         let content_h = self.minimap_content_h.max(1);
-        let line = (dy_px as usize * total / content_h as usize).min(total - 1);
+        let line = first + (dy_px as usize * total / content_h as usize).min(total - 1);
         self.editor.goto_line_centered(line);
         self.poke_cursor();
     }
@@ -52901,6 +53390,12 @@ fn collab_caret_color(navigator_sites: &[u64], site: u64) -> Color {
     }
 }
 
+/// The tree-sitter grammar for `path`, by extension: what symbol tabs
+/// (#369) parse to re-find a renamed or displaced symbol.
+fn syntax_kind_of(path: &Path) -> Option<crate::highlight::LangKind> {
+    crate::highlight::lang_for_extension(path.extension()?.to_str()?)
+}
+
 /// `path` relative to `repo_root` with forward slashes, as GitHub names it.
 fn repo_relative(repo_root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(repo_root).ok()?;
@@ -53563,6 +54058,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             run_pending_scp_uploads(app, terminal)?;
             needs_redraw = true;
         }
+        // Same-file tabs agree before the watcher is read: a save from one
+        // symbol tab leaves its siblings holding the saved text, so the
+        // change event reads as their own write, not a conflict (#369).
+        let symbol_views_settled = app.sync_symbol_views();
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         let fs_changed = app.drain_fs_events();
@@ -53586,6 +54085,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
         let collab_changed = app.poll_collab();
+        let symbol_views_changed = app.sync_symbol_views() | symbol_views_settled;
         let bells_changed = app.drain_terminal_bells();
         // A block whose command has finished gets its output box (#354).
         let captures_changed = app.settle_block_captures();
@@ -53720,6 +54220,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || session_presence_changed
             || session_typing_changed
             || collab_changed
+            || symbol_views_changed
             || bells_changed
             || captures_changed
             || labels_changed
