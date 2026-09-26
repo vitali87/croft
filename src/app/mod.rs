@@ -9924,6 +9924,16 @@ impl App {
             self.status = String::from("Open a local snapshot from the TIMELINE first");
             return;
         };
+        // What is on disk now is kept first: it may never have been
+        // snapshotted (an agent's write, a checkout), and the restore
+        // overwrites it. Refused if it cannot be kept.
+        if let Ok(current) = std::fs::read(&file)
+            && let Err(e) =
+                crate::history::record_kept_in(&self.history_root, &file, &current, now_millis())
+        {
+            self.status = format!("Restore cancelled: could not keep the current version ({e})");
+            return;
+        }
         if let Err(e) = std::fs::write(&file, &content) {
             self.status = format!("Restore failed: {e}");
             return;
@@ -9949,8 +9959,9 @@ impl App {
             onto_buffer.truncate(self.editor.lines.len());
             self.editor.provenance = onto_buffer;
         }
-        // The restore is itself a new version worth keeping.
-        self.record_history_snapshot(&file, seats);
+        // The restore is itself a new version worth keeping, kept like the
+        // version it replaced.
+        self.record_history_snapshot_of_kept(&file, seats);
         self.status = format!("Restored {}", self.status_path(&file));
     }
 
@@ -35425,7 +35436,9 @@ impl App {
     /// it just cannot show a diff.
     fn record_review_baseline(history_root: &Path, path: &Path, bytes: &[u8]) -> Option<u64> {
         let millis = now_millis();
-        let _ = crate::history::record_in(history_root, path, bytes, millis);
+        // Kept: an autosave seconds later must not replace the baseline the
+        // review diff points at, nor may this replace the user's own save.
+        let _ = crate::history::record_kept_in(history_root, path, bytes, millis);
         crate::history::entries_in(history_root, path)
             .into_iter()
             .find(|s| std::fs::read(&s.file).is_ok_and(|held| held == bytes))
@@ -46088,11 +46101,8 @@ impl App {
     /// looked up by path here, since a split can hold the same file in a
     /// second buffer with a different map, and a snapshot restore records
     /// the restored snapshot's own seats, which no tab holds at that moment.
-    fn record_history_snapshot(&mut self, path: &Path, seats: crate::provenance::Provenance) {
-        self.record_history_snapshot_of(path, seats, None);
-    }
-
-    /// [`Self::record_history_snapshot`] with the bytes the map describes.
+    ///
+    /// Records the seats with the bytes the map describes.
     /// The worker re-reads the file, which is what makes the snapshot
     /// byte-exact, and between the save and that read another tab's save of
     /// the same path can land - so the map is recorded only while the bytes
@@ -46110,6 +46120,25 @@ impl App {
         seats: crate::provenance::Provenance,
         described: Option<Vec<u8>>,
     ) {
+        self.spawn_history_record(path, seats, described, false);
+    }
+
+    /// [`Self::record_history_snapshot_of`] as a kept snapshot (a restore).
+    fn record_history_snapshot_of_kept(
+        &mut self,
+        path: &Path,
+        seats: crate::provenance::Provenance,
+    ) {
+        self.spawn_history_record(path, seats, None, true);
+    }
+
+    fn spawn_history_record(
+        &mut self,
+        path: &Path,
+        seats: crate::provenance::Provenance,
+        described: Option<Vec<u8>>,
+        keep: bool,
+    ) {
         let root = self.history_root.clone();
         let path = path.to_path_buf();
         let tx = self.history_done_tx.clone();
@@ -46122,7 +46151,11 @@ impl App {
                     Some(want) if want != bytes => crate::provenance::Provenance::new(),
                     _ => seats,
                 };
-                let _ = crate::history::record_with_seats_in(&root, &path, &bytes, millis, &seats);
+                let _ = if keep {
+                    crate::history::record_kept_with_seats_in(&root, &path, &bytes, millis, &seats)
+                } else {
+                    crate::history::record_with_seats_in(&root, &path, &bytes, millis, &seats)
+                };
             }
             let _ = tx.send(path);
         });

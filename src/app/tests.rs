@@ -12550,6 +12550,32 @@ fn a_completion_applies_its_text_edit_and_additional_edits() {
     assert_eq!(app.editor.lines, vec![String::from("baz")]);
 }
 
+/// Restoring a snapshot keeps the version it overwrites, even one never
+/// snapshotted (an agent's write) or saved seconds ago (inside the merge
+/// window, where the restore used to replace and delete it).
+#[test]
+fn restoring_a_snapshot_keeps_the_version_it_overwrites() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    let now = super::now_millis();
+    crate::history::record_in(&app.history_root, &f, b"v1\n", now - 60_000).unwrap();
+    // Saved a second ago, then rewritten by someone else, never snapshotted.
+    crate::history::record_in(&app.history_root, &f, b"v2\n", now - 1_000).unwrap();
+    std::fs::write(&f, "v3 by an agent\n").unwrap();
+    app.history_restore = Some((f.clone(), now - 60_000, b"v1\n".to_vec()));
+    app.restore_history_snapshot();
+    assert_eq!(std::fs::read(&f).unwrap(), b"v1\n");
+    let held: Vec<Vec<u8>> = crate::history::entries_in(&app.history_root, &f)
+        .iter()
+        .map(|s| std::fs::read(&s.file).unwrap())
+        .collect();
+    assert!(held.contains(&b"v2\n".to_vec()), "{held:?}");
+    assert!(held.contains(&b"v3 by an agent\n".to_vec()), "{held:?}");
+}
+
 #[test]
 fn dispatching_fetch_records_a_line_in_the_git_output_log() {
     let tmp = make_committed_repo();
@@ -14571,7 +14597,7 @@ fn restoring_a_snapshot_carries_its_seats_onto_the_restore() {
     let mut seats_v2 = crate::provenance::Provenance::new();
     seats_v2.record(2..3, Seat::Agent(String::from("pane 2")));
     // v2 is the newest snapshot and recent enough that the restore lands
-    // inside the merge window and supersedes it.
+    // inside the merge window, which must not supersede it.
     let recent = now_millis() - 100;
     crate::history::record_with_seats_in(hist.path(), &f, v1, 1_000, &seats_v1).unwrap();
     crate::history::record_with_seats_in(hist.path(), &f, v2, recent, &seats_v2).unwrap();
@@ -14613,12 +14639,15 @@ fn restoring_a_snapshot_carries_its_seats_onto_the_restore() {
         },
     );
     let snaps = crate::history::entries_in(hist.path(), &f);
+    // v2 is kept, not superseded: the restore overwrote it, and replacing
+    // its snapshot inside the merge window lost that version for good.
     assert_eq!(
         snaps.len(),
-        2,
-        "the restore superseded v2 inside the merge window: {snaps:?}"
+        3,
+        "v1 restored, v2 kept, v1 original: {snaps:?}"
     );
     assert_eq!(std::fs::read(&snaps[0].file).unwrap(), v1);
+    assert_eq!(std::fs::read(&snaps[1].file).unwrap(), v2);
     wait_for_seats(hist.path(), &f, snaps[0].millis);
     assert_eq!(
         crate::history::seats_for(hist.path(), &f, snaps[0].millis),
