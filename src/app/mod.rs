@@ -53411,6 +53411,70 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
     Ok(())
 }
 
+/// Fingerprints of the text cells under each large post-frame image this
+/// frame (see [`overlay::ImageOverlay::needs_emit`]).
+struct ImageUnderlays {
+    editor: [u64; 2],
+    terminal: u64,
+    markdown: u64,
+    minimap: u64,
+}
+
+/// A fingerprint of the cells of `buf` in the given rectangle: symbols,
+/// colours and modifiers, so any write ratatui makes there changes it.
+fn cells_fingerprint(buf: &ratatui::buffer::Buffer, x: u16, y: u16, w: u16, h: u16) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let area = buf.area;
+    let (x0, y0) = (x.max(area.x), y.max(area.y));
+    let x1 = x.saturating_add(w).min(area.x + area.width);
+    let y1 = y.saturating_add(h).min(area.y + area.height);
+    (x0, y0, x1, y1).hash(&mut hasher);
+    for row in y0..y1 {
+        for col in x0..x1 {
+            let cell = &buf[(col, row)];
+            cell.symbol().hash(&mut hasher);
+            (cell.fg, cell.bg, cell.modifier).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+impl App {
+    /// This frame's [`ImageUnderlays`], read from the buffer just drawn.
+    fn image_underlays(&self, buf: &ratatui::buffer::Buffer) -> ImageUnderlays {
+        let o = &self.overlays;
+        let editor = |side: usize| {
+            o.editor[side].layout().map_or(0, |l| {
+                cells_fingerprint(buf, l.cell_x, l.cell_y, l.cell_w, l.cell_h)
+            })
+        };
+        ImageUnderlays {
+            editor: [editor(0), editor(1)],
+            terminal: o.terminal_image.layout().map_or(0, |l| {
+                cells_fingerprint(buf, l.cell_x, l.cell_y, l.cell_w, l.cell_h)
+            }),
+            markdown: o.markdown_image.layout().map_or(0, |l| {
+                cells_fingerprint(buf, l.cell_x, l.cell_y, l.cell_w, l.cell_h)
+            }),
+            minimap: o.minimap.layout().map_or(0, |l| {
+                cells_fingerprint(buf, l.cell_x, l.cell_y, l.cell_w, l.cell_h)
+            }),
+        }
+    }
+
+    /// The screen was wiped or its images evicted: every large image is
+    /// sent again on the next flush.
+    fn forget_sent_images(&mut self) {
+        for side in 0..2 {
+            self.overlays.editor[side].forget_sent();
+        }
+        self.overlays.terminal_image.forget_sent();
+        self.overlays.markdown_image.forget_sent();
+        self.overlays.minimap.forget_sent();
+    }
+}
+
 /// Consume every overlay's one-shot image-clear latch; true when any fired.
 /// Shared by the pre-draw and post-draw eviction checks in [`main_loop`].
 fn consume_any_image_clear(app: &mut App) -> bool {
@@ -53755,11 +53819,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.activity.mark_dirty();
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
+                app.forget_sent_images();
             }
             let draw_start = std::time::Instant::now();
-            terminal.draw(|f| {
+            let drawn = terminal.draw(|f| {
                 app.render(f);
             })?;
+            let mut underlays = app.image_underlays(drawn.buffer);
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -53772,9 +53838,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.activity.mark_dirty();
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
-                terminal.draw(|f| {
+                app.forget_sent_images();
+                let drawn = terminal.draw(|f| {
                     app.render(f);
                 })?;
+                underlays = app.image_underlays(drawn.buffer);
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
@@ -53788,12 +53856,12 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // writes here — re-emitting the pre-encoded OSC bytes every
             // frame is cheap and locks the images in.
             app.flush_activity_image_overlays();
-            // Active editor image preview: bake-once-emit-each-frame
-            // overlay, just like the welcome wordmark. Sent after ratatui
-            // has finished its diff so the image bytes land on cells
-            // ratatui won't repaint until layout changes again. One slot
-            // per editor split column (0 = left, 1 = right); when not
-            // split only slot 0 ever has a payload.
+            // Active editor image preview: baked once, and sent after
+            // ratatui's diff only when it could be missing from the screen
+            // (`ImageOverlay::needs_emit`), never on every frame: a picture
+            // is megabytes, and over SSH resending it per keystroke stalls
+            // the session (#682). One slot per editor split column (0 =
+            // left, 1 = right); when not split only slot 0 has a payload.
             for side in 0..2 {
                 if let Some((osc, layout)) = app.editor_image_payload(side)
                     && app.overlay_fits_on_screen(
@@ -53803,6 +53871,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                         layout.cell_h,
                     )
                 {
+                    if !app.overlays.editor[side].needs_emit(underlays.editor[side]) {
+                        continue;
+                    }
                     use std::io::Write;
                     let mut out = stdout();
                     let cursor_on = app.cursor_should_be_visible();
@@ -53815,10 +53886,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     }
                     let _ = out.flush();
                     app.mark_editor_image_displayed(side);
+                    app.overlays.editor[side].mark_sent_over(underlays.editor[side]);
+                } else {
+                    app.overlays.editor[side].forget_sent();
                 }
             }
             // Terminal-pane inline image (captured imgcat output): same
-            // bake-once / emit-each-frame overlay, anchored to its grid row.
+            // bake-once / send-when-missing overlay, anchored to its grid row.
             if let Some((osc, layout)) = app.terminal_image_payload()
                 && app.overlay_fits_on_screen(
                     layout.cell_x,
@@ -53827,21 +53901,28 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     layout.cell_h,
                 )
             {
-                use std::io::Write;
-                let mut out = stdout();
-                let cursor_on = app.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                let _ = out.write_all(osc.as_bytes());
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
+                if app.overlays.terminal_image.needs_emit(underlays.terminal) {
+                    use std::io::Write;
+                    let mut out = stdout();
+                    let cursor_on = app.cursor_should_be_visible();
+                    let _ = write!(out, "\x1b[?25l\x1b[s");
+                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
+                    let _ = out.write_all(osc.as_bytes());
+                    let _ = write!(out, "\x1b[u");
+                    if cursor_on {
+                        let _ = write!(out, "\x1b[?25h");
+                    }
+                    let _ = out.flush();
+                    app.mark_terminal_image_displayed();
+                    app.overlays
+                        .terminal_image
+                        .mark_sent_over(underlays.terminal);
                 }
-                let _ = out.flush();
-                app.mark_terminal_image_displayed();
+            } else {
+                app.overlays.terminal_image.forget_sent();
             }
             // Markdown-preview inline image (#176): same bake-once /
-            // emit-each-frame overlay, anchored at its reserved rows.
+            // send-when-missing overlay, anchored at its reserved rows.
             if let Some((osc, layout)) = app.markdown_image_payload()
                 && app.overlay_fits_on_screen(
                     layout.cell_x,
@@ -53850,21 +53931,28 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     layout.cell_h,
                 )
             {
-                use std::io::Write;
-                let mut out = stdout();
-                let cursor_on = app.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                let _ = out.write_all(osc.as_bytes());
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
+                if app.overlays.markdown_image.needs_emit(underlays.markdown) {
+                    use std::io::Write;
+                    let mut out = stdout();
+                    let cursor_on = app.cursor_should_be_visible();
+                    let _ = write!(out, "\x1b[?25l\x1b[s");
+                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
+                    let _ = out.write_all(osc.as_bytes());
+                    let _ = write!(out, "\x1b[u");
+                    if cursor_on {
+                        let _ = write!(out, "\x1b[?25h");
+                    }
+                    let _ = out.flush();
+                    app.mark_markdown_image_displayed();
+                    app.overlays
+                        .markdown_image
+                        .mark_sent_over(underlays.markdown);
                 }
-                let _ = out.flush();
-                app.mark_markdown_image_displayed();
+            } else {
+                app.overlays.markdown_image.forget_sent();
             }
-            // Editor minimap: same bake-once / emit-each-frame overlay, painted
-            // after ratatui's diff so the raster lands on the strip cells.
+            // Editor minimap: same bake-once / send-when-missing overlay,
+            // painted after ratatui's diff so the raster lands on the strip.
             if let Some((osc, layout)) = app.minimap_image_payload()
                 && app.overlay_fits_on_screen(
                     layout.cell_x,
@@ -53873,18 +53961,23 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     layout.cell_h,
                 )
             {
-                use std::io::Write;
-                let mut out = stdout();
-                let cursor_on = app.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                let _ = out.write_all(osc.as_bytes());
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
+                if app.overlays.minimap.needs_emit(underlays.minimap) {
+                    use std::io::Write;
+                    let mut out = stdout();
+                    let cursor_on = app.cursor_should_be_visible();
+                    let _ = write!(out, "\x1b[?25l\x1b[s");
+                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
+                    let _ = out.write_all(osc.as_bytes());
+                    let _ = write!(out, "\x1b[u");
+                    if cursor_on {
+                        let _ = write!(out, "\x1b[?25h");
+                    }
+                    let _ = out.flush();
+                    app.mark_minimap_image_displayed();
+                    app.overlays.minimap.mark_sent_over(underlays.minimap);
                 }
-                let _ = out.flush();
-                app.mark_minimap_image_displayed();
+            } else {
+                app.overlays.minimap.forget_sent();
             }
             // Run-and-Debug headline icon: same re-emit-every-frame trick.
             // Only fires while the sidebar is on the Run-Debug view and the
