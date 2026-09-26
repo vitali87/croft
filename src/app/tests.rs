@@ -51906,6 +51906,10 @@ fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
     let (_tmp, root, f, log, stdin, gh) = review_fixture();
     let mut app = review_app(&root, &f, &gh);
     app.load_review_threads();
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the threads", || {
+        app.drain_review_ops();
+        app.review_boxes.is_some()
+    });
     let threads = app.review_boxes.as_ref().map(|(_, t)| t.clone()).unwrap();
     assert_eq!(threads.len(), 1);
     assert!(!threads[0].resolved);
@@ -51994,6 +51998,27 @@ fn pending_comments_stay_with_their_pull_request() {
     assert_eq!(app.navigator_notes["a.rs"].len(), 1);
 }
 
+/// A failed reply or thread load while a review is being submitted does not
+/// end the submission: only the submission's own answer does.
+#[test]
+fn only_the_submissions_own_failure_ends_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.review_submitting = true;
+    app.review_tx
+        .send(crate::review_ops::Outcome::Failed(String::from(
+            "Reply failed",
+        )))
+        .unwrap();
+    app.drain_review_ops();
+    assert!(app.review_submitting);
+    app.review_tx
+        .send(crate::review_ops::Outcome::SubmitFailed(String::from("no")))
+        .unwrap();
+    app.drain_review_ops();
+    assert!(!app.review_submitting);
+}
+
 /// #368: the navigator's notes and pending comments are previewed, then
 /// posted as one review with the navigator's marked as AI-authored; a note
 /// off the diff lands in the summary, and posted notes leave the editor.
@@ -52015,6 +52040,10 @@ fn comments_export_to_the_pull_request_after_a_preview() {
             body: String::from("mine"),
         });
     app.open_export_comments();
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the preview", || {
+        app.drain_review_ops();
+        app.list_picker.is_some()
+    });
     let picker = app.list_picker.as_ref().expect("the preview is shown");
     assert_eq!(
         picker.rows[0].label,

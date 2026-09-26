@@ -39,6 +39,16 @@ pub enum Job {
         pending: Vec<PendingComment>,
         settles: Settles,
     },
+    /// Find the branch's PR and read `rel`'s review threads with their
+    /// resolution (#366). `path` rides along so the threads land on the file
+    /// they were read for.
+    LoadThreads { path: PathBuf, rel: String },
+    /// Find the branch's PR and count which of `comments` GitHub will take
+    /// inline, for the export preview (#368).
+    ExportPreview {
+        comments: Vec<PendingComment>,
+        notes: Vec<u64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +66,41 @@ pub enum Outcome {
         folded: usize,
         settles: Settles,
     },
+    Threads {
+        root: PathBuf,
+        number: String,
+        path: PathBuf,
+        rel: String,
+        threads: Vec<crate::review_threads::Thread>,
+        /// Thread id to (GraphQL node id, resolved).
+        states: std::collections::HashMap<u64, (String, bool)>,
+    },
+    ExportReady {
+        root: PathBuf,
+        number: String,
+        comments: Vec<PendingComment>,
+        notes: Vec<u64>,
+        inline: usize,
+    },
+    /// No PR for the branch; the status says so.
+    NoPr,
+    /// A submission failed: the next one may go.
+    SubmitFailed(String),
+    /// Any other job failed; nothing was in flight on its account.
     Failed(String),
+}
+
+/// The PR number for the branch checked out in `root`.
+fn pr_number(program: &str, root: &Path) -> Option<String> {
+    gh(
+        program,
+        root,
+        &["pr", "view", "--json", "number", "--jq", ".number"],
+        None,
+    )
+    .ok()
+    .map(|n| n.trim().to_string())
+    .filter(|n| !n.is_empty())
 }
 
 /// gh's first stderr line, which names the problem (scope, rate limit, a
@@ -167,7 +211,85 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
                     folded: pending.len() - inline,
                     settles,
                 },
-                Err(e) => Outcome::Failed(format!("Review not submitted: {e}")),
+                Err(e) => Outcome::SubmitFailed(format!("Review not submitted: {e}")),
+            }
+        }
+        Job::LoadThreads { path, rel } => {
+            let Some(number) = pr_number(program, root) else {
+                return Outcome::NoPr;
+            };
+            let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments");
+            let json = match gh(program, root, &["api", &endpoint, "--paginate"], None) {
+                Ok(j) => j,
+                Err(e) => return Outcome::Failed(format!("Could not read the PR's comments: {e}")),
+            };
+            let threads: Vec<_> = crate::review_threads::parse_threads(&json)
+                .into_iter()
+                .filter(|t| t.path == rel)
+                .collect();
+            // Resolution and the node id Resolve needs live only in GraphQL.
+            // Best effort: without it every thread reads as unresolved, the
+            // safe default. Every page: past 100 threads the rest would
+            // otherwise lack the id Resolve needs.
+            let mut states = std::collections::HashMap::new();
+            let mut after: Option<String> = None;
+            loop {
+                let mut args = vec![
+                    String::from("api"),
+                    String::from("graphql"),
+                    String::from("-F"),
+                    String::from("owner={owner}"),
+                    String::from("-F"),
+                    String::from("repo={repo}"),
+                    String::from("-F"),
+                    format!("number={number}"),
+                    String::from("-f"),
+                    format!("query={}", crate::review_threads::THREADS_QUERY),
+                ];
+                if let Some(cursor) = &after {
+                    args.push(String::from("-f"));
+                    args.push(format!("after={cursor}"));
+                }
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let Ok(page) = gh(program, root, &args, None) else {
+                    break;
+                };
+                states.extend(crate::review_threads::parse_thread_states(&page));
+                match crate::review_threads::next_page(&page) {
+                    Some(cursor) if after.as_deref() != Some(cursor.as_str()) => {
+                        after = Some(cursor);
+                    }
+                    _ => break,
+                }
+            }
+            Outcome::Threads {
+                root: root.to_path_buf(),
+                number,
+                path,
+                rel,
+                threads,
+                states,
+            }
+        }
+        Job::ExportPreview { comments, notes } => {
+            let Some(number) = pr_number(program, root) else {
+                return Outcome::NoPr;
+            };
+            // Which comments GitHub will take inline, so one folded into the
+            // summary is no surprise after posting.
+            let diff = gh(program, root, &["pr", "diff", &number], None).unwrap_or_default();
+            let inline = comments
+                .iter()
+                .filter(|c| {
+                    crate::review_threads::commentable_lines(&diff, &c.path).contains(&(c.line + 1))
+                })
+                .count();
+            Outcome::ExportReady {
+                root: root.to_path_buf(),
+                number,
+                comments,
+                notes,
+                inline,
             }
         }
     }

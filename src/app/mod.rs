@@ -25492,10 +25492,30 @@ impl App {
                         ),
                     };
                 }
-                Outcome::Failed(e) => {
+                Outcome::Threads {
+                    root,
+                    number,
+                    path,
+                    rel,
+                    threads,
+                    states,
+                } => self.show_review_threads(root, number, path, rel, threads, states),
+                Outcome::ExportReady {
+                    root,
+                    number,
+                    comments,
+                    notes,
+                    inline,
+                } => self.show_export_ready(root, number, comments, notes, inline),
+                Outcome::NoPr => {
+                    self.status = String::from("No PR for this branch — check it out first");
+                }
+                Outcome::SubmitFailed(e) => {
                     self.review_submitting = false;
                     self.status = e;
                 }
+                // A failed reply or load leaves a submission in flight alone.
+                Outcome::Failed(e) => self.status = e,
             }
         }
         changed
@@ -28342,6 +28362,14 @@ impl App {
     /// in, the file, its repo-relative path, the branch's PR number), or
     /// `None` with the reason in the status bar.
     fn review_context(&mut self) -> Option<(PathBuf, PathBuf, String, String)> {
+        let (root, path, rel) = self.review_file_context()?;
+        let number = self.review_pr_number(&root)?;
+        Some((root, path, rel, number))
+    }
+
+    /// [`Self::review_context`] without the PR number, which costs a `gh`
+    /// call: the root, the file and its repo-relative path.
+    fn review_file_context(&mut self) -> Option<(PathBuf, PathBuf, String)> {
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Open a file from the PR first");
             return None;
@@ -28375,8 +28403,7 @@ impl App {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        let number = self.review_pr_number(&root)?;
-        Some((root, path, rel, number))
+        Some((root, path, rel))
     }
 
     /// The PR number for `root`'s branch, remembered for the write side, or
@@ -28443,26 +28470,29 @@ impl App {
             self.status = String::from("No comments to export");
             return;
         }
-        let Some(number) = self.review_pr_number(&root) else {
-            return;
-        };
         comments.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-        // The preview says which comments GitHub will take inline, so a
-        // comment folded into the summary is no surprise after posting.
-        let diff = std::process::Command::new(&self.review_gh)
-            .args(["pr", "diff", &number])
-            .current_dir(&root)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        let inline = comments
-            .iter()
-            .filter(|c| {
-                crate::review_threads::commentable_lines(&diff, &c.path).contains(&(c.line + 1))
-            })
-            .count();
+        // Finding the PR and reading its diff are `gh` calls, which can take
+        // as long as the network does: off the frame loop, the preview
+        // opens when they answer.
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::ExportPreview { comments, notes },
+            self.review_tx.clone(),
+        );
+        self.status = String::from("Preparing the export\u{2026}");
+    }
+
+    /// Open the export preview once its PR and diff are known.
+    fn show_export_ready(
+        &mut self,
+        root: PathBuf,
+        number: String,
+        comments: Vec<crate::review_threads::PendingComment>,
+        notes: Vec<u64>,
+        inline: usize,
+    ) {
+        self.review_pr = Some((root, number.clone()));
         let mut rows = vec![crate::widgets::list_picker::ListRow {
             id: String::from("post"),
             label: format!(
@@ -28550,79 +28580,31 @@ impl App {
     /// would put them against unrelated code — the same failure as placing
     /// an outdated thread silently, arriving through the other axis.
     fn load_review_threads(&mut self) {
-        let Some((root, path, rel, number)) = self.review_context() else {
+        let Some((root, path, rel)) = self.review_file_context() else {
             return;
         };
-        let api = std::process::Command::new(&self.review_gh)
-            .args([
-                "api",
-                &format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments"),
-                "--paginate",
-            ])
-            .current_dir(&root)
-            .output();
-        let json = match api {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-            Ok(o) => {
-                // gh's own message names the problem — a missing scope, a
-                // rate limit — far better than anything invented here.
-                let err = String::from_utf8_lossy(&o.stderr);
-                self.status = format!(
-                    "Could not read the PR's comments: {}",
-                    err.trim().lines().next().unwrap_or("gh failed")
-                );
-                return;
-            }
-            Err(e) => {
-                self.status = format!("Could not run gh: {e}");
-                return;
-            }
-        };
-        let mut threads: Vec<crate::review_threads::Thread> =
-            crate::review_threads::parse_threads(&json)
-                .into_iter()
-                .filter(|t| t.path == rel)
-                .collect();
-        // Resolution and the node id Resolve needs live only in GraphQL.
-        // Best effort: without it every thread reads as unresolved, the safe
-        // default, and Resolve says why it can't act.
-        // Every page: a PR past 100 threads would otherwise show the rest
-        // as unresolved and leave them without the id Resolve needs.
-        let mut states = std::collections::HashMap::new();
-        let mut after: Option<String> = None;
-        loop {
-            let mut args = vec![
-                String::from("api"),
-                String::from("graphql"),
-                String::from("-F"),
-                String::from("owner={owner}"),
-                String::from("-F"),
-                String::from("repo={repo}"),
-                String::from("-F"),
-                format!("number={number}"),
-                String::from("-f"),
-                format!("query={}", crate::review_threads::THREADS_QUERY),
-            ];
-            if let Some(cursor) = &after {
-                args.push(String::from("-f"));
-                args.push(format!("after={cursor}"));
-            }
-            let Some(page) = std::process::Command::new(&self.review_gh)
-                .args(&args)
-                .current_dir(&root)
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            else {
-                break;
-            };
-            states.extend(crate::review_threads::parse_thread_states(&page));
-            match crate::review_threads::next_page(&page) {
-                Some(cursor) if after.as_deref() != Some(cursor.as_str()) => after = Some(cursor),
-                _ => break,
-            }
-        }
+        // `gh` over the network, several calls for a big PR: off the frame
+        // loop. The threads come back keyed to `path`, the file asked about.
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::LoadThreads { path, rel },
+            self.review_tx.clone(),
+        );
+        self.status = String::from("Loading review comments\u{2026}");
+    }
+
+    /// Show threads read by [`Self::load_review_threads`].
+    fn show_review_threads(
+        &mut self,
+        root: PathBuf,
+        number: String,
+        path: PathBuf,
+        rel: String,
+        mut threads: Vec<crate::review_threads::Thread>,
+        states: std::collections::HashMap<u64, (String, bool)>,
+    ) {
+        self.review_pr = Some((root, number));
         for t in &mut threads {
             if let Some((node, resolved)) = states.get(&t.id) {
                 t.resolved = *resolved;
@@ -28639,13 +28621,9 @@ impl App {
             .count();
         // Stored against the file they describe; the render derives each
         // box's row and title from the buffer as it is at that moment.
-        // `path` is the binding taken at the top of this function, so the
-        // threads are keyed to the file the `gh` query was actually about
-        // rather than to whatever `editor.path` says afterwards. Today those
-        // cannot differ — the event loop is single-threaded and `gh` blocks
-        // it, so no keystroke is handled mid-call — but keying to the
-        // queried file is the property that matters, and it stops being
-        // free the moment this moves off the main thread.
+        // `path` is the file the `gh` query was about, carried through the
+        // worker, not whatever `editor.path` says now: the user may have
+        // switched tabs while it ran.
         self.review_boxes = Some((path, threads.clone()));
         self.status = match outdated {
             0 => format!("{} review comments on {rel}", threads.len()),
