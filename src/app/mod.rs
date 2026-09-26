@@ -4382,10 +4382,17 @@ fn composite_minimap_viewport(base: &[u8], w: u32, h: u32, ov: MinimapOverlay) -
 
 /// Encode an RGBA pixel buffer to PNG (the format `build_inline_image` wants).
 fn rgba_to_png(rgba: Vec<u8>, w: u32, h: u32) -> Option<Vec<u8>> {
-    let img: image::RgbaImage = image::ImageBuffer::from_raw(w, h, rgba)?;
+    use image::ImageEncoder as _;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    if rgba.len() != (w as usize) * (h as usize) * 4 {
+        return None;
+    }
+    // Best compression with adaptive filters: the minimap is a small strip
+    // of flat colour runs, so this costs well under a millisecond and makes
+    // each bake about a quarter the size, which is what SSH carries (#682).
     let mut out = Vec::new();
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+    PngEncoder::new_with_quality(&mut out, CompressionType::Best, FilterType::Adaptive)
+        .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
         .ok()?;
     Some(out)
 }
