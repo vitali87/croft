@@ -279,6 +279,10 @@ pub struct ActivityOverlay {
     /// `last_positions` order: iTerm2 only evicts an icon under traffic next
     /// to it, so the keepalive re-sends only icons whose ring changed (#682).
     neighbourhood: Vec<u64>,
+    /// What each icon slot last sent: its cell and a hash of its image.
+    /// A dirty flush re-sends only slots that differ (a badge count or a
+    /// hover swap), not the whole bar; empty means send everything (#682).
+    sent: Vec<((u16, u16), u64)>,
     clear: ClearLatch,
 }
 
@@ -327,6 +331,23 @@ impl ActivityOverlay {
 
     pub fn set_neighbourhood(&mut self, around: Vec<u64>) {
         self.neighbourhood = around;
+    }
+
+    pub fn was_sent(&self, cell: (u16, u16), image: u64) -> bool {
+        self.sent.contains(&(cell, image))
+    }
+
+    pub fn nothing_sent(&self) -> bool {
+        self.sent.is_empty()
+    }
+
+    pub fn set_sent(&mut self, sent: Vec<((u16, u16), u64)>) {
+        self.sent = sent;
+    }
+
+    /// The screen was wiped or the icons evicted: send them all next time.
+    pub fn forget_sent(&mut self) {
+        self.sent.clear();
     }
 
     /// Whether the dirty flag (a full re-send) is up.

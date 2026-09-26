@@ -655,7 +655,7 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
     let _ = child.kill();
     let _ = child.wait();
     assert!(
-        typed < 50_000,
+        typed < 30_000,
         "20 keystrokes wrote {typed} bytes: images are being re-sent per frame"
     );
 }

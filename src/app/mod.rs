@@ -6447,7 +6447,7 @@ impl App {
         // the sixel cell buffer nor Kitty's image layer evicts, so there the
         // icons re-emit only when dirty: on Kitty the keepalive cost about
         // 13 KB every two seconds, idle, over SSH (#682).
-        let full = self.overlays.activity.dirty();
+        let dirty = self.overlays.activity.dirty();
         let allow_keepalive = self.activity_keepalive_allowed()
             && (0..around.len()).any(|i| self.overlays.activity.neighbourhood_changed(i, around));
         if !self.overlays.activity.should_refresh(allow_keepalive) {
@@ -6461,17 +6461,42 @@ impl App {
         if self.overlays.activity.positions_moved(&positions) {
             self.overlays.activity.request_clear();
             self.overlays.activity.forget_positions();
+            self.overlays.activity.forget_sent();
             return;
         }
-        // A keepalive re-sends only the icons whose surroundings changed;
-        // `around` is in the same order as the unchanged positions.
-        if !full && positions.as_slice() == self.overlays.activity.last_positions() {
+        let hashes: Vec<u64> = overlays
+            .iter()
+            .map(|(_, seq)| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                seq.hash(&mut h);
+                h.finish()
+            })
+            .collect();
+        let sent: Vec<((u16, u16), u64)> = positions.iter().copied().zip(hashes).collect();
+        // Everything goes out after a wipe or on the first frame. Otherwise
+        // a dirty flush sends only the slots whose cell or image changed,
+        // and a keepalive only the icons whose surroundings changed (`around`
+        // is in the order of the unchanged positions).
+        if !self.overlays.activity.nothing_sent() {
+            let same = positions.as_slice() == self.overlays.activity.last_positions();
             let mut i = 0;
             overlays.retain(|_| {
-                let keep = self.overlays.activity.neighbourhood_changed(i, around);
+                let keep = if dirty {
+                    !self.overlays.activity.was_sent(sent[i].0, sent[i].1)
+                } else {
+                    same && self.overlays.activity.neighbourhood_changed(i, around)
+                };
                 i += 1;
                 keep
             });
+        }
+        if overlays.is_empty() {
+            self.overlays.activity.mark_emitted();
+            self.overlays.activity.store_positions(positions);
+            self.overlays.activity.set_neighbourhood(around.to_vec());
+            self.overlays.activity.set_sent(sent);
+            return;
         }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
@@ -6504,6 +6529,7 @@ impl App {
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
         self.overlays.activity.set_neighbourhood(around.to_vec());
+        self.overlays.activity.set_sent(sent);
     }
 
     /// Whether a post-draw overlay at this cell rect may be emitted (#513).
@@ -54106,6 +54132,7 @@ impl App {
     /// sent again on the next flush.
     fn forget_sent_images(&mut self) {
         self.chrome_sent.clear();
+        self.overlays.activity.forget_sent();
         for side in 0..2 {
             self.overlays.editor[side].forget_sent();
         }
