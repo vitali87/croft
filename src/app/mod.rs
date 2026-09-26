@@ -47721,12 +47721,18 @@ impl App {
     }
 
     /// True once a deferred minimap bake is due, so the loop redraws and
-    /// the strip shows the last edit.
+    /// the strip shows the last edit. Consumes the pending flag: that redraw
+    /// bakes (the wait is over), and if the minimap was hidden meanwhile
+    /// nothing is left pending to redraw for, forever.
     pub fn tick_minimap(&mut self) -> bool {
-        self.minimap_edit_pending
+        let due = self.minimap_edit_pending
             && self
                 .minimap_baked_at
-                .is_none_or(|t| t.elapsed() >= MINIMAP_EDIT_REBAKE)
+                .is_none_or(|t| t.elapsed() >= MINIMAP_EDIT_REBAKE);
+        if due {
+            self.minimap_edit_pending = false;
+        }
+        due
     }
 
     fn disable_minimap_image(&mut self) {

@@ -52324,6 +52324,10 @@ fn minimap_rebakes_for_typing_at_most_every_few_hundred_ms() {
     assert!(!app.tick_minimap(), "not due yet");
     app.minimap_baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
     assert!(app.tick_minimap(), "the wait is over: redraw");
+    assert!(
+        !app.tick_minimap(),
+        "one redraw per deferred bake, even if the minimap is gone by then"
+    );
     app.update_minimap_overlay(strip);
     assert_ne!(
         app.minimap_image_payload().map(|(o, _)| o.to_string()),
