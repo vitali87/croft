@@ -224,6 +224,15 @@ pub fn expand_replacement(
     replacement: &str,
     opts: SearchOpts,
 ) -> Option<String> {
+    // Literal mode asks the find bar's own matcher, which is what put the
+    // match on screen. Its whole-word test accepts `$x` in `a $x b`, where
+    // the regex's `\b` (between a space and `$`) never matches, so Replace
+    // on `$var` or `@user` jumped without ever replacing.
+    if !opts.use_regex {
+        return line_matches(line, opts, needle)
+            .contains(&(col_chars, len_chars))
+            .then(|| replacement.to_string());
+    }
     let re = build_find_regex(needle, opts)?;
     for caps in re.captures_iter(line) {
         let m = caps.get(0)?;
@@ -704,6 +713,17 @@ mod tests {
         // No match starts at col 1 — a stale MatchPos must never splice.
         let got = expand_replacement("alpha", 1, 5, "alpha", "beta", SearchOpts::default());
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn expand_replacement_takes_a_whole_word_match_the_find_bar_shows() {
+        let opts = SearchOpts {
+            whole_word: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(line_matches("a $x b", opts, "$x"), vec![(2, 2)]);
+        let got = expand_replacement("a $x b", 2, 2, "$x", "$y", opts);
+        assert_eq!(got.as_deref(), Some("$y"));
     }
 
     #[test]

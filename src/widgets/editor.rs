@@ -6652,7 +6652,10 @@ impl Editor {
         // One bookmark sync for the whole paste, diffed against the text
         // `push_undo` recorded above, not one per character.
         self.bookmark_sync_paused = true;
-        for c in s.chars() {
+        // CRLF and bare CR are line breaks too: only `\n` was, so a paste
+        // from Windows text (or a terminal sending CR) left a raw `\r` inside
+        // lines, which a save then wrote as `\r\r\n`.
+        for c in normalize_newlines(s).chars() {
             if c == '\n' {
                 self.insert_newline_raw();
             } else {
@@ -7231,7 +7234,13 @@ impl Editor {
         }
         self.cursor_row = new_primary.0.min(last);
         self.cursor_col = new_primary.1.min(self.line_char_len(self.cursor_row));
+        // Carets an edit brought together are one caret from here on: kept
+        // apart, the next key edited the same spot twice (one Backspace
+        // deleting two line breaks).
+        let primary = (self.cursor_row, self.cursor_col);
         new_secondary.sort_unstable();
+        new_secondary.dedup();
+        new_secondary.retain(|&p| p != primary);
         self.carets = new_secondary
             .into_iter()
             .map(|(r, c)| EditorSelection::new(r, c))
@@ -8286,6 +8295,34 @@ impl Editor {
         self.hidden_ranges = out;
     }
 
+    /// Drop every fold that touches rows `start..=end`, before an edit that
+    /// reorders those rows without changing the line count. Folds are line
+    /// numbers and are only reset when the count changes, so after Move Line
+    /// or Sort Lines a fold kept hiding the same numbers over different text.
+    fn forget_folds_in(&mut self, start: usize, end: usize) {
+        if self.folded.is_empty() {
+            return;
+        }
+        let touched: Vec<usize> = self
+            .folded
+            .iter()
+            .copied()
+            .filter(|&h| {
+                (start..=end).contains(&h)
+                    || self
+                        .fold_range(h)
+                        .is_some_and(|(s, e)| s <= end && e >= start)
+            })
+            .collect();
+        if touched.is_empty() {
+            return;
+        }
+        for h in touched {
+            self.folded.remove(&h);
+        }
+        self.rebuild_hidden_ranges();
+    }
+
     /// Unfold whatever collapsed region the cursor is sitting inside. Movement
     /// is not the only way in — search, go-to-definition and goto-line all set
     /// `cursor_row` directly — and a caret on a hidden line cannot be painted
@@ -9288,6 +9325,9 @@ impl Editor {
     /// step via the dedicated `EditKind::DuplicateLines`.
     pub fn duplicate_lines_down(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
+        // A single-caret command: extra carets would be left pointing at
+        // rows and columns the edit moved.
+        self.carets.clear();
         let (start_row, end_row) = self.selected_or_cursor_row_range();
         let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
         let block_len = block.len();
@@ -9311,6 +9351,7 @@ impl Editor {
     /// it started at (the original is pushed down by `block_len`).
     pub fn duplicate_lines_up(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
+        self.carets.clear();
         let (start_row, end_row) = self.selected_or_cursor_row_range();
         let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
         for (i, line) in block.into_iter().enumerate() {
@@ -9373,6 +9414,8 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::MoveLines);
+        self.carets.clear();
+        self.forget_folds_in(start, end + 1);
         self.lines[start..=end + 1].rotate_right(1);
         self.cursor_row += 1;
         if let Some(sel) = self.selection.as_mut() {
@@ -9392,6 +9435,8 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::MoveLines);
+        self.carets.clear();
+        self.forget_folds_in(start - 1, end);
         self.lines[start - 1..=end].rotate_left(1);
         self.cursor_row -= 1;
         if let Some(sel) = self.selection.as_mut() {
@@ -9421,6 +9466,7 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
+        self.carets.clear();
         let all_commented = non_blank
             .iter()
             .all(|&r| self.lines[r].trim_start().starts_with(token));
@@ -9476,6 +9522,7 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
+        self.carets.clear();
         let wrapped = trimmed.starts_with(open)
             && trimmed.ends_with(close)
             && trimmed.len() >= open.len() + close.len();
@@ -9486,10 +9533,26 @@ impl Editor {
         } else {
             format!("{open} {trimmed} {close}")
         };
-        self.replace_char_range(start, end, &new);
+        // Only the trimmed core is replaced: the whitespace around it (the
+        // line's indent, and the line break a whole-line selection ends
+        // with) stays as it was. Replacing the whole range joined the next
+        // line into this one and dropped the indent.
+        let lead = &text[..text.len() - text.trim_start().len()];
+        let trail = &text[text.trim_end().len()..];
+        let before = format!("{lead}{new}");
+        self.replace_char_range(start, end, &format!("{before}{trail}"));
         self.selection = None;
-        self.cursor_row = start.0;
-        self.cursor_col = self.line_char_len(start.0);
+        // The caret lands just after the (un)commented text.
+        match before.rsplit_once('\n') {
+            Some((head, tail)) => {
+                self.cursor_row = start.0 + head.matches('\n').count() + 1;
+                self.cursor_col = tail.chars().count();
+            }
+            None => {
+                self.cursor_row = start.0;
+                self.cursor_col = start.1 + before.chars().count();
+            }
+        }
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -9508,6 +9571,7 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::JoinLines);
+        self.carets.clear();
         let mut result = self.lines[start].trim_end().to_string();
         let cursor_col = result.chars().count();
         for line in &self.lines[start + 1..=last] {
@@ -9544,6 +9608,7 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::TransformCase);
+        self.carets.clear();
         let new = match kind {
             CaseTransform::Upper => text.to_uppercase(),
             CaseTransform::Lower => text.to_lowercase(),
@@ -9570,12 +9635,21 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::SortLines);
+        self.carets.clear();
         let mut block: Vec<String> = self.lines[start..=end].to_vec();
         block.sort();
         if !ascending {
             block.reverse();
         }
         self.lines.splice(start..=end, block);
+        // The rows changed under the cursor and selection: a column past the
+        // new line's end made the next word motion index out of bounds.
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        if let Some(sel) = self.selection.as_mut() {
+            sel.anchor.1 = sel.anchor.1.min(self.lines[sel.anchor.0].chars().count());
+            sel.head.1 = sel.head.1.min(self.lines[sel.head.0].chars().count());
+        }
+        self.forget_folds_in(start, end);
         self.mark_buffer_changed();
         self.recompute_highlights();
     }
@@ -9592,6 +9666,7 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::TrimWhitespace);
+        self.carets.clear();
         for line in &mut self.lines {
             let trimmed_len = line.trim_end_matches([' ', '\t']).len();
             line.truncate(trimmed_len);
@@ -9918,6 +9993,7 @@ impl Editor {
         // open reuses it and the bump is lost with it.
         self.pin_on_edit();
         self.push_undo(EditKind::BumpNumber);
+        self.carets.clear();
         // Never coalesce: a run of bumps must undo one at a time, the way
         // holding Ctrl-A in vim does.
         self.last_edit_kind = None;
@@ -10442,6 +10518,7 @@ impl Editor {
     pub fn move_word_left(&mut self) {
         loop {
             let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+            self.cursor_col = self.cursor_col.min(chars.len());
             while self.cursor_col > 0 && !is_word_char(chars[self.cursor_col - 1]) {
                 self.cursor_col -= 1;
             }
@@ -25840,6 +25917,79 @@ mod tests {
         });
         assert!(e.toggle_block_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    #[test]
+    fn toggle_block_comment_keeps_the_indent_and_the_next_line() {
+        let mut e = editor_with("    foo\nbar");
+        e.lang = Some(LangKind::Rust);
+        // A whole-line selection, as Shift+Down makes it.
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 0),
+        });
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["    /* foo */", "bar"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 13));
+        // No selection: the current line, indent kept, and back again.
+        e.cursor_row = 0;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["    foo", "bar"]);
+    }
+
+    #[test]
+    fn carets_that_meet_merge_so_the_next_key_edits_once() {
+        let mut e = editor_with("ab\ncd\nef");
+        e.cursor_row = 2;
+        e.cursor_col = 2;
+        e.carets = vec![EditorSelection::new(2, 1)];
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["ab", "cd", ""]);
+        assert!(e.carets.is_empty(), "{:?}", e.carets);
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["ab", "cd"]);
+    }
+
+    #[test]
+    fn pasting_crlf_or_cr_text_splits_lines_without_stray_returns() {
+        let mut e = editor_with("");
+        e.insert_str_as("a\r\nb\rc", crate::provenance::Seat::Me);
+        assert_eq!(e.lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn moving_or_sorting_lines_drops_the_folds_over_them() {
+        let mut e = editor_with("let y = 1;\nfn a() {\n    body\n}\ntail");
+        e.toggle_fold(1);
+        assert!(e.is_line_hidden(2));
+        e.cursor_row = 0;
+        e.move_lines_down();
+        assert_eq!(e.lines[0], "fn a() {");
+        assert!(
+            !e.is_line_hidden(2),
+            "the fold no longer hides `let y` 's neighbours"
+        );
+        let mut e = editor_with("b\n  b1\n  b2\na");
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1));
+        e.sort_lines(true);
+        assert!((0..4).all(|r| !e.is_line_hidden(r)), "{:?}", e.lines);
+    }
+
+    #[test]
+    fn sorting_lines_clamps_the_cursor_so_word_motion_cannot_panic() {
+        let mut e = editor_with("zzzzzzzzzz\nb\na");
+        e.cursor_row = 0;
+        e.cursor_col = 10;
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (2, 1),
+        });
+        e.sort_lines(true);
+        assert_eq!(e.lines, vec!["a", "b", "zzzzzzzzzz"]);
+        assert!(e.cursor_col <= 1);
+        e.selection = None;
+        e.move_word_left();
     }
 
     // ---- Join Lines ----
