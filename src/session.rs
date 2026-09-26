@@ -46,7 +46,7 @@ fn socket_path(workspace: &Path) -> PathBuf {
 /// Socket for a mux (session-host) session. A distinct name from the legacy
 /// dtach socket, so a client never speaks croft's frame protocol at a live
 /// dtach server (which would feed the frames into the PTY as input).
-fn mux_socket_path(workspace: &Path) -> PathBuf {
+pub(crate) fn mux_socket_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.mux.sock", socket_name(workspace)))
 }
 
