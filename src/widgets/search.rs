@@ -3651,6 +3651,25 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_planted_at_the_temp_name_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "foo\n").unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let tmp = dir
+            .path()
+            .join(format!(".a.txt.croft-replace-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        assert_eq!(
+            replace_in_file(&f, "foo", "bar", SearchOpts::default()),
+            Some(1)
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "bar\n");
+    }
+
+    #[test]
     fn whole_word_replace_takes_matches_edged_with_punctuation() {
         let ww = SearchOpts {
             whole_word: true,
