@@ -676,32 +676,26 @@ fn install_remote_croft_streaming(
     Ok(())
 }
 
-/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
-/// fast path is unavailable (the reason feeds the fallback confirmation);
-/// `Err` = the fast path was attempted and broke.
-fn try_local_cross_install_streaming(
-    ssh: &SshControl,
-    lane: &crate::remote_bulk::BulkLane,
-    source_stamp: &str,
-    log_tx: &std::sync::mpsc::Sender<String>,
-) -> Result<Option<String>> {
+/// Why a local static build for `triple` can't run, or `None` when it can.
+/// Shared by the remote installer and dev containers (#617).
+pub(crate) fn cross_build_unavailable(triple: &str) -> Option<String> {
     if let Some(reason) = cross_compile_unavailable_reason() {
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
+        return Some(reason);
     }
-    let Some(triple) = remote_target_triple(ssh)? else {
-        let reason = String::from("could not detect the remote architecture");
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
-    };
     if !rust_target_installed(triple) {
-        let reason = format!(
+        return Some(format!(
             "rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
-        );
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
+        ));
     }
+    None
+}
 
+/// Cross-build a static croft for `triple` from this checkout and return the
+/// binary's path.
+pub(crate) fn cross_build_static(
+    triple: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<PathBuf> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // This build runs *concurrently* with the live remote session, whose
     // keystrokes are relayed by this same local machine. A default `-j N`
@@ -741,6 +735,36 @@ fn try_local_cross_install_streaming(
             binary.display()
         );
     }
+    Ok(binary)
+}
+
+/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
+/// fast path is unavailable (the reason feeds the fallback confirmation);
+/// `Err` = the fast path was attempted and broke.
+fn try_local_cross_install_streaming(
+    ssh: &SshControl,
+    lane: &crate::remote_bulk::BulkLane,
+    source_stamp: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<Option<String>> {
+    if let Some(reason) = cross_compile_unavailable_reason() {
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    }
+    let Some(triple) = remote_target_triple(ssh)? else {
+        let reason = String::from("could not detect the remote architecture");
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    };
+    if !rust_target_installed(triple) {
+        let reason = format!(
+            "rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
+        );
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    }
+
+    let binary = cross_build_static(triple, log_tx)?;
 
     let mkdir = ssh.background_shell("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
     let mkdir_status =
@@ -1133,7 +1157,25 @@ fn run_pump(
             break;
         }
         let Ok(line) = line else { break };
-        match parse_relay_request(&line) {
+        let request = parse_relay_request(&line);
+        // Two local windows attached to one session tail the same log. The
+        // first to claim a request handles it; without this every window
+        // ran every open, forward and pull, one browser tab each (#648).
+        //
+        // A pull names a file on ONE computer: when two computers are
+        // attached, only the one that has it may claim it, or the other
+        // would claim it, fail, and leave the file's owner nothing to do.
+        if let Some(RelayRequest::Pull { src, .. }) = &request
+            && !Path::new(src).exists()
+        {
+            continue;
+        }
+        if let Some(id) = request.as_ref().and_then(RelayRequest::id)
+            && !ssh_exec(&host, &socket, &claim_command(&inbox_dir, id))
+        {
+            continue;
+        }
+        match request {
             Some(RelayRequest::Pull { id, src }) => {
                 handle_pull_request(&host, &socket, &inbox_dir, &id, &src);
             }
@@ -1384,6 +1426,21 @@ enum RelayRequest {
     },
 }
 
+impl RelayRequest {
+    /// The id a pump claims before acting. `Unforward` has none: each pump
+    /// tears down only a tunnel it holds, so every pump may see it.
+    fn id(&self) -> Option<&str> {
+        match self {
+            Self::Pull { id, .. }
+            | Self::Clipboard { id }
+            | Self::Copy { id }
+            | Self::Open { id, .. }
+            | Self::Forward { id, .. } => Some(id),
+            Self::Unforward { .. } => None,
+        }
+    }
+}
+
 fn parse_relay_request(line: &str) -> Option<RelayRequest> {
     let line = line.trim();
     let mut parts = line.split('\t');
@@ -1601,6 +1658,17 @@ fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The remote command that claims request `id` for this pump: `mkdir` is
+/// atomic, so of several pumps exactly one succeeds.
+fn claim_command(inbox_dir: &str, id: &str) -> String {
+    let claims = format!("{inbox_dir}/.claims");
+    format!(
+        "mkdir -p {} && mkdir {}",
+        shell_quote(&claims),
+        shell_quote(&format!("{claims}/{id}"))
+    )
 }
 
 /// Hand `url` to the local platform opener (`open` on macOS, `xdg-open` on
@@ -4192,6 +4260,32 @@ Host !blocked *.internal
         assert!(
             ensure_call < cargo_install,
             "the C toolchain must be ensured before `cargo install` runs"
+        );
+    }
+
+    #[test]
+    fn a_relay_request_is_claimed_by_exactly_one_pump() {
+        // `mkdir` without -p on the id: the second pump's mkdir fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox").display().to_string();
+        let run = |cmd: String| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(run(claim_command(&inbox, "open-1-2")));
+        assert!(
+            !run(claim_command(&inbox, "open-1-2")),
+            "a second claim loses"
+        );
+        assert!(run(claim_command(&inbox, "open-1-3")));
+        assert_eq!(
+            super::parse_relay_request("open\topen-1\thttps://x/")
+                .and_then(|r| r.id().map(str::to_string)),
+            Some(String::from("open-1"))
         );
     }
 
