@@ -81,9 +81,13 @@ pub struct MarkdownPreview {
 
 impl MarkdownPreview {
     /// The visual row showing `source_line`, when the map covers it.
+    ///
+    /// Interpolated in visual ROWS, not built lines: a wrapped paragraph is
+    /// one built line however many source lines and rows it spans, so
+    /// interpolating built lines landed past it, and past the last anchor
+    /// read a built line number as a row. Clamped to the last line's row.
     pub fn row_for_source_line(&self, source_line: usize) -> Option<usize> {
-        let built = built_line_for_source(&self.source_map, source_line)?;
-        Some(self.row_of_line.get(built).copied().unwrap_or(built))
+        row_for_source(&self.source_map, &self.row_of_line, source_line)
     }
 
     /// The source line under the preview's top row, when the map covers it.
@@ -119,6 +123,22 @@ fn interpolate(map: &[(usize, usize)], x: usize, forward: bool) -> Option<usize>
     }
     let out_span = val(hi).saturating_sub(val(lo));
     Some(val(lo) + (x - key(lo)) * out_span / span)
+}
+
+/// The visual row showing `source_line`, given each built line's first row.
+fn row_for_source(
+    map: &[(usize, usize)],
+    row_of_line: &[usize],
+    source_line: usize,
+) -> Option<usize> {
+    let Some(&last) = row_of_line.last() else {
+        return built_line_for_source(map, source_line);
+    };
+    let rows: SourceMap = map
+        .iter()
+        .map(|&(src, built)| (src, row_of_line.get(built).copied().unwrap_or(last)))
+        .collect();
+    Some(interpolate(&rows, source_line, true)?.min(last))
 }
 
 /// `(source line, built line)` anchors, one per block start (#619).
@@ -1479,6 +1499,18 @@ impl MarkdownPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_sync_interpolates_rows_through_a_wrapped_paragraph() {
+        let rows = [0, 40, 41];
+        let mid = row_for_source(&[(0, 0), (11, 2)], &rows, 6).unwrap();
+        assert!(mid < 40, "inside the paragraph, got {mid}");
+        assert_eq!(
+            row_for_source(&[(0, 0), (2, 2)], &rows, 7),
+            Some(41),
+            "past the end clamps"
+        );
+    }
 
     fn line_text(l: &Line) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()
