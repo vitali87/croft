@@ -304,6 +304,18 @@ pub enum CliCommand {
         #[arg(long = "as")]
         as_ext: Option<String>,
     },
+    /// Serve this workspace's session to a browser over WebSocket (#341).
+    ///
+    /// Each WebSocket connection is one participant of the running session
+    /// (`croft attach` starts it). Loopback only; the printed URL carries a
+    /// per-run token every connection must present.
+    Web {
+        /// Workspace whose session to serve (default: the current directory).
+        workspace: Option<PathBuf>,
+        /// Address to listen on (default 127.0.0.1:7681). Loopback only.
+        #[arg(long)]
+        bind: Option<std::net::SocketAddr>,
+    },
     /// Open a file for editing in the croft that hosts this pane (#620).
     ///
     /// Like `croft view`, plus `--wait`: return only once the tab is
@@ -569,6 +581,17 @@ impl Cli {
                     crate::view_ipc::run(&path, as_ext.as_deref(), &crate::app::croft_cache_dir())
                 {
                     eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            Some(CliCommand::Web { workspace, bind }) => {
+                let workspace = match workspace {
+                    Some(w) => w,
+                    None => std::env::current_dir()?,
+                };
+                if let Err(e) = crate::web::run(&workspace, bind) {
+                    eprintln!("croft web: {e:#}");
                     std::process::exit(1);
                 }
                 Ok(())
@@ -1904,6 +1927,26 @@ mod tests {
         let (root, open, _) = resolve_workspace(&file, Some(other.clone())).unwrap();
         assert_eq!(root, dir.path().canonicalize().unwrap());
         assert_eq!(open, Some(other));
+    }
+
+    #[test]
+    fn parses_web_with_and_without_a_bind() {
+        let cli = Cli::try_parse_from(["croft", "web"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Web {
+                workspace: None,
+                bind: None
+            })
+        ));
+        let cli = Cli::try_parse_from(["croft", "web", "/w", "--bind", "127.0.0.1:9000"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Web { workspace, bind }) => {
+                assert_eq!(workspace.as_deref(), Some(std::path::Path::new("/w")));
+                assert_eq!(bind, Some("127.0.0.1:9000".parse().unwrap()));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
