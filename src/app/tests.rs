@@ -30658,6 +30658,24 @@ fn copy_mode_keys_follow_content_that_streamed_between_presses() {
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
+    // The pane runs a real shell whose prompt arrives on its own schedule:
+    // under load it landed between the fed rows and the key press and moved
+    // the selection. Wait for the shell's output to settle first.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last = app.terminals[0].grid_lines().0;
+    let mut quiet_since = std::time::Instant::now();
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now = app.terminals[0].grid_lines().0;
+        if now != last {
+            last = now;
+            quiet_since = std::time::Instant::now();
+        } else if last.iter().any(|l| !l.trim().is_empty())
+            && quiet_since.elapsed() > std::time::Duration::from_millis(300)
+        {
+            break;
+        }
+    }
     let mut fill = String::new();
     for i in 0..40 {
         fill.push_str(&format!("row-{i}\r\n"));
