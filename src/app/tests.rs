@@ -43170,6 +43170,66 @@ fn a_symbol_tab_minimap_draws_and_maps_only_its_symbol() {
     );
 }
 
+/// #369: a documented symbol starts on its doc comment in the LSP outline
+/// and on its item in the tree-sitter one; opened from both it gets one tab.
+#[test]
+fn a_documented_symbol_opened_from_both_outlines_gets_one_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.rs");
+    std::fs::write(&file, "/// doc\nfn foo() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("foo".into(), 1, 1);
+    app.editor.select(0);
+    app.open_symbol_tab_for("foo".into(), 0, 1);
+    let tabs = app
+        .editor
+        .editors
+        .iter()
+        .filter(|e| e.symbol_view.is_some())
+        .count();
+    assert_eq!(tabs, 1);
+}
+
+/// #369: switching between two symbol tabs of the same length repaints the
+/// minimap (their other layout fields agree), and its viewport and
+/// selection count from the symbol's first line.
+#[test]
+fn switching_between_same_length_symbol_tabs_repaints_the_minimap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cell_pixel = Some((8, 16));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("a".into(), 0, 2);
+    app.editor.select(0);
+    app.open_symbol_tab_for("b".into(), 3, 5);
+    let tab = |app: &App, name: &str| {
+        app.editor
+            .editors
+            .iter()
+            .position(|e| e.symbol_view.as_ref().is_some_and(|v| v.name == name))
+            .unwrap()
+    };
+    let (a, b) = (tab(&app, "a"), tab(&app, "b"));
+    let strip = Rect::new(100, 1, 6, 20);
+    app.editor.select(a);
+    app.update_minimap_overlay(strip);
+    assert_eq!(app.minimap_base.as_ref().map(|m| m.sig.5), Some((0, 3)));
+    app.editor.select(b);
+    app.update_minimap_overlay(strip);
+    assert_eq!(app.minimap_base.as_ref().map(|m| m.sig.5), Some((3, 6)));
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 0),
+        head: (4, 2),
+    });
+    app.update_minimap_overlay(strip);
+    let layout = app.overlays.minimap.layout().expect("laid out");
+    assert_eq!((layout.top, layout.selection), (0, Some((0, 1))));
+}
+
 /// #369: a symbol tab is a tab of its own that shows only its symbol.
 ///
 /// Opened beside the file's tab, titled by the symbol, holding the whole

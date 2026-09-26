@@ -364,38 +364,45 @@ pub enum ViewUpdate {
     Gone,
 }
 
-/// The tree-sitter identity (name, kind, depth) of the symbol a picker
-/// names `name` on lines `first..=last` of `text`: what tells two tabs
-/// apart when the pickers spell one symbol differently (an LSP outline's
-/// `impl Foo` is tree-sitter's `Foo`). `None` without a grammar or match.
+/// A symbol as the tree-sitter outline knows it: name, kind, depth, and
+/// the line its item starts on (after any doc comments or attributes).
+pub type SyntaxIdentity = (String, crate::lsp::manager::OutlineKind, u16, usize);
+
+/// The tree-sitter identity of the symbol a picker names `name` on lines
+/// `first..=last` of `text`: what tells two tabs apart when the pickers
+/// spell one symbol differently (an LSP outline's `impl Foo` is
+/// tree-sitter's `Foo`) or start it on different lines (an LSP range
+/// includes doc comments). `None` without a grammar or match.
 pub fn syntax_identity(
     text: &str,
     kind: Option<crate::highlight::LangKind>,
     name: &str,
     first: usize,
     last: usize,
-) -> Option<(String, crate::lsp::manager::OutlineKind, u16)> {
+) -> Option<SyntaxIdentity> {
     let symbols = crate::outline_syntax::symbols_for(kind?, text.as_bytes());
-    syntax_symbol_heading(&symbols, name, first, last).map(|s| (s.name.clone(), s.kind, s.depth))
+    syntax_symbol_heading(&symbols, name, first, last)
+        .map(|s| (s.name.clone(), s.kind, s.depth, s.range_start_line as usize))
 }
 
 impl SymbolView {
     /// Whether this tab shows the symbol a picker names `name` starting on
-    /// line `first`, whose tree-sitter identity is `identity`. Compared by
-    /// identity when both sides have one, else by the picker's spelling.
-    pub fn shows(
-        &self,
-        name: &str,
-        first: usize,
-        identity: Option<&(String, crate::lsp::manager::OutlineKind, u16)>,
-    ) -> bool {
-        if self.first != first {
-            return false;
-        }
+    /// line `first`, whose tree-sitter identity is `identity`. With an
+    /// identity on both sides they are compared by it, item line included,
+    /// so the pickers' spellings and first lines do not matter; else by
+    /// first line and spelling.
+    pub fn shows(&self, name: &str, first: usize, identity: Option<&SyntaxIdentity>) -> bool {
         match (&self.syntax_name, self.syntax_shape, identity) {
-            (Some(n), Some((k, d)), Some((on, ok, od))) => n == on && k == *ok && d == *od,
-            _ => self.name == name,
+            (Some(n), Some((k, d)), Some((on, ok, od, oline))) => {
+                n == on && k == *ok && d == *od && self.head_line() == *oline
+            }
+            _ => self.first == first && self.name == name,
         }
+    }
+
+    /// The line the tree-sitter item starts on (see `head_at`).
+    fn head_line(&self) -> usize {
+        lines_of(&self.text, SymbolRange::new(self.head_at, self.head_at)).0
     }
 
     pub fn new(

@@ -4269,6 +4269,11 @@ pub struct MinimapLayout {
     bg: (u8, u8, u8),
     /// Active selection `(start_row, end_row)`; a change recomposites the band.
     selection: Option<(usize, usize)>,
+    /// Which document and which of its lines the strip draws: a hash of
+    /// the path (no per-frame allocation) and the drawn span, so switching
+    /// between two tabs whose other fields agree (two same-length symbol
+    /// tabs, #369, or two same-length files) still re-emits.
+    doc: (u64, (usize, usize)),
 }
 
 /// One socket-poll result. `hits` is the pane-subtree scan that decides what to
@@ -28041,9 +28046,11 @@ impl App {
 
     /// Open lines `first..=last` of the active file as a symbol tab named
     /// `name`, placed after the active tab, or focus the symbol tab already
-    /// showing that symbol: same first line and tree-sitter identity (two
-    /// symbols can start on one line, and pickers spell some differently). The new tab starts from the live buffer, unsaved
-    /// edits included, and keeps the caret if it sits inside the symbol.
+    /// showing that symbol, matched by its tree-sitter identity: two
+    /// symbols can start on one line, and pickers spell some symbols and
+    /// their first lines differently. The new tab starts from the live
+    /// buffer, unsaved edits included, and keeps the caret if it sits
+    /// inside the symbol.
     pub(crate) fn open_symbol_tab_for(&mut self, name: String, first: usize, last: usize) {
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Save this buffer before opening a symbol from it");
@@ -47441,12 +47448,18 @@ impl App {
         let rows = self.editor.visible_rows();
         let total = end - first;
         let edit_seq = self.editor.edit_seq;
-        let selection = self.editor.selection_rows().map(|(s, e)| {
-            (
-                s.clamp(first, end - 1) - first,
-                e.clamp(first, end - 1) - first,
-            )
-        });
+        // A selection is only drawn where it meets the drawn lines.
+        let selection = self
+            .editor
+            .selection_rows()
+            .filter(|&(s, e)| s < end && e >= first)
+            .map(|(s, e)| (s.max(first) - first, e.min(end - 1) - first));
+        let doc = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.editor.path.hash(&mut h);
+            (h.finish(), span)
+        };
         let desired = MinimapLayout {
             cell_x: strip.x,
             cell_y: strip.y,
@@ -47459,6 +47472,7 @@ impl App {
             side: self.minimap_side,
             bg,
             selection,
+            doc,
         };
         if self.overlays.minimap.layout_matches(&desired) {
             return;
