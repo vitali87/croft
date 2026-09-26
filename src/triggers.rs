@@ -388,11 +388,6 @@ pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
     out
 }
 
-/// `text` with every redact-trigger match replaced by [`MASK`] runs of the
-/// same char length, line by line. `copy_only` restricts the masking to
-/// rules marked `"copy": "masked"` (the clipboard path); `false` masks
-/// everything (the scrollback dump, and anything else that leaves the
-/// pane as bytes). Returns the input untouched when nothing matches.
 /// [`mask_text`] over terminal rows, where `wraps[i]` says row `i`
 /// soft-wraps into row `i + 1`. Wrapped rows are masked as the one logical
 /// line they are, then split back, so a token the wrap cut in two (a JWT is
@@ -419,6 +414,11 @@ pub fn mask_rows(rows: &[String], wraps: &[bool], set: &TriggerSet) -> Vec<Strin
     out
 }
 
+/// `text` with every redact-trigger match replaced by [`MASK`] runs of the
+/// same char length, line by line. `copy_only` restricts the masking to
+/// rules marked `"copy": "masked"` (the clipboard path); `false` masks
+/// everything (the scrollback dump, and anything else that leaves the
+/// pane as bytes). Returns the input untouched when nothing matches.
 pub fn mask_text(text: &str, set: &TriggerSet, copy_only: bool) -> String {
     if !set.has_redactions() {
         return text.to_string();

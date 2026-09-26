@@ -4058,25 +4058,6 @@ impl Drop for PtyTerminal {
     }
 }
 
-/// Walk the visible grid from (sr, sc) to (er, ec) inclusive, joining
-/// cell contents row-by-row, trimming trailing whitespace per row, and
-/// inserting `\n` between rows. Coordinates are viewport-relative;
-/// `display_offset` is the alacritty grid's current scrollback offset
-/// (number of rows the viewport has been scrolled back from the live
-/// bottom). The grid line we read is `row - display_offset`, which is
-/// negative when the user has scrolled into history — alacritty's
-/// `Grid::index<Point>` accepts those negative `Line` values and
-/// returns the scrollback cell, so the extracted text matches exactly
-/// what the user sees highlighted on screen. Without the subtraction
-/// the function silently re-reads the live grid at the viewport row,
-/// which is a different cell entirely once `display_offset > 0` and
-/// the user gets the wrong line on the clipboard.
-/// One grid row as text plus a char-index → grid-column map. A wide char
-/// (CJK, emoji) occupies two grid columns — the `WIDE_CHAR` cell and a
-/// spacer cell — so the spacers are skipped, making the text read
-/// contiguously (`"日本語"`, never `"日 本 語"`). `cols[i]` is the grid
-/// column the i-th char starts at, so highlight painters can map a match's
-/// char range back onto grid cells.
 /// The logical line grid row `line_idx` belongs to (its soft-wrapped
 /// neighbours joined, at most 64 rows either way) and the char offset of
 /// that row's text within it, both in `row_text_and_cols` terms.
@@ -4114,6 +4095,25 @@ pub fn row_wraps(term: &Term<VoidListener>, line_idx: i32) -> bool {
             .contains(Flags::WRAPLINE)
 }
 
+/// Walk the visible grid from (sr, sc) to (er, ec) inclusive, joining
+/// cell contents row-by-row, trimming trailing whitespace per row, and
+/// inserting `\n` between rows. Coordinates are viewport-relative;
+/// `display_offset` is the alacritty grid's current scrollback offset
+/// (number of rows the viewport has been scrolled back from the live
+/// bottom). The grid line we read is `row - display_offset`, which is
+/// negative when the user has scrolled into history — alacritty's
+/// `Grid::index<Point>` accepts those negative `Line` values and
+/// returns the scrollback cell, so the extracted text matches exactly
+/// what the user sees highlighted on screen. Without the subtraction
+/// the function silently re-reads the live grid at the viewport row,
+/// which is a different cell entirely once `display_offset > 0` and
+/// the user gets the wrong line on the clipboard.
+/// One grid row as text plus a char-index → grid-column map. A wide char
+/// (CJK, emoji) occupies two grid columns — the `WIDE_CHAR` cell and a
+/// spacer cell — so the spacers are skipped, making the text read
+/// contiguously (`"日本語"`, never `"日 本 語"`). `cols[i]` is the grid
+/// column the i-th char starts at, so highlight painters can map a match's
+/// char range back onto grid cells.
 pub fn row_text_and_cols(term: &Term<VoidListener>, line_idx: i32) -> (String, Vec<usize>) {
     let ncols = term.columns();
     let mut s = String::with_capacity(ncols);
