@@ -3486,11 +3486,20 @@ impl Editor {
     /// (called from [`push_undo`](Self::push_undo), which every user edit
     /// passes through before it mutates). A no-op when the file has no marks
     /// or the shadow already belongs to this file.
+    /// Whether `path` has any line-keyed breakpoint state to carry through
+    /// edits (see [`Self::sync_bookmarks_to_buffer`]).
+    fn has_breakpoints_in(&self, path: &Path) -> bool {
+        self.breakpoints.contains_key(path)
+            || self.breakpoint_conditions.contains_key(path)
+            || self.breakpoint_logs.contains_key(path)
+            || self.breakpoint_hit_conditions.contains_key(path)
+    }
+
     fn seed_bookmark_shadow(&mut self) {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        if !self.bookmarks.contains_key(path)
+        if !(self.bookmarks.contains_key(path) || self.has_breakpoints_in(path))
             || self
                 .bookmark_shadow
                 .as_ref()
@@ -3518,25 +3527,66 @@ impl Editor {
             self.bookmark_shadow = None;
             return;
         };
-        let Some(set) = self.bookmarks.get_mut(&path) else {
+        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
             self.bookmark_shadow = None;
             return;
-        };
+        }
+        let len = self.lines.len();
         let mut shadow = match self.bookmark_shadow.take() {
             Some((shadow_path, old)) if shadow_path == path => {
-                if old.len() != self.lines.len() {
-                    *set = shift_bookmark_lines(set, &old, &self.lines);
-                } else {
-                    *set = follow_moved_bookmark_lines(set, &old, &self.lines);
+                let map = line_mapper(&old, &self.lines);
+                if let Some(set) = self.bookmarks.get_mut(&path) {
+                    *set = set.iter().filter_map(|&l| map(l)).collect();
                 }
+                // Breakpoints follow the same edits: they were plain line
+                // numbers, so an Enter above one left it on the line that
+                // moved into its place, and the debugger stopped there.
+                if let Some(set) = self.breakpoints.get_mut(&path) {
+                    *set = set.iter().filter_map(|&l| map(l)).collect();
+                }
+                for per_line in [
+                    &mut self.breakpoint_conditions,
+                    &mut self.breakpoint_logs,
+                    &mut self.breakpoint_hit_conditions,
+                ] {
+                    if let Some(m) = per_line.get_mut(&path) {
+                        *m = std::mem::take(m)
+                            .into_iter()
+                            .filter_map(|(l, v)| map(l).map(|n| (n, v)))
+                            .collect();
+                    }
+                }
+                drop(map);
                 old
             }
             _ => Vec::new(),
         };
-        let len = self.lines.len();
-        set.retain(|&l| (1..=len).contains(&l));
-        if set.is_empty() {
-            self.bookmarks.remove(&path);
+        let in_range = |l: &usize| (1..=len).contains(l);
+        if let Some(set) = self.bookmarks.get_mut(&path) {
+            set.retain(in_range);
+            if set.is_empty() {
+                self.bookmarks.remove(&path);
+            }
+        }
+        if let Some(set) = self.breakpoints.get_mut(&path) {
+            set.retain(in_range);
+            if set.is_empty() {
+                self.breakpoints.remove(&path);
+            }
+        }
+        for per_line in [
+            &mut self.breakpoint_conditions,
+            &mut self.breakpoint_logs,
+            &mut self.breakpoint_hit_conditions,
+        ] {
+            if let Some(m) = per_line.get_mut(&path) {
+                m.retain(|l, _| in_range(l));
+                if m.is_empty() {
+                    per_line.remove(&path);
+                }
+            }
+        }
+        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
             return;
         }
         // Bring the shadow up to date in place rather than cloning the whole
@@ -12327,11 +12377,41 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 /// otherwise collapses onto the run's last new line (the join line a
 /// backspace or a partial-line selection delete leaves behind); a mark on a
 /// line deleted outright is dropped.
+#[cfg_attr(not(test), allow(dead_code))]
 fn shift_bookmark_lines(
     marks: &std::collections::BTreeSet<usize>,
     old: &[String],
     new: &[String],
 ) -> std::collections::BTreeSet<usize> {
+    let map = shift_line_mapper(old, new);
+    marks.iter().filter_map(|&line| map(line)).collect()
+}
+
+/// Where each 1-based line of `old` lands in `new` after an edit, for any
+/// line-keyed marks (bookmarks, breakpoints): through [`shift_bookmark_lines`]'s
+/// diff when the line count changed, through [`follow_moved_bookmark_lines`]'s
+/// move tracking when it did not. None for a line deleted outright.
+fn line_mapper<'a>(
+    old: &'a [String],
+    new: &'a [String],
+) -> Box<dyn Fn(usize) -> Option<usize> + 'a> {
+    if old.len() != new.len() {
+        shift_line_mapper(old, new)
+    } else {
+        Box::new(move |line| {
+            let one = std::collections::BTreeSet::from([line]);
+            follow_moved_bookmark_lines(&one, old, new)
+                .into_iter()
+                .next()
+        })
+    }
+}
+
+/// The line mapping behind [`shift_bookmark_lines`].
+fn shift_line_mapper<'a>(
+    old: &'a [String],
+    new: &'a [String],
+) -> Box<dyn Fn(usize) -> Option<usize> + 'a> {
     use similar::DiffOp;
     let common = old.len().min(new.len());
     let prefix = old
@@ -12358,7 +12438,7 @@ fn shift_bookmark_lines(
         &new[prefix..new_end],
         Some(deadline),
     );
-    let map_middle = |row: usize| -> Option<usize> {
+    let map_middle = move |row: usize| -> Option<usize> {
         let r = row - prefix;
         for op in &ops {
             match *op {
@@ -12385,20 +12465,17 @@ fn shift_bookmark_lines(
         }
         None
     };
-    marks
-        .iter()
-        .filter_map(|&line| {
-            let row = line.checked_sub(1)?;
-            let mapped = if row < prefix {
-                row
-            } else if row >= old_end {
-                row - old_end + new_end
-            } else {
-                map_middle(row)?
-            };
-            Some(mapped + 1)
-        })
-        .collect()
+    Box::new(move |line: usize| {
+        let row = line.checked_sub(1)?;
+        let mapped = if row < prefix {
+            row
+        } else if row >= old_end {
+            row - old_end + new_end
+        } else {
+            map_middle(row)?
+        };
+        Some(mapped + 1)
+    })
 }
 
 /// Marks after an edit that kept the line count: a marked line whose text
@@ -17336,6 +17413,42 @@ mod tests {
         e.cursor_col = 0;
         e.insert_char('x');
         assert_eq!(e.bookmarked_lines(), vec![4]);
+    }
+
+    #[test]
+    fn breakpoints_and_their_conditions_follow_edits_like_bookmarks() {
+        let (mut e, _tmp) = bookmark_editor(10);
+        let f = e.path.clone().unwrap();
+        e.toggle_breakpoint_line(4);
+        e.breakpoint_conditions
+            .entry(f.clone())
+            .or_default()
+            .insert(4, String::from("x > 1"));
+        // Enter at the very top pushes every line down one.
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.insert_newline();
+        assert_eq!(e.breakpoint_lines(&f), vec![5]);
+        assert_eq!(
+            e.breakpoint_conditions[&f].get(&5).map(String::as_str),
+            Some("x > 1")
+        );
+        // Moving the line carries its breakpoint along.
+        e.cursor_row = 4;
+        e.move_lines_down();
+        assert_eq!(e.breakpoint_lines(&f), vec![6]);
+        // Deleting the line drops it rather than leaving it on a neighbour.
+        e.cursor_row = 5;
+        e.selection = Some(EditorSelection {
+            anchor: (5, 0),
+            head: (6, 0),
+        });
+        e.backspace();
+        assert!(
+            e.breakpoint_lines(&f).is_empty(),
+            "{:?}",
+            e.breakpoint_lines(&f)
+        );
     }
 
     #[test]

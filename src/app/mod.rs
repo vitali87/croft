@@ -46121,6 +46121,26 @@ impl App {
         described: Option<Vec<u8>>,
     ) {
         self.spawn_history_record(path, seats, described, false);
+        // Every save passes through here: breakpoints that followed edits in
+        // the buffer are handed to running sessions now that the file on disk
+        // has the same lines, or they stay bound to the old line numbers.
+        self.resend_breakpoints(path);
+    }
+
+    /// Send `path`'s current breakpoints to every debug session.
+    fn resend_breakpoints(&mut self, path: &Path) {
+        if self.debug_sessions.is_empty() {
+            return;
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(path)
+            .map(|lines| self.editor.source_breakpoints(path, lines))
+            .unwrap_or_default();
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(path, &specs);
+        }
     }
 
     /// [`Self::record_history_snapshot_of`] as a kept snapshot (a restore).
