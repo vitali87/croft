@@ -629,6 +629,30 @@ pub fn parse_variables(variables_response: &Value) -> Vec<Variable> {
         .unwrap_or_default()
 }
 
+/// Apply `breakpoint` event reports to the unverified-line map, one line at
+/// a time, returning `true` if anything changed. An event carries a single
+/// breakpoint, unlike a `setBreakpoints` response, so it must not replace
+/// its file's set: every other unverified line there would be dropped and
+/// drawn as verified. Pure.
+pub fn update_breakpoint_lines(
+    map: &mut BTreeMap<PathBuf, std::collections::BTreeSet<usize>>,
+    reports: &[BreakpointReport],
+) -> bool {
+    let mut changed = false;
+    for r in reports {
+        let set = map.entry(r.path.clone()).or_default();
+        changed |= if r.verified {
+            set.remove(&r.line)
+        } else {
+            set.insert(r.line)
+        };
+        if set.is_empty() {
+            map.remove(&r.path);
+        }
+    }
+    changed
+}
+
 /// Fold breakpoint reports into a per-path unverified-line map, returning `true`
 /// if anything changed. Each reported path's unverified set is replaced
 /// wholesale (a `setBreakpoints` response describes that file's full set); a path
@@ -1061,8 +1085,10 @@ impl DapSession {
     /// the change takes effect mid-session (debugpy accepts it at any time).
     pub fn set_exception_filters(&mut self, filters: Vec<String>) {
         self.exception_filters = filters;
+        // The active connection: for js-debug that is the child session,
+        // where the debuggee runs; the parent ignores exception filters.
         let _ = self
-            .transport
+            .active()
             .send(set_exception_breakpoints_request(&self.exception_filters));
     }
 
@@ -1300,7 +1326,7 @@ impl DapSession {
         if msg.get("event").and_then(Value::as_str) == Some("breakpoint") {
             if self.js_server.is_none() {
                 let reports = breakpoint_reports(&msg);
-                if self.apply_breakpoint_reports(&reports) {
+                if update_breakpoint_lines(&mut self.unverified_breakpoints, &reports) {
                     out.push(DapEvent::BreakpointsUpdated);
                 }
             }
@@ -1988,6 +2014,30 @@ mod tests {
                 { "verified": true, "line": 0, "source": { "path": "/c.py" } } ]}
         });
         assert!(breakpoint_reports(&unresolved).is_empty());
+    }
+
+    #[test]
+    fn a_breakpoint_event_updates_only_its_own_line() {
+        let p = PathBuf::from("/a.py");
+        let report = |line, verified| BreakpointReport {
+            path: p.clone(),
+            line,
+            verified,
+        };
+        let mut map = BTreeMap::new();
+        fold_breakpoint_reports(&mut map, &[report(3, false), report(7, false)]);
+        // Line 3 verifies: line 7 stays unverified.
+        assert!(update_breakpoint_lines(&mut map, &[report(3, true)]));
+        assert_eq!(map[&p], [7].into_iter().collect());
+        // A new unverified line joins the set rather than replacing it.
+        assert!(update_breakpoint_lines(&mut map, &[report(9, false)]));
+        assert_eq!(map[&p], [7, 9].into_iter().collect());
+        assert!(!update_breakpoint_lines(&mut map, &[report(9, false)]));
+        update_breakpoint_lines(&mut map, &[report(7, true), report(9, true)]);
+        assert!(!map.contains_key(&p), "an empty set is dropped");
+        // Verifying a line never tracked changes nothing and adds no entry.
+        assert!(!update_breakpoint_lines(&mut map, &[report(1, true)]));
+        assert!(map.is_empty());
     }
 
     #[test]

@@ -2383,6 +2383,9 @@ struct SnippetSession {
     anchor: (usize, usize),
     /// Placeholder length (chars) of the current stop, selected on landing.
     cur_len: usize,
+    /// The placeholder's text on landing, to tell an edit from a plain Tab
+    /// when the replacement happens to be the same length.
+    cur_text: String,
     /// Remaining stops to visit, in order: `(row, col, placeholder_len)`.
     stops: std::collections::VecDeque<(usize, usize, usize)>,
 }
@@ -6752,6 +6755,7 @@ impl Editor {
             self.snippet = Some(SnippetSession {
                 anchor: (first.0, first.1),
                 cur_len: first.2,
+                cur_text: self.span_text(first.0, first.1, first.2),
                 stops: abs,
             });
         }
@@ -6770,14 +6774,19 @@ impl Editor {
         if self.cursor_row == sess.anchor.0 {
             let typed = self.cursor_col as isize - sess.anchor.1 as isize;
             let shift = typed - sess.cur_len as isize;
-            if shift != 0 {
-                let after = sess.anchor.1 + sess.cur_len;
+            let now = self.span_text(sess.anchor.0, sess.anchor.1, typed.max(0) as usize);
+            if now != sess.cur_text {
                 // Stops nested inside the placeholder just replaced
                 // (`${1:foo(${2:x})}`) name text that is gone: drop them, or
-                // the next Tab selects whatever now sits at their offset.
+                // the next Tab selects whatever now sits at their offset,
+                // a same-length replacement included.
+                let after = sess.anchor.1 + sess.cur_len;
                 let anchor = sess.anchor;
                 sess.stops
                     .retain(|s| !(s.0 == anchor.0 && s.1 >= anchor.1 && s.1 < after));
+            }
+            if shift != 0 {
+                let after = sess.anchor.1 + sess.cur_len;
                 for s in sess.stops.iter_mut() {
                     if s.0 == sess.anchor.0 && s.1 >= after {
                         s.1 = (s.1 as isize + shift).max(0) as usize;
@@ -6792,9 +6801,18 @@ impl Editor {
         if !sess.stops.is_empty() {
             sess.anchor = (next.0, next.1);
             sess.cur_len = next.2;
+            sess.cur_text = self.span_text(next.0, next.1, next.2);
             self.snippet = Some(sess);
         }
         true
+    }
+
+    /// `len` chars of row `row` from char column `col`, clamped to the line.
+    fn span_text(&self, row: usize, col: usize, len: usize) -> String {
+        self.lines
+            .get(row)
+            .map(|l| l.chars().skip(col).take(len).collect())
+            .unwrap_or_default()
     }
 
     /// Move the caret to a resolved tab stop, selecting its placeholder text so
@@ -15027,8 +15045,21 @@ impl EditorTabs {
     /// path so subsequent saves and the tab label track the new name.
     pub fn rename_open_path(&mut self, old: &Path, new: &Path) {
         for e in &mut self.editors {
-            if e.path.as_deref() == Some(old) {
-                e.path = Some(new.to_path_buf());
+            // Under a moved folder too: a tab of `dir/a.rs` follows `dir` to
+            // its new place, or its next save recreates the old path.
+            let moved = e
+                .path
+                .as_deref()
+                .and_then(|p| p.strip_prefix(old).ok())
+                .map(|rest| {
+                    if rest.as_os_str().is_empty() {
+                        new.to_path_buf()
+                    } else {
+                        new.join(rest)
+                    }
+                });
+            if let Some(moved) = moved {
+                e.path = Some(moved);
                 // Re-anchor the disk stamp to the new path so the rename
                 // isn't mistaken for an external content change on the next
                 // FS-sync sweep.
@@ -15049,6 +15080,25 @@ impl EditorTabs {
         self.editors[self.active].focused = false;
         self.active = pos;
         Ok(())
+    }
+
+    /// Insert a pinned tab for `path` without reading it (None: untitled),
+    /// reusing the blank initial tab. The caller fills the buffer: this is
+    /// for text whose only copy is in memory, like a session handoff's
+    /// unsaved edits to a file that can no longer be opened.
+    pub fn open_unreadable_tab(&mut self, path: Option<PathBuf>) -> &mut Editor {
+        if !self.is_blank_initial() {
+            let mut e = Editor::new();
+            e.focused = self.editors[self.active].focused;
+            let pos = self.active + 1;
+            self.editors.insert(pos, e);
+            self.editors[self.active].focused = false;
+            self.active = pos;
+        }
+        let e = &mut self.editors[self.active];
+        e.path = path;
+        e.preview = false;
+        e
     }
 
     /// Test-only / disk-less helper: insert a tab whose path is set but
@@ -16289,6 +16339,17 @@ mod tests {
             "z",
             "the nested $2 went with its placeholder"
         );
+        // A same-length replacement is still a replacement.
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        e.insert_str("barbaz");
+        assert!(e.snippet_next());
+        assert_eq!(e.selection_text(), "z");
+        // A plain Tab through an untouched placeholder keeps the nested stop.
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        assert!(e.snippet_next());
+        assert_eq!(e.selection_text(), "x");
     }
 
     /// On-type formatting (#254) keys off real keystrokes only: the typed

@@ -20526,8 +20526,8 @@ fn session_state_round_trip_reopens_tabs_at_saved_cursor_and_active() {
     let state = app.capture_session_state();
     assert_eq!(state.tabs.len(), 2);
     assert_eq!(
-        state.tabs[state.active_tab].path.as_path(),
-        file_a.as_path()
+        state.tabs[state.active_tab].path.as_deref(),
+        Some(file_a.as_path())
     );
 
     let mut restored = App::new(tmp.path().to_path_buf()).unwrap();
@@ -20559,7 +20559,11 @@ fn session_state_preserves_unsaved_buffer_contents() {
     app.editor.editors[idx].dirty = true;
 
     let state = app.capture_session_state();
-    let tab = state.tabs.iter().find(|t| t.path == file).unwrap();
+    let tab = state
+        .tabs
+        .iter()
+        .find(|t| t.path.as_ref() == Some(&file))
+        .unwrap();
     assert!(tab.dirty);
     assert_eq!(tab.unsaved_text.as_deref(), Some("edited unsaved"));
 
@@ -20575,6 +20579,42 @@ fn session_state_preserves_unsaved_buffer_contents() {
     assert_eq!(ed.lines, vec![String::from("edited unsaved")]);
     // On-disk file must be untouched by the capture/restore.
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "saved\n");
+}
+
+/// A self-update must not drop the only copy of unsaved text: neither an
+/// untitled buffer's nor that of a file deleted while the update ran.
+#[test]
+fn session_state_keeps_unsaved_untitled_and_unreadable_buffers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("gone.txt");
+    std::fs::write(&file, "saved\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.lines = vec![String::from("scratch notes")];
+    app.editor.dirty = true;
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.lines = vec![String::from("edited gone")];
+    app.editor.dirty = true;
+    let state = app.capture_session_state();
+    assert_eq!(state.tabs.len(), 2);
+    std::fs::remove_file(&file).unwrap();
+
+    let mut restored = App::new(tmp.path().to_path_buf()).unwrap();
+    restored.apply_session_state(&state);
+    let eds = &restored.editor.editors;
+    let untitled = eds.iter().find(|e| e.path.is_none()).unwrap();
+    assert!(untitled.dirty);
+    assert_eq!(untitled.lines, vec![String::from("scratch notes")]);
+    let gone = eds
+        .iter()
+        .find(|e| e.path.as_deref() == Some(file.as_path()))
+        .unwrap();
+    assert!(gone.dirty);
+    assert_eq!(gone.lines, vec![String::from("edited gone")]);
+    assert_eq!(eds.len(), 2, "the blank initial tab is reused");
+
+    // A blank untitled buffer is not carried.
+    let blank = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(blank.capture_session_state().tabs.is_empty());
 }
 
 #[test]
@@ -43952,7 +43992,7 @@ fn session_capture_keeps_a_symbol_tab_only_when_it_is_the_files_last_tab() {
     app.editor.dirty = true;
     let state = app.capture_session_state();
     assert_eq!(state.tabs.len(), 1);
-    assert_eq!(state.tabs[0].path, file);
+    assert_eq!(state.tabs[0].path.as_ref(), Some(&file));
     assert!(
         state.tabs[0]
             .unsaved_text
@@ -44199,7 +44239,7 @@ fn session_capture_keeps_one_tab_for_orphaned_symbol_tabs_of_a_file() {
     assert_eq!(app.editor.editors.len(), 2);
     let state = app.capture_session_state();
     assert_eq!(state.tabs.len(), 1);
-    assert_eq!(state.tabs[0].path, file);
+    assert_eq!(state.tabs[0].path.as_ref(), Some(&file));
 }
 
 /// #369: deleting a symbol tab's whole symbol closes the tab while a tab of
@@ -51208,6 +51248,35 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
         "{}",
         app.status
     );
+}
+
+#[test]
+fn moving_files_and_folders_carries_every_open_tab_along() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("dir")).unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    std::fs::write(root.join("a.txt"), "a").unwrap();
+    std::fs::write(root.join("dir/b.txt"), "b").unwrap();
+    std::fs::write(root.join("c.txt"), "c").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&root.join("a.txt")).unwrap();
+    app.editor.open_in_new_tab(&root.join("dir/b.txt")).unwrap();
+    app.editor.open_in_new_tab(&root.join("c.txt")).unwrap();
+    // c.txt is active; a.txt and dir/b.txt sit in background tabs.
+    assert!(app.apply_paste_or_drop(
+        &root.join("dest"),
+        &[root.join("a.txt"), root.join("dir")],
+        ExplorerClipMode::Cut
+    ));
+    let paths: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(paths.contains(&root.join("dest/a.txt")), "{paths:?}");
+    assert!(paths.contains(&root.join("dest/dir/b.txt")), "{paths:?}");
 }
 
 #[test]

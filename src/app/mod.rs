@@ -29773,17 +29773,20 @@ impl App {
             if ed.has_non_text_view() {
                 continue;
             }
-            let Some(path) = ed.path.clone() else {
+            // An untitled buffer has no file to reopen, so it is carried only
+            // for its unsaved text; a blank one would reappear as clutter.
+            if ed.path.is_none() && !ed.dirty {
                 continue;
-            };
+            }
+            let path = ed.path.clone();
             // A symbol tab is a view over its file's tab (#369): the file tab
             // carries the text, so only an orphaned symbol tab is kept, as a
             // plain file tab, to keep its unsaved edits.
-            if ed.symbol_view.is_some()
+            if let Some(path) = path.clone().filter(|_| ed.symbol_view.is_some())
                 && (self.editor.find_tab_with_path(&path).is_some()
-                    || tabs
-                        .iter()
-                        .any(|t: &crate::session_state::OpenTabState| t.path == path))
+                    || tabs.iter().any(|t: &crate::session_state::OpenTabState| {
+                        t.path.as_ref() == Some(&path)
+                    }))
             {
                 if idx == self.editor.active_index() {
                     active_path = Some(path);
@@ -29809,7 +29812,7 @@ impl App {
             });
         }
         if let Some(path) = active_path
-            && let Some(i) = tabs.iter().position(|t| t.path == path)
+            && let Some(i) = tabs.iter().position(|t| t.path.as_ref() == Some(&path))
         {
             active_tab = i;
         }
@@ -29826,20 +29829,30 @@ impl App {
 
     fn apply_session_state(&mut self, state: &crate::session_state::SessionState) {
         for tab in &state.tabs {
-            if self.editor.open_pinned(&tab.path).is_err() {
-                continue;
-            }
-            let Some(ed) = self
-                .editor
-                .editors
-                .iter_mut()
-                .find(|e| e.path.as_deref() == Some(tab.path.as_path()))
-            else {
+            let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
+            let opened = tab
+                .path
+                .as_deref()
+                .is_some_and(|p| self.editor.open_pinned(p).is_ok());
+            let ed = if opened {
+                let path = tab.path.as_deref();
+                self.editor
+                    .editors
+                    .iter_mut()
+                    .find(|e| e.path.as_deref() == path)
+            } else if unsaved.is_some() {
+                // An untitled buffer, or a file that can no longer be read
+                // (deleted, permissions changed while the update ran): the
+                // unsaved text is the only copy, so it comes back (below) as a
+                // dirty tab rather than being dropped.
+                Some(self.editor.open_unreadable_tab(tab.path.clone()))
+            } else {
+                None
+            };
+            let Some(ed) = ed else {
                 continue;
             };
-            if tab.dirty
-                && let Some(text) = &tab.unsaved_text
-            {
+            if let Some(text) = unsaved {
                 ed.lines = text.split('\n').map(str::to_string).collect();
                 if ed.lines.is_empty() {
                     ed.lines.push(String::new());
@@ -49402,7 +49415,9 @@ impl App {
             };
             match result {
                 Ok(p) => {
-                    if matches!(mode, ExplorerClipMode::Cut) && self.editor.matches_open_path(src) {
+                    // Every tab, not just the active one: a background tab of
+                    // a moved file kept the old path and recreated it on save.
+                    if matches!(mode, ExplorerClipMode::Cut) {
                         self.editor.rename_open_path(src, &p);
                         self.rename_review_boxes_path(src, &p);
                     }

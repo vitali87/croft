@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 /// One open editor tab, captured so a re-exec into a freshly-installed
 /// croft binary can reopen the file at the same cursor + scroll position.
 /// `unsaved_text` is `Some` only when the buffer is dirty, so an in-place
-/// update never silently drops uncommitted edits.
+/// update never silently drops uncommitted edits. `path` is `None` for an
+/// untitled buffer, which is carried only when it has unsaved text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenTabState {
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub scroll: usize,
@@ -81,7 +82,7 @@ mod tests {
             workspace_root: PathBuf::from("/work/repo"),
             tabs: vec![
                 OpenTabState {
-                    path: PathBuf::from("/work/repo/src/main.rs"),
+                    path: Some(PathBuf::from("/work/repo/src/main.rs")),
                     cursor_row: 12,
                     cursor_col: 4,
                     scroll: 3,
@@ -90,7 +91,7 @@ mod tests {
                     unsaved_text: None,
                 },
                 OpenTabState {
-                    path: PathBuf::from("/work/repo/README.md"),
+                    path: Some(PathBuf::from("/work/repo/README.md")),
                     cursor_row: 0,
                     cursor_col: 0,
                     scroll: 0,
