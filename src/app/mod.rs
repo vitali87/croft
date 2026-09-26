@@ -24311,19 +24311,19 @@ impl App {
     }
 
     /// Session: Detach from the palette (#679): disconnect the client that
-    /// asked, leaving the session running. The asker is taken to be the
-    /// current typist: the host announces a writer before its bytes reach
-    /// the PTY. That attribution is per loop iteration, not per key, so a
-    /// second holder typing in the same instant could be taken instead;
-    /// the chord has no such gap, because the host matches it in the
-    /// sender's own byte stream.
+    /// asked, leaving the session running. See [`detach_target`] for how
+    /// the asker is found, and why it is sometimes refused; the chord has
+    /// no such limit, because the host matches it in the sender's own
+    /// byte stream.
     fn detach_session_client(&mut self) {
         let Some(channel) = self.session_channel.as_mut() else {
             self.status = String::from(NOT_A_SESSION_TO_DETACH);
             return;
         };
-        let Some(id) = detach_target(self.session_typist, &self.session_participants) else {
-            self.status = String::from("No attached client to detach");
+        let Some(id) = detach_target(&self.session_participants) else {
+            self.status = String::from(
+                "Several participants can type here: press Cmd+K Shift+A in the window to detach",
+            );
             return;
         };
         if !channel.kick(id) {
@@ -48963,13 +48963,17 @@ fn takeover_mode_seq() -> Vec<u8> {
 /// Status for Session: Detach outside a persistent session (#679).
 const NOT_A_SESSION_TO_DETACH: &str = "Nothing to detach from: this is not a persistent session";
 
-/// Which client Session: Detach disconnects (#679): the one typing, else
-/// the only one attached (a host too old to announce typists).
-fn detach_target(typist: Option<u64>, roster: &[crate::session_host::Participant]) -> Option<u64> {
-    typist.or(match roster {
-        [only] => Some(only.id),
+/// Which client the palette's Session: Detach disconnects (#679): the
+/// sole write-control holder, else nobody. Only a holder's keys reach the
+/// app, so a sole holder pressed the Enter. The typist would not do: its
+/// attribution is drained per loop iteration and can lag the keys, so it
+/// may name another holder, or one who already left.
+fn detach_target(roster: &[crate::session_host::Participant]) -> Option<u64> {
+    let mut holders = roster.iter().filter(|p| p.control);
+    match (holders.next(), holders.next()) {
+        (Some(only), None) => Some(only.id),
         _ => None,
-    })
+    }
 }
 
 /// The inverse of [`takeover_mode_seq`]: the modes croft hands back when it
