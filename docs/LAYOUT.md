@@ -6,7 +6,7 @@ croft is a three pane workspace in the VS Code arrangement: an Explorer sidebar,
 
 ### Left pane (sidebar)
 
-Explorer with multi-select, cut / copy / paste, drag-and-drop moves, and VS Code style icons. Git-ignored files and folders render their names in dimmed grey (VS Code's ignored-resource decoration); a fully ignored folder dims along with everything under it, and the shading follows `.gitignore` edits via the same debounced refresh that feeds the status bar.
+Explorer with multi-select, cut / copy / paste, drag-and-drop moves, and VS Code style icons. Renaming or moving a file asks the language servers first, so imports that name it are updated to match (rust-analyzer, TypeScript and any server that supports `willRenameFiles`). Git-ignored files and folders render their names in dimmed grey (VS Code's ignored-resource decoration); a fully ignored folder dims along with everything under it, and the shading follows `.gitignore` edits via the same debounced refresh that feeds the status bar.
 
 A `⋯` "Views and More Actions" button on the EXPLORER title line toggles which sub-views stack in the panel, mirroring VS Code. The toggles persist across launches (Open Editors hidden by default, the rest shown):
 
@@ -144,6 +144,8 @@ The TERMINAL tab is your `$SHELL` on a real PTY, splittable into side-by-side pa
 * **Selections:** selections stay glued to their text through streaming output, through your scrolling, and even inside full-screen apps that scroll by repainting (Claude Code, pagers). There the highlight follows the app's own scrolling, keeps its surviving rows lit while the app's chrome covers the block's edge, hides only when the text is fully off the app's view (copy still yields the whole selection), and comes back with it. `Shift`+click extends a selection, and a drag held past the pane edge keeps selecting — through scrollback at a shell, or by scrolling the app itself when it owns the wheel.
 * **Jump to source:** Cmd/Ctrl+click on any printed `path:line` reference (a compiler error, test failure, grep hit, or traceback) jumps the editor straight there, with no problem-matcher config. The Command Palette's **Terminal: Search & Replace from Last grep/rg** turns the `grep`/`rg` you just ran in a pane into the Search sidebar's results, ready to replace across every match.
 
+
+**Command suggestions.** As you type at a prompt, the rest of the newest matching command from croft's history appears after the cursor in grey (preferring one that succeeded in the same folder); `Right` at the end of the line accepts it, as in fish. A shell that draws its own suggestions (fish, zsh-autosuggestions) is left alone, and **Terminal: Toggle Command Suggestions** turns croft's off.
 ## Source Control
 
 Source Control mirrors VS Code's git flow: stage, unstage, and discard per file or in bulk, commit / amend / push / pull / sync, branches, stashes, and tags, with clickable change rows opening a side-by-side diff against HEAD.
@@ -151,6 +153,16 @@ Source Control mirrors VS Code's git flow: stage, unstage, and discard per file 
 Inside that diff, single keys act on the change hunk under the cursor: `S` stages just that hunk, `U` unstages it, and `R` reverts it after a confirm. Drag a selection across rows first and `S`/`U` narrow to exactly those lines (VS Code's Stage Selected Ranges), leaving the rest of the hunk untouched in the index — so one messy working tree becomes several focused commits without leaving the editor.
 
 Below the change list, a **COMMITS** section draws the repo-wide commit graph (VS Code's built-in Source Control Graph, in the tig / lazygit idiom): colour-cycled box-drawing rails trace every branch and merge across local branches and tags, each row showing its ref badges (HEAD's branch bold, tags gold), subject, and age. Clicking a commit opens its full patch — header, message, diffstat, diff — in a read-only editor tab, and the graph refreshes itself whenever HEAD moves.
+
+## Pull request review
+
+**Review: Load PR Comments for This File** shows the branch's PR threads as boxes under their lines, with replies folded into their thread. Type a reply into a box's field and it posts to GitHub. **Review: Resolve or Unresolve Thread** acts on the focused box, or the next one. **Review: Add Comment on This Line** adds a pending comment, shown as a box, and **Review: Submit Review** sends the pending comments as Comment, Approve or Request Changes with a summary. Comments on lines outside the diff go into the summary. **Review: Discard Pending Comments** drops them.
+
+**Source Control: Export Comments to Pull Request** posts the navigator's notes, together with your pending comments, as one review on the branch's PR. It shows a preview first, listing each comment and how many go inline versus into the summary. The navigator's comments start with `[AI, croft navigator] ` (set `review_ai_prefix` to change it, or `""` to drop it). Once posted, they leave the editor and come back as the PR's threads.
+
+## Interactive rebase
+
+`git rebase -i` run in a croft terminal opens its plan (`git-rebase-todo`) as a croft tab, because croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait` in every pane it spawns (a sequence editor you set yourself always wins). In that tab a single key sets the caret commit's action: `p` pick, `r` reword, `e` edit, `s` squash, `f` fixup, `d` drop (with vim mode on, those keys stay vim's). `Alt`+`Up` / `Down` reorder commits. Save and close the tab and git carries on; **Rebase: Abort** in the palette empties the plan, which makes git abort. `croft edit --wait <file>` works for any tool that wants an editor it can wait on.
 
 ## Local history
 
@@ -161,6 +173,32 @@ croft snapshots each file as you save it, and the Explorer's TIMELINE lists thos
 A **Testing** view (the beaker icon, or `Cmd`/`Ctrl`+`K` `B`) mirrors VS Code's Test Explorer. It discovers the project's tests on first open — `cargo test` for Rust, `pytest` for Python, `vitest` or `jest` for JS/TS (detected from package.json) — and lists them as a suite tree with live pass/fail/skip glyphs. Each runner is a built-in extension, so switching one off in the Extensions panel stops its projects being detected.
 
 Each row's play glyph runs that test or suite (a green ▷ also marks test functions in the editor gutter, click it to run), clicking a test's name jumps to its source, Enter runs everything, and `Cmd`/`Ctrl`+`K` `Enter` runs the test under the editor caret. The beaker icon wears a red badge counting failures.
+
+## Live Run
+
+![Live Run: values, output, errors and coverage painted beside the code as you type](images/live-run.gif)
+
+`Cmd`/`Ctrl`+`K` `V` (or **Python: Toggle Live Run** in the palette) turns a Python file into a live notebook without cells. Every time you pause typing, croft runs the buffer, unsaved edits included, and paints what each line did beside it:
+
+```text
+def fib(n):  n = 10
+    for i in range(n):  i = 0, 1, 2 … 9 ×10
+        a, b = b, a + b  a = 1, 1, 2 … 55 ×10  b = 1, 2, 3 … 89 ×10
+    return a  ↩ 55
+squares.append(k * k)  squares = [0], [0, 1], [0, 1, 4] … [0, 1, 4, 9, 16] ×5
+print("total is", total)  ▸ total is 30
+fib(10)  → 55
+ratio = total / (len(squares) - 5)  ✖ ZeroDivisionError: division by zero
+```
+
+* **Values**: what each assignment, loop variable, parameter, and in-place method call (`items.append(x)`) left behind. A line that runs many times shows the first values it took, then the last, then how many times it ran. Objects without their own `__repr__` show their fields (`Point(x=3, y=4)`).
+* **Output and results**: what a line printed (`▸`), what a `return` returned (`↩`), and the value of a bare expression (`→`), so a trailing `fib(10)` works like a REPL.
+* **Failures**: the exception lands on the line that raised it, in red. A run that goes past 3 seconds is interrupted and the line it was stuck on says so, in amber.
+* **Coverage**: line numbers go green for statements that ran and a muted red for statements that never did, so a branch you thought was taken shows up at a glance.
+
+The run uses the file's own directory as its working directory and `sys.path[0]`, with the nearest `.venv` / `venv` / `.env` interpreter inside the workspace (falling back to `python3`), so imports and relative paths behave as they would from a terminal. stdin is empty and nothing is written to `__pycache__`. Only a line whose text still matches the run shows a value, so an edited line goes bare until the next run lands rather than showing a stale answer. A stopped debugger's inline values take precedence over Live Run's on the same line.
+
+Live Run executes your code on every pause, so it is armed **per file**: toggling it on for one script never runs another, and nothing runs until you ask.
 
 ## Tasks
 
@@ -175,6 +213,7 @@ Click a segment to change it. The indentation pill opens VS Code's Select Indent
 ## Debugging
 
 * **Debug Python with breakpoints:** set breakpoints in the editor gutter (`F9`) and press `F5`; croft launches the file under debugpy over the Debug Adapter Protocol so it stops on the red lines. Step over (`F10`), step into (`F11`), step out (`Shift+F11`), resume (`F5`), pause a running program (`F6`), stop (`Shift+F5`). When paused, the Run and Debug panel shows the call stack and an expandable variables tree, plus a debug console of program output with a `❯` REPL that evaluates in the selected frame; hovering a variable in the editor shows its value. Conditional breakpoints (a red `◆`) and break-on-exceptions are in the Command Palette; breakpoints the adapter can't bind show hollow (`○`). Requires CPython 3.14+ (croft provisions a private debugpy venv on first use); no fallback to older interpreters. Rust / C / C++ files route to `lldb-dap` through the same machinery.
+* **More breakpoint kinds:** "Debug: Add Hit Count Breakpoint" pauses only once a line has been hit N times; "Debug: Add Function Breakpoint" pauses on entry to a named function (kept for every later session too); "Debug: Break When Value Changes" pauses when a variable of the paused frame is written (adapters with data breakpoints, such as lldb-dap); and `Ctrl+F10` runs to the caret line and stops there once without leaving a breakpoint behind. Kinds an adapter does not support say so instead of silently doing nothing.
 * **Debug configurations (`launch.json`):** croft reads `.vscode/launch.json` (JSONC, unchanged from VS Code) and `.croft/launch.json` (same schema, no `.vscode/` required) — program arguments, `env`/`envFile`, `cwd`, `stopOnEntry`, a `preLaunchTask` resolved against the task registry (runs in its terminal pane, gates the launch on exit 0), attach by `port` (node, python) or `processId` (lldb), `${...}` variable substitution with loud errors for unresolvable variables, and verbatim passthrough of adapter-specific fields. "Debug: Select and Start Debugging" (or the config row in the Run and Debug panel) picks what `F5` launches; the zero-config "Debug active file" entry is always there.
 
   Compounds declared in the same file are listed too, with their member configurations. Selecting one that names a SINGLE configuration launches it — that needs one session, which croft runs. One that names several is refused rather than launched as a subset, since debugging only the members that happen to resolve would debug something other than what was asked for; running several sessions at once is [still to build](https://github.com/vitali87/croft/issues/310). `presentation.hidden` keeps a compound out of that picker entirely, and one asking only to be hidden launches normally; `presentation.group` and `presentation.order` want an ordering the picker does not have, so a single-member compound setting either is refused rather than launched without it ([#318](https://github.com/vitali87/croft/issues/318)). A compound's own `preLaunchTask` runs before its member starts, gating the launch on exit 0 exactly as a configuration's own task does, and chains with the member's if it has one.

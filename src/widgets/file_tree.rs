@@ -55,6 +55,9 @@ pub struct FileTree {
     /// root path. Swapped in by the app whenever a lane or a seat changes;
     /// a root with no entry paints as before.
     pub root_badges: Arc<HashMap<PathBuf, String>>,
+    /// Unresolved sticky notes per file (#367), painted as a count after
+    /// the name.
+    pub note_counts: Arc<HashMap<PathBuf, usize>>,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -112,6 +115,7 @@ impl FileTree {
             theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
             agent_touched: Arc::default(),
+            note_counts: Arc::default(),
             root_badges: Arc::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
@@ -1116,21 +1120,28 @@ mod android_trash {
 /// (same name) returns Ok with the original path unchanged so the user
 /// can hit Enter on the prompt without typing.
 pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
+    let target = rename_target(parent, old_path, new_name)?;
+    if target != old_path {
+        std::fs::rename(old_path, &target)?;
+    }
+    Ok(target)
+}
+
+/// Where [`rename_in`] would put `old_path`, with the same validation and
+/// without touching the disk, so a caller can ask language servers about
+/// the rename before it happens (#610).
+pub fn rename_target(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
     let trimmed = new_name.trim();
     if let Err(msg) = validate_new_name(trimmed) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     }
     let target = parent.join(trimmed);
-    if target == old_path {
-        return Ok(target);
-    }
-    if target.exists() {
+    if target != old_path && target.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("{} already exists", target.display()),
         ));
     }
-    std::fs::rename(old_path, &target)?;
     Ok(target)
 }
 
@@ -1589,6 +1600,12 @@ impl Widget for &mut FileTree {
                     spans.push(Span::styled(
                         format!(" {AGENT_DOT}"),
                         Style::default().fg(self.theme.ui(Color::Yellow)),
+                    ));
+                }
+                if let Some(n) = self.note_counts.get(&node.path) {
+                    spans.push(Span::styled(
+                        format!(" \u{270e}{n}"),
+                        Style::default().fg(self.theme.ui(Color::Gray)),
                     ));
                 }
             }
