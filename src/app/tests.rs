@@ -13657,6 +13657,7 @@ fn inline_blame_annotation_paints_on_the_cursor_line() {
                 author: "Vitali".into(),
                 age_secs: 3600,
                 uncommitted: false,
+                text: None,
             },
             crate::git::BlameLine {
                 short_hash: "abc12345".into(),
@@ -13664,6 +13665,7 @@ fn inline_blame_annotation_paints_on_the_cursor_line() {
                 author: "Alice".into(),
                 age_secs: 60,
                 uncommitted: false,
+                text: None,
             },
         ]),
     );

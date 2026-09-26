@@ -3751,6 +3751,16 @@ impl Editor {
             return None;
         }
         let line = blame.get(self.cursor_row)?;
+        // Same count is not same lines: a cut and paste further down keeps
+        // the count and shifts every row between, each then wearing the
+        // blame of the line that used to sit there.
+        if line
+            .text
+            .as_ref()
+            .is_some_and(|t| Some(t) != self.lines.get(self.cursor_row))
+        {
+            return None;
+        }
         if line.uncommitted {
             return Some("Uncommitted changes".to_string());
         }
@@ -16556,6 +16566,7 @@ mod tests {
             author: author.into(),
             age_secs: age,
             uncommitted,
+            text: None,
         }
     }
 
@@ -16818,6 +16829,28 @@ mod tests {
             e.current_line_blame_annotation().as_deref(),
             Some("Alice, 2 hours ago • feat: two")
         );
+    }
+
+    #[test]
+    fn blame_is_not_shown_on_a_row_that_holds_another_lines_text() {
+        let mut e = editor_with("one\ntwo\nthree\n");
+        e.path = Some(PathBuf::from("f.rs"));
+        let with_text = |author: &str, text: &str| crate::git::BlameLine {
+            text: Some(text.into()),
+            ..blame_line(author, "s", 90, false)
+        };
+        e.set_blame(
+            PathBuf::from("f.rs"),
+            Some(vec![
+                with_text("A", "one"),
+                with_text("B", "two"),
+                with_text("C", "three"),
+            ]),
+        );
+        // A cut and paste that keeps the count: `one` moved to the end.
+        e.lines = vec!["two".into(), "three".into(), "one".into()];
+        e.cursor_row = 0;
+        assert_eq!(e.current_line_blame_annotation(), None);
     }
 
     #[test]

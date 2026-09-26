@@ -1446,6 +1446,10 @@ pub struct BlameLine {
     /// True for a not-yet-committed line (the zero hash `git blame` reports
     /// for working-tree changes).
     pub uncommitted: bool,
+    /// The line's text as blamed, when known: the annotation is shown only
+    /// while the buffer's line still reads the same (see
+    /// `Editor::committed_blame_annotation`).
+    pub text: Option<String>,
 }
 
 /// Per-line blame for `rel_path`, indexed 0-based by result position (result
@@ -1499,6 +1503,7 @@ pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
                     author: std::mem::take(&mut author),
                     age_secs: now - author_time,
                     uncommitted,
+                    text: Some(raw[1..].to_string()),
                 });
             }
         } else if let Some(h) = raw.split(' ').next() {
