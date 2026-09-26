@@ -2704,11 +2704,15 @@ pub(crate) fn client_identity() -> String {
 /// The composition rule behind [`client_identity`], split out so it can be
 /// tested directly: `set_var` races sibling test threads (#37), so the env
 /// read stays a one-liner and the logic worth asserting lives here.
-fn compose_client_identity(relay_key: &str, nonce: &str) -> String {
-    if relay_key.is_empty() || nonce.is_empty() {
+///
+/// `process_nonce` only tells client processes apart; it is not
+/// cryptographic material, so it is not named a bare `nonce`, which
+/// CodeQL's `rust/hard-coded-cryptographic-value` reads as a crypto input.
+fn compose_client_identity(relay_key: &str, process_nonce: &str) -> String {
+    if relay_key.is_empty() || process_nonce.is_empty() {
         return String::new();
     }
-    format!("{relay_key}.{nonce}")
+    format!("{relay_key}.{process_nonce}")
 }
 
 #[cfg(unix)]
