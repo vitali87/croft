@@ -50,12 +50,10 @@ pub struct Note {
     pub rev: u64,
 }
 
-/// How far from its last line a note looks for its anchor text.
-const ANCHOR_REACH: usize = 200;
-
 impl Note {
     /// The line the note belongs under in `lines`: the nearest line holding
-    /// its anchor text, else its last line clamped to the buffer.
+    /// its anchor text anywhere in the buffer (a block pasted far away still
+    /// carries its note), else its last line clamped to the buffer.
     pub fn place(&self, lines: &[String]) -> usize {
         let last = lines.len().saturating_sub(1);
         let start = self.line.min(last);
@@ -65,11 +63,13 @@ impl Note {
         {
             return start;
         }
-        for d in 1..=ANCHOR_REACH {
+        if self.anchor.trim().is_empty() {
+            return start;
+        }
+        for d in 1..=last {
             for cand in [start.checked_sub(d), start.checked_add(d)] {
                 if let Some(i) = cand.filter(|&i| i <= last)
                     && lines[i].trim() == self.anchor.trim()
-                    && !self.anchor.trim().is_empty()
                 {
                     return i;
                 }
@@ -177,7 +177,16 @@ impl Notes {
     pub fn add(&mut self, author: &str, file: &str, line: usize, anchor: &str, body: &str) -> Note {
         self.next += 1;
         let note = Note {
-            id: format!("{author}-{}-{}", std::process::id(), self.next),
+            // The clock too: a pid alone recurs across restarts, and a
+            // reused id would merge a new note into an old tombstone.
+            id: format!(
+                "{author}-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos()),
+                self.next
+            ),
             file: file.to_string(),
             line,
             anchor: anchor.to_string(),
@@ -231,7 +240,13 @@ impl Notes {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, serde_json::to_string(&self.notes).unwrap_or_default())
+        // Written aside and renamed in, so a crash mid-write never leaves a
+        // truncated file that `load` reads as no notes at all.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_string(&self.notes).unwrap_or_default())?;
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
     }
 }
 
@@ -258,6 +273,17 @@ mod tests {
             1,
             "an edited line keeps the old number"
         );
+    }
+
+    #[test]
+    fn a_note_finds_its_anchor_anywhere_in_the_buffer() {
+        let mut notes = Notes::default();
+        let n = notes.add("ada", "a.rs", 0, "fn moved() {}", "why?");
+        let mut buf = vec![String::from("// filler"); 1000];
+        buf.push(String::from("fn moved() {}"));
+        assert_eq!(n.place(&buf), 1000);
+        let again = notes.add("ada", "a.rs", 0, "x", "y");
+        assert_ne!(n.id, again.id);
     }
 
     #[test]

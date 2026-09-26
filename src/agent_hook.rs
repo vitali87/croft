@@ -47,8 +47,9 @@ pub fn settings_path(scope: Scope, home: &Path, cwd: &Path) -> PathBuf {
 /// as it was written: same keys, same order, same text.
 pub fn with_hook(before: Option<&str>) -> Result<Option<String>, String> {
     let mut root = match before {
-        Some(text) => Node::object_from(text)?,
-        None => Vec::new(),
+        // An empty file (a `touch`ed one) is no settings yet, not bad JSON.
+        Some(text) if !text.trim().is_empty() => Node::object_from(text)?,
+        _ => Vec::new(),
     };
     if count_croft_hooks(&root)? > 0 {
         return Ok(None);
@@ -73,6 +74,9 @@ pub fn with_hook(before: Option<&str>) -> Result<Option<String>, String> {
 /// or `hooks` object left empty by that removal dropped too. `None` when
 /// the file holds no croft hook.
 pub fn without_hook(current: &str) -> Result<Option<String>, String> {
+    if current.trim().is_empty() {
+        return Ok(None);
+    }
     let mut root = Node::object_from(current)?;
     if count_croft_hooks(&root)? == 0 {
         return Ok(None);
@@ -515,6 +519,12 @@ pub fn run_claude_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_settings_file_takes_the_hook_like_a_missing_one() {
+        assert_eq!(with_hook(Some("  \n")), with_hook(None));
+        assert_eq!(without_hook(""), Ok(None));
+    }
 
     fn croft_hooks(text: &str) -> usize {
         let v: Value = serde_json::from_str(text).unwrap();

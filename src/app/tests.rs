@@ -11664,7 +11664,7 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         "the clear request must be one-shot — consuming twice in a row returns false",
     );
     assert!(
-        app.overlays.activity.is_dirty(),
+        app.overlays.activity.dirty(),
         "resize must also re-mark the icons dirty so the post-draw flush re-emits them after the clear",
     );
 }
@@ -11728,7 +11728,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     // First emit at one layout: records the positions, arms no clear.
     place(&mut app, 2);
     app.overlays.activity.mark_dirty();
-    app.flush_activity_image_overlays();
+    app.flush_activity_image_overlays(&[]);
     assert!(
         !app.consume_activity_image_clear(),
         "the first emit has no prior positions to compare, so it must not arm a clear",
@@ -11736,7 +11736,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     // A resize recenters the bar — every icon row shifts by one.
     place(&mut app, 3);
     app.overlays.activity.mark_dirty();
-    app.flush_activity_image_overlays();
+    app.flush_activity_image_overlays(&[]);
     assert!(
         app.consume_activity_image_clear(),
         "icons that moved since the last emit must arm one terminal.clear() to evict the stale image layer",
@@ -14884,7 +14884,7 @@ fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
         app.consume_shortcuts_image_clear(),
         "Esc must also arm terminal.clear() so the modal's text cells get wiped and the activity bar / welcome wordmark / hero icons can be re-emitted cleanly"
     );
-    assert!(app.overlays.activity.is_dirty());
+    assert!(app.overlays.activity.dirty());
     assert!(app.overlays.welcome.is_dirty());
     assert!(app.overlays.hero.is_dirty());
 }
@@ -25159,7 +25159,7 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     // Baseline: no hover, icons already emitted (clean).
     app.hovered_activity_icon = None;
     app.overlays.activity.mark_emitted();
-    assert!(!app.overlays.activity.is_dirty());
+    assert!(!app.overlays.activity.dirty());
     let moved = |col: u16, row: u16| crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
         column: col,
@@ -25170,7 +25170,7 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     app.handle_mouse(moved(0, 5));
     assert_eq!(app.hovered_activity_icon, Some(ActivityIcon::Search));
     assert!(
-        app.overlays.activity.is_dirty(),
+        app.overlays.activity.dirty(),
         "entering an icon re-emits the swapped image"
     );
     // Drifting within the same icon costs nothing: no re-dirty.
@@ -25178,14 +25178,14 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     app.handle_mouse(moved(1, 4));
     assert_eq!(app.hovered_activity_icon, Some(ActivityIcon::Search));
     assert!(
-        !app.overlays.activity.is_dirty(),
+        !app.overlays.activity.dirty(),
         "drifting within one icon does not re-emit"
     );
     // Leaving the bar clears the hover and re-emits the resting icon.
     app.handle_mouse(moved(40, 20));
     assert_eq!(app.hovered_activity_icon, None);
     assert!(
-        app.overlays.activity.is_dirty(),
+        app.overlays.activity.dirty(),
         "leaving the icon re-emits its resting variant"
     );
 }
@@ -52272,4 +52272,208 @@ fn the_cells_under_an_image_fingerprint_writes_inside_it_only() {
     assert_ne!(super::cells_fingerprint(&buf, 2, 2, 5, 3), before);
     // A rectangle past the edge is clamped, not a panic.
     let _ = super::cells_fingerprint(&buf, 18, 8, 10, 10);
+}
+
+/// On Kitty an image lives on its own layer, so text redrawn beneath it
+/// never makes croft resend it; on iTerm2 it does.
+#[test]
+fn only_cell_buffer_protocols_resend_an_image_when_text_beneath_changes() {
+    use crate::iterm2_inline::InlineImageProtocol;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.terminal_image.set(
+        String::from("img"),
+        super::TerminalImageLayout {
+            cell_x: 1,
+            cell_y: 1,
+            cell_w: 4,
+            cell_h: 2,
+            seq: 0,
+            pane: 0,
+        },
+    );
+    let quiet = Buffer::empty(Rect::new(0, 0, 10, 5));
+    let mut busy = quiet.clone();
+    busy[(2, 1)].set_symbol("x");
+    app.inline_protocol = InlineImageProtocol::ITerm2;
+    assert_ne!(
+        app.image_underlays(&quiet).terminal,
+        app.image_underlays(&busy).terminal
+    );
+    app.inline_protocol = InlineImageProtocol::Kitty;
+    assert_eq!(
+        app.image_underlays(&quiet).terminal,
+        app.image_underlays(&busy).terminal
+    );
+}
+
+/// #682: typing re-bakes the minimap at most every `MINIMAP_EDIT_REBAKE`,
+/// and the deferred bake still lands once the wait is over.
+#[test]
+fn minimap_rebakes_for_typing_at_most_every_few_hundred_ms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cell_pixel = Some((8, 16));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.editor.lines = (0..80).map(|i| format!("line {i}")).collect();
+    let strip = ratatui::layout::Rect {
+        x: 100,
+        y: 1,
+        width: 6,
+        height: 40,
+    };
+    app.update_minimap_overlay(strip);
+    let first = app.minimap_image_payload().map(|(o, _)| o.to_string());
+    assert!(first.is_some());
+    app.editor.lines[0] = String::from("changed");
+    app.editor.edit_seq += 1;
+    app.update_minimap_overlay(strip);
+    assert_eq!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        first,
+        "a keystroke right after a bake waits"
+    );
+    assert!(!app.tick_minimap(), "not due yet");
+    app.minimap_baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
+    assert!(app.tick_minimap(), "the wait is over: redraw");
+    assert!(
+        !app.tick_minimap(),
+        "one redraw per deferred bake, even if the minimap is gone by then"
+    );
+    app.update_minimap_overlay(strip);
+    assert_ne!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        first,
+        "the deferred edit is baked"
+    );
+    assert!(!app.tick_minimap());
+    // Scrolling is not held back.
+    app.editor.scroll = 5;
+    let before = app.minimap_image_payload().map(|(o, _)| o.to_string());
+    app.update_minimap_overlay(strip);
+    assert_ne!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        before
+    );
+}
+
+/// #682: only iTerm2 needs the idle icon keepalive.
+#[test]
+fn only_iterm2_keeps_the_activity_icons_alive() {
+    use crate::iterm2_inline::InlineImageProtocol;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for (p, want) in [
+        (InlineImageProtocol::ITerm2, true),
+        (InlineImageProtocol::Kitty, false),
+        (InlineImageProtocol::Sixel, false),
+    ] {
+        app.inline_protocol = p;
+        assert_eq!(app.activity_keepalive_allowed(), want, "{p:?}");
+    }
+}
+
+/// #682: the minimap PNG is compressed hard; a typical strip encodes to a
+/// fraction of its default size.
+#[test]
+fn the_minimap_png_is_small() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.lines = (0..400)
+        .map(|i| format!("    let value_{i} = compute(a, b, {i}); // note"))
+        .collect();
+    let (w, h) = (6 * 9, 45 * 18);
+    let rgba = app
+        .editor
+        .minimap_rgba(w, h, h, (30, 30, 30), (200, 200, 200));
+    let png = super::rgba_to_png(rgba, w, h).unwrap();
+    assert!(png.len() < 1500, "{} bytes", png.len());
+    assert!(image::load_from_memory(&png).is_ok());
+}
+
+/// #682: small chrome images go out when new, changed, moved, back from
+/// hiding, or (iTerm2) repainted around; not on every frame.
+#[test]
+fn a_chrome_image_is_sent_only_when_it_could_be_missing() {
+    use crate::iterm2_inline::InlineImageProtocol;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let at = Rect::new(2, 2, 3, 1);
+    let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
+    app.drawn_buffer = Some(buf.clone());
+    app.inline_protocol = InlineImageProtocol::ITerm2;
+    assert!(app.chrome_image_due("k", "img", at), "new");
+    app.end_chrome_flush();
+    assert!(!app.chrome_image_due("k", "img", at), "unchanged frame");
+    app.end_chrome_flush();
+    assert!(app.chrome_image_due("k", "img2", at), "changed");
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "moved"
+    );
+    app.end_chrome_flush();
+    buf[(2, 2)].set_symbol("x");
+    app.drawn_buffer = Some(buf.clone());
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "a neighbour repainted on iTerm2"
+    );
+    app.end_chrome_flush();
+    app.end_chrome_flush();
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "back after a frame hidden"
+    );
+    app.end_chrome_flush();
+    app.inline_protocol = InlineImageProtocol::Kitty;
+    assert!(app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)));
+    app.end_chrome_flush();
+    buf[(2, 3)].set_symbol("y");
+    app.drawn_buffer = Some(buf);
+    assert!(
+        !app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "Kitty ignores neighbours"
+    );
+}
+
+/// A PROBLEMS count that goes to zero clears the screen only if a badge was
+/// drawn: start-up and graphics re-inits no longer wipe the screen.
+#[test]
+fn a_zero_problem_count_clears_nothing_when_no_badge_was_drawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays
+        .activity
+        .set_images(super::ActivityBarImages::default());
+    app.problems_badge_count = usize::MAX;
+    app.refresh_problems_badge();
+    assert!(!app.consume_problems_badge_image_clear());
+}
+
+/// A comment written while a review is being submitted stays pending, and a
+/// second submit while the first runs is refused rather than posted twice.
+#[test]
+fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
+    let (_tmp, root, f, _log, _stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
+    app.editor.cursor_row = 0;
+    app.open_review_comment_prompt();
+    let rel = app.prompt.take().unwrap().target_dir;
+    app.add_pending_review_comment("first", rel.clone());
+    app.submit_review(String::from("Looks good"));
+    assert!(app.review_submitting);
+    app.editor.cursor_row = 1;
+    app.add_pending_review_comment("written meanwhile", rel);
+    app.submit_review(String::from("again"));
+    assert!(app.status.contains("already"), "{}", app.status);
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the submit", || {
+        app.drain_review_ops();
+        !app.review_submitting
+    });
+    let left: Vec<_> = app.review_pending.iter().map(|c| c.body.clone()).collect();
+    assert_eq!(left, vec![String::from("written meanwhile")]);
 }

@@ -50,12 +50,38 @@ pub fn set_action(line: &str, action: &str) -> Option<String> {
     if !SPELLINGS.contains(&word) || rest.trim().is_empty() {
         return None;
     }
-    Some(format!("{action} {}", rest.trim_start()))
+    let mut rest = rest.trim_start();
+    // `-C`/`-c` (from `--fixup=amend:`/`reword:`) is only valid after
+    // `fixup`; git stops the rebase on `pick -C ...`.
+    if action != "fixup"
+        && let Some(after) = rest
+            .strip_prefix("-C ")
+            .or_else(|| rest.strip_prefix("-c "))
+    {
+        rest = after.trim_start();
+    }
+    Some(format!("{action} {rest}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fixup_flag_goes_when_the_action_is_no_longer_fixup() {
+        assert_eq!(
+            set_action("fixup -C 1a2b Tidy", "pick").as_deref(),
+            Some("pick 1a2b Tidy")
+        );
+        assert_eq!(
+            set_action("fixup -c 1a2b Tidy", "drop").as_deref(),
+            Some("drop 1a2b Tidy")
+        );
+        assert_eq!(
+            set_action("fixup -C 1a2b Tidy", "fixup").as_deref(),
+            Some("fixup -C 1a2b Tidy")
+        );
+    }
 
     #[test]
     fn a_key_rewrites_a_commit_lines_action() {
