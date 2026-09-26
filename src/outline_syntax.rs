@@ -168,6 +168,7 @@ fn lang_and_query(kind: LangKind) -> Option<(Language, &'static str)> {
         LangKind::TypeScript => (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), TS_QUERY),
         LangKind::Tsx => (tree_sitter_typescript::LANGUAGE_TSX.into(), TS_QUERY),
         LangKind::Go => (tree_sitter_go::LANGUAGE.into(), GO_QUERY),
+        LangKind::Lua => (tree_sitter_lua::LANGUAGE.into(), LUA_QUERY),
         // Other languages either lack a useful symbol structure (json/toml/
         // yaml/css/html/bash) or are not yet covered; they fall through to the
         // LSP outline. Add a query + arm here to light one up.
@@ -239,6 +240,25 @@ const GO_QUERY: &str = r#"
 (const_spec name: (identifier) @name.constant) @item
 "#;
 
+const LUA_QUERY: &str = r#"
+(function_declaration name: (identifier) @name.function) @item
+(function_declaration name: (dot_index_expression field: (identifier) @name.function)) @item
+(function_declaration name: (method_index_expression method: (identifier) @name.method)) @item
+(field
+  name: (identifier) @name.function
+  value: (function_definition)) @item
+(assignment_statement
+  (variable_list
+    .
+    name: [
+      (identifier) @name.function
+      (dot_index_expression field: (identifier) @name.function)
+    ])
+  (expression_list
+    .
+    value: (function_definition))) @item
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +323,18 @@ mod tests {
         assert!(got.contains(&("Point".into(), OutlineKind::Struct, 0)));
         assert!(got.contains(&("Norm".into(), OutlineKind::Method, 0)));
         assert!(got.contains(&("Free".into(), OutlineKind::Function, 0)));
+    }
+
+    #[test]
+    fn lua_functions_and_methods_are_extracted() {
+        let src = b"function greet() end\nfunction Player.new() end\nfunction Player:move() end\nlocal Player = { jump = function() end }\nPlayer.attack = function() end\n";
+        let syms = symbols_for(LangKind::Lua, src);
+        let got = names_kinds_depths(&syms);
+        assert!(got.contains(&("greet".into(), OutlineKind::Function, 0)));
+        assert!(got.contains(&("new".into(), OutlineKind::Function, 0)));
+        assert!(got.contains(&("move".into(), OutlineKind::Method, 0)));
+        assert!(got.contains(&("jump".into(), OutlineKind::Function, 0)));
+        assert!(got.contains(&("attack".into(), OutlineKind::Function, 0)));
     }
 
     #[test]
