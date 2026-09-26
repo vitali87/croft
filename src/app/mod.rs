@@ -1536,12 +1536,12 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
     (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
 }
 
-/// A launch.json config launch parked behind its `preLaunchTask` (#250): the
-/// task runs in a terminal pane, and the FinishedCommand sweep decides.
 /// What a network git operation's worker hands back: the UI-thread half
 /// of the operation, applied to the app when it arrives.
 type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
 
+/// A launch.json config launch parked behind its `preLaunchTask` (#250): the
+/// task runs in a terminal pane, and the FinishedCommand sweep decides.
 struct PendingDebugLaunch {
     /// Uid of the pane the task command was written to.
     pane: u64,

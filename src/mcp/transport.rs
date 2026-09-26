@@ -236,10 +236,6 @@ mod tests {
         assert!(d.next_message().is_none());
     }
 
-    /// A sidecar must not share croft's controlling terminal — `spawn` `setsid`s
-    /// it into its own session. Assert the spawned child's session id differs
-    /// from ours. (Spawns `sleep` as a stand-in server; the reader thread just
-    /// hits EOF when it exits.)
     #[test]
     fn a_server_logging_heavily_to_stderr_still_answers() {
         let cwd = std::env::temp_dir();
@@ -254,6 +250,10 @@ mod tests {
         assert_eq!(msg["id"], 1);
     }
 
+    /// A sidecar must not share croft's controlling terminal — `spawn` `setsid`s
+    /// it into its own session. Assert the spawned child's session id differs
+    /// from ours. (Spawns `sleep` as a stand-in server; the reader thread just
+    /// hits EOF when it exits.)
     #[test]
     fn spawned_server_is_detached_into_its_own_session() {
         let cwd = std::env::temp_dir();
