@@ -2898,7 +2898,10 @@ impl PtyTerminal {
             return None;
         }
         let line = vr as i32 - term.grid().display_offset() as i32;
-        let (text, colmap) = row_text_and_cols(&term, line);
+        let (_, colmap) = row_text_and_cols(&term, line);
+        // Matched over the logical line, as the painter masks it: a secret
+        // a soft wrap cut in two is found from a click on either half.
+        let (text, offset) = logical_row_text(&term, line);
         drop(term);
         // The clicked column as a char index: a wide char's spacer column
         // resolves to the wide char itself (the `line_text_at` rule).
@@ -2908,7 +2911,7 @@ impl PtyTerminal {
         // char index - never back into a token. The `rposition` only ever
         // steps back for a wide char's spacer column, which is the wide
         // char itself.
-        let ci = colmap.iter().rposition(|&gc| gc <= vc)?;
+        let ci = offset + colmap.iter().rposition(|&gc| gc <= vc)?;
         crate::triggers::redact_spans(&text, &set)
             .into_iter()
             .find(|s| ci >= s.start && ci < s.start + s.len)

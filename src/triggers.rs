@@ -388,6 +388,39 @@ pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
     out
 }
 
+/// The redacted char ranges `(start, len)` on each of `rows`, matched over
+/// soft-wrapped rows joined as in [`mask_rows`], so a range on one row may
+/// be the tail of a secret that began on the row above.
+pub fn redacted_row_ranges(
+    rows: &[String],
+    wraps: &[bool],
+    set: &TriggerSet,
+) -> Vec<Vec<(usize, usize)>> {
+    let mut out = vec![Vec::new(); rows.len()];
+    let mut i = 0;
+    while i < rows.len() {
+        let mut j = i;
+        while j + 1 < rows.len() && wraps.get(j).copied().unwrap_or(false) {
+            j += 1;
+        }
+        let joined: String = rows[i..=j].concat();
+        let spans = redact_spans(&joined, set);
+        let mut offset = 0;
+        for (r, row) in (i..=j).zip(&rows[i..=j]) {
+            let len = row.chars().count();
+            for s in &spans {
+                let (lo, hi) = (s.start.max(offset), (s.start + s.len).min(offset + len));
+                if lo < hi {
+                    out[r].push((lo - offset, hi - lo));
+                }
+            }
+            offset += len;
+        }
+        i = j + 1;
+    }
+    out
+}
+
 /// [`mask_text`] over terminal rows, where `wraps[i]` says row `i`
 /// soft-wraps into row `i + 1`. Wrapped rows are masked as the one logical
 /// line they are, then split back, so a token the wrap cut in two (a JWT is
@@ -695,6 +728,19 @@ mod tests {
 
     fn set(json: &str) -> TriggerSet {
         TriggerSet::from_json(json)
+    }
+
+    #[test]
+    fn redacted_ranges_follow_a_secret_across_a_wrap() {
+        let s = TriggerSet::default().with_builtin_redactions();
+        let rows = vec![
+            String::from("GH=ghp_abcdefghij"),
+            String::from("klmnopqrstuvwxyz0123456789 ok"),
+        ];
+        let ranges = redacted_row_ranges(&rows, &[true, false], &s);
+        assert_eq!(ranges[0], vec![(3, 14)]);
+        assert_eq!(ranges[1], vec![(0, 26)]);
+        assert!(redacted_row_ranges(&rows, &[false, false], &s)[0].is_empty());
     }
 
     #[test]

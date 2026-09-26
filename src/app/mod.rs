@@ -39547,11 +39547,13 @@ impl App {
         // A hex run or a number inside a masked span would be a fragment of
         // the secret one keystroke from the clipboard (#360): no hint there.
         if self.triggers.has_redactions() && !self.redactions_revealed() {
+            // Over wrapped rows joined, as the painter masks them.
+            let masked = crate::triggers::redacted_row_ranges(&lines, &wraps, &self.triggers);
             let clear = |row: usize, start: usize, len: usize| {
-                lines.get(row).is_none_or(|line| {
-                    crate::triggers::redact_spans(line, &self.triggers)
+                masked.get(row).is_none_or(|ranges| {
+                    ranges
                         .iter()
-                        .all(|s| start + len <= s.start || start >= s.start + s.len)
+                        .all(|&(s, l)| start + len <= s || start >= s + l)
                 })
             };
             // A match that wraps the pane edge continues in `tail`; every
