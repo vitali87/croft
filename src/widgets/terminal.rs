@@ -4,6 +4,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection as TracerSelection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::ClipboardType;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, TermMode};
@@ -140,8 +141,9 @@ impl Selection {
 }
 
 /// Listener for events the embedded `Term` emits. Most variants (title
-/// changes, cursor-blink toggles, clipboard load/store, child exit, etc.)
-/// are owned by the outer croft TUI and ignored here, but two of them
+/// changes, cursor-blink toggles, clipboard load, child exit, etc.)
+/// are owned by the outer croft TUI and ignored here. A clipboard STORE
+/// (OSC 52 copy) is latched for the app to deliver (#678). Two more
 /// MUST be reflected back into the shell's stdin or interactive TUIs
 /// running inside the embedded terminal hang waiting for replies:
 ///
@@ -166,6 +168,9 @@ pub struct VoidListener {
     /// Latched when the child rings BEL (`\a`); the app drains it via
     /// [`PtyTerminal::take_bell`] to surface the bell in the UI.
     bell: Option<Arc<AtomicBool>>,
+    /// The newest OSC 52 clipboard store from the child (#678); drained by
+    /// [`PtyTerminal::take_clipboard_store`].
+    clipboard: Option<Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 impl EventListener for VoidListener {
@@ -174,6 +179,18 @@ impl EventListener for VoidListener {
             AlacEvent::Bell => {
                 if let Some(bell) = self.bell.as_ref() {
                     bell.store(true, Ordering::Release);
+                }
+            }
+            // A program copying through OSC 52: Claude Code, tmux, nvim.
+            // Over SSH it is their ONLY way to copy (a remote box has no
+            // clipboard tool), so dropping it broke copy on a remote while
+            // the same program copied fine locally through pbcopy (#678).
+            // Only the clipboard, never the primary selection: X's
+            // select-to-copy buffer has no counterpart on the user's side,
+            // and writing it into the clipboard would clobber real copies.
+            AlacEvent::ClipboardStore(ClipboardType::Clipboard, text) => {
+                if let Some(clip) = self.clipboard.as_ref() {
+                    *clip.lock().unwrap() = Some(text);
                 }
             }
             AlacEvent::PtyWrite(text) => {
@@ -596,6 +613,9 @@ pub struct PtyTerminal {
     /// Latched by the event listener when the child rings BEL; drained by
     /// [`Self::take_bell`].
     bell: Arc<AtomicBool>,
+    /// Latched by the event listener when the child copies through OSC 52
+    /// (#678); drained by [`Self::take_clipboard_store`].
+    clipboard_store: Arc<std::sync::Mutex<Option<String>>>,
     /// OSC 133 semantic prompt marks recorded by the reader thread, in
     /// arrival order. Positions are stored as `(grid line, history size)`
     /// at record time; [`Self::command_marks`] translates to current grid
@@ -1810,10 +1830,12 @@ impl PtyTerminal {
         let size_shared = Arc::new(std::sync::Mutex::new((cols, rows)));
         let (response_tx, response_rx) = std::sync::mpsc::channel::<String>();
         let bell = Arc::new(AtomicBool::new(false));
+        let clipboard_store = Arc::new(std::sync::Mutex::new(None));
         let listener = VoidListener {
             pty_response_tx: Some(response_tx),
             size: Some(size_shared.clone()),
             bell: Some(bell.clone()),
+            clipboard: Some(clipboard_store.clone()),
         };
         let mut term = Term::new(cfg, &term_size, listener);
         // Before the reader thread exists, so nothing the child writes can
@@ -2262,6 +2284,7 @@ impl PtyTerminal {
             search_opts: crate::widgets::search::SearchOpts::default(),
             current_match: None,
             bell,
+            clipboard_store,
             marks,
             osc7_cwd,
             osc7_host,
@@ -2458,6 +2481,14 @@ impl PtyTerminal {
     /// True once if the child rang BEL since the last call (drains the latch).
     pub fn take_bell(&self) -> bool {
         self.bell.swap(false, Ordering::AcqRel)
+    }
+
+    /// The text the child last copied through OSC 52 since the previous
+    /// call, if any (drains the latch). Only the newest copy survives a
+    /// tick: the clipboard holds one value, so older ones were overwritten
+    /// anyway.
+    pub fn take_clipboard_store(&self) -> Option<String> {
+        self.clipboard_store.lock().unwrap().take()
     }
 
     /// The pane's foreground process group leader pid (what owns the tty now):
@@ -5546,6 +5577,7 @@ mod tests {
             pty_response_tx: Some(tx),
             size: Some(Arc::new(std::sync::Mutex::new((80, 24)))),
             bell: None,
+            clipboard: None,
         };
         let cfg = Config::default();
         let size = TermSize::new(80, 24);
@@ -5575,6 +5607,7 @@ mod tests {
             pty_response_tx: Some(tx),
             size: Some(size),
             bell: None,
+            clipboard: None,
         };
         let cfg = Config::default();
         let term_size = TermSize::new(120, 40);
@@ -7662,6 +7695,35 @@ mod tests {
         assert!(
             !term.take_bell(),
             "take_bell drains the flag — a second read is false"
+        );
+    }
+
+    /// #678: a program in the pane copying through OSC 52 (Claude Code over
+    /// SSH has no other way) must reach the app, once, and only for the
+    /// clipboard: a primary-selection store is not a copy the user made.
+    #[test]
+    fn osc52_clipboard_store_is_latched_for_the_app_and_selection_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        // "aGVsbG8=" is "hello"; the primary-selection store ("p") comes
+        // first so a leak of it would be overwritten into a false pass only
+        // if it were accepted AND ordered last.
+        let script = "printf '\\033]52;c;aGVsbG8=\\007\\033]52;p;bm9wZQ==\\007DONE\\n'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        wait_for_grid(&term, |ls| {
+            ls.iter()
+                .any(|l| l.contains("DONE") && !l.contains("printf"))
+        });
+        assert_eq!(
+            term.take_clipboard_store().as_deref(),
+            Some("hello"),
+            "the clipboard store must be latched, and the selection store ignored"
+        );
+        assert_eq!(
+            term.take_clipboard_store(),
+            None,
+            "take_clipboard_store drains the latch"
         );
     }
 
