@@ -643,8 +643,8 @@ impl Renderer<'_> {
                 (true, "for") => "htmlFor",
                 _ => k,
             };
-            self.out
-                .push_str(&format!(" {}=\"{}\"", k, number(v, index)));
+            let v = number(v, index).replace('"', "&quot;");
+            self.out.push_str(&format!(" {k}=\"{v}\""));
         }
 
         if void {
@@ -704,6 +704,14 @@ fn number(s: &str, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quote_in_an_attribute_value_is_escaped() {
+        let out = super::expand("a[title='say \"hi\"']", "  ", Profile::Html)
+            .unwrap()
+            .0;
+        assert!(out.contains("title=\"say &quot;hi&quot;\""), "{out}");
+    }
 
     /// The HTML profile, which is what every test below means unless it
     /// names another.

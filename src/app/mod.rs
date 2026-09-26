@@ -1655,6 +1655,16 @@ fn search_editor_label(query: &str) -> PathBuf {
     })
 }
 
+/// Whether a tab is a Search Editor by its label, not just by its text: a
+/// real file that happens to open with `# Query: ` must keep its Enter key,
+/// and must never have a rerun overwrite it.
+fn is_search_editor_tab(path: Option<&Path>) -> bool {
+    path.is_some_and(|p| {
+        let p = p.to_string_lossy();
+        p == "Search Editor" || p.starts_with("Search: ")
+    })
+}
+
 /// A query as the status line quotes it, shortened.
 fn header_query_for_status(query: &str) -> String {
     let q: String = query.chars().take(40).collect();
@@ -44549,7 +44559,10 @@ impl App {
     /// Search Editor: Rerun (#615, Cmd+K Shift+R): search again for the query
     /// the active Search Editor's header spells, off the UI thread.
     fn rerun_search_editor(&mut self) {
-        let Some(header) = crate::search_editor::parse_header(&self.editor.lines) else {
+        let header = is_search_editor_tab(self.editor.path.as_deref())
+            .then(|| crate::search_editor::parse_header(&self.editor.lines))
+            .flatten();
+        let Some(header) = header else {
             self.status = String::from("Not a Search Editor");
             return;
         };
@@ -44616,7 +44629,9 @@ impl App {
     /// Open the match under the caret when the active tab is a Search Editor
     /// and the caret is on a result row. Returns whether it did.
     fn open_search_editor_result(&mut self) -> bool {
-        if !crate::search_editor::is_search_editor(&self.editor.lines) {
+        if !is_search_editor_tab(self.editor.path.as_deref())
+            || !crate::search_editor::is_search_editor(&self.editor.lines)
+        {
             return false;
         }
         let Some((path, line)) = crate::search_editor::location_at(

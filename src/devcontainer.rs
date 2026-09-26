@@ -187,8 +187,12 @@ pub fn parse(
                 let target = field("target")?;
                 let kind = field("type").unwrap_or_else(|| String::from("bind"));
                 Some(match field("source") {
-                    Some(source) => format!("type={kind},source={source},target={target}"),
-                    None => format!("type={kind},target={target}"),
+                    Some(source) => format!(
+                        "type={kind},{},{}",
+                        mount_field("source", &source),
+                        mount_field("target", &target)
+                    ),
+                    None => format!("type={kind},{}", mount_field("target", &target)),
                 })
             }
             _ => None,
@@ -214,8 +218,9 @@ pub fn parse(
 
     let workspace_mount = str_of("workspaceMount").map(sub).unwrap_or_else(|| {
         format!(
-            "type=bind,source={},target={workspace_folder}",
-            root.display()
+            "type=bind,{},{}",
+            mount_field("source", &root.display().to_string()),
+            mount_field("target", &workspace_folder)
         )
     });
 
@@ -244,6 +249,17 @@ pub fn parse(
         workspace_folder,
         workspace_mount,
     })
+}
+
+/// `key=value` for a docker `--mount` spec, CSV-quoted when the value has
+/// a comma or a quote: docker splits the spec as CSV, so `/home/u/a,b`
+/// would otherwise read as a stray field `b` and the run would fail.
+fn mount_field(key: &str, value: &str) -> String {
+    if value.contains([',', '"']) {
+        format!("\"{key}={}\"", value.replace('"', "\"\""))
+    } else {
+        format!("{key}={value}")
+    }
 }
 
 /// FNV-1a, hex: a stable short id for a path or a config.
@@ -520,6 +536,13 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mount_path_with_a_comma_is_quoted_for_docker() {
+        assert_eq!(mount_field("source", "/w/app"), "source=/w/app");
+        assert_eq!(mount_field("source", "/w/a,b"), "\"source=/w/a,b\"");
+        assert_eq!(mount_field("source", "/w/a\"b"), "\"source=/w/a\"\"b\"");
+    }
 
     fn parse_str(text: &str) -> DevContainer {
         let root = Path::new("/home/me/proj");
