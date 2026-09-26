@@ -90,6 +90,20 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// `gh api --paginate` prints each page's JSON array back to back
+/// (`[...][...]`), which no JSON parser reads as one value: join the pages
+/// into one array. A single page comes back as it was.
+fn flatten_pages(json: &str) -> String {
+    let mut all = Vec::new();
+    for page in serde_json::Deserializer::from_str(json).into_iter::<serde_json::Value>() {
+        match page {
+            Ok(serde_json::Value::Array(items)) => all.extend(items),
+            _ => return json.to_string(),
+        }
+    }
+    serde_json::Value::Array(all).to_string()
+}
+
 /// The PR number for the branch checked out in `root`.
 fn pr_number(program: &str, root: &Path) -> Option<String> {
     gh(
@@ -223,7 +237,7 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
                 Ok(j) => j,
                 Err(e) => return Outcome::Failed(format!("Could not read the PR's comments: {e}")),
             };
-            let threads: Vec<_> = crate::review_threads::parse_threads(&json)
+            let threads: Vec<_> = crate::review_threads::parse_threads(&flatten_pages(&json))
                 .into_iter()
                 .filter(|t| t.path == rel)
                 .collect();
@@ -305,6 +319,14 @@ pub fn spawn(program: String, root: PathBuf, job: Job, tx: std::sync::mpsc::Send
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paginated_comment_pages_join_into_one_array() {
+        let joined: serde_json::Value =
+            serde_json::from_str(&flatten_pages("[{\"id\":1}]\n[{\"id\":2}]")).unwrap();
+        assert_eq!(joined.as_array().map(Vec::len), Some(2));
+        assert_eq!(flatten_pages("[]"), "[]");
+    }
 
     /// A fake `gh` that logs its arguments and stdin, answers `pr diff`
     /// with a one-hunk diff, and fails when told to.
