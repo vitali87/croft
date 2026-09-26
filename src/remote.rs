@@ -1545,6 +1545,22 @@ fn pull_source_allowed(src: &Path) -> bool {
     std::fs::canonicalize(src).is_ok_and(|real| !hidden(&real))
 }
 
+/// The local `tar` arguments that pack a pulled `basename` from `parent`.
+/// Hidden entries are excluded: [`pull_source_allowed`] vets only the named
+/// path, and a pulled folder (`~`, say) would otherwise carry its `.ssh`
+/// along. `--` keeps a name starting with `-` from reading as an option.
+/// Both GNU tar and bsdtar match `.*` against each path component.
+fn pull_tar_args(parent: &Path, basename: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["-c", "-f", "-", "--exclude", ".*", "-C"]
+        .iter()
+        .map(Into::into)
+        .collect();
+    args.push(parent.into());
+    args.push("--".into());
+    args.push(basename.into());
+    args
+}
+
 fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str, src: &str) {
     let src_path = PathBuf::from(src);
     let dest_dir = format!("{inbox_dir}/{request_id}");
@@ -1588,13 +1604,7 @@ fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
     // destination, which kept failing on freshly-mkdir'd dirs.
     let mut tar = match Command::new("tar")
         .env("COPYFILE_DISABLE", "1")
-        .arg("-c")
-        .arg("-f")
-        .arg("-")
-        .arg("-C")
-        .arg(parent)
-        // `./`-prefixed: a name starting with `-` is otherwise an option.
-        .arg(Path::new(".").join(basename))
+        .args(pull_tar_args(parent, basename))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -4024,6 +4034,56 @@ Host !blocked *.internal
         assert!(!is_transport_failure(Some(1)));
         assert!(!is_transport_failure(Some(101)));
         assert!(!is_transport_failure(None));
+    }
+
+    #[test]
+    fn a_pulled_folder_leaves_its_hidden_entries_behind() {
+        let dir = tempfile::Builder::new()
+            .prefix("croft-pull")
+            .tempdir()
+            .unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("docs/.git")).unwrap();
+        std::fs::write(home.join(".ssh/id"), "key").unwrap();
+        std::fs::write(home.join("docs/.git/cfg"), "x").unwrap();
+        std::fs::write(home.join("docs/a.txt"), "a").unwrap();
+        std::fs::write(home.join("-dash"), "d").unwrap();
+        let list = |parent: &Path, name: &str| {
+            let packed = Command::new("tar")
+                .args(super::pull_tar_args(parent, std::ffi::OsStr::new(name)))
+                .output()
+                .unwrap();
+            assert!(
+                packed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&packed.stderr)
+            );
+            let mut listing = Command::new("tar")
+                .args(["-t", "-f", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            listing
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&packed.stdout)
+                .unwrap();
+            String::from_utf8(listing.wait_with_output().unwrap().stdout).unwrap()
+        };
+        let names = list(dir.path(), "home");
+        assert!(
+            names.contains("home/docs/a.txt") && names.contains("home/-dash"),
+            "{names}"
+        );
+        assert!(
+            !names.contains(".ssh") && !names.contains(".git"),
+            "{names}"
+        );
+        assert_eq!(list(&home, "-dash").trim(), "-dash");
     }
 
     #[test]

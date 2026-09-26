@@ -68,16 +68,23 @@ impl Task {
             return Ok(self.command.clone());
         };
         let sub = |s: &str| crate::dap::configs::substitute(s, ctx);
+        // A value a variable filled in is data, whatever it holds: a path
+        // like `it's` or a file named `a;touch x.rs` from a cloned repo must
+        // not reach the shell as syntax. Text written literally in tasks.json
+        // keeps its shell meaning (globs, `&&`).
+        let from_variable = |raw: &str, value: &str| raw.contains("${") && needs_quote(value);
         let mut line = sub(&v.command)?;
-        // A program path that a variable filled with spaces is still one
-        // word; a command written as a shell line is left as written.
-        if !v.command.contains(char::is_whitespace) && line.contains(char::is_whitespace) {
+        // A command written as a shell line is left as written; a single
+        // word (a program path) is quoted like an argument.
+        if !v.command.contains(char::is_whitespace)
+            && (line.contains(char::is_whitespace) || from_variable(&v.command, &line))
+        {
             line = quote_word(&line);
         }
-        for arg in &v.args {
-            let arg = sub(arg)?;
+        for raw in &v.args {
+            let arg = sub(raw)?;
             line.push(' ');
-            if arg.is_empty() || arg.contains(char::is_whitespace) {
+            if arg.is_empty() || arg.contains(char::is_whitespace) || from_variable(raw, &arg) {
                 line.push_str(&quote_word(&arg));
             } else {
                 line.push_str(&arg);
@@ -95,6 +102,12 @@ impl Task {
         }
         Ok(format!("({} && {line})", setup.join(" && ")))
     }
+}
+
+/// Whether `s` holds anything a shell would read as more than plain text.
+fn needs_quote(s: &str) -> bool {
+    !s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c))
 }
 
 /// `s` as one single-quoted POSIX shell word.
@@ -531,6 +544,16 @@ mod tests {
             build.command_line(&ctx).unwrap(),
             "(cd '/my work/web' && export MODE='it'\\''s' && \
              '/my work/scripts/build.sh' -m 'fix bug' '/my work/a.rs')"
+        );
+        // Values from variables are data even with no whitespace in them.
+        let odd = crate::dap::configs::SubstCtx {
+            workspace_folder: PathBuf::from("/w/it's"),
+            file: Some(PathBuf::from("/w/a;touch${IFS}x.rs")),
+        };
+        assert_eq!(
+            build.command_line(&odd).unwrap(),
+            "(cd '/w/it'\\''s/web' && export MODE='it'\\''s' && \
+             '/w/it'\\''s/scripts/build.sh' -m 'fix bug' '/w/a;touch${IFS}x.rs')"
         );
         let plain = tasks.iter().find(|t| t.label == "plain").unwrap();
         assert_eq!(plain.command_line(&ctx).unwrap(), "npm run lint");
