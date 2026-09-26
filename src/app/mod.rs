@@ -12826,12 +12826,6 @@ impl App {
         self.status = String::from("Resolving quick fix");
     }
 
-    /// Route the key through the completion popup when one is open.
-    /// Up/Down navigate, Enter/Tab accept and replace the typed prefix
-    /// with the chosen completion's full text, Esc dismisses. Printable
-    /// chars and Backspace pass through to the editor and refresh the
-    /// popup's filter prefix in place; if no items match the new prefix
-    /// the popup dismisses on the next tick.
     /// Accept a completion by the server's own edit: its range, from where
     /// it starts to the caret (so letters typed since the request go too),
     /// becomes its text, then its additional edits (auto-imports) apply.
@@ -12881,6 +12875,12 @@ impl App {
         true
     }
 
+    /// Route the key through the completion popup when one is open.
+    /// Up/Down navigate, Enter/Tab accept and replace the typed prefix
+    /// with the chosen completion's full text, Esc dismisses. Printable
+    /// chars and Backspace pass through to the editor and refresh the
+    /// popup's filter prefix in place; if no items match the new prefix
+    /// the popup dismisses on the next tick.
     fn handle_completion_popup_key(&mut self, key: KeyEvent) -> bool {
         if self.completion_popup.is_none() {
             return false;
