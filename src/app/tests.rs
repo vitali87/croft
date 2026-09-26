@@ -10530,6 +10530,165 @@ fn close_all_closes_every_split_group() {
     assert_eq!(app.status, format!("Closed {total} tabs"));
 }
 
+/// #679: Cmd+K Shift+A is Session: Detach, not the Cmd+K A participants
+/// picker; outside a persistent session it says so. Both encodings: the
+/// forwarder's uppercase char and CSI-u's lowercase char with SHIFT.
+#[test]
+fn cmd_k_shift_a_detaches_instead_of_listing_participants() {
+    for c in ['A', 'a'] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            app.status,
+            "Nothing to detach from: this is not a persistent session"
+        );
+        assert!(app.list_picker.is_none(), "no participants picker opened");
+    }
+}
+
+/// The main loop drains typing attribution for a whole iteration before it
+/// handles that iteration's keys, so when Cmd+K Shift+A is handled the
+/// typist can already be another write-control holder. The host detaches
+/// the chord's sender itself; the key must never kick the typist.
+#[test]
+fn cmd_k_shift_a_never_kicks_the_current_typist() {
+    use crate::session_host::{Control, Frame, FrameReader, encode_control_frame};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("s.mux.sock");
+    {
+        let socket = socket.clone();
+        std::thread::spawn(move || {
+            crate::session_host::serve_with_token(&socket, None, &[String::from("cat")], "t")
+        });
+    }
+    crate::test_budget::await_spawned(
+        Duration::from_millis(1000),
+        "the session host to bind its socket",
+        || crate::session::is_alive(&socket),
+    );
+    let mut other = UnixStream::connect(&socket).unwrap();
+    other
+        .write_all(&encode_control_frame(&Control::Hello {
+            name: String::from("other"),
+            cols: 80,
+            rows: 24,
+            version: String::from(env!("CARGO_PKG_VERSION")),
+            client_id: String::new(),
+        }))
+        .unwrap();
+    other
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = FrameReader::new();
+    let mut buf = [0u8; 65536];
+    let other_id = loop {
+        let n = other.read(&mut buf).unwrap();
+        assert!(n > 0, "host closed before the roster arrived");
+        let found = reader.push(&buf[..n]).into_iter().find_map(|f| match f {
+            Frame::Control(Control::Presence { participants }) => participants
+                .iter()
+                .find(|p| p.name == "other")
+                .map(|p| p.id),
+            _ => None,
+        });
+        if let Some(id) = found {
+            break id;
+        }
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_channel = crate::session_host::InnerChannel::connect(&socket, "t");
+    assert!(app.session_channel.is_some(), "inner channel authenticates");
+    app.session_typist = Some(other_id);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('A'), KeyModifiers::SHIFT))
+        .unwrap();
+
+    other
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        match other.read(&mut buf) {
+            Ok(0) => panic!("the current typist was disconnected by another client's chord"),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("typist's connection failed: {e}"),
+        }
+    }
+}
+
+/// The palette's Session: Detach refuses up front when several
+/// participants hold write control: either could have pressed Enter.
+#[test]
+fn several_write_holders_counts_only_control() {
+    let p = |id, control| crate::session_host::Participant {
+        id,
+        name: format!("p{id}"),
+        cols: 80,
+        rows: 24,
+        control,
+        version: String::new(),
+    };
+    assert!(!several_write_holders(&[p(1, true), p(2, false)]));
+    assert!(several_write_holders(&[p(1, true), p(2, true)]));
+    assert!(!several_write_holders(&[p(2, false)]));
+    assert!(!several_write_holders(&[]));
+}
+
+/// #679: a detached client must leave the shell usable: the inner croft
+/// never sends its own teardown to a client it no longer serves.
+#[test]
+fn detached_client_restore_seq_hands_every_mode_back() {
+    let seq = String::from_utf8(detached_client_restore_seq()).unwrap();
+    assert!(
+        seq.starts_with('\x18'),
+        "cancel any sequence the cut left open"
+    );
+    // Kitty keeps a flag stack per screen: the SET must land on the
+    // alternate screen's stack, before leaving it.
+    assert!(
+        seq.find("\x1b[=0;1u") < seq.find("\x1b[?1049l"),
+        "keyboard flags reset before leaving the alternate screen"
+    );
+    // release_mode_seq is the inverse of takeover_mode_seq: every private
+    // mode the takeover sets, the release clears.
+    let takeover = String::from_utf8(takeover_mode_seq()).unwrap();
+    let release = String::from_utf8(release_mode_seq()).unwrap();
+    for set in takeover
+        .split('\x1b')
+        .filter(|s| s.starts_with("[?") && s.ends_with('h'))
+    {
+        let reset = format!("\x1b{}l", &set[..set.len() - 1]);
+        assert!(release.contains(&reset), "release must clear {set}");
+    }
+    for (bytes, what) in [
+        ("\x1b[?1049l", "alternate screen"),
+        ("\x1b[?1000l", "mouse tracking"),
+        ("\x1b[?1003l", "motion tracking"),
+        ("\x1b[?2004l", "bracketed paste"),
+        ("\x1b[?25h", "cursor visibility"),
+        ("\x1b[=0;1u", "kitty keyboard flags"),
+        ("\x1b]110\x07", "host foreground"),
+    ] {
+        assert!(seq.contains(bytes), "must restore {what}");
+    }
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();

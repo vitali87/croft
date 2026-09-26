@@ -395,6 +395,8 @@ The multiplayer session mux (docs/MULTIPLAYER.md): a hidden `croft session-host`
 
 **Host self-replacement.** A host replacing its own image latches `swapping` under the clients lock BEFORE it broadcasts HostSwap, and from then on answers a newly accepted connection with HostSwap plus close instead of seating it. The reconnect its own invitation triggers arrives ~200ms later, inside the flush pause, and a client seated by a process about to `exec` reads the resulting EOF as "session over" and exits — which is how a background update kicked every attached client off a live remote session. The latch is released if the exec fails, so a stale host still serves.
 
+**Detach.** Each client thread runs a `DetachChord` over that client's input bytes, before the read-only filter, and on `Cmd+K Shift+A` shuts the connection down the way a kick does, so read-only participants and clients of a wedged inner croft can leave. The attach client treats an EOF with no Exit frame as `PumpOutcome::Disconnected`: it writes `detached_client_restore_seq` (CAN, then the inverse of `takeover_mode_seq` via `release_mode_seq`, kitty flags SET to 0, host colors and title reset), leaves raw mode, and prints a one-line note if the socket still answers.
+
 **Two smaller fixes.** The attach repaint jiggle runs even when every client is a size-less observer; `min_winsize` returning None used to skip it. And `broadcast` bounds each client write with `poll(2)` at `WRITE_FRAME_DEADLINE`, evicting a non-draining peer and recomputing the shared size so a dead ghost releases the min winsize it pinned — a plain `write_all` used to wedge the PTY pump forever while holding the clients lock.
 
 ### fleet.rs

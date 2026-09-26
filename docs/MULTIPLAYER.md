@@ -141,9 +141,24 @@ host  tty ── croft attach ──┘        (one accept loop,          (uncha
   because liveness is still "can I connect to the socket". Once stable, the
   dtach dependency can go entirely, including `croft_pkg_install dtach` in the
   remote installer (`src/remote.rs:2182`).
-- **Detach chord**: the control channel supplies what the comment at
-  `src/session.rs:9` deferred — an in-app detach command sends a `detach`
-  frame instead of needing a dtach escape key.
+- **Detach chord** (shipped, #679): `Cmd+K Shift+A`. The host matches the
+  chord in each client's input stream (`DetachChord`), before the read-only
+  filter, so a read-only participant and a client of a wedged inner croft
+  can both detach; it then closes that connection exactly as a kick does.
+  Because the host matches it, the chord works in every app state, a prompt
+  or picker included. The app's own handler for the chord does nothing in a
+  session: typing attribution is drained per loop iteration, so by the time
+  it runs the typist may be another holder. The palette entry "Session:
+  Detach" cannot name the window either (its roster lags too), so it sends
+  `DetachWriter` over the privileged channel and the host decides from its
+  live state: it detaches its sole write-control holder when that holder
+  also wrote last, and otherwise does nothing. With several holders the app
+  refuses up front and points at the chord. The host matches the Cmd form
+  only (`CSI 107;9u`), not Termux's Ctrl stand-in, where Ctrl+K is
+  kill-to-end-of-line. On an EOF with no `exit` frame the attach client
+  writes the inverse of croft's takeover modes (the inner croft never sends
+  its teardown to a client it no longer serves) and, if the socket is still
+  live, a one-line "detached" note.
 
 ### How the inner croft learns about participants
 

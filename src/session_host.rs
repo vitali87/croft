@@ -88,6 +88,13 @@ pub enum Control {
     /// pump exits as on a detach). Honored from a control-holding client or
     /// the inner channel.
     Kick { id: u64 },
+    /// Inner channel only (#679, the palette's Session: Detach): detach the
+    /// window that asked. The app cannot name it (typing attribution and
+    /// its roster both lag the keys), but the host's state is live: the
+    /// asker holds write control and wrote last, so the host detaches its
+    /// sole holder when that holder is also the last writer, and otherwise
+    /// does nothing. Older hosts drop the unknown variant.
+    DetachWriter,
     /// A client asks for write control for itself, carrying no id: the host
     /// resolves the requester, so a client never needs to learn its own id.
     /// Granted only when NOBODY holds control (#235) — the claim exists so a
@@ -152,7 +159,7 @@ pub fn stale_client_notice(roster: &[Participant], own: &str) -> Option<String> 
     let older: Vec<&str> = older.into_iter().map(|(_, v)| v).collect();
     (!older.is_empty()).then(|| {
         format!(
-            "Session updated to croft {own}; a client still runs {}. Detach and reattach it to update",
+            "Session updated to croft {own}; a client still runs {}. Detach it (Cmd+K Shift+A) and reattach to update",
             older.join(", ")
         )
     })
@@ -179,6 +186,156 @@ pub fn session_version<'a>(own: &'a str, host: Option<&'a str>) -> &'a str {
     match host {
         Some(h) if version_is_older(own, h) => h,
         _ => own,
+    }
+}
+
+/// How long after `Cmd+K` the second key of the detach chord may arrive,
+/// matching the app's own Cmd+K leader window.
+const DETACH_CHORD_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Watches one client's input for `Cmd+K Shift+A` (Session: Detach, #679).
+/// The host runs it on every client's bytes, including the read-only ones
+/// it drops before the PTY: a read-only participant's keys never reach the
+/// app, and a wedged app cannot act on anyone's, but the host sees both.
+///
+/// The encodings are the ones croft's keyboard flags produce: `Cmd+K`
+/// arrives as the CSI-u `ESC [ 107 ; 9 u` (iTerm2's forwarder and every
+/// kitty-protocol host alike), `Shift+A` as the text `A` (or its CSI-u
+/// form). Mouse reports, focus reports and key releases between the two
+/// keys are not keystrokes and leave the leader armed, as in the app.
+#[derive(Debug, Default)]
+struct DetachChord {
+    /// When `Cmd+K` was pressed, while no other key has followed it yet.
+    armed: Option<Instant>,
+    /// An escape sequence cut off at the end of the previous chunk.
+    partial: Vec<u8>,
+}
+
+/// What one CSI sequence means to [`DetachChord`].
+enum ChordKey {
+    CmdK,
+    ShiftA,
+    /// Not a keypress: mouse, focus, or a key release.
+    Ignore,
+    Other,
+}
+
+/// Classify a complete CSI sequence (`params` between `ESC [` and `last`).
+fn classify_csi(params: &[u8], last: u8) -> ChordKey {
+    match last {
+        b'M' | b'm' if params.first() == Some(&b'<') => return ChordKey::Ignore,
+        b'I' | b'O' if params.is_empty() => return ChordKey::Ignore,
+        b'u' => {}
+        _ => return ChordKey::Other,
+    }
+    let text = String::from_utf8_lossy(params);
+    let mut fields = text.split(';');
+    let code = fields
+        .next()
+        .and_then(|f| f.split(':').next()?.parse::<u32>().ok());
+    let mut mods_field = fields.next().unwrap_or("1").split(':');
+    let mods = mods_field
+        .next()
+        .and_then(|m| m.parse::<u32>().ok())
+        .unwrap_or(1);
+    let event = mods_field
+        .next()
+        .and_then(|e| e.parse::<u32>().ok())
+        .unwrap_or(1);
+    if event == 3 {
+        return ChordKey::Ignore;
+    }
+    // The lock bits (Caps 64, Num 128) do not change which key it is.
+    let held = mods.saturating_sub(1) & !(64 | 128);
+    match (code, held) {
+        (Some(107), 8) => ChordKey::CmdK,
+        (Some(97 | 65), 1) => ChordKey::ShiftA,
+        _ => ChordKey::Other,
+    }
+}
+
+impl DetachChord {
+    /// Feed one chunk of a client's input; true when it completes the chord.
+    fn feed(&mut self, bytes: &[u8], now: Instant) -> bool {
+        let joined;
+        let input: &[u8] = if self.partial.is_empty() {
+            bytes
+        } else {
+            let mut held = std::mem::take(&mut self.partial);
+            held.extend_from_slice(bytes);
+            joined = held;
+            &joined
+        };
+        let mut i = 0;
+        while i < input.len() {
+            let key = if input[i] == 0x1b {
+                // A lone ESC ending a read, or one followed by another ESC,
+                // is the Escape key itself: a terminal writes each key's
+                // sequence whole, so only a CSI or SS3 body is worth
+                // waiting for across reads.
+                if i + 1 == input.len() || input[i + 1] == 0x1b {
+                    i += 1;
+                    ChordKey::Other
+                } else if input[i + 1] == b'O' && i + 2 < input.len() {
+                    // SS3 (application-mode arrows, F1-F4): three bytes,
+                    // whose last must not read as a typed letter.
+                    i += 3;
+                    ChordKey::Other
+                } else if input[i + 1] != b'[' {
+                    // Alt+key (a lone `ESC O` ending a read is Alt+Shift+O).
+                    i += 2;
+                    ChordKey::Other
+                } else {
+                    // CSI body: parameter and intermediate bytes, then one
+                    // final byte. Anything else means the `ESC [` was a key
+                    // of its own (Alt+[), and the next key starts there.
+                    let body = input[i + 2..]
+                        .iter()
+                        .position(|b| !(0x20..=0x3f).contains(b));
+                    match body.map(|len| (len, input[i + 2 + len])) {
+                        Some((len, last)) if (0x40..=0x7e).contains(&last) => {
+                            let params = &input[i + 2..i + 2 + len];
+                            i += 3 + len;
+                            classify_csi(params, last)
+                        }
+                        Some(_) => {
+                            i += 2;
+                            ChordKey::Other
+                        }
+                        None => {
+                            // Unterminated: keep it for the next read, unless
+                            // it is too long to be a key report at all.
+                            if input.len() - i <= 32 {
+                                self.partial = input[i..].to_vec();
+                            }
+                            return false;
+                        }
+                    }
+                }
+            } else {
+                let b = input[i];
+                i += 1;
+                if b == b'A' {
+                    ChordKey::ShiftA
+                } else {
+                    ChordKey::Other
+                }
+            };
+            match key {
+                ChordKey::CmdK => self.armed = Some(now),
+                ChordKey::ShiftA
+                    if self.armed.is_some_and(|t| {
+                        now.saturating_duration_since(t) <= DETACH_CHORD_TIMEOUT
+                    }) =>
+                {
+                    self.armed = None;
+                    return true;
+                }
+                ChordKey::Ignore => {}
+                ChordKey::ShiftA | ChordKey::Other => self.armed = None,
+            }
+        }
+        false
     }
 }
 
@@ -1307,6 +1464,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
     let mut buf = [0u8; 16384];
     let mut my_id: Option<u64> = None;
     let mut privileged = false;
+    let mut detach_chord = DetachChord::default();
     'conn: loop {
         let n = match stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -1458,6 +1616,7 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         let clients = host.clients.lock().unwrap();
                         clients.iter().any(|c| c.id == id && c.control)
                     };
+                    let detach = detach_chord.feed(&bytes, Instant::now());
                     // Server-side enforcement: a read-only client's input
                     // never reaches the PTY (unlike abduco's advisory -r).
                     if has_control {
@@ -1466,6 +1625,15 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                         if pty.write_all(&bytes).and_then(|_| pty.flush()).is_err() {
                             break 'conn;
                         }
+                    }
+                    // Session: Detach (#679). A holder's chord still reached
+                    // the app, whose own handler then finds this client
+                    // already gone; forwarding it keeps the app's Cmd+K
+                    // leader from dangling for the next typist. Shut down
+                    // like a kick: the client learns of it by the EOF.
+                    if detach {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        break 'conn;
                     }
                 }
                 Frame::Control(Control::Resize { cols, rows }) => {
@@ -1488,6 +1656,9 @@ fn client_thread(host: &Host, mut stream: UnixStream) {
                 }
                 Frame::Control(Control::Kick { id: target }) => {
                     kick(host, privileged, my_id, target);
+                }
+                Frame::Control(Control::DetachWriter) if privileged => {
+                    detach_sole_writer(host);
                 }
                 Frame::Control(Control::Claim) => {
                     if let Some(id) = my_id {
@@ -1634,6 +1805,23 @@ fn kick(host: &Host, privileged: bool, requester: Option<u64>, target: u64) {
     }
 }
 
+/// [`Control::DetachWriter`]: kick the sole write-control holder if it is
+/// also the last writer, else nothing.
+fn detach_sole_writer(host: &Host) {
+    let last = *host.last_writer.lock().unwrap();
+    let target = {
+        let clients = host.clients.lock().unwrap();
+        let mut holders = clients.iter().filter(|c| c.control);
+        match (holders.next(), holders.next()) {
+            (Some(only), None) if Some(only.id) == last => Some(only.id),
+            _ => None,
+        }
+    };
+    if let Some(id) = target {
+        kick(host, true, None, id);
+    }
+}
+
 /// dtach `-A` semantics: attach the session on `socket` if it is alive,
 /// otherwise spawn a detached server for `inner` first, then attach.
 pub fn attach_or_create(socket: &Path, workspace: Option<&Path>, inner: &[String]) -> Result<i32> {
@@ -1656,10 +1844,10 @@ pub fn attach_or_create(socket: &Path, workspace: Option<&Path>, inner: &[String
             PumpOutcome::RestartRequested => {
                 kill_stale_server(socket);
             }
-            // attach_client resolves swap handovers internally and returns
-            // Exit when reconnection is exhausted; this arm is exhaustiveness
-            // only.
-            PumpOutcome::HostSwapped => return Ok(0),
+            // attach_client resolves swap handovers and disconnects
+            // internally and returns Exit instead; these arms are
+            // exhaustiveness only.
+            PumpOutcome::HostSwapped | PumpOutcome::Disconnected => return Ok(0),
         }
     }
 }
@@ -1779,6 +1967,10 @@ pub enum PumpOutcome {
     /// connection is about to drop while the socket stays bound. Internal
     /// to the attach loop, which reconnects; callers never see it.
     HostSwapped,
+    /// The connection dropped with no Exit frame: this client was detached
+    /// (Session: Detach or a kick, #679) or the host died. Internal to
+    /// [`attach_client`], which hands the terminal back and reports Exit(0).
+    Disconnected,
 }
 
 /// How long the client waits for [`Control::ServerHello`] after its Hello.
@@ -1832,9 +2024,27 @@ pub fn attach_client(socket: &Path) -> Result<PumpOutcome> {
         .with_context(|| format!("connecting to {}", socket.display()))?;
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     let result = attach_client_loop(socket, &mut stream);
+    let disconnected = matches!(result, Ok(PumpOutcome::Disconnected));
+    if disconnected {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&crate::app::detached_client_restore_seq());
+        let _ = out.flush();
+    }
     let _ = crossterm::terminal::disable_raw_mode();
-    result
+    if !disconnected {
+        return result;
+    }
+    // A live socket means the session outlived this client: a detach, not a
+    // crash. Printed after raw mode is off, into the restored screen.
+    if crate::session::is_alive(socket) {
+        println!("{DETACHED_NOTE}");
+    }
+    Ok(PumpOutcome::Exit(0))
 }
+
+/// The line a detached client leaves in the shell (#679).
+const DETACHED_NOTE: &str =
+    "Detached from the croft session; it keeps running. Attach again to return to it.";
 
 /// Pump the attach, reconnecting across host swaps (#238): a HostSwap frame
 /// means the host is re-execing into the updated binary and the socket
@@ -1849,8 +2059,9 @@ fn attach_client_loop(socket: &Path, stream: &mut UnixStream) -> Result<PumpOutc
             PumpOutcome::HostSwapped => {
                 let Some(fresh) = reconnect_after_swap(socket) else {
                     // The successor never came up: from here the session is
-                    // as gone as a killed server, which is an Exit(0) detach.
-                    return Ok(PumpOutcome::Exit(0));
+                    // as gone as a killed server, and the screen still holds
+                    // the inner croft's modes.
+                    return Ok(PumpOutcome::Disconnected);
                 };
                 *tx.lock().unwrap() = fresh.try_clone().context("cloning socket")?;
                 *stream = fresh;
@@ -2066,7 +2277,7 @@ fn attach_client_pump(
     let mut buf = [0u8; 65536];
     loop {
         let n = match stream.read(&mut buf) {
-            Ok(0) => return Ok(PumpOutcome::Exit(0)),
+            Ok(0) => return Ok(PumpOutcome::Disconnected),
             Ok(n) => n,
             // A read timeout can survive the version phase when clearing it
             // failed (see above): an expiry on a quiet session is "nothing
@@ -2079,7 +2290,7 @@ fn attach_client_pump(
             {
                 continue;
             }
-            Err(_) => return Ok(PumpOutcome::Exit(0)),
+            Err(_) => return Ok(PumpOutcome::Disconnected),
         };
         for frame in reader.push(&buf[..n]) {
             match frame {
@@ -2234,6 +2445,17 @@ impl InnerChannel {
         let ok = write_frame_blocking(
             &mut self.stream,
             &encode_control_frame(&Control::Kick { id }),
+        );
+        self.dead |= !ok;
+        ok
+    }
+
+    /// Ask the host to detach the window that asked (#679): see
+    /// [`Control::DetachWriter`].
+    pub fn detach_writer(&mut self) -> bool {
+        let ok = write_frame_blocking(
+            &mut self.stream,
+            &encode_control_frame(&Control::DetachWriter),
         );
         self.dead |= !ok;
         ok
@@ -3301,6 +3523,139 @@ mod tests {
         drop(ghost);
     }
 
+    /// #679: the host's detach chord, as croft's keyboard flags encode it.
+    #[test]
+    fn detach_chord_fires_on_cmd_k_then_shift_a() {
+        let now = Instant::now();
+        let mut chord = DetachChord::default();
+        assert!(chord.feed(b"\x1b[107;9uA", now));
+
+        // Event-type suffixes (REPORT_EVENT_TYPES): the press arms, the
+        // release in between is not a keystroke.
+        let mut chord = DetachChord::default();
+        assert!(chord.feed(b"\x1b[107;9:1u\x1b[107;9:3uA", now));
+
+        // Caps Lock (bit 64) does not change which key it is; nor does
+        // Shift+A in its CSI-u form.
+        let mut chord = DetachChord::default();
+        assert!(chord.feed(b"\x1b[107;73u\x1b[97;2u", now));
+    }
+
+    #[test]
+    fn detach_chord_survives_split_reads_and_mouse_reports() {
+        let now = Instant::now();
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b[10", now));
+        assert!(!chord.feed(b"7;9u", now));
+        // Motion tracking reports the pointer between the two keys.
+        assert!(!chord.feed(b"\x1b[<35;10;5M\x1b[I", now));
+        assert!(chord.feed(b"A", now));
+    }
+
+    /// A bare Escape keypress arrives as a lone ESC in its own read (legacy
+    /// encoding, or a terminal without kitty flags). It is a whole key, not
+    /// the start of a split sequence, and must not swallow the next chord.
+    #[test]
+    fn detach_chord_after_a_bare_escape_key() {
+        let now = Instant::now();
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b", now));
+        assert!(chord.feed(b"\x1b[107;9uA", now));
+        let mut chord = DetachChord::default();
+        assert!(
+            chord.feed(b"\x1b\x1b[107;9uA", now),
+            "Escape, then the chord"
+        );
+        // A CSI-u Shift+A carrying its shifted key as an alternate.
+        let mut chord = DetachChord::default();
+        assert!(chord.feed(b"\x1b[107;9u\x1b[97:65;2u", now));
+        // Alt+Shift+O and Alt+[ each ending a read are whole keys too.
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1bO", now));
+        assert!(chord.feed(b"\x1b[107;9uA", now));
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b[", now));
+        assert!(chord.feed(b"\x1b[107;9uA", now));
+    }
+
+    #[test]
+    fn detach_chord_ignores_near_misses() {
+        let now = Instant::now();
+        // Cmd+K A (lowercase) is Session: Participants, not detach.
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b[107;9ua", now));
+        // Cmd+K Up in application cursor mode ends in an `A` byte.
+        assert!(!chord.feed(b"\x1b[107;9u\x1bOA", now));
+        // A bare A, and an A after some other key, are typing.
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"A", now));
+        assert!(!chord.feed(b"\x1b[107;9uxA", now));
+        // A paste after Cmd+K is not a keypress, even when it holds an A.
+        assert!(!chord.feed(b"\x1b[107;9u\x1b[200~A\x1b[201~", now));
+        // Cmd+Hyper+K is some other chord.
+        assert!(!chord.feed(b"\x1b[107;25uA", now));
+        // Ctrl+K is kill-to-end-of-line, not the leader.
+        assert!(!chord.feed(b"\x1b[107;5uD", now));
+        assert!(!chord.feed(b"\x0bA", now));
+        // The leader lapses like the app's.
+        let mut chord = DetachChord::default();
+        assert!(!chord.feed(b"\x1b[107;9u", now));
+        assert!(!chord.feed(b"A", now + DETACH_CHORD_TIMEOUT + Duration::from_millis(1)));
+    }
+
+    /// #679: a read-only participant's keys never reach the app, so the host
+    /// itself detaches them on Cmd+K Shift+A; the holder stays on.
+    #[test]
+    fn read_only_participant_detaches_with_the_chord() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut owner = TestClient::connect(&socket, "owner", 80, 24);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut guest = TestClient::connect(&socket, "guest", 80, 24);
+        let frames = owner.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let ps = roster(&frames).unwrap();
+        assert!(
+            !ps.iter().find(|p| p.name == "guest").unwrap().control,
+            "the second attacher is read-only"
+        );
+
+        guest.send(&encode_bytes_frame(b"\x1b[107;9uA"));
+        let frames = owner.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
+        });
+        let ps = roster(&frames).unwrap();
+        assert_eq!(ps[0].name, "owner", "only the guest detached");
+    }
+
+    #[test]
+    fn write_control_holder_detaches_with_the_chord() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+
+        let mut owner = TestClient::connect(&socket, "owner", 80, 24);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut guest = TestClient::connect(&socket, "guest", 80, 24);
+        guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+
+        // Split across two frames, as two separate keypresses arrive.
+        owner.send(&encode_bytes_frame(b"\x1b[107;9u"));
+        owner.send(&encode_bytes_frame(b"A"));
+        let frames = guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
+        });
+        let ps = roster(&frames).unwrap();
+        assert_eq!(ps[0].name, "guest", "only the owner detached");
+    }
+
     #[test]
     fn control_moves_to_next_attacher_after_holder_detaches() {
         let dir = tempfile::tempdir().unwrap();
@@ -3672,6 +4027,132 @@ mod tests {
         a.read_until(|f| {
             matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 1)
         });
+    }
+
+    /// Two clients with the owner holding control; returns them with the
+    /// owner's and guest's ids and an authenticated inner channel.
+    fn owner_and_guest(socket: &Path) -> (TestClient, TestClient, (u64, u64), InnerChannel) {
+        let mut owner = TestClient::connect(socket, "owner", 80, 24);
+        owner.read_until(|f| matches!(f, Frame::Control(Control::Presence { .. })));
+        let mut guest = TestClient::connect(socket, "guest", 80, 24);
+        let frames = guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == 2)
+        });
+        let ps = roster(&frames).unwrap();
+        let id_of = |name: &str| ps.iter().find(|p| p.name == name).unwrap().id;
+        let ids = (id_of("owner"), id_of("guest"));
+        let channel = InnerChannel::connect(socket, TEST_TOKEN).expect("channel");
+        (owner, guest, ids, channel)
+    }
+
+    /// Block until the channel sees a typing marker: proof the host has
+    /// taken in the bytes that caused it.
+    fn await_typing(channel: &mut InnerChannel) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(id) = channel.drain_typing().last().copied() {
+                return id;
+            }
+            assert!(Instant::now() < deadline, "no typing marker arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Assert `client`'s connection stays open for a second: a kick shows up
+    /// as EOF on its own socket, whatever the roster says meanwhile.
+    fn assert_still_attached(client: &mut TestClient, why: &str) {
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut buf = [0u8; 65536];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match client.stream.read(&mut buf) {
+                Ok(0) => panic!("{why}"),
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("{why}: {e}"),
+            }
+        }
+    }
+
+    /// Wait for a roster of `len` on `client` and return it.
+    fn roster_of_len(client: &mut TestClient, len: usize) -> Vec<Participant> {
+        let frames = client.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants }) if participants.len() == len)
+        });
+        roster(&frames).unwrap()
+    }
+
+    /// #679, palette Session: Detach: the host, whose roster is live,
+    /// detaches its sole write-control holder when that holder wrote last.
+    #[test]
+    fn detach_writer_detaches_the_sole_holder_that_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let (mut owner, mut guest, (owner_id, _), mut channel) = owner_and_guest(&socket);
+
+        owner.send(&encode_bytes_frame(b"\r"));
+        assert_eq!(await_typing(&mut channel), owner_id);
+        assert!(channel.detach_writer());
+        let ps = roster_of_len(&mut guest, 1);
+        assert_eq!(ps[0].name, "guest", "only the owner detached");
+    }
+
+    /// With two holders the host cannot tell which one asked: nothing
+    /// happens. The grant that follows on the same channel is ordered after
+    /// the request, so its roster shows whether the request acted.
+    #[test]
+    fn detach_writer_refuses_when_several_hold_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let (mut owner, mut guest, (owner_id, guest_id), mut channel) = owner_and_guest(&socket);
+
+        assert!(channel.set_control(guest_id, true));
+        guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().all(|p| p.control))
+        });
+        owner.send(&encode_bytes_frame(b"\r"));
+        assert_eq!(await_typing(&mut channel), owner_id);
+        assert!(channel.detach_writer());
+        assert_still_attached(&mut owner, "the owner was detached with two holders");
+        assert_still_attached(&mut guest, "the guest was detached with two holders");
+    }
+
+    /// A sole holder who is not the last writer did not ask: the writer lost
+    /// control since, so the request is refused rather than hitting them.
+    #[test]
+    fn detach_writer_refuses_a_holder_that_did_not_write_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let _server = spawn_test_server(socket.clone());
+        wait_alive(&socket);
+        let (mut owner, mut guest, (owner_id, guest_id), mut channel) = owner_and_guest(&socket);
+
+        owner.send(&encode_bytes_frame(b"\r"));
+        assert_eq!(await_typing(&mut channel), owner_id);
+        assert!(channel.set_control(guest_id, true));
+        assert!(channel.set_control(owner_id, false));
+        guest.read_until(|f| {
+            matches!(f, Frame::Control(Control::Presence { participants })
+                if participants.iter().any(|p| p.name == "owner" && !p.control))
+        });
+        assert!(channel.detach_writer());
+        assert_still_attached(
+            &mut guest,
+            "the sole holder was detached without writing last",
+        );
+        assert_still_attached(&mut owner, "the former writer was detached");
     }
 
     #[test]
