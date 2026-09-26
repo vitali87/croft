@@ -6393,13 +6393,14 @@ impl App {
     /// into its OR chain), forgets the emit positions, and skips painting
     /// this frame; the next frame clears, full-redraws, and re-emits a single
     /// clean set at the new cells.
-    pub fn flush_activity_image_overlays(&mut self) {
+    pub fn flush_activity_image_overlays(&mut self, around: u64) {
         use std::io::Write;
         // The keepalive re-emit fights iTerm2's image-cache eviction. Neither
         // the sixel cell buffer nor Kitty's image layer evicts, so there the
         // icons re-emit only when dirty: on Kitty the keepalive cost about
         // 13 KB every two seconds, idle, over SSH (#682).
-        let allow_keepalive = self.activity_keepalive_allowed();
+        let allow_keepalive = self.activity_keepalive_allowed()
+            && self.overlays.activity.neighbourhood_changed(around);
         if !self.overlays.activity.should_refresh(allow_keepalive) {
             return;
         }
@@ -6443,6 +6444,7 @@ impl App {
         let _ = out.flush();
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
+        self.overlays.activity.set_neighbourhood(around);
     }
 
     /// Whether a post-draw overlay at this cell rect may be emitted (#513).
@@ -53923,6 +53925,8 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
 /// Fingerprints of the text cells under each large post-frame image this
 /// frame (see [`overlay::ImageOverlay::needs_emit`]).
 struct ImageUnderlays {
+    /// Around the activity-bar and toolbar icons, for iTerm2's keepalive.
+    activity: u64,
     editor: [u64; 2],
     terminal: u64,
     markdown: u64,
@@ -53952,6 +53956,15 @@ fn cells_fingerprint(buf: &ratatui::buffer::Buffer, x: u16, y: u16, w: u16, h: u
 impl App {
     /// This frame's [`ImageUnderlays`], read from the buffer just drawn.
     fn image_underlays(&self, buf: &ratatui::buffer::Buffer) -> ImageUnderlays {
+        // A one-cell ring around each icon's block (the widest is 4x2).
+        let activity = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for &(x, y) in self.overlays.activity.last_positions() {
+                cells_fingerprint(buf, x.saturating_sub(1), y.saturating_sub(1), 6, 4).hash(&mut h);
+            }
+            h.finish()
+        };
         // Kitty keeps pictures on their own layer: text written into the
         // cells never deletes a placement (only a delete command or a screen
         // clear does, and both forget what was sent). So on Kitty the cells
@@ -53959,6 +53972,7 @@ impl App {
         // nothing.
         if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
             return ImageUnderlays {
+                activity,
                 editor: [0, 0],
                 terminal: 0,
                 markdown: 0,
@@ -53972,6 +53986,7 @@ impl App {
             })
         };
         ImageUnderlays {
+            activity,
             editor: [editor(0), editor(1)],
             terminal: o.terminal_image.layout().map_or(0, |l| {
                 cells_fingerprint(buf, l.cell_x, l.cell_y, l.cell_w, l.cell_h)
@@ -54384,7 +54399,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // buffer in image-mode, ratatui's diff produces zero per-cell
             // writes here — re-emitting the pre-encoded OSC bytes every
             // frame is cheap and locks the images in.
-            app.flush_activity_image_overlays();
+            app.flush_activity_image_overlays(underlays.activity);
             // Active editor image preview: baked once, and sent after
             // ratatui's diff only when it could be missing from the screen
             // (`ImageOverlay::needs_emit`), never on every frame: a picture

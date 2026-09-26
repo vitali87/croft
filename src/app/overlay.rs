@@ -275,6 +275,10 @@ pub struct ActivityOverlay {
     /// shift (terminal resize, or any change that recenters the bar) and
     /// evict iTerm2's stale OSC-1337 image layer before re-emitting.
     last_positions: Vec<(u16, u16)>,
+    /// Fingerprint of the cells around the icons when they were last sent:
+    /// iTerm2 only evicts an icon under traffic next to it, so the
+    /// keepalive runs only after those cells changed (#682).
+    neighbourhood: Option<u64>,
     clear: ClearLatch,
 }
 
@@ -314,6 +318,20 @@ impl ActivityOverlay {
     pub fn mark_emitted(&mut self) {
         self.dirty = false;
         self.last_emit = Some(std::time::Instant::now());
+    }
+
+    /// Whether the cells around the icons changed since they were sent.
+    pub fn neighbourhood_changed(&self, around: u64) -> bool {
+        self.neighbourhood != Some(around)
+    }
+
+    pub fn set_neighbourhood(&mut self, around: u64) {
+        self.neighbourhood = Some(around);
+    }
+
+    /// Where the icons were last painted.
+    pub fn last_positions(&self) -> &[(u16, u16)] {
+        &self.last_positions
     }
 
     /// Arm a one-shot `terminal.clear()` (consumed by the main loop's clear
@@ -381,7 +399,17 @@ pub struct OverlayManager {
 
 #[cfg(test)]
 mod tests {
-    use super::ImageOverlay;
+    use super::{ActivityOverlay, ImageOverlay};
+
+    /// #682: iTerm2's icon keepalive waits for traffic next to the icons.
+    #[test]
+    fn the_icon_keepalive_waits_for_the_cells_around_the_icons_to_change() {
+        let mut a = ActivityOverlay::default();
+        assert!(a.neighbourhood_changed(1), "never sent");
+        a.set_neighbourhood(1);
+        assert!(!a.neighbourhood_changed(1), "idle: nothing to outlast");
+        assert!(a.neighbourhood_changed(2), "a neighbour was repainted");
+    }
 
     /// #682: a large image is sent once and then only when it could be
     /// missing: replaced, moved, written over, wiped or held back.

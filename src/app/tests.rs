@@ -11728,7 +11728,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     // First emit at one layout: records the positions, arms no clear.
     place(&mut app, 2);
     app.overlays.activity.mark_dirty();
-    app.flush_activity_image_overlays();
+    app.flush_activity_image_overlays(0);
     assert!(
         !app.consume_activity_image_clear(),
         "the first emit has no prior positions to compare, so it must not arm a clear",
@@ -11736,7 +11736,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     // A resize recenters the bar — every icon row shifts by one.
     place(&mut app, 3);
     app.overlays.activity.mark_dirty();
-    app.flush_activity_image_overlays();
+    app.flush_activity_image_overlays(0);
     assert!(
         app.consume_activity_image_clear(),
         "icons that moved since the last emit must arm one terminal.clear() to evict the stale image layer",
