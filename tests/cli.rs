@@ -659,3 +659,25 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
         "20 keystrokes wrote {typed} bytes: images are being re-sent per frame"
     );
 }
+
+/// #621: a locale as `$LANG` spells it (`de_DE.UTF-8`) seeds the template
+/// from the German catalog and names the file croft will load.
+#[test]
+fn locale_template_accepts_a_full_locale() {
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .args(["locale-template", "de_DE.UTF-8"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let catalog: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let filled = catalog
+        .as_object()
+        .unwrap()
+        .values()
+        .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        .count();
+    assert!(filled > 0, "the built-in German entries seed it");
+    assert!(stderr.contains("locales/de.json"), "{stderr}");
+}

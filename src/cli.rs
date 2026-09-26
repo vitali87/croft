@@ -604,7 +604,17 @@ impl Cli {
                 Ok(())
             }
             Some(CliCommand::LocaleTemplate { lang }) => {
-                println!("{}", crate::i18n::template(&lang.to_ascii_lowercase(), &[]));
+                // The language croft loads for this locale: `de_DE.UTF-8` and
+                // `de-DE` both read `locales/de.json`, whose built-in catalog
+                // seeds the template.
+                let Some(code) = crate::i18n::language_of(&lang) else {
+                    eprintln!(
+                        "croft locale-template: {lang} names no language croft translates to (English is built in)"
+                    );
+                    std::process::exit(1);
+                };
+                eprintln!("Save this as locales/{code}.json in croft's config directory.");
+                println!("{}", crate::i18n::template(&code, &[]));
                 Ok(())
             }
             Some(CliCommand::Devcontainer { path, rebuild }) => {
