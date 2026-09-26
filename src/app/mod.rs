@@ -3152,6 +3152,10 @@ pub struct App {
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
     view_listener: Option<std::os::unix::net::UnixListener>,
+    /// How long one frame may spend serving `croft view` clients (see
+    /// `drain_view_requests`). A field so a test on a loaded machine can
+    /// stretch it: the fixed 20ms is shorter than one file open there.
+    view_drain_budget: std::time::Duration,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -5071,6 +5075,7 @@ impl App {
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
             view_listener,
+            view_drain_budget: std::time::Duration::from_millis(20),
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -34029,7 +34034,7 @@ impl App {
         if self.view_listener.is_none() {
             return false;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let deadline = std::time::Instant::now() + self.view_drain_budget;
         let mut changed = false;
         loop {
             // Do not accept what we cannot serve. `read_line_by_deadline`

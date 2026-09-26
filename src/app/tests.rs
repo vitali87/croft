@@ -49939,17 +49939,20 @@ fn one_drain_answers_every_client_already_waiting() {
     std::fs::write(&first, "one").unwrap();
     std::fs::write(&second, "two").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Production's 20ms is shorter than one file open under a loaded full
+    // suite, and then the drain rightly defers client 1 to the next frame.
+    // Stretched, a drain that stops after the first client still fails.
+    app.view_drain_budget =
+        crate::test_budget::spawn_budget(crate::test_budget::tests::VIEW_DRAIN_BASE);
     let sock = seat_view_listener(&mut app, tmp.path());
 
     let mut clients = Vec::new();
     for target in [&first, &second] {
         let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
-        // A read timeout, so losing FAILS rather than hangs. Whether both are
-        // served in one drain rests on production's 20ms budget, which no
-        // test scale can stretch: if the first open costs most of it, the
-        // drain returns having served client 0, the assert below still passes
-        // because something opened, and an untimed `read_line` on client 1
-        // blocks forever. That is a CI timeout with no message, which two
+        // A read timeout, so losing FAILS rather than hangs: a drain that
+        // serves only client 0 still passes the assert below, because
+        // something opened, and an untimed `read_line` on client 1 would then
+        // block forever. That is a CI timeout with no message, which two
         // other tests in this file go out of their way to avoid.
         c.set_read_timeout(Some(crate::test_budget::spawn_budget(
             crate::test_budget::tests::VIEW_DRAIN_BASE,
