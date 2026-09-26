@@ -35954,8 +35954,17 @@ impl App {
     /// second, which then times out with its tunnel already up.
     fn relay_request_id(kind: &str) -> String {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // A per-run nonce as well as the pid: claims outlive the process in
+        // the relay dir, and a later croft reusing this pid (after a reboot,
+        // in a container) would find every one of its ids already claimed.
+        static NONCE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        let nonce = NONCE.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        });
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{kind}-{}-{n}", std::process::id())
+        format!("{kind}-{}-{nonce:x}-{n}", std::process::id())
     }
 
     /// Ask the local launcher (via the drop relay) to forward `port` home over
@@ -44464,7 +44473,9 @@ impl App {
             )
             .any(|t| t.path.as_deref().is_some_and(is_it));
         if open {
-            crate::view_ipc::ViewReply::Ok
+            crate::view_ipc::ViewReply::Err {
+                message: String::from(crate::view_ipc::PROBE_OPEN),
+            }
         } else {
             crate::view_ipc::ViewReply::Err {
                 message: String::from(crate::view_ipc::PROBE_CLOSED),

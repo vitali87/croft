@@ -647,6 +647,11 @@ fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> anyhow::Result<Vec<u8>>
 /// The reply to a probe whose file is no longer open in any tab (#620).
 pub const PROBE_CLOSED: &str = "closed";
 
+/// The reply to a probe whose file is still open. Not `Ok`: a croft from
+/// before probes ignores the flag, re-opens the file and answers `Ok`, and
+/// `edit --wait` must tell that apart from "still open" or it waits forever.
+pub const PROBE_OPEN: &str = "open";
+
 /// How often `croft edit --wait` asks whether its tab is still open.
 const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -667,10 +672,41 @@ pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::R
     let probe = ViewRequest::probe(&path);
     loop {
         std::thread::sleep(WAIT_POLL);
-        match send(Path::new(&socket), &probe) {
-            Ok(ViewReply::Ok) => continue,
-            Ok(ViewReply::Err { .. }) | Err(_) => return Ok(()),
+        match wait_step(send(Path::new(&socket), &probe)) {
+            WaitStep::Poll => continue,
+            WaitStep::Closed => return Ok(()),
+            WaitStep::CannotWait => anyhow::bail!(
+                "the croft hosting this pane is older than `croft edit --wait`; restart it (F9) and try again"
+            ),
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WaitStep {
+    Poll,
+    Closed,
+    CannotWait,
+}
+
+/// What one probe reply means to `edit --wait`. Only a definite answer ends
+/// the wait: the tab closed, or croft is gone. A busy frame, a slow reply or
+/// any other refusal is asked again, because returning early lets git run
+/// the plan the user is still editing.
+fn wait_step(reply: std::io::Result<ViewReply>) -> WaitStep {
+    use std::io::ErrorKind as K;
+    match reply {
+        Ok(ViewReply::Err { message }) if message == PROBE_CLOSED => WaitStep::Closed,
+        Ok(ViewReply::Ok) => WaitStep::CannotWait,
+        Ok(ViewReply::Err { .. }) => WaitStep::Poll,
+        Err(e) => match e.kind() {
+            K::NotFound
+            | K::ConnectionRefused
+            | K::ConnectionReset
+            | K::BrokenPipe
+            | K::UnexpectedEof => WaitStep::Closed,
+            _ => WaitStep::Poll,
+        },
     }
 }
 
@@ -742,6 +778,35 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_closed_tab_or_a_gone_croft_ends_edit_wait() {
+        use std::io::{Error, ErrorKind};
+        let err = |m: &str| {
+            Ok(ViewReply::Err {
+                message: m.to_string(),
+            })
+        };
+        assert_eq!(wait_step(err(PROBE_CLOSED)), WaitStep::Closed);
+        assert_eq!(wait_step(err(PROBE_OPEN)), WaitStep::Poll);
+        assert_eq!(
+            wait_step(err(&format!("unreadable request: {FRAME_BUDGET_REFUSAL}"))),
+            WaitStep::Poll
+        );
+        assert_eq!(
+            wait_step(Err(Error::from(ErrorKind::TimedOut))),
+            WaitStep::Poll
+        );
+        assert_eq!(
+            wait_step(Err(Error::from(ErrorKind::WouldBlock))),
+            WaitStep::Poll
+        );
+        assert_eq!(
+            wait_step(Err(Error::from(ErrorKind::ConnectionRefused))),
+            WaitStep::Closed
+        );
+        assert_eq!(wait_step(Ok(ViewReply::Ok)), WaitStep::CannotWait);
+    }
 
     #[test]
     fn a_relative_argument_resolves_against_the_clients_cwd_not_the_servers() {

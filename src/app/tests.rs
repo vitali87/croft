@@ -51393,7 +51393,12 @@ fn a_probe_reports_whether_the_file_is_still_open() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", "pick a b\n");
     let path = app.editor.path.clone().unwrap();
-    assert_eq!(app.probe_view_path(&path), crate::view_ipc::ViewReply::Ok);
+    assert_eq!(
+        app.probe_view_path(&path),
+        crate::view_ipc::ViewReply::Err {
+            message: String::from(crate::view_ipc::PROBE_OPEN)
+        }
+    );
     app.run_command(crate::widgets::command_palette::Command::CloseEditor);
     assert!(matches!(
         app.probe_view_path(&path),
