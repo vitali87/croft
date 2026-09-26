@@ -115,6 +115,18 @@ pub const TABLE: &[Mapping] = &[
         note: "clangd ships built in",
     },
     Mapping {
+        vscode: "sumneko.lua",
+        croft: "lsp-lua",
+        status: Status::Builtin,
+        note: "lua-language-server ships built in",
+    },
+    Mapping {
+        vscode: "luals.lua-language-server",
+        croft: "lsp-lua",
+        status: Status::Builtin,
+        note: "lua-language-server ships built in",
+    },
+    Mapping {
         vscode: "ms-vscode.cmake-tools",
         croft: "",
         status: Status::None,

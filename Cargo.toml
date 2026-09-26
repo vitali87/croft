@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.979"
+version = "0.1.1030"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -68,6 +68,7 @@ tree-sitter-html = "0.23"
 tree-sitter-xml = "0.7"
 tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
+tree-sitter-lua = "0.5"
 
 # CommonMark parser behind the rendered Markdown preview (Cmd+Shift+V).
 # rustdoc / mdBook's engine; parser only, no HTML output needed.
@@ -159,7 +160,7 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # 3.3.0 verified current on crates.io 2026-07-31.
 ureq3 = { package = "ureq", version = "3", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # Text CRDT for multiplayer Phase D (independent viewports): tracks concurrent
 # edit positions so two participants can edit the same buffer without a central
 # authority. Operation-based, byte-offset model, app owns the text (croft keeps
