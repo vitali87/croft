@@ -137,6 +137,11 @@ pub enum CliCommand {
         /// joining the shared screen (see `croft attach --solo`).
         #[arg(long, default_value_t = false)]
         solo: bool,
+        /// Build croft for the remote from this source tree instead of
+        /// installing the matching release binary (#261): for a local tree
+        /// ahead of the latest release.
+        #[arg(long, default_value_t = false)]
+        build: bool,
     },
     /// Attach to (or create) a persistent local session for a workspace, so its
     /// terminals, LSP, DAP, and editor state survive closing the window. Detach
@@ -466,7 +471,14 @@ impl Cli {
                 size,
                 yes,
             }) => setup_iterm2(&font, &nonascii, size, yes),
-            Some(CliCommand::Remote { host, path, solo }) => {
+            Some(CliCommand::Remote {
+                host,
+                path,
+                solo,
+                build,
+            }) => {
+                crate::remote::FORCE_SOURCE_BUILD
+                    .store(build, std::sync::atomic::Ordering::Relaxed);
                 match crate::remote::launch_croft(&host, path.as_deref(), solo)? {
                     crate::remote::RemoteOutcome::ReturnToLocal => {
                         let cwd = std::env::current_dir().context("resolving workspace path")?;
@@ -2292,7 +2304,16 @@ mod tests {
         let cli = Cli::parse_from(["croft", "remote", "reasoner"]);
         assert!(matches!(
             cli.command,
-            Some(CliCommand::Remote { solo: false, .. })
+            Some(CliCommand::Remote {
+                solo: false,
+                build: false,
+                ..
+            })
+        ));
+        let cli = Cli::parse_from(["croft", "remote", "reasoner", "--build"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Remote { build: true, .. })
         ));
     }
 

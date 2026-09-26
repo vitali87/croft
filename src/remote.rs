@@ -646,6 +646,23 @@ fn install_remote_croft_streaming(
     log_tx: &std::sync::mpsc::Sender<String>,
     confirm_fallback: &mut dyn FnMut(&str) -> bool,
 ) -> Result<()> {
+    // The release binary first (#261), over the same bulk lane.
+    let mut ship = |binary: &Path| -> Result<()> {
+        let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
+        let status = ship_file_rsync_command(lane, &ssh.socket_path, binary, &dest)
+            .status()
+            .context("rsyncing the prebuilt croft to the remote")?;
+        anyhow::ensure!(status.success(), "rsync exited with {status}");
+        Ok(())
+    };
+    let mut log = |m: String| {
+        let _ = log_tx.send(m);
+    };
+    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut log) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => log(format!("Prebuilt install failed ({e:#}); building instead")),
+    }
     let reason = match try_local_cross_install_streaming(ssh, lane, source_stamp, log_tx) {
         Ok(None) => return Ok(()),
         Ok(Some(reason)) => reason,
@@ -1932,6 +1949,30 @@ fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
     // but it never engages silently: the user confirms it on the tty
     // first, because quitting to run `croft setup-cross` once is almost
     // always the better deal.
+    //
+    // Before either: the release binary for this exact version (#261), when
+    // this croft IS that release.
+    let mut ship = |binary: &Path| -> Result<()> {
+        let ssh_e = format!(
+            "ssh -S {} -o ControlMaster=no",
+            shell_quote_for_e_arg(&ssh.socket_path),
+        );
+        let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
+        let status = Command::new("rsync")
+            .args(["-az", "--checksum", "-e"])
+            .arg(&ssh_e)
+            .arg(binary)
+            .arg(&dest)
+            .status()
+            .context("rsyncing the prebuilt croft to the remote")?;
+        anyhow::ensure!(status.success(), "rsync exited with {status}");
+        Ok(())
+    };
+    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut |m| println!("{m}")) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => eprintln!("Prebuilt install failed ({e:#}); building instead"),
+    }
     let reason = match try_local_cross_install(ssh, source_stamp) {
         Ok(None) => return Ok(()),
         Ok(Some(reason)) => reason,
@@ -2388,6 +2429,86 @@ fn source_sync_rsync_command(
     rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));
     rsync.arg(source_arg).arg(dest);
     rsync
+}
+
+/// Set by `croft remote --build` (#261): skip the prebuilt release binary
+/// and build from source, for a source tree ahead of the latest release.
+pub(crate) static FORCE_SOURCE_BUILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The prebuilt fast path (#261): when this croft was installed from
+/// crates.io, ship the release binary for its exact version and the remote's
+/// target instead of building one. `Ok(true)` = installed; `Ok(false)` = not
+/// applicable (said why); `Err` = attempted and broke. The caller falls back
+/// to the cross-build either way. `ship` copies a local binary to the
+/// remote's `~/.cargo/bin/croft.new` over whichever transport the caller has.
+fn try_prebuilt_install(
+    ssh: &SshControl,
+    source_stamp: &str,
+    ship: &mut dyn FnMut(&Path) -> Result<()>,
+    log: &mut dyn FnMut(String),
+) -> Result<bool> {
+    if FORCE_SOURCE_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
+        log(String::from(
+            "Prebuilt install skipped: --build asked for a source build",
+        ));
+        return Ok(false);
+    }
+    if !crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")) {
+        log(String::from(
+            "Prebuilt install skipped: this croft is a source build, so the remote gets the same source",
+        ));
+        return Ok(false);
+    }
+    let Some(triple) = remote_target_triple(ssh)? else {
+        log(String::from(
+            "Prebuilt install skipped: no release for the remote's architecture",
+        ));
+        return Ok(false);
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let cache = crate::session_state::dirs_cache_croft().join("prebuilt");
+    let binary = match crate::remote_prebuilt::prepare(
+        version,
+        triple,
+        &cache,
+        &crate::remote_prebuilt::http_get,
+    ) {
+        Ok(b) => b,
+        // Not every version has release artifacts; that is a plain skip,
+        // not a failure to shout about on every connect.
+        Err(e) if crate::remote_prebuilt::is_not_published(&e) => {
+            log(format!(
+                "Prebuilt install skipped: v{version} has no release binary for {triple}"
+            ));
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    let size_mb = std::fs::metadata(&binary).map(|m| m.len()).unwrap_or(0) as f64 / 1e6;
+    log(format!(
+        "Installing prebuilt croft v{version} for {triple} ({size_mb:.0} MB) over SSH"
+    ));
+    let mkdir = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"")
+        .status()
+        .context("creating remote install dirs")?;
+    anyhow::ensure!(mkdir.success(), "remote mkdir exited with {mkdir}");
+    ship(&binary)?;
+    let activate = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg(activate_command(source_stamp))
+        .status()
+        .context("activating the prebuilt croft on the remote")?;
+    anyhow::ensure!(
+        activate.success(),
+        "remote activation exited with {activate}"
+    );
+    log(format!("Installed prebuilt croft v{version} on the remote"));
+    Ok(true)
 }
 
 fn remote_target_triple(ssh: &SshControl) -> Result<Option<&'static str>> {
