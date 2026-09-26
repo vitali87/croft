@@ -151,11 +151,11 @@ host  tty ── croft attach ──┘        (one accept loop,          (uncha
   it runs the typist may be another holder. The palette entry "Session:
   Detach" does go through the inner croft, kicking the current typist over
   the privileged channel. The host matches the Cmd form only (`CSI 107;9u`),
-  not Termux's Ctrl stand-in, where Ctrl+K is kill-to-end-of-line. On an
-  EOF with no
-  `exit` frame the attach client writes the inverse of croft's takeover
-  modes (the inner croft never sends its teardown to a client it no longer
-  serves) and, if the socket is still live, a one-line "detached" note.
+  not Termux's Ctrl stand-in, where Ctrl+K is kill-to-end-of-line. On an EOF
+  with no `exit` frame the attach client writes the inverse of croft's
+  takeover modes (the inner croft never sends its teardown to a client it no
+  longer serves) and, if the socket is still live, a one-line "detached"
+  note.
 
 ### How the inner croft learns about participants
 

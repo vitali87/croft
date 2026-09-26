@@ -24425,7 +24425,7 @@ impl App {
         if !self.session_host_stale_seen && channel.stale_marker.exists() {
             self.session_host_stale_seen = true;
             self.status = String::from(
-                "Session host runs a pre-update binary; every participant detaches (Cmd+K Shift+A) and reattaches to pick up the update",
+                "Session host runs a pre-update binary; every participant runs Session: Detach from the palette and reattaches to pick up the update",
             );
         }
         let path = channel.presence.clone();
