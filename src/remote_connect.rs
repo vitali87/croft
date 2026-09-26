@@ -45,8 +45,6 @@ pub struct SshAuth {
 impl SshAuth {
     pub fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir().context("ssh control dir")?;
-        std::fs::create_dir_all(&socket_dir)
-            .with_context(|| format!("creating {}", socket_dir.display()))?;
         let socket_path = socket_dir.join("ctl");
 
         let pty_system = native_pty_system();

@@ -28650,12 +28650,24 @@ impl App {
     /// The PR number for `root`'s branch, remembered for the write side, or
     /// `None` with the reason in the status bar.
     fn review_pr_number(&mut self, root: &Path) -> Option<String> {
-        let out = std::process::Command::new(&self.review_gh)
-            .args(["pr", "view", "--json", "number", "--jq", ".number"])
-            .current_dir(root)
-            .output();
+        // The PR already loaded for this root, when there is one: this runs
+        // on the UI thread for every comment and submit, and asking GitHub
+        // each time froze croft on a slow network or a gh auth prompt.
+        if let Some((r, number)) = &self.review_pr
+            && r == root
+        {
+            return Some(number.clone());
+        }
+        let out = bounded_output(
+            std::process::Command::new(&self.review_gh)
+                .args(["pr", "view", "--json", "number", "--jq", ".number"])
+                .current_dir(root),
+            std::time::Duration::from_secs(5),
+        );
         let number = match out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Some((status, stdout)) if status.success() => {
+                String::from_utf8_lossy(&stdout).trim().to_string()
+            }
             _ => {
                 self.status = String::from("No PR for this branch — check it out first");
                 return None;
@@ -50797,8 +50809,22 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// through a quoted heredoc so the block runs whole. The terminator is
 /// chosen not to occur in the block, or a line inside it could close the
 /// heredoc early and hand the rest to the shell.
+///
+/// A block holding a tab or `!` goes as one single-quoted `printf '%b'`
+/// argument instead: typed into an interactive shell, a tab is completion
+/// (a python block lost its indentation) and bash expands `!` in a heredoc
+/// body as history, so what ran was not what the confirm popup showed.
+/// Inside single quotes neither happens, and the tab travels as `\t`.
 fn fence_command(interpreter: &str, code: &str) -> String {
     let code = code.trim_end_matches('\n');
+    if code.contains(['\t', '!']) {
+        let escaped = format!("{code}\n")
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+            .replace('\'', "'\\''");
+        return format!("printf '%b' '{escaped}' | {interpreter}\r");
+    }
     match interpreter {
         "sh" => format!("{code}\r"),
         other => {
@@ -53119,6 +53145,44 @@ fn remote_persistence_status(is_remote: bool, persistent: bool) -> Option<&'stat
 #[cfg(test)]
 pub static CACHE_DIR_OVERRIDE_FOR_TEST: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
+
+/// Run `cmd` for at most `budget`, collecting stdout; None when it could not
+/// start or ran out of time (it is then killed and reaped). For the few
+/// short commands that still run on the UI thread.
+fn bounded_output(
+    cmd: &mut std::process::Command,
+    budget: std::time::Duration,
+) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + budget;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let bytes = rx.recv_timeout(budget).ok();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return bytes.map(|b| (status, b)),
+            Ok(None) if bytes.is_some() && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
 
 /// The user's `triggers.json`, with the built-in secret redactions in front
 /// of it when redaction is on (#360).

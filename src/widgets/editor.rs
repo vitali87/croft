@@ -25,6 +25,18 @@ use crate::widgets::scrollbar;
 /// own per-format limits.
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+
+/// An image's pixel size from its header alone. Opening a tab decoded the
+/// whole picture on the render thread just to read these two numbers: a
+/// 48-megapixel photo meant a ~190 MB decode per open, and one past the
+/// decoder's memory limit refused to open although only a downscale shows.
+fn image_dimensions_of(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
 
 /// Read-only image preview attached to a tab. Holds the raw file bytes so
@@ -4805,9 +4817,8 @@ impl Editor {
             anyhow::bail!("Image too large ({} bytes)", meta.len());
         }
         let bytes = std::fs::read(path)?;
-        let (pixel_w, pixel_h) = image::load_from_memory(&bytes)
-            .map(|img| (img.width(), img.height()))
-            .map_err(|e| anyhow::anyhow!("Could not decode image: {e}"))?;
+        let (pixel_w, pixel_h) =
+            image_dimensions_of(&bytes).ok_or_else(|| anyhow::anyhow!("Could not decode image"))?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let format_label = image_format_label_from_ext(ext);
         self.path = Some(path.to_path_buf());
@@ -5182,9 +5193,8 @@ impl Editor {
         };
         let bytes = crate::pdf::rasterize_page(path, page, backend)
             .map_err(|e| anyhow::anyhow!("PDF render failed: {e}"))?;
-        let (pixel_w, pixel_h) = image::load_from_memory(&bytes)
-            .map(|img| (img.width(), img.height()))
-            .map_err(|e| anyhow::anyhow!("Could not decode rasterised PDF: {e}"))?;
+        let (pixel_w, pixel_h) = image_dimensions_of(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("Could not decode rasterised PDF"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
@@ -5667,9 +5677,8 @@ impl Editor {
                 return false;
             }
         };
-        let (pixel_w, pixel_h) = match image::load_from_memory(&bytes) {
-            Ok(img) => (img.width(), img.height()),
-            Err(_) => return false,
+        let Some((pixel_w, pixel_h)) = image_dimensions_of(&bytes) else {
+            return false;
         };
         image.bytes = bytes;
         image.generation = next_image_generation();

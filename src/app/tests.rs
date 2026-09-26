@@ -12435,6 +12435,34 @@ fn opening_a_config_file_keeps_the_active_tabs_unsaved_edits() {
 }
 
 #[test]
+fn bounded_output_gives_up_on_a_command_that_hangs() {
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(500);
+    assert!(
+        bounded_output(
+            std::process::Command::new("sh").args(["-c", "sleep 30"]),
+            budget
+        )
+        .is_none()
+    );
+    assert!(
+        bounded_output(
+            std::process::Command::new("sh").args(["-c", "exec 1>&-; sleep 30"]),
+            budget
+        )
+        .is_none()
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let (status, out) = bounded_output(
+        std::process::Command::new("sh").args(["-c", "printf 42"]),
+        std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(status.success());
+    assert_eq!(out, b"42");
+}
+
+#[test]
 fn dispatching_fetch_records_a_line_in_the_git_output_log() {
     let tmp = make_committed_repo();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -24545,6 +24573,25 @@ fn fence_command_shapes_the_typed_block() {
     assert!(cmd.ends_with("\nCROFT_BLOCK_1\r"), "{cmd}");
     let body = &cmd["python3 - <<'CROFT_BLOCK_1'\n".len()..cmd.len() - "\nCROFT_BLOCK_1\r".len()];
     assert_eq!(body, tricky.trim_end_matches('\n'));
+}
+
+/// A tab or `!` never reaches the shell's line editor as typed input: the
+/// block goes as one quoted printf argument, and running that line through
+/// a real shell reproduces the block byte for byte.
+#[test]
+fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
+    let code = "if True:\n\tprint(\"hi!\")\nx = 'a\\n'\n";
+    let cmd = super::fence_command("python3", code);
+    assert!(!cmd.contains('\t') && cmd.ends_with("| python3\r"), "{cmd}");
+    // What the pipe feeds the interpreter, via a real sh with cat standing in.
+    let line = cmd.trim_end_matches('\r').replace("| python3", "| cat");
+    let out = std::process::Command::new("sh")
+        .args(["-c", &line])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), code);
+    // `sh` blocks get the same treatment, piped to sh.
+    assert!(super::fence_command("sh", "echo hi!\n").ends_with("| sh\r"));
 }
 
 /// #360: the built-in secret rules sit in the trigger set by default,
