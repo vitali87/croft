@@ -2781,6 +2781,11 @@ pub struct Editor {
     /// Whether the file on disk began with a byte-order mark. `decode` strips
     /// it, so without remembering it every save silently dropped it.
     bom: bool,
+    /// Whether the file on disk ended with a line break. The buffer keeps
+    /// no line for it (a trailing newline is not a line of its own), so
+    /// without remembering it every save stripped it: `a\nb\n` came back
+    /// as `a\nb`.
+    final_newline: bool,
     /// Indentation guides (VS Code `editor.guides.indentation`): dim vertical
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
@@ -3103,6 +3108,7 @@ impl Editor {
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
             bom: false,
+            final_newline: false,
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
@@ -4617,6 +4623,7 @@ impl Editor {
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
         let text = enc.decode(&bytes).0.into_owned();
+        self.final_newline = text.ends_with(['\n', '\r']);
         // Detect the file's line-ending style before normalisation so a save
         // preserves it (and the status bar reports it). A single `\r\n` marks
         // the file CRLF, matching VS Code's "files.eol auto" heuristic.
@@ -5255,7 +5262,7 @@ impl Editor {
     /// provenance map to the text it describes (#349). `None` when the
     /// encoding cannot represent the text, since a save would refuse it too.
     pub fn bytes_for_disk(&self) -> Option<Vec<u8>> {
-        let content = self.lines.join(self.eol.sequence());
+        let content = self.content_for_disk();
         let (encoded, had_errors) = self.encode_for_disk(&content);
         (!had_errors).then_some(encoded)
     }
@@ -6521,6 +6528,7 @@ impl Editor {
         // Re-sniff against the bytes just read: reinterpreting the file under a
         // new encoding must not carry the previous one's BOM answer over.
         self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
+        self.final_newline = text.ends_with(['\n', '\r']);
         self.eol = if text.contains("\r\n") {
             LineEnding::Crlf
         } else {
@@ -8696,6 +8704,16 @@ impl Editor {
         out
     }
 
+    /// The text a save writes: the lines joined with the file's EOL, and
+    /// the final newline the file had. An emptied buffer writes nothing.
+    fn content_for_disk(&self) -> String {
+        let mut content = self.lines.join(self.eol.sequence());
+        if self.final_newline && !content.is_empty() {
+            content.push_str(self.eol.sequence());
+        }
+        content
+    }
+
     fn write_buffer_to_disk(&mut self) -> Result<SaveOutcome> {
         // Preview tabs (image/PDF, sheet, diff, hex) hold the whole-
         // buffer-swap PLACEHOLDER in `lines`, not the file's content:
@@ -8711,7 +8729,7 @@ impl Editor {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No file open"))?
             .clone();
-        let content = self.lines.join(self.eol.sequence());
+        let content = self.content_for_disk();
         let (encoded, had_errors) = self.encode_for_disk(&content);
         // The single choke point every save funnels through, so no caller can
         // route around the guard. The consent flag survives a failed write
@@ -9566,7 +9584,10 @@ impl Editor {
             // element IS the final newline. An empty buffer is left alone:
             // a zero-byte file has no last line to terminate.
             let empty_buffer = self.lines.len() == 1 && self.lines[0].is_empty();
-            if !empty_buffer && !self.lines.last().is_some_and(String::is_empty) {
+            if !empty_buffer
+                && !self.final_newline
+                && !self.lines.last().is_some_and(String::is_empty)
+            {
                 self.push_undo(EditKind::InsertFinalNewline);
                 self.lines.push(String::new());
                 self.mark_buffer_changed();
@@ -21531,8 +21552,8 @@ mod tests {
             .read_to_end(&mut raw)
             .unwrap();
         assert_eq!(
-            raw, b"alpha\r\nbeta",
-            "save re-applies CRLF, no trailing EOL"
+            raw, b"alpha\r\nbeta\r\n",
+            "save re-applies CRLF, final newline included"
         );
     }
 
@@ -21928,6 +21949,28 @@ mod tests {
     }
 
     #[test]
+    fn saving_keeps_the_files_final_newline() {
+        for (disk, want) in [
+            ("a\nb\n", "xa\nb\n"),
+            ("a\r\nb\r\n", "xa\r\nb\r\n"),
+            ("a\n\n", "xa\n\n"),
+            ("a", "xa"),
+        ] {
+            let tmp = NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), disk).unwrap();
+            let mut e = Editor::new();
+            e.open(tmp.path()).unwrap();
+            e.insert_char('x');
+            e.save_to_disk().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(tmp.path()).unwrap(),
+                want,
+                "from {disk:?}"
+            );
+        }
+    }
+
+    #[test]
     fn save_round_trips_content() {
         let tmp = NamedTempFile::new().unwrap();
         let mut e = Editor::new();
@@ -22253,7 +22296,7 @@ mod tests {
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
         assert_eq!(
             std::fs::read(tmp.path()).unwrap(),
-            b"&#26085;&#26412;&#35486; costs 5\x80",
+            b"&#26085;&#26412;&#35486; costs 5\x80\n",
             "consent writes encoding_rs' references, and € as the 0x80 byte"
         );
         assert!(!e.encoding_loss);
@@ -22271,7 +22314,7 @@ mod tests {
         e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
         e.lines = vec![String::from("café")];
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
-        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9");
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9\n");
         assert!(e.unmappable_chars().is_empty());
         // The same text in UTF-8 is always representable.
         let mut u = Editor::new();
