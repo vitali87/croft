@@ -325,6 +325,12 @@ pub struct Prefs {
     /// means the built-in 5000. Applies to panes opened after the change.
     #[serde(default)]
     pub terminal_scrollback: usize,
+    /// Memory, in megabytes, that terminal rewind (#357) may hold across ALL
+    /// panes together (#694). Unset means 128 locally and 32 on a remote
+    /// host; `0` turns rewind recording off. Applies from the next pane
+    /// opened, and re-splits the budget across the panes already open.
+    #[serde(default)]
+    pub terminal_rewind_mb: Option<usize>,
     /// What exported navigator comments start with (#368), marking them as
     /// AI-authored on GitHub. Unset means `[AI, croft navigator] `; an
     /// empty string turns the marker off.
