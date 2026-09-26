@@ -517,10 +517,15 @@ pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
 /// Write `bytes` to `tmp`, created no more readable than `dest` already is
 /// (0600 when `dest` is new): the file replaces `dest`, which may hold
 /// notification headers, and must not widen to the umask's 0644.
-fn write_keeping_mode(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_keeping_mode(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    // Created fresh, never opened through what is already there: the temp
+    // names are predictable, and create+truncate followed a symlink planted
+    // at one, writing the bytes wherever it pointed. `create_new` (O_EXCL)
+    // refuses a symlink, and a stale file is removed first.
+    let _ = std::fs::remove_file(tmp);
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -529,8 +534,7 @@ fn write_keeping_mode(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<
         mode
     };
     let mut file = opts.open(tmp)?;
-    // `mode` at creation is still narrowed by the umask, and a leftover tmp
-    // keeps its old mode: set it outright.
+    // `mode` at creation is still narrowed by the umask: set it outright.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

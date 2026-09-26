@@ -9841,7 +9841,7 @@ impl App {
     fn activate_open_editor(&mut self, path: PathBuf) {
         if let Some(idx) = self.editor.find_tab_with_path(&path) {
             self.editor.select(idx);
-        } else if self.editor.open(&path).is_err() {
+        } else if self.editor.open_pinned(&path).is_err() {
             self.status = format!("Could not open {}", path.display());
             return;
         }
@@ -20275,25 +20275,30 @@ impl App {
     fn confirm_pending_replace_all(&mut self) {
         self.pending_replace_all = None;
         let dirty = self.dirty_open_paths();
-        let (n, skipped) = self.search.replace_all_skipping(&dirty);
-        self.status = if skipped.is_empty() {
-            format!("Replace All: replaced {n} occurrence(s)")
-        } else {
-            let names: Vec<String> = skipped
-                .iter()
-                .take(2)
-                .map(|p| self.status_path(p))
-                .collect();
-            let more = skipped.len().saturating_sub(names.len());
-            let list = if more > 0 {
+        let (n, skipped, failed) = self.search.replace_all_skipping(&dirty);
+        let list = |paths: &[PathBuf]| {
+            let names: Vec<String> = paths.iter().take(2).map(|p| self.status_path(p)).collect();
+            let more = paths.len().saturating_sub(names.len());
+            if more > 0 {
                 format!("{} and {more} more", names.join(", "))
             } else {
                 names.join(", ")
-            };
-            format!(
-                "Replace All: replaced {n} occurrence(s); skipped {list} (unsaved changes — save first)"
-            )
+            }
         };
+        let mut status = format!("Replace All: replaced {n} occurrence(s)");
+        if !skipped.is_empty() {
+            status.push_str(&format!(
+                "; skipped {} (unsaved changes — save first)",
+                list(&skipped)
+            ));
+        }
+        if !failed.is_empty() {
+            status.push_str(&format!(
+                "; could not rewrite {} (not UTF-8, or unwritable)",
+                list(&failed)
+            ));
+        }
+        self.status = status;
         self.submit_search_query();
     }
 
@@ -24520,7 +24525,17 @@ impl App {
             }
             InputPurpose::ReloadConflict { paths } => {
                 self.close_input_prompt();
-                let reverted = self.editor.revert_paths_to_disk(&paths);
+                // Every group: the prompt lists conflicts from the other
+                // splits too, and reverting only the focused one left theirs
+                // unreloaded with the prompt never coming back.
+                let mut reverted = self.editor.revert_paths_to_disk(&paths);
+                for group in self.editor_layout.inactive_groups_mut() {
+                    for p in group.revert_paths_to_disk(&paths) {
+                        if !reverted.contains(&p) {
+                            reverted.push(p);
+                        }
+                    }
+                }
                 self.sync_open_file_poll_mtime();
                 // A failed reload (file deleted since the popup opened) keeps
                 // its unsaved edits — say so instead of silently doing nothing.
@@ -38699,7 +38714,7 @@ impl App {
         }
         if let Some(idx) = self.editor.find_tab_with_path(&path) {
             self.editor.select(idx);
-        } else if self.editor.open(&path).is_err() {
+        } else if self.editor.open_pinned(&path).is_err() {
             self.status = format!("Could not open {}", path.display());
             return;
         }
@@ -49286,6 +49301,16 @@ impl App {
         );
     }
 
+    /// Re-point the tabs of a renamed or moved path in every editor group,
+    /// not just the focused one: a tab in the other split kept the old path,
+    /// raised a disk conflict, and a save brought the old file back.
+    fn rename_open_path_everywhere(&mut self, old: &Path, new: &Path) {
+        self.editor.rename_open_path(old, new);
+        for group in self.editor_layout.inactive_groups_mut() {
+            group.rename_open_path(old, new);
+        }
+    }
+
     /// Perform the confirmed trash of `paths` (the popup's Enter path).
     fn perform_delete_paths(&mut self, paths: Vec<PathBuf>) {
         let total = paths.len();
@@ -49311,14 +49336,17 @@ impl App {
         };
         match result {
             Ok(()) => {
+                // Every group's tabs, and files under a deleted folder too.
+                // A tab with unsaved edits is kept open: closing it threw the
+                // edits away while the trash only held the saved copy.
+                let mut kept = 0;
                 for path in &paths {
-                    if self.editor.matches_open_path(path) {
-                        if !self.editor.close_active() {
-                            *self.editor = Editor::new();
-                        }
-                        self.sync_open_file_poll_mtime();
+                    kept += self.editor.close_clean_tabs_under(path);
+                    for group in self.editor_layout.inactive_groups_mut() {
+                        kept += group.close_clean_tabs_under(path);
                     }
                 }
+                self.sync_open_file_poll_mtime();
                 for dir in &affected_dirs {
                     if let Some(idx) = self.tree.index_of_dir(dir) {
                         self.tree.refresh_children(idx);
@@ -49330,6 +49358,12 @@ impl App {
                 } else {
                     format!("Moved {total} items to Trash")
                 };
+                if kept > 0 {
+                    self.status.push_str(&format!(
+                        "; {kept} tab{} with unsaved changes kept open",
+                        if kept == 1 { "" } else { "s" }
+                    ));
+                }
             }
             Err(e) => {
                 for dir in &affected_dirs {
@@ -49577,7 +49611,7 @@ impl App {
                             self.tree.select(new_idx);
                         }
                     }
-                    self.editor.rename_open_path(&old, &new_path);
+                    self.rename_open_path_everywhere(&old, &new_path);
                     self.rename_review_boxes_path(&old, &new_path);
                     self.sync_open_file_poll_mtime();
                     true
@@ -49620,7 +49654,7 @@ impl App {
                     // Every tab, not just the active one: a background tab of
                     // a moved file kept the old path and recreated it on save.
                     if matches!(mode, ExplorerClipMode::Cut) {
-                        self.editor.rename_open_path(src, &p);
+                        self.rename_open_path_everywhere(src, &p);
                         self.rename_review_boxes_path(src, &p);
                     }
                     placed.push(p);
@@ -49793,7 +49827,9 @@ impl App {
                             }
                         }
                         if create_kind == CreateKind::File {
-                            if let Err(e) = self.editor.open(&path) {
+                            // A tab of its own: `open` reloads the ACTIVE tab
+                            // in place, discarding its unsaved edits.
+                            if let Err(e) = self.editor.open_pinned(&path) {
                                 self.status = format!("Created but could not open: {e}");
                             } else {
                                 self.sync_open_file_poll_mtime();

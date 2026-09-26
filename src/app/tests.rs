@@ -12409,6 +12409,31 @@ fn a_push_runs_off_the_ui_thread_and_reports_when_it_lands() {
     assert_eq!(remote_head, local_head);
 }
 
+/// Opening a config file must not reload the active tab in place: it held
+/// unsaved edits to another file, which were silently discarded.
+#[test]
+fn opening_a_config_file_keeps_the_active_tabs_unsaved_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "saved\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.lines = vec![String::from("unsaved")];
+    app.editor.dirty = true;
+    let layer = tmp.path().join(".croft").join("config.json");
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    app.open_config_file_in_editor(layer.clone(), ConfigFileSeed::SettingsLayer);
+    assert_eq!(app.editor.path.as_deref(), Some(layer.as_path()));
+    let kept = app
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("a.txt still has its tab");
+    assert!(kept.dirty);
+    assert_eq!(kept.lines, vec![String::from("unsaved")]);
+}
+
 #[test]
 fn dispatching_fetch_records_a_line_in_the_git_output_log() {
     let tmp = make_committed_repo();
@@ -51334,6 +51359,37 @@ fn moving_files_and_folders_carries_every_open_tab_along() {
         .collect();
     assert!(paths.contains(&root.join("dest/a.txt")), "{paths:?}");
     assert!(paths.contains(&root.join("dest/dir/b.txt")), "{paths:?}");
+}
+
+/// A move re-points the file's tab in the OTHER split too, not only in the
+/// focused group.
+#[test]
+fn moving_a_file_repoints_its_tab_in_every_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    std::fs::write(root.join("a.txt"), "a").unwrap();
+    std::fs::write(root.join("c.txt"), "c").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&root.join("a.txt")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    // The focused (right) group moves on to another file; a.txt stays open
+    // in the left one.
+    app.editor.open_pinned(&root.join("c.txt")).unwrap();
+    app.editor.close_tab(0);
+    assert!(app.apply_paste_or_drop(
+        &root.join("dest"),
+        &[root.join("a.txt")],
+        ExplorerClipMode::Cut
+    ));
+    let groups = app.editor_layout.inactive_groups_mut();
+    let paths: Vec<_> = groups[0]
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(paths.contains(&root.join("dest/a.txt")), "{paths:?}");
 }
 
 #[test]

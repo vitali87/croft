@@ -719,18 +719,54 @@ fn build_replace_regex(query: &str, opts: SearchOpts) -> Option<regex::Regex> {
     if !opts.case_sensitive {
         pattern.push_str("(?i)");
     }
-    // The search that found the hits matches line by line, so `^` and `$`
-    // mean a line's ends here too (CRLF-aware), not the whole file's: `^foo`
-    // replaced only the first of the lines the preview listed.
-    pattern.push_str("(?mR)");
-    if opts.whole_word {
-        pattern.push_str("\\b(?:");
-        pattern.push_str(&body);
-        pattern.push_str(")\\b");
-    } else {
-        pattern.push_str(&body);
-    }
+    // Applied to one line at a time (see `replace_in_text`), as the search
+    // matches, so `^` and `$` are that line's ends. Whole-word is checked on
+    // each match by the search's own rule, not `\b`, which never matches
+    // beside a query that starts or ends with punctuation (`$var`, `@x`).
+    pattern.push_str(&body);
     regex::Regex::new(&pattern).ok()
+}
+
+/// Replace the matches in ONE line (no terminator), returning the new text
+/// and how many were replaced. Empty matches are skipped: the search that
+/// listed the hits never shows one.
+fn replace_in_line(
+    line: &str,
+    re: &regex::Regex,
+    replacement: &str,
+    opts: SearchOpts,
+) -> (String, usize) {
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    let mut pos = 0;
+    let mut count = 0;
+    while pos <= line.len() {
+        let Some(caps) = re.captures_at(line, pos) else {
+            break;
+        };
+        let m = caps.get(0).expect("group 0 always matches");
+        let skip =
+            m.is_empty() || (opts.whole_word && !is_whole_word_match(line, m.start(), m.end()));
+        if skip {
+            // Retry one char further on: a later start can still match.
+            match line[m.start()..].chars().next() {
+                Some(c) => pos = m.start() + c.len_utf8(),
+                None => break,
+            }
+            continue;
+        }
+        out.push_str(&line[last..m.start()]);
+        if opts.use_regex {
+            caps.expand(&brace_group_refs(replacement), &mut out);
+        } else {
+            out.push_str(replacement);
+        }
+        count += 1;
+        last = m.end();
+        pos = m.end();
+    }
+    out.push_str(&line[last..]);
+    (out, count)
 }
 
 /// `replacement` with each numbered capture reference braced (`$1_old` to
@@ -778,19 +814,21 @@ pub fn replace_in_text(
     opts: SearchOpts,
 ) -> Option<(String, usize)> {
     let re = build_replace_regex(query, opts)?;
-    let count = re.find_iter(content).count();
-    if count == 0 {
-        return Some((content.to_string(), 0));
+    // Line by line, exactly as the search matched: over the whole file,
+    // `[^;]*`, `\s` or `\W` ran across line breaks, so Replace All deleted
+    // lines the search had never listed.
+    let mut out = String::with_capacity(content.len());
+    let mut count = 0;
+    for piece in content.split_inclusive('\n') {
+        let body = piece
+            .strip_suffix("\r\n")
+            .or_else(|| piece.strip_suffix('\n'))
+            .unwrap_or(piece);
+        let (line, n) = replace_in_line(body, &re, replacement, opts);
+        out.push_str(&line);
+        out.push_str(&piece[body.len()..]);
+        count += n;
     }
-    let out = if opts.use_regex {
-        re.replace_all(content, brace_group_refs(replacement).as_str())
-            .into_owned()
-    } else {
-        // Literal replacement: escape `$` so the substituted text is inserted
-        // verbatim rather than parsed as a capture reference.
-        let escaped = replacement.replace('$', "$$");
-        re.replace_all(content, escaped.as_str()).into_owned()
-    };
     Some((out, count))
 }
 
@@ -829,7 +867,16 @@ pub fn replace_in_file(
     if count == 0 {
         return Some(0);
     }
-    std::fs::write(path, new_content).ok()?;
+    // Written aside and renamed in, keeping the file's mode: written in
+    // place, a failed write (a full disk) left the file truncated.
+    let name = path.file_name()?.to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.croft-replace-{}", std::process::id()));
+    let written = crate::prefs::write_keeping_mode(&tmp, path, new_content.as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
     Some(count)
 }
 
@@ -1410,12 +1457,19 @@ impl SearchPanel {
 
     /// Replace All, skipping `skip` (files open with unsaved edits — a disk
     /// write under a dirty buffer forces the tab into conflict divergence).
-    /// Returns `(occurrences replaced, the skipped hit files)`.
-    pub fn replace_all_skipping(&self, skip: &HashSet<PathBuf>) -> (usize, Vec<PathBuf>) {
+    /// Returns `(occurrences replaced, the skipped hit files, the files that
+    /// could not be rewritten)`. The last are named rather than dropped: a
+    /// file that is not UTF-8 still shows hits (the search reads bytes) but
+    /// is never replaced, and "replaced N" alone hid that.
+    pub fn replace_all_skipping(
+        &self,
+        skip: &HashSet<PathBuf>,
+    ) -> (usize, Vec<PathBuf>, Vec<PathBuf>) {
         let needle = self.query.trim();
         if needle.is_empty() {
-            return (0, Vec::new());
+            return (0, Vec::new(), Vec::new());
         }
+        let mut failed = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut total = 0usize;
         let mut skipped = Vec::new();
@@ -1427,11 +1481,12 @@ impl SearchPanel {
                 skipped.push(hit.path.clone());
                 continue;
             }
-            if let Some(n) = replace_in_file(&hit.path, needle, &self.replace, self.opts) {
-                total += n;
+            match replace_in_file(&hit.path, needle, &self.replace, self.opts) {
+                Some(n) => total += n,
+                None => failed.push(hit.path.clone()),
             }
         }
-        (total, skipped)
+        (total, skipped, failed)
     }
 
     /// Run the current query, store the results, and reset selection.
@@ -3544,6 +3599,87 @@ mod tests {
     }
 
     // ---- replace ----
+
+    #[test]
+    fn replace_in_text_never_matches_across_a_line_break() {
+        let re = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(
+            replace_in_text("let a = 1\nlet b = 2;\n", "a[^;]*", "Z", re),
+            Some((String::from("let Z\nlet b = 2;\n"), 1))
+        );
+        assert_eq!(
+            replace_in_text("foo  \r\n  bar\n", "foo\\s+", "X", re).map(|r| r.0),
+            Some(String::from("X\r\n  bar\n"))
+        );
+        // Stripping indentation leaves blank lines alone.
+        assert_eq!(
+            replace_in_text("  a\n\n  b\n", "^\\s+", "", re).map(|r| r.0),
+            Some(String::from("a\n\nb\n"))
+        );
+    }
+
+    #[test]
+    fn replace_in_file_keeps_the_mode_and_reports_a_non_utf8_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.sh");
+        std::fs::write(&f, "echo foo\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            replace_in_file(&f, "foo", "bar", SearchOpts::default()),
+            Some(1)
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "echo bar\n");
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let latin = dir.path().join("l.txt");
+        std::fs::write(&latin, b"foo \xe9\n").unwrap();
+        assert_eq!(
+            replace_in_file(&latin, "foo", "bar", SearchOpts::default()),
+            None
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "no temp file left"
+        );
+    }
+
+    #[test]
+    fn a_symlink_planted_at_the_temp_name_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "foo\n").unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let tmp = dir
+            .path()
+            .join(format!(".a.txt.croft-replace-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        assert_eq!(
+            replace_in_file(&f, "foo", "bar", SearchOpts::default()),
+            Some(1)
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "bar\n");
+    }
+
+    #[test]
+    fn whole_word_replace_takes_matches_edged_with_punctuation() {
+        let ww = SearchOpts {
+            whole_word: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(
+            replace_in_text("echo $var here $variable", "$var", "$x", ww),
+            Some((String::from("echo $x here $variable"), 1))
+        );
+    }
 
     #[test]
     fn replace_in_text_literal_replaces_all_occurrences() {
