@@ -43014,28 +43014,73 @@ fn one_tab_speaks_for_a_file_to_the_language_server() {
     assert_eq!(seen, vec![active, active, active], "no tick resends");
 }
 
-/// #369: vim operators in a symbol tab stay inside its symbol. `dgg` from
-/// the symbol's second line and `db` at its first column used to reach the
-/// hidden lines above it.
+/// A file of three functions with a symbol tab on the middle one, `b`
+/// (lines 3 to 5), active, and vim on.
+fn vim_symbol_tab_on_b(tmp: &tempfile::TempDir) -> App {
+    let file = tmp.path().join("three.rs");
+    std::fs::write(
+        &file,
+        "fn a() {\n    1\n}\nfn b() {\n    2\n}\nfn c() {\n    3\n}",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    let view = app.editor.symbol_view.as_ref().expect("a symbol tab on b");
+    assert_eq!((view.first, view.last), (3, 5));
+    app.focus = Pane::Editor;
+    app.vim.enabled = true;
+    app
+}
+
+/// #369: vim operators in a symbol tab stay inside its symbol. Upward
+/// (`dgg`, `d5k`, `db` at its first column) they used to reach the hidden
+/// lines above it, downward (`dG`, `dw` at its end) the ones below; inside
+/// it they still delete what they cover.
 #[test]
 fn vim_operators_in_a_symbol_tab_stay_inside_its_symbol() {
-    let above = ["fn a() {", "    1", "}"];
-    for (keys, row) in [("dgg", 4), ("d5k", 4), ("db", 3)] {
+    let a = ["fn a() {", "    1", "}"];
+    let c = ["fn c() {", "    3", "}"];
+    let whole = [&a[..], &["fn b() {", "    2", "}"], &c[..]].concat();
+    // (keys, caret, the buffer after)
+    let cases: [(&str, (usize, usize), Vec<&str>); 5] = [
+        ("dgg", (4, 0), [&a[..], &["}"], &c[..]].concat()),
+        ("d5k", (4, 0), [&a[..], &["}"], &c[..]].concat()),
+        ("db", (3, 0), whole.clone()),
+        ("dG", (4, 0), [&a[..], &["fn b() {"], &c[..]].concat()),
+        (
+            "dw",
+            (5, 0),
+            [&a[..], &["fn b() {", "    2", ""], &c[..]].concat(),
+        ),
+    ];
+    for (keys, (row, col), after) in cases {
         let tmp = tempfile::tempdir().unwrap();
-        let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
-        app.sync_symbol_views();
-        assert!(app.editor.symbol_view.is_some());
-        app.focus = Pane::Editor;
-        app.vim.enabled = true;
+        let mut app = vim_symbol_tab_on_b(&tmp);
         app.editor.cursor_row = row;
-        app.editor.cursor_col = 0;
+        app.editor.cursor_col = col;
         vim_feed_str(&mut app, keys);
-        assert_eq!(app.editor.lines[..3], above, "{keys} kept `a`");
+        assert_eq!(app.editor.lines, after, "{keys}");
     }
 }
 
-/// #369: two symbols that start on one line get a tab each, and opening
-/// either again focuses its own tab.
+/// #369: a count on a line operator stops at the symbol's last line, and
+/// the status reports the lines it covered.
+#[test]
+fn a_vim_line_count_in_a_symbol_tab_stops_at_its_last_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = vim_symbol_tab_on_b(&tmp);
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 0;
+    vim_feed_str(&mut app, "5yy");
+    assert_eq!(app.status, "Yanked 2 line(s)");
+}
+
+/// #369: two symbols that start on one line get a tab each, opening either
+/// again focuses its own tab, and each follows its own symbol: renaming the
+/// inner one leaves the outer tab's title alone.
 #[test]
 fn symbols_starting_on_one_line_get_a_tab_each() {
     let tmp = tempfile::tempdir().unwrap();
@@ -43047,21 +43092,81 @@ fn symbols_starting_on_one_line_get_a_tab_each() {
     app.editor.select(0);
     app.open_symbol_tab_for("m".into(), 0, 0);
     let names = |app: &App| -> Vec<String> {
-        app.editor
+        let mut names: Vec<String> = app
+            .editor
             .editors
             .iter()
             .filter_map(|e| e.symbol_view.as_ref().map(|v| v.name.clone()))
-            .collect()
+            .collect();
+        names.sort();
+        names
     };
-    let mut both = names(&app);
-    both.sort();
-    assert_eq!(both, vec!["S", "m"]);
+    assert_eq!(names(&app), vec!["S", "m"]);
     app.editor.select(0);
     app.open_symbol_tab_for("S".into(), 0, 0);
     assert_eq!(names(&app).len(), 2, "reopening S focused its tab");
     assert_eq!(
         app.editor.symbol_view.as_ref().map(|v| v.name.as_str()),
         Some("S")
+    );
+    // Rename m to n from the file's tab.
+    app.editor.select(0);
+    let col = app.editor.lines[0].find("m()").unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = col;
+    app.editor.delete_forward();
+    app.editor.insert_char('n');
+    app.sync_symbol_views();
+    assert_eq!(names(&app), vec!["S", "n"]);
+}
+
+/// #369: pickers spell some symbols differently (the LSP outline's
+/// `impl Foo` is tree-sitter's `Foo`); asking for the same symbol under
+/// either name focuses the one tab.
+#[test]
+fn one_symbol_under_two_spellings_gets_one_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("foo.rs");
+    std::fs::write(&file, "impl Foo {\n    fn a() {}\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("Foo".into(), 0, 2);
+    app.editor.select(0);
+    app.open_symbol_tab_for("impl Foo".into(), 0, 2);
+    let tabs = app
+        .editor
+        .editors
+        .iter()
+        .filter(|e| e.symbol_view.is_some())
+        .count();
+    assert_eq!(tabs, 1);
+}
+
+/// #369: a symbol tab's minimap draws only its symbol, and a click on it
+/// lands on the symbol's lines, not the file's.
+#[test]
+fn a_symbol_tab_minimap_draws_and_maps_only_its_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("mm.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\n  fn b() {\n    2\n  }").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let (bg, fg) = ((0, 0, 0), (255, 255, 255));
+    // Row 0, column 0: `f` of `fn a` in the file's tab.
+    let lit = |buf: &[u8]| buf[0] != 0;
+    assert!(lit(&app.editor.minimap_rgba(4, 3, 3, bg, fg)));
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    assert_eq!(app.editor.minimap_span(), (3, 6));
+    // `  fn b`: column 0 is indentation.
+    assert!(!lit(&app.editor.minimap_rgba(4, 3, 3, bg, fg)));
+    app.minimap_img_rect = Rect::new(0, 0, 2, 3);
+    app.cell_pixel = Some((1, 1));
+    app.minimap_content_h = 3;
+    app.minimap_scroll_to_row(0);
+    assert_eq!(
+        app.editor.cursor_row, 3,
+        "the top of the strip is b's first line"
     );
 }
 

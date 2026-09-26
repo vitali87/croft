@@ -364,7 +364,40 @@ pub enum ViewUpdate {
     Gone,
 }
 
+/// The tree-sitter identity (name, kind, depth) of the symbol a picker
+/// names `name` on lines `first..=last` of `text`: what tells two tabs
+/// apart when the pickers spell one symbol differently (an LSP outline's
+/// `impl Foo` is tree-sitter's `Foo`). `None` without a grammar or match.
+pub fn syntax_identity(
+    text: &str,
+    kind: Option<crate::highlight::LangKind>,
+    name: &str,
+    first: usize,
+    last: usize,
+) -> Option<(String, crate::lsp::manager::OutlineKind, u16)> {
+    let symbols = crate::outline_syntax::symbols_for(kind?, text.as_bytes());
+    syntax_symbol_heading(&symbols, name, first, last).map(|s| (s.name.clone(), s.kind, s.depth))
+}
+
 impl SymbolView {
+    /// Whether this tab shows the symbol a picker names `name` starting on
+    /// line `first`, whose tree-sitter identity is `identity`. Compared by
+    /// identity when both sides have one, else by the picker's spelling.
+    pub fn shows(
+        &self,
+        name: &str,
+        first: usize,
+        identity: Option<&(String, crate::lsp::manager::OutlineKind, u16)>,
+    ) -> bool {
+        if self.first != first {
+            return false;
+        }
+        match (&self.syntax_name, self.syntax_shape, identity) {
+            (Some(n), Some((k, d)), Some((on, ok, od))) => n == on && k == *ok && d == *od,
+            _ => self.name == name,
+        }
+    }
+
     pub fn new(
         name: String,
         text: String,
@@ -543,12 +576,20 @@ fn syntax_symbol_heading<'a>(
     first: usize,
     last: usize,
 ) -> Option<&'a crate::lsp::manager::OutlineSymbol> {
-    syntax_symbol_starting_at(symbols, first).or_else(|| {
-        symbols
-            .iter()
-            .filter(|s| s.name == name && (first..=last).contains(&(s.range_start_line as usize)))
-            .min_by_key(|s| s.range_start_line)
-    })
+    // Two symbols can start on one line (`impl S { fn m() {} }`): the one
+    // named as asked wins, then the innermost.
+    symbols
+        .iter()
+        .find(|s| s.range_start_line as usize == first && s.name == name)
+        .or_else(|| syntax_symbol_starting_at(symbols, first))
+        .or_else(|| {
+            symbols
+                .iter()
+                .filter(|s| {
+                    s.name == name && (first..=last).contains(&(s.range_start_line as usize))
+                })
+                .min_by_key(|s| s.range_start_line)
+        })
 }
 
 /// The innermost outline symbol whose range starts on `line`: the one a

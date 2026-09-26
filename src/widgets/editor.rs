@@ -10699,6 +10699,12 @@ impl Editor {
         Some((start.0, end.0))
     }
 
+    /// The lines the minimap draws, as `(first, end)` with `end` exclusive:
+    /// a symbol tab's symbol (#369), else the whole buffer.
+    pub fn minimap_span(&self) -> (usize, usize) {
+        self.symbol_clip().unwrap_or((0, self.lines.len()))
+    }
+
     /// Move the cursor to `line` and center the viewport on it (minimap click /
     /// drag navigation). The cursor moves too because the render's scroll-follow
     /// snaps the viewport back to keep the caret visible; centering the caret
@@ -10743,17 +10749,21 @@ impl Editor {
             px[2] = bg.2;
             px[3] = 0xff;
         }
-        let total = self.lines.len().max(1) as u64;
-        for (i, line) in self.lines.iter().enumerate() {
+        let (first, end) = self.minimap_span();
+        let total = (end - first).max(1) as u64;
+        for (i, line) in self.lines[first..end].iter().enumerate() {
             let y0 = (i as u64 * content_h as u64 / total) as u32;
             if y0 >= h {
                 break;
             }
             let y1 = (((i as u64 + 1) * content_h as u64 / total) as u32).clamp(y0 + 1, h);
             let merged = merge_overlay(
-                self.highlights.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                self.highlights
+                    .get(first + i)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
                 self.semantic_overlay
-                    .get(i)
+                    .get(first + i)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
             );

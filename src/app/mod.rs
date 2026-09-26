@@ -4243,9 +4243,13 @@ struct MinimapBase {
     rgba: Vec<u8>,
     w: u32,
     h: u32,
-    /// (path, edit_seq, canvas_w_px, canvas_h_px, bg) — a change rebakes.
-    sig: (Option<PathBuf>, u64, u32, u32, (u8, u8, u8)),
+    /// (path, edit_seq, canvas_w_px, canvas_h_px, bg, lines drawn) — a
+    /// change rebakes. The lines drawn tell a symbol tab (#369) from its
+    /// file's tab.
+    sig: MinimapSig,
 }
+
+type MinimapSig = (Option<PathBuf>, u64, u32, u32, (u8, u8, u8), (usize, usize));
 
 /// Re-emit key for the minimap overlay. Differs from the base sig: the
 /// viewport fields move on scroll (recomposite, no rebake), the cell fields
@@ -28037,8 +28041,8 @@ impl App {
 
     /// Open lines `first..=last` of the active file as a symbol tab named
     /// `name`, placed after the active tab, or focus the symbol tab already
-    /// showing that symbol (same first line and name: two symbols can
-    /// start on one line). The new tab starts from the live buffer, unsaved
+    /// showing that symbol: same first line and tree-sitter identity (two
+    /// symbols can start on one line, and pickers spell some differently). The new tab starts from the live buffer, unsaved
     /// edits included, and keeps the caret if it sits inside the symbol.
     pub(crate) fn open_symbol_tab_for(&mut self, name: String, first: usize, last: usize) {
         let Some(path) = self.editor.path.clone() else {
@@ -28049,12 +28053,19 @@ impl App {
             self.status = String::from("Symbol tabs open from a text editor");
             return;
         }
+        let identity = crate::symbol_range::syntax_identity(
+            &self.editor.lines.join("\n"),
+            syntax_kind_of(&path),
+            &name,
+            first,
+            last,
+        );
         if let Some(i) = self.editor.editors.iter().position(|ed| {
             ed.path.as_deref() == Some(path.as_path())
                 && ed
                     .symbol_view
                     .as_ref()
-                    .is_some_and(|v| v.first == first && v.name == name)
+                    .is_some_and(|v| v.shows(&name, first, identity.as_ref()))
         }) {
             self.editor.select(i);
             self.focus_pane(Pane::Editor);
@@ -47422,11 +47433,20 @@ impl App {
         let cell_w = strip.width;
         let cell_h = strip.height;
         let bg = self.theme.editor_bg_rgb();
-        let top = self.editor.scroll;
+        // A symbol tab's minimap draws only its symbol (#369), so rows
+        // count from the symbol's first line.
+        let span = self.editor.minimap_span();
+        let (first, end) = span;
+        let top = self.editor.scroll.saturating_sub(first);
         let rows = self.editor.visible_rows();
-        let total = self.editor.lines.len();
+        let total = end - first;
         let edit_seq = self.editor.edit_seq;
-        let selection = self.editor.selection_rows();
+        let selection = self.editor.selection_rows().map(|(s, e)| {
+            (
+                s.clamp(first, end - 1) - first,
+                e.clamp(first, end - 1) - first,
+            )
+        });
         let desired = MinimapLayout {
             cell_x: strip.x,
             cell_y: strip.y,
@@ -47472,7 +47492,14 @@ impl App {
         // Luminance picks the default text color and the viewport tint so the
         // box reads on either theme.
         let light = 0.299 * bg.0 as f32 + 0.587 * bg.1 as f32 + 0.114 * bg.2 as f32 > 140.0;
-        let sig = (self.editor.path.clone(), edit_seq, canvas_w, canvas_h, bg);
+        let sig = (
+            self.editor.path.clone(),
+            edit_seq,
+            canvas_w,
+            canvas_h,
+            bg,
+            span,
+        );
         if self.minimap_base.as_ref().map(|b| &b.sig) != Some(&sig) {
             let fg = if light {
                 (0x38, 0x3a, 0x41)
@@ -47640,14 +47667,15 @@ impl App {
     /// click lands on the line actually under the cursor.
     fn minimap_scroll_to_row(&mut self, row: u16) {
         let r = self.minimap_img_rect;
-        let total = self.editor.lines.len();
+        let (first, end) = self.editor.minimap_span();
+        let total = end - first;
         if r.height == 0 || total == 0 {
             return;
         }
         let ch_px = self.cell_pixel.map(|(_, h)| h).unwrap_or(1).max(1);
         let dy_px = (row.saturating_sub(r.y)) as u32 * ch_px;
         let content_h = self.minimap_content_h.max(1);
-        let line = (dy_px as usize * total / content_h as usize).min(total - 1);
+        let line = first + (dy_px as usize * total / content_h as usize).min(total - 1);
         self.editor.goto_line_centered(line);
         self.poke_cursor();
     }
