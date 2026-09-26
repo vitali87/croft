@@ -43189,6 +43189,35 @@ fn a_documented_symbol_opened_from_both_outlines_gets_one_tab() {
         .filter(|e| e.symbol_view.is_some())
         .count();
     assert_eq!(tabs, 1);
+    assert!(
+        app.editor.symbol_view.is_some(),
+        "the existing tab is focused"
+    );
+}
+
+/// #369: two same-named symbols of one kind and depth (a `fn new` in each
+/// of two impls) are told apart by the line their item starts on.
+#[test]
+fn same_named_symbols_on_different_lines_get_a_tab_each() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("news.rs");
+    std::fs::write(
+        &file,
+        "impl A {\n    fn new() {}\n}\nimpl B {\n    fn new() {}\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("new".into(), 1, 1);
+    app.editor.select(0);
+    app.open_symbol_tab_for("new".into(), 4, 4);
+    let tabs = app
+        .editor
+        .editors
+        .iter()
+        .filter(|e| e.symbol_view.is_some())
+        .count();
+    assert_eq!(tabs, 2);
 }
 
 /// #369: switching between two symbol tabs of the same length repaints the

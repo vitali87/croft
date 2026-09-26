@@ -4272,7 +4272,9 @@ pub struct MinimapLayout {
     /// Which document and which of its lines the strip draws: a hash of
     /// the path (no per-frame allocation) and the drawn span, so switching
     /// between two tabs whose other fields agree (two same-length symbol
-    /// tabs, #369, or two same-length files) still re-emits.
+    /// tabs, #369, or two same-length files) still re-emits. A tab without
+    /// a path is only ever the empty fallback left by closing the last
+    /// tab, whose strip is the same for every one.
     doc: (u64, (usize, usize)),
 }
 
