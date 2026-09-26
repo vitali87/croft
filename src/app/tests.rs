@@ -52193,3 +52193,38 @@ fn the_cells_under_an_image_fingerprint_writes_inside_it_only() {
     // A rectangle past the edge is clamped, not a panic.
     let _ = super::cells_fingerprint(&buf, 18, 8, 10, 10);
 }
+
+/// On Kitty an image lives on its own layer, so text redrawn beneath it
+/// never makes croft resend it; on iTerm2 it does.
+#[test]
+fn only_cell_buffer_protocols_resend_an_image_when_text_beneath_changes() {
+    use crate::iterm2_inline::InlineImageProtocol;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.terminal_image.set(
+        String::from("img"),
+        super::TerminalImageLayout {
+            cell_x: 1,
+            cell_y: 1,
+            cell_w: 4,
+            cell_h: 2,
+            seq: 0,
+            pane: 0,
+        },
+    );
+    let quiet = Buffer::empty(Rect::new(0, 0, 10, 5));
+    let mut busy = quiet.clone();
+    busy[(2, 1)].set_symbol("x");
+    app.inline_protocol = InlineImageProtocol::ITerm2;
+    assert_ne!(
+        app.image_underlays(&quiet).terminal,
+        app.image_underlays(&busy).terminal
+    );
+    app.inline_protocol = InlineImageProtocol::Kitty;
+    assert_eq!(
+        app.image_underlays(&quiet).terminal,
+        app.image_underlays(&busy).terminal
+    );
+}

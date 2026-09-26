@@ -53872,6 +53872,19 @@ fn cells_fingerprint(buf: &ratatui::buffer::Buffer, x: u16, y: u16, w: u16, h: u
 impl App {
     /// This frame's [`ImageUnderlays`], read from the buffer just drawn.
     fn image_underlays(&self, buf: &ratatui::buffer::Buffer) -> ImageUnderlays {
+        // Kitty keeps pictures on their own layer: text written into the
+        // cells never deletes a placement (only a delete command or a screen
+        // clear does, and both forget what was sent). So on Kitty the cells
+        // beneath do not matter, and streaming output beside an image sends
+        // nothing.
+        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
+            return ImageUnderlays {
+                editor: [0, 0],
+                terminal: 0,
+                markdown: 0,
+                minimap: 0,
+            };
+        }
         let o = &self.overlays;
         let editor = |side: usize| {
             o.editor[side].layout().map_or(0, |l| {
