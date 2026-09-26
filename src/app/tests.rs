@@ -12532,6 +12532,22 @@ fn a_completion_applies_its_text_edit_and_additional_edits() {
     assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 6));
     // No text edit: the prefix path takes over.
     assert!(!app.accept_completion_edit(&crate::lsp::CompletionItem::default()));
+    // A range past the caret replaces the suffix it covers.
+    app.editor.lines = vec![String::from("fooBar")];
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    let item = crate::lsp::CompletionItem {
+        label: String::from("baz"),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 0),
+            end: (0, 6),
+            new_text: String::from("baz"),
+            utf16: true,
+        }),
+        ..Default::default()
+    };
+    assert!(app.accept_completion_edit(&item));
+    assert_eq!(app.editor.lines, vec![String::from("baz")]);
 }
 
 #[test]

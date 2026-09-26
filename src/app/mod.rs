@@ -12827,7 +12827,8 @@ impl App {
     }
 
     /// Accept a completion by the server's own edit: its range, from where
-    /// it starts to the caret (so letters typed since the request go too),
+    /// it starts to its end or the caret, whichever is further (so letters
+    /// typed since the request go too),
     /// becomes its text, then its additional edits (auto-imports) apply.
     /// False when the item has no usable edit, for the prefix fallback.
     fn accept_completion_edit(&mut self, item: &crate::lsp::CompletionItem) -> bool {
@@ -12841,19 +12842,25 @@ impl App {
         let Some(line) = self.editor.lines.get(row) else {
             return false;
         };
-        let start = if te.utf16 {
-            crate::widgets::editor::utf16_to_char_col(line, te.start.1 as u32)
-        } else {
-            te.start.1
+        let col = |c: usize| {
+            if te.utf16 {
+                crate::widgets::editor::utf16_to_char_col(line, c as u32)
+            } else {
+                c
+            }
         };
+        let (start, end) = (col(te.start.1), col(te.end.1));
         let caret = self.editor.cursor_col;
         if start > caret {
             return false;
         }
+        // To the server's end, or the caret when letters typed since the
+        // request run past it: a range covering a suffix after the caret
+        // (`fooBar` completed from `foo|`) replaces the suffix too.
         self.editor
             .apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
                 start: (row, start),
-                end: (row, caret),
+                end: (row, end.max(caret)),
                 new_text: te.new_text.clone(),
                 utf16: false,
             }]);
