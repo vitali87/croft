@@ -689,6 +689,7 @@ struct SidebarAreas {
 /// state. Encoded once in `App::init_graphics` (no PNG re-encoding per
 /// frame) and rewritten under the activity-bar block after every ratatui
 /// frame draw, since ratatui's bg-clear overdraws the image.
+#[cfg_attr(test, derive(Default))]
 pub struct ActivityBarImages {
     explorer_active: String,
     explorer_inactive: String,
@@ -3032,6 +3033,17 @@ pub struct App {
     /// `<=` the image's pixel height for short files). Click mapping divides by
     /// this, not the full strip height, so clicks land on the right line.
     minimap_content_h: u32,
+    /// When the minimap image was last baked, and whether an edit since then
+    /// is waiting for the next bake (see [`MINIMAP_EDIT_REBAKE`]).
+    minimap_baked_at: Option<std::time::Instant>,
+    minimap_edit_pending: bool,
+    /// The buffer ratatui drew last, and what each small chrome image (the
+    /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
+    /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
+    /// checked in a frame (the image was hidden) are dropped.
+    drawn_buffer: Option<ratatui::buffer::Buffer>,
+    chrome_sent: std::collections::HashMap<&'static str, u64>,
+    chrome_seen: std::collections::HashSet<&'static str>,
     /// A left-drag is panning the view via the minimap strip.
     minimap_drag: bool,
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
@@ -4232,6 +4244,9 @@ const MINIMAP_WIDTH_CELLS: u16 = 6;
 /// Minimum editor-text width that must remain after carving the strip; below
 /// this the minimap is suppressed so the code never gets squeezed to nothing.
 const MINIMAP_MIN_EDITOR_WIDTH: u16 = 44;
+/// While only the text changes, the minimap image is re-baked at most this
+/// often: each bake is a fresh PNG of the whole strip (#682).
+const MINIMAP_EDIT_REBAKE: std::time::Duration = std::time::Duration::from_millis(300);
 /// Maximum pixel height per source line in the minimap. Only kicks in for very
 /// short files: it caps a six-line file to a compact sliver instead of
 /// stretching those lines down the whole strip. Any file long enough that its
@@ -4375,10 +4390,17 @@ fn composite_minimap_viewport(base: &[u8], w: u32, h: u32, ov: MinimapOverlay) -
 
 /// Encode an RGBA pixel buffer to PNG (the format `build_inline_image` wants).
 fn rgba_to_png(rgba: Vec<u8>, w: u32, h: u32) -> Option<Vec<u8>> {
-    let img: image::RgbaImage = image::ImageBuffer::from_raw(w, h, rgba)?;
+    use image::ImageEncoder as _;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    if rgba.len() != (w as usize) * (h as usize) * 4 {
+        return None;
+    }
+    // Best compression with adaptive filters: the minimap is a small strip
+    // of flat colour runs, so this costs well under a millisecond and makes
+    // each bake about a quarter the size, which is what SSH carries (#682).
     let mut out = Vec::new();
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+    PngEncoder::new_with_quality(&mut out, CompressionType::Best, FilterType::Adaptive)
+        .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
         .ok()?;
     Some(out)
 }
@@ -4998,6 +5020,11 @@ impl App {
             minimap_base: None,
             minimap_img_rect: Rect::default(),
             minimap_content_h: 0,
+            minimap_baked_at: None,
+            minimap_edit_pending: false,
+            drawn_buffer: None,
+            chrome_sent: std::collections::HashMap::new(),
+            chrome_seen: std::collections::HashSet::new(),
             minimap_drag: false,
             clipboard_reader: read_system_clipboard,
             is_relay_session: !cfg!(test) && std::env::var_os("CROFT_RELAY_KEY").is_some(),
@@ -5801,9 +5828,18 @@ impl App {
             self.overlays.run_debug.clear_emitted();
             return;
         }
-        let Some(osc) = self.overlays.run_debug.image() else {
+        let Some(osc) = self.overlays.run_debug.image().map(str::to_owned) else {
             return;
         };
+        let at = Rect {
+            x: cx,
+            y: cy,
+            width: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
+            height: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
+        };
+        if !self.chrome_image_due("run_debug", &osc, at) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -5853,9 +5889,18 @@ impl App {
             self.overlays.problems_badge.clear_emitted();
             return;
         }
-        let Some(osc) = self.overlays.problems_badge.image() else {
+        let Some(osc) = self.overlays.problems_badge.image().map(str::to_owned) else {
             return;
         };
+        let at = Rect {
+            x: cx,
+            y: cy,
+            width: crate::iterm2_inline::count_badge_cells_w(self.problems_badge_count),
+            height: 1,
+        };
+        if !self.chrome_image_due("problems_badge", &osc, at) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -5934,9 +5979,12 @@ impl App {
                 self.overlays.hero.set(osc, desired);
             }
         }
-        let Some(osc) = self.overlays.hero.image() else {
+        let Some(osc) = self.overlays.hero.image().map(str::to_owned) else {
             return;
         };
+        if !self.chrome_image_due("hero", &osc, hero) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -5976,9 +6024,18 @@ impl App {
         let Some((cx, cy)) = self.remote.last_image_cell else {
             return;
         };
-        let Some(osc) = self.overlays.ssh.image() else {
+        let Some(osc) = self.overlays.ssh.image().map(str::to_owned) else {
             return;
         };
+        let at = Rect {
+            x: cx,
+            y: cy,
+            width: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_W,
+            height: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_H,
+        };
+        if !self.chrome_image_due("ssh", &osc, at) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -6366,6 +6423,12 @@ impl App {
         })
     }
 
+    /// Only iTerm2 evicts cached images, so only there do the activity
+    /// icons need re-sending while nothing changed.
+    fn activity_keepalive_allowed(&self) -> bool {
+        self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::ITerm2
+    }
+
     /// Post-draw flush of the activity-bar icons. Re-emits the pre-encoded
     /// OSC-1337 image bytes each frame (ratatui doesn't track image cells, so
     /// neighbouring SGR traffic can evict them from iTerm2's cache) — but
@@ -6378,16 +6441,19 @@ impl App {
     /// into its OR chain), forgets the emit positions, and skips painting
     /// this frame; the next frame clears, full-redraws, and re-emits a single
     /// clean set at the new cells.
-    pub fn flush_activity_image_overlays(&mut self) {
+    pub fn flush_activity_image_overlays(&mut self, around: &[u64]) {
         use std::io::Write;
-        // The keepalive re-emit fights iTerm2's image-cache eviction; the sixel
-        // cell buffer doesn't evict, so its icons re-emit only when dirty.
-        let allow_keepalive =
-            self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Sixel;
+        // The keepalive re-emit fights iTerm2's image-cache eviction. Neither
+        // the sixel cell buffer nor Kitty's image layer evicts, so there the
+        // icons re-emit only when dirty: on Kitty the keepalive cost about
+        // 13 KB every two seconds, idle, over SSH (#682).
+        let dirty = self.overlays.activity.dirty();
+        let allow_keepalive = self.activity_keepalive_allowed()
+            && (0..around.len()).any(|i| self.overlays.activity.neighbourhood_changed(i, around));
         if !self.overlays.activity.should_refresh(allow_keepalive) {
             return;
         }
-        let overlays = self.pending_activity_image_overlays();
+        let mut overlays = self.pending_activity_image_overlays();
         if overlays.is_empty() {
             return;
         }
@@ -6395,6 +6461,41 @@ impl App {
         if self.overlays.activity.positions_moved(&positions) {
             self.overlays.activity.request_clear();
             self.overlays.activity.forget_positions();
+            self.overlays.activity.forget_sent();
+            return;
+        }
+        let hashes: Vec<u64> = overlays
+            .iter()
+            .map(|(_, seq)| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                seq.hash(&mut h);
+                h.finish()
+            })
+            .collect();
+        let sent: Vec<((u16, u16), u64)> = positions.iter().copied().zip(hashes).collect();
+        // Everything goes out after a wipe or on the first frame. Otherwise
+        // a dirty flush sends only the slots whose cell or image changed,
+        // and a keepalive only the icons whose surroundings changed (`around`
+        // is in the order of the unchanged positions).
+        if !self.overlays.activity.nothing_sent() {
+            let same = positions.as_slice() == self.overlays.activity.last_positions();
+            let mut i = 0;
+            overlays.retain(|_| {
+                let keep = if dirty {
+                    !self.overlays.activity.was_sent(sent[i].0, sent[i].1)
+                } else {
+                    same && self.overlays.activity.neighbourhood_changed(i, around)
+                };
+                i += 1;
+                keep
+            });
+        }
+        if overlays.is_empty() {
+            self.overlays.activity.mark_emitted();
+            self.overlays.activity.store_positions(positions);
+            self.overlays.activity.set_neighbourhood(around.to_vec());
+            self.overlays.activity.set_sent(sent);
             return;
         }
         let mut out = stdout();
@@ -6427,6 +6528,8 @@ impl App {
         let _ = out.flush();
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
+        self.overlays.activity.set_neighbourhood(around.to_vec());
+        self.overlays.activity.set_sent(sent);
     }
 
     /// Whether a post-draw overlay at this cell rect may be emitted (#513).
@@ -7069,8 +7172,11 @@ impl App {
         }
         self.problems_badge_count = count;
         if count == 0 {
+            // Clear the screen only if a badge was actually drawn: at start-up
+            // and on every graphics re-init the count goes from unknown to 0,
+            // and on iTerm2 a needless clear is a whole-screen repaint.
             self.overlays.problems_badge.clear_image();
-            self.overlays.problems_badge.request_clear();
+            self.clear_problems_badge_if_emitted();
             return;
         }
         if let Some(img) = self.build_count_badge_image(
@@ -47532,6 +47638,38 @@ impl App {
                     desired.cell_h,
                 )
         });
+        // Typing re-bakes the whole strip image, several kilobytes a key
+        // over SSH (#682). While only the text changed, the strip catches up
+        // at most every `MINIMAP_EDIT_REBAKE`; `tick_minimap` redraws once
+        // the wait is over so the last edit always lands.
+        let text_only = !placement_moved
+            && self.overlays.minimap.layout().is_some_and(|prev| {
+                (
+                    prev.top,
+                    prev.rows,
+                    prev.side,
+                    prev.bg,
+                    prev.selection,
+                    prev.doc,
+                ) == (
+                    desired.top,
+                    desired.rows,
+                    desired.side,
+                    desired.bg,
+                    desired.selection,
+                    desired.doc,
+                )
+            });
+        if text_only
+            && self
+                .minimap_baked_at
+                .is_some_and(|t| t.elapsed() < MINIMAP_EDIT_REBAKE)
+        {
+            self.minimap_edit_pending = true;
+            return;
+        }
+        self.minimap_edit_pending = false;
+        self.minimap_baked_at = Some(std::time::Instant::now());
         if placement_moved {
             self.overlays.minimap.request_clear_if_displayed();
         }
@@ -47606,6 +47744,21 @@ impl App {
             );
             self.overlays.minimap.set(osc, desired);
         }
+    }
+
+    /// True once a deferred minimap bake is due, so the loop redraws and
+    /// the strip shows the last edit. Consumes the pending flag: that redraw
+    /// bakes (the wait is over), and if the minimap was hidden meanwhile
+    /// nothing is left pending to redraw for, forever.
+    pub fn tick_minimap(&mut self) -> bool {
+        let due = self.minimap_edit_pending
+            && self
+                .minimap_baked_at
+                .is_none_or(|t| t.elapsed() >= MINIMAP_EDIT_REBAKE);
+        if due {
+            self.minimap_edit_pending = false;
+        }
+        due
     }
 
     fn disable_minimap_image(&mut self) {
@@ -53866,6 +54019,8 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
 /// Fingerprints of the text cells under each large post-frame image this
 /// frame (see [`overlay::ImageOverlay::needs_emit`]).
 struct ImageUnderlays {
+    /// Around each activity-bar and toolbar icon, for iTerm2's keepalive.
+    activity: Vec<u64>,
     editor: [u64; 2],
     terminal: u64,
     markdown: u64,
@@ -53895,6 +54050,28 @@ fn cells_fingerprint(buf: &ratatui::buffer::Buffer, x: u16, y: u16, w: u16, h: u
 impl App {
     /// This frame's [`ImageUnderlays`], read from the buffer just drawn.
     fn image_underlays(&self, buf: &ratatui::buffer::Buffer) -> ImageUnderlays {
+        // A one-cell ring around each icon's block (the widest is 4x2).
+        let activity: Vec<u64> = self
+            .overlays
+            .activity
+            .last_positions()
+            .iter()
+            .map(|&(x, y)| cells_fingerprint(buf, x.saturating_sub(1), y.saturating_sub(1), 6, 4))
+            .collect();
+        // Kitty keeps pictures on their own layer: text written into the
+        // cells never deletes a placement (only a delete command or a screen
+        // clear does, and both forget what was sent). So on Kitty the cells
+        // beneath do not matter, and streaming output beside an image sends
+        // nothing.
+        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
+            return ImageUnderlays {
+                activity,
+                editor: [0, 0],
+                terminal: 0,
+                markdown: 0,
+                minimap: 0,
+            };
+        }
         let o = &self.overlays;
         let editor = |side: usize| {
             o.editor[side].layout().map_or(0, |l| {
@@ -53902,6 +54079,7 @@ impl App {
             })
         };
         ImageUnderlays {
+            activity,
             editor: [editor(0), editor(1)],
             terminal: o.terminal_image.layout().map_or(0, |l| {
                 cells_fingerprint(buf, l.cell_x, l.cell_y, l.cell_w, l.cell_h)
@@ -53915,9 +54093,46 @@ impl App {
         }
     }
 
+    /// Whether a small chrome image must be sent this frame (#682). These
+    /// used to go out after every redraw, so a keystroke re-sent each one
+    /// over SSH. Now one goes out when it is new, changed or moved, and on
+    /// iTerm2 and Sixel also when the cells around it were repainted (iTerm2
+    /// evicts an image under neighbouring traffic, and a cell-buffer picture
+    /// is erased by writes into it). Kitty keeps images on their own layer.
+    fn chrome_image_due(&mut self, key: &'static str, image: &str, at: Rect) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        image.hash(&mut h);
+        (at.x, at.y, at.width, at.height).hash(&mut h);
+        if self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Kitty
+            && let Some(buf) = &self.drawn_buffer
+        {
+            cells_fingerprint(
+                buf,
+                at.x.saturating_sub(1),
+                at.y.saturating_sub(1),
+                at.width.saturating_add(2),
+                at.height.saturating_add(2),
+            )
+            .hash(&mut h);
+        }
+        let sig = h.finish();
+        self.chrome_seen.insert(key);
+        self.chrome_sent.insert(key, sig) != Some(sig)
+    }
+
+    /// Drop the record of chrome images that were not on screen this frame,
+    /// so they are sent again when they come back.
+    fn end_chrome_flush(&mut self) {
+        let seen = std::mem::take(&mut self.chrome_seen);
+        self.chrome_sent.retain(|k, _| seen.contains(k));
+    }
+
     /// The screen was wiped or its images evicted: every large image is
     /// sent again on the next flush.
     fn forget_sent_images(&mut self) {
+        self.chrome_sent.clear();
+        self.overlays.activity.forget_sent();
         for side in 0..2 {
             self.overlays.editor[side].forget_sent();
         }
@@ -54058,7 +54273,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
-        let live_run_changed = app.tick_live_run() | app.sync_markdown_scroll();
+        let live_run_changed =
+            app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
         let code_lens_changed = app.drain_lsp_code_lens()
             | app.drain_search_editor()
@@ -54284,6 +54500,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.render(f);
             })?;
             let mut underlays = app.image_underlays(drawn.buffer);
+            app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -54301,6 +54518,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     app.render(f);
                 })?;
                 underlays = app.image_underlays(drawn.buffer);
+                app.drawn_buffer = Some(drawn.buffer.clone());
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
@@ -54313,7 +54531,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // buffer in image-mode, ratatui's diff produces zero per-cell
             // writes here — re-emitting the pre-encoded OSC bytes every
             // frame is cheap and locks the images in.
-            app.flush_activity_image_overlays();
+            app.flush_activity_image_overlays(&underlays.activity);
             // Active editor image preview: baked once, and sent after
             // ratatui's diff only when it could be missing from the screen
             // (`ImageOverlay::needs_emit`), never on every frame: a picture
@@ -54447,6 +54665,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.flush_problems_badge_overlay();
             app.flush_no_repo_hero_overlay();
             app.flush_ssh_empty_state_overlay();
+            app.end_chrome_flush();
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
