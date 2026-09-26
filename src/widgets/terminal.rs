@@ -480,13 +480,13 @@ pub struct PtyTerminal {
     /// The app drains this each tick to feed the PORTS panel and the toast.
     port_rx: std::sync::mpsc::Receiver<crate::port_detect::PortHit>,
     master: Box<dyn MasterPty + Send>,
-    /// Shared between this struct's user-input path (`write_input`,
-    /// `paste_*`, `cd_into`) and the background responder thread that
-    /// ships alacritty's reply bytes (`PtyWrite`, `TextAreaSizeRequest`)
-    /// back to the shell's stdin. portable-pty rejects a second
-    /// `take_writer` call, so there is exactly one underlying writer
-    /// and both paths funnel through this mutex.
-    writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    /// Bytes for the child's stdin, written by this pane's writer thread.
+    /// The user-input path (`write_input`, `paste_*`, `cd_into`, mouse
+    /// reports) and the responder that ships alacritty's replies both send
+    /// here: portable-pty hands out one writer, and a blocking `write_all`
+    /// on the UI thread froze all of croft when a large paste met a program
+    /// that was not reading its stdin.
+    input_tx: std::sync::mpsc::Sender<Vec<u8>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     /// The PTY reader thread's handle, joined in `Drop` after the child is
     /// killed so a dropped terminal never leaves a live shell + blocked
@@ -1832,9 +1832,17 @@ impl PtyTerminal {
         let shell_pid = child.process_id().map(|p| p as i32);
         drop(pair.slave);
 
-        let writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>> = Arc::new(std::sync::Mutex::new(
-            pair.master.take_writer().context("take writer")?,
-        ));
+        let mut writer: Box<dyn Write + Send> = pair.master.take_writer().context("take writer")?;
+        let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // Ends once every sender is gone (the pane and its responder), or
+        // when the child stops taking input.
+        std::thread::spawn(move || {
+            while let Ok(bytes) = input_rx.recv() {
+                if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
 
         let term_size = TermSize::new(cols as usize, rows as usize);
@@ -1866,17 +1874,11 @@ impl PtyTerminal {
         }
         let term = Arc::new(FairMutex::new(term));
         let term_for_thread = term.clone();
-        let writer_for_responder = writer.clone();
+        let input_for_responder = input_tx.clone();
 
         std::thread::spawn(move || {
             while let Ok(text) = response_rx.recv() {
-                let Ok(mut w) = writer_for_responder.lock() else {
-                    break;
-                };
-                if w.write_all(text.as_bytes()).is_err() {
-                    break;
-                }
-                if w.flush().is_err() {
+                if input_for_responder.send(text.into_bytes()).is_err() {
                     break;
                 }
             }
@@ -2267,7 +2269,7 @@ impl PtyTerminal {
             agent: None,
             port_rx,
             master: pair.master,
-            writer,
+            input_tx,
             _child: child,
             reader_thread: Some(reader_thread),
             reader_shutdown: Some(shutdown_w),
@@ -3670,10 +3672,7 @@ impl PtyTerminal {
             .lock()
             .unwrap()
             .extend_from_slice(data);
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(data);
-            let _ = w.flush();
-        }
+        let _ = self.input_tx.send(data.to_vec());
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -3741,10 +3740,7 @@ impl PtyTerminal {
             .lock()
             .unwrap()
             .extend_from_slice(&report);
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(&report);
-            let _ = w.flush();
-        }
+        let _ = self.input_tx.send(report);
         self.input_seen = true;
         self.pty_dirty.store(true, Ordering::Release);
         true
@@ -5690,6 +5686,24 @@ mod tests {
         assert!(
             args.is_empty(),
             "an unknown shell must be spawned without -l in case the flag means something else there"
+        );
+    }
+
+    #[test]
+    fn a_large_write_to_a_child_not_reading_never_blocks_the_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("stty raw -echo; sleep 3")],
+            tmp.path(),
+        )
+        .unwrap();
+        let big = vec![b'x'; 1 << 20];
+        let started = std::time::Instant::now();
+        term.write_input(&big);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the write went to the pane's writer thread, not the caller"
         );
     }
 

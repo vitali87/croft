@@ -356,6 +356,8 @@ fn with_spec_workspace_diagnostics(mut params: serde_json::Value) -> serde_json:
 
 pub struct LspClient {
     server: ServerSocket,
+    /// A clone of `server` for requests; see [`LspRequests`].
+    requests: LspRequests,
     capabilities: ServerCapabilities,
     /// See [`LspClient::supports_type_hierarchy`].
     type_hierarchy: bool,
@@ -496,6 +498,9 @@ impl LspClient {
             .context("lsp initialized notification")?;
 
         Ok(Self {
+            requests: LspRequests {
+                server: server.clone(),
+            },
             server,
             capabilities: init.capabilities,
             type_hierarchy,
@@ -534,6 +539,11 @@ impl LspClient {
     /// user of that client, including `open_doc` on the worker loop.
     pub fn detached_server(&self) -> ServerSocket {
         self.server.clone()
+    }
+
+    /// The request methods on their own, to await with the client unlocked.
+    pub fn requests(&self) -> LspRequests {
+        self.requests.clone()
     }
 
     pub fn did_open(
@@ -587,6 +597,60 @@ impl LspClient {
             .context("did_close")
     }
 
+    /// `textDocument/codeLens` (#608), on a detached server handle so the
+    /// client's lock isn't held while the server answers.
+    pub async fn code_lens_on(
+        mut server: ServerSocket,
+        uri: Url,
+    ) -> Result<Option<Vec<lsp_types::CodeLens>>> {
+        server
+            .code_lens(lsp_types::CodeLensParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("codeLens")
+    }
+
+    /// `codeLens/resolve` (#608): fill in a lens's command, on a detached
+    /// server handle.
+    pub async fn code_lens_resolve_on(
+        mut server: ServerSocket,
+        lens: lsp_types::CodeLens,
+    ) -> Result<lsp_types::CodeLens> {
+        server
+            .code_lens_resolve(lens)
+            .await
+            .context("codeLens/resolve")
+    }
+
+    /// `workspace/didRenameFiles` (#610): tell the server the move happened.
+    pub fn did_rename_files(&mut self, files: Vec<lsp_types::FileRename>) -> Result<()> {
+        self.server
+            .did_rename_files(lsp_types::RenameFilesParams { files })
+            .context("didRenameFiles")
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.server.shutdown(()).await.context("lsp shutdown")?;
+        self.server.exit(()).context("lsp exit")?;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.child.wait()).await;
+        Ok(())
+    }
+}
+
+/// The request half of an [`LspClient`]: a clone of its server socket,
+/// cheap to take while the client's lock is held and awaited after it is
+/// released. A server may take long to answer, or never answer, and holding
+/// the client lock across that await stalled every other user of the client
+/// behind it, the document syncs of every language included.
+#[derive(Clone)]
+pub struct LspRequests {
+    server: ServerSocket,
+}
+
+impl LspRequests {
     pub async fn completion(
         &mut self,
         uri: Url,
@@ -1114,34 +1178,6 @@ impl LspClient {
             .context("rename")
     }
 
-    /// `textDocument/codeLens` (#608), on a detached server handle so the
-    /// client's lock isn't held while the server answers.
-    pub async fn code_lens_on(
-        mut server: ServerSocket,
-        uri: Url,
-    ) -> Result<Option<Vec<lsp_types::CodeLens>>> {
-        server
-            .code_lens(lsp_types::CodeLensParams {
-                text_document: TextDocumentIdentifier { uri },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .await
-            .context("codeLens")
-    }
-
-    /// `codeLens/resolve` (#608): fill in a lens's command, on a detached
-    /// server handle.
-    pub async fn code_lens_resolve_on(
-        mut server: ServerSocket,
-        lens: lsp_types::CodeLens,
-    ) -> Result<lsp_types::CodeLens> {
-        server
-            .code_lens_resolve(lens)
-            .await
-            .context("codeLens/resolve")
-    }
-
     /// `workspace/willRenameFiles` (#610): the edit a server wants applied
     /// before `files` move, typically the imports that name them.
     pub async fn will_rename_files(
@@ -1152,13 +1188,6 @@ impl LspClient {
             .will_rename_files(lsp_types::RenameFilesParams { files })
             .await
             .context("willRenameFiles")
-    }
-
-    /// `workspace/didRenameFiles` (#610): tell the server the move happened.
-    pub fn did_rename_files(&mut self, files: Vec<lsp_types::FileRename>) -> Result<()> {
-        self.server
-            .did_rename_files(lsp_types::RenameFilesParams { files })
-            .context("didRenameFiles")
     }
 
     /// `textDocument/prepareRename`: validate the position and get the
@@ -1367,12 +1396,18 @@ impl LspClient {
             .await
             .context("semantic_tokens_range")
     }
+}
 
-    pub async fn shutdown(&mut self) -> Result<()> {
-        self.server.shutdown(()).await.context("lsp shutdown")?;
-        self.server.exit(()).context("lsp exit")?;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.child.wait()).await;
-        Ok(())
+impl std::ops::Deref for LspClient {
+    type Target = LspRequests;
+    fn deref(&self) -> &LspRequests {
+        &self.requests
+    }
+}
+
+impl std::ops::DerefMut for LspClient {
+    fn deref_mut(&mut self) -> &mut LspRequests {
+        &mut self.requests
     }
 }
 
