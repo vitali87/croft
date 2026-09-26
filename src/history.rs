@@ -129,21 +129,65 @@ fn dir_for(root_dir: &Path, abs_path: &Path) -> PathBuf {
 /// Prunes to [`MAX_SNAPSHOTS_PER_FILE`]. Best-effort: any IO error is
 /// returned but a caller may ignore it (history is a convenience, not a
 /// guarantee).
+#[cfg(test)]
 pub fn record_in(
     root_dir: &Path,
     abs_path: &Path,
     content: &[u8],
     millis: u64,
 ) -> std::io::Result<()> {
+    record_impl(root_dir, abs_path, content, millis, false)
+}
+
+/// Record `content` as a snapshot the merge window neither merges into nor
+/// later replaces: a restore's before and after, and a review baseline.
+/// Merged like a save, the restore replaced (deleted) the version it was
+/// overwriting when that was seconds old, and an autosave right after
+/// "mark reviewed" deleted the baseline the review diff points at.
+pub fn record_kept_in(
+    root_dir: &Path,
+    abs_path: &Path,
+    content: &[u8],
+    millis: u64,
+) -> std::io::Result<()> {
+    record_impl(root_dir, abs_path, content, millis, true)
+}
+
+/// Whether the snapshot at `millis` in `dir` is kept (see [`record_kept_in`]).
+fn is_kept(dir: &Path, millis: u64) -> bool {
+    keep_path(dir, millis).exists()
+}
+
+fn keep_path(dir: &Path, millis: u64) -> PathBuf {
+    dir.join(format!("{millis}.{KEEP_EXT}"))
+}
+
+const KEEP_EXT: &str = "keep";
+
+fn record_impl(
+    root_dir: &Path,
+    abs_path: &Path,
+    content: &[u8],
+    millis: u64,
+    keep: bool,
+) -> std::io::Result<()> {
     let dir = dir_for(root_dir, abs_path);
     if let Some(latest) = entries_in(root_dir, abs_path).first() {
-        // Skip when the newest snapshot already holds this exact content.
+        // Skip when the newest snapshot already holds this exact content;
+        // a kept record marks it kept instead of adding a duplicate.
         if std::fs::read(&latest.file).is_ok_and(|prev| prev == content) {
+            if keep {
+                write_staged(&dir, latest.millis, KEEP_EXT, b"")?;
+            }
             return Ok(());
         }
         // Inside the merge window: this save supersedes the newest snapshot
         // rather than appending, so a 1s auto save can't churn out history.
-        if millis.saturating_sub(latest.millis) < MERGE_WINDOW_MILLIS {
+        // Never for a kept record, and never over a kept snapshot.
+        if !keep
+            && !is_kept(&dir, latest.millis)
+            && millis.saturating_sub(latest.millis) < MERGE_WINDOW_MILLIS
+        {
             // The sidecar described the bytes about to be replaced, at either
             // timestamp: two saves in one millisecond overwrite `<millis>.snap`
             // in place, and a sidecar left beside it would describe the
@@ -160,10 +204,27 @@ pub fn record_in(
             return Ok(());
         }
     }
-    std::fs::create_dir_all(&dir)?;
+    create_private_dir(&dir)?;
     write_snapshot(&dir, millis, content)?;
+    if keep {
+        write_staged(&dir, millis, KEEP_EXT, b"")?;
+    }
     prune_in(root_dir, abs_path);
     Ok(())
+}
+
+/// Create `dir` (and missing parents) owner-only: snapshots copy the files
+/// they record, a 0600 `.env` included, and the umask's 0755 let any local
+/// user list and read them.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 /// Put `content` at `<millis>.snap` under `dir` so that the entry is never
@@ -194,7 +255,15 @@ fn write_staged(dir: &Path, millis: u64, ext: &str, content: &[u8]) -> std::io::
     let final_path = dir.join(format!("{millis}.{ext}"));
     let tmp = staging_path(dir, millis);
     let written = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
+        // Owner-only, like the directory (see `create_private_dir`).
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
         file.lock()?;
         file.write_all(content)?;
         // Windows cannot rename a file that is open; the lock is released
@@ -295,7 +364,7 @@ fn record_seats_in(
     }
     let dir = dir_for(root_dir, abs_path);
     let json = serde_json::to_vec(seats).map_err(std::io::Error::other)?;
-    std::fs::create_dir_all(&dir)?;
+    create_private_dir(&dir)?;
     write_staged(&dir, millis, SEATS_EXT, &json)
 }
 
@@ -309,7 +378,30 @@ pub fn record_with_seats_in(
     millis: u64,
     seats: &crate::provenance::Provenance,
 ) -> std::io::Result<()> {
-    record_in(root_dir, abs_path, content, millis)?;
+    record_seated(root_dir, abs_path, content, millis, seats, false)
+}
+
+/// [`record_with_seats_in`] for a snapshot that is kept (see
+/// [`record_kept_in`]).
+pub fn record_kept_with_seats_in(
+    root_dir: &Path,
+    abs_path: &Path,
+    content: &[u8],
+    millis: u64,
+    seats: &crate::provenance::Provenance,
+) -> std::io::Result<()> {
+    record_seated(root_dir, abs_path, content, millis, seats, true)
+}
+
+fn record_seated(
+    root_dir: &Path,
+    abs_path: &Path,
+    content: &[u8],
+    millis: u64,
+    seats: &crate::provenance::Provenance,
+    keep: bool,
+) -> std::io::Result<()> {
+    record_impl(root_dir, abs_path, content, millis, keep)?;
     // Nothing attributed writes nothing (see `record_seats_in`), so skip the
     // listing and the snapshot read that would find its holder.
     if seats.attributed() == 0 {
@@ -370,6 +462,7 @@ fn prune_in(root_dir: &Path, abs_path: &Path) {
     for old in all.into_iter().skip(MAX_SNAPSHOTS_PER_FILE) {
         let _ = std::fs::remove_file(&old.file);
         let _ = std::fs::remove_file(seats_path(&dir, old.millis));
+        let _ = std::fs::remove_file(keep_path(&dir, old.millis));
     }
     sweep_abandoned_staging(&dir, std::time::SystemTime::now());
 }
@@ -377,6 +470,38 @@ fn prune_in(root_dir: &Path, abs_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kept_snapshots_are_never_merged_away_and_history_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/.env");
+        record_in(root, f, b"v2", 1000).unwrap();
+        // A restore 2s later keeps both what it overwrites and what it writes.
+        record_kept_in(root, f, b"v2", 3000).unwrap();
+        record_kept_in(root, f, b"v1", 3001).unwrap();
+        // An autosave right after does not replace the kept snapshot.
+        record_in(root, f, b"v1 edited", 4000).unwrap();
+        let held: Vec<Vec<u8>> = entries_in(root, f)
+            .iter()
+            .map(|s| std::fs::read(&s.file).unwrap())
+            .collect();
+        assert_eq!(
+            held,
+            vec![b"v1 edited".to_vec(), b"v1".to_vec(), b"v2".to_vec()]
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir_for(root, f);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let snap = &entries_in(root, f)[0].file;
+        assert_eq!(
+            std::fs::metadata(snap).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn a_snapshot_is_staged_under_a_name_the_listing_ignores() {

@@ -908,8 +908,6 @@ impl SshControl {
 
     fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir()?;
-        std::fs::create_dir_all(&socket_dir)
-            .with_context(|| format!("creating {}", socket_dir.display()))?;
         let socket_path = socket_dir.join("ctl");
         let status = Command::new("ssh")
             .arg("-M")
@@ -1958,12 +1956,32 @@ pub(crate) fn client_process_nonce() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Create a fresh, owner-only directory for an SSH control socket and
+/// return it. Created here, in one step, rather than named and later
+/// `create_dir_all`ed: the name is predictable in a shared `/tmp`, and
+/// `create_dir_all` accepted a directory another local user had made first,
+/// who could then plant a `ctl` that reads as "authenticated" or swap in a
+/// socket of their own. The create fails if the name already exists.
 pub fn ssh_control_dir() -> Result<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock before unix epoch")?
         .as_millis();
-    Ok(std::env::temp_dir().join(format!("croft-ssh-{}-{now}", std::process::id())))
+    // A counter too: two calls in one millisecond must not collide now that
+    // an existing name is an error.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("croft-ssh-{}-{now}-{seq}", std::process::id()));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
 }
 
 fn run_remote_croft(
@@ -4034,6 +4052,18 @@ Host !blocked *.internal
         assert!(!is_transport_failure(Some(1)));
         assert!(!is_transport_failure(Some(101)));
         assert!(!is_transport_failure(None));
+    }
+
+    #[test]
+    fn the_ssh_control_dir_is_fresh_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = super::ssh_control_dir().unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A directory already at the name (made by someone else) is an
+        // error, not something to adopt.
+        assert!(std::fs::DirBuilder::new().create(&dir).is_err());
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

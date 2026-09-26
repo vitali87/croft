@@ -1039,6 +1039,10 @@ fn path_at_commit(root: &Path, hash: &str, rel_path: &str) -> Option<String> {
         &[
             "log",
             "--follow",
+            // As deep as the TIMELINE lists (`file_history`'s 50), with room
+            // to spare: a row past it cannot be clicked, and the full walk
+            // of a long history was the slow part.
+            "-n200",
             "--name-only",
             "--format=%x1e%H",
             "--",
@@ -1442,6 +1446,10 @@ pub struct BlameLine {
     /// True for a not-yet-committed line (the zero hash `git blame` reports
     /// for working-tree changes).
     pub uncommitted: bool,
+    /// The line's text as blamed, when known: the annotation is shown only
+    /// while the buffer's line still reads the same (see
+    /// `Editor::committed_blame_annotation`).
+    pub text: Option<String>,
 }
 
 /// Per-line blame for `rel_path`, indexed 0-based by result position (result
@@ -1485,7 +1493,7 @@ pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
             author_time = rest.trim().parse().unwrap_or(now);
         } else if let Some(rest) = raw.strip_prefix("summary ") {
             summary = rest.to_string();
-        } else if raw.starts_with('\t') {
+        } else if let Some(content) = raw.strip_prefix('\t') {
             // The content line closes a group: emit the accumulated blame.
             if let Some(full) = hash.take() {
                 let uncommitted = full.chars().all(|c| c == '0');
@@ -1495,6 +1503,7 @@ pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
                     author: std::mem::take(&mut author),
                     age_secs: now - author_time,
                     uncommitted,
+                    text: Some(content.to_string()),
                 });
             }
         } else if let Some(h) = raw.split(' ').next() {

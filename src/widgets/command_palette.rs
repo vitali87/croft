@@ -1438,9 +1438,9 @@ pub fn render_command_palette(
     center: bool,
 ) {
     let width = area.width.saturating_mul(7) / 10;
-    let width = width.clamp(40, 100.min(area.width));
+    let width = width.clamp(40, 100).min(area.width);
     let height = area.height.saturating_mul(6) / 10;
-    let height = height.clamp(10, area.height);
+    let height = height.max(10).min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     // Quick Input Position: Top anchors in the upper third (VS Code's
     // default); Center pins it to the vertical middle.

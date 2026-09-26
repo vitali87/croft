@@ -59,49 +59,110 @@ impl Task {
     /// The line to type into the task's shell. A tasks.json entry gets its
     /// `${workspaceFolder}` / `${file}` variables expanded (the shell would
     /// otherwise expand them to nothing and run `/scripts/build.sh`), each
-    /// argument with whitespace quoted (`"fix bug"` stays one word), and
+    /// argument with whitespace kept one word (`"fix bug"`), and
     /// `options.cwd` / `options.env` applied in a subshell, so the pane's
-    /// own directory and environment are left alone. Err names a variable
-    /// that cannot be expanded.
+    /// own directory and environment are left alone. Err only when a
+    /// `${file}`-family variable is used with no file open.
     pub fn command_line(&self, ctx: &crate::dap::configs::SubstCtx) -> Result<String, String> {
         let Some(v) = &self.vscode else {
             return Ok(self.command.clone());
         };
-        let sub = |s: &str| crate::dap::configs::substitute(s, ctx);
-        // A value a variable filled in is data, whatever it holds: a path
-        // like `it's` or a file named `a;touch x.rs` from a cloned repo must
-        // not reach the shell as syntax. Text written literally in tasks.json
-        // keeps its shell meaning (globs, `&&`).
-        let from_variable = |raw: &str, value: &str| raw.contains("${") && needs_quote(value);
-        let mut line = sub(&v.command)?;
-        // A command written as a shell line is left as written; a single
-        // word (a program path) is quoted like an argument.
-        if !v.command.contains(char::is_whitespace)
-            && (line.contains(char::is_whitespace) || from_variable(&v.command, &line))
-        {
-            line = quote_word(&line);
-        }
+        // The command's literal text keeps its shell meaning (`&&`, globs);
+        // an argument's is quoted only when it must stay one word.
+        let mut line = expand_task_text(&v.command, ctx, false)?;
         for raw in &v.args {
-            let arg = sub(raw)?;
+            let literal_space =
+                raw.is_empty() || literal_parts(raw).any(|l| l.contains(char::is_whitespace));
             line.push(' ');
-            if arg.is_empty() || arg.contains(char::is_whitespace) || from_variable(raw, &arg) {
-                line.push_str(&quote_word(&arg));
-            } else {
-                line.push_str(&arg);
-            }
+            line.push_str(&expand_task_text(raw, ctx, literal_space)?);
         }
         let mut setup = Vec::new();
         if let Some(cwd) = &v.cwd {
-            setup.push(format!("cd {}", quote_word(&sub(cwd)?)));
+            setup.push(format!("cd {}", expand_task_text(cwd, ctx, true)?));
         }
         for (key, value) in &v.env {
-            setup.push(format!("export {key}={}", quote_word(&sub(value)?)));
+            setup.push(format!(
+                "export {key}={}",
+                expand_task_text(value, ctx, true)?
+            ));
         }
         if setup.is_empty() {
             return Ok(line);
         }
         Ok(format!("({} && {line})", setup.join(" && ")))
     }
+}
+
+/// `raw` with its `${...}` variables substituted for a shell line. A value
+/// a variable filled in is data whatever it holds, so it is quoted when it
+/// needs to be: a workspace `it's` or a file `a;touch x.rs` from a cloned
+/// repo must not reach the shell as syntax, in `python3 ${file}` as much as
+/// in an argument. A variable croft does not expand (`${HOME}`,
+/// `${input:...}`) is left bare for the shell, as it always was, rather
+/// than refusing the task; an unset `${env:X}` is empty, as in VS Code.
+/// With `quote_literals`, the literal text is quoted too, so the whole
+/// result is one shell word.
+fn expand_task_text(
+    raw: &str,
+    ctx: &crate::dap::configs::SubstCtx,
+    quote_literals: bool,
+) -> Result<String, String> {
+    let literal = |out: &mut String, text: &str| {
+        if quote_literals && !text.is_empty() {
+            out.push_str(&quote_word(text));
+        } else {
+            out.push_str(text);
+        }
+    };
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start + 2..].find('}') else {
+            break;
+        };
+        literal(&mut out, &rest[..start]);
+        let var = &rest[start + 2..start + 2 + len];
+        match crate::dap::configs::substitute(&format!("${{{var}}}"), ctx) {
+            Ok(value) if needs_quote(&value) || (quote_literals && value.is_empty()) => {
+                out.push_str(&quote_word(&value));
+            }
+            Ok(value) => out.push_str(&value),
+            Err(e) if e.contains("no active file") => return Err(e),
+            Err(_) if var.starts_with("env:") => {}
+            Err(_) => {
+                out.push_str("${");
+                out.push_str(var);
+                out.push('}');
+            }
+        }
+        rest = &rest[start + 2 + len + 1..];
+    }
+    literal(&mut out, rest);
+    if quote_literals && out.is_empty() {
+        out.push_str("''");
+    }
+    Ok(out)
+}
+
+/// The literal text of `raw` between its `${...}` variables.
+fn literal_parts(raw: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(raw);
+    std::iter::from_fn(move || {
+        let r = rest?;
+        match r
+            .find("${")
+            .and_then(|s| r[s + 2..].find('}').map(|l| (s, l)))
+        {
+            Some((s, l)) => {
+                rest = Some(&r[s + 2 + l + 1..]);
+                Some(&r[..s])
+            }
+            None => {
+                rest = None;
+                Some(r)
+            }
+        }
+    })
 }
 
 /// Whether `s` holds anything a shell would read as more than plain text.
@@ -520,6 +581,18 @@ mod tests {
             .collect()
     }
 
+    /// The words a shell line splits into, and the cwd/env it sets up, as a
+    /// real `sh` sees them: the program is swapped for a printer, so each
+    /// argument comes back bracketed.
+    fn shell_words(line: &str, program: &str) -> String {
+        let probe = line.replacen(program, "printf '[%s]'", 1);
+        let out = std::process::Command::new("sh")
+            .args(["-c", &probe])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
     #[test]
     fn a_tasks_json_line_expands_variables_quotes_args_and_applies_options() {
         let tmp = tempfile::tempdir().unwrap();
@@ -530,39 +603,52 @@ mod tests {
                 {"label": "build", "command": "${workspaceFolder}/scripts/build.sh",
                  "args": ["-m", "fix bug", "${file}"],
                  "options": {"cwd": "${workspaceFolder}/web", "env": {"MODE": "it's"}}},
+                {"label": "line", "command": "python3 ${file} ${env:CROFT_TEST_UNSET_VAR} ${HOME}"},
                 {"label": "plain", "command": "npm run lint"}
             ]}"#,
         )
         .unwrap();
         let tasks = discover_tasks(tmp.path());
+        let task = |label: &str| tasks.iter().find(|t| t.label == label).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("it's work");
+        std::fs::create_dir_all(ws.join("web")).unwrap();
         let ctx = crate::dap::configs::SubstCtx {
-            workspace_folder: PathBuf::from("/my work"),
-            file: Some(PathBuf::from("/my work/a.rs")),
+            workspace_folder: ws.clone(),
+            file: Some(ws.join("a;touch${IFS}pwned.rs")),
         };
-        let build = tasks.iter().find(|t| t.label == "build").unwrap();
-        assert_eq!(
-            build.command_line(&ctx).unwrap(),
-            "(cd '/my work/web' && export MODE='it'\\''s' && \
-             '/my work/scripts/build.sh' -m 'fix bug' '/my work/a.rs')"
+        let build = task("build").command_line(&ctx).unwrap();
+        assert!(
+            build.starts_with("(cd ") && build.contains("export MODE="),
+            "{build}"
         );
-        // Values from variables are data even with no whitespace in them.
-        let odd = crate::dap::configs::SubstCtx {
-            workspace_folder: PathBuf::from("/w/it's"),
-            file: Some(PathBuf::from("/w/a;touch${IFS}x.rs")),
-        };
+        let program = build.rsplit(" && ").next().unwrap().trim_end_matches(')');
+        let words = shell_words(program, program.split(" -m").next().unwrap());
         assert_eq!(
-            build.command_line(&odd).unwrap(),
-            "(cd '/w/it'\\''s/web' && export MODE='it'\\''s' && \
-             '/w/it'\\''s/scripts/build.sh' -m 'fix bug' '/w/a;touch${IFS}x.rs')"
+            words,
+            format!(
+                "[-m][fix bug][{}]",
+                ws.join("a;touch${IFS}pwned.rs").display()
+            )
         );
-        let plain = tasks.iter().find(|t| t.label == "plain").unwrap();
-        assert_eq!(plain.command_line(&ctx).unwrap(), "npm run lint");
+        // A shell-line command: the file stays one word and runs nothing;
+        // an unset env var is empty; `${HOME}` is left for the shell.
+        let line = task("line").command_line(&ctx).unwrap();
+        assert!(line.contains("${HOME}"), "{line}");
+        let words = shell_words(&line, "python3");
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(
+            words,
+            format!("[{}][{home}]", ws.join("a;touch${IFS}pwned.rs").display())
+        );
+        assert!(!std::path::Path::new("pwned.rs").exists());
+        assert_eq!(task("plain").command_line(&ctx).unwrap(), "npm run lint");
         let no_file = crate::dap::configs::SubstCtx {
             workspace_folder: PathBuf::from("/w"),
             file: None,
         };
         assert!(
-            build.command_line(&no_file).is_err(),
+            task("build").command_line(&no_file).is_err(),
             "${{file}} with no file"
         );
     }

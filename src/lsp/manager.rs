@@ -32,7 +32,7 @@ use crate::lsp::registry::ServerRegistry;
 use crate::lsp::runtime::LspRuntime;
 use crate::widgets::editor::TextSpanEdit;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionItem {
     pub label: String,
     pub detail: Option<String>,
@@ -44,6 +44,14 @@ pub struct CompletionItem {
     /// snippet injected into the popup. The app expands it through the editor's
     /// snippet engine on accept instead of inserting it verbatim.
     pub is_snippet: bool,
+    /// The server's own edit for this item (`textEdit`; for an insert/
+    /// replace edit, its insert range), UTF-16 columns. It can reach back
+    /// before the typed word (TypeScript's `?.foo` replaces the `.`), which
+    /// replacing the word alone got wrong.
+    pub text_edit: Option<TextSpanEdit>,
+    /// `additionalTextEdits`: an auto-import or `#include` elsewhere in the
+    /// file, applied along with the item.
+    pub additional_edits: Vec<TextSpanEdit>,
 }
 
 #[derive(Debug)]
@@ -5320,6 +5328,19 @@ fn text_edit_to_span(te: &TextEdit) -> TextSpanEdit {
 
 fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
     let is_snippet = item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET);
+    let text_edit = item.text_edit.as_ref().map(|te| match te {
+        lsp_types::CompletionTextEdit::Edit(e) => text_edit_to_span(e),
+        lsp_types::CompletionTextEdit::InsertAndReplace(e) => text_edit_to_span(&TextEdit {
+            range: e.insert,
+            new_text: e.new_text.clone(),
+        }),
+    });
+    let additional_edits = item
+        .additional_text_edits
+        .iter()
+        .flatten()
+        .map(text_edit_to_span)
+        .collect();
     CompletionItem {
         label: item.label,
         detail: item.detail,
@@ -5327,6 +5348,8 @@ fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
         filter_text: item.filter_text,
         kind: item.kind,
         is_snippet,
+        text_edit,
+        additional_edits,
     }
 }
 

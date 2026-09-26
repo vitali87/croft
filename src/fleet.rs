@@ -330,16 +330,28 @@ fn run_killable(mut cmd: std::process::Command, host: &str, timeout: Duration) -
     // after exit, a command printing more than a pipe buffer (~64 KiB, any
     // `journalctl`) blocked on the write, never exited, and was killed at
     // the deadline with all its output lost.
+    // Into a shared buffer, chunk by chunk: a command that leaves a
+    // background process holding the pipe (`nohup srv &`) never reaches EOF,
+    // and waiting for the whole read lost everything it had printed.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let sink = buf.clone();
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
             if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
+                let mut chunk = [0u8; 8192];
+                while let Ok(n) = p.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut b) = sink.lock() {
+                        b.extend_from_slice(&chunk[..n]);
+                    }
+                }
             }
-            let _ = tx.send(buf);
+            let _ = done_tx.send(());
         });
-        rx
+        (buf, done_rx)
     };
     let stdout = drain(
         child
@@ -373,8 +385,15 @@ fn run_killable(mut cmd: std::process::Command, host: &str, timeout: Duration) -
     // A descendant the command left running can hold a pipe open past the
     // exit, so the readers get a short grace rather than a join.
     let grace = Duration::from_millis(500);
-    let out = stdout.recv_timeout(grace).unwrap_or_default();
-    let err = stderr.recv_timeout(grace).unwrap_or_default();
+    let take = |(buf, done): (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        std::sync::mpsc::Receiver<()>,
+    )| {
+        let _ = done.recv_timeout(grace);
+        buf.lock().map(|b| b.clone()).unwrap_or_default()
+    };
+    let out = take(stdout);
+    let err = take(stderr);
     // stdout AND stderr: a command that failed usually said why on
     // stderr, and a tile showing an empty box for a failure tells
     // the user nothing they can act on.
@@ -393,6 +412,15 @@ fn run_killable(mut cmd: std::process::Command, host: &str, timeout: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_is_kept_when_a_background_child_holds_the_pipe() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo started; sleep 30 &"]);
+        let r = run_killable(cmd, "h", Duration::from_secs(20));
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(r.output, "started");
+    }
 
     #[test]
     fn a_command_printing_more_than_a_pipe_buffer_completes() {

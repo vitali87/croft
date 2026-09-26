@@ -1222,10 +1222,22 @@ pub fn render_markdown_mapped(
                     // (#176). Remote URLs and misses keep the labelled
                     // placeholder - the preview never fetches.
                     let local = (!dest_url.contains("://"))
-                        .then(|| r.base_dir.as_ref().map(|d| d.join(dest_url.as_ref())))
+                        .then(|| {
+                            r.base_dir
+                                .as_ref()
+                                .map(|d| local_image_path(d, dest_url.as_ref()))
+                        })
                         .flatten()
-                        .filter(|p| p.is_file());
-                    let dims = local.as_ref().and_then(|p| image::image_dimensions(p).ok());
+                        .flatten();
+                    // Capped like the editor's image tab and the notebook
+                    // viewer: the preview reads and decodes the whole file
+                    // on the render thread, and any README could name a
+                    // huge one.
+                    let dims = local
+                        .as_ref()
+                        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() <= 25 * 1024 * 1024))
+                        .and_then(|p| image::image_dimensions(p).ok())
+                        .filter(|&(w, h)| u64::from(w) * u64::from(h) <= 64_000_000);
                     if let (Some(path), Some((px_w, px_h))) = (local, dims) {
                         r.ensure_blank();
                         // Cells are roughly twice as tall as wide; the
@@ -1496,9 +1508,42 @@ impl MarkdownPreview {
     }
 }
 
+/// The file a markdown image destination names under `base`, if it exists.
+/// A destination is a URL: `Screen%20Shot.png` is how CommonMark writes a
+/// space, and GitHub READMEs add `?raw=true`, so the query and fragment are
+/// dropped and escapes decoded. The literal spelling is tried first, for a
+/// file whose name really holds a `%`.
+fn local_image_path(base: &std::path::Path, dest: &str) -> Option<std::path::PathBuf> {
+    let literal = base.join(dest);
+    if literal.is_file() {
+        return Some(literal);
+    }
+    let bare = dest.split(['?', '#']).next().unwrap_or(dest);
+    let decoded = crate::shell_integration::percent_decode(bare.as_bytes());
+    let decoded = String::from_utf8(decoded).ok()?;
+    Some(base.join(decoded)).filter(|p| p.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_destinations_are_url_decoded_without_query_or_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Screen Shot.png"), b"x").unwrap();
+        std::fs::write(dir.path().join("100%.png"), b"x").unwrap();
+        let hit =
+            |d: &str| local_image_path(dir.path(), d).map(|p| p.file_name().unwrap().to_owned());
+        assert_eq!(hit("Screen%20Shot.png").unwrap(), "Screen Shot.png");
+        assert_eq!(
+            hit("Screen%20Shot.png?raw=true").unwrap(),
+            "Screen Shot.png"
+        );
+        assert_eq!(hit("Screen%20Shot.png#top").unwrap(), "Screen Shot.png");
+        assert_eq!(hit("100%.png").unwrap(), "100%.png");
+        assert!(hit("missing.png").is_none());
+    }
 
     #[test]
     fn scroll_sync_interpolates_rows_through_a_wrapped_paragraph() {

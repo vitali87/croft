@@ -368,6 +368,39 @@ impl PartialEq for SourceDoc {
 }
 impl Eq for SourceDoc {}
 
+/// Write into `doc` (the file as read) what changed between `loaded` (its
+/// typed view then) and `current` (the settings now), key by key and into
+/// nested objects: a changed `layout` field must not drop keys a newer
+/// version put inside `layout`. A key the current settings no longer
+/// serialize (an option cleared) leaves the file too.
+fn merge_changed(
+    doc: &mut serde_json::Map<String, serde_json::Value>,
+    loaded: &serde_json::Value,
+    current: &serde_json::Value,
+) {
+    use serde_json::Value;
+    let (Value::Object(loaded), Value::Object(current)) = (loaded, current) else {
+        return;
+    };
+    for key in loaded.keys().filter(|k| !current.contains_key(*k)) {
+        doc.remove(key);
+    }
+    for (key, value) in current {
+        let before = loaded.get(key);
+        if before == Some(value) {
+            continue;
+        }
+        match (doc.get_mut(key), before, value) {
+            (Some(Value::Object(inner)), Some(b @ Value::Object(_)), Value::Object(_)) => {
+                merge_changed(inner, b, value);
+            }
+            _ => {
+                doc.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 /// The `config.json` that [`Prefs::load_or_default`] reads, or `None` in
 /// test builds: the user's real `config.json` must never steer a test
 /// (#624), the same rule `config_layers::load_merged` applies to the
@@ -452,20 +485,7 @@ impl Prefs {
         let loaded: Self = serde_json::from_value(serde_json::Value::Object(doc.clone()))
             .context("re-reading prefs")?;
         let loaded = serde_json::to_value(&loaded).context("serializing prefs")?;
-        if let (serde_json::Value::Object(current), serde_json::Value::Object(loaded)) =
-            (current, loaded)
-        {
-            // A setting cleared to a value that is skipped when serialized
-            // must leave the file too, or the old value would load again.
-            for key in loaded.keys().filter(|k| !current.contains_key(*k)) {
-                doc.remove(key);
-            }
-            for (key, value) in current {
-                if loaded.get(&key) != Some(&value) {
-                    doc.insert(key, value);
-                }
-            }
-        }
+        merge_changed(&mut doc, &loaded, &current);
         Ok(serde_json::Value::Object(doc))
     }
 
@@ -854,6 +874,28 @@ pub(crate) fn config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_keeps_unknown_keys_nested_in_a_changed_object_and_drops_removed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"explorer_views": {"open_editors": false, "future_view": true},
+                "mcp_tool_fingerprints": {"a": "1", "b": "2"}}"#,
+        )
+        .unwrap();
+        let mut prefs = Prefs::load(&path).unwrap();
+        prefs.explorer_views.open_editors = true;
+        prefs.mcp_tool_fingerprints.remove("a");
+        prefs.save(&path).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["explorer_views"]["open_editors"], true);
+        assert_eq!(doc["explorer_views"]["future_view"], true);
+        assert!(doc["mcp_tool_fingerprints"].get("a").is_none(), "{doc}");
+        assert_eq!(doc["mcp_tool_fingerprints"]["b"], "2");
+    }
 
     #[test]
     fn saving_one_setting_keeps_keys_prefs_does_not_model_and_accepts_jsonc() {

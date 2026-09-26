@@ -25,6 +25,18 @@ use crate::widgets::scrollbar;
 /// own per-format limits.
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+
+/// An image's pixel size from its header alone. Opening a tab decoded the
+/// whole picture on the render thread just to read these two numbers: a
+/// 48-megapixel photo meant a ~190 MB decode per open, and one past the
+/// decoder's memory limit refused to open although only a downscale shows.
+fn image_dimensions_of(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
 
 /// Read-only image preview attached to a tab. Holds the raw file bytes so
@@ -3470,6 +3482,15 @@ impl Editor {
             .unwrap_or(0)
     }
 
+    /// Whether `path` has any line-keyed breakpoint state to carry through
+    /// edits (see [`Self::sync_bookmarks_to_buffer`]).
+    fn has_breakpoints_in(&self, path: &Path) -> bool {
+        self.breakpoints.contains_key(path)
+            || self.breakpoint_conditions.contains_key(path)
+            || self.breakpoint_logs.contains_key(path)
+            || self.breakpoint_hit_conditions.contains_key(path)
+    }
+
     /// Record the text the open file's bookmarks describe, ahead of an edit
     /// (called from [`push_undo`](Self::push_undo), which every user edit
     /// passes through before it mutates). A no-op when the file has no marks
@@ -3478,7 +3499,7 @@ impl Editor {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        if !self.bookmarks.contains_key(path)
+        if !(self.bookmarks.contains_key(path) || self.has_breakpoints_in(path))
             || self
                 .bookmark_shadow
                 .as_ref()
@@ -3506,25 +3527,66 @@ impl Editor {
             self.bookmark_shadow = None;
             return;
         };
-        let Some(set) = self.bookmarks.get_mut(&path) else {
+        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
             self.bookmark_shadow = None;
             return;
-        };
+        }
+        let len = self.lines.len();
         let mut shadow = match self.bookmark_shadow.take() {
             Some((shadow_path, old)) if shadow_path == path => {
-                if old.len() != self.lines.len() {
-                    *set = shift_bookmark_lines(set, &old, &self.lines);
-                } else {
-                    *set = follow_moved_bookmark_lines(set, &old, &self.lines);
+                let map = line_mapper(&old, &self.lines);
+                if let Some(set) = self.bookmarks.get_mut(&path) {
+                    *set = set.iter().filter_map(|&l| map(l)).collect();
                 }
+                // Breakpoints follow the same edits: they were plain line
+                // numbers, so an Enter above one left it on the line that
+                // moved into its place, and the debugger stopped there.
+                if let Some(set) = self.breakpoints.get_mut(&path) {
+                    *set = set.iter().filter_map(|&l| map(l)).collect();
+                }
+                for per_line in [
+                    &mut self.breakpoint_conditions,
+                    &mut self.breakpoint_logs,
+                    &mut self.breakpoint_hit_conditions,
+                ] {
+                    if let Some(m) = per_line.get_mut(&path) {
+                        *m = std::mem::take(m)
+                            .into_iter()
+                            .filter_map(|(l, v)| map(l).map(|n| (n, v)))
+                            .collect();
+                    }
+                }
+                drop(map);
                 old
             }
             _ => Vec::new(),
         };
-        let len = self.lines.len();
-        set.retain(|&l| (1..=len).contains(&l));
-        if set.is_empty() {
-            self.bookmarks.remove(&path);
+        let in_range = |l: &usize| (1..=len).contains(l);
+        if let Some(set) = self.bookmarks.get_mut(&path) {
+            set.retain(in_range);
+            if set.is_empty() {
+                self.bookmarks.remove(&path);
+            }
+        }
+        if let Some(set) = self.breakpoints.get_mut(&path) {
+            set.retain(in_range);
+            if set.is_empty() {
+                self.breakpoints.remove(&path);
+            }
+        }
+        for per_line in [
+            &mut self.breakpoint_conditions,
+            &mut self.breakpoint_logs,
+            &mut self.breakpoint_hit_conditions,
+        ] {
+            if let Some(m) = per_line.get_mut(&path) {
+                m.retain(|l, _| in_range(l));
+                if m.is_empty() {
+                    per_line.remove(&path);
+                }
+            }
+        }
+        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
             return;
         }
         // Bring the shadow up to date in place rather than cloning the whole
@@ -3689,6 +3751,16 @@ impl Editor {
             return None;
         }
         let line = blame.get(self.cursor_row)?;
+        // Same count is not same lines: a cut and paste further down keeps
+        // the count and shifts every row between, each then wearing the
+        // blame of the line that used to sit there.
+        if line
+            .text
+            .as_ref()
+            .is_some_and(|t| Some(t) != self.lines.get(self.cursor_row))
+        {
+            return None;
+        }
         if line.uncommitted {
             return Some("Uncommitted changes".to_string());
         }
@@ -4222,11 +4294,17 @@ impl Editor {
     /// Number of visual rows a logical line occupies. Avoids allocating the
     /// segment vector for the common case of a line that already fits.
     fn line_visual_rows(&self, line: usize, width: usize) -> usize {
+        // A line inside a collapsed fold is not drawn: no rows. Counted, it
+        // put Down/Up onto the hidden line (which then unfolded) and threw
+        // the scrollbar and wheel off by the hidden rows.
+        if self.is_line_hidden(line) {
+            return 0;
+        }
         if width == 0 {
             return 1;
         }
         let len = self.line_char_len(line);
-        if len <= width {
+        if len <= width && self.lines.get(line).is_none_or(|l| l.is_ascii()) {
             1
         } else {
             self.line_segments(line, width).len()
@@ -4238,6 +4316,9 @@ impl Editor {
     /// (totals, viewport top, cursor row, decomposition) speaks group rows
     /// so boxes shift everything below them consistently.
     fn group_visual_rows(&self, line: usize, width: usize) -> usize {
+        if self.is_line_hidden(line) {
+            return 0;
+        }
         self.line_visual_rows(line, width) + self.box_rows_at_line(line, width)
     }
 
@@ -4317,6 +4398,9 @@ impl Editor {
     fn logical_pos_at_visual_row(&self, target: usize, width: usize) -> (usize, usize) {
         let mut acc = 0;
         for line in 0..self.lines.len() {
+            if self.is_line_hidden(line) {
+                continue;
+            }
             let segs = self.line_segments(line, width);
             let group = segs.len() + self.box_rows_at_line(line, width);
             if acc + group > target {
@@ -4337,7 +4421,7 @@ impl Editor {
         let mut acc = 0;
         for line in 0..self.lines.len() {
             let segs = self.line_visual_rows(line, width);
-            let group = segs + self.box_rows_at_line(line, width);
+            let group = self.group_visual_rows(line, width);
             if acc + group > target {
                 return target - acc >= segs;
             }
@@ -4421,6 +4505,16 @@ impl Editor {
     }
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
+        // A FIFO, socket or device blocks the first read until some other
+        // process writes to it, freezing the UI thread indefinitely; none of
+        // them is a document. (Directories and missing paths go on to the
+        // handling they always had.)
+        if let Ok(meta) = std::fs::metadata(path)
+            && !meta.is_file()
+            && !meta.is_dir()
+        {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         // The Reopen-as-Text override is PER TAB and per file: a path
         // change is a different document, which routes normally again.
@@ -4805,9 +4899,8 @@ impl Editor {
             anyhow::bail!("Image too large ({} bytes)", meta.len());
         }
         let bytes = std::fs::read(path)?;
-        let (pixel_w, pixel_h) = image::load_from_memory(&bytes)
-            .map(|img| (img.width(), img.height()))
-            .map_err(|e| anyhow::anyhow!("Could not decode image: {e}"))?;
+        let (pixel_w, pixel_h) =
+            image_dimensions_of(&bytes).ok_or_else(|| anyhow::anyhow!("Could not decode image"))?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let format_label = image_format_label_from_ext(ext);
         self.path = Some(path.to_path_buf());
@@ -5182,9 +5275,8 @@ impl Editor {
         };
         let bytes = crate::pdf::rasterize_page(path, page, backend)
             .map_err(|e| anyhow::anyhow!("PDF render failed: {e}"))?;
-        let (pixel_w, pixel_h) = image::load_from_memory(&bytes)
-            .map(|img| (img.width(), img.height()))
-            .map_err(|e| anyhow::anyhow!("Could not decode rasterised PDF: {e}"))?;
+        let (pixel_w, pixel_h) = image_dimensions_of(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("Could not decode rasterised PDF"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
@@ -5667,9 +5759,8 @@ impl Editor {
                 return false;
             }
         };
-        let (pixel_w, pixel_h) = match image::load_from_memory(&bytes) {
-            Ok(img) => (img.width(), img.height()),
-            Err(_) => return false,
+        let Some((pixel_w, pixel_h)) = image_dimensions_of(&bytes) else {
+            return false;
         };
         image.bytes = bytes;
         image.generation = next_image_generation();
@@ -8279,6 +8370,8 @@ impl Editor {
     /// already inside the span being built is skipped: an inner fold's range is
     /// contained by its outer's, so it can add nothing.
     fn rebuild_hidden_ranges(&mut self) {
+        // Hidden lines take no wrap rows, so the cached totals change too.
+        self.wrap_total_cache.clear();
         #[cfg(test)]
         FOLD_RANGE_REBUILDS.with(|c| c.set(c.get() + 1));
         let mut out: Vec<(usize, usize)> = Vec::new();
@@ -12231,7 +12324,7 @@ fn byte_index_of_char(line: &str, chars_in: usize) -> usize {
 /// positions count UTF-16 code units; the editor lays out by character, so a
 /// line containing astral-plane characters (which take two UTF-16 units) needs
 /// this conversion. An offset past the line clamps to the line's char length.
-fn utf16_to_char_col(line: &str, u16_off: u32) -> usize {
+pub(crate) fn utf16_to_char_col(line: &str, u16_off: u32) -> usize {
     let mut units: u32 = 0;
     for (char_idx, ch) in line.chars().enumerate() {
         if units >= u16_off {
@@ -12254,6 +12347,20 @@ fn is_wrap_break_after(c: char) -> bool {
         )
 }
 
+/// Screen cells a char takes in the editor: its display width, with a tab
+/// drawn as one cell (the editor paints tabs as a single glyph).
+fn char_cells(c: char) -> usize {
+    if c == '\t' {
+        1
+    } else {
+        unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+}
+
+fn cells_of(chars: &[char]) -> usize {
+    chars.iter().map(|&c| char_cells(c)).sum()
+}
+
 /// Soft-wrap a logical line into visual segments for word-wrap mode.
 ///
 /// Each segment is a half-open `(start_char, end_char)` range over `chars`;
@@ -12265,17 +12372,30 @@ fn is_wrap_break_after(c: char) -> bool {
 /// still occupies a row. Mirrors VS Code's monospace wrap: pick the rightmost
 /// break opportunity within the column, else split the over-long token.
 fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
-    if width == 0 || chars.len() <= width {
+    if width == 0 || chars.len() <= width && cells_of(chars) <= width {
         return vec![(0, chars.len())];
     }
     let mut segs = Vec::new();
     let mut start = 0;
     while start < chars.len() {
-        if chars.len() - start <= width {
+        if cells_of(&chars[start..]) <= width {
             segs.push((start, chars.len()));
             break;
         }
-        let limit = start + width;
+        // The hard limit counts CELLS, as the renderer clips: counted in
+        // chars, a row of wide (CJK) characters was twice as wide as the
+        // pane and its second half was never shown on any row. At least one
+        // char per row, so a char wider than the pane cannot stall.
+        let mut limit = start;
+        let mut used = 0;
+        while limit < chars.len() {
+            let w = char_cells(chars[limit]);
+            if used + w > width && limit > start {
+                break;
+            }
+            used += w;
+            limit += 1;
+        }
         // Scan back from the hard limit for the rightmost break-after char;
         // `i` is the char count, so the char sits at `chars[i - 1]` and the
         // segment becomes `[start, i)`. Stop at `start + 1` so a break right
@@ -12308,11 +12428,41 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 /// otherwise collapses onto the run's last new line (the join line a
 /// backspace or a partial-line selection delete leaves behind); a mark on a
 /// line deleted outright is dropped.
+#[cfg_attr(not(test), allow(dead_code))]
 fn shift_bookmark_lines(
     marks: &std::collections::BTreeSet<usize>,
     old: &[String],
     new: &[String],
 ) -> std::collections::BTreeSet<usize> {
+    let map = shift_line_mapper(old, new);
+    marks.iter().filter_map(|&line| map(line)).collect()
+}
+
+/// Where each 1-based line of `old` lands in `new` after an edit, for any
+/// line-keyed marks (bookmarks, breakpoints): through [`shift_bookmark_lines`]'s
+/// diff when the line count changed, through [`follow_moved_bookmark_lines`]'s
+/// move tracking when it did not. None for a line deleted outright.
+fn line_mapper<'a>(
+    old: &'a [String],
+    new: &'a [String],
+) -> Box<dyn Fn(usize) -> Option<usize> + 'a> {
+    if old.len() != new.len() {
+        shift_line_mapper(old, new)
+    } else {
+        Box::new(move |line| {
+            let one = std::collections::BTreeSet::from([line]);
+            follow_moved_bookmark_lines(&one, old, new)
+                .into_iter()
+                .next()
+        })
+    }
+}
+
+/// The line mapping behind [`shift_bookmark_lines`].
+fn shift_line_mapper<'a>(
+    old: &'a [String],
+    new: &'a [String],
+) -> Box<dyn Fn(usize) -> Option<usize> + 'a> {
     use similar::DiffOp;
     let common = old.len().min(new.len());
     let prefix = old
@@ -12339,7 +12489,7 @@ fn shift_bookmark_lines(
         &new[prefix..new_end],
         Some(deadline),
     );
-    let map_middle = |row: usize| -> Option<usize> {
+    let map_middle = move |row: usize| -> Option<usize> {
         let r = row - prefix;
         for op in &ops {
             match *op {
@@ -12366,20 +12516,17 @@ fn shift_bookmark_lines(
         }
         None
     };
-    marks
-        .iter()
-        .filter_map(|&line| {
-            let row = line.checked_sub(1)?;
-            let mapped = if row < prefix {
-                row
-            } else if row >= old_end {
-                row - old_end + new_end
-            } else {
-                map_middle(row)?
-            };
-            Some(mapped + 1)
-        })
-        .collect()
+    Box::new(move |line: usize| {
+        let row = line.checked_sub(1)?;
+        let mapped = if row < prefix {
+            row
+        } else if row >= old_end {
+            row - old_end + new_end
+        } else {
+            map_middle(row)?
+        };
+        Some(mapped + 1)
+    })
 }
 
 /// Marks after an edit that kept the line count: a marked line whose text
@@ -13237,9 +13384,16 @@ impl Widget for &mut Editor {
             // same code paints both modes.
             let raw = &self.lines[line_idx];
             let line_len = self.line_char_len(line_idx);
-            let row_width = (row_end - row_start) as u16;
             let byte_start = byte_index_of_char(raw, row_start);
             let byte_end = byte_index_of_char(raw, row_end);
+            // A wrapped row's width in CELLS, which is what the painters clip
+            // by: its char count cut a row of wide characters in half.
+            let row_width = if wrap {
+                let cells: usize = raw[byte_start..byte_end].chars().map(char_cells).sum();
+                cells.max(row_end - row_start).min(text_width as usize) as u16
+            } else {
+                (row_end - row_start) as u16
+            };
             let visible_raw = &raw[byte_start..byte_end];
             let seg_bytes = byte_end - byte_start;
             let empty: Vec<HiSpan> = Vec::new();
@@ -14232,7 +14386,14 @@ impl Editor {
             // its last cell (end of line / blank line — where the user is
             // about to type). Bail only when the cell would fall outside the
             // text column: past the pane edge or onto the vertical scrollbar.
-            let visible_col = self.cursor_col - start;
+            // In cells, as the row was painted: wide characters before the
+            // caret push it right by two each.
+            let visible_col: usize = self.lines[self.cursor_row]
+                .chars()
+                .skip(start)
+                .take(self.cursor_col - start)
+                .map(char_cells)
+                .sum();
             let x = text_x as usize + visible_col;
             let right = (self.last_inner.x + self.last_inner.width)
                 .saturating_sub(u16::from(self.last_scrollbar.width > 0))
@@ -16405,6 +16566,7 @@ mod tests {
             author: author.into(),
             age_secs: age,
             uncommitted,
+            text: None,
         }
     }
 
@@ -16670,6 +16832,28 @@ mod tests {
     }
 
     #[test]
+    fn blame_is_not_shown_on_a_row_that_holds_another_lines_text() {
+        let mut e = editor_with("one\ntwo\nthree\n");
+        e.path = Some(PathBuf::from("f.rs"));
+        let with_text = |author: &str, text: &str| crate::git::BlameLine {
+            text: Some(text.into()),
+            ..blame_line(author, "s", 90, false)
+        };
+        e.set_blame(
+            PathBuf::from("f.rs"),
+            Some(vec![
+                with_text("A", "one"),
+                with_text("B", "two"),
+                with_text("C", "three"),
+            ]),
+        );
+        // A cut and paste that keeps the count: `one` moved to the end.
+        e.lines = vec!["two".into(), "three".into(), "one".into()];
+        e.cursor_row = 0;
+        assert_eq!(e.current_line_blame_annotation(), None);
+    }
+
+    #[test]
     fn current_line_blame_annotation_marks_uncommitted_lines() {
         let mut e = editor_with("edited\n");
         e.path = Some(PathBuf::from("f.rs"));
@@ -16724,6 +16908,26 @@ mod tests {
             e.current_line_blame_annotation().is_none(),
             "a.rs blame painted on b.rs while its own fetch was still in flight"
         );
+    }
+
+    #[test]
+    fn opening_a_fifo_is_refused_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skipping: mkfifo unavailable");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut e = Editor::new();
+            let _ = tx.send(e.open(&fifo).map_err(|e| e.to_string()));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open returned instead of blocking on the pipe");
+        assert!(result.unwrap_err().contains("not a regular file"));
     }
 
     #[test]
@@ -17297,6 +17501,42 @@ mod tests {
         e.cursor_col = 0;
         e.insert_char('x');
         assert_eq!(e.bookmarked_lines(), vec![4]);
+    }
+
+    #[test]
+    fn breakpoints_and_their_conditions_follow_edits_like_bookmarks() {
+        let (mut e, _tmp) = bookmark_editor(10);
+        let f = e.path.clone().unwrap();
+        e.toggle_breakpoint_line(4);
+        e.breakpoint_conditions
+            .entry(f.clone())
+            .or_default()
+            .insert(4, String::from("x > 1"));
+        // Enter at the very top pushes every line down one.
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.insert_newline();
+        assert_eq!(e.breakpoint_lines(&f), vec![5]);
+        assert_eq!(
+            e.breakpoint_conditions[&f].get(&5).map(String::as_str),
+            Some("x > 1")
+        );
+        // Moving the line carries its breakpoint along.
+        e.cursor_row = 4;
+        e.move_lines_down();
+        assert_eq!(e.breakpoint_lines(&f), vec![6]);
+        // Deleting the line drops it rather than leaving it on a neighbour.
+        e.cursor_row = 5;
+        e.selection = Some(EditorSelection {
+            anchor: (5, 0),
+            head: (6, 0),
+        });
+        e.backspace();
+        assert!(
+            e.breakpoint_lines(&f).is_empty(),
+            "{:?}",
+            e.breakpoint_lines(&f)
+        );
     }
 
     #[test]
@@ -22976,6 +23216,57 @@ mod tests {
         // the slash rather than mid-segment.
         let segs = wrap_segments(&chars("abc/defgh"), 6);
         assert_eq!(segs, vec![(0, 4), (4, 9)]);
+    }
+
+    #[test]
+    fn wrap_segments_count_wide_characters_as_two_cells() {
+        let line: String = std::iter::repeat_n('漢', 60).collect();
+        let segs = wrap_segments(&chars(&line), 30);
+        assert_eq!(segs.len(), 4, "{segs:?}");
+        assert!(segs.iter().all(|&(s, e)| e - s == 15), "{segs:?}");
+        // A char wider than the pane still makes progress.
+        assert_eq!(wrap_segments(&chars("漢漢"), 1), vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn down_in_wrap_mode_steps_over_a_collapsed_fold() {
+        let mut e = editor_with("fn a() {\n    one\n    two\n}\nafter");
+        e.wrap_override = Some(true);
+        e.last_inner = Rect::new(0, 0, 40, 10);
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1) && e.is_line_hidden(2));
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.move_down();
+        assert!(
+            !e.is_line_hidden(e.cursor_row),
+            "landed on hidden line {}",
+            e.cursor_row
+        );
+        assert!(e.is_line_hidden(1), "the fold stays collapsed");
+    }
+
+    #[test]
+    fn a_wrapped_cjk_line_shows_every_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.md");
+        let text: String = (0..60)
+            .map(|i| char::from_u32(0x4e00 + i).unwrap())
+            .collect();
+        std::fs::write(&p, &text).unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        e.wrap_override = Some(true);
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        let shown: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        for c in text.chars() {
+            assert!(shown.contains(c), "{c} missing from the wrapped render");
+        }
     }
 
     #[test]

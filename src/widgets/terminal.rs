@@ -1488,8 +1488,16 @@ impl PtyTerminal {
         let mut l = top;
         while l <= bottom {
             let (s, _cols) = row_text_and_cols(&term, l);
-            lines.push(s.trim_end().to_string());
-            wraps.push(l < bottom && row_wraps(&term, l));
+            // A wrapped row keeps its trailing blanks: a space in its last
+            // column separates words of the logical line (`Bearer ` then the
+            // token), and trimming it glued them so a redact rule missed.
+            let wraps_on = l < bottom && row_wraps(&term, l);
+            lines.push(if wraps_on {
+                s
+            } else {
+                s.trim_end().to_string()
+            });
+            wraps.push(wraps_on);
             l += 1;
         }
         (lines, wraps, top)
@@ -1545,12 +1553,15 @@ impl PtyTerminal {
                 let ch = if cell.c == '\0' { ' ' } else { cell.c };
                 cells.push((ch, (cell.fg, cell.bg, cell.flags)));
             }
-            let plain: String = cells
-                .iter()
-                .map(|(ch, _)| *ch)
-                .collect::<String>()
-                .trim_end()
-                .to_string();
+            let wraps_on = l < bottom && row_wraps(&term, l);
+            let plain: String = cells.iter().map(|(ch, _)| *ch).collect::<String>();
+            // Trailing blanks trimmed only where the row does not wrap (see
+            // `grid_lines_wrapped`).
+            let plain = if wraps_on {
+                plain
+            } else {
+                plain.trim_end().to_string()
+            };
             while cells.last().is_some_and(|(ch, (fg, bg, flags))| {
                 *ch == ' ' && style_is_default(*fg, *bg, *flags)
             }) {
@@ -1574,7 +1585,7 @@ impl PtyTerminal {
             if styled {
                 out.push_str("\x1b[0m");
             }
-            lines.push((plain, out, l < bottom && row_wraps(&term, l)));
+            lines.push((plain, out, wraps_on));
             l += 1;
         }
         lines
@@ -5776,6 +5787,27 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "the write went to the pane's writer thread, not the caller"
         );
+    }
+
+    #[test]
+    fn a_space_at_the_wrap_still_separates_words_for_redaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        term.resize(22, 10);
+        // `Authorization: Bearer` is 21 chars: the space lands in column 22,
+        // the last, and the token starts the next row.
+        let token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl";
+        term.feed_bytes_for_test(
+            format!("\x1b[2J\x1b[HAuthorization: Bearer {token}\r\n").as_bytes(),
+        );
+        let (lines, wraps, _) = term.grid_lines_wrapped();
+        assert!(
+            lines.concat().contains(&format!("Bearer {token}")),
+            "{lines:?}"
+        );
+        let set = crate::triggers::TriggerSet::default().with_builtin_redactions();
+        let masked = crate::triggers::mask_rows(&lines, &wraps, &set).concat();
+        assert!(!masked.contains("c2lnbmF0dXJl"), "{masked}");
     }
 
     #[test]

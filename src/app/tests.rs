@@ -236,14 +236,14 @@ fn sqlite_pages_step_at_batch_boundaries() {
     app.editor.open(&p).unwrap();
     let view = app.editor.sheet.as_ref().unwrap();
     assert_eq!(view.sheets[0].row_count(), 500);
-    assert!(view.sheets[0].name.contains("rows 1-500 of 700"));
+    assert!(view.sheets[0].name.contains("rows 1-500, more follow"));
 
     app.handle_sheet_key(key(KeyCode::End, KeyModifiers::SUPER));
     app.handle_sheet_key(key(KeyCode::PageDown, KeyModifiers::NONE));
     let view = app.editor.sheet.as_ref().unwrap();
     assert_eq!(view.sheets[0].row_count(), 200, "second page loaded");
     assert!(
-        view.sheets[0].name.contains("rows 501-700 of 700"),
+        view.sheets[0].name.ends_with("rows 501-700"),
         "{}",
         view.sheets[0].name
     );
@@ -513,6 +513,37 @@ fn terminal_warning_renders_inside_a_narrow_frame_without_panicking() {
     let backend = ratatui::backend::TestBackend::new(8, 3);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
+}
+
+/// Overlays on a terminal smaller than their minimum size: `clamp(40, w)`
+/// panics when the width is under 40, and a confirm dialog's 50-column
+/// floor built a rect outside the buffer. A phone in portrait or a small
+/// tmux split is enough.
+#[test]
+fn overlays_render_on_a_tiny_terminal_without_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let draw = |app: &mut App, w: u16, h: u16| {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    };
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_command_palette();
+    draw(&mut app, 36, 20);
+    draw(&mut app, 80, 9);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_finder();
+    draw(&mut app, 36, 20);
+    draw(&mut app, 80, 9);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: String::from("a.txt"),
+        untracked: false,
+        staged: false,
+    });
+    draw(&mut app, 45, 12);
+    draw(&mut app, 45, 5);
+    draw(&mut app, 8, 3);
 }
 
 #[test]
@@ -12435,6 +12466,117 @@ fn opening_a_config_file_keeps_the_active_tabs_unsaved_edits() {
 }
 
 #[test]
+fn bounded_output_gives_up_on_a_command_that_hangs() {
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(500);
+    assert!(
+        bounded_output(
+            std::process::Command::new("sh").args(["-c", "sleep 30"]),
+            budget
+        )
+        .is_none()
+    );
+    assert!(
+        bounded_output(
+            std::process::Command::new("sh").args(["-c", "exec 1>&-; sleep 30"]),
+            budget
+        )
+        .is_none()
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let (status, out) = bounded_output(
+        std::process::Command::new("sh").args(["-c", "printf 42"]),
+        std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(status.success());
+    assert_eq!(out, b"42");
+}
+
+/// A completion is accepted by the server's own edit: TypeScript's `?.foo`
+/// replaces the `.` before the word (croft produced `a.?.foo`), letters
+/// typed since the request go too, and an auto-import lands with it.
+#[test]
+fn a_completion_applies_its_text_edit_and_additional_edits() {
+    use crate::widgets::editor::TextSpanEdit;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.lines = vec![String::from("a.f")];
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    let item = crate::lsp::CompletionItem {
+        label: String::from("foo"),
+        // Requested at `a.` (col 2); `f` was typed since.
+        text_edit: Some(TextSpanEdit {
+            start: (0, 1),
+            end: (0, 2),
+            new_text: String::from("?.foo"),
+            utf16: true,
+        }),
+        additional_edits: vec![TextSpanEdit {
+            start: (0, 0),
+            end: (0, 0),
+            new_text: String::from("import { x } from 'x';\n"),
+            utf16: true,
+        }],
+        ..Default::default()
+    };
+    assert!(app.accept_completion_edit(&item));
+    assert_eq!(
+        app.editor.lines,
+        vec![
+            String::from("import { x } from 'x';"),
+            String::from("a?.foo")
+        ]
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 6));
+    // No text edit: the prefix path takes over.
+    assert!(!app.accept_completion_edit(&crate::lsp::CompletionItem::default()));
+    // A range past the caret replaces the suffix it covers.
+    app.editor.lines = vec![String::from("fooBar")];
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    let item = crate::lsp::CompletionItem {
+        label: String::from("baz"),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 0),
+            end: (0, 6),
+            new_text: String::from("baz"),
+            utf16: true,
+        }),
+        ..Default::default()
+    };
+    assert!(app.accept_completion_edit(&item));
+    assert_eq!(app.editor.lines, vec![String::from("baz")]);
+}
+
+/// Restoring a snapshot keeps the version it overwrites, even one never
+/// snapshotted (an agent's write) or saved seconds ago (inside the merge
+/// window, where the restore used to replace and delete it).
+#[test]
+fn restoring_a_snapshot_keeps_the_version_it_overwrites() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    let now = super::now_millis();
+    crate::history::record_in(&app.history_root, &f, b"v1\n", now - 60_000).unwrap();
+    // Saved a second ago, then rewritten by someone else, never snapshotted.
+    crate::history::record_in(&app.history_root, &f, b"v2\n", now - 1_000).unwrap();
+    std::fs::write(&f, "v3 by an agent\n").unwrap();
+    app.history_restore = Some((f.clone(), now - 60_000, b"v1\n".to_vec()));
+    app.restore_history_snapshot();
+    assert_eq!(std::fs::read(&f).unwrap(), b"v1\n");
+    let held: Vec<Vec<u8>> = crate::history::entries_in(&app.history_root, &f)
+        .iter()
+        .map(|s| std::fs::read(&s.file).unwrap())
+        .collect();
+    assert!(held.contains(&b"v2\n".to_vec()), "{held:?}");
+    assert!(held.contains(&b"v3 by an agent\n".to_vec()), "{held:?}");
+}
+
+#[test]
 fn dispatching_fetch_records_a_line_in_the_git_output_log() {
     let tmp = make_committed_repo();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -13515,6 +13657,7 @@ fn inline_blame_annotation_paints_on_the_cursor_line() {
                 author: "Vitali".into(),
                 age_secs: 3600,
                 uncommitted: false,
+                text: None,
             },
             crate::git::BlameLine {
                 short_hash: "abc12345".into(),
@@ -13522,6 +13665,7 @@ fn inline_blame_annotation_paints_on_the_cursor_line() {
                 author: "Alice".into(),
                 age_secs: 60,
                 uncommitted: false,
+                text: None,
             },
         ]),
     );
@@ -14455,7 +14599,7 @@ fn restoring_a_snapshot_carries_its_seats_onto_the_restore() {
     let mut seats_v2 = crate::provenance::Provenance::new();
     seats_v2.record(2..3, Seat::Agent(String::from("pane 2")));
     // v2 is the newest snapshot and recent enough that the restore lands
-    // inside the merge window and supersedes it.
+    // inside the merge window, which must not supersede it.
     let recent = now_millis() - 100;
     crate::history::record_with_seats_in(hist.path(), &f, v1, 1_000, &seats_v1).unwrap();
     crate::history::record_with_seats_in(hist.path(), &f, v2, recent, &seats_v2).unwrap();
@@ -14497,12 +14641,15 @@ fn restoring_a_snapshot_carries_its_seats_onto_the_restore() {
         },
     );
     let snaps = crate::history::entries_in(hist.path(), &f);
+    // v2 is kept, not superseded: the restore overwrote it, and replacing
+    // its snapshot inside the merge window lost that version for good.
     assert_eq!(
         snaps.len(),
-        2,
-        "the restore superseded v2 inside the merge window: {snaps:?}"
+        3,
+        "v1 restored, v2 kept, v1 original: {snaps:?}"
     );
     assert_eq!(std::fs::read(&snaps[0].file).unwrap(), v1);
+    assert_eq!(std::fs::read(&snaps[1].file).unwrap(), v2);
     wait_for_seats(hist.path(), &f, snaps[0].millis);
     assert_eq!(
         crate::history::seats_for(hist.path(), &f, snaps[0].millis),
@@ -20660,6 +20807,33 @@ fn session_state_preserves_unsaved_buffer_contents() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "saved\n");
 }
 
+/// A relaunch carries the unsaved text of every split, not just the
+/// focused one.
+#[test]
+fn session_state_keeps_unsaved_edits_from_every_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let c = tmp.path().join("c.txt");
+    std::fs::write(&a, "a\n").unwrap();
+    std::fs::write(&c, "c\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.lines = vec![String::from("edited a")];
+    app.editor.dirty = true;
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    // The focused (right) group moves to another file and closes its copy.
+    app.editor.open_pinned(&c).unwrap();
+    app.editor.close_tab(0);
+    let state = app.capture_session_state();
+    let tab = state
+        .tabs
+        .iter()
+        .find(|t| t.path.as_ref() == Some(&a))
+        .expect("the left split's dirty tab is carried");
+    assert_eq!(tab.unsaved_text.as_deref(), Some("edited a"));
+}
+
 /// A self-update must not drop the only copy of unsaved text: neither an
 /// untitled buffer's nor that of a file deleted while the update ran.
 #[test]
@@ -24545,6 +24719,25 @@ fn fence_command_shapes_the_typed_block() {
     assert!(cmd.ends_with("\nCROFT_BLOCK_1\r"), "{cmd}");
     let body = &cmd["python3 - <<'CROFT_BLOCK_1'\n".len()..cmd.len() - "\nCROFT_BLOCK_1\r".len()];
     assert_eq!(body, tricky.trim_end_matches('\n'));
+}
+
+/// A tab or `!` never reaches the shell's line editor as typed input: the
+/// block goes as one quoted printf argument, and running that line through
+/// a real shell reproduces the block byte for byte.
+#[test]
+fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
+    let code = "if True:\n\tprint(\"hi!\")\nx = 'a\\n'\n";
+    let cmd = super::fence_command("python3", code);
+    assert!(!cmd.contains('\t') && cmd.ends_with("| python3\r"), "{cmd}");
+    // What the pipe feeds the interpreter, via a real sh with cat standing in.
+    let line = cmd.trim_end_matches('\r').replace("| python3", "| cat");
+    let out = std::process::Command::new("sh")
+        .args(["-c", &line])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), code);
+    // `sh` blocks get the same treatment, piped to sh.
+    assert!(super::fence_command("sh", "echo hi!\n").ends_with("| sh\r"));
 }
 
 /// #360: the built-in secret rules sit in the trigger set by default,
@@ -30512,6 +30705,24 @@ fn copy_mode_keys_follow_content_that_streamed_between_presses() {
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
+    // The pane runs a real shell whose prompt arrives on its own schedule:
+    // under load it landed between the fed rows and the key press and moved
+    // the selection. Wait for the shell's output to settle first.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last = app.terminals[0].grid_lines().0;
+    let mut quiet_since = std::time::Instant::now();
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now = app.terminals[0].grid_lines().0;
+        if now != last {
+            last = now;
+            quiet_since = std::time::Instant::now();
+        } else if last.iter().any(|l| !l.trim().is_empty())
+            && quiet_since.elapsed() > std::time::Duration::from_millis(300)
+        {
+            break;
+        }
+    }
     let mut fill = String::new();
     for i in 0..40 {
         fill.push_str(&format!("row-{i}\r\n"));
@@ -35417,6 +35628,15 @@ fn clicking_a_commit_graph_row_opens_the_commit_patch_tab() {
         .map(|c| c.short_hash.clone())
         .expect("precondition established a commit at the click row");
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    // The patch is read off the UI thread.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the commit patch",
+        || {
+            app.drain_git_view();
+            app.git_view_job.is_none()
+        },
+    );
     assert!(
         app.status.contains("Opened commit"),
         "clicking a commit row must open its patch tab; status: {:?}",
