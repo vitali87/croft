@@ -522,6 +522,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
         title: "Editor: code navigation",
         entries: &[
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+V",
+                description: "Open the symbol at the caret in its own tab: it shows only that function or class and follows it as the file changes",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "F2",
                 description: "Rename the symbol across every file it touches",
                 handler: "is_rename_symbol_key",
@@ -540,6 +545,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Opt+F12",
                 description: "Peek definition (Enter jumps, Esc closes)",
                 handler: "is_peek_definition_key",
+            },
+            ShortcutEntry {
+                keys: "Opt+Shift+F12",
+                description: "Peek references (Up/Down step, Enter jumps, Esc closes)",
+                handler: "is_peek_references_key",
             },
             ShortcutEntry {
                 keys: "Shift+F12",
@@ -817,6 +827,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+Shift+G",
+                description: "Switch to the next debug session of a compound",
+                handler: "is_switch_debug_session_key",
+            },
+            ShortcutEntry {
                 keys: "F9",
                 description: "Toggle a breakpoint on the cursor's line",
                 handler: "",
@@ -835,6 +850,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Alt+F9",
                 description: "Toggle break on raised (not just uncaught) exceptions",
                 handler: "",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+F10",
+                description: "Run to cursor (debugger paused): resume and stop once at the caret line",
+                handler: "is_run_to_cursor_key",
             },
             ShortcutEntry {
                 keys: "F10",

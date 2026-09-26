@@ -21,6 +21,9 @@ pub struct ImageOverlay<L> {
     displayed: bool,
     dirty: bool,
     clear: ClearLatch,
+    /// Fingerprint of the text cells under the image when it was last sent
+    /// (see [`Self::needs_emit`]).
+    under: Option<u64>,
 }
 
 impl<L> Default for ImageOverlay<L> {
@@ -31,6 +34,7 @@ impl<L> Default for ImageOverlay<L> {
             displayed: false,
             dirty: false,
             clear: ClearLatch::default(),
+            under: None,
         }
     }
 }
@@ -47,14 +51,40 @@ impl<L: PartialEq> ImageOverlay<L> {
     pub fn set(&mut self, image: String, layout: L) {
         self.image = Some(image);
         self.layout = Some(layout);
+        self.under = None;
     }
 
     pub fn set_image(&mut self, image: String) {
         self.image = Some(image);
+        self.under = None;
     }
 
     pub fn set_layout(&mut self, layout: L) {
         self.layout = Some(layout);
+        self.under = None;
+    }
+
+    /// Whether the post-frame blit must send the image again, given a
+    /// fingerprint of the text cells beneath it this frame. A picture is
+    /// megabytes of escape sequence, so it goes out only when it could be
+    /// missing from the screen: never shown, replaced, moved, wiped, or
+    /// written over since it was sent (the cells beneath it changed). Every
+    /// other frame, a keystroke or a cursor blink, sends nothing, which is
+    /// what keeps an image cheap over SSH (#682).
+    pub fn needs_emit(&self, under: u64) -> bool {
+        !self.displayed || self.under != Some(under)
+    }
+
+    /// Record that the image was sent over cells with fingerprint `under`.
+    pub fn mark_sent_over(&mut self, under: u64) {
+        self.displayed = true;
+        self.under = Some(under);
+    }
+
+    /// Forget what was sent: the next frame sends the image again. For a
+    /// screen wipe, or a frame that held the image back (a modal over it).
+    pub fn forget_sent(&mut self) {
+        self.under = None;
     }
 
     pub fn has_image(&self) -> bool {
@@ -95,6 +125,7 @@ impl<L: PartialEq> ImageOverlay<L> {
 
     pub fn invalidate_layout(&mut self) {
         self.layout = None;
+        self.under = None;
     }
 
     pub fn disable(&mut self) {
@@ -346,4 +377,31 @@ pub struct OverlayManager {
     pub run_debug: CellOverlay,
     pub problems_badge: CellOverlay,
     pub activity: ActivityOverlay,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImageOverlay;
+
+    /// #682: a large image is sent once and then only when it could be
+    /// missing: replaced, moved, written over, wiped or held back.
+    #[test]
+    fn an_image_is_sent_again_only_when_it_could_be_missing() {
+        let mut o: ImageOverlay<u8> = ImageOverlay::default();
+        o.set(String::from("img"), 1);
+        assert!(o.needs_emit(7), "never shown");
+        o.mark_sent_over(7);
+        assert!(!o.needs_emit(7), "a keystroke elsewhere sends nothing");
+        assert!(o.needs_emit(8), "the cells beneath it were written over");
+        o.mark_sent_over(8);
+        o.set_layout(2);
+        assert!(o.needs_emit(8), "moved");
+        o.mark_sent_over(8);
+        o.forget_sent();
+        assert!(o.needs_emit(8), "the screen was wiped");
+        o.mark_sent_over(8);
+        o.request_clear();
+        assert!(o.consume_clear());
+        assert!(o.needs_emit(8), "cleared images are shown again");
+    }
 }
