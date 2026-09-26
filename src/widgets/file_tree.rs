@@ -1127,6 +1127,39 @@ pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Res
     Ok(target)
 }
 
+/// Whether renaming `old_path` to `new_name` in `parent` only respells the
+/// same entry on a case-insensitive volume (macOS by default), where
+/// `README.md` "exists" while `readme.md` is renamed to it. True only when
+/// the directory does not list `new_name` as an entry of its own (so a
+/// separate file, or a hard link to the same file, is still a clash) and
+/// the name resolves to the entry being renamed.
+fn is_case_only_respelling(parent: &Path, old_path: &Path, new_name: &str) -> bool {
+    let listed = std::fs::read_dir(parent).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
+    });
+    if listed {
+        return false;
+    }
+    let target = parent.join(new_name);
+    match (
+        std::fs::symlink_metadata(&target),
+        std::fs::symlink_metadata(old_path),
+    ) {
+        #[cfg(unix)]
+        (Ok(a), Ok(b)) => {
+            use std::os::unix::fs::MetadataExt;
+            a.dev() == b.dev() && a.ino() == b.ino()
+        }
+        // No inode to compare: a name the directory does not list that
+        // still resolves can only be the same entry respelled.
+        #[cfg(not(unix))]
+        (Ok(_), Ok(_)) => true,
+        _ => false,
+    }
+}
+
 /// Where [`rename_in`] would put `old_path`, with the same validation and
 /// without touching the disk, so a caller can ask language servers about
 /// the rename before it happens (#610).
@@ -1136,20 +1169,8 @@ pub fn rename_target(parent: &Path, old_path: &Path, new_name: &str) -> std::io:
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     }
     let target = parent.join(trimmed);
-    // The same entry under another spelling is not a clash: on a
-    // case-insensitive volume (macOS by default) `README.md` "exists" while
-    // `readme.md` is being renamed to it, and the rename was refused.
-    let same_entry = || {
-        use std::os::unix::fs::MetadataExt;
-        match (
-            std::fs::symlink_metadata(&target),
-            std::fs::symlink_metadata(old_path),
-        ) {
-            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-            _ => false,
-        }
-    };
-    if target != old_path && target.exists() && !same_entry() {
+    if target != old_path && target.exists() && !is_case_only_respelling(parent, old_path, trimmed)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("{} already exists", target.display()),
@@ -3022,18 +3043,23 @@ mod tests {
     }
 
     #[test]
-    fn a_rename_onto_another_name_for_the_same_file_is_not_a_clash() {
-        // What a case-only rename sees on a case-insensitive volume: the
-        // target name resolves to the very entry being renamed. A hard link
-        // gives Linux the same shape.
+    fn a_hard_link_under_the_new_name_is_still_a_clash() {
+        // A second directory entry for the same file is a separate name:
+        // renaming onto it would succeed without moving anything.
         let tmp = TempDir::new().unwrap();
         let a = tmp.path().join("readme.md");
         std::fs::write(&a, "x").unwrap();
         std::fs::hard_link(&a, tmp.path().join("README.md")).unwrap();
-        assert_eq!(
-            rename_target(tmp.path(), &a, "README.md").unwrap(),
-            tmp.path().join("README.md")
-        );
+        for err in [
+            rename_target(tmp.path(), &a, "README.md").unwrap_err(),
+            rename_in(tmp.path(), &a, "README.md").unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        assert!(a.exists());
+        // On a case-sensitive volume a name nothing answers to is no
+        // respelling of anything.
+        assert!(!is_case_only_respelling(tmp.path(), &a, "Readme.md"));
     }
 
     #[test]

@@ -238,7 +238,6 @@ impl Notes {
     /// added in one vanished when the other saved. This window picks the
     /// other's notes up in the same step.
     pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
-        use std::os::fd::AsRawFd;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -247,11 +246,8 @@ impl Notes {
             .truncate(false)
             .write(true)
             .open(path.with_extension("json.lock"))?;
-        // SAFETY: flock on a descriptor this function owns; released when
-        // `lock` is dropped at the end of the call.
-        unsafe {
-            libc::flock(lock.as_raw_fd(), libc::LOCK_EX);
-        }
+        // Released when `lock` is dropped at the end of the call.
+        lock.lock()?;
         for note in read_store(path) {
             self.merge(note);
         }

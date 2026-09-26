@@ -235,14 +235,22 @@ where
     // the umask's 0644 for any other user to read.
     let write = || -> std::io::Result<()> {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // Created fresh (O_EXCL), never opened through a symlink someone
+        // planted at the temp name.
+        let _ = std::fs::remove_file(&tmp);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         f.write_all(json.as_bytes())
     };
     write().map_err(|e| {
