@@ -15209,6 +15209,28 @@ impl EditorTabs {
     /// just-launched state instead of being removed (so the editor pane
     /// always has at least one buffer to render). Returns false only on an
     /// out-of-range index.
+    /// Close every tab showing `path` or a file under it (a deleted file or
+    /// folder), except tabs with unsaved edits: those stay open, dirty, so
+    /// the edits can still be saved (recreating the file) or discarded.
+    /// Returns how many dirty tabs were kept.
+    pub fn close_clean_tabs_under(&mut self, path: &Path) -> usize {
+        let mut kept = 0;
+        let mut i = self.editors.len();
+        while i > 0 {
+            i -= 1;
+            let e = &self.editors[i];
+            if !e.path.as_deref().is_some_and(|p| p.starts_with(path)) {
+                continue;
+            }
+            if e.dirty {
+                kept += 1;
+            } else {
+                self.close_tab(i);
+            }
+        }
+        kept
+    }
+
     pub fn close_tab(&mut self, idx: usize) -> bool {
         if idx >= self.editors.len() {
             return false;
@@ -16708,6 +16730,26 @@ mod tests {
     /// the HEAD-vs-working one. `open_diff` backs the Compare actions, and
     /// missing the setter there meant Compare always started in `Off`
     /// regardless of config (caught in review on #292).
+    #[test]
+    fn deleting_closes_clean_tabs_under_the_path_and_keeps_dirty_ones() {
+        let mut tabs = EditorTabs::new();
+        tabs.add_tab_with_path(PathBuf::from("/w/dir/a.rs"));
+        tabs.add_tab_with_path(PathBuf::from("/w/dir/sub/b.rs"));
+        tabs.editors[2].dirty = true;
+        tabs.add_tab_with_path(PathBuf::from("/w/other.rs"));
+        tabs.add_tab_with_path(PathBuf::from("/w/dirt.rs"));
+        assert_eq!(tabs.close_clean_tabs_under(Path::new("/w/dir")), 1);
+        let left: Vec<_> = tabs.editors.iter().filter_map(|e| e.path.clone()).collect();
+        assert_eq!(
+            left,
+            vec![
+                PathBuf::from("/w/dir/sub/b.rs"),
+                PathBuf::from("/w/other.rs"),
+                PathBuf::from("/w/dirt.rs"),
+            ]
+        );
+    }
+
     #[test]
     fn every_diff_opener_applies_the_configured_whitespace_default() {
         use crate::widgets::diff::DiffWhitespace;

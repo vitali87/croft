@@ -127,22 +127,58 @@ mod linux {
     ///
     /// Tries `wl-paste`, then `xclip`, then `xsel`.
     pub fn read_string() -> Option<String> {
-        read_via(&["wl-paste"])
+        // `--no-newline`: wl-paste appends `\n` to text otherwise. `--type
+        // text`: any text type, never an image's bytes when an image is on
+        // the clipboard.
+        read_via(&["wl-paste", "--no-newline", "--type", "text"])
             .or_else(|| read_via(&["xclip", "-selection", "clipboard", "-o"]))
             .or_else(|| read_via(&["xsel", "--clipboard", "--output"]))
     }
 
     fn read_via(argv: &[&str]) -> Option<String> {
-        let out = Command::new(argv[0])
+        use std::io::Read;
+        // Bounded: a paste runs on the UI thread, and a clipboard owner that
+        // never answers (a hung X client holding the selection) would freeze
+        // croft for as long as xclip waits on it.
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+        let mut child = Command::new(argv[0])
             .args(&argv[1..])
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .output()
+            .spawn()
             .ok()?;
-        if !out.status.success() {
+        let mut stdout = child.stdout.take()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        let Ok(bytes) = rx.recv_timeout(BUDGET) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        let status = child.wait().ok()?;
+        if !status.success() {
             return None;
         }
-        Some(String::from_utf8_lossy(&out.stdout).to_string())
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn a_clipboard_reader_that_never_answers_is_given_up_on() {
+            let started = std::time::Instant::now();
+            assert_eq!(super::read_via(&["sh", "-c", "sleep 30"]), None);
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            assert_eq!(
+                super::read_via(&["sh", "-c", "printf foo"]).as_deref(),
+                Some("foo")
+            );
+        }
     }
 }
 

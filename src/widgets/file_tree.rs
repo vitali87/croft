@@ -1136,7 +1136,20 @@ pub fn rename_target(parent: &Path, old_path: &Path, new_name: &str) -> std::io:
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     }
     let target = parent.join(trimmed);
-    if target != old_path && target.exists() {
+    // The same entry under another spelling is not a clash: on a
+    // case-insensitive volume (macOS by default) `README.md` "exists" while
+    // `readme.md` is being renamed to it, and the rename was refused.
+    let same_entry = || {
+        use std::os::unix::fs::MetadataExt;
+        match (
+            std::fs::symlink_metadata(&target),
+            std::fs::symlink_metadata(old_path),
+        ) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    };
+    if target != old_path && target.exists() && !same_entry() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("{} already exists", target.display()),
@@ -3006,6 +3019,21 @@ mod tests {
         // Both originals must still exist intact.
         assert!(a.exists());
         assert!(b.exists());
+    }
+
+    #[test]
+    fn a_rename_onto_another_name_for_the_same_file_is_not_a_clash() {
+        // What a case-only rename sees on a case-insensitive volume: the
+        // target name resolves to the very entry being renamed. A hard link
+        // gives Linux the same shape.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("readme.md");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::hard_link(&a, tmp.path().join("README.md")).unwrap();
+        assert_eq!(
+            rename_target(tmp.path(), &a, "README.md").unwrap(),
+            tmp.path().join("README.md")
+        );
     }
 
     #[test]
