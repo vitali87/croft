@@ -2375,6 +2375,7 @@ struct Prompt {
 struct PendingDiscard {
     rel_path: String,
     untracked: bool,
+    staged: bool,
 }
 
 /// A revert-hunk request waiting on its confirm popup. Holds the
@@ -27255,24 +27256,20 @@ impl App {
     /// the diff caret. Sets a status message and returns `None` when the
     /// active tab isn't a working-tree diff or no hunk is at the cursor.
     fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
-        let root = self.tree.root.clone();
         let built = match self.editor.diff.as_ref() {
             None => Err("Hunk actions work inside a Source Control diff"),
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control")
             }
-            Some(diff) => match diff.right_path.strip_prefix(&root) {
-                Err(_) => Err("File is outside the workspace"),
-                Ok(rel) => {
-                    let rel = rel.to_string_lossy().to_string();
-                    match diff.hunk_range_at(diff.action_row()) {
-                        None => Err("No change hunk at the cursor"),
-                        Some(range) => {
-                            let patch = diff.hunk_patch(&rel, range);
-                            Ok((rel, patch))
-                        }
+            Some(diff) => match self.repo_relative_path(&diff.right_path) {
+                None => Err("File is outside the repository"),
+                Some(rel) => match diff.hunk_range_at(diff.action_row()) {
+                    None => Err("No change hunk at the cursor"),
+                    Some(range) => {
+                        let patch = diff.hunk_patch(&rel, range);
+                        Ok((rel, patch))
                     }
-                }
+                },
             },
         };
         match built {
@@ -27289,7 +27286,6 @@ impl App {
     /// `None` when there is no selection spanning a changed row, so the
     /// caller falls back to the whole-hunk action.
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
-        let root = self.tree.root.clone();
         let diff = self.editor.diff.as_ref()?;
         if !diff.left_is_git_head {
             return None;
@@ -27298,11 +27294,33 @@ impl App {
         if !sel.has_area() {
             return None;
         }
-        let rel = diff.right_path.strip_prefix(&root).ok()?;
-        let rel = rel.to_string_lossy().to_string();
+        let rel = self.repo_relative_path(&diff.right_path)?;
         let (start, end) = sel.normalized();
         let patch = diff.selected_lines_patch(&rel, (start.0, end.0))?;
         Some((rel, patch))
+    }
+
+    /// `path` relative to the repository top level, where `git apply` runs
+    /// (#139's convention). Relative to the WORKSPACE, a workspace opened on
+    /// `repo/sub` sent `x` for `sub/x`, and every hunk action failed or hit
+    /// a same-named file at the top level.
+    fn repo_relative_path(&self, path: &Path) -> Option<String> {
+        let root = self.scm_root();
+        let rel = match path.strip_prefix(&root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => path
+                .canonicalize()
+                .ok()?
+                .strip_prefix(root.canonicalize().ok()?)
+                .ok()?
+                .to_path_buf(),
+        };
+        Some(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
     }
 
     /// Cycle the open diff's ignore-whitespace mode (off → leading → all).
@@ -27631,9 +27649,17 @@ impl App {
             return;
         };
         let untracked = matches!(entry.kind, ChangeKind::Untracked);
+        let staged = matches!(
+            entry.kind,
+            ChangeKind::StagedAdded
+                | ChangeKind::StagedModified
+                | ChangeKind::StagedDeleted
+                | ChangeKind::StagedRenamed
+        );
         self.pending_discard = Some(PendingDiscard {
             rel_path: entry.path,
             untracked,
+            staged,
         });
     }
 
@@ -27641,7 +27667,7 @@ impl App {
         let Some(pd) = self.pending_discard.take() else {
             return;
         };
-        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked) {
+        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked, pd.staged) {
             Ok(()) => {
                 self.status = format!("Discarded {}", pd.rel_path);
                 self.active_git_bypass_debounce();
@@ -43799,6 +43825,11 @@ impl App {
                 // consent to the lossy write, so retrying here would just
                 // re-refuse every tick.
                 && !e.encoding_loss
+                // A merge with conflicts still open: its Result holds only
+                // the base text there, and writing it would drop both
+                // sides from disk. Complete Merge (or an explicit Cmd+S) is
+                // the user's call.
+                && !e.merge.as_ref().is_some_and(|m| m.unresolved_count() > 0)
                 && !(guest
                     && e.path
                         .as_ref()
@@ -45780,6 +45811,13 @@ impl App {
     fn prompt_encoding_loss(&mut self) {
         self.editor.lossy_save_armed = true;
         let chars = self.editor.unmappable_chars();
+        if chars.is_empty() && self.editor.decode_lossy {
+            self.status = format!(
+                "Not saved: this file has bytes that are not valid {}, shown as \u{fffd} - press Cmd+S again to write them as \u{fffd} (irreversible), or Reopen with Encoding via the status bar",
+                self.editor.encoding.name()
+            );
+            return;
+        }
         let shown: String = chars.iter().map(|c| format!("{c} ")).collect();
         self.status = format!(
             "Not saved: {} cannot represent {}- press Cmd+S again to replace them with &#…; references (irreversible), or switch encoding via the status bar",

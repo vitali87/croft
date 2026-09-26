@@ -2786,6 +2786,11 @@ pub struct Editor {
     /// without remembering it every save stripped it: `a\nb\n` came back
     /// as `a\nb`.
     final_newline: bool,
+    /// Whether decoding the file met bytes invalid in its encoding, now
+    /// shown as U+FFFD. Saving writes those as `EF BF BD`, destroying the
+    /// original bytes, so it takes the same explicit consent as an encoding
+    /// that cannot represent the text.
+    pub decode_lossy: bool,
     /// Indentation guides (VS Code `editor.guides.indentation`): dim vertical
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
@@ -3109,6 +3114,7 @@ impl Editor {
             encoding: encoding_rs::UTF_8,
             bom: false,
             final_newline: false,
+            decode_lossy: false,
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
@@ -4622,7 +4628,9 @@ impl Editor {
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
-        let text = enc.decode(&bytes).0.into_owned();
+        let (decoded, _, decode_lossy) = enc.decode(&bytes);
+        let text = decoded.into_owned();
+        self.decode_lossy = decode_lossy;
         self.final_newline = text.ends_with(['\n', '\r']);
         // Detect the file's line-ending style before normalisation so a save
         // preserves it (and the status bar reports it). A single `\r\n` marks
@@ -6522,9 +6530,10 @@ impl Editor {
         // in when the file carries one, returning what it actually used. Take
         // that, or the buffer would hold text decoded one way while claiming to
         // be another — and the save would then re-encode it wrongly.
-        let (decoded, used, _) = enc.decode(&bytes);
+        let (decoded, used, decode_lossy) = enc.decode(&bytes);
         let text = decoded.into_owned();
         self.encoding = used;
+        self.decode_lossy = decode_lossy;
         // Re-sniff against the bytes just read: reinterpreting the file under a
         // new encoding must not carry the previous one's BOM answer over.
         self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
@@ -8734,11 +8743,12 @@ impl Editor {
         // The single choke point every save funnels through, so no caller can
         // route around the guard. The consent flag survives a failed write
         // (the user still consented) and is cleared only once the bytes land.
-        if had_errors && !self.lossy_save_armed {
+        if (had_errors || self.decode_lossy) && !self.lossy_save_armed {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
         }
         std::fs::write(&path, encoded)?;
+        self.decode_lossy = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.dirty = false;
@@ -21968,6 +21978,25 @@ mod tests {
                 "from {disk:?}"
             );
         }
+    }
+
+    #[test]
+    fn saving_over_invalid_bytes_asks_first() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"caf\xe9 ok\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert!(e.decode_lossy, "a lone 0xE9 is not UTF-8");
+        e.insert_char('x');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::EncodingLoss);
+        assert_eq!(
+            std::fs::read(tmp.path()).unwrap(),
+            b"caf\xe9 ok\n",
+            "untouched"
+        );
+        e.lossy_save_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(!e.decode_lossy);
     }
 
     #[test]
