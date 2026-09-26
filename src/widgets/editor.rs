@@ -15203,12 +15203,6 @@ impl EditorTabs {
         self.close_tab(self.active)
     }
 
-    /// Close the tab at `idx`. When more than one tab is open the tab is
-    /// removed and `self.active` is shifted so it still points at a valid
-    /// tab. When this is the last remaining tab it is reset to the blank
-    /// just-launched state instead of being removed (so the editor pane
-    /// always has at least one buffer to render). Returns false only on an
-    /// out-of-range index.
     /// Close every tab showing `path` or a file under it (a deleted file or
     /// folder), except tabs with unsaved edits: those stay open, dirty, so
     /// the edits can still be saved (recreating the file) or discarded.
@@ -15231,6 +15225,12 @@ impl EditorTabs {
         kept
     }
 
+    /// Close the tab at `idx`. When more than one tab is open the tab is
+    /// removed and `self.active` is shifted so it still points at a valid
+    /// tab. When this is the last remaining tab it is reset to the blank
+    /// just-launched state instead of being removed (so the editor pane
+    /// always has at least one buffer to render). Returns false only on an
+    /// out-of-range index.
     pub fn close_tab(&mut self, idx: usize) -> bool {
         if idx >= self.editors.len() {
             return false;
@@ -16726,10 +16726,6 @@ mod tests {
         );
     }
 
-    /// #258: every diff opener must apply the configured default, not just
-    /// the HEAD-vs-working one. `open_diff` backs the Compare actions, and
-    /// missing the setter there meant Compare always started in `Off`
-    /// regardless of config (caught in review on #292).
     #[test]
     fn deleting_closes_clean_tabs_under_the_path_and_keeps_dirty_ones() {
         let mut tabs = EditorTabs::new();
@@ -16750,6 +16746,10 @@ mod tests {
         );
     }
 
+    /// #258: every diff opener must apply the configured default, not just
+    /// the HEAD-vs-working one. `open_diff` backs the Compare actions, and
+    /// missing the setter there meant Compare always started in `Off`
+    /// regardless of config (caught in review on #292).
     #[test]
     fn every_diff_opener_applies_the_configured_whitespace_default() {
         use crate::widgets::diff::DiffWhitespace;
