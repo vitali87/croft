@@ -1039,6 +1039,10 @@ fn path_at_commit(root: &Path, hash: &str, rel_path: &str) -> Option<String> {
         &[
             "log",
             "--follow",
+            // As deep as the TIMELINE lists (`file_history`'s 50), with room
+            // to spare: a row past it cannot be clicked, and the full walk
+            // of a long history was the slow part.
+            "-n200",
             "--name-only",
             "--format=%x1e%H",
             "--",

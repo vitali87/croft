@@ -35626,6 +35626,15 @@ fn clicking_a_commit_graph_row_opens_the_commit_patch_tab() {
         .map(|c| c.short_hash.clone())
         .expect("precondition established a commit at the click row");
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    // The patch is read off the UI thread.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the commit patch",
+        || {
+            app.drain_git_view();
+            app.git_view_job.is_none()
+        },
+    );
     assert!(
         app.status.contains("Opened commit"),
         "clicking a commit row must open its patch tab; status: {:?}",

@@ -2707,6 +2707,10 @@ pub struct App {
     /// The network git operation in flight (push, pull, fetch, clone...),
     /// named for the status line, and where its finisher arrives.
     git_net_job: Option<(String, std::sync::mpsc::Receiver<GitNetDone>)>,
+    /// A read-only git view being computed off the UI thread (a TIMELINE
+    /// commit diff, a COMMITS patch): a large repo's `git show` or rename
+    /// walk froze the editor when run inline. A newer click replaces it.
+    git_view_job: Option<std::sync::mpsc::Receiver<GitNetDone>>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
     /// The provenance lens (#349): who typed each line, in the gutter and
@@ -4926,6 +4930,7 @@ impl App {
             blame_tx,
             blame_fetched: None,
             git_net_job: None,
+            git_view_job: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
@@ -9900,20 +9905,22 @@ impl App {
             .and_then(|p| self.roots.owning_root(p))
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
-        match crate::git::show_commit_file_diff(&timeline_root, &hash, &rel) {
-            Ok(raw) => {
-                let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
-                if let Err(e) = self.editor.open_git_diff_side_by_side(&label, &raw) {
-                    self.status = format!("Could not open diff: {e}");
-                    return;
+        self.status = format!("Loading {rel} at {hash}\u{2026}");
+        self.spawn_git_view(move || {
+            let result = crate::git::show_commit_file_diff(&timeline_root, &hash, &rel);
+            Box::new(move |app: &mut App| match result {
+                Ok(raw) => {
+                    let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
+                    if let Err(e) = app.editor.open_git_diff_side_by_side(&label, &raw) {
+                        app.status = format!("Could not open diff: {e}");
+                        return;
+                    }
+                    app.focus_pane(Pane::Editor);
+                    app.status = format!("Showing {rel} at {hash}");
                 }
-                self.focus_pane(Pane::Editor);
-                self.status = format!("Showing {rel} at {hash}");
-            }
-            Err(e) => {
-                self.status = format!("git show failed: {e}");
-            }
-        }
+                Err(e) => app.status = format!("git show failed: {e}"),
+            })
+        });
     }
 
     /// Restore the local snapshot currently shown in a TIMELINE diff: write its
@@ -20548,20 +20555,27 @@ impl App {
     /// Open a commit's full patch (header, message, diffstat, diff) in a
     /// read-only scratch tab — the graph's click-through, tig's enter key.
     fn open_commit_patch(&mut self, hash: &str, short_hash: &str) {
-        match crate::git::show_commit(&self.scm_root(), hash) {
-            Ok(text) => {
-                let label = format!("commit {short_hash}");
-                match self.editor.open_text_buffer(Path::new(&label), &text) {
-                    Ok(()) => {
-                        self.focus_pane(Pane::Editor);
-                        self.sync_open_file_poll_mtime();
-                        self.status = format!("Opened commit {short_hash}");
+        let root = self.scm_root();
+        let hash = hash.to_string();
+        let short_hash = short_hash.to_string();
+        self.status = format!("Loading commit {short_hash}\u{2026}");
+        self.spawn_git_view(move || {
+            let result = crate::git::show_commit(&root, &hash);
+            Box::new(move |app: &mut App| match result {
+                Ok(text) => {
+                    let label = format!("commit {short_hash}");
+                    match app.editor.open_text_buffer(Path::new(&label), &text) {
+                        Ok(()) => {
+                            app.focus_pane(Pane::Editor);
+                            app.sync_open_file_poll_mtime();
+                            app.status = format!("Opened commit {short_hash}");
+                        }
+                        Err(e) => app.status = format!("Open commit failed: {e}"),
                     }
-                    Err(e) => self.status = format!("Open commit failed: {e}"),
                 }
-            }
-            Err(e) => self.status = format!("Show commit failed: {e}"),
-        }
+                Err(e) => app.status = format!("Show commit failed: {e}"),
+            })
+        });
     }
 
     fn handle_extensions_key(&mut self, key: KeyEvent) {
@@ -24006,6 +24020,36 @@ impl App {
         });
         self.git_net_job = Some((what.to_string(), rx));
         self.status = format!("Git: {what}\u{2026}");
+    }
+
+    /// Run a read-only git view off the UI thread; its finisher is applied by
+    /// [`Self::drain_git_view`]. A newer request supersedes a pending one,
+    /// whose result is then dropped.
+    fn spawn_git_view(&mut self, job: impl FnOnce() -> GitNetDone + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.git_view_job = Some(rx);
+    }
+
+    /// Apply a finished git view. True when one landed.
+    fn drain_git_view(&mut self) -> bool {
+        let Some(rx) = &self.git_view_job else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(done) => {
+                self.git_view_job = None;
+                done(self);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.git_view_job = None;
+                false
+            }
+        }
     }
 
     /// Whether a network git operation is still running, saying so.
@@ -55016,7 +55060,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
-        let blame_changed = app.drain_blame() | app.drain_git_net();
+        let blame_changed = app.drain_blame() | app.drain_git_net() | app.drain_git_view();
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
