@@ -42953,284 +42953,1405 @@ fn a_recording_writes_a_parseable_asciicast() {
     );
 }
 
-/// #369: the symbol's byte range slices exactly its source, including for
-/// the LAST symbol in a file.
-///
-/// The line-to-byte sum charges a `\n` between lines, and croft's offset
-/// model gives an N-line buffer no trailing newline — so charging one to the
-/// final line puts `end` a byte past the buffer. That panics anything that
-/// slices by the range, which is the whole point of the range, and makes an
-/// append at true EOF read as INSIDE the symbol rather than below it.
-#[test]
-fn a_symbol_range_slices_exactly_its_source() {
-    let tmp = tempfile::tempdir().unwrap();
+/// A file with two functions, `fn b` the LAST thing in it (no trailing
+/// newline), opened with the caret inside `fn b` and the symbol tab opened
+/// from the palette.
+fn app_with_symbol_tab_on_b(tmp: &tempfile::TempDir) -> (App, std::path::PathBuf) {
     let file = tmp.path().join("two.rs");
-    let text = "fn a() {\n    1\n}\nfn b() {\n    2\n}";
-    std::fs::write(&file, text).unwrap();
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&file).unwrap();
-
-    // `fn b` occupies lines 3..5 (0-based), the last symbol in the file.
-    app.outline.set_symbols(
-        file.clone(),
-        vec![crate::lsp::manager::OutlineSymbol {
-            name: String::from("fn b"),
-            detail: None,
-            kind: crate::lsp::manager::OutlineKind::Function,
-            depth: 0,
-            line: 3,
-            character: 0,
-            range_start_line: 3,
-            range_end_line: 5,
-        }],
-    );
+    app.editor.open_pinned(&file).unwrap();
     app.editor.cursor_row = 4;
     app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    (app, file)
+}
 
-    let (_, _, range) = app.symbol_tab.clone().expect("a symbol tab opened");
-    assert!(
-        range.end <= text.len(),
-        "the range runs {} bytes past a {}-byte buffer",
-        range.end - text.len(),
-        text.len()
+fn painted(app: &mut App) -> String {
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let mut all = String::new();
+    for y in 0..30 {
+        for x in 0..100 {
+            all.push_str(term.backend().buffer()[(x, y)].symbol());
+        }
+        all.push('\n');
+    }
+    all
+}
+
+/// #369: a file and its symbol tab count edits apart, but one of them
+/// speaks for the file to the language server: the active tab. Judged
+/// each against the one record, they took turns resending the whole text
+/// on every tick.
+#[test]
+fn one_tab_speaks_for_a_file_to_the_language_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 5;
+    for _ in 0..3 {
+        app.editor.insert_char('1');
+    }
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    assert!(app.editor.symbol_view.is_some(), "the symbol tab is active");
+    let path = app.editor.path.clone().unwrap();
+    assert_ne!(
+        app.editor.editors[0].edit_seq, app.editor.edit_seq,
+        "the tabs' counters differ"
     );
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        app.sync_lsp();
+        seen.push(app.lsp_last_seen.get(&path).copied());
+    }
+    let active = Some(app.editor.edit_seq);
+    assert_eq!(seen, vec![active, active, active], "no tick resends");
+}
+
+/// A file of three functions with a symbol tab on the middle one, `b`
+/// (lines 3 to 5), active, and vim on.
+fn vim_symbol_tab_on_b(tmp: &tempfile::TempDir) -> App {
+    let file = tmp.path().join("three.rs");
+    std::fs::write(
+        &file,
+        "fn a() {\n    1\n}\nfn b() {\n    2\n}\nfn c() {\n    3\n}",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    let view = app.editor.symbol_view.as_ref().expect("a symbol tab on b");
+    assert_eq!((view.first, view.last), (3, 5));
+    app.focus = Pane::Editor;
+    app.vim.enabled = true;
+    app
+}
+
+/// #369: vim operators in a symbol tab stay inside its symbol. Upward
+/// (`dgg`, `d5k`, `db` at its first column) they used to reach the hidden
+/// lines above it, downward (`dG`, `dw` at its end) the ones below; inside
+/// it they still delete what they cover.
+#[test]
+fn vim_operators_in_a_symbol_tab_stay_inside_its_symbol() {
+    let a = ["fn a() {", "    1", "}"];
+    let c = ["fn c() {", "    3", "}"];
+    let whole = [&a[..], &["fn b() {", "    2", "}"], &c[..]].concat();
+    // (keys, caret, the buffer after)
+    let cases: [(&str, (usize, usize), Vec<&str>); 5] = [
+        ("dgg", (4, 0), [&a[..], &["}"], &c[..]].concat()),
+        ("d5k", (4, 0), [&a[..], &["}"], &c[..]].concat()),
+        ("db", (3, 0), whole.clone()),
+        ("dG", (4, 0), [&a[..], &["fn b() {"], &c[..]].concat()),
+        (
+            "dw",
+            (5, 0),
+            [&a[..], &["fn b() {", "    2", ""], &c[..]].concat(),
+        ),
+    ];
+    for (keys, (row, col), after) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = vim_symbol_tab_on_b(&tmp);
+        app.editor.cursor_row = row;
+        app.editor.cursor_col = col;
+        vim_feed_str(&mut app, keys);
+        assert_eq!(app.editor.lines, after, "{keys}");
+    }
+}
+
+/// #369: a count on a line operator stops at the symbol's last line, and
+/// the status reports the lines it covered.
+#[test]
+fn a_vim_line_count_in_a_symbol_tab_stops_at_its_last_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = vim_symbol_tab_on_b(&tmp);
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 0;
+    vim_feed_str(&mut app, "5yy");
+    assert_eq!(app.status, "Yanked 2 line(s)");
+}
+
+/// #369: two symbols that start on one line get a tab each, opening either
+/// again focuses its own tab, and each follows its own symbol: renaming the
+/// inner one leaves the outer tab's title alone.
+#[test]
+fn symbols_starting_on_one_line_get_a_tab_each() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("one.rs");
+    std::fs::write(&file, "impl S { fn m() {} }\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("S".into(), 0, 0);
+    app.editor.select(0);
+    app.open_symbol_tab_for("m".into(), 0, 0);
+    let names = |app: &App| -> Vec<String> {
+        let mut names: Vec<String> = app
+            .editor
+            .editors
+            .iter()
+            .filter_map(|e| e.symbol_view.as_ref().map(|v| v.name.clone()))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&app), vec!["S", "m"]);
+    app.editor.select(0);
+    app.open_symbol_tab_for("S".into(), 0, 0);
+    assert_eq!(names(&app).len(), 2, "reopening S focused its tab");
     assert_eq!(
-        &text[range.start..range.end],
-        "fn b() {\n    2\n}",
-        "the range must slice exactly the symbol's source"
+        app.editor.symbol_view.as_ref().map(|v| v.name.as_str()),
+        Some("S")
+    );
+    // Rename m to n from the file's tab.
+    app.editor.select(0);
+    let col = app.editor.lines[0].find("m()").unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = col;
+    app.editor.delete_forward();
+    app.editor.insert_char('n');
+    app.sync_symbol_views();
+    assert_eq!(names(&app), vec!["S", "n"]);
+}
+
+/// #369: pickers spell some symbols differently (the LSP outline's
+/// `impl Foo` is tree-sitter's `Foo`); asking for the same symbol under
+/// either name focuses the one tab.
+#[test]
+fn one_symbol_under_two_spellings_gets_one_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("foo.rs");
+    std::fs::write(&file, "impl Foo {\n    fn a() {}\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("Foo".into(), 0, 2);
+    app.editor.select(0);
+    app.open_symbol_tab_for("impl Foo".into(), 0, 2);
+    let tabs = app
+        .editor
+        .editors
+        .iter()
+        .filter(|e| e.symbol_view.is_some())
+        .count();
+    assert_eq!(tabs, 1);
+}
+
+/// #369: a symbol tab's minimap draws only its symbol, and a click on it
+/// lands on the symbol's lines, not the file's.
+#[test]
+fn a_symbol_tab_minimap_draws_and_maps_only_its_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("mm.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\n  fn b() {\n    2\n  }").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let (bg, fg) = ((0, 0, 0), (255, 255, 255));
+    // Row 0, column 0: `f` of `fn a` in the file's tab.
+    let lit = |buf: &[u8]| buf[0] != 0;
+    assert!(lit(&app.editor.minimap_rgba(4, 3, 3, bg, fg)));
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    assert_eq!(app.editor.minimap_span(), (3, 6));
+    // `  fn b`: column 0 is indentation.
+    assert!(!lit(&app.editor.minimap_rgba(4, 3, 3, bg, fg)));
+    app.minimap_img_rect = Rect::new(0, 0, 2, 3);
+    app.cell_pixel = Some((1, 1));
+    app.minimap_content_h = 3;
+    app.minimap_scroll_to_row(0);
+    assert_eq!(
+        app.editor.cursor_row, 3,
+        "the top of the strip is b's first line"
     );
 }
 
-/// Focusing another editor GROUP closes a symbol tab too (#369).
-///
-/// A group swap changes the active file with no open call and no path
-/// argument: `focus_editor_group` pulls another group into `self.editor`.
-/// So neither the open-based sync nor a path-keyed guard sees it - it is a
-/// tenth category beyond the nine `open_preview`/`open` bypasses, and the
-/// guard lives in `focus_pane` to catch it.
+/// #369: a documented symbol starts on its doc comment in the LSP outline
+/// and on its item in the tree-sitter one; opened from both it gets one tab.
 #[test]
-fn focusing_another_editor_group_closes_a_symbol_tab() {
+fn a_documented_symbol_opened_from_both_outlines_gets_one_tab() {
     let tmp = tempfile::tempdir().unwrap();
-    let a = tmp.path().join("a.rs");
-    let b = tmp.path().join("b.rs");
-    std::fs::write(&a, "fn one() {\n    let x = 1;\n}\n").unwrap();
-    std::fs::write(&b, "fn two() {}\n").unwrap();
+    let file = tmp.path().join("doc.rs");
+    std::fs::write(&file, "/// doc\nfn foo() {}\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-
-    app.editor.open_pinned(&a).unwrap();
-    app.split_editor();
-    app.editor.open_pinned(&b).unwrap();
-    assert!(app.editor_layout.is_split(), "two groups");
-
-    // The tab belongs to the file in the OTHER group.
-    app.symbol_tab = Some((
-        String::from("fn one"),
-        a.clone(),
-        crate::symbol_range::SymbolRange::new(0, 27),
-    ));
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("foo".into(), 1, 1);
+    app.editor.select(0);
+    app.open_symbol_tab_for("foo".into(), 0, 1);
+    let tabs = app
+        .editor
+        .editors
+        .iter()
+        .filter(|e| e.symbol_view.is_some())
+        .count();
+    assert_eq!(tabs, 1);
     assert!(
-        app.symbol_tab.is_some(),
-        "staging: a tab is open for the other group's file"
-    );
-
-    // The layout is DETERMINED, not incidental: `split_active` puts the
-    // existing group at DFS index 0 and the new active one at 1, which
-    // `split_active_makes_a_two_leaf_horizontal_split_with_the_new_group_active_after`
-    // in editor_layout.rs pins directly. So left holds a.rs, right holds
-    // b.rs. Asserting that rather than branching on it - an earlier version
-    // guarded the clear behind an `if`, which is the shape that goes green
-    // having asserted nothing if the layout ever moves.
-    app.focus_editor_group(true);
-    assert_eq!(
-        app.editor.path.as_deref(),
-        Some(a.as_path()),
-        "the left group holds the file the tab belongs to"
-    );
-    assert!(
-        app.symbol_tab.is_some(),
-        "a swap onto the tab's OWN file must not close it"
-    );
-
-    app.focus_editor_group(false);
-    assert_eq!(
-        app.editor.path.as_deref(),
-        Some(b.as_path()),
-        "the right group holds the other file"
-    );
-    assert!(
-        app.symbol_tab.is_none(),
-        "a swap onto a different file must close the tab"
+        app.editor.symbol_view.is_some(),
+        "the existing tab is focused"
     );
 }
 
-/// A symbol tab belongs to the file it was opened from (#369).
-///
-/// The range is BYTE offsets into one buffer. Navigating to another file
-/// left it attached, so `follow_symbol_tab_edit` then applied edits made in
-/// the NEW file against offsets from the old one - silently walking the
-/// range somewhere meaningless rather than reporting `Gone`. Nothing
-/// cleared it except a straddling edit, so it survived every jump.
+/// #369: two same-named symbols of one kind and depth (a `fn new` in each
+/// of two impls) are told apart by the line their item starts on.
 #[test]
-fn a_symbol_tab_does_not_follow_you_into_another_file() {
+fn same_named_symbols_on_different_lines_get_a_tab_each() {
     let tmp = tempfile::tempdir().unwrap();
-    let a = tmp.path().join("a.rs");
-    let b = tmp.path().join("b.rs");
-    std::fs::write(&a, "fn one() {\n    let x = 1;\n}\n").unwrap();
-    std::fs::write(&b, "fn two() {}\n").unwrap();
+    let file = tmp.path().join("news.rs");
+    std::fs::write(
+        &file,
+        "impl A {\n    fn new() {}\n}\nimpl B {\n    fn new() {}\n}\n",
+    )
+    .unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&a).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("new".into(), 1, 1);
+    app.editor.select(0);
+    app.open_symbol_tab_for("new".into(), 4, 4);
+    let tabs = app
+        .editor
+        .editors
+        .iter()
+        .filter(|e| e.symbol_view.is_some())
+        .count();
+    assert_eq!(tabs, 2);
+}
 
-    app.symbol_tab = Some((
-        String::from("fn one"),
-        a.clone(),
-        crate::symbol_range::SymbolRange::new(0, 27),
-    ));
-    assert!(app.symbol_tab.is_some(), "staging: a tab is open on a.rs");
-
-    // Navigating to another file must drop it: the range describes a.rs.
-    app.open_at_utf16(&b, 0, 0).unwrap();
-    assert!(
-        app.symbol_tab.is_none(),
-        "the symbol tab must not survive into a different file"
-    );
-
-    // And through a path that never reaches `open_at`. Search hits, a
-    // quick-open pick with no line hint, tree clicks and plain tab switching
-    // all open a file directly - `open_at` looked like the chokepoint and
-    // covers ten of nineteen such sites.
-    app.editor.open(&a).unwrap();
-    app.symbol_tab = Some((
-        String::from("fn one"),
-        a.clone(),
-        crate::symbol_range::SymbolRange::new(0, 27),
-    ));
-    // `open_search_hit` is one of the nine that bypass `open_at`; it calls
-    // `sync_open_file_poll_mtime` directly, which is where the guard now
-    // lives. Driving the real navigation rather than `editor.open` alone,
-    // which is the raw editor call and not a navigation path at all.
-    app.open_search_hit(&crate::widgets::search::SearchHit {
-        path: b.clone(),
-        line_no: 1,
-        line_text: String::from("fn two() {}"),
+/// #369: switching between two symbol tabs of the same length repaints the
+/// minimap (their other layout fields agree), and its viewport and
+/// selection count from the symbol's first line.
+#[test]
+fn switching_between_same_length_symbol_tabs_repaints_the_minimap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cell_pixel = Some((8, 16));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.editor.open_pinned(&file).unwrap();
+    app.open_symbol_tab_for("a".into(), 0, 2);
+    app.editor.select(0);
+    app.open_symbol_tab_for("b".into(), 3, 5);
+    let tab = |app: &App, name: &str| {
+        app.editor
+            .editors
+            .iter()
+            .position(|e| e.symbol_view.as_ref().is_some_and(|v| v.name == name))
+            .unwrap()
+    };
+    let (a, b) = (tab(&app, "a"), tab(&app, "b"));
+    let strip = Rect::new(100, 1, 6, 20);
+    app.editor.select(a);
+    app.update_minimap_overlay(strip);
+    assert_eq!(app.minimap_base.as_ref().map(|m| m.sig.5), Some((0, 3)));
+    app.editor.select(b);
+    app.update_minimap_overlay(strip);
+    assert_eq!(app.minimap_base.as_ref().map(|m| m.sig.5), Some((3, 6)));
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 0),
+        head: (4, 2),
     });
-    assert!(
-        app.symbol_tab.is_none(),
-        "a search-hit jump must drop it too, not only the open_at route"
-    );
-
-    // Paired positive: reopening a.rs and a tab there still tracks edits, so
-    // the clear above is scoped to a file CHANGE rather than firing always.
-    // Navigating WITHIN the same file must NOT clear it: a go-to-definition
-    // that lands in the same file, or a Back jump, never left the buffer the
-    // range describes. Clearing unconditionally would fix the bug above and
-    // silently close the tab on every such jump - and it passes a test that
-    // only ever re-seeds the tab AFTER the navigation, which is why this
-    // seeds it BEFORE.
-    app.editor.open(&a).unwrap();
-    // Starting at 11, not 0: an insertion AT `start` is deliberately treated
-    // as inside (src/symbol_range.rs:86), so a range anchored at 0 has no
-    // "above" to test with and the paired case would assert the wrong rule.
-    app.symbol_tab = Some((
-        String::from("fn one"),
-        a.clone(),
-        crate::symbol_range::SymbolRange::new(11, 27),
-    ));
-    app.open_at_utf16(&a, 0, 0).unwrap();
-    assert!(
-        app.symbol_tab.is_some(),
-        "re-opening the tab's OWN file must not close it"
-    );
-    // A DIFFERENT SPELLING of the same file must not clear it. On macOS the
-    // workspace under /tmp canonicalises to /private/tmp, and
-    // `go_to_definition` feeds paths from the server's realpath-resolved
-    // URI while the tab stored whatever the user opened - so a raw `!=`
-    // closes the tab on a jump that never left the file. The old test could
-    // not catch this: it passed the same spelling on both sides, the one
-    // case where a raw comparison is always right.
-
-    app.follow_symbol_tab_edit(0, 0, 4);
-    let (_, _, range) = app
-        .symbol_tab
-        .clone()
-        .expect("an insertion above still tracks");
-    assert_eq!(
-        (range.start, range.end),
-        (15, 31),
-        "an edit above shifts the whole range rather than clearing it"
-    );
+    app.update_minimap_overlay(strip);
+    let layout = app.overlays.minimap.layout().expect("laid out");
+    assert_eq!((layout.top, layout.selection), (0, Some((0, 1))));
 }
 
-/// #369: an open symbol tab follows edits, and closes when its symbol goes.
+/// #369: a symbol tab is a tab of its own that shows only its symbol.
 ///
-/// The tab is a VIEW over a byte range rather than a copy, so an edit that
-/// never reaches it leaves the tab pointing at bytes that have moved —
-/// showing the wrong text under the right title, which is worse than showing
-/// nothing at all.
+/// Opened beside the file's tab, titled by the symbol, holding the whole
+/// file (so LSP, save and line numbers stay in file coordinates) while it
+/// paints only the symbol's lines. `fn b` is the last symbol in the file:
+/// its range must stop at the buffer's end, not a separator byte past it.
 #[test]
-fn a_symbol_tab_follows_edits_and_closes_when_its_symbol_goes() {
+fn a_symbol_tab_opens_beside_its_file_showing_only_the_symbol() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let anchored = tmp.path().join("a.rs");
-    app.symbol_tab = Some((
-        String::from("render"),
-        anchored.clone(),
-        crate::symbol_range::SymbolRange::new(100, 200),
-    ));
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
 
-    // An edit ABOVE slides the whole range.
-    app.follow_symbol_tab_edit(10, 0, 30);
+    assert_eq!(app.editor.editors.len(), 2, "a NEW tab, not a replaced one");
+    assert_eq!(app.editor.active_index(), 1, "placed after its file's tab");
+    let tab = &app.editor.editors[1];
+    assert_eq!(tab.path.as_deref(), Some(file.as_path()));
+    let view = tab.symbol_view.as_ref().expect("the tab is a symbol tab");
+    assert_eq!((view.name.as_str(), view.first, view.last), ("b", 3, 5));
+    let text = tab.lines.join("\n");
     assert_eq!(
-        app.symbol_tab.as_ref().map(|(_, _, r)| (r.start, r.end)),
-        Some((130, 230)),
-        "an insertion above must move the tab with its symbol"
+        &text[view.range.start..view.range.end],
+        "fn b() {\n    2\n}",
+        "the range slices exactly the symbol, up to the buffer's end"
     );
+    assert_eq!(tab.cursor_row, 4, "the caret stays where it was");
 
-    // An edit INSIDE resizes rather than moving — the case that would slide
-    // the tab off its own function if it shifted.
-    app.follow_symbol_tab_edit(150, 0, 20);
-    assert_eq!(
-        app.symbol_tab.as_ref().map(|(_, _, r)| (r.start, r.end)),
-        Some((130, 250)),
-        "typing inside must grow the range, not move it"
-    );
-
-    // Deleting the symbol closes the tab and says so, rather than
-    // re-anchoring to whatever is now at those bytes.
-    app.follow_symbol_tab_edit(130, 120, 0);
-    assert!(app.symbol_tab.is_none(), "a deleted symbol closes its tab");
+    // Scrolled to the top, the clip, not the scroll, keeps `fn a` out.
+    app.editor.scroll = 0;
+    let screen = painted(&mut app);
     assert!(
-        app.status.contains("render") && app.status.contains("gone"),
-        "the user must be told which tab closed and why: {}",
+        screen.contains("b \u{b7} two.rs"),
+        "titled by its symbol:\n{screen}"
+    );
+    assert!(
+        screen.contains("fn b() {"),
+        "the symbol is shown:\n{screen}"
+    );
+    assert!(
+        !screen.contains("fn a() {"),
+        "nothing outside the symbol is painted:\n{screen}"
+    );
+
+    // Opening it again focuses the existing tab rather than stacking one.
+    app.editor.select(0);
+    app.editor.cursor_row = 5;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    assert_eq!(app.editor.editors.len(), 2);
+    assert_eq!(app.editor.active_index(), 1);
+}
+
+/// #369: the caret and every edit stay inside the symbol.
+///
+/// Motions stop at its edges, and the edits that would join its first or
+/// last line to a line outside it (Backspace at its start, Delete at its
+/// end, moving a line across its edge) do nothing, rather than pulling text
+/// the tab cannot show into or out of it.
+#[test]
+fn a_symbol_tab_keeps_the_caret_and_edits_inside_its_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_symbol_tab_on_b(&tmp);
+    let before = app.editor.lines.clone();
+
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.cursor_row, 3,
+        "Up stops at the symbol's first line"
+    );
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines, before,
+        "Backspace at its start joins nothing"
+    );
+    app.handle_key(key(KeyCode::Up, KeyModifiers::ALT)).unwrap();
+    assert_eq!(
+        app.editor.lines, before,
+        "its first line cannot move above it"
+    );
+
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (5, 1),
+        "the caret parks at the symbol's end"
+    );
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    app.editor.cursor_row = 5;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines, before,
+        "Delete and Alt+Down stop at its end"
+    );
+
+    // An ordinary edit inside still works.
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('0'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[4], "    20");
+}
+
+/// #369: a symbol tab and its file's tab are one document.
+///
+/// Typing in either shows up in the other, an edit above the symbol moves
+/// the clip with it, saving either clears both dirty dots, and a symbol
+/// that is deleted closes its tab with a note saying why.
+#[test]
+fn a_symbol_tab_mirrors_its_file_and_follows_the_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+
+    // Typing in the symbol tab reaches the file's tab.
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    // The key itself mirrors the edit, so nothing is left for the tick.
+    assert!(!app.sync_symbol_views());
+    assert_eq!(app.editor.editors[0].lines[4], "    27");
+    assert!(
+        app.editor.editors[0].dirty,
+        "the file's tab has the unsaved edit"
+    );
+
+    // Lines added above the symbol in the file's tab move the clip down.
+    app.editor.select(0);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    let tab = &app.editor.editors[1];
+    assert_eq!(tab.lines, app.editor.editors[0].lines);
+    let view = tab.symbol_view.as_ref().unwrap();
+    assert_eq!(
+        (view.first, view.last),
+        (4, 6),
+        "the clip moved with its symbol"
+    );
+
+    // Saving one clears both.
+    app.editor.editors[0].save_to_disk().unwrap();
+    app.sync_symbol_views();
+    assert!(
+        !app.editor.editors[1].dirty,
+        "the saved text is the symbol tab's text too"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "\nfn a() {\n    1\n}\nfn b() {\n    27\n}"
+    );
+
+    // Renaming the symbol retitles the tab.
+    app.editor.select(1);
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 4;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert_eq!(
+        app.editor.editors[1].symbol_view.as_ref().unwrap().name,
+        "bx"
+    );
+
+    // Deleting it closes the tab.
+    app.editor.select(0);
+    let kept: Vec<String> = app.editor.lines[..4].to_vec();
+    app.editor.replace_all_lines(kept);
+    app.sync_symbol_views();
+    assert_eq!(app.editor.editors.len(), 1, "the symbol tab closed");
+    assert!(app.editor.editors[0].symbol_view.is_none());
+    assert!(
+        app.status.contains("bx") && app.status.contains("gone"),
+        "the user is told which tab closed and why: {}",
         app.status
     );
+}
 
-    // With no tab open, a further edit is a no-op rather than a panic.
-    app.follow_symbol_tab_edit(0, 5, 5);
-    assert!(app.symbol_tab.is_none());
+/// #369: Alt+Enter in the workspace-symbol picker opens the symbol tab even
+/// when the server names the file through a symlink.
+///
+/// The jump lands on the tab already open under the real path, so the
+/// landed check has to compare the two spellings by their canonical form.
+#[cfg(unix)]
+#[test]
+fn alt_enter_on_a_symlinked_symbol_still_opens_its_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let file = root.join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let link = root.join("link.rs");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.open_workspace_symbols("b");
+    app.ws_symbols_request_id = Some(1);
+    app.apply_workspace_symbols(1, vec![ws_item("b", &link, 3)], false);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT))
+        .unwrap();
+    let view = app
+        .editor
+        .symbol_view
+        .as_ref()
+        .expect("the symbol tab opened");
+    assert_eq!(view.name, "b");
+}
 
-    // A tab carries its FILE, and an edit to another file must not move it.
-    // The range is a byte offset into one buffer, so offsets from elsewhere
-    // mean nothing — a collaborator typing in `b.rs` would otherwise shift a
-    // tab pointed at `a.rs`, or announce that its symbol had gone.
-    app.symbol_tab = Some((
-        String::from("render"),
-        anchored.clone(),
-        crate::symbol_range::SymbolRange::new(100, 200),
-    ));
-    let before = app.symbol_tab.clone();
-    app.apply_collab_spans(
-        tmp.path(),
-        "b.rs",
-        &[crate::collab::ResolvedSpan {
-            at: 0,
-            deleted: 0,
-            inserted: String::from("xxxxx"),
-        }],
-        1,
-    );
+/// #369: duplicating the symbol's last line keeps the copy inside it.
+///
+/// The copy lands below the closing brace, so the clip has to grow by the
+/// one line rather than leave the new line outside the tab.
+#[test]
+fn duplicating_a_symbols_last_line_keeps_the_copy_inside_the_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 1;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    let view = app.editor.symbol_view.as_ref().expect("symbol tab on a");
+    assert_eq!((view.first, view.last), (0, 2));
+
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.editor.duplicate_lines_down();
+    app.sync_symbol_views();
     assert_eq!(
-        app.symbol_tab, before,
-        "an edit to another file must leave the tab exactly where it was"
+        app.editor.lines[..5],
+        ["fn a() {", "    1", "}", "}", "fn b() {"]
+    );
+    let view = app.editor.symbol_view.as_ref().expect("still a symbol tab");
+    assert_eq!((view.first, view.last), (0, 3), "the clip grew by the copy");
+    assert_eq!(app.editor.cursor_row, 3, "the caret sits on the copy");
+}
+
+/// #369: saving the file's tab leaves no disk conflict on its symbol tab.
+///
+/// The symbol tab holds the same text that was just written, so the next
+/// external-change check must see it as in sync with disk instead of
+/// offering to reload over the saved edit.
+#[test]
+fn saving_the_files_tab_leaves_no_conflict_on_its_symbol_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.editors[1].dirty);
+
+    app.editor.editors[0].save_to_disk().unwrap();
+    app.sync_symbol_views();
+    assert!(
+        !app.reload_open_file_after_external_change(),
+        "the symbol tab already holds the saved text"
+    );
+    assert!(app.input_prompt.is_none(), "no reload prompt");
+    assert_eq!(app.editor.editors[1].lines[4], "    27");
+}
+
+/// #369: Cmd+S in the symbol tab writes the file and leaves both tabs clean,
+/// with no conflict for the file's tab, which holds the same text.
+#[test]
+fn cmd_s_in_a_symbol_tab_saves_the_file_and_cleans_both_tabs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.editors[0].dirty, "the file's tab has the edit");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "fn a() {\n    1\n}\nfn b() {\n    27\n}"
+    );
+    assert!(!app.editor.editors[1].dirty, "the symbol tab is saved");
+    assert!(!app.editor.editors[0].dirty, "so is the file's tab");
+    assert!(
+        !app.reload_open_file_after_external_change(),
+        "the file's tab already holds the saved text"
+    );
+    assert!(app.input_prompt.is_none(), "no reload prompt");
+}
+
+/// #369: auto save writes a file with a symbol tab once. Both tabs hold the
+/// edit and are due together; writing the second would read the first
+/// write as an external change and raise a conflict prompt.
+#[test]
+fn auto_save_writes_a_file_with_a_symbol_tab_once_and_cleans_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.auto_save = true;
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    for e in app.editor.editors.iter_mut() {
+        assert!(e.dirty, "fixture: both tabs hold the edit");
+        e.last_edit_at = Some(past);
+    }
+    assert!(app.tick_auto_save());
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "fn a() {\n    1\n}\nfn b() {\n    27\n}"
+    );
+    for e in &app.editor.editors {
+        assert!(!e.dirty && !e.disk_conflict, "both tabs are saved");
+    }
+    assert!(app.input_prompt.is_none(), "no conflict prompt");
+    assert!(!app.reload_open_file_after_external_change());
+}
+
+/// #369: both tabs of a file with a symbol tab meet a disk conflict
+/// together, and the prompt names the file once.
+#[test]
+fn auto_save_reports_a_symbol_tabs_file_conflict_once() {
+    use crate::widgets::input_prompt::InputPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.auto_save = true;
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    std::fs::write(
+        &file,
+        "fn a() {\n    1\n}\nfn b() {\n    changed elsewhere\n}",
+    )
+    .unwrap();
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    for e in app.editor.editors.iter_mut() {
+        e.last_edit_at = Some(past);
+    }
+    assert!(app.tick_auto_save());
+    assert!(
+        app.editor.editors.iter().all(|e| e.disk_conflict),
+        "both tabs latch the conflict"
+    );
+    match app.input_prompt.as_ref().map(|p| &p.purpose) {
+        Some(InputPurpose::ReloadConflict { paths }) => assert_eq!(paths, &vec![file]),
+        _ => panic!("a conflict prompt"),
+    }
+}
+
+/// #369: an encoding refusal on a file with a symbol tab names the file
+/// once, not once per tab.
+#[test]
+fn auto_save_names_a_symbol_tabs_file_once_when_its_encoding_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.auto_save = true;
+    app.sync_symbol_views();
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    for e in app.editor.editors.iter_mut() {
+        e.encoding = encoding_rs::WINDOWS_1252;
+        e.lines[4] = String::from("    \u{65e5}\u{672c}");
+        e.dirty = true;
+        e.last_edit_at = Some(past);
+    }
+    assert!(app.tick_auto_save());
+    assert!(app.editor.editors.iter().all(|e| e.encoding_loss));
+    assert_eq!(app.status.matches("two.rs").count(), 1, "{}", app.status);
+}
+
+/// #369: a format-on-save write lands after `save` returned, so it settles
+/// the file's other tab itself rather than leaving it dirty.
+#[test]
+fn a_deferred_format_on_save_write_cleans_the_symbol_tabs_sibling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    app.save_after_format = Some(file.clone());
+    app.complete_pending_save();
+    assert!(std::fs::read_to_string(&file).unwrap().contains("27"));
+    assert!(!app.editor.editors[1].dirty, "the symbol tab is saved");
+    assert!(!app.editor.editors[0].dirty, "so is the file's tab");
+    assert!(!app.reload_open_file_after_external_change());
+}
+
+/// #369: a format-on-save reply that lands after the user moved to another
+/// file writes the requested file's tab and still settles its symbol tab.
+#[test]
+fn a_late_format_on_save_write_cleans_the_symbol_tabs_sibling_from_another_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    let other = tmp.path().join("other.rs");
+    std::fs::write(&other, "fn c() {}").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(other.as_path()));
+    app.save_after_format = Some(file.clone());
+    app.complete_pending_save();
+    assert!(std::fs::read_to_string(&file).unwrap().contains("27"));
+    let tabs: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .filter(|e| e.path.as_deref() == Some(file.as_path()))
+        .collect();
+    assert_eq!(tabs.len(), 2, "fixture: the file and its symbol tab");
+    assert!(tabs.iter().all(|e| !e.dirty), "both tabs are saved");
+}
+
+/// #369: the focus-change sweep, which waits for no delay, also writes a
+/// file with a symbol tab once and cleans both when focus leaves the editor.
+#[test]
+fn a_focus_change_save_writes_a_file_with_a_symbol_tab_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert!(app.editor.editors.iter().all(|e| e.dirty), "fixture");
+    // Focus left the editor, so both tabs are due at once.
+    app.focus = Pane::Tree;
+    assert!(app.sweep_auto_save(false));
+    assert!(std::fs::read_to_string(&file).unwrap().contains("27"));
+    for e in &app.editor.editors {
+        assert!(!e.dirty && !e.disk_conflict, "both tabs are saved");
+    }
+    assert!(app.input_prompt.is_none(), "no conflict prompt");
+}
+
+/// #369: every way in opens the same symbol tab.
+///
+/// `Cmd+K Shift+V` takes the symbol at the caret, and an OUTLINE row's right-click
+/// menu opens the row's symbol even when the caret sits elsewhere.
+#[test]
+fn the_chord_and_the_outline_menu_open_a_symbol_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 1;
+    // Plain Cmd+K V is Live Run's.
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('v'), KeyModifiers::NONE)));
+    assert!(
+        app.editor.symbol_view.is_none(),
+        "Cmd+K V is not the symbol tab"
+    );
+    // Shift arrives lowercase with SHIFT under CSI-u.
+    let mut csi_u = App::new(tmp.path().to_path_buf()).unwrap();
+    csi_u.editor.open_pinned(&file).unwrap();
+    csi_u.editor.cursor_row = 1;
+    assert!(csi_u.handle_cmd_k_chord(key(KeyCode::Char('v'), KeyModifiers::SHIFT)));
+    assert!(csi_u.editor.symbol_view.is_some(), "Shift+v opens it too");
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('V'), KeyModifiers::SHIFT)));
+    let view = app
+        .editor
+        .symbol_view
+        .as_ref()
+        .expect("Cmd+K Shift+V opened a symbol tab");
+    assert_eq!((view.name.as_str(), view.first, view.last), ("a", 0, 2));
+
+    app.editor.select(0);
+    app.dispatch_menu_action(
+        MenuAction::OpenSymbolTab {
+            path: file.clone(),
+            name: "b".into(),
+            first: 3,
+            last: 5,
+        },
+        tmp.path().to_path_buf(),
+    );
+    let view = app
+        .editor
+        .symbol_view
+        .as_ref()
+        .expect("the menu opened a symbol tab");
+    assert_eq!((view.name.as_str(), view.first, view.last), ("b", 3, 5));
+    assert_eq!(app.editor.editors.len(), 3);
+}
+
+/// #369: right-clicking an OUTLINE row offers its symbol as a tab.
+///
+/// The row, not the caret, picks the symbol: the caret sits in `a` while
+/// the click lands on `b`'s row.
+#[test]
+fn an_outline_row_right_click_opens_that_symbol_as_a_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    if !app.explorer_views.is_visible(ExplorerView::Outline) {
+        app.toggle_explorer_view(ExplorerView::Outline);
+    }
+    app.outline.collapsed = false;
+    let symbols = app.compute_syntax_outline(&file);
+    app.outline.set_symbols(file.clone(), symbols);
+    painted(&mut app);
+    let area = app.outline.last_area;
+    let row = (area.y..area.y + area.height)
+        .find(|&y| {
+            app.outline
+                .row_at(y)
+                .is_some_and(|i| app.outline.symbols()[i].name == "b")
+        })
+        .expect("b has an OUTLINE row");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 2,
+        row,
+    ));
+    let menu = app.context_menu.as_mut().expect("the row has a menu");
+    let idx = menu
+        .items
+        .iter()
+        .position(|e| menu_label(e) == "Open Symbol in Its Own Tab")
+        .expect("the menu offers the symbol tab");
+    menu.selected = idx;
+    app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+    let view = app
+        .editor
+        .symbol_view
+        .as_ref()
+        .expect("a symbol tab opened");
+    assert_eq!((view.name.as_str(), view.first, view.last), ("b", 3, 5));
+}
+
+/// #369: a restart restores the file, not a duplicate of it.
+///
+/// The symbol tab mirrors its file's tab, so session capture drops it while
+/// that tab is open, and keeps it (as a plain tab, with its unsaved text)
+/// when it is the file's only tab.
+#[test]
+fn session_capture_keeps_a_symbol_tab_only_when_it_is_the_files_last_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    let state = app.capture_session_state();
+    assert_eq!(state.tabs.len(), 1, "the file's tab alone");
+    assert_eq!(state.active_tab, 0, "focus falls to the file's tab");
+
+    app.editor.close_tab(0);
+    app.editor.lines[4] = "    9".into();
+    app.editor.dirty = true;
+    let state = app.capture_session_state();
+    assert_eq!(state.tabs.len(), 1);
+    assert_eq!(state.tabs[0].path, file);
+    assert!(
+        state.tabs[0]
+            .unsaved_text
+            .as_deref()
+            .unwrap()
+            .contains("    9")
+    );
+}
+
+/// #369: scrolling a symbol tab stops once its last line reaches the pane's
+/// bottom; a short symbol never leaves a lone line above blank rows.
+#[test]
+fn a_symbol_tab_never_scrolls_its_tail_off_a_pane_it_fits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 0;
+    app.editor.scroll = 5;
+    painted(&mut app);
+    assert_eq!(
+        app.editor.scroll, 3,
+        "fn b's three lines fill the pane top down"
+    );
+}
+
+/// #369: multi-cursor commands in a symbol tab stay inside the symbol:
+/// Change All Occurrences matches only there, Add Cursor Above stops at its
+/// first line, and a caret that lands outside is dropped rather than
+/// stacked on the edge.
+#[test]
+fn multi_cursor_commands_stay_in_the_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 0;
+    assert_eq!(
+        app.editor.select_all_occurrences_of_word_at_cursor(),
+        1,
+        "fn a's `fn` is outside"
+    );
+    assert!(app.editor.carets.is_empty());
+    app.editor.selection = None;
+    app.editor.add_cursor_above();
+    assert!(app.editor.carets.is_empty(), "no caret above the symbol");
+    for row in [0, 1] {
+        app.editor
+            .carets
+            .push(crate::widgets::editor::EditorSelection::new(row, 0));
+    }
+    app.editor.clamp_to_symbol_view();
+    assert!(app.editor.carets.is_empty(), "outside carets are dropped");
+    // Two copies of one inside caret, and one on the primary, leave one.
+    let (row, col) = (app.editor.cursor_row, app.editor.cursor_col);
+    for (r, c) in [(4, 0), (4, 0), (row, col)] {
+        app.editor
+            .carets
+            .push(crate::widgets::editor::EditorSelection::new(r, c));
+    }
+    app.editor.clamp_to_symbol_view();
+    assert_eq!(app.editor.carets.len(), 1, "duplicates are removed");
+    app.editor.carets.clear();
+    // Add Selection to Next Match finds no `fn` outside the symbol.
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 0;
+    assert_eq!(app.editor.select_next_occurrence(), 1, "selects the word");
+    assert_eq!(
+        app.editor.select_next_occurrence(),
+        1,
+        "fn a's `fn` is outside"
+    );
+    assert!(app.editor.carets.is_empty());
+}
+
+/// #369: Add Cursor Below in a symbol tab stops at the symbol's last line,
+/// with the rest of the file below it.
+#[test]
+fn add_cursor_below_stops_at_the_symbols_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 1;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    assert_eq!(app.editor.symbol_clip(), Some((0, 3)));
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.editor.add_cursor_below();
+    assert!(app.editor.carets.is_empty(), "fn b is not the tab's");
+}
+
+/// #369: a collaborator's edit is not the symbol tab's own. A line they
+/// open at the start of the symbol's first line stays above the symbol.
+#[test]
+fn a_collaborators_edit_on_a_symbols_edge_is_not_the_tabs_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    for ed in app.editor.editors.iter_mut() {
+        ed.apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
+            start: (3, 0),
+            end: (3, 0),
+            new_text: String::from("\n"),
+        }]);
+        // The local caret sits just past the new line, where a caret that
+        // had typed it would be.
+        ed.cursor_row = 4;
+        ed.cursor_col = 0;
+        ed.collab_doc_gen = 1;
+        ed.collab_synced_seq = ed.edit_seq;
+    }
+    app.sync_symbol_views();
+    let view = app.editor.editors[1].symbol_view.as_ref().unwrap();
+    assert_eq!(
+        (view.first, view.last),
+        (4, 6),
+        "the new line is above fn b"
+    );
+}
+
+/// #369: an edit on a symbol's edge lands on the side its caret is on.
+///
+/// Enter at the end of the symbol, typed in its own tab, opens a line the
+/// tab keeps showing, so the caret stays on it; Enter at the start of the
+/// symbol's first line, typed in the file's tab, opens a line above it that
+/// the clip leaves out.
+#[test]
+fn a_line_opened_on_a_symbols_edge_goes_where_the_caret_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[6], "z", "the caret stayed on the new line");
+    assert_eq!(app.editor.cursor_row, 6);
+    let view = app.editor.editors[1].symbol_view.as_ref().unwrap();
+    assert_eq!((view.first, view.last), (3, 6), "the symbol grew");
+
+    app.editor.select(0);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let view = app.editor.editors[1].symbol_view.as_ref().unwrap();
+    assert_eq!(
+        (view.first, view.last),
+        (4, 7),
+        "the opened line is above the symbol"
+    );
+}
+
+/// #369: a mirrored tab undoes as far as the tab that was typed in.
+///
+/// A typing burst is one undo step where it was typed, so it is one step in
+/// the file's tab too, and a selection away from the edit survives it.
+#[test]
+fn a_mirrored_typing_burst_is_one_undo_step_and_keeps_a_distant_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    let before = app.editor.lines.clone();
+    let mut sel = crate::widgets::editor::EditorSelection::new(0, 0);
+    sel.head = (0, 4);
+    app.editor.editors[0].selection = Some(sel);
+
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    for c in ['a', 'b', 'c'] {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(app.editor.editors[0].lines[4], "    2abc");
+    assert_eq!(
+        app.editor.editors[0].selection,
+        Some(sel),
+        "a selection clear of the edit is kept"
+    );
+    assert!(app.editor.editors[0].undo());
+    assert!(app.editor.editors[1].undo());
+    assert_eq!(app.editor.editors[1].lines, before);
+    assert_eq!(
+        app.editor.editors[0].lines, before,
+        "one undo takes back the whole burst in the file's tab too"
+    );
+}
+
+/// #369: Join Lines, a counted line delete, find and Replace All stay
+/// inside the symbol.
+#[test]
+fn line_joins_counted_deletes_and_find_stay_in_the_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("two.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.cursor_row = 1;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    assert_eq!(app.editor.symbol_clip(), Some((0, 3)));
+    let before = app.editor.lines.clone();
+
+    app.editor.cursor_row = 2;
+    app.editor.join_lines();
+    assert_eq!(app.editor.lines, before, "the last line joins nothing");
+
+    // Find wraps within the symbol: from `fn a`'s `}`, the next `}` is
+    // that same one, not `fn b`'s.
+    let opts = crate::widgets::search::SearchOpts::default();
+    let m = app.editor_find_step(true, "}", opts, 2, 0, true).unwrap();
+    assert_eq!(m.row, 2);
+
+    let mut find = crate::widgets::editor_find::EditorFind::new("fn".into(), opts);
+    find.replace_visible = true;
+    find.replace = "FN".into();
+    app.editor_find = Some(find);
+    app.editor_find_replace_all();
+    assert_eq!(app.editor.lines[0], "FN a() {");
+    assert_eq!(app.editor.lines[3], "fn b() {", "outside the symbol");
+
+    app.editor.cursor_row = 1;
+    app.editor.delete_lines(10);
+    assert_eq!(
+        app.editor.lines,
+        ["FN a() {", "fn b() {", "    2", "}"],
+        "the count stops at the symbol's end"
+    );
+}
+
+/// #369: two symbol tabs of one file with no file tab restore as ONE tab.
+#[test]
+fn session_capture_keeps_one_tab_for_orphaned_symbol_tabs_of_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.editor.close_tab(0);
+    app.open_symbol_tab_for("a".into(), 0, 2);
+    assert_eq!(app.editor.editors.len(), 2);
+    let state = app.capture_session_state();
+    assert_eq!(state.tabs.len(), 1);
+    assert_eq!(state.tabs[0].path, file);
+}
+
+/// #369: deleting a symbol tab's whole symbol closes the tab while a tab of
+/// the whole file still holds the text.
+#[test]
+fn a_symbol_tab_whose_symbol_is_gone_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    assert_eq!(app.editor.editors.len(), 2);
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert_eq!(app.editor.editors.len(), 1, "{}", app.status);
+    assert!(app.status.contains("that symbol is gone"), "{}", app.status);
+    assert!(app.editor.symbol_view.is_none());
+}
+
+/// #369: a symbol tab left as the only tab of its file keeps its unsaved
+/// edits when its symbol is deleted: it becomes a tab of the whole file
+/// instead of closing and taking them with it.
+#[test]
+fn an_orphaned_symbol_tab_with_unsaved_edits_survives_its_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    // An edit outside the symbol, made in the file tab and mirrored in.
+    app.editor.select(0);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('9'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    app.editor.close_tab(0);
+    assert!(
+        app.editor.symbol_view.is_some(),
+        "only the symbol tab is left"
+    );
+    assert!(app.editor.dirty);
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert_eq!(app.editor.editors.len(), 1, "the tab stays: {}", app.status);
+    assert!(
+        app.editor.symbol_view.is_none(),
+        "it shows the whole file now"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
+    assert_eq!(
+        app.editor.lines[1], "    19",
+        "the out-of-clip edit survives"
+    );
+    assert!(app.editor.dirty);
+    assert!(app.status.contains("whole file"), "{}", app.status);
+}
+
+/// #369: a tab that turned into a whole-file tab keeps the keys typed
+/// right after, in the same burst, while another symbol tab of its file is
+/// still open to mirror against.
+#[test]
+fn a_kept_orphan_keeps_the_next_keys_beside_a_sibling_symbol_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.select(0);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    let whole = |app: &App| {
+        app.editor
+            .editors
+            .iter()
+            .position(|e| e.symbol_view.is_none())
+    };
+    app.editor.close_tab(whole(&app).expect("the file tab"));
+    assert_eq!(app.editor.editors.len(), 2, "two symbol tabs are left");
+    let b = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.symbol_view.as_ref().is_some_and(|v| v.name == "b"))
+        .expect("the b tab");
+    app.editor.select(b);
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    let kept = whole(&app).expect("the b tab became a file tab");
+    assert_eq!(
+        app.editor.editors[kept].path.as_deref(),
+        Some(file.as_path())
+    );
+    assert!(
+        app.editor.editors[kept].lines.iter().any(|l| l == "x"),
+        "{:?}",
+        app.editor.editors[kept].lines
+    );
+}
+
+/// #369: one symbol's tabs in two groups, with no file tab left in either:
+/// deleting the symbol keeps one of them as the file's tab, and the other,
+/// whose edits that tab now holds, closes and folds its group away.
+#[test]
+fn one_symbols_tabs_in_two_groups_keep_a_single_file_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.split_editor();
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+    app.sync_symbol_views();
+    let file_tab = |tabs: &crate::widgets::editor::EditorTabs| {
+        tabs.editors
+            .iter()
+            .position(|e| e.symbol_view.is_none())
+            .expect("the file tab")
+    };
+    let i = file_tab(&app.editor);
+    app.editor.close_tab(i);
+    let other = &mut app.editor_layout.inactive_groups_mut()[0];
+    let i = file_tab(other);
+    other.close_tab(i);
+    assert_eq!(app.editor.editors.len(), 1);
+    assert_eq!(app.editor_layout.inactive_groups()[0].editors.len(), 1);
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor_layout.inactive_groups().is_empty(),
+        "the other copy closed and its group folded away"
+    );
+    assert_eq!(app.editor.editors.len(), 1);
+    let kept = &app.editor.editors[0];
+    assert!(kept.symbol_view.is_none() && kept.dirty);
+    assert_eq!(kept.path.as_deref(), Some(file.as_path()));
+    assert!(app.status.contains("whole file"), "{}", app.status);
+}
+
+/// Opens `impl S` and `fn m` as symbol tabs, closes the file tab, deletes
+/// m's line from the impl tab one Backspace at a time (m goes on the last
+/// one), then presses undo once in the impl tab or in the m tab (by then
+/// the file's tab); hands back the line undo left.
+fn undo_once_after_m_goes(in_kept: bool) -> String {
+    fn tab(app: &App, name: &str) -> Option<usize> {
+        app.editor
+            .editors
+            .iter()
+            .position(|e| e.symbol_view.as_ref().is_some_and(|v| v.name == name))
+    }
+    let m_line = "    fn m() {}";
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("s.rs");
+    std::fs::write(&file, format!("impl S {{\n{m_line}\n}}\n")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    for row in [1, 0] {
+        app.editor.select(0);
+        app.editor.cursor_row = row;
+        app.editor.cursor_col = 0;
+        app.run_command(crate::widgets::command_palette::Command::OpenAsSymbolTab);
+        app.sync_symbol_views();
+    }
+    let i = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.symbol_view.is_none())
+        .expect("the file tab");
+    app.editor.close_tab(i);
+    let imp = tab(&app, "S").expect("the impl tab");
+    app.editor.select(imp);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = m_line.chars().count();
+    app.focus_pane(Pane::Editor);
+    for _ in 0..m_line.chars().count() {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert!(tab(&app, "m").is_none(), "m is gone");
+    let kept = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.symbol_view.is_none())
+        .expect("the m tab became the file tab");
+    assert_eq!(
+        app.editor.editors[kept].lines[1], "",
+        "the kept tab mirrors the emptied line"
+    );
+    let at = if in_kept {
+        kept
+    } else {
+        tab(&app, "S").expect("the impl tab")
+    };
+    app.editor.select(at);
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER))
+        .unwrap();
+    app.editor.lines[1].clone()
+}
+
+/// #369: a method's symbol tab kept as the file's tab while the impl tab's
+/// Backspaces delete the method keeps taking one undo step per Backspace,
+/// so one undo there walks back as far as it does in the impl tab. m goes
+/// on the last Backspace, in the pass that last mirrored it: the kept tab
+/// must stay a mirror member (its `mirror_seq` kept), or its undo is
+/// overwritten by the impl tab's text.
+#[test]
+fn a_kept_orphan_undoes_the_backspaces_that_deleted_its_symbol_like_its_sibling() {
+    let in_impl = undo_once_after_m_goes(false);
+    assert_ne!(
+        in_impl, "",
+        "undo in the impl tab restores part of the line"
+    );
+    assert_eq!(undo_once_after_m_goes(true), in_impl);
+}
+
+/// #369: a clean symbol tab whose symbol goes closes even with no file
+/// tab open: it holds nothing the disk does not.
+#[test]
+fn a_clean_orphaned_symbol_tab_closes_when_its_symbol_goes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.editor.close_tab(0);
+    assert!(app.editor.symbol_view.is_some() && !app.editor.dirty);
+    std::fs::write(&file, "fn a() {\n    1\n}\n").unwrap();
+    app.editor.reload_if_clean().unwrap().unwrap();
+    app.sync_symbol_views();
+    assert!(
+        app.editor.editors.iter().all(|e| e.path.is_none()),
+        "{}",
+        app.status
+    );
+    assert!(app.status.contains("that symbol is gone"), "{}", app.status);
+}
+
+/// #369: going to a file lands on the tab that shows ALL of it.
+///
+/// A symbol tab has the file's path, and the tab lookups behind opening,
+/// previewing and selecting a file would otherwise pick it and show a jump
+/// target that sits outside its clip as the clip's nearest edge.
+#[test]
+fn opening_a_file_never_lands_in_its_symbol_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.editor.close_tab(0);
+    assert!(
+        app.editor.editors[0].symbol_view.is_some(),
+        "only the symbol tab is left"
+    );
+
+    app.open_at_utf16(&file, 0, 0).unwrap();
+    assert!(
+        app.editor.symbol_view.is_none(),
+        "the jump opened a tab of the whole file"
+    );
+    assert_eq!(app.editor.cursor_row, 0, "and landed where it was sent");
+    assert_eq!(
+        app.editor.editors.len(),
+        2,
+        "the symbol tab stays open beside it"
     );
 }
 
