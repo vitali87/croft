@@ -48386,7 +48386,10 @@ fn accepting_or_dismissing_the_offer_clears_it() {
     app.remote_offer_refused.clear();
     let pane = app.terminals[0].uid();
     app.consider_ssh_offer(pane, Some(String::from("db-1")));
-    assert_eq!(app.accept_ssh_offer().as_deref(), Some("db-1"));
+    assert_eq!(
+        app.accept_ssh_offer().map(|(host, _)| host).as_deref(),
+        Some("db-1")
+    );
     assert!(app.ssh_offer.is_none() && app.status.is_empty());
     assert_eq!(app.accept_ssh_offer(), None, "nothing to accept twice");
 
@@ -48657,7 +48660,7 @@ fn a_failed_provisioning_is_remembered_and_a_later_success_forgets_it() {
     );
     let pane = app.terminals[0].uid();
 
-    app.note_provisioning_failed("DB-1");
+    app.note_provisioning_failed("DB-1", "refused");
     assert!(
         app.remote_offer_refused.contains_key("db-1"),
         "remembered in memory, lower-cased"
@@ -52078,6 +52081,39 @@ tool = "go"
         !crate::prefs::trust_mcp_tool_in(&croft, "oth.go", "o2"),
         "another extension's record stays"
     );
+}
+
+#[test]
+fn provisioning_outcomes_are_logged_to_the_remote_output_channel() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #364: a host that gets croft through provisioning says so in OUTPUT >
+    // Remote, success and failure alike, with the reason on failure.
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.note_provisioning_failed("zz364-a.example", "no space left on device");
+        app.note_provisioning_succeeded("zz364-b.example");
+        let lines = crate::output::snapshot(crate::output::CHANNEL_REMOTE)
+            .expect("the Remote channel exists");
+        let failed = lines
+            .iter()
+            .find(|l| l.text.contains("zz364-a.example"))
+            .expect("the failure is logged");
+        assert!(
+            failed.text.contains("no space left on device"),
+            "{}",
+            failed.text
+        );
+        assert_eq!(failed.level, crate::output::OutputLevel::Error);
+        assert!(
+            lines.iter().any(|l| l.text.contains("zz364-b.example")
+                && l.level != crate::output::OutputLevel::Error),
+            "the success is logged"
+        );
+    });
 }
 
 const EXITED_EVENT: &str = r#"{"seq":1,"type":"event","event":"exited","body":{"exitCode":0}}"#;

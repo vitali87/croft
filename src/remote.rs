@@ -3119,6 +3119,62 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
 
+    fn report(path: &str, host: Option<&str>) -> CwdReport {
+        (std::path::PathBuf::from(path), host.map(str::to_string))
+    }
+
+    #[test]
+    fn a_new_remote_report_is_the_workspace_path() {
+        let before = report("/Users/me/code", Some("localhost"));
+        let now = report("/srv/app", Some("db-1.internal"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&before), Some(&now)).as_deref(),
+            Some("/srv/app")
+        );
+        // No report at all when the offer appeared (no local integration).
+        assert_eq!(
+            remote_workspace_path("db-1", None, Some(&now)).as_deref(),
+            Some("/srv/app")
+        );
+    }
+
+    #[test]
+    fn an_unchanged_report_counts_only_when_it_names_the_host() {
+        let same = report("/srv/app", Some("db-1"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&same), Some(&same)).as_deref(),
+            Some("/srv/app"),
+            "the remote prompt reported before the offer sampled"
+        );
+        let fqdn = report("/srv/app", Some("DB-1.internal"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&fqdn), Some(&fqdn)).as_deref(),
+            Some("/srv/app"),
+            "a domain-qualified name for the same host, any case"
+        );
+        let stale = report("/home/old", Some("web-7"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&stale), Some(&stale)),
+            None,
+            "left over from an earlier session on another host"
+        );
+        let prefix = report("/x", Some("db-10"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&prefix), Some(&prefix)),
+            None,
+            "db-10 is not db-1"
+        );
+    }
+
+    #[test]
+    fn a_local_or_hostless_report_is_never_remote() {
+        let local = report("/Users/me", Some("localhost"));
+        assert_eq!(remote_workspace_path("db-1", None, Some(&local)), None);
+        let hostless = report("/Users/me", None);
+        assert_eq!(remote_workspace_path("db-1", None, Some(&hostless)), None);
+        assert_eq!(remote_workspace_path("db-1", None, None), None);
+    }
+
     /// The destination an ssh command line names, from the shapes people
     /// actually type (#364).
     ///
@@ -4612,6 +4668,44 @@ pub fn offer_allowed(
     !refused
         .get(&host.to_ascii_lowercase())
         .is_some_and(|at| refusal_live(*at, now))
+}
+
+/// A pane's last OSC 7 report: the directory its shell says it is in, and
+/// the host that shell says it runs on.
+pub type CwdReport = (std::path::PathBuf, Option<String>);
+
+/// The remote directory to open when the ssh-pane offer for `host` is
+/// accepted (#364), from the pane's OSC 7 report now and the one it had when
+/// the offer appeared. A report is used only when it comes from another
+/// machine and is either new since the offer (the remote shell's first
+/// prompt) or names the offered host. A report from this machine, or a stale
+/// one left by an earlier session elsewhere, is never taken for the remote's
+/// directory; `None` then opens the login directory, as before.
+pub fn remote_workspace_path(
+    host: &str,
+    at_offer: Option<&CwdReport>,
+    now: Option<&CwdReport>,
+) -> Option<String> {
+    let (path, reporter) = now?;
+    let reporter = reporter.as_deref().filter(|h| !h.is_empty())?;
+    if crate::command_history::is_local_host(reporter) {
+        return None;
+    }
+    let fresh = at_offer != now;
+    if !fresh && !same_host(host, reporter) {
+        return None;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Whether an ssh alias and a shell-reported hostname name the same machine:
+/// equal ignoring case, or one is the other plus a domain (`db-1` and
+/// `db-1.internal`). `db-1` and `db-10` are different hosts.
+fn same_host(alias: &str, reported: &str) -> bool {
+    let (a, r) = (alias.to_ascii_lowercase(), reported.to_ascii_lowercase());
+    a == r
+        || r.strip_prefix(&a).is_some_and(|rest| rest.starts_with('.'))
+        || a.strip_prefix(&r).is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// The label thread's ssh verdict for each pane it named (#364). `named` is

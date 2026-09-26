@@ -2397,6 +2397,9 @@ struct SshOffer {
     pane: u64,
     host: String,
     since: std::time::Instant,
+    /// The pane's OSC 7 report when the offer appeared, so accepting can
+    /// tell the remote shell's directory from one left by an earlier shell.
+    cwd_at_offer: Option<crate::remote::CwdReport>,
 }
 
 /// A left press forwarded to a mouse-tracking child (#474): which pane got
@@ -19064,7 +19067,7 @@ impl App {
             // offer only saves the reaching.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'g') => {
                 match self.accept_ssh_offer() {
-                    Some(host) => self.request_remote_launch(host, None),
+                    Some((host, path)) => self.request_remote_launch(host, path),
                     None => {
                         self.status = String::from(
                             "No ssh workspace offer is open (it appears when a pane connects to a host in ~/.ssh/config)",
@@ -27594,22 +27597,38 @@ impl App {
                 }
                 self.status =
                     format!("Connected to {host} · Open workspace here? (Cmd+K G, Esc dismisses)");
+                let cwd_at_offer = self.pane_cwd_report(pane);
                 self.ssh_offer = Some(SshOffer {
                     pane,
                     host,
                     since: std::time::Instant::now(),
+                    cwd_at_offer,
                 });
             }
         }
     }
 
-    /// Take the open offer's host for launching (#364), clearing the offer.
-    fn accept_ssh_offer(&mut self) -> Option<String> {
+    /// The pane's last OSC 7 report: its shell's directory and host.
+    fn pane_cwd_report(&self, pane: u64) -> Option<crate::remote::CwdReport> {
+        let term = self.terminals.iter().find(|t| t.uid() == pane)?;
+        Some((term.shell_cwd()?, term.shell_host()))
+    }
+
+    /// Take the open offer for launching (#364), clearing it: the host, and
+    /// the remote shell's directory when the pane reported one that can be
+    /// trusted to be on that host (see `remote::remote_workspace_path`).
+    fn accept_ssh_offer(&mut self) -> Option<(String, Option<String>)> {
         let offer = self.ssh_offer.take()?;
         if self.status.starts_with("Connected to ") {
             self.status.clear();
         }
-        Some(offer.host)
+        let now = self.pane_cwd_report(offer.pane);
+        let path = crate::remote::remote_workspace_path(
+            &offer.host,
+            offer.cwd_at_offer.as_ref(),
+            now.as_ref(),
+        );
+        Some((offer.host, path))
     }
 
     /// Remember that provisioning `host` failed (#364): the ssh-pane offer
@@ -27617,7 +27636,12 @@ impl App {
     /// install that fails, offer-launched or not, because the fact learned
     /// is about the host; and undone by the next success (below), so a box
     /// that merely failed on a bad day is offered again once it works.
-    fn note_provisioning_failed(&mut self, host: &str) {
+    fn note_provisioning_failed(&mut self, host: &str, detail: &str) {
+        crate::output::push(
+            crate::output::CHANNEL_REMOTE,
+            crate::output::OutputLevel::Error,
+            &format!("Could not install croft on {host}: {detail}"),
+        );
         let key = host.to_ascii_lowercase();
         let now = std::time::SystemTime::now();
         self.remote_offer_refused.insert(key.clone(), now);
@@ -27634,6 +27658,11 @@ impl App {
     /// instance may have recorded a refusal this one never loaded, and
     /// `forget_refused_host` is a no-op when there is nothing to forget.
     fn note_provisioning_succeeded(&mut self, host: &str) {
+        crate::output::push(
+            crate::output::CHANNEL_REMOTE,
+            crate::output::OutputLevel::Info,
+            &format!("croft is installed on {host}; launching the remote workspace"),
+        );
         let key = host.to_ascii_lowercase();
         self.remote_offer_refused.remove(&key);
         let _ = crate::remote::forget_refused_host(
@@ -27710,12 +27739,15 @@ impl App {
         match crate::remote::ssh_reroot_decision(&argv, &targets) {
             Ok(host) => {
                 let alias = host.alias.clone();
-                // No path: the remote flow opens the login directory, which
-                // is where the ssh session started. Carrying the pane's
-                // remote cwd across would need the shell's OSC 7 report from
-                // the far side, and croft only trusts those against a local
-                // cwd it can verify.
-                self.request_remote_launch(alias, None);
+                // The far side's OSC 7 report opens the workspace where the
+                // remote shell is. With no earlier report to tell a fresh one
+                // from a stale one, it is trusted only when it names this
+                // host; otherwise the login directory, as before.
+                let uid = self.terminals[self.active_terminal].uid();
+                let report = self.pane_cwd_report(uid);
+                let path =
+                    crate::remote::remote_workspace_path(&alias, report.as_ref(), report.as_ref());
+                self.request_remote_launch(alias, path);
             }
             // The message distinguishes "not ssh" from "ssh to a box croft
             // has no config entry for": the second names the host, because
@@ -29109,6 +29141,13 @@ impl App {
                 host.clone(),
                 path,
             ));
+            crate::output::push(
+                crate::output::CHANNEL_REMOTE,
+                crate::output::OutputLevel::Info,
+                &format!(
+                    "Preparing croft on {host}: checking for an install, provisioning if missing"
+                ),
+            );
             self.status = format!("Preparing remote croft on {host}");
         }
         true
@@ -29180,7 +29219,7 @@ impl App {
             // beside the failure it learns from, and best-effort: a write
             // that fails costs one repeated offer.
             if let Some(host) = self.install_session.as_ref().map(|s| s.host.clone()) {
-                self.note_provisioning_failed(&host);
+                self.note_provisioning_failed(&host, &detail);
             }
             if let Some(dialog) = self.connect_dialog.as_mut() {
                 dialog.set_failed(detail.clone());
