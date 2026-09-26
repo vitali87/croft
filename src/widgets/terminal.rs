@@ -518,6 +518,10 @@ pub struct PtyTerminal {
     /// shell's own rc startup — the state `cwd_seed_is_safe` treats as
     /// still seedable (#94).
     input_seen: bool,
+    /// When input was last written, in the same clock as `last_output_ms`:
+    /// until output newer than this arrives, the screen does not yet show
+    /// what was typed (#614).
+    last_input_ms: u64,
     /// True for a `new_running` pane: the child is a launched program
     /// (a task, run-active-file, a debug attach), not an interactive
     /// shell. Such a pane is doing work the user asked for even though
@@ -1365,6 +1369,14 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
         // plainly").
         None => cmd.env_remove(crate::view_ipc::SOCK_ENV),
     }
+}
+
+/// Milliseconds since the epoch, the clock `last_output_ms` keeps.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// `exe` as a path that still runs. Once an update renames a new binary
@@ -2272,6 +2284,7 @@ impl PtyTerminal {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             input_seen: false,
+            last_input_ms: 0,
             run_pane: script_mode,
             manual_name_seen: false,
             cols,
@@ -2524,6 +2537,12 @@ impl PtyTerminal {
     /// Set the foreground-process label (from the off-loop refresh).
     pub fn set_auto_label(&mut self, label: String) {
         self.auto_label = label;
+    }
+
+    /// Whether input was written that the shell has not echoed yet, so the
+    /// prompt line on screen lags what was typed.
+    pub fn awaiting_echo(&self) -> bool {
+        self.last_input_ms > self.last_output_ms.load(Ordering::Relaxed)
     }
 
     /// How long since the PTY last produced output; a pane that never has is
@@ -3652,6 +3671,7 @@ impl PtyTerminal {
     pub fn write_input(&mut self, data: &[u8]) {
         self.reset_scrollback();
         self.input_seen = true;
+        self.last_input_ms = now_ms();
         #[cfg(test)]
         self.written_for_test
             .lock()

@@ -7123,8 +7123,12 @@ impl Editor {
         // Clear so the per-caret raw ops can't see stale carets.
         self.carets.clear();
 
-        let mut new_primary = (self.cursor_row, self.cursor_col);
-        let mut new_secondary: Vec<(usize, usize)> = Vec::new();
+        // Each caret's place, kept as (rows from the bottom, chars from its
+        // line's end): the later edits happen above or to the left of it, and
+        // leave everything after it untouched, so those two stay true where a
+        // plain (row, col) goes stale on its row (`abcd` with carets at 1 and
+        // 3, typing X then Y, gave `aXYbcYXd`).
+        let mut placed: Vec<(bool, usize, usize)> = Vec::new();
         for (is_primary, sel) in items {
             if sel.has_area() {
                 self.selection = Some(sel);
@@ -7135,16 +7139,29 @@ impl Editor {
             self.cursor_row = sel.head.0.min(last);
             self.cursor_col = sel.head.1.min(self.line_char_len(self.cursor_row));
             self.apply_caret_edit_raw(edit);
-            let pos = (self.cursor_row, self.cursor_col);
+            let from_bottom = self.lines.len().saturating_sub(1) - self.cursor_row;
+            let from_end = self
+                .line_char_len(self.cursor_row)
+                .saturating_sub(self.cursor_col);
+            placed.push((is_primary, from_bottom, from_end));
+        }
+
+        self.selection = None;
+        let last = self.lines.len().saturating_sub(1);
+        let resolve = |this: &Self, from_bottom: usize, from_end: usize| {
+            let row = last.saturating_sub(from_bottom);
+            (row, this.line_char_len(row).saturating_sub(from_end))
+        };
+        let mut new_primary = (self.cursor_row, self.cursor_col);
+        let mut new_secondary: Vec<(usize, usize)> = Vec::new();
+        for (is_primary, from_bottom, from_end) in placed {
+            let pos = resolve(self, from_bottom, from_end);
             if is_primary {
                 new_primary = pos;
             } else {
                 new_secondary.push(pos);
             }
         }
-
-        self.selection = None;
-        let last = self.lines.len().saturating_sub(1);
         self.cursor_row = new_primary.0.min(last);
         self.cursor_col = new_primary.1.min(self.line_char_len(self.cursor_row));
         new_secondary.sort_unstable();
@@ -14558,6 +14575,13 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
     if quote.is_some() || depth > 0 {
         return None;
     }
+    // Already closed: the `>` was deleted and is being retyped before an
+    // existing one (`<div|>`), or the end tag is already there on the line
+    // (`<div|</div>`). Closing again would double it.
+    let after = &line[byte..];
+    if after.trim_start().starts_with('>') || after.contains(&format!("</{name}>")) {
+        return None;
+    }
     // A `>` already inside means that `<` is closed and the caret is past
     // the tag (or inside an attribute value holding a `>`); either way this
     // keystroke is not closing THIS tag.
@@ -20134,6 +20158,25 @@ mod tests {
         // One undo restores the whole batch at once.
         assert!(e.undo());
         assert_eq!(e.lines, vec!["foo bar foo".to_string(), "foo".to_string()]);
+    }
+
+    #[test]
+    fn carets_on_one_line_keep_their_places_across_keystrokes() {
+        let mut e = editor_with("abcd");
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        e.carets = vec![EditorSelection::new(0, 3)];
+        e.multi_insert_char('X');
+        e.multi_insert_char('Y');
+        assert_eq!(e.lines, vec!["aXYbcXYd".to_string()]);
+        // A backspace that joins lines moves the carets below it up.
+        let mut e = editor_with("ab\ncd\nef");
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.carets = vec![EditorSelection::new(2, 1)];
+        e.multi_backspace();
+        e.multi_insert_char('X');
+        assert_eq!(e.lines, vec!["abXcd".to_string(), "Xf".to_string()]);
     }
 
     #[test]
@@ -28630,6 +28673,16 @@ mod tests {
         let mut e = tag_editor("<div></div", LangKind::Html);
         e.insert_char('>');
         assert_eq!(e.lines[0], "<div></div>");
+    }
+
+    #[test]
+    fn retyping_the_angle_of_an_already_closed_tag_adds_no_second_close() {
+        for (text, want) in [("<div</div>", "<div></div>"), ("<div>", "<div>>")] {
+            let mut e = tag_editor(text, LangKind::Html);
+            e.cursor_col = 4;
+            e.insert_char('>');
+            assert_eq!(e.lines[0], want);
+        }
     }
 
     #[test]
