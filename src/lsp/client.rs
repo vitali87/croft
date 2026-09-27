@@ -1462,11 +1462,23 @@ fn prefer_as_oom_victim(command: &mut Command, score: &'static [u8]) {
 mod tests {
     use super::*;
 
-    /// #694: a language server starts as the kernel's preferred OOM victim,
-    /// read back from the child's own `/proc` entry.
+    /// #694: a spawned child starts with the raised OOM score, and croft's
+    /// own score is untouched by the spawn.
+    ///
+    /// A distinctive score rather than the production 500: CI runners start
+    /// job processes at 500 themselves, so a child reading 500 there proves
+    /// nothing, and "croft is not at 500" is false before croft does anything.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_language_server_is_the_preferred_oom_victim() {
+        const PROBE: &[u8] = b"613";
+        let own = || std::fs::read_to_string("/proc/self/oom_score_adj").unwrap();
+        let before = own();
+        assert_ne!(
+            before.trim(),
+            "613",
+            "precondition: the probe score must be new"
+        );
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1474,19 +1486,23 @@ mod tests {
         let out = rt.block_on(async {
             let mut command = Command::new("cat");
             command.arg("/proc/self/oom_score_adj");
-            prefer_as_oom_victim(&mut command, LANGUAGE_SERVER_OOM_SCORE_ADJ);
+            prefer_as_oom_victim(&mut command, PROBE);
             command.output().await.unwrap()
         });
         assert!(out.status.success());
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            "500",
-            "the server must start with the raised score"
+            "613",
+            "the child must start with the score it was given"
         );
-        // PRESENCE: croft itself is left alone, or the test proves nothing
-        // about the child.
-        let own = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap();
-        assert_ne!(own.trim(), "500", "croft's own score must not change");
+        assert_eq!(own(), before, "croft's own score must not change");
+        // The production value stays above croft's default of 0.
+        assert!(
+            std::str::from_utf8(LANGUAGE_SERVER_OOM_SCORE_ADJ)
+                .unwrap()
+                .parse::<i32>()
+                .is_ok_and(|v| v > 0)
+        );
     }
     use crate::lsp::runtime::LspRuntime;
     use async_lsp::{AnyNotification, LspService};
