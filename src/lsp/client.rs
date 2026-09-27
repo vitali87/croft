@@ -413,6 +413,7 @@ impl LspClient {
         if !extra_path.is_empty() {
             command.env("PATH", crate::lsp::install::prepend_paths(extra_path));
         }
+        prefer_as_oom_victim(&mut command, LANGUAGE_SERVER_OOM_SCORE_ADJ);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1421,9 +1422,71 @@ impl Drop for LspClient {
     }
 }
 
+/// The `oom_score_adj` a language server runs with (#694): well above croft's
+/// own 0, so when memory runs out the kernel kills the server before croft
+/// and the shells in its panes: losing a server costs language features
+/// until it is started again, losing croft costs every pane. rust-analyzer
+/// alone held 2.4 GB in the OOM that prompted this.
+const LANGUAGE_SERVER_OOM_SCORE_ADJ: &[u8] = b"500";
+
+/// Make a child the kernel's preferred OOM victim, set in the child between
+/// fork and exec so it holds from the first allocation.
+///
+/// Raising one's own score needs no privilege, only lowering it does, so
+/// this works as any user. Where `/proc` is missing or refuses, the child
+/// simply keeps croft's score; nothing about the spawn depends on it.
+fn prefer_as_oom_victim(command: &mut Command, score: &'static [u8]) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the closure runs between fork and exec, where only
+    // async-signal-safe calls are allowed; open, write and close are, and it
+    // allocates nothing (the path and score are static).
+    unsafe {
+        command.pre_exec(move || {
+            let fd = libc::open(
+                c"/proc/self/oom_score_adj".as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC,
+            );
+            if fd >= 0 {
+                libc::write(fd, score.as_ptr().cast(), score.len());
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (command, score);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #694: a language server starts as the kernel's preferred OOM victim,
+    /// read back from the child's own `/proc` entry.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_language_server_is_the_preferred_oom_victim() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(async {
+            let mut command = Command::new("cat");
+            command.arg("/proc/self/oom_score_adj");
+            prefer_as_oom_victim(&mut command, LANGUAGE_SERVER_OOM_SCORE_ADJ);
+            command.output().await.unwrap()
+        });
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "500",
+            "the server must start with the raised score"
+        );
+        // PRESENCE: croft itself is left alone, or the test proves nothing
+        // about the child.
+        let own = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap();
+        assert_ne!(own.trim(), "500", "croft's own score must not change");
+    }
     use crate::lsp::runtime::LspRuntime;
     use async_lsp::{AnyNotification, LspService};
     use serde_json::json;

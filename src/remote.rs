@@ -3089,6 +3089,11 @@ if [ -n "$CROFT_LIVE" ]; then
   # seconds to shut down cleanly: let both finish before the first rustc.
   sleep 5
 fi
+# And make the compile the kernel's first choice if memory still runs out
+# (#694): an OOM kill took croft or a terminal pane when rustc was the one
+# growing. Raising one's own score needs no privilege; cargo and every rustc
+# it starts inherit it. Best effort where /proc is read-only.
+echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
 # eval, because this script runs under the remote user's login shell and
 # zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
 # try to run a command literally named "nice -n 19". eval re-parses the
@@ -4447,7 +4452,7 @@ Host !blocked *.internal
             "cargo",
             &format!(
                 "sleep 0.5\n\
-                 printf '%s %s' \"$$\" \"$(cat \"$HOME\"/.cache/croft/building.* 2>/dev/null)\" > \"{}\"\n\
+                 printf '%s %s %s' \"$$\" \"$(cat \"$HOME\"/.cache/croft/building.* 2>/dev/null)\" \"$(cat /proc/self/oom_score_adj 2>/dev/null)\" > \"{}\"\n\
                  exit {cargo_exit}",
                 dir.join("seen").display()
             ),
@@ -4486,12 +4491,24 @@ Host !blocked *.internal
         let tmp = tempfile::tempdir().unwrap();
         let (ok, seen) = run_install_script(tmp.path(), 0);
         assert!(ok, "the stubbed install must succeed");
-        let (own, marked) = seen.split_once(' ').expect("cargo ran and reported");
+        let mut fields = seen.split(' ');
+        let (own, marked, oom) = (
+            fields.next().expect("cargo ran and reported"),
+            fields.next().unwrap_or_default(),
+            fields.next().unwrap_or_default(),
+        );
         assert_eq!(
             own, marked,
             "while cargo runs the marker must name cargo itself, so a killed \
              script shell cannot make the build look finished"
         );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            oom, "1000",
+            "the compile must be the kernel's first OOM victim, not croft (#694)"
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = oom;
         assert!(leftover_markers(tmp.path()).is_empty());
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("home/.cache/croft/install-stamp")).unwrap(),
