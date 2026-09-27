@@ -82,16 +82,18 @@ pub enum ExplorerView {
     Outline,
     Timeline,
     Dependencies,
+    AgentLane,
 }
 
 impl ExplorerView {
     /// Every view, in stacking order — the order the ⋯ menu lists them.
-    pub const ALL: [ExplorerView; 5] = [
+    pub const ALL: [ExplorerView; 6] = [
         ExplorerView::OpenEditors,
         ExplorerView::Folders,
         ExplorerView::Outline,
         ExplorerView::Timeline,
         ExplorerView::Dependencies,
+        ExplorerView::AgentLane,
     ];
 
     /// Menu / section-header label, matching VS Code's wording. Dependencies is
@@ -104,6 +106,7 @@ impl ExplorerView {
             ExplorerView::Outline => "Outline",
             ExplorerView::Timeline => "Timeline",
             ExplorerView::Dependencies => "Dependencies",
+            ExplorerView::AgentLane => "Agent Lane",
         }
     }
 }
@@ -133,6 +136,7 @@ impl ExplorerViewVisibility {
             ExplorerView::Outline => self.flags.outline,
             ExplorerView::Timeline => self.flags.timeline,
             ExplorerView::Dependencies => self.flags.dependencies,
+            ExplorerView::AgentLane => self.flags.agent_lane,
         }
     }
 
@@ -144,6 +148,7 @@ impl ExplorerViewVisibility {
             ExplorerView::Outline => &mut self.flags.outline,
             ExplorerView::Timeline => &mut self.flags.timeline,
             ExplorerView::Dependencies => &mut self.flags.dependencies,
+            ExplorerView::AgentLane => &mut self.flags.agent_lane,
         };
         *slot = !*slot;
         *slot
@@ -1536,6 +1541,16 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
     (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
 }
 
+/// What a pull request review tab's `gh` call is fetching (#365).
+enum PrGhJob {
+    /// The PR itself (`gh pr view`), by number or URL.
+    View { selector: String },
+    /// The whole patch, then the section for `path` opens.
+    Diff { path: String },
+    /// A failing check's log, for OUTPUT > PR Checks.
+    Log { name: String },
+}
+
 /// What a network git operation's worker hands back: the UI-thread half
 /// of the operation, applied to the app when it arrives.
 type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
@@ -2405,6 +2420,13 @@ pub enum BranchPurpose {
     Rebase,
 }
 
+/// A tour in progress (#377).
+pub struct TourRun {
+    pub tour: crate::tour::Tour,
+    pub scratch: PathBuf,
+    pub previous_root: PathBuf,
+}
+
 /// The live ssh-pane workspace offer (#364): which pane's foreground became
 /// `ssh <host>`, the resolved config alias, and when the offer appeared (it
 /// expires on its own if neither accepted nor dismissed).
@@ -2413,6 +2435,9 @@ struct SshOffer {
     pane: u64,
     host: String,
     since: std::time::Instant,
+    /// The pane's OSC 7 report when the offer appeared, so accepting can
+    /// tell the remote shell's directory from one left by an earlier shell.
+    cwd_at_offer: Option<crate::remote::CwdReport>,
 }
 
 /// A left press forwarded to a mouse-tracking child (#474): which pane got
@@ -2610,6 +2635,8 @@ pub struct App {
     /// The Explorer's TIMELINE section: the active file's git history, fetched
     /// off-thread via [`crate::git::file_history`]. See [`TimelinePanel`].
     pub timeline: TimelinePanel,
+    /// The Explorer's AGENT LANE section (#345).
+    pub agent_lane_panel: crate::widgets::agent_lane::AgentLanePanel,
     /// The Explorer's DEPENDENCIES section: the workspace's packages, resolved
     /// off-thread per detected ecosystem. See [`DependenciesPanel`].
     pub dependencies: DependenciesPanel,
@@ -3163,6 +3190,21 @@ pub struct App {
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
     view_listener: Option<std::os::unix::net::UnixListener>,
+    /// Agent edit approvals (#347): this workspace's hook socket, the
+    /// proposals waiting on the user in arrival order, and the popup's
+    /// state for the one at the head (`Some` exactly while one waits).
+    hook_listener: Option<std::os::unix::net::UnixListener>,
+    approvals: std::collections::VecDeque<crate::agent_approval::Pending>,
+    approval_ui: Option<crate::agent_approval::ApprovalUi>,
+    /// One Jupyter kernel per notebook that has run a cell (#355), by path.
+    /// Dropping one (the map entry going) shuts its kernel down.
+    notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
+    /// When the shown coverage report was taken, the file its editor lens
+    /// was built for, and the install command a missing coverage tool
+    /// needs (#263).
+    coverage_at: Option<std::time::SystemTime>,
+    coverage_lens_path: Option<PathBuf>,
+    coverage_install: Option<String>,
     /// How long one frame may spend serving `croft view` clients (see
     /// `drain_view_requests`). A field so a test on a loaded machine can
     /// stretch it: the fixed 20ms is shorter than one file open there.
@@ -3680,6 +3722,9 @@ pub struct App {
     review_nodes: std::collections::HashMap<u64, String>,
     review_verdict: Option<crate::review_threads::ReviewEvent>,
     review_gh: String,
+    /// The review tab's `gh` call in flight (#365): what it is for, and
+    /// where its answer arrives.
+    pr_gh: Option<(PrGhJob, std::sync::mpsc::Receiver<Result<String, String>>)>,
     review_tx: std::sync::mpsc::Sender<crate::review_ops::Outcome>,
     review_rx: std::sync::mpsc::Receiver<crate::review_ops::Outcome>,
     /// An open asciicast recording (#356): the writer, the file it appends
@@ -3698,6 +3743,25 @@ pub struct App {
     /// showing the live buffer. `Some` at `Position::Working` is a real
     /// state: the scrubber is open and parked at the user's own edits.
     scrubber: Option<crate::scrubber::Scrubber>,
+    /// The active file as it was at the scrubber's commit (#371): a separate
+    /// read-only editor painted in place of the live one, which is never
+    /// touched. `None` at the working tree.
+    pub scrub_view: Option<crate::widgets::editor::Editor>,
+    /// The file `scrub_view` was built for. Switching tabs while scrubbing
+    /// rebuilds the view for the new file rather than showing the old one's
+    /// history over it.
+    scrub_for: Option<PathBuf>,
+    /// File text per (commit, workspace-relative path) for the scrubber;
+    /// `None` records that the file did not exist there.
+    scrub_cache: std::collections::HashMap<(String, String), Option<String>>,
+    /// The running `croft demo` tour (#377), with its scratch project and
+    /// the workspace to return to.
+    pub tour: Option<TourRun>,
+    /// The tour was finished or skipped once (#377), so the welcome panel
+    /// no longer offers it.
+    pub tour_done: bool,
+    /// The welcome panel's Take the Tour button, from the last frame.
+    pub welcome_tour_button: Rect,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -4826,6 +4890,13 @@ impl App {
         // `view_ipc::SOCK_PATH` at spawn time, so this ordering is what
         // decides whether the startup pane can use `croft view` at all (#362).
         let view_listener = Self::bind_view_socket();
+        // A second croft on the same workspace finds the socket live and
+        // leaves it to the first: one editor answers a workspace's agents.
+        let hook_listener = if cfg!(test) {
+            None
+        } else {
+            crate::agent_approval::bind(&root).ok()
+        };
         let view_bind_error = VIEW_BIND_ERROR.lock().unwrap().take();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
 
@@ -4918,6 +4989,7 @@ impl App {
             outline,
             open_editors,
             timeline,
+            agent_lane_panel: crate::widgets::agent_lane::AgentLanePanel::new(),
             dependencies,
             dep_ecosystems,
             explorer_views,
@@ -5104,6 +5176,13 @@ impl App {
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
             view_listener,
+            hook_listener,
+            approvals: std::collections::VecDeque::new(),
+            approval_ui: None,
+            notebook_kernels: std::collections::HashMap::new(),
+            coverage_at: None,
+            coverage_lens_path: None,
+            coverage_install: None,
             view_drain_budget: std::time::Duration::from_millis(20),
             pending_local_open: None,
             pending_discard: None,
@@ -5416,11 +5495,18 @@ impl App {
             review_nodes: std::collections::HashMap::new(),
             review_verdict: None,
             review_gh: String::from("gh"),
+            pr_gh: None,
             review_tx,
             review_rx,
             recording: None,
             recorded_size: (0, 0),
             scrubber: None,
+            scrub_view: None,
+            scrub_for: None,
+            scrub_cache: std::collections::HashMap::new(),
+            tour: None,
+            tour_done: loaded_prefs.tour_done,
+            welcome_tour_button: Rect::default(),
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
@@ -7491,6 +7577,8 @@ impl App {
             // Drop the closed file's diagnostics so the store doesn't grow
             // unbounded across a long session of opening and closing files.
             dropped_any |= self.lsp_diagnostics.remove(&p).is_some();
+            // Reopening asks for its lenses again anyway.
+            self.code_lens_requested.remove(&p);
         }
         // A closed file's problems must leave the PROBLEMS panel too.
         // Under Open Files scope the panel also depends on WHICH buffers are
@@ -9354,13 +9442,7 @@ impl App {
         let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for u in updates {
             touched.insert(u.path.clone());
-            let by_server = self.lsp_diagnostics.entry(u.path).or_default();
-            // An empty batch is the server saying "all clear" for its findings.
-            if u.diagnostics.is_empty() {
-                by_server.remove(&u.server);
-            } else {
-                by_server.insert(u.server, u.diagnostics);
-            }
+            store_diagnostics_update(&mut self.lsp_diagnostics, u);
         }
         let mut changed = false;
         // The active editor re-decodes when its file was touched this tick OR
@@ -11361,6 +11443,52 @@ impl App {
         );
     }
 
+    /// The AGENT LANE rows (#345): each agent that changed files, then those
+    /// files as the ledger orders them (unreviewed first), labelled relative
+    /// to their workspace root.
+    fn agent_lane_panel_rows(&self) -> Vec<crate::widgets::agent_lane::LaneRow> {
+        use crate::widgets::agent_lane::LaneRow;
+        let mut rows = Vec::new();
+        for agent in self.agent_ledger.agents() {
+            rows.push(LaneRow::Agent {
+                name: agent.to_string(),
+                unreviewed: self.agent_ledger.unreviewed_count(agent),
+            });
+            for file in self.agent_ledger.lane(agent) {
+                let label = self
+                    .roots
+                    .owning_root(&file.path)
+                    .and_then(|root| file.path.strip_prefix(root).ok())
+                    .unwrap_or(&file.path)
+                    .display()
+                    .to_string();
+                rows.push(LaneRow::File {
+                    agent: agent.to_string(),
+                    path: file.path.clone(),
+                    label,
+                    unreviewed: file.unreviewed(),
+                });
+            }
+        }
+        rows
+    }
+
+    /// Cmd+K V (#345): make the AGENT LANE section visible and open, on the
+    /// Explorer, or say there is nothing in it yet.
+    fn show_agent_lane_section(&mut self) {
+        if self.agent_ledger.agents().is_empty() {
+            self.status = String::from("Agent Lane: no agent has changed a file yet");
+            return;
+        }
+        if !self.explorer_views.is_visible(ExplorerView::AgentLane) {
+            self.toggle_explorer_view(ExplorerView::AgentLane);
+        }
+        self.agent_lane_panel.collapsed = false;
+        self.show_tree = true;
+        self.set_sidebar_view(SidebarView::Explorer);
+        self.focus_pane(Pane::Tree);
+    }
+
     /// Lay out and paint the Explorer's visible stacked sub-views top-to-bottom
     /// inside `area` (the region above the SYSTEM footer). Folders (the file
     /// tree) is the flexible region that absorbs leftover rows; every other
@@ -11372,6 +11500,9 @@ impl App {
         self.outline.last_area = Rect::default();
         self.timeline.last_area = Rect::default();
         self.dependencies.last_area = Rect::default();
+        self.agent_lane_panel.last_area = Rect::default();
+        let lane_rows = self.agent_lane_panel_rows();
+        self.agent_lane_panel.set_rows(lane_rows);
 
         let folders_visible = self.explorer_views.is_visible(ExplorerView::Folders);
         if !folders_visible {
@@ -11394,12 +11525,18 @@ impl App {
             if !self.explorer_views.is_visible(v) || !self.explorer_view_available(v) {
                 continue;
             }
+            // Offered in the ⋯ menu always, but drawn only once an agent has
+            // changed something: an empty lane would cost rows for nothing.
+            if v == ExplorerView::AgentLane && self.agent_lane_panel.rows().is_empty() {
+                continue;
+            }
             let h = match v {
                 ExplorerView::Folders => 0,
                 ExplorerView::OpenEditors => self.open_editors.desired_height(area.height),
                 ExplorerView::Outline => self.outline.desired_height(area.height),
                 ExplorerView::Timeline => self.timeline.desired_height(area.height),
                 ExplorerView::Dependencies => self.dependencies.desired_height(area.height),
+                ExplorerView::AgentLane => self.agent_lane_panel.desired_height(area.height),
             };
             heights.push((v, h));
         }
@@ -11457,6 +11594,7 @@ impl App {
                 ExplorerView::Outline => frame.render_widget(&mut self.outline, rect),
                 ExplorerView::Timeline => frame.render_widget(&mut self.timeline, rect),
                 ExplorerView::Dependencies => frame.render_widget(&mut self.dependencies, rect),
+                ExplorerView::AgentLane => frame.render_widget(&mut self.agent_lane_panel, rect),
             }
         }
     }
@@ -13187,6 +13325,33 @@ impl App {
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
+        self.render_welcome_panel(frame, outer_area);
+        // The first-launch tour (#377), until it has been taken or skipped.
+        if !self.tour_done && self.tour.is_none() && outer_area.height > 6 {
+            let label = " Take the Tour ";
+            let w = label.chars().count() as u16;
+            if outer_area.width > w + 4 {
+                let rect = Rect {
+                    x: outer_area.x + (outer_area.width - w) / 2,
+                    y: outer_area.y + outer_area.height - 3,
+                    width: w,
+                    height: 1,
+                };
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(label).style(
+                        Style::default()
+                            .fg(self.theme.accent_contrast_fg())
+                            .bg(self.theme.accent())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    rect,
+                );
+                self.welcome_tour_button = rect;
+            }
+        }
+    }
+
+    fn render_welcome_panel(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
         // In iTerm2 image mode we let the iTerm session bg (forced to
         // sRGB(EDITOR_BG_RGB) by `SetColors=bg=srgb:…` at startup) show
         // through the welcome cells via SGR 49 (default bg). The OSC-1337
@@ -15307,11 +15472,72 @@ impl App {
         out
     }
 
+    /// Take agent edit proposals off the hook socket and drop the ones
+    /// whose hook has already given up, keeping the popup on the head of
+    /// the queue.
+    fn drain_hook_requests(&mut self) -> bool {
+        let head = self.approvals.front().map(|p| p.arrived);
+        let mut changed = match self.hook_listener.as_ref() {
+            Some(listener) => crate::agent_approval::accept_into(listener, &mut self.approvals),
+            None => false,
+        };
+        let now = std::time::Instant::now();
+        let before = self.approvals.len();
+        self.approvals.retain(|p| !p.expired(now));
+        changed |= self.approvals.len() != before;
+        if self.approvals.front().map(|p| p.arrived) != head {
+            self.approval_ui = None;
+        }
+        if self.approvals.is_empty() {
+            self.approval_ui = None;
+        } else if self.approval_ui.is_none() {
+            self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(now));
+            changed = true;
+        }
+        changed
+    }
+
+    fn handle_approval_key(&mut self, key: KeyEvent) {
+        let rows = self
+            .approvals
+            .front()
+            .map(|p| crate::agent_approval::diff_rows(&p.proposal).len())
+            .unwrap_or(0);
+        let Some(ui) = self.approval_ui.as_mut() else {
+            return;
+        };
+        let Some(decision) = ui.key(key, std::time::Instant::now(), rows) else {
+            return;
+        };
+        if let Some(head) = self.approvals.pop_front() {
+            head.answer(&decision);
+        }
+        self.approval_ui = (!self.approvals.is_empty())
+            .then(|| crate::agent_approval::ApprovalUi::new(std::time::Instant::now()));
+    }
+
+    fn render_approval_popup(&self, frame: &mut ratatui::Frame) {
+        let (Some(ui), Some(head)) = (self.approval_ui.as_ref(), self.approvals.front()) else {
+            return;
+        };
+        let area = frame.area();
+        crate::widgets::approval_popup::render(
+            area,
+            frame.buffer_mut(),
+            self.theme,
+            head,
+            ui,
+            self.approvals.len(),
+            self.workspace_root(),
+        );
+    }
+
     /// Whether a modal overlay owns the screen right now. The same eleven-way
     /// check was repeated verbatim at three overlay-flush sites; auto-hide
     /// (#260) needs it too, so it lives here once.
     fn modal_overlay_open(&self) -> bool {
-        self.shortcuts_modal.is_some()
+        self.approval_ui.is_some()
+            || self.shortcuts_modal.is_some()
             || self.file_finder.is_some()
             || self.command_palette.is_some()
             || self.go_to_symbol.is_some()
@@ -15762,6 +15988,8 @@ impl App {
         self.timeline.focus_gradient = gradient;
         self.timeline.theme = self.theme;
         self.timeline.focused = explorer_focused;
+        self.agent_lane_panel.theme = self.theme;
+        self.agent_lane_panel.focused = explorer_focused;
         self.commit_graph.focus_gradient = gradient;
         self.commit_graph.theme = self.theme;
         self.commit_graph.focused =
@@ -16221,6 +16449,8 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
+        // Set again by the welcome panel when it paints the button.
+        self.welcome_tour_button = Rect::default();
         let size = frame.area();
         self.last_frame_area = size;
         if let Some(menu) = self.context_menu.as_mut() {
@@ -16477,6 +16707,7 @@ impl App {
             self.outline.hover_pointer = panel_pointer;
             self.open_editors.hover_pointer = panel_pointer;
             self.timeline.hover_pointer = panel_pointer;
+            self.agent_lane_panel.hover_pointer = panel_pointer;
             self.dependencies.hover_pointer = panel_pointer;
             self.extensions.hover_pointer = panel_pointer;
             self.commit_graph.hover_pointer = panel_pointer;
@@ -16725,6 +16956,10 @@ impl App {
             // Lay the leaves out and paint each at its rect (depth-first order),
             // reporting the active group's rect so popups anchor there.
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
+            if self.scrubber.is_some() && self.scrub_for != self.editor.path {
+                self.rebuild_scrub_view();
+            }
+            let paint_history = self.scrub_view.is_some();
             let active_idx = self.editor_layout.active_dfs_index();
             let focused_area = if self.editor_layout.is_split() {
                 let active_area = rects[active_idx];
@@ -16783,6 +17018,25 @@ impl App {
                 self.disable_minimap_image();
                 editor_area
             };
+            // The history scrubber's view stands in for the live editor's
+            // text (#371); the tab strip and breadcrumbs stay the live ones.
+            if paint_history
+                && let Some(view) = self.scrub_view.as_mut()
+                && self.editor.last_body.width > 0
+            {
+                view.theme = self.theme;
+                // The editor paints only the rows it has text for, so a
+                // shorter historical file would leave the live buffer's
+                // lower lines showing through: blank the body first.
+                let body = self.editor.last_body;
+                frame.render_widget(ratatui::widgets::Clear, body);
+                frame.render_widget(
+                    ratatui::widgets::Block::default()
+                        .style(Style::default().bg(self.theme.editor_bg())),
+                    body,
+                );
+                frame.render_widget(view, body);
+            }
             if self.focus == Pane::Editor
                 && self.completion_popup.is_some()
                 && let Some((cx, cy)) = self.editor.cursor_screen_pos()
@@ -17482,9 +17736,19 @@ impl App {
         // controls and commentary stop sharing a costume; the clickable ones
         // take a hover fill under the pointer (spans are built after `rx` is
         // known, below, so hover can be computed against this frame's rects).
+        // The active file's coverage rides the Ln/Col readout (#263): that
+        // segment is not a click target, so the clickable ones keep their
+        // indices.
+        let coverage = self
+            .editor
+            .coverage
+            .as_ref()
+            .and_then(|l| l.percent)
+            .map(|p| format!(" \u{b7} {p:.0}% covered"))
+            .unwrap_or_default();
         let mut seg_texts: Vec<String> = vec![
             format!(
-                " Ln {}, Col {} ",
+                " Ln {}, Col {}{coverage} ",
                 self.editor.cursor_row + 1,
                 self.editor.cursor_col + 1
             ),
@@ -17678,6 +17942,7 @@ impl App {
         }
         self.render_port_toast(frame);
         self.render_update_toast(frame);
+        self.render_tour_caption(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
         self.render_prompt(frame);
@@ -17710,6 +17975,7 @@ impl App {
         self.render_connect_dialog(frame);
         // The startup unsupported-terminal nudge renders last so it sits above
         // every other overlay until the user dismisses it.
+        self.render_approval_popup(frame);
         self.render_terminal_warning(frame);
 
         // Chrome button-hint tooltip. Rendered at the top level against the
@@ -19404,7 +19670,7 @@ impl App {
             // offer only saves the reaching.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'g') => {
                 match self.accept_ssh_offer() {
-                    Some(host) => self.request_remote_launch(host, None),
+                    Some((host, path)) => self.request_remote_launch(host, path),
                     None => {
                         self.status = String::from(
                             "No ssh workspace offer is open (it appears when a pane connects to a host in ~/.ssh/config)",
@@ -19744,6 +20010,10 @@ impl App {
             }
             return Ok(());
         }
+        if self.approval_ui.is_some() {
+            self.handle_approval_key(key);
+            return Ok(());
+        }
         if self.connect_dialog.is_some() {
             self.handle_connect_dialog_key(key);
             return Ok(());
@@ -19854,6 +20124,43 @@ impl App {
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && self.handle_scrubber_key(key.code)
         {
+            return Ok(());
+        }
+        // While a commit is on screen, keys that would edit the hidden live
+        // buffer are refused rather than typed blind into it (#371).
+        if self.scrub_view.is_some()
+            && self.focus == Pane::Editor
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            && matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Enter
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Tab
+            )
+        {
+            self.status = String::from(
+                "Looking at history - Esc returns to your working tree before editing",
+            );
+            return Ok(());
+        }
+        // The tour (#377): with no picker or palette open, Enter moves on and
+        // Esc leaves. Below the modal guards, so a picker a step opened keeps
+        // its own Enter and Esc.
+        if self.tour.is_some()
+            && key.kind == KeyEventKind::Press
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Enter | KeyCode::Esc)
+        {
+            if key.code == KeyCode::Enter {
+                self.advance_tour();
+            } else {
+                self.finish_tour();
+            }
             return Ok(());
         }
         if self.scm_menu.open && matches!(key.code, KeyCode::Esc) {
@@ -20866,6 +21173,9 @@ impl App {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Enter => self.run_all_tests(),
             KeyCode::Char('r' | 'R') => self.discover_tests(),
+            KeyCode::Char('w' | 'W') => {
+                self.toggle_test_watch(crate::testing::watch::WatchScope::All)
+            }
             KeyCode::Up => self.testing.scroll_up(1),
             KeyCode::Down => self.testing.scroll_down(1),
             _ => {}
@@ -20900,6 +21210,170 @@ impl App {
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
+        }
+    }
+
+    /// Run everything with the runner's coverage tool (#263). Results
+    /// stream into the tree as usual; the report lands in the editor's
+    /// gutter, the status bar and the Testing summary.
+    fn run_all_tests_with_coverage(&mut self) {
+        if self.testing.is_busy() || !self.testing_runner_available() {
+            return;
+        }
+        self.test_worker.run_coverage();
+        self.set_sidebar_view(SidebarView::Testing);
+        self.status = String::from("Running tests with coverage");
+    }
+
+    /// Fold a finished coverage run into the editor, and keep the active
+    /// file's lens current: rebuilt when the report or the file changes,
+    /// dimmed once the file is edited or rewritten after the run.
+    fn sync_coverage(&mut self) -> bool {
+        use crate::testing::worker::CoverageError;
+        let mut changed = false;
+        match self.testing.take_coverage_error() {
+            Some(CoverageError::Missing { tool, install }) => {
+                self.status = format!(
+                    "Coverage needs {tool}: run \"Testing: Install Coverage Tool\" ({install})"
+                );
+                self.coverage_install = Some(install);
+                changed = true;
+            }
+            Some(CoverageError::NoReport) => {
+                self.status = String::from("The coverage run wrote no report");
+                changed = true;
+            }
+            None => {}
+        }
+        let fresh = self.testing.take_coverage_fresh();
+        if fresh {
+            self.coverage_at = Some(std::time::SystemTime::now());
+            if let Some(pct) = self.testing.coverage.as_ref().and_then(|c| c.percent()) {
+                self.status = format!("Coverage: {pct:.0}% of lines");
+            }
+        }
+        let path = self.editor.path.clone();
+        if fresh || path != self.coverage_lens_path {
+            self.coverage_lens_path = path.clone();
+            let stale = path
+                .as_ref()
+                .is_some_and(|p| self.file_changed_since_coverage(p));
+            self.editor.coverage = match (self.testing.coverage.as_ref(), path.as_ref()) {
+                (Some(c), Some(p)) => c.lens(p, stale),
+                _ => None,
+            };
+            changed = true;
+        }
+        if self.editor.dirty
+            && let Some(lens) = self.editor.coverage.as_mut()
+            && !lens.stale
+        {
+            lens.stale = true;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The file on disk is newer than the coverage run.
+    fn file_changed_since_coverage(&self, path: &Path) -> bool {
+        let Some(at) = self.coverage_at else {
+            return false;
+        };
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|m| m > at)
+    }
+
+    /// Drop the coverage report and give the gutter lane back to git.
+    fn clear_coverage(&mut self) {
+        self.testing.coverage = None;
+        self.editor.coverage = None;
+        self.coverage_at = None;
+        self.status = String::from("Coverage cleared");
+    }
+
+    /// Install the runner's coverage tool in a terminal pane, where its
+    /// output and any prompt are visible.
+    fn install_coverage_tool(&mut self) {
+        let Some(command) = self.coverage_install.clone() else {
+            self.status = String::from("No coverage tool is missing");
+            return;
+        };
+        match crate::widgets::terminal::PtyTerminal::new(&self.active_test_root) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(String::from("coverage install")));
+                term.write_input(format!("{command}\r").as_bytes());
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                self.status = format!("Installing: {command}");
+            }
+            Err(e) => self.status = format!("Could not open a terminal: {e}"),
+        }
+    }
+
+    /// Watch `scope`, or stop watching it (#263).
+    fn toggle_test_watch(&mut self, scope: crate::testing::watch::WatchScope) {
+        use crate::testing::watch::WatchScope;
+        let label = match &scope {
+            WatchScope::All => String::from("all tests"),
+            WatchScope::Suite(s) => format!("suite {s}"),
+            WatchScope::Test(t) => t.clone(),
+        };
+        self.status = if self.testing.watch.toggle(scope) {
+            format!("Watching {label}: it reruns when a file is saved")
+        } else {
+            format!("Stopped watching {label}")
+        };
+    }
+
+    /// Rerun what is watched, if a save made it due, and report a watched
+    /// run that has just turned red. A rerun leaves the sidebar where the
+    /// user has it: a save should not pull them away from what they were
+    /// doing. A red run already raises the activity-bar badge; the status
+    /// line adds which test and how to get to it.
+    fn tick_test_watch(&mut self) -> bool {
+        use crate::testing::watch::{WatchNotice, WatchScope};
+        let mut changed = false;
+        if let Some(ok) = self.testing.take_finished()
+            && self.testing.watch.finished(ok) == WatchNotice::NewlyRed
+        {
+            self.status = match self.testing.first_failed() {
+                Some(name) => {
+                    format!("Watched tests failed: {name} (Testing: Go to First Failure)")
+                }
+                None => String::from("Watched tests failed"),
+            };
+            changed = true;
+        }
+        if self.testing.watch.scope().is_none() {
+            return changed;
+        }
+        let busy = self.testing.is_busy()
+            || crate::testing::worker::runner_for(&self.active_test_root).is_none();
+        let Some(scope) = self.testing.watch.take_due(std::time::Instant::now(), busy) else {
+            return changed;
+        };
+        match scope {
+            WatchScope::All => self.test_worker.run_all(),
+            WatchScope::Suite(suite) => {
+                self.testing
+                    .start_filter(&crate::testing::suite_pattern(&suite));
+                self.test_worker.run_suite(suite);
+            }
+            WatchScope::Test(name) => {
+                self.testing.start_single(&name);
+                self.test_worker.run_one(name);
+            }
+        }
+        true
+    }
+
+    /// Jump to the first failing test's source.
+    fn go_to_first_failed_test(&mut self) {
+        match self.testing.first_failed() {
+            Some(name) => self.jump_to_test_source(name),
+            None => self.status = String::from("No failing tests"),
         }
     }
 
@@ -22744,6 +23218,32 @@ impl App {
                     breakpoints,
                 )
             }
+            AdapterKind::Delve => {
+                if rc.request == RequestKind::Launch && rc.program.is_none() {
+                    self.debug_error(format!(
+                        "config \"{name}\": a go launch needs a \"program\" (a package directory or file)"
+                    ));
+                    return;
+                }
+                if rc.request == RequestKind::Attach && rc.process_id.is_none() {
+                    self.debug_error(format!(
+                        "config \"{name}\": a go attach needs a \"processId\""
+                    ));
+                    return;
+                }
+                match crate::dap::install::dlv_program() {
+                    Ok(dlv) => crate::dap::session::DapSession::launch_delve(
+                        &dlv,
+                        &cwd,
+                        configs::delve_request(&rc),
+                        breakpoints,
+                    ),
+                    Err(e) => {
+                        self.debug_error(format!("{e}"));
+                        return;
+                    }
+                }
+            }
             AdapterKind::JsDebug => {
                 if rc.request == RequestKind::Launch && rc.program.is_none() {
                     self.debug_error(format!(
@@ -22827,6 +23327,10 @@ impl App {
                 self.start_js_debug_session(&path);
                 return;
             }
+            Some(AdapterKind::Delve) => {
+                self.start_delve_debug_session(&path);
+                return;
+            }
             None => {
                 // An executable binary (e.g. a compiled `target/debug/app`) can
                 // be debugged directly by lldb-dap with no build step.
@@ -22870,6 +23374,41 @@ impl App {
             breakpoints,
             false,
         ) {
+            Ok(session) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.debug_sessions.replace_with(name.clone(), session);
+                self.run_debug.feedback = Some(format!("Debugging {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("Debugging {name} — F5 continue · F10 step over · Shift+F5 stop");
+                self.reveal_debug_view();
+            }
+            Err(e) => {
+                self.debug_error(format!("Failed to start debugger: {e}"));
+            }
+        }
+    }
+
+    /// Debug the Go file at `path` under delve (#264): its package's `main`,
+    /// or its tests for a `_test.go` file. delve builds the package itself.
+    fn start_delve_debug_session(&mut self, path: &Path) {
+        let dlv = match crate::dap::install::dlv_program() {
+            Ok(d) => d,
+            Err(e) => {
+                self.debug_error(format!("{e}"));
+                return;
+            }
+        };
+        let breakpoints = self.collect_editor_breakpoints();
+        let cwd = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.roots.primary().to_path_buf());
+        let request = crate::dap::session::delve_zero_config_request(path);
+        match crate::dap::session::DapSession::launch_delve(&dlv, &cwd, request, breakpoints) {
             Ok(session) => {
                 let name = path
                     .file_name()
@@ -24625,6 +25164,10 @@ impl App {
             InputPurpose::NewWorktreeLane => {
                 self.close_input_prompt();
                 self.create_worktree_lane(&value);
+            }
+            InputPurpose::PullRequestNumber => {
+                self.close_input_prompt();
+                self.submit_pr_number(&value);
             }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
@@ -28271,22 +28814,38 @@ impl App {
                 }
                 self.status =
                     format!("Connected to {host} · Open workspace here? (Cmd+K G, Esc dismisses)");
+                let cwd_at_offer = self.pane_cwd_report(pane);
                 self.ssh_offer = Some(SshOffer {
                     pane,
                     host,
                     since: std::time::Instant::now(),
+                    cwd_at_offer,
                 });
             }
         }
     }
 
-    /// Take the open offer's host for launching (#364), clearing the offer.
-    fn accept_ssh_offer(&mut self) -> Option<String> {
+    /// The pane's last OSC 7 report: its shell's directory and host.
+    fn pane_cwd_report(&self, pane: u64) -> Option<crate::remote::CwdReport> {
+        let term = self.terminals.iter().find(|t| t.uid() == pane)?;
+        Some((term.shell_cwd()?, term.shell_host()))
+    }
+
+    /// Take the open offer for launching (#364), clearing it: the host, and
+    /// the remote shell's directory when the pane reported one that can be
+    /// trusted to be on that host (see `remote::remote_workspace_path`).
+    fn accept_ssh_offer(&mut self) -> Option<(String, Option<String>)> {
         let offer = self.ssh_offer.take()?;
         if self.status.starts_with("Connected to ") {
             self.status.clear();
         }
-        Some(offer.host)
+        let now = self.pane_cwd_report(offer.pane);
+        let path = crate::remote::remote_workspace_path(
+            &offer.host,
+            offer.cwd_at_offer.as_ref(),
+            now.as_ref(),
+        );
+        Some((offer.host, path))
     }
 
     /// Remember that provisioning `host` failed (#364): the ssh-pane offer
@@ -28294,7 +28853,12 @@ impl App {
     /// install that fails, offer-launched or not, because the fact learned
     /// is about the host; and undone by the next success (below), so a box
     /// that merely failed on a bad day is offered again once it works.
-    fn note_provisioning_failed(&mut self, host: &str) {
+    fn note_provisioning_failed(&mut self, host: &str, detail: &str) {
+        crate::output::push(
+            crate::output::CHANNEL_REMOTE,
+            crate::output::OutputLevel::Error,
+            &format!("Could not install croft on {host}: {detail}"),
+        );
         let key = host.to_ascii_lowercase();
         let now = std::time::SystemTime::now();
         self.remote_offer_refused.insert(key.clone(), now);
@@ -28311,6 +28875,11 @@ impl App {
     /// instance may have recorded a refusal this one never loaded, and
     /// `forget_refused_host` is a no-op when there is nothing to forget.
     fn note_provisioning_succeeded(&mut self, host: &str) {
+        crate::output::push(
+            crate::output::CHANNEL_REMOTE,
+            crate::output::OutputLevel::Info,
+            &format!("croft is installed on {host}; launching the remote workspace"),
+        );
         let key = host.to_ascii_lowercase();
         self.remote_offer_refused.remove(&key);
         let _ = crate::remote::forget_refused_host(
@@ -28387,18 +28956,184 @@ impl App {
         match crate::remote::ssh_reroot_decision(&argv, &targets) {
             Ok(host) => {
                 let alias = host.alias.clone();
-                // No path: the remote flow opens the login directory, which
-                // is where the ssh session started. Carrying the pane's
-                // remote cwd across would need the shell's OSC 7 report from
-                // the far side, and croft only trusts those against a local
-                // cwd it can verify.
-                self.request_remote_launch(alias, None);
+                // The far side's OSC 7 report opens the workspace where the
+                // remote shell is. With no earlier report to tell a fresh one
+                // from a stale one, it is trusted only when it names this
+                // host; otherwise the login directory, as before.
+                let uid = self.terminals[self.active_terminal].uid();
+                let report = self.pane_cwd_report(uid);
+                let path =
+                    crate::remote::remote_workspace_path(&alias, report.as_ref(), report.as_ref());
+                self.request_remote_launch(alias, path);
             }
             // The message distinguishes "not ssh" from "ssh to a box croft
             // has no config entry for": the second names the host, because
             // adding it to ~/.ssh/config is the action available.
             Err(why) => self.status = why,
         }
+    }
+
+    /// Start the guided tour (#377) in a fresh scratch project, never the
+    /// user's workspace, and perform its first step.
+    pub fn start_demo(&mut self) {
+        // A second start would record the first tour's scratch project as
+        // the workspace to return to, and the user's own would be lost.
+        if self.tour.is_some() {
+            self.status = String::from("The tour is already running (Esc leaves it)");
+            return;
+        }
+        let tour = match crate::tour::Tour::parse(crate::tour::TOUR_JSON) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("The tour could not start: {e}");
+                return;
+            }
+        };
+        let scratch = match crate::tour::create_scratch(&croft_cache_dir().join("demo")) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("The tour could not create its sample project: {e}");
+                return;
+            }
+        };
+        let previous_root = self.workspace_root().to_path_buf();
+        self.change_workspace_root(scratch.clone());
+        let first = tour.current().map(|s| s.action.clone());
+        self.tour = Some(TourRun {
+            tour,
+            scratch,
+            previous_root,
+        });
+        if let Some(action) = first {
+            self.perform_tour_action(action);
+        }
+    }
+
+    /// Perform the next tour step, or finish after the last one.
+    pub fn advance_tour(&mut self) {
+        let Some(run) = self.tour.as_mut() else {
+            return;
+        };
+        match run.tour.advance().map(|s| s.action.clone()) {
+            Some(action) => self.perform_tour_action(action),
+            None => self.finish_tour(),
+        }
+    }
+
+    /// Leave the tour: back to the workspace it started from, and the
+    /// scratch project deleted.
+    pub fn finish_tour(&mut self) {
+        let Some(run) = self.tour.take() else {
+            return;
+        };
+        // Finished or skipped, the welcome panel stops offering it.
+        self.tour_done = true;
+        let _ = crate::prefs::save_tour_done_in(&self.config_dir);
+        self.change_workspace_root(run.previous_root);
+        self.status = match crate::tour::remove_scratch(&run.scratch) {
+            Ok(()) => String::from("Tour finished"),
+            Err(e) => format!("Tour finished, but its sample project was not removed: {e}"),
+        };
+    }
+
+    fn perform_tour_action(&mut self, action: crate::tour::TourAction) {
+        use crate::tour::TourAction as A;
+        let Some(scratch) = self.tour.as_ref().map(|r| r.scratch.clone()) else {
+            return;
+        };
+        match action {
+            A::Open(rel) => {
+                if let Err(e) = self.open_at(&scratch.join(rel), 0, 0) {
+                    self.status = format!("Tour: {e}");
+                }
+            }
+            A::QuickOpen => self.open_file_finder(),
+            A::SplitEditor => self.split_editor(),
+            A::Terminal => {
+                if !self.show_terminal {
+                    self.toggle_terminal();
+                }
+                self.focus_pane(Pane::Terminal);
+            }
+            A::Run(cmd) => {
+                if !self.show_terminal {
+                    self.toggle_terminal();
+                }
+                if let Some(term) = self.terminals.get_mut(self.active_terminal) {
+                    term.write_input(format!("{cmd}\r").as_bytes());
+                }
+            }
+            A::JumpToError => {
+                let lines = self
+                    .terminals
+                    .get(self.active_terminal)
+                    .map(|t| t.visible_lines().0)
+                    .unwrap_or_default();
+                match crate::tour::first_error_ref(&lines) {
+                    Some((file, line)) => {
+                        let path = if std::path::Path::new(&file).is_absolute() {
+                            PathBuf::from(file)
+                        } else {
+                            scratch.join(file)
+                        };
+                        let _ = self.open_at(&path, line.saturating_sub(1), 0);
+                    }
+                    // The command may still be running: open where the
+                    // sample's mistake is, which is what it would find.
+                    None => {
+                        let _ = self.open_at(&scratch.join("app.py"), 3, 0);
+                    }
+                }
+            }
+            A::CommandPalette => self.open_command_palette(),
+            A::ThemePicker => self.open_theme_picker(),
+            A::Done => {}
+        }
+    }
+
+    /// The caption chip (#377): step, caption and keys, above the status bar.
+    fn render_tour_caption(&mut self, frame: &mut ratatui::Frame) {
+        let Some(run) = self.tour.as_ref() else {
+            return;
+        };
+        let Some(step) = run.tour.current() else {
+            return;
+        };
+        let area = frame.area();
+        if area.width < 20 || area.height < 4 {
+            return;
+        }
+        let text = format!(
+            " {}  {}   Enter next \u{b7} Esc leave ",
+            run.tour.progress(),
+            step.caption
+        );
+        let width = (text.chars().count() as u16 + 2).min(area.width - 2);
+        let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + area.height - status_h - 2,
+            width,
+            height: 1,
+        };
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(text).style(
+                Style::default()
+                    .fg(self.theme.accent_contrast_fg())
+                    .bg(self.theme.accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rect,
+        );
+    }
+
+    /// Close every picker and palette a tour step may have opened.
+    #[cfg(test)]
+    pub fn close_all_modals_for_test(&mut self) {
+        self.command_palette = None;
+        self.file_finder = None;
+        self.context_menu = None;
     }
 
     /// Open the history scrubber over the current branch (#371).
@@ -28414,6 +29149,7 @@ impl App {
         // first rather than HEAD, and stepping back from the working tree
         // lands on a commit the current branch may not even contain.
         let commits = crate::git::branch_history(self.workspace_root(), SCRUB_COMMIT_LIMIT);
+        self.scrub_view = None;
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
             return;
@@ -29186,12 +29922,23 @@ impl App {
             self.status = String::from("Fleet run needs a command");
             return;
         }
-        let known: Vec<String> = crate::remote::discover_ssh_targets()
+        let mut known: Vec<String> = crate::remote::discover_ssh_targets()
             .into_iter()
             .map(|t| t.alias)
             .collect();
-        if known.is_empty() {
-            self.status = String::from("No hosts in ~/.ssh/config to run on");
+        let no_ssh_hosts = known.is_empty();
+        // `localhost` and running containers can be named explicitly; `*`
+        // still means the ssh hosts only (see `parse_request_with_groups`).
+        known.extend(crate::fleet::local_targets_in(command, &self.fleet_groups));
+        if no_ssh_hosts
+            && !crate::fleet::split_request(command).is_some_and(|(spec, _)| {
+                spec.split(',')
+                    .any(|n| crate::fleet::is_local_target(n.trim()))
+            })
+        {
+            self.status = String::from(
+                "No hosts in ~/.ssh/config to run on (localhost and docker:<container> work too)",
+            );
             return;
         }
         // The fleet must be NAMED. Defaulting to every configured host means
@@ -29264,8 +30011,27 @@ impl App {
                     } else {
                         crate::output::OutputLevel::Error
                     },
-                    &format!("{}  [{mark}]  {}", r.host, r.output.replace('\n', " ")),
+                    &format!(
+                        "{}  [{mark}]  ({:.1}s)  {}",
+                        r.host,
+                        r.elapsed.as_secs_f64(),
+                        r.output.replace('\n', " ")
+                    ),
                 );
+                // A differing host lists the lines that differ from the
+                // reference, so the row says WHAT differs, not only that
+                // something does.
+                if mark == "DIFFERS"
+                    && let Some(reference) = reference.as_deref()
+                {
+                    for line in crate::fleet::differing_lines(reference, &r.output) {
+                        crate::output::push(
+                            crate::output::CHANNEL_FLEET,
+                            crate::output::OutputLevel::Info,
+                            &format!("    {line}"),
+                        );
+                    }
+                }
             }
             let summary = crate::fleet::summarise(&results, reference.as_deref());
             crate::output::push(
@@ -29719,6 +30485,7 @@ impl App {
                 // scrubber never replaced it, so there is nothing to put
                 // back and no path where unsaved edits could be lost.
                 self.scrubber = None;
+                self.scrub_view = None;
                 self.status = String::from("Left the history scrubber");
                 return true;
             }
@@ -29731,7 +30498,61 @@ impl App {
             Some(c) => format!("At {} — {}", c.short_hash, c.summary),
             None => String::from("At your working tree"),
         };
+        self.rebuild_scrub_view();
         true
+    }
+
+    /// Build the read-only view of the active file at the scrubber's commit
+    /// (#371), or drop it at the working tree. File text is cached per
+    /// (commit, path), so stepping back and forth after the first visit
+    /// costs no git process.
+    fn rebuild_scrub_view(&mut self) {
+        self.scrub_for = self.editor.path.clone();
+        let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
+            self.scrub_view = None;
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            self.scrub_view = None;
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let Ok(rel) = path
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
+            self.scrub_view = None;
+            return;
+        };
+        let mut read = |rev: &str| -> Option<String> {
+            let key = (rev.to_string(), rel.clone());
+            self.scrub_cache
+                .entry(key)
+                .or_insert_with(|| crate::git::read_file_at_rev(&root, rev, &rel).ok())
+                .clone()
+        };
+        let text = read(&commit.hash);
+        let baseline = commit
+            .parents
+            .first()
+            .and_then(|p| read(p))
+            .map(|t| crate::widgets::editor::split_into_lines(&t))
+            .unwrap_or_default();
+        let mut view = match text {
+            Some(text) => crate::widgets::editor::Editor::historical(&path, &text, baseline),
+            None => crate::widgets::editor::Editor::historical(
+                &PathBuf::from("history.txt"),
+                &format!("({rel} did not exist at {})", commit.short_hash),
+                Vec::new(),
+            ),
+        };
+        // Look at the same stretch of the file the live buffer shows.
+        view.scroll = self.editor.scroll.min(view.lines.len().saturating_sub(1));
+        view.cursor_row = self
+            .editor
+            .cursor_row
+            .min(view.lines.len().saturating_sub(1));
+        self.scrub_view = Some(view);
     }
 
     pub fn poll_connect_dialog(&mut self) -> bool {
@@ -29781,6 +30602,13 @@ impl App {
                 host.clone(),
                 path,
             ));
+            crate::output::push(
+                crate::output::CHANNEL_REMOTE,
+                crate::output::OutputLevel::Info,
+                &format!(
+                    "Preparing croft on {host}: checking for an install, provisioning if missing"
+                ),
+            );
             self.status = format!("Preparing remote croft on {host}");
         }
         true
@@ -29852,7 +30680,7 @@ impl App {
             // beside the failure it learns from, and best-effort: a write
             // that fails costs one repeated offer.
             if let Some(host) = self.install_session.as_ref().map(|s| s.host.clone()) {
-                self.note_provisioning_failed(&host);
+                self.note_provisioning_failed(&host, &detail);
             }
             if let Some(dialog) = self.connect_dialog.as_mut() {
                 dialog.set_failed(detail.clone());
@@ -31521,6 +32349,10 @@ impl App {
         }
         if self.editor.archive.is_some() {
             self.handle_archive_key(key);
+            return;
+        }
+        if self.editor.pr_review.is_some() {
+            self.handle_pr_review_key(key);
             return;
         }
         // Image preview tabs are read-only. PDF tabs page with every
@@ -33638,7 +34470,89 @@ impl App {
         let Some(block) = md.runnables.get(idx).cloned() else {
             return;
         };
+        // A notebook cell runs in its kernel straight away, as in Jupyter:
+        // no pane, no confirm.
+        if let Some(cell) = block.kernel_cell {
+            let text = self.editor.lines.join("\n");
+            if let Some(cell) = crate::notebook_kernel::code_cell(&text, cell) {
+                self.run_notebook_cells(vec![cell]);
+            }
+            return;
+        }
         self.pending_run_block = Some(self.pending_run_block_for(idx, &block));
+    }
+
+    /// Send `cells` to the active notebook's kernel, starting it on the
+    /// first run. Each cell's old outputs are cleared now, in one edit,
+    /// so what the file shows is always this run's.
+    fn run_notebook_cells(&mut self, cells: Vec<crate::notebook_kernel::CellRef>) {
+        use crate::notebook_kernel::{CellEdit, KernelSession, NotebookRun, apply, kernel_name};
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if cells.is_empty() {
+            self.status = String::from("No code cells to run");
+            return;
+        }
+        let mut text = self.editor.lines.join("\n");
+        let root = self.workspace_root().to_path_buf();
+        let starting = !self.notebook_kernels.contains_key(&path);
+        let run = self
+            .notebook_kernels
+            .entry(path.clone())
+            .or_insert_with(|| {
+                let dir = path.parent().unwrap_or(&root);
+                NotebookRun::new(KernelSession::start(&root, dir, &kernel_name(&text)))
+            });
+        for cell in cells {
+            if let Some(next) = apply(&text, &cell, CellEdit::Begin) {
+                text = next;
+            }
+            run.execute(cell);
+        }
+        self.editor.notebook_running = run.running_indices();
+        self.editor
+            .replace_all_lines(text.split('\n').map(str::to_string).collect());
+        if starting {
+            self.status = String::from("Starting kernel…");
+        }
+    }
+
+    /// Fold what each kernel said into its notebook. A notebook that is not
+    /// the active tab keeps its events until it is.
+    fn poll_notebook_kernels(&mut self) -> bool {
+        let active = self.editor.path.clone();
+        let mut changed = false;
+        for (path, run) in self.notebook_kernels.iter_mut() {
+            if !run.collect() || active.as_ref() != Some(path) {
+                continue;
+            }
+            let text = self.editor.lines.join("\n");
+            let (next, notes) = run.fold(&text);
+            self.editor.notebook_running = run.running_indices();
+            if let Some(next) = next {
+                self.editor
+                    .replace_all_lines(next.split('\n').map(str::to_string).collect());
+            }
+            if let Some(note) = notes.last() {
+                self.status = note.clone();
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// Interrupt or restart the active notebook's kernel.
+    fn notebook_kernel_request(&mut self, request: crate::notebook_kernel::Request) {
+        let run = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| self.notebook_kernels.get(p));
+        match run {
+            Some(run) => run.send(request),
+            None => self.status = String::from("This notebook has no running kernel"),
+        }
     }
 
     /// Cmd+Enter in a Markdown SOURCE buffer (#353): the fence under the
@@ -36659,6 +37573,27 @@ impl App {
     /// Ask the local launcher (via the drop relay) to forward `port` home over
     /// the live SSH master, optionally opening the local browser once it's up.
     fn request_remote_forward(&mut self, port: u16, open: bool) {
+        // Forwarded already: reuse the tunnel. Asking again found the remote
+        // port held locally by croft's own first tunnel and fell back to a
+        // random one, so every click on the same link opened one more tunnel
+        // and one more browser tab at a new 127.0.0.1 address (#648).
+        if let Some(local) = self.ports.forwarded_local_port(port) {
+            if open {
+                self.request_remote_url_open(format!("http://127.0.0.1:{local}/"));
+                self.status = format!("Opening port {port} (forwarded to {local})");
+            } else {
+                self.status = format!("Port {port} is already forwarded to {local}");
+            }
+            return;
+        }
+        // And one request per port at a time: a second click before the
+        // first forward answered sent a duplicate.
+        if self.pending_remote_pulls.iter().any(
+            |p| matches!(p.kind, RemotePullKind::Forward { remote_port } if remote_port == port),
+        ) {
+            self.status = format!("Port {port} is already being forwarded");
+            return;
+        }
         let Some(log_path) = self.relay_log_path() else {
             self.status = String::from("Forward port: drop relay vanished");
             return;
@@ -38562,6 +39497,7 @@ impl App {
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
+            Cmd::TakeTheTour => self.start_demo(),
             Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
             Cmd::NavigateBack => self.nav_back(),
@@ -38641,6 +39577,32 @@ impl App {
                 }
                 None => self.status = String::from("No file in the active tab"),
             },
+            Cmd::NotebookRunAll => {
+                let text = self.editor.lines.join("\n");
+                if self
+                    .editor
+                    .markdown_preview
+                    .as_ref()
+                    .is_some_and(|m| m.notebook)
+                {
+                    self.run_notebook_cells(crate::notebook_kernel::code_cells(&text));
+                } else {
+                    self.status = String::from("Run All works on a notebook's rendered view");
+                }
+            }
+            Cmd::NotebookInterrupt => {
+                self.notebook_kernel_request(crate::notebook_kernel::Request::Interrupt)
+            }
+            Cmd::NotebookRestart => {
+                self.notebook_kernel_request(crate::notebook_kernel::Request::Restart)
+            }
+            Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
+            Cmd::CoverageClear => self.clear_coverage(),
+            Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
+            Cmd::TestingToggleWatchAll => {
+                self.toggle_test_watch(crate::testing::watch::WatchScope::All)
+            }
+            Cmd::TestingGoToFirstFailure => self.go_to_first_failed_test(),
             Cmd::ReopenAsText => match self.editor.path.clone() {
                 // Merge editor (#253): back to the in-buffer marker flow.
                 // The Result buffer is deliberately discarded — it was
@@ -38953,6 +39915,14 @@ impl App {
                 ))
             }
             Cmd::NewWorktreeLane => self.open_new_lane_prompt(),
+            Cmd::ReviewPullRequest => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::PullRequestNumber,
+                    String::from("Review Pull Request"),
+                    String::from("number, #number, or the PR's URL"),
+                ));
+            }
             Cmd::DiffWorktreeLane => self.diff_worktree_lane(),
             Cmd::CloseWorktreeLane => self.close_worktree_lane(),
             Cmd::MarkAgentFileReviewed => {
@@ -39001,6 +39971,7 @@ impl App {
                     rows.join(" \u{b7} ")
                 };
             }
+            Cmd::OpenAgentLaneSection => self.show_agent_lane_section(),
             Cmd::DiffAgentFileSinceReview => {
                 match self.editor.path.clone() {
                     None => self.status = String::from("No file open"),
@@ -41309,6 +42280,10 @@ impl App {
         {
             return;
         }
+        // The approval popup takes no clicks, and none reach what it covers.
+        if self.approval_ui.is_some() {
+            return;
+        }
         if self.connect_dialog.is_some() {
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.handle_connect_dialog_click(m.column, m.row);
@@ -42602,6 +43577,21 @@ impl App {
                     }
                     return;
                 }
+                // AGENT LANE (#345): the header collapses it; a file row opens
+                // that file's diff against its reviewed snapshot.
+                if rect_contains(self.agent_lane_panel.last_area, m.column, m.row) {
+                    if self.agent_lane_panel.hit_header(m.column, m.row) {
+                        self.agent_lane_panel.toggle_collapse();
+                    } else if let Some(crate::widgets::agent_lane::LaneRow::File {
+                        agent,
+                        path,
+                        ..
+                    }) = self.agent_lane_panel.row_at(m.row).cloned()
+                    {
+                        self.diff_agent_lane_row(&agent, &path);
+                    }
+                    return;
+                }
                 // DEPENDENCIES: display-only, so only the header (collapse)
                 // and the scrollbar lane are interactive.
                 if rect_contains(self.dependencies.last_area, m.column, m.row) {
@@ -42884,6 +43874,10 @@ impl App {
                     self.set_sidebar_view(SidebarView::Extensions);
                     return;
                 }
+                if rect_contains(self.welcome_tour_button, m.column, m.row) {
+                    self.start_demo();
+                    return;
+                }
                 if rect_contains(self.sidebar_areas.testing_icon, m.column, m.row) {
                     self.open_testing_view();
                     return;
@@ -43159,8 +44153,13 @@ impl App {
                     if rect_contains(self.testing.last_scrollbar, m.column, m.row) {
                         self.testing.scroll_to_bar_y(m.row);
                         self.testing_scrollbar_drag = true;
+                    } else if rect_contains(self.testing.last_watch_all, m.column, m.row) {
+                        self.toggle_test_watch(crate::testing::watch::WatchScope::All);
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
+                            Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
+                                self.toggle_test_watch(scope)
+                            }
                             Some(crate::widgets::testing::RowHit::RunCase(name)) => {
                                 self.run_test(name)
                             }
@@ -46385,6 +47384,11 @@ impl App {
         seats: crate::provenance::Provenance,
         described: Option<Vec<u8>>,
     ) {
+        // Every save lands here, so this is where a watched test scope
+        // hears about it (#263).
+        self.testing
+            .watch
+            .on_saved(path, &self.active_test_root, std::time::Instant::now());
         self.spawn_history_record(path, seats, described, false);
         // Every save passes through here: breakpoints that followed edits in
         // the buffer are handed to running sessions now that the file on disk
@@ -49289,6 +50293,241 @@ impl App {
             _ => return,
         }
         sheet_follow_cursor(sheet, current, visible);
+    }
+
+    fn pr_viewed_path() -> PathBuf {
+        croft_cache_dir().join("pr-viewed.json")
+    }
+
+    /// Open pull request `pr` for review in its own tab (#365), with the
+    /// viewed marks remembered for `key` (`owner/repo#n`).
+    pub fn open_pr_review(&mut self, pr: crate::pr_review::PrInfo, key: String) {
+        let store = crate::pr_review::ViewedStore::load(&Self::pr_viewed_path());
+        let viewed = store.viewed(&key);
+        let n = pr.number;
+        self.editor
+            .open_pr_review(crate::widgets::pr_review::PrReviewView::new(
+                pr, key, viewed,
+            ));
+        self.focus_pane(Pane::Editor);
+        self.status = format!("Reviewing PR #{n}");
+    }
+
+    /// The Review Pull Request prompt's answer.
+    fn submit_pr_number(&mut self, input: &str) {
+        match crate::pr_review::parse_pr_selector(input) {
+            Some(selector) => self.start_pr_review(selector),
+            None => {
+                self.status = format!("{:?} is not a pull request number", input.trim());
+            }
+        }
+    }
+
+    /// Fetch the pull request `selector` names (a number, or its URL) with
+    /// `gh` and open it for review once it arrives.
+    fn start_pr_review(&mut self, selector: String) {
+        self.status = format!("Loading PR {selector}…");
+        let args = crate::pr_review::view_args(&selector);
+        self.spawn_pr_gh(PrGhJob::View { selector }, args);
+    }
+
+    /// Run one `gh` call for the review tab on a worker (#365): a slow
+    /// network or a large log never stalls input or redraws, and the call
+    /// is killed at [`crate::pr_review::GH_TIMEOUT`]. A newer call replaces
+    /// one still running, whose answer is then dropped.
+    fn spawn_pr_gh(&mut self, job: PrGhJob, args: Vec<String>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gh = self.review_gh.clone();
+        let root = self.workspace_root().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::pr_review::run_gh(
+                &gh,
+                &args,
+                &root,
+                crate::pr_review::GH_TIMEOUT,
+            ));
+        });
+        self.pr_gh = Some((job, rx));
+    }
+
+    /// Apply a finished review `gh` call. Returns true when it changed what
+    /// is on screen.
+    fn poll_pr_gh(&mut self) -> bool {
+        let Some((_, rx)) = self.pr_gh.as_ref() else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("gh stopped without answering"))
+            }
+        };
+        let Some((job, _)) = self.pr_gh.take() else {
+            return false;
+        };
+        match job {
+            PrGhJob::View { selector } => {
+                match result.and_then(|json| crate::pr_review::parse_pr(&json)) {
+                    Ok(pr) => {
+                        let key = crate::pr_review::review_key(&pr);
+                        self.open_pr_review(pr, key);
+                    }
+                    Err(why) => self.status = format!("Could not load PR {selector}: {why}"),
+                }
+            }
+            PrGhJob::Diff { path } => match result {
+                Ok(patch) => {
+                    let Some(view) = self.editor.pr_review.as_mut() else {
+                        return true;
+                    };
+                    view.diff = Some(crate::pr_review::split_diff_by_file(&patch));
+                    self.open_pr_diff_section(&path);
+                }
+                Err(why) => self.status = format!("gh pr diff failed: {why}"),
+            },
+            PrGhJob::Log { name } => {
+                let channel = "PR Checks";
+                crate::output::clear(channel);
+                // A failed fetch's reason goes where the log would have.
+                let text = result.unwrap_or_else(|why| why);
+                for line in text.lines() {
+                    crate::output::push(channel, crate::output::OutputLevel::Info, line);
+                }
+                self.status = format!("{name}: log in OUTPUT > {channel}");
+            }
+        }
+        true
+    }
+
+    /// PULL REQUEST tab keys (#365).
+    fn handle_pr_review_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.editor.pr_review.as_mut() else {
+            return;
+        };
+        let page = (view.rows_visible as isize).max(1);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => view.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => view.move_selection(-1),
+            KeyCode::PageDown => view.move_selection(page),
+            KeyCode::PageUp => view.move_selection(-page),
+            KeyCode::Home => view.selected = 0,
+            KeyCode::End => view.move_selection(isize::MAX / 2),
+            KeyCode::Char(' ') => {
+                let Some(path) = view.selected_file().map(|f| f.path.clone()) else {
+                    return;
+                };
+                let store_path = Self::pr_viewed_path();
+                let mut store = crate::pr_review::ViewedStore::load(&store_path);
+                let now = store.toggle(&view.key, &path);
+                if let Err(e) = store.save(&store_path) {
+                    self.status = format!("Could not save the viewed mark: {e}");
+                }
+                if now {
+                    view.viewed.insert(path);
+                } else {
+                    view.viewed.remove(&path);
+                }
+                view.move_selection(1);
+            }
+            KeyCode::Enter => {
+                if view.selected_check().is_some() {
+                    self.show_pr_check_log();
+                } else {
+                    self.open_pr_file_diff();
+                }
+            }
+            KeyCode::Char('l') => self.show_pr_check_log(),
+            KeyCode::Char('r') => {
+                // By URL, so a PR opened from another repository refreshes
+                // as itself.
+                let selector = if view.pr.url.is_empty() {
+                    view.pr.number.to_string()
+                } else {
+                    view.pr.url.clone()
+                };
+                self.start_pr_review(selector);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let n = view.pr.number;
+                self.editor.close_active();
+                self.status = format!("Left review of PR #{n}");
+            }
+            _ => {}
+        }
+    }
+
+    /// The selected file's section of the PR's patch, side by side. The
+    /// patch is fetched once per tab with `gh pr diff`, off the UI thread.
+    fn open_pr_file_diff(&mut self) {
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
+        let Some(path) = view.selected_file().map(|f| f.path.clone()) else {
+            return;
+        };
+        if view.diff.is_some() {
+            self.open_pr_diff_section(&path);
+            return;
+        }
+        let selector = if view.pr.url.is_empty() {
+            view.pr.number.to_string()
+        } else {
+            view.pr.url.clone()
+        };
+        self.status = format!("Fetching the diff of PR #{}…", view.pr.number);
+        self.spawn_pr_gh(
+            PrGhJob::Diff { path },
+            vec![String::from("pr"), String::from("diff"), selector],
+        );
+    }
+
+    /// Open `path`'s section of the fetched patch in a diff tab.
+    fn open_pr_diff_section(&mut self, path: &str) {
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
+        let n = view.pr.number;
+        let Some(section) = view.diff.as_ref().and_then(|d| d.get(path)).cloned() else {
+            self.status = format!("{path} has no textual diff (binary or too large)");
+            return;
+        };
+        let label = PathBuf::from(format!("PR #{n}: {path}"));
+        match self.editor.open_git_diff_side_by_side(&label, &section) {
+            Ok(()) => self.status = format!("PR #{n}: {path}"),
+            Err(e) => self.status = format!("Could not open the diff: {e}"),
+        }
+    }
+
+    /// Put the selected (or first failing) check's failing-step log in
+    /// OUTPUT > PR Checks.
+    fn show_pr_check_log(&mut self) {
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
+        let check = view.selected_check().or_else(|| {
+            view.pr
+                .checks
+                .iter()
+                .find(|c| c.state == crate::pr_review::CheckState::Fail)
+        });
+        let Some(check) = check.cloned() else {
+            self.status = String::from("No failing check");
+            return;
+        };
+        let Some((run, job)) = check.url.as_deref().and_then(crate::pr_review::run_and_job) else {
+            self.status = format!(
+                "{} is not a GitHub Actions check; its page: {}",
+                check.name,
+                check.url.unwrap_or_default()
+            );
+            return;
+        };
+        self.status = format!("Fetching the log of {}…", check.name);
+        self.spawn_pr_gh(
+            PrGhJob::Log { name: check.name },
+            crate::pr_review::log_args(run, job),
+        );
     }
 
     /// Archive browser keys (#179): selection movement, Enter extracts
@@ -54051,6 +55290,33 @@ fn mcp_tool_trust(
     ))
 }
 
+/// File one server's diagnostics batch in the store. An empty batch is the
+/// server saying "all clear" for its findings; a path no server reports on
+/// any more leaves the store. Files never opened (a workspace pull, a
+/// flycheck) and deleted ones used to keep an empty entry each for the rest
+/// of the session (#694).
+fn store_diagnostics_update(
+    store: &mut std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
+    >,
+    u: crate::lsp::manager::DiagnosticsUpdate,
+) {
+    if u.diagnostics.is_empty() {
+        if let Some(by_server) = store.get_mut(&u.path) {
+            by_server.remove(&u.server);
+            if by_server.is_empty() {
+                store.remove(&u.path);
+            }
+        }
+    } else {
+        store
+            .entry(u.path)
+            .or_default()
+            .insert(u.server, u.diagnostics);
+    }
+}
+
 /// Run a resolved MCP command to completion on a worker thread: provision +
 /// spawn the server, verify the tool definition (trust-on-first-use rug-pull
 /// guard), call the tool, and return its text. Pure blocking; the caller sends
@@ -54655,6 +55921,14 @@ pub fn run(
     app.start_update_watch_if_remote();
     app.start_drift_probe_if_local();
     app.start_update_check_if_local();
+    // `croft pr <n>` (#365): open the review once the app is up.
+    if let Some(selector) = crate::pr_review::take_startup_pr() {
+        app.start_pr_review(selector);
+    }
+    // `croft demo` (#377): start the tour once the app is up.
+    if crate::tour::take_startup_demo() {
+        app.start_demo();
+    }
 
     enable_raw_mode().context("enable raw mode")?;
     // Sixel has no env var, so when neither iTerm2 nor Kitty was detected from
@@ -55272,6 +56546,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
+        let hook_changed = app.drain_hook_requests() | app.poll_pr_gh();
+        let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
@@ -55360,6 +56636,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         }
         // One notification per red run (#358), from the latch the panel
         // sets when a run ends, never per test case.
+        let coverage_changed = app.sync_coverage();
+        let watch_changed = app.tick_test_watch();
         if app.testing.take_failed_run() {
             let (passed, failed, _) = app.testing.counts();
             app.notifier.emit(
@@ -55400,6 +56678,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || mcp_changed
             || pair_changed
             || tests_changed
+            || coverage_changed
+            || watch_changed
             || blink_changed
             || spinner_changed
             || ext_index_changed
@@ -55408,6 +56688,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || remote_changed
             || pulls_changed
             || view_changed
+            || hook_changed
+            || kernel_changed
             || ports_changed
             || session_presence_changed
             || session_typing_changed

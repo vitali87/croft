@@ -68,6 +68,10 @@ pub struct ExplorerViewsPrefs {
     /// Rust-only `rust_dependencies` key parsing into this generalized field.
     #[serde(default = "default_true", alias = "rust_dependencies")]
     pub dependencies: bool,
+    /// The AGENT LANE view (#345): only drawn while a coding agent has
+    /// changed files, so on by default costs nothing until one has.
+    #[serde(default = "default_true")]
+    pub agent_lane: bool,
 }
 
 fn default_true() -> bool {
@@ -82,6 +86,7 @@ impl Default for ExplorerViewsPrefs {
             outline: true,
             timeline: true,
             dependencies: true,
+            agent_lane: true,
         }
     }
 }
@@ -187,6 +192,10 @@ pub struct Prefs {
     /// default), so disabling is opt-in and an older config still parses.
     #[serde(default)]
     pub disabled_extensions: BTreeSet<String>,
+    /// The first-launch tour was finished or skipped (#377): the welcome
+    /// panel stops offering it.
+    #[serde(default)]
+    pub tour_done: bool,
     /// MCP sidecar extension ids the user has consented to spawn (the first-run
     /// consent gate). croft never launches a sidecar process until its extension
     /// id is in this set.
@@ -299,6 +308,16 @@ pub struct Prefs {
     /// host, a box you only ever tunnel through. User layers only.
     #[serde(default)]
     pub remote_offer_excluded_hosts: Vec<String>,
+    /// Hosts (ssh config aliases, matched case-insensitively) that config
+    /// sync (#262) never pushes to: the per-host `sync_config = off`. A shared
+    /// box, or one whose keybindings are deliberately different. User layers
+    /// only: a workspace must not be able to switch sync on or off.
+    #[serde(default)]
+    pub config_sync_excluded_hosts: Vec<String>,
+    /// Syncable files, by name (`"keybindings.json"`), that never travel to
+    /// any remote (#262): the per-file escape. User layers only.
+    #[serde(default)]
+    pub config_sync_excluded_files: Vec<String>,
     /// Named sets of SSH hosts for "Terminal: Fleet Run" (#363), so a fleet
     /// can be named once rather than retyped per run.
     ///
@@ -602,6 +621,17 @@ pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String
     prefs.save(&path)
 }
 
+/// Record that the tour was finished or skipped (#377), under an explicit
+/// config dir so a test can point it at a scratch dir.
+pub fn save_tour_done_in(config_dir: &Path) -> Result<()> {
+    let path = config_dir.join("config.json");
+    // A config.json croft cannot read is left alone, not replaced by
+    // defaults with only this flag set.
+    let mut prefs = Prefs::load_for_update(&path)?;
+    prefs.tour_done = true;
+    prefs.save(&path)
+}
+
 /// Record a first-run consent for `ext_id` under an explicit config dir: the app carries the
 /// dir it was built with, so a test can point it at a scratch dir instead
 /// of mutating the process-wide environment (which races sibling tests).
@@ -891,6 +921,24 @@ pub(crate) fn config_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn finishing_the_tour_leaves_an_unreadable_config_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let broken = "{ \"theme\": \"dark\", oops }";
+        std::fs::write(&path, broken).unwrap();
+        assert!(save_tour_done_in(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        // With no file yet, it is created with the flag set.
+        let fresh = tempfile::tempdir().unwrap();
+        save_tour_done_in(fresh.path()).unwrap();
+        assert!(
+            Prefs::load(&fresh.path().join("config.json"))
+                .unwrap()
+                .tour_done
+        );
+    }
     use super::*;
 
     #[test]

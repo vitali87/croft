@@ -1344,6 +1344,17 @@ pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::path::Path>) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // A pane's shell must count characters the way the terminal draws them.
+    // macOS forwards `LC_CTYPE=UTF-8` over ssh, which Linux does not know, so
+    // a remote shell fell back to ASCII and counted a 3-byte prompt glyph
+    // (`❯`, a Nerd Font icon) as 3 columns: every redraw landed 2 columns
+    // off and left 2-character coloured tails behind (#537).
+    if cfg!(target_os = "linux") {
+        let var = |k: &str| std::env::var(k).ok();
+        if let Some((key, value)) = utf8_ctype_fix(var("LC_ALL"), var("LC_CTYPE"), var("LANG")) {
+            cmd.env(key, value);
+        }
+    }
     // `git rebase -i` opens its plan in this croft (#620), unless the user
     // chose their own sequence editor, which always wins: an exported
     // GIT_SEQUENCE_EDITOR here, or `sequence.editor` in git config, which
@@ -1365,6 +1376,40 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
         // promises ("panes then see no CROFT_VIEW_SOCK and the client says so
         // plainly").
         None => cmd.env_remove(crate::view_ipc::SOCK_ENV),
+    }
+}
+
+/// The locale variable to set so a Linux shell reads its text as UTF-8, or
+/// None when the inherited locale already does (or the user pinned another
+/// with `LC_ALL`, which wins over anything set here). The bare name `UTF-8`
+/// is what macOS sends and no Linux locale is called that.
+fn utf8_ctype_fix(
+    lc_all: Option<String>,
+    lc_ctype: Option<String>,
+    lang: Option<String>,
+) -> Option<(&'static str, &'static str)> {
+    let is_utf8 = |v: &str| {
+        let codeset = v
+            .split('@')
+            .next()
+            .unwrap_or(v)
+            .rsplit('.')
+            .next()
+            .unwrap_or("");
+        v.contains('.') && matches!(codeset.to_ascii_lowercase().as_str(), "utf-8" | "utf8")
+    };
+    let bare = |v: &str| v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("utf8");
+    match lc_all.filter(|v| !v.is_empty()) {
+        Some(v) if bare(&v) => return Some(("LC_ALL", "C.UTF-8")),
+        Some(_) => return None,
+        None => {}
+    }
+    let effective = lc_ctype
+        .filter(|v| !v.is_empty())
+        .or(lang.filter(|v| !v.is_empty()));
+    match effective {
+        Some(v) if is_utf8(&v) => None,
+        _ => Some(("LC_CTYPE", "C.UTF-8")),
     }
 }
 
@@ -5846,6 +5891,32 @@ mod tests {
         let (logical, offset) = logical_row_text(&t, first + 1);
         assert!(logical.contains(token), "{logical}");
         assert_eq!(offset, 30);
+    }
+
+    #[test]
+    fn a_pane_gets_a_utf8_ctype_when_the_inherited_one_is_not() {
+        let s = |v: &str| Some(v.to_string());
+        // What macOS forwards over ssh, and no locale at all.
+        assert_eq!(
+            utf8_ctype_fix(None, s("UTF-8"), None),
+            Some(("LC_CTYPE", "C.UTF-8"))
+        );
+        assert_eq!(
+            utf8_ctype_fix(None, None, None),
+            Some(("LC_CTYPE", "C.UTF-8"))
+        );
+        assert_eq!(
+            utf8_ctype_fix(None, None, s("C")),
+            Some(("LC_CTYPE", "C.UTF-8"))
+        );
+        assert_eq!(
+            utf8_ctype_fix(s("UTF-8"), None, None),
+            Some(("LC_ALL", "C.UTF-8"))
+        );
+        // Already UTF-8, or pinned by the user: untouched.
+        assert_eq!(utf8_ctype_fix(None, None, s("en_US.UTF-8")), None);
+        assert_eq!(utf8_ctype_fix(None, s("de_DE.utf8@euro"), None), None);
+        assert_eq!(utf8_ctype_fix(s("POSIX"), None, None), None);
     }
 
     #[test]

@@ -421,6 +421,12 @@ impl LspClient {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawn lsp server `{}`", config.command))?;
+        // The kernel reclaims a language server before croft and the shells
+        // in its panes when memory runs out (#694): losing a server costs its
+        // editor features until relaunch, losing croft costs every shell.
+        if let Some(pid) = child.id() {
+            crate::oom::prefer_to_reclaim(pid, crate::oom::HELPER_SCORE);
+        }
 
         let stdout = child
             .stdout

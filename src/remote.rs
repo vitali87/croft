@@ -646,6 +646,23 @@ fn install_remote_croft_streaming(
     log_tx: &std::sync::mpsc::Sender<String>,
     confirm_fallback: &mut dyn FnMut(&str) -> bool,
 ) -> Result<()> {
+    // The release binary first (#261), over the same bulk lane.
+    let mut ship = |binary: &Path| -> Result<()> {
+        let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
+        let status = ship_file_rsync_command(lane, &ssh.socket_path, binary, &dest)
+            .status()
+            .context("rsyncing the prebuilt croft to the remote")?;
+        anyhow::ensure!(status.success(), "rsync exited with {status}");
+        Ok(())
+    };
+    let mut log = |m: String| {
+        let _ = log_tx.send(m);
+    };
+    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut log) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => log(format!("Prebuilt install failed ({e:#}); building instead")),
+    }
     let reason = match try_local_cross_install_streaming(ssh, lane, source_stamp, log_tx) {
         Ok(None) => return Ok(()),
         Ok(Some(reason)) => reason,
@@ -2009,6 +2026,30 @@ fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
     // but it never engages silently: the user confirms it on the tty
     // first, because quitting to run `croft setup-cross` once is almost
     // always the better deal.
+    //
+    // Before either: the release binary for this exact version (#261), when
+    // this croft IS that release.
+    let mut ship = |binary: &Path| -> Result<()> {
+        let ssh_e = format!(
+            "ssh -S {} -o ControlMaster=no",
+            shell_quote_for_e_arg(&ssh.socket_path),
+        );
+        let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
+        let status = Command::new("rsync")
+            .args(["-az", "--checksum", "-e"])
+            .arg(&ssh_e)
+            .arg(binary)
+            .arg(&dest)
+            .status()
+            .context("rsyncing the prebuilt croft to the remote")?;
+        anyhow::ensure!(status.success(), "rsync exited with {status}");
+        Ok(())
+    };
+    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut |m| println!("{m}")) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => eprintln!("Prebuilt install failed ({e:#}); building instead"),
+    }
     let reason = match try_local_cross_install(ssh, source_stamp) {
         Ok(None) => return Ok(()),
         Ok(Some(reason)) => reason,
@@ -2302,7 +2343,25 @@ fn sync_workspace_lock(source: &Path, log: impl Fn(String)) {
 /// outcome is reported so a silent no-op is distinguishable from a silent
 /// success.
 fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
-    let files = crate::config_sync::local_files();
+    // User layers only: a workspace must not decide what leaves the laptop.
+    let prefs = crate::config_layers::load_merged(None).prefs;
+    if crate::config_sync::host_excluded(&ssh.host, &prefs.config_sync_excluded_hosts) {
+        log(format!(
+            "Config sync: off for {} (config_sync_excluded_hosts)",
+            ssh.host
+        ));
+        return;
+    }
+    let (files, skipped) = crate::config_sync::apply_exclusions(
+        crate::config_sync::local_files(),
+        &prefs.config_sync_excluded_files,
+    );
+    if !skipped.is_empty() {
+        log(format!(
+            "Config sync: not pushing {} (config_sync_excluded_files)",
+            skipped.join(", ")
+        ));
+    }
     if files.is_empty() {
         return;
     }
@@ -2465,6 +2524,86 @@ fn source_sync_rsync_command(
     rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));
     rsync.arg(source_arg).arg(dest);
     rsync
+}
+
+/// Set by `croft remote --build` (#261): skip the prebuilt release binary
+/// and build from source, for a source tree ahead of the latest release.
+pub(crate) static FORCE_SOURCE_BUILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The prebuilt fast path (#261): when this croft was installed from
+/// crates.io, ship the release binary for its exact version and the remote's
+/// target instead of building one. `Ok(true)` = installed; `Ok(false)` = not
+/// applicable (said why); `Err` = attempted and broke. The caller falls back
+/// to the cross-build either way. `ship` copies a local binary to the
+/// remote's `~/.cargo/bin/croft.new` over whichever transport the caller has.
+fn try_prebuilt_install(
+    ssh: &SshControl,
+    source_stamp: &str,
+    ship: &mut dyn FnMut(&Path) -> Result<()>,
+    log: &mut dyn FnMut(String),
+) -> Result<bool> {
+    if FORCE_SOURCE_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
+        log(String::from(
+            "Prebuilt install skipped: --build asked for a source build",
+        ));
+        return Ok(false);
+    }
+    if !crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")) {
+        log(String::from(
+            "Prebuilt install skipped: this croft is a source build, so the remote gets the same source",
+        ));
+        return Ok(false);
+    }
+    let Some(triple) = remote_target_triple(ssh)? else {
+        log(String::from(
+            "Prebuilt install skipped: no release for the remote's architecture",
+        ));
+        return Ok(false);
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let cache = crate::session_state::dirs_cache_croft().join("prebuilt");
+    let binary = match crate::remote_prebuilt::prepare(
+        version,
+        triple,
+        &cache,
+        &crate::remote_prebuilt::http_get,
+    ) {
+        Ok(b) => b,
+        // Not every version has release artifacts; that is a plain skip,
+        // not a failure to shout about on every connect.
+        Err(e) if crate::remote_prebuilt::is_not_published(&e) => {
+            log(format!(
+                "Prebuilt install skipped: v{version} has no release binary for {triple}"
+            ));
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    let size_mb = std::fs::metadata(&binary).map(|m| m.len()).unwrap_or(0) as f64 / 1e6;
+    log(format!(
+        "Installing prebuilt croft v{version} for {triple} ({size_mb:.0} MB) over SSH"
+    ));
+    let mkdir = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"")
+        .status()
+        .context("creating remote install dirs")?;
+    anyhow::ensure!(mkdir.success(), "remote mkdir exited with {mkdir}");
+    ship(&binary)?;
+    let activate = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg(activate_command(source_stamp))
+        .status()
+        .context("activating the prebuilt croft on the remote")?;
+    anyhow::ensure!(
+        activate.success(),
+        "remote activation exited with {activate}"
+    );
+    log(format!("Installed prebuilt croft v{version} on the remote"));
+    Ok(true)
 }
 
 fn remote_target_triple(ssh: &SshControl) -> Result<Option<&'static str>> {
@@ -3098,7 +3237,13 @@ echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
 # zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
 # try to run a command literally named "nice -n 19". eval re-parses the
 # assembled line, which splits correctly under both sh/bash and zsh.
-eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked &'
+# The subshell marks the build (and every rustc under it) as the kernel's
+# first choice when memory runs out, without touching this shell (#694),
+# then `exec`s it, so `$!` below is still the compile's own pid.
+(
+  echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
+  eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
+) &
 CROFT_BUILD_PID=$!
 printf %s "$CROFT_BUILD_PID" > "$CROFT_MARK"
 wait "$CROFT_BUILD_PID"
@@ -3272,6 +3417,62 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    fn report(path: &str, host: Option<&str>) -> CwdReport {
+        (std::path::PathBuf::from(path), host.map(str::to_string))
+    }
+
+    #[test]
+    fn a_new_remote_report_is_the_workspace_path() {
+        let before = report("/Users/me/code", Some("localhost"));
+        let now = report("/srv/app", Some("db-1.internal"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&before), Some(&now)).as_deref(),
+            Some("/srv/app")
+        );
+        // No report at all when the offer appeared (no local integration).
+        assert_eq!(
+            remote_workspace_path("db-1", None, Some(&now)).as_deref(),
+            Some("/srv/app")
+        );
+    }
+
+    #[test]
+    fn an_unchanged_report_counts_only_when_it_names_the_host() {
+        let same = report("/srv/app", Some("db-1"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&same), Some(&same)).as_deref(),
+            Some("/srv/app"),
+            "the remote prompt reported before the offer sampled"
+        );
+        let fqdn = report("/srv/app", Some("DB-1.internal"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&fqdn), Some(&fqdn)).as_deref(),
+            Some("/srv/app"),
+            "a domain-qualified name for the same host, any case"
+        );
+        let stale = report("/home/old", Some("web-7"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&stale), Some(&stale)),
+            None,
+            "left over from an earlier session on another host"
+        );
+        let prefix = report("/x", Some("db-10"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&prefix), Some(&prefix)),
+            None,
+            "db-10 is not db-1"
+        );
+    }
+
+    #[test]
+    fn a_local_or_hostless_report_is_never_remote() {
+        let local = report("/Users/me", Some("localhost"));
+        assert_eq!(remote_workspace_path("db-1", None, Some(&local)), None);
+        let hostless = report("/Users/me", None);
+        assert_eq!(remote_workspace_path("db-1", None, Some(&hostless)), None);
+        assert_eq!(remote_workspace_path("db-1", None, None), None);
+    }
 
     /// The destination an ssh command line names, from the shapes people
     /// actually type (#364).
@@ -4363,6 +4564,27 @@ Host !blocked *.internal
     // box, and even niced, a rustc compile on a small VPS wrecks the live
     // session sharing it. When a croft session is running on the box, the
     // compile must yield everything: one job and idle-class IO.
+    /// #694: the build, and every rustc under it, is the kernel's first
+    /// choice when memory runs out, and the script still parses as sh.
+    #[test]
+    fn remote_install_marks_the_build_for_the_oom_killer_first() {
+        let command = remote_install_command("abc123");
+        let adj = command
+            .find("echo 1000 > /proc/self/oom_score_adj")
+            .unwrap();
+        let install = command.find("cargo install --path").unwrap();
+        assert!(adj < install, "the score must be set before the compile");
+        let out = Command::new("sh")
+            .args(["-n", "-c", &command])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn remote_install_compile_yields_to_a_live_croft_session() {
         let command = remote_install_command("abc123");
@@ -4406,7 +4628,7 @@ Host !blocked *.internal
         before("CROFT_MARK=\"$HOME/.cache/croft/building.$$\"");
         before("trap '");
         assert!(
-            command.contains(r#"eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
+            command.contains(r#"eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
             "the memory cap must wrap the compile itself"
         );
         // Little memory FREE drops to one job too, not just a small total:
@@ -5017,6 +5239,44 @@ pub fn offer_allowed(
     !refused
         .get(&host.to_ascii_lowercase())
         .is_some_and(|at| refusal_live(*at, now))
+}
+
+/// A pane's last OSC 7 report: the directory its shell says it is in, and
+/// the host that shell says it runs on.
+pub type CwdReport = (std::path::PathBuf, Option<String>);
+
+/// The remote directory to open when the ssh-pane offer for `host` is
+/// accepted (#364), from the pane's OSC 7 report now and the one it had when
+/// the offer appeared. A report is used only when it comes from another
+/// machine and is either new since the offer (the remote shell's first
+/// prompt) or names the offered host. A report from this machine, or a stale
+/// one left by an earlier session elsewhere, is never taken for the remote's
+/// directory; `None` then opens the login directory, as before.
+pub fn remote_workspace_path(
+    host: &str,
+    at_offer: Option<&CwdReport>,
+    now: Option<&CwdReport>,
+) -> Option<String> {
+    let (path, reporter) = now?;
+    let reporter = reporter.as_deref().filter(|h| !h.is_empty())?;
+    if crate::command_history::is_local_host(reporter) {
+        return None;
+    }
+    let fresh = at_offer != now;
+    if !fresh && !same_host(host, reporter) {
+        return None;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Whether an ssh alias and a shell-reported hostname name the same machine:
+/// equal ignoring case, or one is the other plus a domain (`db-1` and
+/// `db-1.internal`). `db-1` and `db-10` are different hosts.
+fn same_host(alias: &str, reported: &str) -> bool {
+    let (a, r) = (alias.to_ascii_lowercase(), reported.to_ascii_lowercase());
+    a == r
+        || r.strip_prefix(&a).is_some_and(|rest| rest.starts_with('.'))
+        || a.strip_prefix(&r).is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// The label thread's ssh verdict for each pane it named (#364). `named` is

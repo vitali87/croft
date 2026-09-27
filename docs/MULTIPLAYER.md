@@ -730,6 +730,21 @@ croft pair --base-url http://box:8080 --model qwen3-coder:30b   # implies ollama
   popup names the constraining participant and humans resolve it — the same
   social contract tmux users already live with.
 
+## Recording a session (`croft record`, #356)
+
+`croft record [path] [--out file.cast]` writes a running persistent session to
+an asciicast v2 file that `asciinema play` and `agg` read. The recorder is an
+ordinary client that says `Hello` with a **0x0** size, which the host treats as
+a pure observer on every axis: it never shrinks the shared PTY
+(`min_winsize` skips it), its input is dropped, and it is **never auto-granted
+write control**, even when it attaches first, so the next real client still
+gets control. It records the full-colour byte stream every participant is
+painted with. The size comes from the roster: the recorder recomputes the
+host's minimum over the other participants and writes an `r` event when it
+changes. The cast header therefore waits for at least one other participant.
+Lines are written and flushed one at a time, so `croft record --stop`
+(SIGTERM to the pid it left beside the socket) or Ctrl-C leaves a valid file.
+
 ## Sticky notes
 
 `Cmd+K N` leaves a note on a line: overlay state, never buffer content. In a `--solo` session the note replicates over the collab relay as `CollabMsg::Note`, and a guest that joins asks the owner for every note (`NotesRequest`). Every peer merges copies of a note the same way: fields from the higher `(rev, content)` copy, replies from both copies, and a deletion that no older copy can undo. So peers converge, and a concurrent reply is never lost. A note keeps the text of its line and finds that text again near where it was, so it follows the code without tracking edits. The owner (or a lone croft) keeps the notes in `~/.cache/croft/notes/`, so they survive disconnects and restarts.

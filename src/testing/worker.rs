@@ -47,6 +47,8 @@ pub enum TestRequest {
     /// arm anchors it with [`super::suite_pattern`] so `parse` cannot sweep
     /// `parse_utils::b`; pytest gets it positionally as a node-ID prefix.
     RunSuite(String),
+    /// Run everything with the runner's coverage tool on (#263).
+    RunCoverage,
     Discover,
     /// Rebind the worker's working directory (Explorer re-root). Without it the
     /// worker keeps shelling cargo in the launch dir captured at spawn, so after
@@ -72,6 +74,20 @@ pub enum TestResponse {
     /// Running marks the `start_*` call painted instead of stranding them,
     /// and the app can say why nothing ran.
     Refused,
+    /// A coverage run's report, or why there is none. Sent before its
+    /// `Finished`.
+    Coverage(Result<super::coverage::Coverage, CoverageError>),
+}
+
+/// Why a coverage run produced no report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverageError {
+    /// The runner's coverage tool is not installed: its name and the
+    /// command that installs it.
+    Missing { tool: &'static str, install: String },
+    /// The run ended without writing a report (it failed to build, or
+    /// the tool errored).
+    NoReport,
 }
 
 pub struct TestWorker {
@@ -122,6 +138,10 @@ impl TestWorker {
             },
             response_tx,
         )
+    }
+
+    pub fn run_coverage(&self) {
+        let _ = self.request_tx.send(TestRequest::RunCoverage);
     }
 
     pub fn run_all(&self) {
@@ -177,6 +197,7 @@ impl TestWorker {
                 TestResponse::Progress(line) => panel.set_progress(line),
                 TestResponse::Finished { ok } => panel.on_finished(ok),
                 TestResponse::Refused => panel.on_refused(),
+                TestResponse::Coverage(result) => panel.on_coverage(result),
             }
             changed = true;
         }
@@ -208,6 +229,7 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, Te
         let etx = EpochTx { tx: &tx, epoch };
         match req {
             TestRequest::RunAll => run_all(&root, &etx),
+            TestRequest::RunCoverage => run_coverage(&root, &etx),
             TestRequest::RunOne(name) => run_one(&root, &etx, &name),
             TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
             TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
@@ -750,6 +772,148 @@ fn run_all(root: &Path, tx: &EpochTx) {
     tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
+/// The report every runner is asked to write: LCOV, into `dir`.
+fn coverage_report(dir: &Path) -> PathBuf {
+    dir.join("lcov.info")
+}
+
+/// The run-everything argv with coverage on, writing LCOV into `dir`. Each
+/// keeps the output format the normal run parses, so results stream into
+/// the tree as usual.
+fn coverage_args(runner: Runner, dir: &Path) -> Vec<String> {
+    let dir_s = dir.display().to_string();
+    let report = coverage_report(dir).display().to_string();
+    let v = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    match runner {
+        Runner::Pytest => {
+            let mut a = v(&["-v", "--color=no", "--cov=.", "--cov-branch"]);
+            a.push(format!("--cov-report=lcov:{report}"));
+            a
+        }
+        Runner::Vitest => {
+            let mut a = v(&[
+                "run",
+                "--reporter=tap-flat",
+                "--coverage.enabled",
+                "--coverage.reporter=lcov",
+            ]);
+            a.push(format!("--coverage.reportsDirectory={dir_s}"));
+            a
+        }
+        Runner::Jest => {
+            let mut a = v(&["--json", "--coverage", "--coverageReporters=lcov"]);
+            a.push(format!("--coverageDirectory={dir_s}"));
+            a
+        }
+        Runner::Cargo => {
+            let mut a = v(&[
+                "llvm-cov",
+                "--no-fail-fast",
+                "--color=never",
+                "--lcov",
+                "--output-path",
+            ]);
+            a.push(report);
+            a
+        }
+    }
+}
+
+/// What installs a runner's coverage tool, picked from the project's own
+/// package manager. `None` for jest, whose coverage is built in.
+fn coverage_install(runner: Runner, root: &Path) -> Option<(&'static str, String)> {
+    let has = |f: &str| root.join(f).exists();
+    match runner {
+        Runner::Cargo => Some((
+            "cargo-llvm-cov",
+            String::from("cargo install cargo-llvm-cov"),
+        )),
+        Runner::Pytest => Some((
+            "pytest-cov",
+            if has("uv.lock") {
+                String::from("uv add --dev pytest-cov")
+            } else if has(".venv") {
+                String::from(".venv/bin/python -m pip install pytest-cov")
+            } else {
+                String::from("python3 -m pip install pytest-cov")
+            },
+        )),
+        Runner::Vitest => Some((
+            "@vitest/coverage-v8",
+            if has("pnpm-lock.yaml") {
+                String::from("pnpm add -D @vitest/coverage-v8")
+            } else if has("yarn.lock") {
+                String::from("yarn add -D @vitest/coverage-v8")
+            } else {
+                String::from("npm install -D @vitest/coverage-v8")
+            },
+        )),
+        Runner::Jest => None,
+    }
+}
+
+/// Whether the runner's coverage tool can run here.
+fn coverage_tool_present(runner: Runner, root: &Path) -> bool {
+    match runner {
+        Runner::Cargo => cargo_cmd(root, &["llvm-cov", "--version"])
+            .status()
+            .is_ok_and(|s| s.success()),
+        Runner::Pytest => pytest_cmd(root, &["--help"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("--cov")),
+        Runner::Vitest => ["coverage-v8", "coverage-istanbul"]
+            .iter()
+            .any(|p| root.join("node_modules/@vitest").join(p).is_dir()),
+        Runner::Jest => true,
+    }
+}
+
+/// Run everything with coverage (#263). A missing tool is reported before
+/// anything runs, with the command that installs it; the tree is left as
+/// it was.
+fn run_coverage(root: &Path, tx: &EpochTx) {
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Refused);
+        return;
+    };
+    if !coverage_tool_present(runner, root)
+        && let Some((tool, install)) = coverage_install(runner, root)
+    {
+        {
+            tx.send(TestResponse::Coverage(Err(CoverageError::Missing {
+                tool,
+                install,
+            })));
+            tx.send(TestResponse::Finished { ok: None });
+            return;
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("croft-coverage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    tx.send(TestResponse::Started(Activity::Running));
+    let args = coverage_args(runner, &dir);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let ok = match runner {
+        Runner::Pytest => run_streaming(tx, pytest_cmd(root, &args), one(parse_pytest_line)),
+        Runner::Vitest => run_streaming(
+            tx,
+            js_cmd(root, "vitest", &args),
+            one(parse_vitest_tap_line),
+        ),
+        Runner::Jest => run_streaming(tx, js_cmd(root, "jest", &args), |line| {
+            parse_jest_json(root, line)
+        }),
+        Runner::Cargo => run_streaming(tx, cargo_cmd(root, &args), one(parse_test_line)),
+    }
+    .unwrap_or(false);
+    let report = std::fs::read_to_string(coverage_report(&dir))
+        .map(|text| super::coverage::Coverage::from_lcov(&text, root))
+        .map_err(|_| CoverageError::NoReport);
+    tx.send(TestResponse::Coverage(report));
+    tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
 /// Run a single test by exact name: `cargo test <name> --color=never -- --exact`
 /// (`--exact` stops the name being treated as a substring filter), or for
 /// pytest the node ID itself, which is already exact. No `Started` is sent: the
@@ -1256,6 +1420,62 @@ mod tests {
         assert_eq!(
             vitest_filter_args("tests/a.test.js", true),
             vec!["run", "tests/a.test.js", "--reporter=tap-flat"]
+        );
+    }
+
+    #[test]
+    fn coverage_runs_keep_each_runners_output_and_write_lcov_into_the_dir() {
+        let dir = Path::new("/t/cov");
+        let py = coverage_args(Runner::Pytest, dir);
+        assert!(
+            py.contains(&"--cov-report=lcov:/t/cov/lcov.info".to_string()),
+            "{py:?}"
+        );
+        assert!(py.contains(&"--cov-branch".to_string()) && py.contains(&"-v".to_string()));
+        let vi = coverage_args(Runner::Vitest, dir);
+        assert!(vi.contains(&"--reporter=tap-flat".to_string()));
+        assert!(
+            vi.contains(&"--coverage.reportsDirectory=/t/cov".to_string()),
+            "{vi:?}"
+        );
+        let je = coverage_args(Runner::Jest, dir);
+        assert!(je.contains(&"--json".to_string()));
+        assert!(je.contains(&"--coverageDirectory=/t/cov".to_string()));
+        let ca = coverage_args(Runner::Cargo, dir);
+        assert_eq!(ca[0], "llvm-cov");
+        assert_eq!(ca.last().unwrap(), "/t/cov/lcov.info");
+        assert_eq!(coverage_report(dir), Path::new("/t/cov/lcov.info"));
+    }
+
+    #[test]
+    fn the_install_offer_follows_the_projects_package_manager() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            coverage_install(Runner::Jest, d.path()),
+            None,
+            "jest has coverage built in"
+        );
+        assert_eq!(
+            coverage_install(Runner::Pytest, d.path()).unwrap().1,
+            "python3 -m pip install pytest-cov"
+        );
+        std::fs::write(d.path().join("uv.lock"), "").unwrap();
+        assert_eq!(
+            coverage_install(Runner::Pytest, d.path()).unwrap().1,
+            "uv add --dev pytest-cov"
+        );
+        assert_eq!(
+            coverage_install(Runner::Vitest, d.path()).unwrap().1,
+            "npm install -D @vitest/coverage-v8"
+        );
+        std::fs::write(d.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(
+            coverage_install(Runner::Vitest, d.path()).unwrap().1,
+            "pnpm add -D @vitest/coverage-v8"
+        );
+        assert_eq!(
+            coverage_install(Runner::Cargo, d.path()).unwrap().0,
+            "cargo-llvm-cov"
         );
     }
 }

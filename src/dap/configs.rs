@@ -571,6 +571,7 @@ pub fn adapter_for_type(type_name: &str) -> Option<AdapterKind> {
     match type_name {
         "python" | "debugpy" => Some(AdapterKind::Debugpy),
         "lldb" | "lldb-dap" | "cppdbg" | "codelldb" => Some(AdapterKind::LldbDap),
+        "go" => Some(AdapterKind::Delve),
         "node" | "pwa-node" | "node-terminal" | "javascript" => Some(AdapterKind::JsDebug),
         _ => None,
     }
@@ -719,7 +720,7 @@ const MAPPED_KEYS: &[&str] = &[
 pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, String> {
     let kind = adapter_for_type(&cfg.type_name).ok_or_else(|| {
         format!(
-            "config \"{}\": unsupported type \"{}\" (python, lldb, and node families are supported)",
+            "config \"{}\": unsupported type \"{}\" (python, lldb, node and go families are supported)",
             cfg.name, cfg.type_name
         )
     })?;
@@ -919,6 +920,30 @@ pub fn lldb_request(rc: &ResolvedConfig) -> Value {
     }
 }
 
+/// Build the delve `launch`/`attach` request (#264). `mode` passes through
+/// from the config and defaults to delve's own defaults: `debug` to launch
+/// (build and run the package at `program`), `local` to attach to `processId`.
+pub fn delve_request(rc: &ResolvedConfig) -> Value {
+    let mut args = base_arguments(rc);
+    if !rc.env.is_empty() {
+        args.insert("env".into(), json!(rc.env));
+    }
+    match rc.request {
+        RequestKind::Launch => {
+            args.entry("mode").or_insert_with(|| json!("debug"));
+            request_value("launch", args)
+        }
+        RequestKind::Attach => {
+            args.entry("mode").or_insert_with(|| json!("local"));
+            if let Some(pid) = rc.process_id {
+                args.insert("processId".into(), json!(pid));
+            }
+            args.remove("stopOnEntry");
+            request_value("attach", args)
+        }
+    }
+}
+
 /// Build the vscode-js-debug `launch`/`attach` request (`pwa-node`, the
 /// canonical Node type — croft already normalises onto it for zero-config).
 pub fn js_request(rc: &ResolvedConfig) -> Value {
@@ -1027,8 +1052,44 @@ mod tests {
         assert_eq!(cfgs[1].name, "Worker");
     }
 
+    /// #264: a `type: "go"` config defaults delve's `mode` the way delve
+    /// does, and an explicit `mode` (e.g. `test`) passes through.
     #[test]
-    fn maps_the_three_adapter_families_and_rejects_unknown_types() {
+    fn delve_request_defaults_mode_and_passes_an_explicit_one_through() {
+        let launch = resolve(
+            &config(
+                r#"[{ "name": "G", "type": "go", "request": "launch", "program": "./cmd/app" }]"#,
+            ),
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(launch.kind, AdapterKind::Delve);
+        let req = delve_request(&launch);
+        assert_eq!(req["command"], "launch");
+        assert_eq!(req["arguments"]["mode"], "debug");
+        assert_eq!(req["arguments"]["program"], "./cmd/app");
+
+        let test = resolve(
+            &config(r#"[{ "name": "T", "type": "go", "request": "launch", "mode": "test", "program": "." }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(delve_request(&test)["arguments"]["mode"], "test");
+
+        let attach = resolve(
+            &config(r#"[{ "name": "A", "type": "go", "request": "attach", "processId": 77 }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        let req = delve_request(&attach);
+        assert_eq!(req["command"], "attach");
+        assert_eq!(req["arguments"]["mode"], "local");
+        assert_eq!(req["arguments"]["processId"], 77);
+        assert!(req["arguments"].get("stopOnEntry").is_none());
+    }
+
+    #[test]
+    fn maps_the_adapter_families_and_rejects_unknown_types() {
         use AdapterKind::*;
         for (t, k) in [
             ("python", Debugpy),
@@ -1037,13 +1098,14 @@ mod tests {
             ("cppdbg", LldbDap),
             ("node", JsDebug),
             ("pwa-node", JsDebug),
+            ("go", Delve),
         ] {
             assert_eq!(adapter_for_type(t), Some(k), "{t}");
         }
-        assert_eq!(adapter_for_type("go"), None);
-        let cfg = config(r#"[{ "name": "Go", "type": "go", "program": "main.go" }]"#);
+        let cfg = config(r#"[{ "name": "J", "type": "java", "program": "Main.java" }]"#);
         let err = resolve(&cfg, &ctx()).unwrap_err();
-        assert!(err.contains("unsupported type \"go\""), "{err}");
+        assert!(err.contains("unsupported type \"java\""), "{err}");
+        assert!(err.contains("go"), "the supported list names go: {err}");
     }
 
     #[test]

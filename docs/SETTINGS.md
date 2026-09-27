@@ -86,7 +86,7 @@ allowlist — appearance and editor/terminal behavior:
 `disable_inline_values`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`.
 
-Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `fleet_groups`, `lane_agent`,
+Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `lane_agent`,
 `mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `locale`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.
@@ -119,6 +119,25 @@ set them.
 
 The mapped values sit **below** `.croft/config.json` in the chain, so a
 croft-native workspace file always wins over the VS Code one.
+
+## Config sync to remotes
+
+`croft remote <host>` pushes your `keybindings.json`, `snippets.json`,
+`triggers.json`, `matchers.json` and `macros.json` to the remote's
+`~/.config/croft/` on connect, only when their content differs (#262).
+`config.json` never travels: it carries MCP consent and tool fingerprints,
+which must be granted per machine. Two user-layer settings opt out:
+
+```jsonc
+{
+  // Never push to these hosts (ssh config aliases, case-insensitive).
+  "config_sync_excluded_hosts": ["shared-box"],
+  // Never push these files to any host.
+  "config_sync_excluded_files": ["keybindings.json"]
+}
+```
+
+The connect output says what was pushed, what was skipped and why.
 
 ## Notification sinks
 

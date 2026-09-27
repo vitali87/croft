@@ -1,3 +1,5 @@
+pub mod agent_lane;
+pub mod approval_popup;
 pub mod branch_picker;
 pub mod captures;
 pub mod command_palette;
@@ -22,6 +24,7 @@ pub mod osk;
 pub mod outline;
 pub mod output;
 pub mod ports;
+pub mod pr_review;
 pub mod problems;
 pub mod process_picker;
 pub mod remote;

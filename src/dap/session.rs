@@ -191,6 +191,31 @@ pub enum AdapterKind {
     /// program under Node. Multi-session: a parent bootstraps and a child binds
     /// breakpoints (see [`start_debugging_request`]).
     JsDebug,
+    /// delve (`dlv dap` over TCP), launches a Go package or test (#264).
+    /// Single-session: breakpoints bind in the one connection, like debugpy.
+    Delve,
+}
+
+/// The zero-config delve `launch` for the Go file at `file` (#264): the file's
+/// package directory is the program, which delve builds itself. A `_test.go`
+/// file runs in delve's `test` mode (the package's tests); anything else in
+/// `debug` mode (the package's `main`).
+pub fn delve_zero_config_request(file: &Path) -> Value {
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let is_test = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("_test.go"));
+    json!({
+        "type": "request",
+        "command": "launch",
+        "arguments": {
+            "mode": if is_test { "test" } else { "debug" },
+            "program": dir.to_string_lossy(),
+            "cwd": dir.to_string_lossy(),
+            "stopOnEntry": false,
+        }
+    })
 }
 
 /// Build the lldb-dap `launch` request for a compiled `program` binary. Unlike
@@ -939,6 +964,9 @@ pub struct DapSession {
     /// value changes", and the `dataBreakpointInfo` requests in flight.
     pub data_breakpoints: Vec<(String, String)>,
     pending_data_info: std::collections::HashMap<i64, String>,
+    /// The session attached to a process croft did not start, so ending
+    /// it must leave that process running.
+    attached: bool,
 }
 
 impl DapSession {
@@ -978,8 +1006,11 @@ impl DapSession {
     ) -> Result<DapSession> {
         let transport = DapTransport::spawn(adapter_program, adapter_args, cwd)?;
         transport.send(initialize_request())?;
+        let attached = is_attach(&launch_request);
         transport.send(launch_request)?;
-        Ok(Self::new_with_transport(transport, breakpoints, None))
+        let mut session = Self::new_with_transport(transport, breakpoints, None);
+        session.attached = attached;
+        Ok(session)
     }
 
     /// Launch a vscode-js-debug session: spawn `node dapDebugServer.js <port>
@@ -1033,6 +1064,28 @@ impl DapSession {
         ))
     }
 
+    /// Launch a delve session (#264): spawn `dlv dap --listen=<host:port>`,
+    /// connect over TCP, and send `start_request`. delve serves one session
+    /// per connection, so unlike js-debug there is no child to open later.
+    pub fn launch_delve(
+        dlv: &Path,
+        cwd: &Path,
+        start_request: Value,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> Result<DapSession> {
+        let host = "127.0.0.1";
+        let port = super::transport::free_port()?;
+        let args = vec![String::from("dap"), format!("--listen={host}:{port}")];
+        let transport =
+            DapTransport::connect_tcp_server(&dlv.to_string_lossy(), &args, cwd, host, port, None)?;
+        transport.send(initialize_request())?;
+        let attached = is_attach(&start_request);
+        transport.send(start_request)?;
+        let mut session = Self::new_with_transport(transport, breakpoints, None);
+        session.attached = attached;
+        Ok(session)
+    }
+
     /// Assemble a fresh session around its (parent) `transport`. `js_server` is
     /// set only for vscode-js-debug, marking the session multi-session and
     /// carrying the address its child connection reuses.
@@ -1063,6 +1116,7 @@ impl DapSession {
             run_to: None,
             data_breakpoints: Vec::new(),
             pending_data_info: std::collections::HashMap::new(),
+            attached: false,
         }
     }
 
@@ -1515,19 +1569,32 @@ impl DapSession {
 
     /// Ask the adapter to disconnect and terminate the debuggee. Sent to both the
     /// child (if any) and the parent so a js-debug server tears the whole tree
-    /// down, not just the target.
+    /// down, not just the target. An attached session leaves its process
+    /// running: croft did not start it, and delve and lldb-dap both honour
+    /// `terminateDebuggee` for an attach.
     pub fn disconnect(&mut self) {
-        let req = json!({
-            "type": "request",
-            "command": "disconnect",
-            "arguments": { "terminateDebuggee": true }
-        });
+        let req = disconnect_request(self.attached);
         if let Some(child) = self.child.as_ref() {
             let _ = child.send(req.clone());
         }
         let _ = self.transport.send(req);
         self.phase = SessionPhase::Terminated;
     }
+}
+
+/// Whether a start request attaches to a running process rather than
+/// launching one.
+fn is_attach(request: &Value) -> bool {
+    request["command"] == "attach"
+}
+
+/// `disconnect`, ending the debuggee only when the session launched it.
+fn disconnect_request(attached: bool) -> Value {
+    json!({
+        "type": "request",
+        "command": "disconnect",
+        "arguments": { "terminateDebuggee": !attached }
+    })
 }
 
 /// The `(name, value)` pairs inline values draw from (#135): every variable
@@ -1727,6 +1794,63 @@ fn with_run_to(
 
 #[cfg(test)]
 mod tests {
+    /// #264: zero-config Go debugging runs the file's package; a `_test.go`
+    /// file runs the package's tests instead.
+    #[test]
+    fn delve_zero_config_runs_the_package_or_its_tests() {
+        let main = delve_zero_config_request(Path::new("/w/cmd/app/main.go"));
+        assert_eq!(main["arguments"]["mode"], "debug");
+        assert_eq!(main["arguments"]["program"], "/w/cmd/app");
+        let test = delve_zero_config_request(Path::new("/w/pkg/util_test.go"));
+        assert_eq!(test["arguments"]["mode"], "test");
+        assert_eq!(test["arguments"]["program"], "/w/pkg");
+    }
+
+    /// End to end against a real delve: a breakpoint in a small Go program
+    /// binds, the program stops there, and the stop is reported at that line.
+    /// Needs Go and `dlv` (CROFT_TEST_DLV, or the usual discovery), so it is
+    /// ignored by default; run it with `--ignored`.
+    #[test]
+    #[ignore]
+    fn delve_stops_at_a_breakpoint_in_a_real_go_program() {
+        let dlv = std::env::var_os("CROFT_TEST_DLV")
+            .map(PathBuf::from)
+            .or_else(|| crate::dap::install::dlv_program().ok())
+            .expect("dlv");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module t\n\ngo 1.21\n").unwrap();
+        let main = tmp.path().join("main.go");
+        std::fs::write(
+            &main,
+            "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tx := 41\n\tx++\n\tfmt.Println(x)\n}\n",
+        )
+        .unwrap();
+        let main = main.canonicalize().unwrap();
+        let mut bps = BTreeMap::new();
+        bps.insert(main.clone(), vec![SourceBreakpoint::plain(7)]);
+        let mut s = DapSession::launch_delve(
+            &dlv,
+            main.parent().unwrap(),
+            delve_zero_config_request(&main),
+            bps,
+        )
+        .expect("delve starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while s.phase != SessionPhase::Stopped && std::time::Instant::now() < deadline {
+            s.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(s.phase, SessionPhase::Stopped, "delve never stopped");
+        while s.current_location.is_none() && std::time::Instant::now() < deadline {
+            s.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (file, line) = s.current_location.clone().expect("a stop location");
+        assert_eq!(line, 7);
+        assert_eq!(file.canonicalize().unwrap(), main);
+        s.disconnect();
+    }
+
     #[test]
     fn run_to_cursor_stops_even_on_a_logpoint_line() {
         let src = PathBuf::from("/w/app.py");
@@ -1750,6 +1874,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn stopping_an_attached_session_leaves_its_process_running() {
+        let attach = json!({"type": "request", "command": "attach", "arguments": {"processId": 7}});
+        let launch = json!({"type": "request", "command": "launch", "arguments": {}});
+        assert!(is_attach(&attach));
+        assert!(!is_attach(&launch));
+        assert_eq!(
+            disconnect_request(is_attach(&attach))["arguments"]["terminateDebuggee"],
+            false
+        );
+        assert_eq!(
+            disconnect_request(is_attach(&launch))["arguments"]["terminateDebuggee"],
+            true
+        );
+    }
 
     #[test]
     fn inline_locals_prefer_local_scopes_and_fall_back_to_the_first() {

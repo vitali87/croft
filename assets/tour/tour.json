@@ -1,0 +1,13 @@
+{
+  "steps": [
+    { "action": { "open": "src/main.rs" }, "caption": "This is croft. A file opens in a tab, highlighted, with a language server behind it. Press Enter to go on, Esc to leave the tour at any time." },
+    { "action": "quick_open", "caption": "Cmd+P finds any file by a few letters of its name. Type 'app' and press Enter, or press Esc to close it." },
+    { "action": "split_editor", "caption": "Cmd+\\ splits the editor so two files sit side by side." },
+    { "action": "terminal", "caption": "Ctrl+` opens a real terminal inside croft. It runs your shell, in this folder." },
+    { "action": { "run": "python3 -m py_compile app.py" }, "caption": "Commands run right here. This one checks app.py, and it has a mistake in it." },
+    { "action": "jump_to_error", "caption": "croft reads the error in the terminal and takes you to the line. Cmd+click does the same on any file:line you see." },
+    { "action": "command_palette", "caption": "Cmd+Shift+P is the command palette: every command croft has, searchable." },
+    { "action": "theme_picker", "caption": "Pick a colour theme with the arrows. Enter keeps it." },
+    { "action": "done", "caption": "That is the tour. Press Enter to finish; the sample project is removed and you are back in croft." }
+  ]
+}
