@@ -1423,10 +1423,11 @@ impl Drop for LspClient {
 }
 
 /// The `oom_score_adj` a language server runs with (#694): well above croft's
-/// own 0, so when memory runs out the kernel kills the server before croft
-/// and the shells in its panes: losing a server costs language features
-/// until it is started again, losing croft costs every pane. rust-analyzer
-/// alone held 2.4 GB in the OOM that prompted this.
+/// own 0, so when memory runs out the kernel is far likelier to pick the
+/// server than croft and the shells in its panes. Likelier, not certain: the
+/// adjustment is added to a score that also counts memory use. Losing a
+/// server costs language features until it is started again; losing croft
+/// costs every pane. rust-analyzer alone held 2.4 GB in the OOM behind this.
 const LANGUAGE_SERVER_OOM_SCORE_ADJ: &[u8] = b"500";
 
 /// Make a child the kernel's preferred OOM victim, set in the child between

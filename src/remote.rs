@@ -3089,9 +3089,9 @@ if [ -n "$CROFT_LIVE" ]; then
   # seconds to shut down cleanly: let both finish before the first rustc.
   sleep 5
 fi
-# And make the compile the kernel's first choice if memory still runs out
-# (#694): an OOM kill took croft or a terminal pane when rustc was the one
-# growing. Raising one's own score needs no privilege; cargo and every rustc
+# And make the compile the kernel's likeliest choice if memory still runs
+# out (#694): an OOM kill took croft or a terminal pane when rustc was the
+# one growing. The maximum adjustment, though memory use still counts too. Raising one's own score needs no privilege; cargo and every rustc
 # it starts inherit it. Best effort where /proc is read-only.
 echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
 # eval, because this script runs under the remote user's login shell and
