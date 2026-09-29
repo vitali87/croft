@@ -65453,3 +65453,79 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         app.settings_chain
     );
 }
+
+/// #840 regression, through base APIs only: clicking the QL icon walked the
+/// whole workspace for queries on the UI thread before the view switched,
+/// so the list was already filled when `open_codeql_view` returned. The
+/// view now switches at once and the walk's packs land on a later tick.
+#[test]
+fn opening_the_codeql_view_returns_before_the_query_walk_lands() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
+        std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            names.is_empty(),
+            "the walk ran on the UI thread before the view opened: {names:?}"
+        );
+    });
+}
+
+/// #840 negative: reopening the view while a walk is in flight keeps that
+/// walk rather than starting a second over the same tree: what it sends is
+/// what lands.
+#[test]
+fn reopening_the_codeql_view_keeps_the_walk_in_flight() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.codeql_queries_job = Some(rx);
+        app.open_codeql_view();
+        let pack = crate::codeql_query::QueryPack {
+            name: String::from("acme/in-flight"),
+            language: None,
+            dir: tmp.path().to_path_buf(),
+            queries: Vec::new(),
+        };
+        tx.send(vec![pack]).unwrap();
+        assert!(app.drain_codeql_queries());
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/in-flight"]);
+    });
+}
+
+/// #840 negative: a walk whose thread died without sending stops the
+/// "Discovering queries" line and leaves the list alone; with no walk in
+/// flight a drain changes nothing.
+#[test]
+fn a_query_walk_that_dies_stops_saying_it_is_discovering() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert!(
+            !app.drain_codeql_queries(),
+            "nothing in flight, nothing changes"
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::codeql_query::QueryPack>>();
+        drop(tx);
+        app.codeql_queries_job = Some(rx);
+        app.codeql.discovering_queries = true;
+        assert!(app.drain_codeql_queries());
+        assert!(!app.codeql.discovering_queries);
+        assert!(app.codeql_queries_job.is_none());
+        assert!(app.codeql.queries.is_empty());
+    });
+}
