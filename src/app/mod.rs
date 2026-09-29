@@ -13406,7 +13406,10 @@ impl App {
                 self.refresh_source_control();
                 self.status = format!("Merge complete: staged {rel}");
             }
-            Err(e) => self.status = format!("Stage failed: {e}"),
+            Err(e) => {
+                let why = self.git_error_line("add", &e);
+                self.status = format!("Stage failed: {why}");
+            }
         }
     }
 
@@ -31407,7 +31410,8 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.status = format!("git show HEAD failed: {e}");
+                        let why = self.git_error_line("show HEAD", &e);
+                        self.status = format!("git show HEAD failed: {why}");
                         // Fall back to plain open so the user still sees
                         // something rather than nothing.
                         if abs.is_file() {
@@ -31435,7 +31439,8 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.status = format!("git show HEAD failed: {e}");
+                        let why = self.git_error_line("show HEAD", &e);
+                        self.status = format!("git show HEAD failed: {why}");
                         false
                     }
                 }
@@ -31491,7 +31496,8 @@ impl App {
             }
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                self.status = format!("git init failed: {err}");
+                let why = self.git_error_line("init", &err);
+                self.status = format!("git init failed: {why}");
             }
             Err(e) => {
                 self.status = format!("git init failed: {e}");
@@ -31539,8 +31545,9 @@ impl App {
                 };
             }
             Err(err) => {
-                self.status = format!("Stage failed: {err}");
-                self.source_control.commit_feedback = Some(err);
+                let why = self.git_error_line("add", &err);
+                self.status = format!("Stage failed: {why}");
+                self.source_control.commit_feedback = Some(why);
                 self.source_control.commit_feedback_is_error = true;
             }
         }
@@ -31610,13 +31617,20 @@ impl App {
         self.log_git("pull", &result);
         match result {
             Ok(summary) => {
+                // git's result ("Fast-forward", "Already up to date."), not
+                // the `From <url>` / `Updating a..b` lines before it (#858).
+                let summary = crate::git::result_line(&summary);
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pulled".to_string()
                 } else {
                     format!("pulled: {summary}")
                 });
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Pulled: {summary}");
+                self.status = if summary.is_empty() {
+                    String::from("Pulled")
+                } else {
+                    format!("Pulled: {summary}")
+                };
             }
             Err(err) => {
                 self.source_control.commit_feedback = Some(crate::git::failure_line("pull", &err));
@@ -31642,10 +31656,14 @@ impl App {
         });
     }
 
+    /// Report a finished Sync on one line (#858): what the pull did and the
+    /// push's ref update ("Synced: pulled: Fast-forward | pushed: a..b main
+    /// -> main"), or why either half failed; the Git Output log keeps both
+    /// of git's texts.
     fn finish_sync(&mut self, pull: Result<String, String>, push: Option<Result<String, String>>) {
         self.log_git("pull", &pull);
         let pull_summary = match pull {
-            Ok(s) => s,
+            Ok(s) => crate::git::result_line(&s),
             Err(err) => {
                 // One line (#858): the conflicts the pull stopped on, or
                 // git's error line; the Git Output log has the rest.
@@ -31659,18 +31677,31 @@ impl App {
                 return;
             }
         };
-        match push.unwrap_or_else(|| Err(String::from("push did not run"))) {
+        let push = push.unwrap_or_else(|| Err(String::from("push did not run")));
+        self.log_git("push", &push);
+        match push {
             Ok(push_summary) => {
-                self.source_control.commit_feedback = Some(format!(
-                    "synced (pulled: {pull_summary} | pushed: {push_summary})"
-                ));
+                let push_summary = crate::git::summary_line(&push_summary);
+                let combined = [("pulled", pull_summary), ("pushed", push_summary)]
+                    .into_iter()
+                    .filter(|(_, summary)| !summary.is_empty())
+                    .map(|(half, summary)| format!("{half}: {summary}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let (feedback, status) = if combined.is_empty() {
+                    (String::from("synced"), String::from("Synced"))
+                } else {
+                    (format!("synced: {combined}"), format!("Synced: {combined}"))
+                };
+                self.source_control.commit_feedback = Some(feedback);
                 self.source_control.commit_feedback_is_error = false;
-                self.status = String::from("Synced");
+                self.status = status;
             }
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("pull ok; push failed: {err}"));
+                let why = crate::git::error_line(&err);
+                self.source_control.commit_feedback = Some(format!("pull ok; push failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Sync: pull ok; push failed: {err}");
+                self.status = format!("Sync: pull ok; push failed: {why}");
             }
         }
         self.active_git_bypass_debounce();
@@ -31679,18 +31710,27 @@ impl App {
     }
 
     /// Stash the working tree (`git stash push`). Reached from the commit
-    /// dropdown's "Stash" item.
+    /// dropdown's "Stash" item. Reported on one line (#858); the Git Output
+    /// log keeps git's text.
     pub fn stash_source_control(&mut self) {
-        match crate::git::stash_push(&self.scm_root()) {
+        let stashed = crate::git::stash_push(&self.scm_root());
+        self.log_git("stash push", &stashed);
+        match stashed {
             Ok(summary) => {
-                self.source_control.commit_feedback = Some(format!("stashed: {summary}"));
+                let summary = crate::git::result_line(&summary);
+                let (feedback, status) = if summary.is_empty() {
+                    (String::from("stashed"), String::from("Stashed"))
+                } else {
+                    (format!("stashed: {summary}"), format!("Stashed: {summary}"))
+                };
+                self.source_control.commit_feedback = Some(feedback);
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Stashed: {summary}");
+                self.status = status;
             }
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("stash failed: {err}"));
+                self.source_control.commit_feedback = Some(crate::git::failure_line("stash", &err));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Stash failed: {err}");
+                self.status = crate::git::failure_line("Stash", &err);
             }
         }
         self.active_git_bypass_debounce();
@@ -31706,9 +31746,19 @@ impl App {
         self.log_git("stash pop", &popped);
         match popped {
             Ok(summary) => {
-                self.source_control.commit_feedback = Some(format!("popped: {summary}"));
+                // The stash it dropped, not the `git status` dump before it.
+                let summary = crate::git::result_line(&summary);
+                let (feedback, status) = if summary.is_empty() {
+                    (String::from("popped"), String::from("Stash popped"))
+                } else {
+                    (
+                        format!("popped: {summary}"),
+                        format!("Stash popped: {summary}"),
+                    )
+                };
+                self.source_control.commit_feedback = Some(feedback);
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Stash popped: {summary}");
+                self.status = status;
             }
             Err(err) => {
                 self.source_control.commit_feedback =
@@ -31739,8 +31789,9 @@ impl App {
                 self.refresh_source_control();
             }
             Err(err) => {
-                self.status = format!("Unstage failed: {err}");
-                self.source_control.commit_feedback = Some(err);
+                let why = self.git_error_line("reset -q HEAD --", &err);
+                self.status = format!("Unstage failed: {why}");
+                self.source_control.commit_feedback = Some(why);
                 self.source_control.commit_feedback_is_error = true;
             }
         }
@@ -31765,6 +31816,14 @@ impl App {
         }
     }
 
+    /// Git's error `err` on the one line the status bar and the Source
+    /// Control panel show ([`crate::git::error_line`]), its whole text sent
+    /// to the Git Output log under `label` (#858).
+    fn git_error_line(&mut self, label: &str, err: &str) -> String {
+        self.log_git(label, &Err(err.to_string()));
+        crate::git::error_line(err)
+    }
+
     /// Run an immediate git operation: log it, surface its summary or error
     /// in the commit-feedback line, and refresh the panel. The single path
     /// every "⋯"-menu leaf that acts now (vs. opening a modal) flows through.
@@ -31781,14 +31840,17 @@ impl App {
         self.log_git(label, &outcome);
         match outcome {
             Ok(summary) => {
-                let summary = crate::git::headline(&summary);
-                self.source_control.commit_feedback = Some(if summary.is_empty() {
+                // git's result line, past a fetch's `From <url>`, a push's
+                // `To <url>` and the like (#858).
+                let summary = crate::git::result_line(&summary);
+                let line = if summary.is_empty() {
                     ok_prefix.to_string()
                 } else {
                     format!("{ok_prefix}: {summary}")
-                });
+                };
+                self.source_control.commit_feedback = Some(line.clone());
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("{ok_prefix}: {summary}");
+                self.status = line;
             }
             Err(err) => {
                 let line = crate::git::failure_line(noun, &err);
@@ -31901,10 +31963,10 @@ impl App {
                 }
             }
             Err(err) => {
-                self.log_git("clone", &Err(err.clone()));
-                self.source_control.commit_feedback = Some(format!("clone failed: {err}"));
+                let why = self.git_error_line("clone", &err);
+                self.source_control.commit_feedback = Some(format!("clone failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Clone failed: {err}");
+                self.status = format!("Clone failed: {why}");
             }
         }
     }
@@ -35488,9 +35550,10 @@ impl App {
         let raw = match crate::git::diff_staged(&self.scm_root()) {
             Ok(r) => r,
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
+                let why = self.git_error_line("diff --staged", &err);
+                self.source_control.commit_feedback = Some(format!("diff failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("View Staged Changes failed: {err}");
+                self.status = format!("View Staged Changes failed: {why}");
                 return;
             }
         };
@@ -35528,9 +35591,10 @@ impl App {
         let raw = match crate::git::diff_against_branch(&self.scm_root(), &branch) {
             Ok(r) => r,
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
+                let why = self.git_error_line(&format!("diff {branch}"), &err);
+                self.source_control.commit_feedback = Some(format!("diff failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("View Changes vs {branch} failed: {err}");
+                self.status = format!("View Changes vs {branch} failed: {why}");
                 return;
             }
         };
@@ -35561,9 +35625,10 @@ impl App {
         let raw = match crate::git::diff_previous_commit(&self.scm_root()) {
             Ok(r) => r,
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
+                let why = self.git_error_line("diff HEAD~1", &err);
+                self.source_control.commit_feedback = Some(format!("diff failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("View Changes vs previous failed: {err}");
+                self.status = format!("View Changes vs previous failed: {why}");
                 return;
             }
         };
@@ -35662,8 +35727,9 @@ impl App {
                 self.refresh_source_control();
             }
             Err(err) => {
-                self.status = format!("Stage failed: {err}");
-                self.source_control.commit_feedback = Some(err);
+                let why = self.git_error_line("add", &err);
+                self.status = format!("Stage failed: {why}");
+                self.source_control.commit_feedback = Some(why);
                 self.source_control.commit_feedback_is_error = true;
             }
         }
@@ -36092,8 +36158,9 @@ impl App {
                 self.refresh_source_control();
             }
             Err(err) => {
-                self.status = format!("Discard failed: {err}");
-                self.source_control.commit_feedback = Some(err);
+                let why = self.git_error_line("checkout -- (discard)", &err);
+                self.status = format!("Discard failed: {why}");
+                self.source_control.commit_feedback = Some(why);
                 self.source_control.commit_feedback_is_error = true;
             }
         }
@@ -48671,29 +48738,46 @@ impl App {
     /// feedback line so the user can amend the name.
     fn apply_branch_action(&mut self, action: crate::widgets::branch_picker::BranchAction) {
         use crate::widgets::branch_picker::BranchAction;
-        let (result, verb) = match &action {
+        let (result, verb, label, name) = match &action {
             BranchAction::Checkout(name) => (
                 crate::git::checkout_branch(&self.scm_root(), name),
                 "Switched to",
+                "switch",
+                name,
             ),
-            BranchAction::Create(name) => {
-                (crate::git::create_branch(&self.scm_root(), name), "Created")
-            }
+            BranchAction::Create(name) => (
+                crate::git::create_branch(&self.scm_root(), name),
+                "Created",
+                "switch -c",
+                name,
+            ),
         };
+        self.log_git(label, &result);
         match result {
             Ok(summary) => {
+                // One line (#858): git's result, or, when git said only which
+                // edits it carried over (`M\tpath`) or how the branch stands
+                // against its upstream, where the switch went.
+                let summary = crate::git::result_line(&summary);
+                let (feedback, status) = if summary.is_empty() {
+                    let line = format!("{verb} {name}");
+                    (line.clone(), line)
+                } else {
+                    (summary.clone(), format!("{verb}: {summary}"))
+                };
                 self.close_branch_picker();
-                self.source_control.commit_feedback = Some(summary.clone());
+                self.source_control.commit_feedback = Some(feedback);
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("{verb}: {summary}");
+                self.status = status;
                 self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("branch: {err}"));
+                let why = crate::git::error_line(&err);
+                self.source_control.commit_feedback = Some(format!("branch: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Branch: {err}");
+                self.status = format!("Branch: {why}");
             }
         }
     }

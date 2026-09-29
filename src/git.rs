@@ -1010,6 +1010,59 @@ pub fn summary_line(output: &str) -> String {
     words.collect::<Vec<_>>().join(" ")
 }
 
+/// The one line a git operation that succeeded reports in the status bar
+/// and the Source Control panel (#858): git's result ("Already up to
+/// date.", "Fast-forward", "Merge made by the 'ort' strategy.",
+/// "Successfully rebased and updated refs/heads/main.", "Dropped
+/// refs/stash@{0} (…)", "[main 5a6cd5c] subject"). Passed over on the way:
+/// the fetch's `From <url>` and the push's `To <url>`, `remote:` chatter,
+/// `hint:`s, `Updating a..b`, `Fetching <remote>`, `Auto-merging` notes,
+/// the `warning:` / `error:` / `fatal:` asides a success can still carry
+/// (a failed push negotiation), the `git status` dump a stash or a switch
+/// prints, the `M\tpath` rows a switch lists, and every indented line (ref
+/// updates, the diffstat, file lists). Lines read as [`shown`]. When
+/// nothing else is left, the ref update if there is one ([`summary_line`]),
+/// else empty, and the caller's own word ("Pulled", "Applied stash") says
+/// it; the Git Output log keeps git's whole text.
+pub fn result_line(output: &str) -> String {
+    const NOISE: [&str; 18] = [
+        "From ",
+        "To ",
+        "remote:",
+        "hint:",
+        "Updating ",
+        "Fetching ",
+        AUTO_MERGING,
+        "warning:",
+        "error:",
+        "fatal:",
+        "On branch ",
+        "Your branch ",
+        "Changes not staged for commit:",
+        "Changes to be committed:",
+        "Untracked files:",
+        "Unmerged paths:",
+        "no changes added to commit",
+        "nothing added to commit",
+    ];
+    // `M\tpath`: a file `git switch` carried over.
+    let file_row = |line: &str| {
+        let bytes = line.as_bytes();
+        bytes.len() > 1 && bytes[0].is_ascii_uppercase() && bytes[1] == b'\t'
+    };
+    let result = output.lines().map(shown).find(|line| {
+        !line.trim().is_empty()
+            && !line.starts_with(char::is_whitespace)
+            && !file_row(line)
+            && !NOISE.iter().any(|n| line.starts_with(n))
+    });
+    match result {
+        Some(line) => line.trim_end().to_string(),
+        None if output.contains(" -> ") => summary_line(output),
+        None => String::new(),
+    }
+}
+
 /// The conflicts git stopped on, from the `CONFLICT …` lines of its
 /// `output` (#858): "1 conflict (pricing.py)", "2 conflicts (a.py, b.py)",
 /// naming three files at most before "…". A lone conflict git words
@@ -2825,6 +2878,58 @@ mod tests {
             "Merge failed: Auto-merging pricing.py",
             "only noise: still says something, and still that the merge failed"
         );
+    }
+    /// #858: the line a successful pull, fetch, push, stash or switch
+    /// reports, from git's own texts (2.43): its result, past the fetch and
+    /// push chatter, the range, the diffstat and `git status` dumps.
+    #[test]
+    fn result_line_names_what_git_did() {
+        let fast_forward = "Updating 5d25c91..f79a881\nFast-forward\n f.txt | 1 +\n 1 file changed, 1 insertion(+)";
+        assert_eq!(result_line(fast_forward), "Fast-forward");
+        let rebased = "From /tmp/r\n   5d25c91..f79a881  main       -> origin/main\nRebasing (1/2)\rRebasing (2/2)\r\r\u{1b}[KSuccessfully rebased and updated refs/heads/main.";
+        assert_eq!(
+            result_line(rebased),
+            "Successfully rebased and updated refs/heads/main."
+        );
+        assert_eq!(
+            result_line("Auto-merging f.txt\nMerge made by the 'ort' strategy.\n f.txt | 1 +"),
+            "Merge made by the 'ort' strategy."
+        );
+        let popped = "On branch main\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   g.txt\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\nDropped refs/stash@{0} (4f2e1d0)";
+        assert_eq!(result_line(popped), "Dropped refs/stash@{0} (4f2e1d0)");
+        assert_eq!(
+            result_line("[main 5a6cd5c] fix: a -> b  twice\n 1 file changed"),
+            "[main 5a6cd5c] fix: a -> b  twice",
+            "a commit's subject is kept as written"
+        );
+        let fetched = "From /tmp/r\n   a3fecf9..117b94a  main       -> origin/main";
+        assert_eq!(result_line(fetched), "a3fecf9..117b94a main -> origin/main");
+        let negotiated = "fatal: expected 'acknowledgments', received 'packfile'\nwarning: push negotiation failed; proceeding anyway with push\nTo /tmp/r.git\n + 915bd5e...74d526d main -> main (forced update)";
+        assert_eq!(
+            result_line(negotiated),
+            "915bd5e...74d526d main -> main (forced update)"
+        );
+    }
+
+    /// #858 negative: a one-line result is kept whole, and a text with
+    /// nothing but noise and no ref update is empty, for the caller's own
+    /// word, never a stray `M\tpath` or `Your branch` line.
+    #[test]
+    fn result_line_keeps_a_lone_result_and_is_empty_for_pure_noise() {
+        assert_eq!(result_line("Already up to date."), "Already up to date.");
+        assert_eq!(
+            result_line("Everything up-to-date"),
+            "Everything up-to-date"
+        );
+        assert_eq!(
+            result_line("branch 'newb' set up to track 'origin/newb'."),
+            "branch 'newb' set up to track 'origin/newb'."
+        );
+        assert_eq!(
+            result_line("M\tseed.txt\nYour branch is up to date with 'origin/main'."),
+            ""
+        );
+        assert_eq!(result_line(""), "");
     }
     use super::*;
     use tempfile::TempDir;
