@@ -36,14 +36,17 @@ pub struct Cli {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
+    // Ignoring a subcommand is left as-is deliberately: clap subcommands are
+    // not argument ids, so `conflicts_with = "command"` is a runtime assert
+    // failure rather than a guard. A plain comment rather than part of the
+    // doc below, because clap prints a field's `///` as its long help and
+    // this note is for maintainers, not `croft --help` readers (#853).
     /// Print the version with build provenance (git hash and build time) and
     /// exit. `--version` prints the plain `x.y.z`; this is the flag to quote
     /// in a bug report, since two builds can share a version (#282).
     ///
     /// It answers before anything else runs, so pairing it with a subcommand
-    /// swallows that subcommand. Left as-is deliberately: clap subcommands are
-    /// not argument ids, so `conflicts_with = "command"` is a runtime assert
-    /// failure rather than a guard, and `--version` behaves the same way.
+    /// ignores that subcommand, as `--version` does.
     #[arg(long)]
     pub build_info: bool,
 
@@ -2125,6 +2128,28 @@ mod tests {
         let cli = Cli::try_parse_from(["croft", "--build-info"]).unwrap();
         assert!(cli.build_info);
         assert!(!Cli::try_parse_from(["croft"]).unwrap().build_info);
+    }
+
+    /// #853: clap prints a field's whole `///` doc as its long help, so a
+    /// maintainer's note about clap left there shipped in `croft --help`.
+    #[test]
+    fn build_info_long_help_speaks_to_users_not_maintainers() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        let start = help.find("--build-info").expect("--build-info is listed");
+        let entry = &help[start..];
+        let entry = &entry[..entry.find("--open-file").unwrap_or(entry.len())];
+        assert!(
+            entry.contains("ignores that subcommand"),
+            "the user-facing caveat stays: {entry}"
+        );
+        for leak in ["clap", "conflicts_with", "assert"] {
+            assert!(
+                !entry.contains(leak),
+                "{leak:?} leaked into --build-info's help: {entry}"
+            );
+        }
     }
 
     #[test]
