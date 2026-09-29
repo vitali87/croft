@@ -132,7 +132,9 @@ fn parse_mp3(head: &[u8], file_len: u64) -> Option<MediaInfo> {
         ..Default::default()
     };
     let mut off = 0usize;
-    if head.starts_with(b"ID3") {
+    // The ten-byte ID3 header must be there before its size is read: a
+    // truncated file starting `ID3` indexed past its end and crashed croft.
+    if head.starts_with(b"ID3") && head.len() >= 10 {
         let size = (((head[6] & 0x7f) as usize) << 21)
             | (((head[7] & 0x7f) as usize) << 14)
             | (((head[8] & 0x7f) as usize) << 7)
@@ -225,7 +227,9 @@ fn parse_mp4(head: &[u8], brand: Option<String>) -> Option<MediaInfo> {
             let body = &b[i + 8..i + sz];
             match typ {
                 b"moov" | b"trak" => walk(body, info, depth + 1),
-                b"mvhd" if body.len() >= 20 => {
+                // Version 1 reads up to byte 32, version 0 up to 20: one
+                // shared `>= 20` guard let a short version-1 box crash croft.
+                b"mvhd" if body.len() >= if body.first() == Some(&1) { 32 } else { 20 } => {
                     let (ts, dur) = if body[0] == 1 {
                         (
                             u32::from_be_bytes(body[20..24].try_into().unwrap()),
@@ -424,6 +428,29 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn truncated_mp3_and_mp4_headers_do_not_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mp3 = tmp.path().join("x.mp3");
+        std::fs::write(&mp3, b"ID3\x03\x00").unwrap();
+        assert!(probe(&mp3).is_some());
+        // ftyp, then moov holding a version-1 mvhd with only 20 body bytes.
+        let mut mp4 = Vec::new();
+        mp4.extend_from_slice(&16u32.to_be_bytes());
+        mp4.extend_from_slice(b"ftypisom\0\0\0\0");
+        let mvhd_body = [&[1u8][..], &[0u8; 19][..]].concat();
+        let mvhd_len = 8 + mvhd_body.len() as u32;
+        mp4.extend_from_slice(&(8 + mvhd_len).to_be_bytes());
+        mp4.extend_from_slice(b"moov");
+        mp4.extend_from_slice(&mvhd_len.to_be_bytes());
+        mp4.extend_from_slice(b"mvhd");
+        mp4.extend_from_slice(&mvhd_body);
+        let path = tmp.path().join("x.mp4");
+        std::fs::write(&path, &mp4).unwrap();
+        let info = probe(&path).unwrap();
+        assert_eq!(info.duration_s, None);
+    }
 
     #[test]
     fn wav_header_yields_duration_and_rates() {

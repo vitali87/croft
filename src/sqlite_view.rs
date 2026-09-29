@@ -19,8 +19,8 @@ pub fn extension_is_sqlite(ext: &str) -> bool {
     )
 }
 
-/// One fetched table page: headers, rows, and the table's total count.
-pub type TablePage = (Vec<String>, Vec<Vec<String>>, i64);
+/// One fetched table page: headers, rows, and whether rows follow it.
+pub type TablePage = (Vec<String>, Vec<Vec<String>>, bool);
 
 /// Fetch one page of a table (#201 review: real paging, not a
 /// permanent head snapshot).
@@ -31,13 +31,15 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
     )
     .map_err(|e| e.to_string())?;
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-    let total: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {quoted}"), [], |r| r.get(0))
-        .unwrap_or(-1);
+    // One row past the page says whether more follow. `COUNT(*)` gave an
+    // exact total, but SQLite keeps no row count: it scanned every table in
+    // full, on the UI thread, when the database opened and on every page
+    // turn, freezing croft for minutes on a large file.
     let offset = page * ROW_CAP;
+    let probe = ROW_CAP + 1;
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT * FROM {quoted} LIMIT {ROW_CAP} OFFSET {offset}"
+            "SELECT * FROM {quoted} LIMIT {probe} OFFSET {offset}"
         ))
         .map_err(|e| e.to_string())?;
     let headers: Vec<String> = stmt
@@ -63,17 +65,21 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
         }
         body.push(out);
     }
-    Ok((headers, body, total))
+    let more = body.len() > ROW_CAP;
+    body.truncate(ROW_CAP);
+    Ok((headers, body, more))
 }
 
-/// The sheet name for a table page: honest about position and total.
-pub fn page_label(table: &str, page: usize, got: usize, total: i64) -> String {
-    if total >= 0 && (total as usize) > got.max(1) && (total as usize) > ROW_CAP {
-        let first = page * ROW_CAP + 1;
-        format!("{table}: rows {first}-{} of {total}", page * ROW_CAP + got)
-    } else {
-        format!("{table}: {got} rows")
+/// The sheet name for a table page: honest about position, and about more
+/// rows following without claiming a total nobody counted.
+pub fn page_label(table: &str, page: usize, got: usize, more: bool) -> String {
+    if page == 0 && !more {
+        return format!("{table}: {got} rows");
     }
+    let first = page * ROW_CAP + 1;
+    let last = page * ROW_CAP + got;
+    let tail = if more { ", more follow" } else { "" };
+    format!("{table}: rows {first}-{last}{tail}")
 }
 
 /// Build a sheet view over the database: one SheetData per table with
@@ -103,10 +109,10 @@ pub fn open_database(path: &Path) -> Result<crate::sheet::SheetView, String> {
     }
     let mut sheets = Vec::new();
     for name in &names {
-        let (headers, body, total) = table_page(path, name, 0)?;
+        let (headers, body, more) = table_page(path, name, 0)?;
         let got = body.len();
         sheets.push(crate::sheet::sheet_data_from_parts(
-            page_label(name, 0, got, total),
+            page_label(name, 0, got, more),
             headers,
             body,
         ));
@@ -149,6 +155,30 @@ mod tests {
         assert_eq!(fruit.cell(0, 3), "<blob 2 bytes>");
         assert_eq!(fruit.cell(1, 2), "", "NULL renders empty");
         assert!(fruit.name.contains("2 rows"));
+    }
+
+    #[test]
+    fn a_full_page_says_more_rows_follow_without_counting_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.sqlite");
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE t (n INTEGER); WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < {}) INSERT INTO t SELECT x FROM c;",
+            ROW_CAP + 7
+        ))
+        .unwrap();
+        let (_, rows, more) = table_page(&p, "t", 0).unwrap();
+        assert_eq!((rows.len(), more), (ROW_CAP, true));
+        assert_eq!(
+            page_label("t", 0, rows.len(), more),
+            format!("t: rows 1-{ROW_CAP}, more follow")
+        );
+        let (_, rows, more) = table_page(&p, "t", 1).unwrap();
+        assert_eq!((rows.len(), more), (7, false));
+        assert_eq!(
+            page_label("t", 1, rows.len(), more),
+            format!("t: rows {}-{}", ROW_CAP + 1, ROW_CAP + 7)
+        );
     }
 
     #[test]

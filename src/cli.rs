@@ -93,6 +93,19 @@ pub enum HookAction {
 
 #[derive(Subcommand, Debug)]
 pub enum CliCommand {
+    /// Take the guided tour (#377) in a throwaway sample project.
+    Demo {
+        /// Run this tour file (the same JSON shape as the built-in
+        /// assets/tour/tour.json) instead of the built-in tour.
+        #[arg(long)]
+        tour: Option<PathBuf>,
+    },
+    /// Review a pull request (#365): open croft on this repository with the
+    /// PR's changed files, checks and viewed marks in their own tab.
+    Pr {
+        /// The pull request number (`579`, `#579`, or its URL).
+        number: String,
+    },
     /// Set macOS Terminal.app's default profile font to a Nerd Font.
     SetupTerminal {
         /// PostScript name of the font (read from the .ttf with `fontTools` or `fc-scan`)
@@ -137,6 +150,11 @@ pub enum CliCommand {
         /// joining the shared screen (see `croft attach --solo`).
         #[arg(long, default_value_t = false)]
         solo: bool,
+        /// Build croft for the remote from this source tree instead of
+        /// installing the matching release binary (#261): for a local tree
+        /// ahead of the latest release.
+        #[arg(long, default_value_t = false)]
+        build: bool,
     },
     /// Attach to (or create) a persistent local session for a workspace, so its
     /// terminals, LSP, DAP, and editor state survive closing the window. Detach
@@ -153,6 +171,21 @@ pub enum CliCommand {
         /// participants over the collab relay (see docs/MULTIPLAYER.md).
         #[arg(long, default_value_t = false)]
         solo: bool,
+    },
+    /// Record a persistent session (started with `croft attach`) to an
+    /// asciicast v2 file that `asciinema play` and the agg GIF converter read.
+    /// The recorder watches read-only: it never resizes the session or types
+    /// into it. Stop with Ctrl-C or `croft record --stop`.
+    Record {
+        /// Workspace whose session to record (defaults to the current directory).
+        path: Option<PathBuf>,
+        /// Where to write the cast (defaults to `croft-session-<time>.cast` in
+        /// the workspace).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Stop the recording running for the workspace instead of starting one.
+        #[arg(long, default_value_t = false)]
+        stop: bool,
     },
     /// List the running persistent croft sessions started with `croft attach`.
     Ls,
@@ -183,6 +216,26 @@ pub enum CliCommand {
         /// Always print the text chart, even where an image would render.
         #[arg(long, default_value_t = false)]
         text: bool,
+    },
+    /// Internal: hold one terminal pane's shell in a process of its own, so
+    /// it outlives croft (#694). croft starts it; not for manual use.
+    #[command(hide = true)]
+    PaneHost {
+        /// The socket the pane attaches to.
+        #[arg(long)]
+        socket: PathBuf,
+        /// The pane's size, COLSxROWS.
+        #[arg(long, default_value = "80x24")]
+        size: String,
+        /// The shell's working directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// KEY=VALUE set for the shell; repeatable.
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// The shell and its arguments, after `--`.
+        #[arg(last = true)]
+        argv: Vec<String>,
     },
     /// Internal: the multiplayer session host/client (croft's dtach
     /// replacement; see docs/MULTIPLAYER.md). `croft attach` and the remote
@@ -304,6 +357,66 @@ pub enum CliCommand {
         #[arg(long = "as")]
         as_ext: Option<String>,
     },
+    /// Serve this workspace's session to a browser over WebSocket (#341).
+    ///
+    /// Each WebSocket connection is one participant of the running session
+    /// (`croft attach` starts it). Every connection must present the
+    /// per-run token printed at start-up. The listener stops when the
+    /// session does.
+    Web {
+        /// Workspace whose session to serve (default: the current directory).
+        workspace: Option<PathBuf>,
+        /// Address to listen on (default 127.0.0.1:7681). A non-loopback
+        /// address is served with a warning: other machines can reach it.
+        #[arg(long)]
+        bind: Option<std::net::SocketAddr>,
+        /// Serve TLS with this PEM certificate chain and private key.
+        #[arg(long, num_args = 2, value_names = ["CERT", "KEY"])]
+        tls: Option<Vec<PathBuf>>,
+        /// Restart this workspace's listener with a new token.
+        #[arg(long, default_value_t = false, conflicts_with = "off")]
+        rotate_token: bool,
+        /// Stop this workspace's listener; the session keeps running.
+        #[arg(long, default_value_t = false, conflicts_with_all = ["bind", "tls"])]
+        off: bool,
+    },
+    /// Open a file for editing in the croft that hosts this pane (#620).
+    ///
+    /// Like `croft view`, plus `--wait`: return only once the tab is
+    /// closed. croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait`, so
+    /// `git rebase -i` opens its plan here.
+    Edit {
+        /// File to open.
+        path: std::ffi::OsString,
+        /// Block until the file's tab is closed.
+        #[arg(long, default_value_t = false)]
+        wait: bool,
+        /// Running as git's sequence editor: defer to `sequence.editor`
+        /// when the repository's git config names one.
+        #[arg(long, default_value_t = false, hide = true)]
+        sequence_editor: bool,
+    },
+    /// Print a JSON template for translating croft's UI into `lang` (#621).
+    ///
+    /// Every palette title, with the built-in translation filled in where one
+    /// exists. Fill in the rest and save it as
+    /// `<config>/locales/<lang>.json`.
+    LocaleTemplate {
+        /// Language code, such as `de` or `fr`.
+        lang: String,
+    },
+    /// Open a workspace inside its dev container (#617).
+    ///
+    /// Reads `.devcontainer/devcontainer.json`, builds or pulls the image,
+    /// starts (or reuses) the container, runs `postCreateCommand` once,
+    /// installs croft into it and runs it there on this terminal.
+    Devcontainer {
+        /// Workspace folder (default: the current directory).
+        path: Option<std::path::PathBuf>,
+        /// Replace the existing container even if the config is unchanged.
+        #[arg(long, default_value_t = false)]
+        rebuild: bool,
+    },
     /// Route a coding agent's file edits through croft for approval (#346).
     Hook {
         #[command(subcommand)]
@@ -371,6 +484,43 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
+    /// Open a `croft://attach?host=…&path=…&focus=…` link (#359): attach to
+    /// the session it names. The host must be an alias in ~/.ssh/config.
+    /// A `croft://decide?…` link answers a pending agent edit instead.
+    OpenLink { url: String },
+    /// Approve or deny an agent's pending edit by the one-time token its
+    /// notification carried (#359), without attaching to the session.
+    #[command(hide = true)]
+    Decide {
+        token: String,
+        #[arg(value_parser = ["allow", "deny"])]
+        decision: String,
+        /// The workspace whose croft holds the edit (default: the current
+        /// directory).
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Push your keybindings, snippets, triggers, matchers and macros to a
+    /// remote now, as connecting does (#262). A file edited on the remote
+    /// since the last push is left alone: --diff compares it, and
+    /// --take-local or --keep-remote settles it.
+    SyncConfig {
+        /// Host alias from ~/.ssh/config.
+        host: String,
+        /// Show how the remote's copy of this file differs from yours.
+        #[arg(long, value_name = "FILE")]
+        diff: Option<String>,
+        /// Push this file even though the remote's copy was edited.
+        #[arg(long, value_name = "FILE")]
+        take_local: Vec<String>,
+        /// Keep the remote's copy of this file until either side changes.
+        #[arg(long, value_name = "FILE")]
+        keep_remote: Vec<String>,
+    },
+    /// Make `croft://` links open croft: an xdg handler on Linux, Termux's
+    /// URL opener on Android. On macOS the launcher (install-launcher)
+    /// registers the scheme.
+    InstallLinkHandler,
     /// Create a clickable macOS launcher (Croft.app) that opens Ghostty with
     /// croft already running. Reachable from Spotlight, Launchpad, and the Dock.
     InstallLauncher {
@@ -386,12 +536,27 @@ pub enum CliCommand {
     },
 }
 
+/// `--build-info`'s text: version, commit and build time, plus how the
+/// binary was installed when a package manager owns it (#375).
+fn build_info_line(source: crate::update_check::InstallSource) -> String {
+    match source {
+        crate::update_check::InstallSource::Homebrew => format!(
+            "{}, installed with Homebrew)",
+            VERBOSE_VERSION.trim_end_matches(')')
+        ),
+        crate::update_check::InstallSource::SelfManaged => VERBOSE_VERSION.to_string(),
+    }
+}
+
 impl Cli {
     pub fn run(self) -> Result<()> {
         // `--build-info` is a pure query: answer and exit before any setup,
         // exactly as clap does for `--version`.
         if self.build_info {
-            println!("croft {VERBOSE_VERSION}");
+            println!(
+                "croft {}",
+                build_info_line(crate::update_check::current_install_source())
+            );
             return Ok(());
         }
         // Pure liveness probes answer before anything else runs: the remote
@@ -422,7 +587,14 @@ impl Cli {
                 size,
                 yes,
             }) => setup_iterm2(&font, &nonascii, size, yes),
-            Some(CliCommand::Remote { host, path, solo }) => {
+            Some(CliCommand::Remote {
+                host,
+                path,
+                solo,
+                build,
+            }) => {
+                crate::remote::FORCE_SOURCE_BUILD
+                    .store(build, std::sync::atomic::Ordering::Relaxed);
                 match crate::remote::launch_croft(&host, path.as_deref(), solo)? {
                     crate::remote::RemoteOutcome::ReturnToLocal => {
                         let cwd = std::env::current_dir().context("resolving workspace path")?;
@@ -432,6 +604,9 @@ impl Cli {
                 }
             }
             Some(CliCommand::Attach { path, solo }) => crate::session::attach(path, solo),
+            Some(CliCommand::Record { path, out, stop }) => {
+                crate::session_record::record(path, out, stop)
+            }
             Some(CliCommand::Ls) => crate::session::list(),
             Some(CliCommand::Plot {
                 kind,
@@ -450,6 +625,35 @@ impl Cli {
                 height,
                 text,
             ),
+            Some(CliCommand::PaneHost {
+                socket,
+                size,
+                cwd,
+                env,
+                argv,
+            }) => {
+                let (cols, rows) = crate::pane_host::parse_size(&size)
+                    .with_context(|| format!("--size {size:?} is not COLSxROWS"))?;
+                let env = env
+                    .iter()
+                    .map(|e| {
+                        crate::pane_host::parse_env(e)
+                            .with_context(|| format!("--env {e:?} is not KEY=VALUE"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let code = crate::pane_host::serve(&crate::pane_host::PaneSpec {
+                    socket,
+                    cwd,
+                    env,
+                    cols,
+                    rows,
+                    argv,
+                })?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            }
             Some(CliCommand::SessionHost {
                 probe,
                 serve,
@@ -499,6 +703,29 @@ impl Cli {
                 crate::collab::ensure_relay(&socket)?;
                 crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
             }
+            Some(CliCommand::Pr { number }) => {
+                let Some(selector) = crate::pr_review::parse_pr_selector(&number) else {
+                    eprintln!("croft pr: {number:?} is not a pull request number or URL");
+                    std::process::exit(2);
+                };
+                crate::pr_review::set_startup_pr(selector);
+                let cwd = std::env::current_dir()?;
+                crate::app::run(cwd, None, None, false, Vec::new())
+            }
+            Some(CliCommand::Demo { tour }) => {
+                if let Some(path) = tour {
+                    let json = std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    if let Err(e) = crate::tour::Tour::parse(&json) {
+                        eprintln!("croft demo: {} is not a tour: {e}", path.display());
+                        std::process::exit(2);
+                    }
+                    crate::tour::set_custom_tour(json);
+                }
+                crate::tour::request_startup_demo();
+                let cwd = std::env::current_dir()?;
+                crate::app::run(cwd, None, None, false, Vec::new())
+            }
             Some(CliCommand::View { path, as_ext }) => {
                 // Printed and exited here rather than returned: an `Err` out
                 // of `run` reaches anyhow's `Debug`, which appends a full
@@ -514,6 +741,53 @@ impl Cli {
                 }
                 Ok(())
             }
+            Some(CliCommand::Web {
+                workspace,
+                bind,
+                tls,
+                rotate_token,
+                off,
+            }) => {
+                let workspace = match workspace {
+                    Some(w) => w,
+                    None => std::env::current_dir()?,
+                };
+                let opts = crate::web::Options {
+                    bind,
+                    tls: tls.map(|mut pair| {
+                        let key = pair.pop().unwrap_or_default();
+                        (pair.pop().unwrap_or_default(), key)
+                    }),
+                    rotate_token,
+                    off,
+                };
+                if let Err(e) = crate::web::run(&workspace, opts) {
+                    eprintln!("croft web: {e:#}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            Some(CliCommand::Edit {
+                path,
+                wait,
+                sequence_editor,
+            }) => {
+                if sequence_editor && let Some(configured) = configured_sequence_editor() {
+                    // Exactly how git itself runs an editor value.
+                    let status = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("{configured} \"$@\""))
+                        .arg(configured.as_str())
+                        .arg(&path)
+                        .status();
+                    std::process::exit(status.ok().and_then(|s| s.code()).unwrap_or(1));
+                }
+                if let Err(e) = crate::view_ipc::edit(&path, wait, &crate::app::croft_cache_dir()) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
             Some(CliCommand::Hook { action }) => {
                 // Printed and exited, like `view`: a one-line reason, never
                 // anyhow's backtrace.
@@ -522,6 +796,24 @@ impl Cli {
                     std::process::exit(1);
                 }
                 Ok(())
+            }
+            Some(CliCommand::LocaleTemplate { lang }) => {
+                // The language croft loads for this locale: `de_DE.UTF-8` and
+                // `de-DE` both read `locales/de.json`, whose built-in catalog
+                // seeds the template.
+                let Some(code) = crate::i18n::language_of(&lang) else {
+                    eprintln!(
+                        "croft locale-template: {lang} names no language croft translates to (English is built in)"
+                    );
+                    std::process::exit(1);
+                };
+                eprintln!("Save this as locales/{code}.json in croft's config directory.");
+                println!("{}", crate::i18n::template(&code, &[]));
+                Ok(())
+            }
+            Some(CliCommand::Devcontainer { path, rebuild }) => {
+                let root = path.unwrap_or_else(|| std::path::PathBuf::from("."));
+                crate::devcontainer::up_and_attach(&root, rebuild)
             }
             Some(CliCommand::Pair {
                 workspace,
@@ -648,6 +940,57 @@ impl Cli {
                 dry_run,
             }) => theme_import(&file, theme.as_deref(), id.as_deref(), dry_run),
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
+            Some(CliCommand::OpenLink { url }) => {
+                // One line, like `croft view`: a link click deserves a
+                // sentence about the link, not croft's stack.
+                if let Err(e) = open_link(&url) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            Some(CliCommand::Decide {
+                token,
+                decision,
+                path,
+            }) => {
+                let cwd = match path {
+                    Some(p) => p,
+                    None => std::env::current_dir()?,
+                };
+                let decision = crate::agent_approval::RemoteDecision {
+                    token,
+                    allow: decision == "allow",
+                };
+                match crate::agent_approval::send_decision(&cwd, &decision) {
+                    Ok(message) => {
+                        println!("{message}");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Some(CliCommand::SyncConfig {
+                host,
+                diff,
+                take_local,
+                keep_remote,
+            }) => {
+                let resolution = crate::remote::SyncResolution {
+                    take_local,
+                    keep_remote,
+                };
+                if let Err(e) = crate::remote::sync_config_now(&host, &resolution, diff.as_deref())
+                {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            Some(CliCommand::InstallLinkHandler) => install_link_handler(),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
                 install_launcher(path, user, yes)
             }
@@ -660,6 +1003,124 @@ impl Cli {
             }
         }
     }
+}
+
+/// The user's own `sequence.editor` for the repository git is running in,
+/// if they set one (#620).
+fn configured_sequence_editor() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", "sequence.editor"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// `croft open-link` (#359): check the link, then become the `croft remote`
+/// or `croft attach` it describes, so the session gets this terminal.
+fn open_link(url: &str) -> Result<()> {
+    let mut link = crate::deep_link::parse(url)?;
+    if let Some(host) = link.host.take() {
+        let targets: Vec<(String, Option<String>)> = crate::remote::discover_ssh_targets()
+            .into_iter()
+            .map(|t| (t.alias, t.host_name))
+            .collect();
+        link.host = crate::deep_link::resolve_host(&host, &local_hostname(), &targets)?;
+    }
+    let home = std::env::var("HOME").ok();
+    if let Some(args) = crate::deep_link::decide_argv(&link, home.as_deref()) {
+        // Answer where the edit waits, then report: nothing to attach to.
+        let status = match &link.host {
+            Some(alias) => std::process::Command::new("ssh")
+                .arg("--")
+                .arg(alias)
+                .arg(crate::deep_link::remote_shell_command(&args))
+                .status()?,
+            None => std::process::Command::new(std::env::current_exe()?)
+                .args(&args)
+                .status()?,
+        };
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(crate::deep_link::argv(&link, home.as_deref()));
+    if let Some(focus) = link.focus {
+        cmd.env("CROFT_FOCUS", focus.as_str());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let err = cmd.exec();
+        Err(anyhow::anyhow!("could not start croft: {err}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn local_hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// `croft install-link-handler` (#359).
+fn install_link_handler() -> Result<()> {
+    let exe = std::env::current_exe()?.display().to_string();
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .context("HOME is not set")?;
+    if std::env::var_os("TERMUX_VERSION").is_some() {
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let opener = bin.join("termux-url-opener");
+        if opener.exists()
+            && !std::fs::read_to_string(&opener)
+                .unwrap_or_default()
+                .contains("croft install-link-handler")
+        {
+            anyhow::bail!(
+                "{} already exists; add a `croft://*) croft open-link \"$1\"` case to it",
+                opener.display()
+            );
+        }
+        std::fs::write(&opener, crate::deep_link::termux_url_opener(&exe))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755))?;
+        }
+        println!("croft:// links now open croft ({})", opener.display());
+        return Ok(());
+    }
+    if cfg!(target_os = "macos") {
+        println!("On macOS, `croft install-launcher` registers croft:// links.");
+        return Ok(());
+    }
+    let apps = home.join(".local/share/applications");
+    std::fs::create_dir_all(&apps)?;
+    let entry = apps.join("croft-link.desktop");
+    std::fs::write(&entry, crate::deep_link::desktop_entry(&exe))?;
+    let status = std::process::Command::new("xdg-mime")
+        .args(["default", "croft-link.desktop", "x-scheme-handler/croft"])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("croft:// links now open croft ({})", entry.display()),
+        _ => println!(
+            "Wrote {}; register it with `xdg-mime default croft-link.desktop x-scheme-handler/croft`",
+            entry.display()
+        ),
+    }
+    Ok(())
 }
 
 /// `croft plot` (#361): parse stdin, draw, and print either an inline image
@@ -1597,6 +2058,40 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn pr_takes_a_number_or_a_url() {
+        let cli = Cli::try_parse_from(["croft", "pr", "#579"]).unwrap();
+        assert!(matches!(cli.command, Some(CliCommand::Pr { ref number }) if number == "#579"));
+        assert!(
+            Cli::try_parse_from(["croft", "pr"]).is_err(),
+            "the number is required"
+        );
+    }
+
+    #[test]
+    fn demo_is_a_subcommand() {
+        let cli = Cli::try_parse_from(["croft", "demo"]).unwrap();
+        assert!(matches!(cli.command, Some(CliCommand::Demo { tour: None })));
+        let cli = Cli::try_parse_from(["croft", "demo", "--tour", "mine.json"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(CliCommand::Demo { tour: Some(p) }) if p == Path::new("mine.json"))
+        );
+    }
+
+    /// #375: `--build-info` says when a package manager owns the binary, so a
+    /// bug report shows which upgrade path the user has.
+    #[test]
+    fn build_info_names_a_homebrew_install() {
+        use crate::update_check::InstallSource;
+        let brew = build_info_line(InstallSource::Homebrew);
+        assert!(
+            brew.starts_with(VERBOSE_VERSION.trim_end_matches(')')),
+            "{brew}"
+        );
+        assert!(brew.ends_with(", installed with Homebrew)"), "{brew}");
+        assert_eq!(build_info_line(InstallSource::SelfManaged), VERBOSE_VERSION);
+    }
+
     /// #282: `--version` is a plain `x.y.z`. The regression this guards is a
     /// well-meaning one — re-adding provenance "so bug reports carry it" is
     /// exactly how the hash got into the common path the first time.
@@ -1679,6 +2174,67 @@ mod tests {
         let (root, open, _) = resolve_workspace(&file, Some(other.clone())).unwrap();
         assert_eq!(root, dir.path().canonicalize().unwrap());
         assert_eq!(open, Some(other));
+    }
+
+    #[test]
+    fn parses_web_with_and_without_a_bind() {
+        let cli = Cli::try_parse_from(["croft", "web"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Web {
+                workspace: None,
+                bind: None,
+                tls: None,
+                rotate_token: false,
+                off: false,
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "croft",
+            "web",
+            "/w",
+            "--bind",
+            "0.0.0.0:9000",
+            "--tls",
+            "c.pem",
+            "k.pem",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(CliCommand::Web {
+                workspace,
+                bind,
+                tls,
+                ..
+            }) => {
+                assert_eq!(workspace.as_deref(), Some(std::path::Path::new("/w")));
+                assert_eq!(bind, Some("0.0.0.0:9000".parse().unwrap()));
+                assert_eq!(
+                    tls,
+                    Some(vec![PathBuf::from("c.pem"), PathBuf::from("k.pem")])
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let cli = Cli::try_parse_from(["croft", "web", "--rotate-token"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Web {
+                rotate_token: true,
+                ..
+            })
+        ));
+        // `--tls` takes both files; `--off` stops, so it takes no listener
+        // settings and cannot also rotate.
+        assert!(Cli::try_parse_from(["croft", "web", "--tls", "c.pem"]).is_err());
+        assert!(Cli::try_parse_from(["croft", "web", "--off", "--bind", "127.0.0.1:1"]).is_err());
+        assert!(Cli::try_parse_from(["croft", "web", "--off", "--rotate-token"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["croft", "web", "--off"])
+                .unwrap()
+                .command,
+            Some(CliCommand::Web { off: true, .. })
+        ));
     }
 
     #[test]
@@ -2109,7 +2665,16 @@ mod tests {
         let cli = Cli::parse_from(["croft", "remote", "reasoner"]);
         assert!(matches!(
             cli.command,
-            Some(CliCommand::Remote { solo: false, .. })
+            Some(CliCommand::Remote {
+                solo: false,
+                build: false,
+                ..
+            })
+        ));
+        let cli = Cli::parse_from(["croft", "remote", "reasoner", "--build"]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Remote { build: true, .. })
         ));
     }
 

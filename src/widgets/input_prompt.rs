@@ -18,6 +18,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
+/// The four ways VS Code's Databases view adds a database (#578).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeqlDbSource {
+    Folder,
+    Archive,
+    Url,
+    Github,
+}
+
 /// Why an input prompt is open, so the App can route the submitted value
 /// to the right git operation. Variants carry whatever context the second
 /// step needs (e.g. the base ref a new branch forks from).
@@ -36,6 +45,97 @@ pub enum InputPurpose {
     /// A new value for the setting `key` (#612).
     SettingValue {
         key: String,
+    },
+    /// The host to push the syncable config to now (#262).
+    SyncConfigHost,
+    /// The pull request to review (#365): a number, `#n`, or its URL.
+    PullRequestNumber,
+    /// Where to add a CodeQL database from (#578).
+    CodeqlDatabase {
+        source: CodeqlDbSource,
+    },
+    /// Confirm removing the CodeQL database at `path` (#578). Submitting
+    /// (Enter) removes it; Esc keeps it. The value is a sentinel.
+    CodeqlRemoveDatabase {
+        path: PathBuf,
+    },
+    /// Confirm deleting the unused CodeQL databases at `paths` (#578), all
+    /// copies in croft's cache. Submitting (Enter) deletes them; Esc keeps
+    /// them. The value is a sentinel.
+    CodeqlDeleteUnusedDatabases {
+        paths: Vec<PathBuf>,
+    },
+    /// A new display name for the CodeQL database at `path` (#578).
+    CodeqlRenameDatabase {
+        path: PathBuf,
+    },
+    /// Confirm removing the query history entry whose run wrote `output`
+    /// (#578). Submitting (Enter) removes it; Esc keeps it. The value is a
+    /// sentinel.
+    CodeqlRemoveHistory {
+        output: PathBuf,
+    },
+    /// A label for the query history entry whose run wrote `output` (#578).
+    CodeqlRenameHistory {
+        output: PathBuf,
+    },
+    /// The name of a new CodeQL query to write into `dir` (#578), in
+    /// `language` when it is known.
+    CodeqlCreateQuery {
+        dir: PathBuf,
+        language: Option<String>,
+    },
+    /// The controller repository variant analysis runs from (#578):
+    /// `owner/repo` or its GitHub URL.
+    CodeqlControllerRepository,
+    /// A repository to add for variant analysis (#578), into the list
+    /// called `list` when there is one.
+    CodeqlAddVariantRepo {
+        list: Option<String>,
+    },
+    /// The name of a new variant analysis repository list (#578).
+    CodeqlAddVariantList,
+    /// A GitHub user or organisation to add for variant analysis (#578).
+    CodeqlAddVariantOwner,
+    /// The CodeQL packs to download from the registry (#578).
+    CodeqlDownloadPacks,
+    /// A GitHub Code Search query whose repositories go into the variant
+    /// analysis list called `list` (#578).
+    CodeqlVariantCodeSearch {
+        list: String,
+    },
+    /// Where to export the results of remembered variant analysis `index`
+    /// (#578): a folder, or `gist`.
+    CodeqlExportVariantResults {
+        index: usize,
+    },
+    /// A new name for the variant analysis list called `name` (#578).
+    CodeqlRenameVariantList {
+        name: String,
+    },
+    /// Confirm removing the variant analysis list called `name` (#578).
+    /// Submitting (Enter) removes it; Esc keeps it. The value is a sentinel.
+    CodeqlRemoveVariantList {
+        name: String,
+    },
+    /// Where a SARIF result's file lives on this machine (#577): the value
+    /// is a path; `uri` is the location the log named.
+    SarifLocate {
+        uri: String,
+    },
+    /// Another SARIF log to merge into the open viewer (#577).
+    SarifAddLog,
+    /// The SARIF results list's optional columns, comma-separated (#577).
+    SarifColumns,
+    /// A baseline SARIF log to compare the open viewer against (#577).
+    SarifBaseline,
+    /// Where to write the SARIF viewer's visible results as CSV (#577).
+    SarifExport,
+    /// The optional comment for dismissing code scanning alert `number`
+    /// with reason `reason` (an index into `DismissReason::ALL`).
+    DismissAlertComment {
+        number: u64,
+        reason: usize,
     },
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
@@ -105,6 +205,11 @@ pub enum InputPurpose {
         range: (usize, usize),
         selection: String,
     },
+    /// One field of **Debug: Add Configuration…** (#250); the draft it
+    /// fills is the App's.
+    DebugConfigField {
+        field: crate::dap::configs::DraftField,
+    },
 }
 
 pub struct InputPrompt {
@@ -114,6 +219,9 @@ pub struct InputPrompt {
     pub value: String,
     pub cursor: usize,
     pub last_rect: Rect,
+    /// Whether Enter on an empty field submits (an optional field left
+    /// blank) rather than waiting for a value.
+    pub allow_blank: bool,
 }
 
 impl InputPrompt {
@@ -129,7 +237,14 @@ impl InputPrompt {
             value: String::new(),
             cursor: 0,
             last_rect: Rect::default(),
+            allow_blank: false,
         }
+    }
+
+    /// Let Enter submit an empty field, for a value that is optional.
+    pub fn allowing_blank(mut self) -> Self {
+        self.allow_blank = true;
+        self
     }
 
     /// Seed the field with an initial value (e.g. the current branch name
@@ -198,7 +313,7 @@ impl InputPrompt {
     /// field is a no-op the caller treats as "keep waiting").
     pub fn submit_value(&self) -> Option<String> {
         let v = self.value.trim();
-        (!v.is_empty()).then(|| v.to_string())
+        (self.allow_blank || !v.is_empty()).then(|| v.to_string())
     }
 }
 
@@ -208,7 +323,9 @@ pub fn render_input_prompt(
     buf: &mut Buffer,
     theme: crate::theme::Theme,
 ) {
-    let width = (screen.width.saturating_mul(6) / 10).clamp(30, 90.min(screen.width));
+    let width = (screen.width.saturating_mul(6) / 10)
+        .clamp(30, 90)
+        .min(screen.width);
     let height: u16 = 5;
     let rect = Rect {
         x: screen.x + (screen.width.saturating_sub(width)) / 2,

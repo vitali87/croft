@@ -6,6 +6,11 @@ key by key:
 1. **Built-in defaults** — what a fresh install behaves like.
 2. **User** — `~/.config/croft/config.json` (or `$XDG_CONFIG_HOME/croft/`).
    The file every toggle and the theme picker write to.
+   - **Synced** — `~/.config/croft/config.synced.json`. Written by config
+     sync when you `croft remote` here from another machine (see below): that
+     machine's theme and editor toggles, limited to the same allowlist as a
+     workspace layer. It wins over this machine's `config.json`, so your
+     theme follows you, and loses to `config.local.json`.
 3. **User, machine-local** — `~/.config/croft/config.local.json`. Overrides
    for this machine only; keep `config.json` in your dotfiles repo and put
    the per-box exceptions here.
@@ -86,8 +91,8 @@ allowlist — appearance and editor/terminal behavior:
 `disable_inline_values`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`.
 
-Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `fleet_groups`, `lane_agent`,
-`mcp_tool_fingerprints`, `host_accents`, `notifications`, and any future key not explicitly
+Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
+`mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.
 
@@ -120,6 +125,98 @@ set them.
 The mapped values sit **below** `.croft/config.json` in the chain, so a
 croft-native workspace file always wins over the VS Code one.
 
+## Config sync to remotes
+
+`croft remote <host>` pushes your `keybindings.json`, `snippets.json`,
+`triggers.json`, `matchers.json` and `macros.json` to the remote's
+`~/.config/croft/` on connect, only when their content differs (#262).
+
+Your theme and editor toggles travel too, but `config.json` itself never
+does: it carries MCP consent and tool fingerprints, which must be granted
+per machine. croft sends its projection instead: the keys a workspace layer
+may set (see the allowlist above), read from your `config.json`'s top level,
+landing as the remote's `config.synced.json`. That is a layer of its own, so
+it never touches the remote's `config.json` and whatever was granted there,
+and the remote refuses any other key in it. It applies on arrival and is
+re-sent when you change `config.json` during the session. To keep a
+different theme on one box, set it in that box's `config.local.json`, or
+exclude `config.synced.json` for everyone. Two user-layer settings opt out:
+
+```jsonc
+{
+  // Never push to these hosts (ssh config aliases, case-insensitive).
+  "config_sync_excluded_hosts": ["shared-box"],
+  // Never push these files to any host.
+  "config_sync_excluded_files": ["keybindings.json"]
+}
+```
+
+The connect output says what was pushed, what was skipped and why.
+
+A file edited on the remote since croft last pushed it is never overwritten.
+It is left alone, and the output names it along with the commands that settle it:
+
+```sh
+croft sync-config devbox --diff keybindings.json         # remote vs local, + is what a push brings
+croft sync-config devbox --take-local keybindings.json   # push yours over it
+croft sync-config devbox --keep-remote keybindings.json  # keep theirs until either side changes
+```
+
+`croft sync-config <host>` on its own pushes now, as a connect does. The
+**Remote: Sync Config Now** palette command runs it in a terminal pane. What
+was last pushed to each host is recorded in croft's cache dir. If that record
+is lost, the next push asks about any remote copy that differs rather than
+replacing it.
+
+## GitHub code scanning
+
+`code_scanning` controls whether croft loads the repository's GitHub code
+scanning results into the SARIF viewer by itself, through `gh`:
+
+```jsonc
+{
+  // "off" (default): only when asked. "on": load the current branch's
+  // results, and again after checking out another branch or a detached
+  // HEAD. "prompt": say they are there and wait.
+  "code_scanning": "prompt"
+}
+```
+
+It loads the newest analysis per tool at the nearest scanned commit in the
+branch's history, so a branch whose latest commits are not scanned yet still
+gets results. **SARIF: Load Code Scanning Results for This Branch** loads them
+whatever the setting. **SARIF: Open GitHub Code Scanning Analysis** picks any
+one analysis by hand.
+
+## The CodeQL CLI
+
+`codeql_cli_path` names the CodeQL CLI croft runs, such as
+`"~/tools/codeql/codeql"`. When it is unset or not a file, croft uses
+`codeql` on `PATH`, then the newest CLI it downloaded itself into
+`~/.cache/croft/codeql/cli/<version>/`, else plain `codeql`.
+
+**CodeQL: Download CLI** downloads GitHub's release for this platform
+(Linux x64, macOS or Windows x64) and switches to it, unless
+`codeql_cli_path` is set: that one always wins. **CodeQL: Check for CLI
+Updates** compares the latest release with the CLI in use; a newer one is
+what the next download installs. User config only: it names a program to
+run.
+
+## Persistent terminal panes
+
+`"terminal_persistent_panes": true` keeps each terminal pane's shell in a
+process of its own, `croft pane-host` (#694), instead of in croft. When croft
+is killed or crashes (the OOM killer tends to pick it, being the largest
+process), the shells and whatever they are running carry on, and the next
+croft in the workspace reattaches to them: the same shell, with its screen and
+recent scrollback redrawn, including what it printed while croft was down.
+
+- Closing a pane, or quitting croft normally, still ends its shell.
+- A host no croft has reattached to for a week ends its shell.
+- It applies to shell panes opened after the change, not to task or run
+  panes, on Linux and macOS.
+- A pane whose host cannot start is an ordinary pane.
+
 ## Notification sinks
 
 A `notifications` list forwards events croft already notices to somewhere
@@ -139,13 +236,45 @@ optionally, which events it takes:
 
 Events are `command_finished` (a command in a pane you are not focused on,
 lasting at least `min_duration_secs`, default 10), `tests_failed` (once per
-red Test Explorer run), `osc9` (a terminal's own notification), and
+red Test Explorer run), `osc9` (a terminal's own notification),
+`approval_pending` (an agent's edit waits in the approval popup), and
 `agent_waiting` (reserved). An empty `events` takes all of them.
 `ntfy` posts to `server` (default `https://ntfy.sh`) under `topic`; both `ntfy` and `webhook` endpoints must be `https`, or `http` only to localhost — a plain-http endpoint across a network is refused and named in the channel;
-`webhook` posts JSON `{event, title, body, workspace, host, link}` with your
+`webhook` posts JSON `{event, title, body, workspace, host, link, actions}` with your
 `headers`; `termux` runs `termux-notification`; `command` runs `argv` with
 the notification in `CROFT_TITLE`, `CROFT_BODY`, `CROFT_LINK`, and
 `CROFT_EVENT`. Delivery is off the render path on one worker with a bounded
 queue and one retry for transient failures; what finally fails appears in
 the **Notifications** OUTPUT channel, naming only a URL's host. The key is
 user-config only, and a webhook's headers belong in `config.local.json`.
+
+An `approval_pending` notification can be answered from the phone. Its link
+(`croft://attach?…&focus=approval`) opens the session with the popup up.
+Its **Approve** and **Deny** buttons (ntfy action buttons, termux
+`--button1`/`--button2`, a webhook's `actions` array,
+`CROFT_APPROVE_LINK`/`CROFT_DENY_LINK` for a command) are
+`croft://decide?host=…&path=…&token=…&decision=allow|deny` links.
+`croft open-link` runs `croft decide` for them, over ssh when the host is
+not this machine. That answers the agent without attaching. The token is
+random, belongs to that one edit, and stops working once the edit is
+answered anywhere or its 120 s window passes. Links open through
+`croft install-link-handler`, as for attach links.
+
+## Profiles
+
+A profile is a named set of settings, keybindings and snippets you can switch between (for example "Python" and "Writing"). **Profiles: Switch Profile** in the palette lists them:
+
+* **New Profile from Current Setup** copies the settings, keybindings and snippets now in effect into a new profile and switches to it.
+* Choosing a profile (or **Default**) switches to it. Keybindings and snippets apply at once; settings apply the next time croft starts.
+* **Use the Active Profile for This Workspace** writes `.croft/profile`, so this folder always opens with that profile, whatever the global choice.
+
+Profiles live in `~/.config/croft/profiles/<name>/`. History, macros and sessions are shared by every profile.
+
+
+## Accessibility and language
+
+* `"screen_reader": true` (or **Accessibility: Toggle Screen Reader Mode**, also in Settings) stops the caret blinking and keeps the real cursor on the focused text: the editor caret, the shell cursor in a terminal, or the status bar when a picker, menu or the Explorer has focus. The status bar then describes each change in one line: the line the caret moved to, the diagnostic under it, the highlighted completion, palette entry or file, focus changes and status messages. Terminal screen readers (VoiceOver, Orca, NVDA over WSL) read it from there.
+* `"screen_reader_command": "spd-say"` (or `"say"` on macOS) also speaks each line through that program, with the line as its last argument.
+* `"locale": "de"` picks the UI language; unset, croft follows `LC_ALL`, `LC_MESSAGES` or `LANG`. Menus, palette titles and status messages are translated where the catalog has an entry, and the palette matches queries in either language. German (`de`) and Spanish (`es`) ship as starter catalogs. For another language or to fix a translation, run `croft locale-template <lang> > ~/.config/croft/locales/<lang>.json` and fill in the values; entries there override the built-in ones. A key with `{}` is a pattern: `"Saved {}": "Gespeichert: {}"`.
+
+All three are user-config only.

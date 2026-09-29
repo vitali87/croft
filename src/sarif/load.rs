@@ -3,7 +3,8 @@
 //! Only SARIF 2.1.0 is accepted, identified by `version` or, when a producer
 //! left that out, by a `$schema` naming 2.1.0. Anything else is refused with a
 //! message that names what was found, so the user knows whether to upgrade the
-//! producer or the file.
+//! producer or the file. A log written to one of the rtm.1 to rtm.4 release
+//! candidates of 2.1.0 is upgraded in memory to the final format.
 
 use super::model::SarifLog;
 
@@ -54,8 +55,15 @@ pub fn parse_log(text: &str) -> Result<SarifLog, LoadError> {
         obj.get("version").and_then(|v| v.as_str()),
         obj.get("$schema").and_then(|v| v.as_str()),
     )?;
+    let rtm = obj
+        .get("$schema")
+        .and_then(|v| v.as_str())
+        .and_then(rtm_candidate);
     let mut value = value;
     drop_nulls(&mut value);
+    if matches!(rtm, Some(1..=4)) {
+        upgrade_rtm_1_to_4(&mut value);
+    }
     serde_json::from_value(value).map_err(|e| LoadError::NotSarif(e.to_string()))
 }
 
@@ -76,6 +84,42 @@ fn drop_nulls(v: &mut serde_json::Value) {
         }
         serde_json::Value::Array(a) => a.iter_mut().for_each(drop_nulls),
         _ => {}
+    }
+}
+
+/// Which 2.1.0 release candidate a `$schema` URL names: 1 for
+/// `.../sarif-2.1.0-rtm.1.json` or `http://json.schemastore.org/sarif-2.1.0-rtm.1`.
+fn rtm_candidate(schema: &str) -> Option<u32> {
+    let rest = &schema[schema.find("sarif-2.1.0-rtm.")? + "sarif-2.1.0-rtm.".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let tail = &rest[digits.len()..];
+    if !(tail.is_empty() || tail == ".json") {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The one change between the rtm.1 to rtm.4 candidates and the final
+/// 2.1.0 format (oasis-tcs/sarif-spec#449, as the SARIF SDK's
+/// PrereleaseCompatibilityTransformer applies it): a suppression's `state`
+/// became `status`. A suppression that already has `status` keeps it.
+fn upgrade_rtm_1_to_4(log: &mut serde_json::Value) {
+    let runs = log.get_mut("runs").and_then(|r| r.as_array_mut());
+    for run in runs.into_iter().flatten() {
+        let results = run.get_mut("results").and_then(|r| r.as_array_mut());
+        for result in results.into_iter().flatten() {
+            let suppressions = result
+                .get_mut("suppressions")
+                .and_then(|s| s.as_array_mut());
+            for s in suppressions.into_iter().flatten() {
+                if let Some(obj) = s.as_object_mut()
+                    && !obj.contains_key("status")
+                    && let Some(state) = obj.remove("state")
+                {
+                    obj.insert("status".to_string(), state);
+                }
+            }
+        }
     }
 }
 
@@ -131,6 +175,58 @@ mod tests {
         )
         .unwrap();
         assert!(log.runs.is_empty());
+    }
+
+    #[test]
+    fn rtm_1_to_4_suppression_state_is_read_as_status() {
+        let log_for = |schema: &str| {
+            parse_log(&format!(
+                r#"{{"version":"2.1.0","$schema":"{schema}","runs":[{{"tool":{{"driver":{{"name":"t"}}}},
+                "results":[{{"message":{{"text":"m"}},"suppressions":[{{"kind":"inSource","state":"underReview"}}]}}]}}]}}"#
+            ))
+            .unwrap()
+        };
+        let status = |log: &SarifLog| {
+            log.runs[0].results.as_ref().unwrap()[0]
+                .suppressions
+                .as_ref()
+                .unwrap()[0]
+                .status
+                .clone()
+        };
+        for schema in [
+            "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.1.json",
+            "http://json.schemastore.org/sarif-2.1.0-rtm.4",
+        ] {
+            assert_eq!(
+                status(&log_for(schema)).as_deref(),
+                Some("underReview"),
+                "{schema}"
+            );
+        }
+        // The final format has no `state`; it is not read as `status`.
+        let final_log =
+            log_for("https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json");
+        assert_eq!(status(&final_log), None);
+    }
+
+    #[test]
+    fn rtm_candidate_reads_the_number_from_either_schema_url_form() {
+        assert_eq!(
+            rtm_candidate(
+                "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.3.json"
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            rtm_candidate("http://json.schemastore.org/sarif-2.1.0-rtm.2"),
+            Some(2)
+        );
+        assert_eq!(
+            rtm_candidate("https://json.schemastore.org/sarif-2.1.0.json"),
+            None
+        );
+        assert_eq!(rtm_candidate("http://x/sarif-2.1.0-rtm.2-other.json"), None);
     }
 
     #[test]

@@ -188,7 +188,7 @@ pub fn text_range(region: &Region, lines: &Lines, kind: ColumnKind) -> Option<Te
     let offset = region.char_offset.filter(|&o| o >= 0)?;
     let length = region.char_length.unwrap_or(0).max(0);
     let (start, c1) = offset_pos(lines, offset as usize, kind);
-    let (end, c2) = offset_pos(lines, (offset + length) as usize, kind);
+    let (end, c2) = offset_pos(lines, offset.saturating_add(length) as usize, kind);
     Some(TextRange {
         start,
         end,
@@ -233,6 +233,12 @@ pub fn byte_range(region: &Region) -> Option<(u64, u64)> {
     Some((offset, length))
 }
 
+/// A range as byte offsets into the text `lines` was built from.
+pub fn byte_span(lines: &Lines, range: &TextRange) -> (usize, usize) {
+    let a = lines.byte_of(range.start);
+    (a, lines.byte_of(range.end).max(a))
+}
+
 /// The text a range covers, for comparing against `region.snippet`.
 pub fn slice<'t>(lines: &Lines<'t>, range: &TextRange) -> &'t str {
     let a = lines.byte_of(range.start);
@@ -269,6 +275,40 @@ pub fn reanchor(region: &Region, lines: &Lines, kind: ColumnKind) -> Option<Text
         end,
         clamped: false,
     })
+}
+
+/// Where a result's region starts in `text`, the file as it is now, for
+/// opening it (#577): the snippet's new place when the file drifted since
+/// the log was written ([`reanchor`]), else the stated range, which also
+/// covers a region given only by `charOffset`. The bool says the snippet
+/// moved it. `None` for a region with no text position at all.
+pub fn locate(
+    region: &Region,
+    context: Option<&Region>,
+    text: &str,
+    newlines: &[String],
+    kind: ColumnKind,
+) -> Option<(Pos, bool)> {
+    let lines = Lines::new(text, newlines);
+    if let Some(moved) = reanchor(region, &lines, kind) {
+        return Some((moved.start, true));
+    }
+    // The region's own snippet is gone or absent, but the surrounding
+    // `contextRegion` (§3.29.5) may have moved as a whole: find it, and put
+    // the region at the same distance from its start as it was.
+    if let (Some(ctx), Some(start_line)) = (context, region.start_line.filter(|&l| l > 0))
+        && let Some(ctx_start) = ctx.start_line.filter(|&l| l > 0)
+        && start_line >= ctx_start
+        && let Some(moved) = reanchor(ctx, &lines, kind)
+    {
+        let line = moved.start.line + (start_line - ctx_start) as usize;
+        if line < lines.count() {
+            let col = region.start_column.unwrap_or(1).max(1) as usize - 1;
+            let col = col.min(lines.full(line).chars().count());
+            return Some((Pos { line, col }, true));
+        }
+    }
+    text_range(region, &lines, kind).map(|r| (r.start, false))
 }
 
 fn pos_of_byte(lines: &Lines, byte: usize) -> Pos {
@@ -315,6 +355,52 @@ mod tests {
         let lines = Lines::new(text, &crlf());
         let r = text_range(&region(json), &lines, ColumnKind::UnicodeCodePoints).unwrap();
         slice(&lines, &r).to_string()
+    }
+
+    #[test]
+    fn locate_follows_offsets_and_moved_snippets() {
+        let kind = ColumnKind::UnicodeCodePoints;
+        // An offset-only region gets its line and column.
+        let (pos, moved) =
+            locate(&region(r#"{"charOffset":7}"#), None, SPEC, &crlf(), kind).unwrap();
+        assert_eq!((pos, moved), (Pos { line: 1, col: 1 }, false));
+        // Two lines were inserted above since the scan: the snippet is
+        // followed to its new place.
+        let now = "new\r\nnew\r\nabcd\r\nefg\r\nhijk\r\n";
+        let r = region(r#"{"startLine":2,"startColumn":1,"endColumn":4,"snippet":{"text":"efg"}}"#);
+        assert_eq!(
+            locate(&r, None, now, &crlf(), kind),
+            Some((Pos { line: 3, col: 0 }, true))
+        );
+        // Unmoved, it is the stated place.
+        assert_eq!(
+            locate(&r, None, SPEC, &crlf(), kind),
+            Some((Pos { line: 1, col: 0 }, false))
+        );
+        // No text position at all.
+        assert_eq!(
+            locate(&region(r#"{"byteOffset":3}"#), None, SPEC, &crlf(), kind),
+            None
+        );
+    }
+
+    #[test]
+    fn locate_follows_a_moved_context_region_when_the_snippet_is_gone() {
+        let kind = ColumnKind::UnicodeCodePoints;
+        // The flagged line itself was edited, but the function around it
+        // moved down two lines intact.
+        let now = "new\r\nnew\r\nfn f() {\r\n    call(y);\r\n}\r\n";
+        let r = region(r#"{"startLine":2,"startColumn":5,"snippet":{"text":"call(x);"}}"#);
+        let ctx = region(r#"{"startLine":1,"endLine":3,"snippet":{"text":"fn f() {"}}"#);
+        assert_eq!(
+            locate(&r, Some(&ctx), now, &crlf(), kind),
+            Some((Pos { line: 3, col: 4 }, true))
+        );
+        // Without the context it falls back to the stated place.
+        assert_eq!(
+            locate(&r, None, now, &crlf(), kind),
+            Some((Pos { line: 1, col: 4 }, false))
+        );
     }
 
     // ── run-level settings ──────────────────────────────────────────────

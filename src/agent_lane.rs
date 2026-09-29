@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// One file in one agent's lane.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaneFile {
     pub path: PathBuf,
     /// Content hash when the user last marked it reviewed; `None` until the
@@ -59,8 +59,9 @@ impl LaneFile {
     }
 }
 
-/// Every agent's ledger, keyed by agent name.
-#[derive(Clone, Debug, Default)]
+/// Every agent's ledger, keyed by agent name. Saved per workspace (#345),
+/// so the queue and its review baselines outlive a restart.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentLedger {
     lanes: BTreeMap<String, BTreeMap<PathBuf, LaneFile>>,
     /// Ticks once per recorded write, so every row can be ordered against
@@ -73,6 +74,10 @@ pub struct AgentLedger {
     /// the user believing a partial queue is a complete one — the one thing
     /// this module must never do.
     may_be_incomplete: bool,
+    /// Bumped by every change, so the app saves only when there is
+    /// something new to save. Not itself saved.
+    #[serde(skip)]
+    generation: u64,
 }
 
 /// Files above this are not hashed: the ledger runs on the frame loop
@@ -159,9 +164,47 @@ impl AgentLedger {
         Self::default()
     }
 
+    /// No lane holds anything: nothing worth saving.
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+
+    /// Changes since this ledger was made or loaded (see `generation`).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// A saved ledger, less rows whose file is gone: a file deleted while
+    /// croft was closed has nothing left to review, and nothing will ever
+    /// report its deletion now.
+    pub fn restored(mut self, exists: impl Fn(&Path) -> bool) -> Self {
+        for lane in self.lanes.values_mut() {
+            lane.retain(|path, _| exists(path));
+        }
+        self.lanes.retain(|_, lane| !lane.is_empty());
+        self.write_seq = self
+            .lanes
+            .values()
+            .flat_map(|l| l.values())
+            .map(|f| f.last_write_seq)
+            .max()
+            .unwrap_or(0)
+            .max(self.write_seq);
+        self.settle_if_empty();
+        self.generation = 0;
+        self
+    }
+
     /// Record that the watcher dropped events: every count from here on is
     /// a lower bound until the queue is next emptied.
     pub fn note_dropped_events(&mut self) {
+        if !self.may_be_incomplete {
+            self.touch();
+        }
         self.may_be_incomplete = true;
     }
 
@@ -217,6 +260,9 @@ impl AgentLedger {
                     changed = true;
                 }
             }
+        }
+        if changed {
+            self.touch();
         }
         changed
     }
@@ -353,6 +399,7 @@ impl AgentLedger {
         entry.current_hash = current;
         entry.writes_since_review = 0;
         self.settle_if_empty();
+        self.touch();
         true
     }
 
@@ -404,6 +451,9 @@ impl AgentLedger {
             lane.remove(path);
         }
         self.settle_if_empty();
+        if cleared + gone.len() > 0 {
+            self.touch();
+        }
         (cleared, gone.len())
     }
 
@@ -426,6 +476,7 @@ impl AgentLedger {
         }
         if any {
             self.settle_if_empty();
+            self.touch();
         }
         any
     }
@@ -435,6 +486,7 @@ impl AgentLedger {
         let removed = self.lanes.remove(agent).is_some();
         if removed {
             self.settle_if_empty();
+            self.touch();
         }
         removed
     }
@@ -473,6 +525,55 @@ impl AgentLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_ledger_comes_back_less_deleted_files_and_counts_its_changes() {
+        // #345: the queue and its baselines round-trip; a file deleted
+        // while croft was closed does not come back; `generation` moves
+        // only on real changes, which is what the app saves on.
+        let mut l = AgentLedger::new();
+        let working = [String::from("claude")];
+        assert!(l.record_write(&p("/w/a.rs"), 1, &working));
+        assert!(l.record_write(&p("/w/b.rs"), 2, &working));
+        l.mark_reviewed("claude", &p("/w/b.rs"), 2, Some(77));
+        let g = l.generation();
+        assert!(!l.record_write(&p("/w/a.rs"), 1, &working), "same content");
+        assert!(!l.mark_reviewed("nobody", &p("/w/a.rs"), 1, None));
+        assert!(!l.forget_path(&p("/w/zzz.rs")));
+        assert_eq!(l.generation(), g, "nothing changed, nothing to save");
+        l.note_dropped_events();
+        assert!(l.generation() > g);
+
+        let json = serde_json::to_string(&l).unwrap();
+        let back: AgentLedger = serde_json::from_str(&json).unwrap();
+        let back = back.restored(|path| path != Path::new("/w/gone.rs"));
+        assert_eq!(back.generation(), 0, "a load is not a change");
+        assert_eq!(back.lane("claude").len(), 2);
+        assert!(back.is_unreviewed(&p("/w/a.rs")));
+        assert!(!back.is_unreviewed(&p("/w/b.rs")));
+        let b = back
+            .lane("claude")
+            .into_iter()
+            .find(|f| f.path == p("/w/b.rs"))
+            .unwrap();
+        assert_eq!(b.reviewed_millis, Some(77), "the diff anchor survives");
+        assert!(back.may_be_incomplete());
+
+        let gone = back.restored(|path| path != Path::new("/w/a.rs"));
+        assert_eq!(
+            gone.lane("claude").len(),
+            1,
+            "a deleted file's row is dropped"
+        );
+        assert!(
+            !gone.may_be_incomplete(),
+            "with nothing left unreviewed there is nothing to doubt"
+        );
+        // A write after the load orders after every saved one.
+        let mut gone = gone;
+        gone.record_write(&p("/w/c.rs"), 3, &working);
+        assert_eq!(gone.lane("claude")[0].path, p("/w/c.rs"));
+    }
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)

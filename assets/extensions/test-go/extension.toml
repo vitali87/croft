@@ -1,0 +1,16 @@
+# Bundled croft extension: Go test runner.
+# Points the Testing view's `go test -json` mechanism (src/testing/gotest.rs)
+# at Go modules. The commands and parsers stay native; this manifest only
+# declares which marker files route to the go mechanism. Disabling this
+# extension stops the Testing view from detecting Go projects.
+id = "test-go"
+name = "Go Test Runner"
+description = "Discover and run Go tests with go test in the Testing view."
+builtin = true
+api_version = 1
+
+[[test_runners]]
+id = "test-go"
+label = "go test"
+kind = "go"
+markers = ["go.mod"]

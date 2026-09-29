@@ -230,7 +230,33 @@ where
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    // Owner-only: these stores hold per-workspace state, the terminal one a
+    // transcript of each pane's last lines, and a plain write left them at
+    // the umask's 0644 for any other user to read.
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        // Created fresh (O_EXCL), never opened through a symlink someone
+        // planted at the temp name.
+        let _ = std::fs::remove_file(&tmp);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(json.as_bytes())
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("write {}: {e}", tmp.display())
+    })?;
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
@@ -312,10 +338,24 @@ pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), Stri
 /// keeps the first answer.
 fn relative_to_base(base: &Path, base_canon: &Path, target: &Path) -> String {
     let direct = relative_or_absolute(base, target);
+    let target_canon = target.canonicalize().ok();
     if !Path::new(&direct).is_absolute() {
-        return direct;
+        // A `..` walk is resolved by the OS AFTER following any symlink in
+        // `base`: from `~/link/ws` (link -> /data/x), `../../other` opens
+        // `/data/other`, not `~/other`. Keep the spelling only when it
+        // reopens the same directory; otherwise save the folder absolute.
+        let reopens = match &target_canon {
+            Some(want) => base.join(&direct).canonicalize().ok().as_ref() == Some(want),
+            // A folder not on disk cannot be checked; keep its spelling.
+            None => true,
+        };
+        return if reopens {
+            direct
+        } else {
+            target.display().to_string()
+        };
     }
-    let Ok(target_canon) = target.canonicalize() else {
+    let Some(target_canon) = target_canon else {
         return direct;
     };
     let via_canon = relative_or_absolute(base_canon, &target_canon);
@@ -366,6 +406,35 @@ pub fn is_workspace_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_stores_are_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        update_json_store::<String, _>(&path, |m| {
+            m.insert("k".into(), "v".into());
+        })
+        .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_folder_is_not_saved_through_a_symlinked_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("data/x/ws")).unwrap();
+        std::fs::create_dir_all(home.join("other")).unwrap();
+        std::os::unix::fs::symlink(home.join("data/x"), home.join("link")).unwrap();
+        let base = home.join("link/ws");
+        let saved = relative_to_base(&base, &base.canonicalize().unwrap(), &home.join("other"));
+        let reopened = base.join(&saved).canonicalize().unwrap();
+        assert_eq!(reopened, home.join("other"), "saved as {saved}");
+    }
 
     #[test]
     fn a_single_root_set_answers_primary_with_it() {

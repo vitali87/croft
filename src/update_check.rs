@@ -8,7 +8,10 @@
 //! the binary on PATH is untouched, so a fresh `croft` launch tomorrow is
 //! still the version the user has today. Only Relaunch copies the staged
 //! binary over the installed one and re-execs into it. Later remembers the
-//! version so the same release is not offered again.
+//! version so the same release is not offered again. On Linux, a croft that
+//! is a release (from crates.io or a release archive) stages the release's
+//! own verified binary instead of building it, so a box with no Rust
+//! toolchain updates too (#261); building stays the fallback.
 //!
 //! (Neovim has no updater at all and leaves it to the package manager; VS
 //! Code downloads in the background and shows "Restart to Update"; Zed
@@ -33,6 +36,50 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_FILE: &str = "update-check.json";
 const STAGE_DIR: &str = "staged";
+
+/// Where the running binary came from, as far as upgrading it is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallSource {
+    /// Inside a Homebrew Cellar: Homebrew owns the file, and `brew upgrade`
+    /// is the only upgrade that keeps its records true.
+    Homebrew,
+    /// Anything else (cargo, binstall, a release archive, a source build):
+    /// croft may stage and swap the binary itself.
+    SelfManaged,
+}
+
+/// What a Homebrew user runs instead of croft's own updater.
+pub const BREW_UPGRADE: &str = "brew upgrade croft";
+
+/// Classify `exe`, the canonical path of the running binary (symlinks such
+/// as `/opt/homebrew/bin/croft` already resolved into the Cellar).
+pub fn install_source(exe: &Path) -> InstallSource {
+    // Homebrew keeps every formula at `<prefix>/Cellar/<formula>/<version>/`,
+    // on every prefix it supports (/opt/homebrew, /usr/local, linuxbrew), so
+    // a `Cellar/croft` pair of components is the signature, not the prefix.
+    let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    // The whole `Cellar/croft/<version>/bin/croft` tail: a source checkout
+    // that happens to sit under a `Cellar/croft` directory is not brew's.
+    let owned = parts.len() >= 5
+        && parts[parts.len() - 5] == "Cellar"
+        && parts[parts.len() - 4] == "croft"
+        && parts[parts.len() - 2] == "bin"
+        && parts[parts.len() - 1] == "croft";
+    if owned {
+        InstallSource::Homebrew
+    } else {
+        InstallSource::SelfManaged
+    }
+}
+
+/// The running binary's install source, resolving symlinks first so the
+/// `bin/croft` link Homebrew puts on PATH is traced into the Cellar.
+pub fn current_install_source() -> InstallSource {
+    std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map(|p| install_source(&p))
+        .unwrap_or(InstallSource::SelfManaged)
+}
 
 /// The on-disk memory of the check, one small JSON file in the cache dir.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -227,6 +274,84 @@ pub fn stage_command(cargo: PathBuf, version: &str, stage_root: &Path) -> std::p
     cmd
 }
 
+/// The release binary target this machine runs, when releases carry one:
+/// the static musl builds for Linux on x86_64 and aarch64 (#261).
+pub fn prebuilt_triple() -> Option<&'static str> {
+    if cfg!(target_os = "linux") {
+        crate::remote::arch_to_musl_triple(std::env::consts::ARCH)
+    } else {
+        None
+    }
+}
+
+/// Fetches `version`'s verified release binary for a target:
+/// [`crate::remote_prebuilt::prepare`] with its cache and verifier bound.
+pub type PrepareRelease<'a> =
+    dyn Fn(&str, &str) -> anyhow::Result<(PathBuf, crate::remote_prebuilt::Signature)> + 'a;
+
+/// Stage `version` at `binary`, saying how in the returned log. With a
+/// release target (`prebuilt`), the release's own binary is fetched,
+/// checked against its signed `SHA256SUMS` and copied in: no compile, so a
+/// box with no toolchain can update itself (#261). Without one, or when
+/// that release has no binary or it fails its checks, `build` compiles the
+/// published crate as before.
+pub fn stage_update(
+    version: &str,
+    binary: &Path,
+    prebuilt: Option<(&str, &PrepareRelease<'_>)>,
+    build: &dyn Fn() -> std::io::Result<std::process::Output>,
+) -> (UpdateEvent, String) {
+    let mut log = String::new();
+    if let Some((triple, prepare)) = prebuilt {
+        match prepare(version, triple) {
+            Ok((path, signature)) => {
+                let copied = binary
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::copy(&path, binary).map(|_| ()));
+                match copied {
+                    Ok(()) => {
+                        log.push_str(&format!(
+                            "Staged the v{version} release binary for {triple} (signature {})\n",
+                            match signature {
+                                crate::remote_prebuilt::Signature::Verified => "verified",
+                                crate::remote_prebuilt::Signature::Unchecked =>
+                                    "NOT checked: cosign is not installed",
+                            }
+                        ));
+                        return (UpdateEvent::Ready, log);
+                    }
+                    Err(e) => log.push_str(&format!(
+                        "Could not stage the release binary ({e}); building instead\n"
+                    )),
+                }
+            }
+            Err(e) if crate::remote_prebuilt::is_not_published(&e) => log.push_str(&format!(
+                "v{version} has no release binary for {triple}; building instead\n"
+            )),
+            Err(e) => log.push_str(&format!(
+                "The v{version} release binary was refused ({e:#}); building instead\n"
+            )),
+        }
+    }
+    match build() {
+        Ok(out) => {
+            log.push_str(&String::from_utf8_lossy(&out.stdout));
+            log.push_str(&String::from_utf8_lossy(&out.stderr));
+            let event = if out.status.success() {
+                UpdateEvent::Ready
+            } else {
+                UpdateEvent::Failed
+            };
+            (event, log)
+        }
+        Err(err) => {
+            log.push_str(&format!("failed to run cargo: {err}"));
+            (UpdateEvent::Failed, log)
+        }
+    }
+}
+
 /// A background staged build, reported through the same [`UpdateEvent`]
 /// lifecycle the remote watcher and the drift reinstall use so the app's
 /// spinner and "ready" pill need no third state machine.
@@ -248,23 +373,32 @@ impl StagedInstall {
             if let Some(dir) = log_path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let cargo = crate::widgets::dependencies::cargo_binary();
-            let event = match stage_command(cargo, &ver, &stage_root).output() {
-                Ok(out) => {
-                    let mut log = out.stdout;
-                    log.extend_from_slice(&out.stderr);
-                    let _ = std::fs::write(&log_path, &log);
-                    if out.status.success() {
-                        UpdateEvent::Ready
-                    } else {
-                        UpdateEvent::Failed
-                    }
-                }
-                Err(err) => {
-                    let _ = std::fs::write(&log_path, format!("failed to run cargo: {err}"));
-                    UpdateEvent::Failed
-                }
+            let build = || {
+                stage_command(
+                    crate::widgets::dependencies::cargo_binary(),
+                    &ver,
+                    &stage_root,
+                )
+                .output()
             };
+            let cache = crate::session_state::dirs_cache_croft().join("prebuilt");
+            let prepare = |version: &str, triple: &str| {
+                crate::remote_prebuilt::prepare(
+                    version,
+                    triple,
+                    &cache,
+                    &crate::remote_prebuilt::http_get,
+                    &crate::remote_prebuilt::cosign_verify,
+                )
+            };
+            // A release binary only stands in for a release: a croft from
+            // crates.io or a release archive, never a source build.
+            let prebuilt = prebuilt_triple()
+                .filter(|_| crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")))
+                .map(|t| (t, &prepare as &PrepareRelease<'_>));
+            let staged = staged_binary_path(&cache_dir);
+            let (event, log) = stage_update(&ver, &staged, prebuilt, &build);
+            let _ = std::fs::write(&log_path, log);
             let _ = tx.send(event);
         });
         Self {
@@ -355,6 +489,37 @@ fn apply_staged_at(staged: &Path, target: &Path, tmp: &Path) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_binary_in_a_homebrew_cellar_is_homebrew_owned() {
+        for p in [
+            "/opt/homebrew/Cellar/croft/0.1.961/bin/croft",
+            "/usr/local/Cellar/croft/0.1.961/bin/croft",
+            "/home/linuxbrew/.linuxbrew/Cellar/croft/0.1.961/bin/croft",
+        ] {
+            assert_eq!(install_source(Path::new(p)), InstallSource::Homebrew, "{p}");
+        }
+    }
+
+    #[test]
+    fn other_installs_are_self_managed() {
+        for p in [
+            "/Users/me/.cargo/bin/croft",
+            "/usr/local/bin/croft",
+            // Another formula's Cellar is not ours, and a folder merely named
+            // Cellar outside a Homebrew layout is not Homebrew.
+            "/opt/homebrew/Cellar/other/1.0/bin/croft",
+            "/Users/me/Cellar/notes/croft",
+            "/Users/me/Cellar/croft/target/release/croft",
+            "/Users/me/code/croft/target/release/croft",
+        ] {
+            assert_eq!(
+                install_source(Path::new(p)),
+                InstallSource::SelfManaged,
+                "{p}"
+            );
+        }
+    }
 
     #[test]
     fn versions_parse_with_or_without_the_v_and_compare_numerically() {
@@ -558,5 +723,66 @@ mod tests {
             b"#!/bin/sh\necho new\n",
             "the failed apply left the target alone"
         );
+    }
+    #[test]
+    fn a_release_binary_is_staged_without_building() {
+        use crate::remote_prebuilt::{NotPublished, Signature};
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release-croft");
+        std::fs::write(&release, b"release bytes").unwrap();
+        let staged = tmp.path().join("staged/bin/croft");
+        let built = std::cell::Cell::new(0);
+        let build = || {
+            built.set(built.get() + 1);
+            std::process::Command::new("sh")
+                .args(["-c", "echo compiled; exit 0"])
+                .output()
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let found = |v: &str, t: &str| {
+            asked.borrow_mut().push(format!("{v} {t}"));
+            Ok((release.clone(), Signature::Verified))
+        };
+        let (event, log) = stage_update(
+            "0.2.0",
+            &staged,
+            Some(("x86_64-unknown-linux-musl", &found)),
+            &build,
+        );
+        assert_eq!(event, UpdateEvent::Ready);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"release bytes");
+        assert_eq!(built.get(), 0, "no compile");
+        assert_eq!(*asked.borrow(), ["0.2.0 x86_64-unknown-linux-musl"]);
+        assert!(log.contains("signature verified"), "{log}");
+
+        // No binary for that release: build as before.
+        let missing = |_: &str, _: &str| -> anyhow::Result<(PathBuf, Signature)> {
+            Err(anyhow::Error::new(NotPublished(String::from("x"))))
+        };
+        let (event, log) = stage_update("0.2.1", &staged, Some(("t", &missing)), &build);
+        assert_eq!((event, built.get()), (UpdateEvent::Ready, 1));
+        assert!(
+            log.contains("v0.2.1 has no release binary for t; building instead"),
+            "{log}"
+        );
+        assert!(log.contains("compiled"), "{log}");
+
+        // A release that fails its checks is refused, and built instead.
+        let forged = |_: &str, _: &str| -> anyhow::Result<(PathBuf, Signature)> {
+            anyhow::bail!("does not match SHA256SUMS")
+        };
+        let (_, log) = stage_update("0.2.2", &staged, Some(("t", &forged)), &build);
+        assert!(log.contains("refused (does not match SHA256SUMS)"), "{log}");
+        assert_eq!(built.get(), 2);
+
+        // No release target (macOS, a source build): only the build.
+        let failing = || {
+            std::process::Command::new("sh")
+                .args(["-c", "echo broken >&2; exit 1"])
+                .output()
+        };
+        let (event, log) = stage_update("0.2.3", &staged, None, &failing);
+        assert_eq!(event, UpdateEvent::Failed);
+        assert!(log.contains("broken"), "{log}");
     }
 }

@@ -8,10 +8,11 @@
 //! fenced blocks in the kernel's language with an `In [n]` frame;
 //! text/stream outputs paint dim (ANSI stripped), errors red, and
 //! image/png outputs are written to the session scratch directory and
-//! reserve overlay rows exactly like a Markdown picture. Croft runs no
-//! kernels: the view is read-only truth about the file.
+//! reserve overlay rows exactly like a Markdown picture. Each code cell
+//! wears the run glyph; running it goes through the notebook's kernel
+//! (`notebook_kernel`, #355), whose outputs land in the file itself.
 
-use crate::markdown::MdImage;
+use crate::markdown::{MdImage, MdRunnable};
 use crate::theme::Theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -183,16 +184,19 @@ fn joined(v: &serde_json::Value) -> String {
     }
 }
 
-/// Render the notebook to preview lines + overlay images. `scratch`
-/// receives decoded image outputs (one file per output, named by a
-/// content hash so rebuilds reuse them).
+/// Render the notebook to preview lines + overlay images + one runnable
+/// per code cell. `scratch` receives decoded image outputs (one file per
+/// output, named by a content hash so rebuilds reuse them). Cells listed
+/// in `running` show `In [*]`, as Jupyter marks a cell that is running or
+/// queued.
 pub fn render(
     text: &str,
     theme: Theme,
     registry: &mut crate::highlight::LangRegistry,
     base_dir: Option<&Path>,
     scratch: &Path,
-) -> Option<(Vec<Line<'static>>, Vec<MdImage>)> {
+    running: &[usize],
+) -> Option<(Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>)> {
     let doc: serde_json::Value = serde_json::from_str(text).ok()?;
     let cells = doc.get("cells")?.as_array()?;
     let lang = doc
@@ -202,11 +206,12 @@ pub fn render(
         .to_string();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<MdImage> = Vec::new();
+    let mut runnables: Vec<MdRunnable> = Vec::new();
     let frame = Style::default()
         .fg(theme.ui(FRAME))
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(theme.ui(DIM));
-    for cell in cells {
+    for (index, cell) in cells.iter().enumerate() {
         let kind = cell.get("cell_type").and_then(|v| v.as_str()).unwrap_or("");
         let source = cell.get("source").map(joined).unwrap_or_default();
         match kind {
@@ -223,12 +228,29 @@ pub fn render(
                 lines.push(Line::default());
             }
             "code" => {
-                let n = cell
-                    .get("execution_count")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| String::from(" "));
-                lines.push(Line::from(Span::styled(format!("In [{n}]:"), frame)));
+                let n = if running.contains(&index) {
+                    String::from("*")
+                } else {
+                    cell.get("execution_count")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| String::from(" "))
+                };
+                runnables.push(MdRunnable {
+                    first_line: lines.len(),
+                    lines: (0, 0),
+                    code: source.clone(),
+                    interpreter: "kernel",
+                    destructive: false,
+                    cwd_root: false,
+                    persist: false,
+                    capture_timeout: None,
+                    kernel_cell: Some(index),
+                });
+                lines.push(Line::from(vec![
+                    Span::styled(crate::markdown::RUN_GLYPH, frame),
+                    Span::styled(format!("In [{n}]:"), frame),
+                ]));
                 let fenced = format!("```{lang}\n{source}\n```");
                 let (mut code_lines, _) =
                     crate::markdown::render_markdown_with_images(&fenced, theme, registry, None);
@@ -246,7 +268,7 @@ pub fn render(
             _ => {}
         }
     }
-    Some((lines, images))
+    Some((lines, images, runnables))
 }
 
 fn render_output(
@@ -356,8 +378,25 @@ mod tests {
         );
         let tmp = tempfile::tempdir().unwrap();
         let mut reg = crate::highlight::LangRegistry::default();
-        let (lines, images) =
-            render(&doc, Theme::BLACK, &mut reg, None, tmp.path()).expect("parses");
+        let (lines, _, runnables) =
+            render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).expect("parses");
+        // The code cell (index 1; the markdown cell is 0) wears the run
+        // glyph on its `In [n]` line; the markdown cell does not run.
+        assert_eq!(runnables.len(), 1);
+        assert_eq!(runnables[0].kernel_cell, Some(1));
+        assert_eq!(runnables[0].code, "print(1)\n");
+        let frame = &lines[runnables[0].first_line];
+        assert_eq!(frame.spans[0].content.as_ref(), crate::markdown::RUN_GLYPH);
+        assert_eq!(frame.spans[1].content.as_ref(), "In [2]:");
+        // Running or queued, the count reads `*`, as in Jupyter.
+        let (lines, _, _) =
+            render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[1]).expect("parses");
+        assert_eq!(
+            lines[runnables[0].first_line].spans[1].content.as_ref(),
+            "In [*]:"
+        );
+        let (lines, images, _) =
+            render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).expect("parses");
         let all: String = lines
             .iter()
             .flat_map(|l| l.spans.iter())
@@ -387,8 +426,8 @@ mod tests {
         ));
         let tmp = tempfile::tempdir().unwrap();
         let mut reg = crate::highlight::LangRegistry::default();
-        let (lines, images) =
-            render(&doc, Theme::BLACK, &mut reg, None, tmp.path()).expect("parses");
+        let (lines, images, _) =
+            render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).expect("parses");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].rows, 18);
         assert!(images[0].path.is_file(), "decoded png written to scratch");
@@ -396,7 +435,7 @@ mod tests {
             assert!(lines[images[0].first_line + i].spans.is_empty());
         }
         // Rebuild reuses the SAME hash-named file.
-        let (_, again) = render(&doc, Theme::BLACK, &mut reg, None, tmp.path()).unwrap();
+        let (_, again, _) = render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).unwrap();
         assert_eq!(again[0].path, images[0].path);
     }
 

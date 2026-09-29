@@ -45,8 +45,6 @@ pub struct SshAuth {
 impl SshAuth {
     pub fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir().context("ssh control dir")?;
-        std::fs::create_dir_all(&socket_dir)
-            .with_context(|| format!("creating {}", socket_dir.display()))?;
         let socket_path = socket_dir.join("ctl");
 
         let pty_system = native_pty_system();
@@ -155,9 +153,11 @@ impl SshAuth {
         }
     }
 
-    pub fn respond_password(&mut self, password: &str) {
+    /// Type `answer` into ssh's current prompt and press Enter: a password
+    /// or passphrase, a 2FA code, or `yes`/`no` to a host-key question.
+    pub fn respond_to_prompt(&mut self, answer: &str) {
         if let Some(w) = self.writer.as_mut() {
-            let _ = w.write_all(password.as_bytes());
+            let _ = w.write_all(answer.as_bytes());
             let _ = w.write_all(b"\r");
             let _ = w.flush();
         }

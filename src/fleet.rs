@@ -29,6 +29,8 @@ pub struct HostResult {
     pub output: String,
     /// `None` when the run timed out or ssh never returned a status.
     pub exit: Option<i32>,
+    /// Wall-clock time from spawn to exit (or to the deadline).
+    pub elapsed: Duration,
 }
 
 impl HostResult {
@@ -193,14 +195,18 @@ pub fn parse_request_with_groups<'a>(
     known: &'a [String],
     groups: &std::collections::BTreeMap<String, Vec<String>>,
 ) -> Option<(Vec<&'a String>, String)> {
-    let (spec, command) = input.split_once(':')?;
+    let (spec, command) = split_request(input)?;
     let command = command.trim();
     if command.is_empty() {
         return None;
     }
     let spec = spec.trim();
     if spec == "*" {
-        return Some((known.iter().collect(), command.to_string()));
+        // Every ssh host: `*` has always meant ~/.ssh/config, and a local
+        // shell or container joining it unasked would change what the same
+        // request runs on.
+        let hosts: Vec<&String> = known.iter().filter(|k| !is_local_target(k)).collect();
+        return Some((hosts, command.to_string()));
     }
     let mut hosts = Vec::new();
     for name in spec.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -228,6 +234,100 @@ pub fn parse_request_with_groups<'a>(
         }
     }
     (!hosts.is_empty()).then_some((hosts, command.to_string()))
+}
+
+/// Split `hosts: command` at the colon that ends the host list. A colon that
+/// only closes a `docker:` prefix (`docker:web: uptime`) belongs to the
+/// target, not to the separator.
+pub fn split_request(input: &str) -> Option<(&str, &str)> {
+    let mut from = 0;
+    while let Some(i) = input[from..].find(':').map(|i| i + from) {
+        let token_start = input[..i].rfind(',').map_or(0, |c| c + 1);
+        if input[token_start..i].trim() == "docker" {
+            from = i + 1;
+            continue;
+        }
+        return Some((&input[..i], &input[i + 1..]));
+    }
+    None
+}
+
+/// Whether a fleet target runs on this machine rather than over ssh:
+/// `localhost`, or a container as `docker:<name>` (#363).
+pub fn is_local_target(target: &str) -> bool {
+    target == "localhost"
+        || target
+            .strip_prefix("docker:")
+            .is_some_and(|n| !n.is_empty())
+}
+
+/// The local targets a fleet `request` may name besides ssh hosts:
+/// `localhost`, and every `docker:<name>` the request or one of `groups`
+/// names. Containers are not listed with `docker ps`: that waits on the
+/// Docker daemon, and a hung daemon would freeze the editor before the run
+/// even started. A container that does not exist fails in its own result,
+/// with docker's message.
+pub fn local_targets_in(
+    request: &str,
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut out = vec![String::from("localhost")];
+    let spec = split_request(request).map_or("", |(spec, _)| spec);
+    let named = spec
+        .split(',')
+        .chain(groups.values().flatten().map(String::as_str))
+        .map(str::trim)
+        .filter(|n| n.strip_prefix("docker:").is_some_and(|c| !c.is_empty()));
+    for n in named {
+        if !out.iter().any(|o| o == n) {
+            out.push(n.to_string());
+        }
+    }
+    out
+}
+
+/// The program and arguments that run `command` on `target`: ssh for a
+/// host, `sh -c` for `localhost`, `docker exec` for `docker:<name>`.
+pub fn target_command(target: &str, command: &str) -> (String, Vec<String>) {
+    if target == "localhost" {
+        return (
+            String::from("sh"),
+            vec![String::from("-c"), command.to_string()],
+        );
+    }
+    if let Some(name) = target.strip_prefix("docker:").filter(|n| !n.is_empty()) {
+        return (
+            String::from("docker"),
+            ["exec", name, "sh", "-c", command]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
+    }
+    (String::from("ssh"), fleet_ssh_args(target, command))
+}
+
+/// How `output` differs from the reference, line by line and in order:
+/// `+ line` for what the host printed that the reference lacks, `- line`
+/// for a reference line the host's output is missing. Both sides, so a
+/// host that dropped a line says which one, not only that it differs.
+pub fn differing_lines(reference: &str, output: &str) -> Vec<String> {
+    use crate::widgets::diff::{DiffRow, build_diff_rows};
+    let old: Vec<String> = reference.lines().map(str::to_string).collect();
+    let new: Vec<String> = output.lines().map(str::to_string).collect();
+    let mut out = Vec::new();
+    for row in build_diff_rows(&old, &new) {
+        match row {
+            DiffRow::Equal { .. } => {}
+            DiffRow::Removed { left } => out.push(format!("- {}", old[left])),
+            DiffRow::Added { right } => out.push(format!("+ {}", new[right])),
+            DiffRow::Replaced { left, right } => {
+                out.push(format!("- {}", old[left]));
+                out.push(format!("+ {}", new[right]));
+            }
+        }
+    }
+    out
 }
 
 /// Run `command` on every host in parallel, one thread each.
@@ -286,6 +386,7 @@ pub fn run_on_hosts(hosts: &[String], command: &str, timeout: Duration) -> Vec<H
                 host: h.clone(),
                 output: String::from("timed out"),
                 exit: None,
+                elapsed: Duration::ZERO,
             })
         })
         .collect()
@@ -300,84 +401,281 @@ pub fn run_on_hosts(hosts: &[String], command: &str, timeout: Duration) -> Vec<H
 /// as timed out. Every subsequent run leaks another, and a command the user
 /// gave up on can still complete minutes later.
 fn run_one(host: &str, command: &str, timeout: Duration) -> HostResult {
-    let secs = timeout.as_secs().max(1);
-    let mut args = vec![String::from("-o"), format!("ConnectTimeout={secs}")];
-    args.extend(fleet_ssh_args(host, command));
-    let spawned = std::process::Command::new("ssh")
-        .args(&args)
+    let started = std::time::Instant::now();
+    let mut result = run_one_untimed(host, command, timeout);
+    result.elapsed = started.elapsed();
+    result
+}
+
+fn run_one_untimed(host: &str, command: &str, timeout: Duration) -> HostResult {
+    let (program, mut args) = target_command(host, command);
+    if program == "ssh" {
+        let secs = timeout.as_secs().max(1);
+        let mut with_timeout = vec![String::from("-o"), format!("ConnectTimeout={secs}")];
+        with_timeout.append(&mut args);
+        args = with_timeout;
+    }
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args);
+    run_killable(cmd, &program, host, timeout)
+}
+
+/// Run `cmd` (`program`, for messages) for `host`, collecting stdout and
+/// stderr, and kill it if it outlives `timeout`.
+fn run_killable(
+    mut cmd: std::process::Command,
+    program: &str,
+    host: &str,
+    timeout: Duration,
+) -> HostResult {
+    use std::io::Read;
+    let result = |output: String, exit: Option<i32>| HostResult {
+        host: host.to_string(),
+        output,
+        exit,
+        elapsed: Duration::ZERO,
+    };
+    let spawned = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();
     let mut child = match spawned {
         Ok(c) => c,
-        Err(e) => {
-            return HostResult {
-                host: host.to_string(),
-                output: format!("could not run ssh: {e}"),
-                exit: None,
-            };
-        }
+        Err(e) => return result(format!("could not run {program}: {e}"), None),
     };
+    // Both pipes drain on their own threads WHILE the child runs. Read only
+    // after exit, a command printing more than a pipe buffer (~64 KiB, any
+    // `journalctl`) blocked on the write, never exited, and was killed at
+    // the deadline with all its output lost.
+    // Into a shared buffer, chunk by chunk: a command that leaves a
+    // background process holding the pipe (`nohup srv &`) never reaches EOF,
+    // and waiting for the whole read lost everything it had printed.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let sink = buf.clone();
+        std::thread::spawn(move || {
+            if let Some(mut p) = pipe {
+                let mut chunk = [0u8; 8192];
+                while let Ok(n) = p.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut b) = sink.lock() {
+                        b.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        (buf, done_rx)
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
     // Poll rather than block, so the child can be killed when its time is
     // up. `wait_with_output` would consume the child and leave no handle to
     // kill, which is how the abandoned processes accumulated.
     let deadline = std::time::Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 // Reaped, so the process does not linger as a zombie.
                 let _ = child.wait();
-                return HostResult {
-                    host: host.to_string(),
-                    output: String::from("timed out"),
-                    exit: None,
-                };
+                return result(String::from("timed out"), None);
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => {
-                return HostResult {
-                    host: host.to_string(),
-                    output: format!("could not wait on ssh: {e}"),
-                    exit: None,
-                };
-            }
+            Err(e) => return result(format!("could not wait on {program}: {e}"), None),
         }
-    }
-    let out = child.wait_with_output();
-    match out {
-        Ok(o) => {
-            // stdout AND stderr: a command that failed usually said why on
-            // stderr, and a tile showing an empty box for a failure tells
-            // the user nothing they can act on.
-            let mut text = String::from_utf8_lossy(&o.stdout).trim_end().to_string();
-            let err = String::from_utf8_lossy(&o.stderr);
-            let err = err.trim_end();
-            if !err.is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(err);
-            }
-            HostResult {
-                host: host.to_string(),
-                output: text,
-                exit: o.status.code(),
-            }
+    };
+    // A descendant the command left running can hold a pipe open past the
+    // exit, so the readers get a short grace rather than a join.
+    let grace = Duration::from_millis(500);
+    let take = |(buf, done): (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        std::sync::mpsc::Receiver<()>,
+    )| {
+        let _ = done.recv_timeout(grace);
+        buf.lock().map(|b| b.clone()).unwrap_or_default()
+    };
+    let out = take(stdout);
+    let err = take(stderr);
+    // stdout AND stderr: a command that failed usually said why on
+    // stderr, and a tile showing an empty box for a failure tells
+    // the user nothing they can act on.
+    let mut text = String::from_utf8_lossy(&out).trim_end().to_string();
+    let err = String::from_utf8_lossy(&err);
+    let err = err.trim_end();
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
         }
-        Err(e) => HostResult {
-            host: host.to_string(),
-            output: format!("could not run ssh: {e}"),
-            exit: None,
-        },
+        text.push_str(err);
     }
+    result(text, status.code())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_targets_are_localhost_and_docker_containers() {
+        assert!(is_local_target("localhost"));
+        assert!(is_local_target("docker:web"));
+        assert!(!is_local_target("docker:"), "a container needs a name");
+        assert!(!is_local_target("db-1"));
+        assert!(!is_local_target("localhost.example.com"));
+    }
+
+    #[test]
+    fn each_target_kind_gets_its_own_runner() {
+        let (p, a) = target_command("localhost", "uname -r");
+        assert_eq!(
+            (p.as_str(), a),
+            ("sh", vec!["-c".to_string(), "uname -r".to_string()])
+        );
+        let (p, a) = target_command("docker:web", "uname -r");
+        assert_eq!(
+            (p.as_str(), a),
+            (
+                "docker",
+                vec!["exec", "web", "sh", "-c", "uname -r"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        let (p, a) = target_command("db-1", "uname -r");
+        assert_eq!((p.as_str(), a), ("ssh", fleet_ssh_args("db-1", "uname -r")));
+    }
+
+    #[test]
+    fn local_targets_are_what_the_request_or_a_group_names() {
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(
+            String::from("web"),
+            vec![String::from("docker:front"), String::from("db-1")],
+        );
+        assert_eq!(
+            local_targets_in("docker:api, localhost: uptime", &groups),
+            vec!["localhost", "docker:api", "docker:front"]
+        );
+        assert_eq!(
+            local_targets_in("db-1: uptime", &std::collections::BTreeMap::new()),
+            vec!["localhost"]
+        );
+        assert_eq!(
+            local_targets_in("docker:: uptime", &std::collections::BTreeMap::new()),
+            vec!["localhost"],
+            "an empty container name is not a target"
+        );
+    }
+
+    #[test]
+    fn star_means_every_ssh_host_not_local_targets() {
+        let known: Vec<String> = ["db-1", "localhost", "docker:web", "db-2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let (hosts, _) =
+            parse_request_with_groups("*: uptime", &known, &std::collections::BTreeMap::new())
+                .unwrap();
+        let names: Vec<&str> = hosts.iter().map(|h| h.as_str()).collect();
+        assert_eq!(names, vec!["db-1", "db-2"]);
+        // Named explicitly, a local target is fine.
+        let (hosts, _) = parse_request_with_groups(
+            "localhost,docker:web: uptime",
+            &known,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(hosts.len(), 2);
+    }
+
+    #[test]
+    fn the_separator_skips_a_docker_prefix() {
+        assert_eq!(split_request("db-1: uptime"), Some(("db-1", " uptime")));
+        assert_eq!(
+            split_request("docker:web: uname -r"),
+            Some(("docker:web", " uname -r"))
+        );
+        assert_eq!(
+            split_request("db-1, docker:web ,localhost: a:b"),
+            Some(("db-1, docker:web ,localhost", " a:b")),
+            "a colon inside the command is the command's"
+        );
+        assert_eq!(split_request("docker:web"), None, "no command");
+    }
+
+    #[test]
+    fn differing_lines_show_both_what_is_extra_and_what_is_missing() {
+        let reference = "Linux\n6.8.0-45\nx86_64\n";
+        assert!(differing_lines(reference, reference).is_empty());
+        assert_eq!(
+            differing_lines(reference, "Linux\n6.8.0-31\nx86_64\n"),
+            vec!["- 6.8.0-45", "+ 6.8.0-31"]
+        );
+        assert_eq!(
+            differing_lines(reference, "Linux\n6.8.0-45\nx86_64\nextra\n"),
+            vec!["+ extra"]
+        );
+        // A host missing a line says which.
+        assert_eq!(differing_lines("a\nb\nc\n", "a\nc\n"), vec!["- b"]);
+    }
+
+    #[test]
+    fn localhost_runs_locally_and_is_timed() {
+        let r = run_on_hosts(
+            &["localhost".to_string()],
+            "printf hi",
+            Duration::from_secs(10),
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].output, "hi");
+        assert_eq!(r[0].exit, Some(0));
+        assert!(
+            r[0].elapsed > Duration::ZERO,
+            "the tile shows how long it took"
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn output_is_kept_when_a_background_child_holds_the_pipe() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo started; sleep 30 &"]);
+        let r = run_killable(cmd, "sh", "h", Duration::from_secs(20));
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(r.output, "started");
+    }
+
+    #[test]
+    fn a_command_printing_more_than_a_pipe_buffer_completes() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "head -c 300000 /dev/zero | tr '\\0' x; echo oops >&2"]);
+        let r = run_killable(cmd, "sh", "h", Duration::from_secs(20));
+        assert_eq!(
+            r.exit,
+            Some(0),
+            "{}",
+            &r.output[r.output.len().saturating_sub(80)..]
+        );
+        assert!(r.output.starts_with("xxxx"));
+        assert!(r.output.ends_with("\noops"));
+        assert_eq!(r.output.len(), 300_000 + "\noops".len());
+    }
 
     fn groups(pairs: &[(&str, &[&str])]) -> std::collections::BTreeMap<String, Vec<String>> {
         pairs
@@ -501,6 +799,7 @@ mod tests {
             host: String::from(host),
             output: String::from(out),
             exit,
+            elapsed: Duration::ZERO,
         }
     }
 

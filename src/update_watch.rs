@@ -48,6 +48,109 @@ impl UpdateWatch {
     }
 }
 
+/// The prefix of the markers the remote source build writes while it
+/// compiles (#694), under `~/.cache/croft`: one `building.<shell pid>` per
+/// build, holding the pid of the compile once it has started.
+pub const BUILD_MARKER_PREFIX: &str = "building.";
+
+/// True while a source build of croft is compiling on this host.
+///
+/// A build counts while its marker names a live pid (`alive` is the caller's
+/// probe, so tests need no real process). The build removes its marker when
+/// it ends, but a shell killed outright never runs its trap, so a marker
+/// naming a dead pid is stale and ignored: it must not keep croft's language
+/// servers stopped for good. So is one from an earlier boot — a reboot
+/// mid-build leaves the file, and after it the pid may belong to anything:
+/// its `.boot` sidecar names another `boot_id`, or, for a marker without
+/// one, it was written before `booted`. The two lookups are closures, run
+/// only when a marker needs them. A marker without a usable pid counts as
+/// none.
+pub fn source_build_running(
+    cache_dir: &std::path::Path,
+    boot_id: impl Fn() -> Option<String>,
+    booted: impl Fn() -> Option<std::time::SystemTime>,
+    alive: impl Fn(u32) -> bool,
+) -> bool {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(BUILD_MARKER_PREFIX) || name.ends_with(BOOT_SIDECAR_SUFFIX) {
+            return false;
+        }
+        let sidecar = entry
+            .path()
+            .with_file_name(format!("{name}{BOOT_SIDECAR_SUFFIX}"));
+        match std::fs::read_to_string(&sidecar) {
+            // The boot it was written in (#736): another one means stale,
+            // whatever the clock has done since.
+            Ok(written) => {
+                if boot_id().is_some_and(|now| now != written.trim()) {
+                    return false;
+                }
+            }
+            // A marker from before sidecars: judged by boot time, read only
+            // now that such a marker exists.
+            Err(_) => {
+                if let (Some(booted), Ok(modified)) =
+                    (booted(), entry.metadata().and_then(|m| m.modified()))
+                    && modified < booted
+                {
+                    return false;
+                }
+            }
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            return false;
+        };
+        match text.trim().parse::<u32>() {
+            // 0 would probe the caller's own process group, and anything
+            // past i32::MAX is not a pid at all.
+            Ok(pid) if pid != 0 && i32::try_from(pid).is_ok() => alive(pid),
+            _ => false,
+        }
+    })
+}
+
+/// The suffix of a build marker's sidecar naming the boot it was written
+/// in: `building.<pid>.boot` (#736).
+pub const BOOT_SIDECAR_SUFFIX: &str = ".boot";
+
+/// This boot's identity, the kernel's `boot_id`, read once per process: it
+/// cannot change while croft runs. `None` where there is no such file, and
+/// markers are then judged by their pid alone.
+pub fn boot_id() -> Option<String> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        parse_boot_id(&std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?)
+    })
+    .clone()
+}
+
+/// A `boot_id` file's contents, or `None` for anything that is not one.
+fn parse_boot_id(text: &str) -> Option<String> {
+    let id = text.trim();
+    (id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        .then(|| id.to_string())
+}
+
+/// When this host last booted, from `btime` in `/proc/stat`, for markers
+/// written before they carried a boot id. `None` where there is no `/proc`.
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    parse_btime(&std::fs::read_to_string("/proc/stat").ok()?)
+}
+
+fn parse_btime(stat: &str) -> Option<std::time::SystemTime> {
+    let secs: u64 = stat
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
 /// One-shot background probe answering: does the repo this binary was
 /// installed from now sit at a different commit/dirty state than the binary
 /// has baked in? The local half of the deploy-verification story (#242) —
@@ -664,5 +767,104 @@ mod tests {
         std::fs::remove_file(dir.join(MARKER_FILE)).unwrap();
         assert!(wait_for(&watch, UpdateEvent::Failed));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #694: a build marker pauses language servers only while the build
+    /// it names is alive, and only if it was written since boot.
+    #[test]
+    fn a_build_marker_counts_only_while_its_pid_is_alive() {
+        let dir = scratch_dir("build-marker");
+        let alive = |pid: u32| pid == 4242;
+        let no_id = || None;
+        let no_time = || None;
+        let marker = |name: &str| dir.join(format!("{BUILD_MARKER_PREFIX}{name}"));
+        assert!(
+            !source_build_running(
+                &dir,
+                || -> Option<String> { panic!("boot id read with no marker") },
+                || -> Option<std::time::SystemTime> { panic!("btime read with no marker") },
+                alive
+            ),
+            "no marker means no build, and nothing read to decide it"
+        );
+
+        std::fs::write(marker("100"), "4242\n").unwrap();
+        assert!(
+            source_build_running(&dir, no_id, no_time, alive),
+            "a live build must count"
+        );
+
+        // A second build's marker, already dead, must not hide the first.
+        std::fs::write(marker("200"), "999").unwrap();
+        assert!(source_build_running(&dir, no_id, no_time, alive));
+
+        // Only dead markers left: stale, so no build.
+        std::fs::remove_file(marker("100")).unwrap();
+        assert!(
+            !source_build_running(&dir, no_id, no_time, alive),
+            "a stale marker must not keep the servers stopped"
+        );
+
+        // Written before the last boot: stale whatever its pid says.
+        std::fs::write(marker("300"), "4242").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(!source_build_running(&dir, no_id, || Some(later), alive));
+        assert!(source_build_running(
+            &dir,
+            no_id,
+            || Some(std::time::UNIX_EPOCH),
+            alive
+        ));
+
+        std::fs::remove_file(marker("200")).unwrap();
+        // #736: with a boot sidecar the boot id decides, and boot time is
+        // never consulted, so a stepped clock changes nothing.
+        let this = || Some(String::from("aaaa"));
+        std::fs::write(marker("300.boot"), "aaaa\n").unwrap();
+        let unread = || -> Option<std::time::SystemTime> { panic!("btime read for a sidecar") };
+        assert!(source_build_running(&dir, this, unread, alive));
+        std::fs::write(marker("300.boot"), "bbbb").unwrap();
+        assert!(
+            !source_build_running(&dir, this, unread, alive),
+            "a marker from another boot must not keep the servers stopped"
+        );
+        // A host with no boot id to compare keeps the pid check alone.
+        assert!(source_build_running(&dir, no_id, unread, alive));
+        std::fs::remove_file(marker("300.boot")).unwrap();
+        std::fs::remove_file(marker("300")).unwrap();
+
+        // Junk, 0 (the caller's process group) and non-pids never count,
+        // and are never even probed. Nor does a file without the prefix.
+        for junk in ["", "abc", "0", "4294967295"] {
+            std::fs::write(marker("400"), junk).unwrap();
+            assert!(
+                !source_build_running(&dir, no_id, no_time, |_| true),
+                "marker {junk:?} must not count as a build"
+            );
+        }
+        std::fs::remove_file(marker("400")).unwrap();
+        // A lone sidecar is not a marker.
+        std::fs::write(marker("500.boot"), "4242").unwrap();
+        assert!(!source_build_running(&dir, no_id, no_time, |_| true));
+        std::fs::remove_file(marker("500.boot")).unwrap();
+        std::fs::write(dir.join("building"), "4242").unwrap();
+        assert!(!source_build_running(&dir, no_id, no_time, |_| true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boot_identity_parsing_takes_only_well_formed_values() {
+        assert_eq!(
+            parse_boot_id("0f9c6a4e-2a1b-4c3d-9e8f-0123456789ab\n").as_deref(),
+            Some("0f9c6a4e-2a1b-4c3d-9e8f-0123456789ab")
+        );
+        assert_eq!(parse_boot_id(""), None);
+        assert_eq!(parse_boot_id("not a boot id at all, clearly nope!!"), None);
+        assert_eq!(
+            parse_btime("cpu 1 2 3\nbtime 1700000000\nprocesses 9\n"),
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+        );
+        assert_eq!(parse_btime("cpu 1 2 3\n"), None, "no btime line");
+        assert_eq!(parse_btime("btime soon\n"), None, "junk");
     }
 }

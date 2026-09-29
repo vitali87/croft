@@ -522,7 +522,17 @@ fn run_croft_session(
     // `launch_croft_with` and the in-app `launch_only` — which the install
     // hook does not, since an already-installed remote installs on a
     // detached thread and never waits.
-    push_config_files(&ssh, &mut |msg| println!("{msg}"));
+    // The re-push baseline is taken BEFORE the connect-time push: a file
+    // edited while that push runs then still reads as changed, instead of
+    // becoming the baseline with the remote holding the older copy.
+    let repush_watch =
+        crate::config_sync::ConfigWatch::new(crate::config_sync::watched_local_paths());
+    push_config_files(&ssh, &SyncResolution::default(), &mut |msg| {
+        println!("{msg}")
+    });
+    // A file edited on this machine while the session runs follows it
+    // (#262); the remote croft applies it on arrival. Stops with the session.
+    let repush = ConfigRepush::start(&ssh, repush_watch);
     let mut bootstrapped = false;
     // The relay rendezvous is keyed on the launch identity — the very same
     // `hash(launch arg)` the dtach socket uses — NOT the remote croft's
@@ -577,7 +587,10 @@ fn run_croft_session(
             RemoteStatusClass::Failed if persistent && is_transport_failure(status.code()) => {
                 drop(pump);
                 match reconnect_master(host) {
-                    Some(new_ssh) => ssh = new_ssh,
+                    Some(new_ssh) => {
+                        ssh = new_ssh;
+                        repush.retarget(&ssh);
+                    }
                     None => return Ok(RemoteOutcome::Exited),
                 }
             }
@@ -646,6 +659,23 @@ fn install_remote_croft_streaming(
     log_tx: &std::sync::mpsc::Sender<String>,
     confirm_fallback: &mut dyn FnMut(&str) -> bool,
 ) -> Result<()> {
+    // The release binary first (#261), over the same bulk lane.
+    let mut ship = |binary: &Path| -> Result<()> {
+        let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
+        let status = ship_file_rsync_command(lane, &ssh.socket_path, binary, &dest)
+            .status()
+            .context("rsyncing the prebuilt croft to the remote")?;
+        anyhow::ensure!(status.success(), "rsync exited with {status}");
+        Ok(())
+    };
+    let mut log = |m: String| {
+        let _ = log_tx.send(m);
+    };
+    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut log) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => log(format!("Prebuilt install failed ({e:#}); building instead")),
+    }
     let reason = match try_local_cross_install_streaming(ssh, lane, source_stamp, log_tx) {
         Ok(None) => return Ok(()),
         Ok(Some(reason)) => reason,
@@ -676,32 +706,26 @@ fn install_remote_croft_streaming(
     Ok(())
 }
 
-/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
-/// fast path is unavailable (the reason feeds the fallback confirmation);
-/// `Err` = the fast path was attempted and broke.
-fn try_local_cross_install_streaming(
-    ssh: &SshControl,
-    lane: &crate::remote_bulk::BulkLane,
-    source_stamp: &str,
-    log_tx: &std::sync::mpsc::Sender<String>,
-) -> Result<Option<String>> {
+/// Why a local static build for `triple` can't run, or `None` when it can.
+/// Shared by the remote installer and dev containers (#617).
+pub(crate) fn cross_build_unavailable(triple: &str) -> Option<String> {
     if let Some(reason) = cross_compile_unavailable_reason() {
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
+        return Some(reason);
     }
-    let Some(triple) = remote_target_triple(ssh)? else {
-        let reason = String::from("could not detect the remote architecture");
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
-    };
     if !rust_target_installed(triple) {
-        let reason = format!(
+        return Some(format!(
             "rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
-        );
-        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
-        return Ok(Some(reason));
+        ));
     }
+    None
+}
 
+/// Cross-build a static croft for `triple` from this checkout and return the
+/// binary's path.
+pub(crate) fn cross_build_static(
+    triple: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<PathBuf> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // This build runs *concurrently* with the live remote session, whose
     // keystrokes are relayed by this same local machine. A default `-j N`
@@ -741,6 +765,36 @@ fn try_local_cross_install_streaming(
             binary.display()
         );
     }
+    Ok(binary)
+}
+
+/// `Ok(None)` = binary shipped via the fast path; `Ok(Some(reason))` = the
+/// fast path is unavailable (the reason feeds the fallback confirmation);
+/// `Err` = the fast path was attempted and broke.
+fn try_local_cross_install_streaming(
+    ssh: &SshControl,
+    lane: &crate::remote_bulk::BulkLane,
+    source_stamp: &str,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<Option<String>> {
+    if let Some(reason) = cross_compile_unavailable_reason() {
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    }
+    let Some(triple) = remote_target_triple(ssh)? else {
+        let reason = String::from("could not detect the remote architecture");
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    };
+    if !rust_target_installed(triple) {
+        let reason = format!(
+            "rustup target `{triple}` missing (run `rustup target add {triple}` once to enable the fast path)"
+        );
+        let _ = log_tx.send(format!("Local cross-build skipped: {reason}"));
+        return Ok(Some(reason));
+    }
+
+    let binary = cross_build_static(triple, log_tx)?;
 
     let mkdir = ssh.background_shell("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
     let mkdir_status =
@@ -884,8 +938,6 @@ impl SshControl {
 
     fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir()?;
-        std::fs::create_dir_all(&socket_dir)
-            .with_context(|| format!("creating {}", socket_dir.display()))?;
         let socket_path = socket_dir.join("ctl");
         let status = Command::new("ssh")
             .arg("-M")
@@ -1120,6 +1172,10 @@ impl Drop for DropPump {
     }
 }
 
+/// How long a window without a pull's file waits before answering it as
+/// missing, so an attached window that has the file claims it first.
+const MISSING_PULL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn run_pump(
     host: String,
     socket: PathBuf,
@@ -1133,7 +1189,37 @@ fn run_pump(
             break;
         }
         let Ok(line) = line else { break };
-        match parse_relay_request(&line) {
+        let request = parse_relay_request(&line);
+        // Two local windows attached to one session tail the same log. The
+        // first to claim a request handles it; without this every window
+        // ran every open, forward and pull, one browser tab each (#648).
+        //
+        // A pull names a file on ONE computer: when two computers are
+        // attached, only the one that has it may claim it, or the other
+        // would claim it, fail, and leave the file's owner nothing to do.
+        //
+        // A file on NEITHER computer still needs an answer, or the remote
+        // waits out its whole timeout: after a grace period that lets the
+        // owner claim it first, whoever claims it now says it is missing.
+        if let Some(RelayRequest::Pull { id, src }) = &request
+            && !Path::new(src).exists()
+        {
+            let (host, socket, inbox_dir) = (host.clone(), socket.clone(), inbox_dir.clone());
+            let (id, src) = (id.clone(), src.clone());
+            thread::spawn(move || {
+                thread::sleep(MISSING_PULL_GRACE);
+                if ssh_exec(&host, &socket, &claim_command(&inbox_dir, &id)) {
+                    handle_pull_request(&host, &socket, &inbox_dir, &id, &src);
+                }
+            });
+            continue;
+        }
+        if let Some(id) = request.as_ref().and_then(RelayRequest::id)
+            && !ssh_exec(&host, &socket, &claim_command(&inbox_dir, id))
+        {
+            continue;
+        }
+        match request {
             Some(RelayRequest::Pull { id, src }) => {
                 handle_pull_request(&host, &socket, &inbox_dir, &id, &src);
             }
@@ -1384,6 +1470,21 @@ enum RelayRequest {
     },
 }
 
+impl RelayRequest {
+    /// The id a pump claims before acting. `Unforward` has none: each pump
+    /// tears down only a tunnel it holds, so every pump may see it.
+    fn id(&self) -> Option<&str> {
+        match self {
+            Self::Pull { id, .. }
+            | Self::Clipboard { id }
+            | Self::Copy { id }
+            | Self::Open { id, .. }
+            | Self::Forward { id, .. } => Some(id),
+            Self::Unforward { .. } => None,
+        }
+    }
+}
+
 fn parse_relay_request(line: &str) -> Option<RelayRequest> {
     let line = line.trim();
     let mut parts = line.split('\t');
@@ -1450,9 +1551,57 @@ fn url_is_safe_to_open(url: &str) -> bool {
         .any(|c| c == '\0' || c == '\n' || c == '\r' || c == '\t')
 }
 
+/// Whether a pull may send `src`. The request comes from the remote's
+/// relay log, which any process running as the remote user can append to,
+/// so it is not proof the user dropped that file. A drag from Finder names
+/// a visible file; credentials live under hidden paths (`~/.ssh`,
+/// `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.config/...`). So a path that is
+/// not absolute, or that resolves (through `..` or symlinks) to anything
+/// under a hidden component, is refused.
+fn pull_source_allowed(src: &Path) -> bool {
+    use std::path::Component;
+    let hidden = |p: &Path| {
+        p.components().any(|c| match c {
+            Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+            Component::ParentDir => true,
+            _ => false,
+        })
+    };
+    if !src.is_absolute() || hidden(src) {
+        return false;
+    }
+    std::fs::canonicalize(src).is_ok_and(|real| !hidden(&real))
+}
+
+/// The local `tar` arguments that pack a pulled `basename` from `parent`.
+/// Hidden entries are excluded: [`pull_source_allowed`] vets only the named
+/// path, and a pulled folder (`~`, say) would otherwise carry its `.ssh`
+/// along. `--` keeps a name starting with `-` from reading as an option.
+/// Both GNU tar and bsdtar match `.*` against each path component.
+fn pull_tar_args(parent: &Path, basename: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["-c", "-f", "-", "--exclude", ".*", "-C"]
+        .iter()
+        .map(Into::into)
+        .collect();
+    args.push(parent.into());
+    args.push("--".into());
+    args.push(basename.into());
+    args
+}
+
 fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str, src: &str) {
     let src_path = PathBuf::from(src);
     let dest_dir = format!("{inbox_dir}/{request_id}");
+    if src_path.exists() && !pull_source_allowed(&src_path) {
+        write_relay_err(
+            host,
+            socket,
+            inbox_dir,
+            request_id,
+            &format!("refusing to send a hidden path: {}", src_path.display()),
+        );
+        return;
+    }
     if !src_path.exists() {
         write_relay_err(
             host,
@@ -1483,12 +1632,7 @@ fn handle_pull_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
     // destination, which kept failing on freshly-mkdir'd dirs.
     let mut tar = match Command::new("tar")
         .env("COPYFILE_DISABLE", "1")
-        .arg("-c")
-        .arg("-f")
-        .arg("-")
-        .arg("-C")
-        .arg(parent)
-        .arg(basename)
+        .args(pull_tar_args(parent, basename))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -1601,6 +1745,17 @@ fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The remote command that claims request `id` for this pump: `mkdir` is
+/// atomic, so of several pumps exactly one succeeds.
+fn claim_command(inbox_dir: &str, id: &str) -> String {
+    let claims = format!("{inbox_dir}/.claims");
+    format!(
+        "mkdir -p {} && mkdir {}",
+        shell_quote(&claims),
+        shell_quote(&format!("{claims}/{id}"))
+    )
 }
 
 /// Hand `url` to the local platform opener (`open` on macOS, `xdg-open` on
@@ -1831,12 +1986,32 @@ pub(crate) fn client_process_nonce() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Create a fresh, owner-only directory for an SSH control socket and
+/// return it. Created here, in one step, rather than named and later
+/// `create_dir_all`ed: the name is predictable in a shared `/tmp`, and
+/// `create_dir_all` accepted a directory another local user had made first,
+/// who could then plant a `ctl` that reads as "authenticated" or swap in a
+/// socket of their own. The create fails if the name already exists.
 pub fn ssh_control_dir() -> Result<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock before unix epoch")?
         .as_millis();
-    Ok(std::env::temp_dir().join(format!("croft-ssh-{}-{now}", std::process::id())))
+    // A counter too: two calls in one millisecond must not collide now that
+    // an existing name is an error.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("croft-ssh-{}-{now}-{seq}", std::process::id()));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
 }
 
 fn run_remote_croft(
@@ -1864,6 +2039,30 @@ fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Result<()> {
     // but it never engages silently: the user confirms it on the tty
     // first, because quitting to run `croft setup-cross` once is almost
     // always the better deal.
+    //
+    // Before either: the release binary for this exact version (#261), when
+    // this croft IS that release.
+    let mut ship = |binary: &Path| -> Result<()> {
+        let ssh_e = format!(
+            "ssh -S {} -o ControlMaster=no",
+            shell_quote_for_e_arg(&ssh.socket_path),
+        );
+        let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
+        let status = Command::new("rsync")
+            .args(["-az", "--checksum", "-e"])
+            .arg(&ssh_e)
+            .arg(binary)
+            .arg(&dest)
+            .status()
+            .context("rsyncing the prebuilt croft to the remote")?;
+        anyhow::ensure!(status.success(), "rsync exited with {status}");
+        Ok(())
+    };
+    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut |m| println!("{m}")) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => eprintln!("Prebuilt install failed ({e:#}); building instead"),
+    }
     let reason = match try_local_cross_install(ssh, source_stamp) {
         Ok(None) => return Ok(()),
         Ok(Some(reason)) => reason,
@@ -2156,8 +2355,26 @@ fn sync_workspace_lock(source: &Path, log: impl Fn(String)) {
 /// behaviour — failing the connect over it would be a regression. Every
 /// outcome is reported so a silent no-op is distinguishable from a silent
 /// success.
-fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
-    let files = crate::config_sync::local_files();
+fn push_config_files(ssh: &SshControl, resolution: &SyncResolution, log: &mut dyn FnMut(String)) {
+    // User layers only: a workspace must not decide what leaves the laptop.
+    let prefs = crate::config_layers::load_merged(None).prefs;
+    if crate::config_sync::host_excluded(&ssh.host, &prefs.config_sync_excluded_hosts) {
+        log(format!(
+            "Config sync: off for {} (config_sync_excluded_hosts)",
+            ssh.host
+        ));
+        return;
+    }
+    let (files, skipped) = crate::config_sync::apply_exclusions(
+        crate::config_sync::local_files(),
+        &prefs.config_sync_excluded_files,
+    );
+    if !skipped.is_empty() {
+        log(format!(
+            "Config sync: not pushing {} (config_sync_excluded_files)",
+            skipped.join(", ")
+        ));
+    }
     if files.is_empty() {
         return;
     }
@@ -2174,16 +2391,88 @@ fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
         return;
     }
 
+    // What is there now, so a copy edited on the remote is never replaced
+    // (#262). Unreadable means unknown, and unknown is not permission.
+    let remote = match ssh
+        .background_shell(&crate::config_sync::remote_hash_script())
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            crate::config_sync::parse_remote_hashes(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => {
+            log(String::from(
+                "Config sync: could not read the remote's copies; pushing nothing rather than risk overwriting them",
+            ));
+            return;
+        }
+    };
+    let state_path = crate::config_sync::SyncState::path();
+    let mut state = crate::config_sync::SyncState::load(&state_path);
+
     let bulk = crate::remote_bulk::establish(&ssh.host, &ssh.socket_path, |_| {});
     let mut pushed = Vec::new();
     let mut failed = Vec::new();
+    let mut kept = Vec::new();
+    let mut conflicts = Vec::new();
     for (syncable, local) in &files {
-        let dest = crate::config_sync::remote_dest(&ssh.host, syncable.name);
-        let mut rsync = ship_file_rsync_command(&bulk.lane, &ssh.socket_path, local, &dest);
-        match rsync.status() {
-            Ok(st) if st.success() => pushed.push(syncable),
-            _ => failed.push(syncable.name),
+        let Ok(bytes) = std::fs::read(local) else {
+            failed.push(syncable.name);
+            continue;
+        };
+        let local_hash = crate::config_sync::content_hash(&bytes);
+        let there = remote.get(syncable.name).map(String::as_str);
+        let chosen = |list: &[String]| list.iter().any(|n| n == syncable.name);
+        let plan = if chosen(&resolution.take_local) {
+            crate::config_sync::Plan::Push
+        } else if chosen(&resolution.keep_remote) && there.is_some_and(|r| r != local_hash) {
+            let entry = state.file_mut(&ssh.host, syncable.name);
+            entry.kept = there.map(|r| (r.to_string(), local_hash.clone()));
+            crate::config_sync::Plan::Kept
+        } else {
+            crate::config_sync::plan(&local_hash, there, state.file(&ssh.host, syncable.name))
+        };
+        match plan {
+            crate::config_sync::Plan::Push => {
+                let dest = crate::config_sync::remote_dest(&ssh.host, syncable.name);
+                let mut rsync = ship_file_rsync_command(&bulk.lane, &ssh.socket_path, local, &dest);
+                match rsync.status() {
+                    Ok(st) if st.success() => {
+                        let entry = state.file_mut(&ssh.host, syncable.name);
+                        entry.pushed = Some(local_hash);
+                        entry.kept = None;
+                        pushed.push(syncable);
+                    }
+                    _ => failed.push(syncable.name),
+                }
+            }
+            crate::config_sync::Plan::UpToDate => {
+                let entry = state.file_mut(&ssh.host, syncable.name);
+                entry.pushed = Some(local_hash);
+                entry.kept = None;
+            }
+            crate::config_sync::Plan::Kept => kept.push(syncable.name),
+            crate::config_sync::Plan::Conflict => conflicts.push(syncable.name),
         }
+    }
+    if let Err(e) = state.save(&state_path) {
+        log(format!(
+            "Config sync: could not record what was pushed ({e})"
+        ));
+    }
+    if !kept.is_empty() {
+        log(format!(
+            "Config sync: keeping the remote's own {} (as you chose)",
+            kept.join(", ")
+        ));
+    }
+    for name in &conflicts {
+        log(format!(
+            "Config sync: {name} was changed on {host} since croft last pushed it, so it was left alone. \
+             `croft sync-config {host} --diff {name}` compares the two; `--take-local {name}` pushes yours, \
+             `--keep-remote {name}` keeps theirs",
+            host = ssh.host
+        ));
     }
 
     if !pushed.is_empty() {
@@ -2191,14 +2480,11 @@ fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
         // nothing about whether the one they just edited went.
         let names: Vec<&str> = pushed.iter().map(|s| s.name).collect();
         log(format!("Config sync: pushed {}", names.join(", ")));
-        // ALL of it applies on the remote's next launch, not just the files
-        // with no reload arm. The reload path is driven by croft's own save
-        // (`reload_config_for_path`), and nothing watches ~/.config/croft, so
-        // a file that arrives by rsync is not noticed at all until relaunch.
-        // Saying "these four are live" would be the lie this message exists
-        // to prevent.
+        // A croft already running on the remote applies them within its
+        // config watch's interval (`ConfigWatch`, #262); one started later
+        // reads them at launch.
         log(format!(
-            "Config sync: {} applies on the remote's next launch",
+            "Config sync: {} applies on the remote within a few seconds",
             names.join(", ")
         ));
     }
@@ -2207,6 +2493,415 @@ fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
             "Config sync: could not push {} (the remote keeps its own copy)",
             failed.join(", ")
         ));
+    }
+}
+
+/// How the user settled config files that differ on the remote (#262):
+/// push these anyway, or keep the remote's copy of these.
+#[derive(Debug, Default, Clone)]
+pub struct SyncResolution {
+    pub take_local: Vec<String>,
+    pub keep_remote: Vec<String>,
+}
+
+/// `croft sync-config <host>` (#262): push the syncable config now, the
+/// same way a connect does, or with `diff` set show how the remote's copy
+/// of that file differs from the local one.
+pub fn sync_config_now(host: &str, resolution: &SyncResolution, diff: Option<&str>) -> Result<()> {
+    for name in resolution
+        .take_local
+        .iter()
+        .chain(&resolution.keep_remote)
+        .map(String::as_str)
+        .chain(diff)
+    {
+        if !crate::config_sync::SYNCABLE.iter().any(|s| s.name == name) {
+            let names: Vec<&str> = crate::config_sync::SYNCABLE
+                .iter()
+                .map(|s| s.name)
+                .collect();
+            anyhow::bail!("{name} is not a synced file ({})", names.join(", "));
+        }
+    }
+    let ssh = SshControl::start(host)?;
+    match diff {
+        Some(name) => print_config_diff(&ssh, name),
+        None => {
+            push_config_files(&ssh, resolution, &mut |msg| println!("{msg}"));
+            Ok(())
+        }
+    }
+}
+
+/// Re-pushes a config file edited on this machine while a remote session
+/// runs (#262), so a keybinding changed mid-session reaches the remote
+/// croft, which applies it on arrival, instead of waiting for the next
+/// connect. A thread polls the files with [`crate::config_sync::ConfigWatch`]
+/// and ships each change over the bulk lane; it logs to
+/// `~/.cache/croft/config-sync.log`, never to the terminal, which belongs to
+/// the remote croft. Dropping it stops the thread.
+struct ConfigRepush {
+    /// Host and control socket to push through; swapped on a reconnect.
+    target: std::sync::Arc<std::sync::Mutex<(String, PathBuf)>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Joined on drop, so no push starts after the session has ended.
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ConfigRepush {
+    /// Start re-pushing changes relative to `watch`, whose baseline the
+    /// caller took before the connect-time push.
+    fn start(ssh: &SshControl, watch: crate::config_sync::ConfigWatch) -> Self {
+        let target = std::sync::Arc::new(std::sync::Mutex::new((
+            ssh.host.clone(),
+            ssh.socket_path.clone(),
+        )));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (t, s) = (target.clone(), stop.clone());
+        let worker = std::thread::spawn(move || {
+            let dir = crate::prefs::config_dir();
+            let mut state = RepushState::new(watch);
+            let mut exclusions = SyncExclusions::load();
+            let mut log = config_sync_log();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Checked after the sleep too, so a session that ended
+                // during it starts no push.
+                if s.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let (host, socket) = match t.lock() {
+                    Ok(g) => g.clone(),
+                    Err(_) => return,
+                };
+                repush_tick(
+                    &mut state,
+                    &dir,
+                    std::time::Instant::now(),
+                    &mut || match exclusions.current() {
+                        None => RepushGate::Unknown,
+                        Some((hosts, _)) if crate::config_sync::host_excluded(&host, &hosts) => {
+                            RepushGate::HostExcluded
+                        }
+                        Some((_, files)) => RepushGate::Push(files),
+                    },
+                    &mut |files| push_over_bulk_lane(&host, &socket, files),
+                    &mut log,
+                );
+            }
+        });
+        ConfigRepush {
+            target,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    /// Push through the connection a reconnect just opened.
+    fn retarget(&self, ssh: &SshControl) {
+        if let Ok(mut g) = self.target.lock() {
+            *g = (ssh.host.clone(), ssh.socket_path.clone());
+        }
+    }
+}
+
+/// Print a unified diff of the remote's copy of `name` against the local
+/// one, remote first, so `+` lines are what a push would bring.
+fn print_config_diff(ssh: &SshControl, name: &str) -> Result<()> {
+    let local = crate::prefs::config_dir().join(name);
+    let out = ssh
+        .background_shell(&format!("cat ~/.config/croft/{name} 2>/dev/null"))
+        .output()?;
+    let tmp = std::env::temp_dir().join(format!("croft-sync-{}-{name}", std::process::id()));
+    std::fs::write(&tmp, &out.stdout)?;
+    let local_arg = if local.is_file() {
+        local
+    } else {
+        PathBuf::from("/dev/null")
+    };
+    let status = Command::new("diff")
+        .args(["-u", "--label"])
+        .arg(format!("{}:{name}", ssh.host))
+        .arg("--label")
+        .arg(format!("local:{name}"))
+        .arg(&tmp)
+        .arg(&local_arg)
+        .status();
+    let _ = std::fs::remove_file(&tmp);
+    let status = status?;
+    if status.code() == Some(0) {
+        println!("{name} is the same on {} and here", ssh.host);
+    }
+    Ok(())
+}
+
+impl Drop for ConfigRepush {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // At most one sleep plus a push in flight: the teardown waits for a
+        // transfer already started rather than cutting it off.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// The user's config-sync exclusions (#603) as a live re-push reads them.
+///
+/// Read again whenever a file changes, so an edited exclusion applies
+/// without a reconnect. Only a clean read counts: one that skipped a layer
+/// (a config file half-written or invalid at that moment) would report the
+/// default, empty lists, and pushing on those would send a file to a host
+/// the user had excluded. So a bad read keeps the last clean one, and until
+/// there has been a clean read at all the exclusions are unknown and
+/// nothing is pushed.
+struct SyncExclusions {
+    /// `(config_sync_excluded_hosts, config_sync_excluded_files)` from the
+    /// last clean read; `None` before the first.
+    known: Option<(Vec<String>, Vec<String>)>,
+}
+
+impl SyncExclusions {
+    /// The exclusions as of the session start, if they read cleanly.
+    fn load() -> Self {
+        let mut ex = SyncExclusions { known: None };
+        ex.update(crate::config_layers::load_merged(None));
+        ex
+    }
+
+    /// Re-read the exclusions: the latest clean read, or `None` while no
+    /// read has been clean. User layers only, as at connect: a workspace
+    /// must not decide what leaves the laptop.
+    fn current(&mut self) -> Option<(Vec<String>, Vec<String>)> {
+        self.update(crate::config_layers::load_merged(None));
+        self.known.clone()
+    }
+
+    fn update(&mut self, merged: crate::config_layers::MergedConfig) {
+        if merged.warnings.is_empty() {
+            self.known = Some((
+                merged.prefs.config_sync_excluded_hosts,
+                merged.prefs.config_sync_excluded_files,
+            ));
+        }
+    }
+}
+
+/// What the exclusions say about a pending re-push.
+enum RepushGate {
+    /// Push, leaving out these files (`config_sync_excluded_files`).
+    Push(Vec<String>),
+    /// The host is in `config_sync_excluded_hosts`: push nothing, now or later.
+    HostExcluded,
+    /// The exclusions have not read cleanly: hold the files and try again.
+    Unknown,
+}
+
+/// How long a failed re-push waits before it is tried again: long enough
+/// not to hammer a connection that is down, short enough that an edit lands
+/// soon after a reconnect.
+const REPUSH_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a live re-push carries between polls.
+struct RepushState {
+    watch: crate::config_sync::ConfigWatch,
+    /// Changed files not yet pushed: a failed push stays here and is
+    /// retried, so an edit made while the connection was down still lands
+    /// after the reconnect.
+    pending: std::collections::BTreeSet<PathBuf>,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl RepushState {
+    fn new(watch: crate::config_sync::ConfigWatch) -> Self {
+        RepushState {
+            watch,
+            pending: std::collections::BTreeSet::new(),
+            retry_at: None,
+        }
+    }
+}
+
+/// Config files to push, each with the local path it is read from.
+type Pushes = [(crate::config_sync::Syncable, PathBuf)];
+
+/// What a re-push did not send: files that failed to transfer (tried
+/// again), and files held because they were edited on the remote since
+/// croft last pushed them (#262), which wait for the user to settle.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PushResult {
+    failed: Vec<&'static str>,
+    held: Vec<&'static str>,
+}
+
+/// One poll of a live re-push: push the syncable files that changed and
+/// exist, and log what went and what did not. `push` returns the names it
+/// could not ship.
+fn repush_tick(
+    state: &mut RepushState,
+    dir: &Path,
+    now: std::time::Instant,
+    exclusions: &mut dyn FnMut() -> RepushGate,
+    push: &mut dyn FnMut(&Pushes) -> PushResult,
+    log: &mut dyn FnMut(String),
+) {
+    let changed = state.watch.poll(now);
+    let retry_due = state.retry_at.is_some_and(|t| now >= t);
+    if changed.is_empty() && !retry_due {
+        return;
+    }
+    state.pending.extend(changed);
+    // A pending file deleted since, or no longer syncable, drops out.
+    let pending: Vec<PathBuf> = state.pending.iter().cloned().collect();
+    let files = crate::config_sync::repush_targets(&pending, dir);
+    state.pending = files.iter().map(|(_, p)| p.clone()).collect();
+    state.retry_at = None;
+    if files.is_empty() {
+        return;
+    }
+    // The same rules as the push at connect (#603), read when a file
+    // changes so an edited exclusion applies without a reconnect.
+    let excluded = match exclusions() {
+        RepushGate::Push(excluded) => excluded,
+        RepushGate::HostExcluded => {
+            state.pending.clear();
+            return;
+        }
+        RepushGate::Unknown => {
+            // Nothing leaves until the exclusions can be read; the files
+            // stay pending and are tried again.
+            state.retry_at = Some(now + REPUSH_RETRY);
+            log(String::from(
+                "Config sync: holding changes until the config-sync exclusions read cleanly",
+            ));
+            return;
+        }
+    };
+    let (files, _) = crate::config_sync::apply_exclusions(files, &excluded);
+    if files.is_empty() {
+        state.pending.clear();
+        return;
+    }
+    let PushResult { failed, held } = push(&files);
+    state.pending = files
+        .iter()
+        .filter(|(s, _)| failed.contains(&s.name))
+        .map(|(_, p)| p.clone())
+        .collect();
+    if !state.pending.is_empty() {
+        state.retry_at = Some(now + REPUSH_RETRY);
+    }
+    let pushed: Vec<&str> = files
+        .iter()
+        .map(|(s, _)| s.name)
+        .filter(|n| !failed.contains(n) && !held.contains(n))
+        .collect();
+    if !pushed.is_empty() {
+        log(format!("Config sync: re-pushed {}", pushed.join(", ")));
+    }
+    for name in &held {
+        log(format!(
+            "Config sync: left {name} alone: it was changed on the remote since croft last pushed it \
+             (`croft sync-config <host> --diff {name}`)"
+        ));
+    }
+    if !failed.is_empty() {
+        log(format!(
+            "Config sync: could not re-push {} (the remote keeps its copy)",
+            failed.join(", ")
+        ));
+    }
+}
+
+/// Ship `files` over a bulk lane opened for this batch; the names that
+/// failed.
+fn push_over_bulk_lane(
+    host: &str,
+    socket: &Path,
+    files: &[(crate::config_sync::Syncable, PathBuf)],
+) -> PushResult {
+    // The connect-time push creates this only when it had files to send, so
+    // a host that had none has no ~/.config/croft for the first file made
+    // mid-session to land in.
+    let mut mk = ssh_socket_command(socket, true);
+    mk.arg(host).arg("mkdir -p ~/.config/croft");
+    let all_failed = || PushResult {
+        failed: files.iter().map(|(s, _)| s.name).collect(),
+        held: Vec::new(),
+    };
+    if !matches!(mk.status(), Ok(st) if st.success()) {
+        return all_failed();
+    }
+    // The connect-time rule (#262): never over a copy edited there since.
+    let mut hashes = ssh_socket_command(socket, true);
+    hashes
+        .arg(host)
+        .arg(crate::config_sync::remote_hash_script());
+    let remote = match hashes.output() {
+        Ok(out) if out.status.success() => {
+            crate::config_sync::parse_remote_hashes(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => return all_failed(),
+    };
+    let state_path = crate::config_sync::SyncState::path();
+    let mut state = crate::config_sync::SyncState::load(&state_path);
+    let bulk = crate::remote_bulk::establish(host, socket, |_| {});
+    let mut result = PushResult::default();
+    for (syncable, local) in files {
+        let Ok(bytes) = std::fs::read(local) else {
+            result.failed.push(syncable.name);
+            continue;
+        };
+        let hash = crate::config_sync::content_hash(&bytes);
+        let there = remote.get(syncable.name).map(String::as_str);
+        match crate::config_sync::plan(&hash, there, state.file(host, syncable.name)) {
+            crate::config_sync::Plan::Push => {
+                let dest = crate::config_sync::remote_dest(host, syncable.name);
+                let ok = matches!(
+                    ship_file_rsync_command(&bulk.lane, socket, local, &dest).status(),
+                    Ok(st) if st.success()
+                );
+                if ok {
+                    let entry = state.file_mut(host, syncable.name);
+                    entry.pushed = Some(hash);
+                    entry.kept = None;
+                } else {
+                    result.failed.push(syncable.name);
+                }
+            }
+            crate::config_sync::Plan::UpToDate => {
+                let entry = state.file_mut(host, syncable.name);
+                entry.pushed = Some(hash);
+                entry.kept = None;
+            }
+            crate::config_sync::Plan::Kept | crate::config_sync::Plan::Conflict => {
+                result.held.push(syncable.name)
+            }
+        }
+    }
+    let _ = state.save(&state_path);
+    result
+}
+
+/// Appends timestamped lines to `~/.cache/croft/config-sync.log`.
+fn config_sync_log() -> impl FnMut(String) {
+    let path = install_log_path().with_file_name("config-sync.log");
+    move |line: String| {
+        use std::io::Write as _;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "{secs} {line}");
+        }
     }
 }
 
@@ -2320,6 +3015,98 @@ fn source_sync_rsync_command(
     rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));
     rsync.arg(source_arg).arg(dest);
     rsync
+}
+
+/// Set by `croft remote --build` (#261): skip the prebuilt release binary
+/// and build from source, for a source tree ahead of the latest release.
+pub(crate) static FORCE_SOURCE_BUILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The prebuilt fast path (#261): when this croft was installed from
+/// crates.io, ship the release binary for its exact version and the remote's
+/// target instead of building one. `Ok(true)` = installed; `Ok(false)` = not
+/// applicable (said why); `Err` = attempted and broke. The caller falls back
+/// to the cross-build either way. `ship` copies a local binary to the
+/// remote's `~/.cargo/bin/croft.new` over whichever transport the caller has.
+fn try_prebuilt_install(
+    ssh: &SshControl,
+    source_stamp: &str,
+    ship: &mut dyn FnMut(&Path) -> Result<()>,
+    log: &mut dyn FnMut(String),
+) -> Result<bool> {
+    if FORCE_SOURCE_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
+        log(String::from(
+            "Prebuilt install skipped: --build asked for a source build",
+        ));
+        return Ok(false);
+    }
+    if !crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")) {
+        log(String::from(
+            "Prebuilt install skipped: this croft is a source build, so the remote gets the same source",
+        ));
+        return Ok(false);
+    }
+    let Some(triple) = remote_target_triple(ssh)? else {
+        log(String::from(
+            "Prebuilt install skipped: no release for the remote's architecture",
+        ));
+        return Ok(false);
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let cache = crate::session_state::dirs_cache_croft().join("prebuilt");
+    let binary = match crate::remote_prebuilt::prepare(
+        version,
+        triple,
+        &cache,
+        &crate::remote_prebuilt::http_get,
+        &crate::remote_prebuilt::cosign_verify,
+    ) {
+        Ok((b, crate::remote_prebuilt::Signature::Verified)) => {
+            log(format!(
+                "Release signature verified: v{version}'s SHA256SUMS was signed by its release workflow"
+            ));
+            b
+        }
+        Ok((b, crate::remote_prebuilt::Signature::Unchecked)) => {
+            log(format!(
+                "Release signature NOT checked: cosign is not installed here, so v{version}'s SHA256SUMS rests on HTTPS to GitHub; install cosign to verify it"
+            ));
+            b
+        }
+        // Not every version has release artifacts; that is a plain skip,
+        // not a failure to shout about on every connect.
+        Err(e) if crate::remote_prebuilt::is_not_published(&e) => {
+            log(format!(
+                "Prebuilt install skipped: v{version} has no release binary for {triple}"
+            ));
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    let size_mb = std::fs::metadata(&binary).map(|m| m.len()).unwrap_or(0) as f64 / 1e6;
+    log(format!(
+        "Installing prebuilt croft v{version} for {triple} ({size_mb:.0} MB) over SSH"
+    ));
+    let mkdir = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"")
+        .status()
+        .context("creating remote install dirs")?;
+    anyhow::ensure!(mkdir.success(), "remote mkdir exited with {mkdir}");
+    ship(&binary)?;
+    let activate = ssh
+        .command()
+        .arg(&ssh.host)
+        .arg(activate_command(source_stamp))
+        .status()
+        .context("activating the prebuilt croft on the remote")?;
+    anyhow::ensure!(
+        activate.success(),
+        "remote activation exited with {activate}"
+    );
+    log(format!("Installed prebuilt croft v{version} on the remote"));
+    Ok(true)
 }
 
 fn remote_target_triple(ssh: &SshControl) -> Result<Option<&'static str>> {
@@ -2768,6 +3555,14 @@ pub(crate) fn shell_quote_for_e_arg(p: &std::path::Path) -> String {
     }
 }
 
+/// True when croft runs inside an SSH login, which is how a remote croft is
+/// launched (`croft remote` execs it over ssh).
+pub fn running_over_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+}
+
 fn remote_install_command(source_stamp: &str) -> String {
     format!(
         r#"set -e
@@ -2868,19 +3663,102 @@ CROFT_JOBS=$(( ( $(nproc 2>/dev/null || echo 2) + 1 ) / 2 ))
 # is typing into a shell that shares these cores, RAM, and disk. Half the
 # cores still wrecks a small VPS, so drop to one compile job and put all
 # codegen IO in the idle class; the update simply takes longer.
+CROFT_LIVE=""
 if pgrep -x croft >/dev/null 2>&1; then
   CROFT_JOBS=1
+  CROFT_LIVE=1
+fi
+# nice and ionice ration CPU and IO, not memory (#694). Each rustc job on
+# croft costs well over a GB, so on a host under 16 GB two of them next to
+# rust-analyzer were enough to wake the OOM killer, which then took croft or
+# a terminal pane. Below that, compile one crate at a time.
+CROFT_MEM_KB=$(awk '/^MemTotal:/ {{ print $2 }}' /proc/meminfo 2>/dev/null || true)
+CROFT_AVAIL_KB=$(awk '/^MemAvailable:/ {{ print $2 }}' /proc/meminfo 2>/dev/null || true)
+if [ -n "$CROFT_MEM_KB" ] && [ "$CROFT_MEM_KB" -lt 16777216 ]; then
+  CROFT_JOBS=1
+fi
+# Little memory free right now counts too, whatever the total: a big host
+# can still be mostly spoken for by the time the update runs.
+if [ -n "$CROFT_AVAIL_KB" ] && [ "$CROFT_AVAIL_KB" -lt 2097152 ]; then
+  CROFT_JOBS=1
+  echo "croft: only $(( CROFT_AVAIL_KB / 1024 )) MB of memory available; building with one job" >&2
+fi
+# And cap the build's memory outright where systemd can: the compile runs
+# in its own scope limited to 60% of RAM with no swap, so if it outgrows
+# that it is the BUILD the kernel kills, inside its scope, and never croft
+# or a shell. Probed first, because a user manager or a delegated memory
+# controller is not a given on a server; without one the build runs uncapped
+# but still single-job on a small host.
+CROFT_MEMCAP=""
+# The probe reads the limit back from inside a test scope: systemd accepts
+# MemoryMax without complaint where the memory controller is not delegated
+# to the user manager (cgroup v1 and hybrid hosts), and enforces nothing.
+if [ -n "$CROFT_MEM_KB" ] && command -v systemd-run >/dev/null 2>&1 \
+  && [ "$(systemd-run --user --scope --quiet -p MemoryMax=64M -p MemorySwapMax=0 \
+    sh -c 'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"' 2>/dev/null)" = 67108864 ]; then
+  CROFT_MEMCAP="systemd-run --user --scope --quiet -p MemoryMax=$(( CROFT_MEM_KB * 6 / 10 ))K -p MemorySwapMax=0"
 fi
 CROFT_NICE=""
 if command -v nice >/dev/null 2>&1; then CROFT_NICE="nice -n 19"; fi
 CROFT_IONICE=""
 if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
+# Tell a croft running on this box that a compile is under way, so it stops
+# its own language servers (rust-analyzer alone held 2.4 GB in the OOM that
+# prompted #694) and restarts them once no marker names a live build.
+#
+# One marker per build (`building.<this shell's pid>`), so a second install
+# finishing first cannot clear the first's. It holds the pid of the COMPILE
+# once it starts (systemd-run --scope, nice and ionice all exec, so `$!` is
+# cargo itself): a shell killed mid-build leaves cargo running as an orphan,
+# and the marker must keep naming it. Markers whose pid is gone are stale;
+# they are swept here, and croft ignores them and any from before a reboot.
+#
+# Which boot a marker belongs to is `building.<pid>.boot`, the kernel's
+# boot_id (#736): unlike boot time it does not move when the wall clock is
+# stepped. A sidecar rather than a second field, so a croft from before it,
+# which reads the marker as one pid, still pauses for this build.
+mkdir -p "$HOME/.cache/croft"
+CROFT_BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+for CROFT_OLD in "$HOME/.cache/croft"/building.*; do
+  [ -f "$CROFT_OLD" ] || continue
+  case "$CROFT_OLD" in
+    # Its marker sorts first, so a sidecar whose marker is gone is orphaned.
+    *.boot) [ -e "${{CROFT_OLD%.boot}}" ] || rm -f "$CROFT_OLD"; continue ;;
+  esac
+  CROFT_OLD_PID=$(cat "$CROFT_OLD" 2>/dev/null || true)
+  CROFT_OLD_BOOT=$(cat "$CROFT_OLD.boot" 2>/dev/null || true)
+  if [ -z "$CROFT_OLD_PID" ] || ! kill -0 "$CROFT_OLD_PID" 2>/dev/null \
+    || {{ [ -n "$CROFT_OLD_BOOT" ] && [ -n "$CROFT_BOOT" ] && [ "$CROFT_OLD_BOOT" != "$CROFT_BOOT" ]; }}; then
+    rm -f "$CROFT_OLD" "$CROFT_OLD.boot"
+  fi
+done
+CROFT_MARK="$HOME/.cache/croft/building.$$"
+CROFT_BUILD_PID=""
+if [ -n "$CROFT_BOOT" ]; then printf %s "$CROFT_BOOT" > "$CROFT_MARK.boot"; fi
+printf %s "$$" > "$CROFT_MARK"
+# Keep the marker while the compile outlives this shell; croft sees it go
+# stale the moment the compile ends.
+trap 'if [ -z "$CROFT_BUILD_PID" ] || ! kill -0 "$CROFT_BUILD_PID" 2>/dev/null; then rm -f "$CROFT_MARK" "$CROFT_MARK.boot"; fi' EXIT
+if [ -n "$CROFT_LIVE" ]; then
+  # croft polls the marker once a second, and a server gets up to three
+  # seconds to shut down cleanly: let both finish before the first rustc.
+  sleep 5
+fi
 # eval, because this script runs under the remote user's login shell and
 # zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
 # try to run a command literally named "nice -n 19". eval re-parses the
 # assembled line, which splits correctly under both sh/bash and zsh.
-eval "$CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
-mkdir -p "$HOME/.cache/croft"
+# The subshell marks the build (and every rustc under it) as the kernel's
+# first choice when memory runs out, without touching this shell (#694),
+# then `exec`s it, so `$!` below is still the compile's own pid.
+(
+  echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
+  eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
+) &
+CROFT_BUILD_PID=$!
+printf %s "$CROFT_BUILD_PID" > "$CROFT_MARK"
+wait "$CROFT_BUILD_PID"
+rm -f "$CROFT_MARK" "$CROFT_MARK.boot"
 printf %s {stamp} > "$HOME/.cache/croft/install-stamp"
 rm -f "$HOME/.cache/croft/updating"
 "#,
@@ -2939,7 +3817,23 @@ command -v croft >/dev/null 2>&1 && echo yes"#,
 }
 
 fn local_source_stamp() -> Result<String> {
-    source_stamp_for(&PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    build_stamp_for(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// The stamp of a croft built from `root` at `version`: the hash of its
+/// source, or `release-v<version>` when `root` does not exist here. A
+/// release binary bakes the CI checkout it was built in; hashing a missing
+/// tree gives one constant for every version, so after the first install a
+/// remote would never update again, its watcher never fire and F9 never
+/// offer the relaunch (#261). A release's version names its binary exactly.
+fn build_stamp_for(root: &PathBuf, version: &str) -> Result<String> {
+    if !root.exists() {
+        return Ok(format!("release-v{version}"));
+    }
+    source_stamp_for(root)
 }
 
 /// A croft installed with `cargo install` from a registry or git snapshot
@@ -3050,6 +3944,62 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    fn report(path: &str, host: Option<&str>) -> CwdReport {
+        (std::path::PathBuf::from(path), host.map(str::to_string))
+    }
+
+    #[test]
+    fn a_new_remote_report_is_the_workspace_path() {
+        let before = report("/Users/me/code", Some("localhost"));
+        let now = report("/srv/app", Some("db-1.internal"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&before), Some(&now)).as_deref(),
+            Some("/srv/app")
+        );
+        // No report at all when the offer appeared (no local integration).
+        assert_eq!(
+            remote_workspace_path("db-1", None, Some(&now)).as_deref(),
+            Some("/srv/app")
+        );
+    }
+
+    #[test]
+    fn an_unchanged_report_counts_only_when_it_names_the_host() {
+        let same = report("/srv/app", Some("db-1"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&same), Some(&same)).as_deref(),
+            Some("/srv/app"),
+            "the remote prompt reported before the offer sampled"
+        );
+        let fqdn = report("/srv/app", Some("DB-1.internal"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&fqdn), Some(&fqdn)).as_deref(),
+            Some("/srv/app"),
+            "a domain-qualified name for the same host, any case"
+        );
+        let stale = report("/home/old", Some("web-7"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&stale), Some(&stale)),
+            None,
+            "left over from an earlier session on another host"
+        );
+        let prefix = report("/x", Some("db-10"));
+        assert_eq!(
+            remote_workspace_path("db-1", Some(&prefix), Some(&prefix)),
+            None,
+            "db-10 is not db-1"
+        );
+    }
+
+    #[test]
+    fn a_local_or_hostless_report_is_never_remote() {
+        let local = report("/Users/me", Some("localhost"));
+        assert_eq!(remote_workspace_path("db-1", None, Some(&local)), None);
+        let hostless = report("/Users/me", None);
+        assert_eq!(remote_workspace_path("db-1", None, Some(&hostless)), None);
+        assert_eq!(remote_workspace_path("db-1", None, None), None);
+    }
 
     /// The destination an ssh command line names, from the shapes people
     /// actually type (#364).
@@ -3596,6 +4546,25 @@ mod tests {
     }
 
     #[test]
+    fn a_release_binary_is_stamped_by_its_version_not_a_missing_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("home/runner/work/croft/croft");
+        assert_eq!(build_stamp_for(&gone, "0.1.9").unwrap(), "release-v0.1.9");
+        assert_ne!(
+            build_stamp_for(&gone, "0.1.9").unwrap(),
+            build_stamp_for(&gone, "0.1.10").unwrap(),
+            "a new release is a new stamp, so the remote updates"
+        );
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        let root = tmp.path().to_path_buf();
+        assert_eq!(
+            build_stamp_for(&root, "0.1.9").unwrap(),
+            source_stamp_for(&root).unwrap(),
+            "a source tree is still hashed"
+        );
+    }
+
+    #[test]
     fn source_stamp_tracks_build_inputs_only() {
         // The stamp decides whether a remote reinstall is needed, so it must
         // cover exactly the inputs that shape the shipped binary. Build
@@ -3910,6 +4879,92 @@ Host !blocked *.internal
     }
 
     #[test]
+    fn the_ssh_control_dir_is_fresh_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = super::ssh_control_dir().unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A directory already at the name (made by someone else) is an
+        // error, not something to adopt.
+        assert!(std::fs::DirBuilder::new().create(&dir).is_err());
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pulled_folder_leaves_its_hidden_entries_behind() {
+        let dir = tempfile::Builder::new()
+            .prefix("croft-pull")
+            .tempdir()
+            .unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("docs/.git")).unwrap();
+        std::fs::write(home.join(".ssh/id"), "key").unwrap();
+        std::fs::write(home.join("docs/.git/cfg"), "x").unwrap();
+        std::fs::write(home.join("docs/a.txt"), "a").unwrap();
+        std::fs::write(home.join("-dash"), "d").unwrap();
+        let list = |parent: &Path, name: &str| {
+            let packed = Command::new("tar")
+                .args(super::pull_tar_args(parent, std::ffi::OsStr::new(name)))
+                .output()
+                .unwrap();
+            assert!(
+                packed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&packed.stderr)
+            );
+            let mut listing = Command::new("tar")
+                .args(["-t", "-f", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            listing
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&packed.stdout)
+                .unwrap();
+            String::from_utf8(listing.wait_with_output().unwrap().stdout).unwrap()
+        };
+        let names = list(dir.path(), "home");
+        assert!(
+            names.contains("home/docs/a.txt") && names.contains("home/-dash"),
+            "{names}"
+        );
+        assert!(
+            !names.contains(".ssh") && !names.contains(".git"),
+            "{names}"
+        );
+        assert_eq!(list(&home, "-dash").trim(), "-dash");
+    }
+
+    #[test]
+    fn a_pull_refuses_hidden_paths_and_links_into_them() {
+        // Not `tempdir()`: its `.tmpXXXX` name is itself hidden.
+        let dir = tempfile::Builder::new()
+            .prefix("croft-pull")
+            .tempdir()
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(root.join("-notes.txt"), "hi").unwrap();
+        std::os::unix::fs::symlink(root.join(".ssh/id_ed25519"), root.join("key")).unwrap();
+        assert!(super::pull_source_allowed(&root.join("-notes.txt")));
+        assert!(!super::pull_source_allowed(&root.join(".ssh/id_ed25519")));
+        assert!(
+            !super::pull_source_allowed(&root.join("key")),
+            "a link into .ssh"
+        );
+        assert!(!super::pull_source_allowed(
+            &root.join("x/../.ssh/id_ed25519")
+        ));
+        assert!(!super::pull_source_allowed(Path::new("relative.txt")));
+    }
+
+    #[test]
     fn parse_relay_request_pulls_have_id_and_path() {
         match super::parse_relay_request("pull\tabc-123\t/Users/v/foo.txt") {
             Some(super::RelayRequest::Pull { id, src }) => {
@@ -4055,6 +5110,254 @@ Host !blocked *.internal
     // box, and even niced, a rustc compile on a small VPS wrecks the live
     // session sharing it. When a croft session is running on the box, the
     // compile must yield everything: one job and idle-class IO.
+    /// #262 review: a read of the settings that skipped a broken layer keeps
+    /// the last clean exclusions rather than falling back to none, which
+    /// would push to a host the user excluded.
+    #[test]
+    fn a_broken_config_read_keeps_the_last_good_sync_exclusions() {
+        let mut ex = SyncExclusions { known: None };
+        let broken = crate::config_layers::MergedConfig {
+            prefs: crate::prefs::Prefs::default(),
+            provenance: Default::default(),
+            chain: Vec::new(),
+            warnings: vec![String::from("config.json: expected value at line 1")],
+        };
+        // No clean read yet: the exclusions are unknown, not empty.
+        ex.update(broken.clone());
+        assert_eq!(ex.known, None);
+        // A clean read applies.
+        let prefs = crate::prefs::Prefs {
+            config_sync_excluded_hosts: vec![String::from("shared-box")],
+            config_sync_excluded_files: vec![String::from("macros.json")],
+            ..Default::default()
+        };
+        let clean = crate::config_layers::MergedConfig {
+            prefs,
+            provenance: Default::default(),
+            chain: Vec::new(),
+            warnings: Vec::new(),
+        };
+        ex.update(clean);
+        let good = Some((
+            vec![String::from("shared-box")],
+            vec![String::from("macros.json")],
+        ));
+        assert_eq!(ex.known, good);
+        // A later broken read keeps it rather than falling back to none.
+        ex.update(broken);
+        assert_eq!(ex.known, good);
+    }
+
+    /// #262: a config file edited during the session is pushed once, on the
+    /// next check; an excluded file or host gets nothing; a failed push is
+    /// logged, kept, and retried after `REPUSH_RETRY` (not sooner), so an
+    /// edit made while the connection was down lands after the reconnect.
+    #[test]
+    fn a_live_repush_ships_each_edit_once_and_retries_a_failed_one() {
+        use crate::config_sync::ConfigWatch;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keybindings.json");
+        let snips = dir.path().join("snippets.json");
+        let macros = dir.path().join("macros.json");
+        std::fs::write(&keys, "[]").unwrap();
+        let mut state = RepushState::new(ConfigWatch::new(vec![
+            keys.clone(),
+            snips.clone(),
+            macros.clone(),
+        ]));
+        let t0 = std::time::Instant::now();
+        let mut sent: Vec<Vec<&'static str>> = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
+        // `excluded`: None is an excluded host, else the excluded files.
+        let tick = |state: &mut RepushState,
+                    now: std::time::Instant,
+                    excluded: Option<Vec<String>>,
+                    fail: &'static [&'static str],
+                    sent: &mut Vec<Vec<&'static str>>,
+                    lines: &mut Vec<String>| {
+            repush_tick(
+                state,
+                dir.path(),
+                now,
+                &mut || match excluded.clone() {
+                    Some(files) => RepushGate::Push(files),
+                    None => RepushGate::HostExcluded,
+                },
+                &mut |files| {
+                    sent.push(files.iter().map(|(s, _)| s.name).collect());
+                    PushResult {
+                        failed: fail.to_vec(),
+                        held: Vec::new(),
+                    }
+                },
+                &mut |l| lines.push(l),
+            );
+        };
+        let step = ConfigWatch::INTERVAL;
+        tick(
+            &mut state,
+            t0 + step,
+            Some(vec![]),
+            &[],
+            &mut sent,
+            &mut lines,
+        );
+        assert!(sent.is_empty(), "nothing edited yet");
+        std::fs::write(&keys, r#"[{"key": "ctrl+k"}]"#).unwrap();
+        std::fs::write(&snips, "{}").unwrap();
+        std::fs::write(&macros, "{}").unwrap();
+        // macros.json is in config_sync_excluded_files: it stays home. The
+        // snippets push fails (the connection is down).
+        let failed_at = t0 + step * 2;
+        tick(
+            &mut state,
+            failed_at,
+            Some(vec![String::from("macros.json")]),
+            &["snippets.json"],
+            &mut sent,
+            &mut lines,
+        );
+        assert_eq!(sent, vec![vec!["keybindings.json", "snippets.json"]]);
+        assert_eq!(
+            lines,
+            vec![
+                "Config sync: re-pushed keybindings.json".to_string(),
+                "Config sync: could not re-push snippets.json (the remote keeps its copy)"
+                    .to_string(),
+            ]
+        );
+        // Before the retry delay nothing is sent; keybindings is not resent.
+        tick(
+            &mut state,
+            t0 + step * 3,
+            Some(vec![]),
+            &[],
+            &mut sent,
+            &mut lines,
+        );
+        assert_eq!(sent.len(), 1, "no retry before REPUSH_RETRY");
+        // After it, only the failed file goes again, and lands.
+        tick(
+            &mut state,
+            failed_at + REPUSH_RETRY,
+            Some(vec![]),
+            &[],
+            &mut sent,
+            &mut lines,
+        );
+        assert_eq!(sent.last().unwrap(), &vec!["snippets.json"]);
+        assert!(state.pending.is_empty());
+        assert_eq!(
+            lines.last().unwrap(),
+            "Config sync: re-pushed snippets.json"
+        );
+        // A host in config_sync_excluded_hosts gets nothing.
+        std::fs::write(&keys, "[ ]").unwrap();
+        let later = failed_at + REPUSH_RETRY + step;
+        tick(&mut state, later, None, &[], &mut sent, &mut lines);
+        assert_eq!(sent.len(), 2, "an excluded host is never pushed to");
+        assert!(state.pending.is_empty());
+    }
+
+    /// #262 review: while the exclusions have not read cleanly, a changed
+    /// file is held, not pushed, and goes once they do.
+    #[test]
+    fn a_live_repush_holds_changes_until_the_exclusions_read_cleanly() {
+        use crate::config_sync::ConfigWatch;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keybindings.json");
+        std::fs::write(&keys, "[]").unwrap();
+        let mut state = RepushState::new(ConfigWatch::new(vec![keys.clone()]));
+        let t0 = std::time::Instant::now();
+        std::fs::write(&keys, r#"[{"key": "ctrl+k"}]"#).unwrap();
+        let mut sent = 0;
+        let mut lines = Vec::new();
+        let first = t0 + ConfigWatch::INTERVAL * 2;
+        repush_tick(
+            &mut state,
+            dir.path(),
+            first,
+            &mut || RepushGate::Unknown,
+            &mut |_| {
+                sent += 1;
+                PushResult::default()
+            },
+            &mut |l| lines.push(l),
+        );
+        assert_eq!(sent, 0, "nothing leaves while the exclusions are unknown");
+        assert_eq!(state.pending.len(), 1, "the edit is held");
+        assert!(lines[0].contains("holding changes"), "{lines:?}");
+        repush_tick(
+            &mut state,
+            dir.path(),
+            first + REPUSH_RETRY,
+            &mut || RepushGate::Push(Vec::new()),
+            &mut |_| {
+                sent += 1;
+                PushResult::default()
+            },
+            &mut |l| lines.push(l),
+        );
+        assert_eq!(sent, 1, "it goes once they read cleanly");
+        assert!(state.pending.is_empty());
+    }
+
+    /// #262: a live re-push that finds the remote copy edited since croft
+    /// last pushed it holds the file: not reported as re-pushed, not
+    /// retried, and the log names the command that compares the two.
+    #[test]
+    fn a_live_repush_holds_a_file_edited_on_the_remote() {
+        use crate::config_sync::ConfigWatch;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keybindings.json");
+        std::fs::write(&keys, "[]").unwrap();
+        let mut state = RepushState::new(ConfigWatch::new(vec![keys.clone()]));
+        let t0 = std::time::Instant::now();
+        std::fs::write(&keys, r#"[{"key": "ctrl+k"}]"#).unwrap();
+        let mut lines = Vec::new();
+        repush_tick(
+            &mut state,
+            dir.path(),
+            t0 + ConfigWatch::INTERVAL * 2,
+            &mut || RepushGate::Push(Vec::new()),
+            &mut |_| PushResult {
+                failed: Vec::new(),
+                held: vec!["keybindings.json"],
+            },
+            &mut |l| lines.push(l),
+        );
+        assert!(state.pending.is_empty(), "a held file is not retried");
+        assert!(state.retry_at.is_none());
+        assert!(!lines.iter().any(|l| l.contains("re-pushed")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("left keybindings.json alone") && l.contains("--diff")),
+            "{lines:?}"
+        );
+    }
+
+    /// #694: the build, and every rustc under it, is the kernel's first
+    /// choice when memory runs out, and the script still parses as sh.
+    #[test]
+    fn remote_install_marks_the_build_for_the_oom_killer_first() {
+        let command = remote_install_command("abc123");
+        let adj = command
+            .find("echo 1000 > /proc/self/oom_score_adj")
+            .unwrap();
+        let install = command.find("cargo install --path").unwrap();
+        assert!(adj < install, "the score must be set before the compile");
+        let out = Command::new("sh")
+            .args(["-n", "-c", &command])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn remote_install_compile_yields_to_a_live_croft_session() {
         let command = remote_install_command("abc123");
@@ -4073,6 +5376,372 @@ Host !blocked *.internal
         let gate = command.find("pgrep -x croft").unwrap();
         let install = command.find("cargo install --path").unwrap();
         assert!(gate < install, "the session check must precede the compile");
+    }
+
+    // #694: nice/ionice ration CPU and IO but not memory, and a two-job
+    // compile beside rust-analyzer OOM-killed croft on 8 GB hosts. The
+    // build must drop to one job below 16 GB, run memory-capped where
+    // systemd allows it, and flag itself so a live croft stops its language
+    // servers — all before the compile starts.
+    #[test]
+    fn remote_install_compile_is_memory_bounded() {
+        let command = remote_install_command("abc123");
+        let install = command.find("cargo install --path").unwrap();
+        let before = |needle: &str| {
+            let at = command
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?}"));
+            assert!(at < install, "{needle:?} must come before the compile");
+        };
+        before("/proc/meminfo");
+        before("-lt 16777216");
+        before("systemd-run --user --scope");
+        before("MemoryMax=");
+        before("MemorySwapMax=0");
+        before("CROFT_MARK=\"$HOME/.cache/croft/building.$$\"");
+        before("trap '");
+        assert!(
+            command.contains(r#"eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
+            "the memory cap must wrap the compile itself"
+        );
+        // Little memory FREE drops to one job too, not just a small total:
+        // a warning that promised one job without setting it was the bug.
+        let avail = command.find("-lt 2097152").unwrap();
+        let avail_branch = &command[avail..command[avail..].find("fi\n").unwrap() + avail];
+        assert!(
+            avail_branch.contains("CROFT_JOBS=1"),
+            "low available memory must drop to one job: {avail_branch}"
+        );
+        // The marker goes as soon as the compile does, so language servers
+        // are not held back through the rest of the install.
+        let cleared = command
+            .rfind("rm -f \"$CROFT_MARK\" \"$CROFT_MARK.boot\"")
+            .unwrap();
+        assert!(cleared > install);
+    }
+
+    /// The rendered install script as a `sh` command under a scratch home in
+    /// `dir`, with stub tools, not yet started.
+    ///
+    /// Stubs stand in for everything the script would otherwise install or
+    /// probe, so it goes straight to the compile: `cc`, `pkg-config` and
+    /// `dtach` exist, and `pgrep` finds no live croft (so no 5 s wait).
+    /// `systemd-run` is the stub `systemd_run` rather than the host's: the
+    /// host's may well be on `PATH`, and its probe then fails only because
+    /// `env_clear` drops the user bus, which is not what a test should rest
+    /// on (#737).
+    ///
+    /// The stub `cargo` waits, within a load-scaled budget rather than a
+    /// fixed sleep, until the marker names its own pid, writes `<its pid>
+    /// <the pid the marker holds> <the marker's boot sidecar>` to `seen`,
+    /// then, given `hold`, touches `<hold>.ready` and waits for `hold` to
+    /// exist before exiting with `cargo_exit`.
+    #[cfg(unix)]
+    fn install_command(
+        dir: &std::path::Path,
+        cargo_exit: u8,
+        systemd_run: &str,
+        seen: &std::path::Path,
+        hold: Option<&std::path::Path>,
+    ) -> std::process::Command {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(home.join(".cache/croft")).unwrap();
+        let stub = |name: &str, body: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        for ok in ["cc", "pkg-config", "dtach"] {
+            stub(ok, "exit 0");
+        }
+        stub("pgrep", "exit 1");
+        stub("systemd-run", systemd_run);
+        let tries =
+            crate::test_budget::spawn_budget(std::time::Duration::from_secs(5)).as_millis() / 50;
+        stub(
+            "cargo",
+            &format!(
+                r#"i=0
+while [ "$i" -lt {tries} ]; do
+  for f in "$HOME"/.cache/croft/building.*; do
+    case "$f" in
+      *.boot) ;;
+      *) if [ "$(cat "$f" 2>/dev/null)" = "$$" ]; then m=$$; b=$(cat "$f.boot" 2>/dev/null); break 2; fi ;;
+    esac
+  done
+  sleep 0.05; i=$((i+1))
+done
+printf '%s %s %s' "$$" "$m" "$b" > "$CROFT_TEST_SEEN"
+if [ -n "$CROFT_TEST_HOLD" ]; then
+  : > "$CROFT_TEST_HOLD.ready"
+  j=0
+  while [ ! -e "$CROFT_TEST_HOLD" ] && [ "$j" -lt {tries} ]; do sleep 0.05; j=$((j+1)); done
+fi
+exit {cargo_exit}"#
+            ),
+        );
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(remote_install_command("abc123"))
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", path)
+            .env("CROFT_TEST_SEEN", seen)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(hold) = hold {
+            cmd.env("CROFT_TEST_HOLD", hold);
+        }
+        cmd
+    }
+
+    /// Run the rendered install script to the end (see [`install_command`])
+    /// and report whether it succeeded and what the stub `cargo` saw.
+    #[cfg(unix)]
+    fn run_install_script(dir: &std::path::Path, cargo_exit: u8) -> (bool, String) {
+        let seen = dir.join("seen");
+        let status = install_command(dir, cargo_exit, "exit 1", &seen, None)
+            .status()
+            .unwrap();
+        let seen = std::fs::read_to_string(seen).unwrap_or_default();
+        (status.success(), seen)
+    }
+
+    /// Alive and not a zombie: a killed script's cargo is reparented, and
+    /// reads as alive to `kill -0` until its new parent reaps it.
+    #[cfg(target_os = "linux")]
+    fn running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| !rest.starts_with('Z')))
+            .unwrap_or(false)
+    }
+
+    /// Whether croft would see a live build in the scratch home's cache.
+    #[cfg(target_os = "linux")]
+    fn build_seen(dir: &std::path::Path) -> bool {
+        crate::update_watch::source_build_running(
+            &dir.join("home/.cache/croft"),
+            crate::update_watch::boot_id,
+            crate::update_watch::boot_time,
+            running,
+        )
+    }
+
+    /// #737: SIGTERM to the script's shell mid-compile leaves cargo running,
+    /// and the marker keeps naming it: croft still sees the build, and sees
+    /// it end when cargo does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_killed_install_shell_leaves_the_marker_naming_the_live_compile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = tmp.path().join("hold");
+        let seen = tmp.path().join("seen");
+        let mut shell = install_command(tmp.path(), 0, "exit 1", &seen, Some(&hold))
+            .spawn()
+            .unwrap();
+        let ready = tmp.path().join("hold.ready");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "the stub compile to start",
+            || ready.exists(),
+        );
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        let cargo: u32 = seen.split(' ').next().unwrap().parse().unwrap();
+        assert!(seen.starts_with(&format!("{cargo} {cargo}")), "{seen}");
+
+        // SAFETY: signals the shell this test spawned, by its own pid.
+        unsafe {
+            libc::kill(shell.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let _ = shell.wait();
+        assert!(running(cargo), "the compile must outlive its shell");
+        assert_eq!(
+            leftover_markers(tmp.path())
+                .iter()
+                .filter(|n| !n.ends_with(".boot"))
+                .map(
+                    |n| std::fs::read_to_string(tmp.path().join("home/.cache/croft").join(n))
+                        .unwrap()
+                )
+                .collect::<Vec<_>>(),
+            vec![cargo.to_string()],
+            "the marker must keep naming the compile"
+        );
+        assert!(build_seen(tmp.path()), "croft must still see the build");
+
+        std::fs::write(&hold, "").unwrap();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "the build to read as over once the compile exits",
+            || !build_seen(tmp.path()),
+        );
+    }
+
+    /// #737: two installs at once each keep their own marker, so the one
+    /// finishing first cannot make the other's build look over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_second_install_finishing_first_leaves_the_first_ones_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = tmp.path().join("hold");
+        let mut long = install_command(
+            tmp.path(),
+            0,
+            "exit 1",
+            &tmp.path().join("seen-long"),
+            Some(&hold),
+        )
+        .spawn()
+        .unwrap();
+        let ready = tmp.path().join("hold.ready");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "the long build's compile to start",
+            || ready.exists(),
+        );
+        let short = install_command(
+            tmp.path(),
+            0,
+            "exit 1",
+            &tmp.path().join("seen-short"),
+            None,
+        )
+        .status()
+        .unwrap();
+        assert!(short.success());
+        assert!(
+            build_seen(tmp.path()),
+            "the short build's end hid the long one: {:?}",
+            leftover_markers(tmp.path())
+        );
+
+        std::fs::write(&hold, "").unwrap();
+        assert!(long.wait().unwrap().success());
+        assert!(leftover_markers(tmp.path()).is_empty());
+    }
+
+    /// #737: the compile runs under the memory cap only when the probe reads
+    /// the limit back from its test scope; `max` means the controller is not
+    /// delegated and the limit would be ignored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_install_script_caps_the_compile_only_when_the_limit_reads_back() {
+        for (probe, capped) in [("67108864", true), ("max", false)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("capped");
+            let systemd_run = format!(
+                r#"while [ $# -gt 0 ]; do case "$1" in -p) shift 2 ;; --*) shift ;; *) break ;; esac; done
+if [ "$1" = sh ]; then echo {probe}; exit 0; fi
+: > "{}"
+exec "$@""#,
+                log.display()
+            );
+            let seen = tmp.path().join("seen");
+            let status = install_command(tmp.path(), 0, &systemd_run, &seen, None)
+                .status()
+                .unwrap();
+            assert!(status.success(), "probe {probe}");
+            assert_eq!(log.exists(), capped, "probe {probe}");
+            // Capped or not, the marker named the compile itself.
+            let seen = std::fs::read_to_string(&seen).unwrap();
+            let mut f = seen.split(' ');
+            assert_eq!(f.next(), f.next(), "probe {probe}: {seen}");
+        }
+    }
+
+    /// Any `building.*` marker left under the scratch home.
+    #[cfg(unix)]
+    fn leftover_markers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir.join("home/.cache/croft"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("building."))
+            .collect()
+    }
+
+    /// #694 review: the marker names the COMPILE's pid while it runs, and is
+    /// gone after the build, whether it succeeded or failed.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_script_marks_the_compile_and_clears_the_mark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, seen) = run_install_script(tmp.path(), 0);
+        assert!(ok, "the stubbed install must succeed");
+        let mut fields = seen.splitn(3, ' ');
+        let (own, marked, boot) = (
+            fields.next().unwrap(),
+            fields.next().expect("cargo ran and reported"),
+            fields.next().unwrap_or_default(),
+        );
+        // #736: the marker carries the boot it was written in, where the
+        // host has one.
+        let host_boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|b| b.trim().to_string())
+            .unwrap_or_default();
+        assert_eq!(boot.trim(), host_boot, "the marker's boot sidecar");
+        assert_eq!(
+            own, marked,
+            "while cargo runs the marker must name cargo itself, so a killed \
+             script shell cannot make the build look finished"
+        );
+        assert!(leftover_markers(tmp.path()).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("home/.cache/croft/install-stamp")).unwrap(),
+            "abc123"
+        );
+
+        // A failing compile: `set -e` ends the script, and the EXIT trap
+        // still removes the marker.
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, _) = run_install_script(tmp.path(), 3);
+        assert!(!ok, "a failing compile must fail the install");
+        assert!(
+            leftover_markers(tmp.path()).is_empty(),
+            "a failed build left its marker behind"
+        );
+    }
+
+    /// Stale markers from dead builds are swept; a live one is kept.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_script_sweeps_only_dead_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("home/.cache/croft");
+        std::fs::create_dir_all(&cache).unwrap();
+        // This test process is alive and ours, as a real build's compile
+        // is: `kill -0` on another user's pid (pid 1, say) fails with EPERM
+        // for a non-root user and would read as dead. A pid past pid_max is
+        // never alive.
+        std::fs::write(cache.join("building.1"), std::process::id().to_string()).unwrap();
+        std::fs::write(cache.join("building.2"), "2147483646").unwrap();
+        // #736: a live pid from another boot is someone else's process now,
+        // and an orphaned sidecar goes with nothing to describe.
+        let this_boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok();
+        if let Some(boot) = &this_boot {
+            std::fs::write(cache.join("building.1.boot"), boot.trim()).unwrap();
+            std::fs::write(cache.join("building.3"), std::process::id().to_string()).unwrap();
+            std::fs::write(cache.join("building.3.boot"), "another-boot").unwrap();
+        }
+        std::fs::write(cache.join("building.4.boot"), "orphan").unwrap();
+        let (ok, _) = run_install_script(tmp.path(), 0);
+        assert!(ok);
+        let mut left = leftover_markers(tmp.path());
+        left.sort();
+        let expect: Vec<String> = if this_boot.is_some() {
+            vec!["building.1".into(), "building.1.boot".into()]
+        } else {
+            vec!["building.1".into()]
+        };
+        assert_eq!(
+            left, expect,
+            "only the live build of this boot, and its sidecar, may survive another build"
+        );
     }
 
     // A backgrounded install's log lines died with the connect dialog,
@@ -4136,6 +5805,32 @@ Host !blocked *.internal
         assert!(
             ensure_call < cargo_install,
             "the C toolchain must be ensured before `cargo install` runs"
+        );
+    }
+
+    #[test]
+    fn a_relay_request_is_claimed_by_exactly_one_pump() {
+        // `mkdir` without -p on the id: the second pump's mkdir fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox").display().to_string();
+        let run = |cmd: String| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(run(claim_command(&inbox, "open-1-2")));
+        assert!(
+            !run(claim_command(&inbox, "open-1-2")),
+            "a second claim loses"
+        );
+        assert!(run(claim_command(&inbox, "open-1-3")));
+        assert_eq!(
+            super::parse_relay_request("open\topen-1\thttps://x/")
+                .and_then(|r| r.id().map(str::to_string)),
+            Some(String::from("open-1"))
         );
     }
 
@@ -4518,6 +6213,44 @@ pub fn offer_allowed(
     !refused
         .get(&host.to_ascii_lowercase())
         .is_some_and(|at| refusal_live(*at, now))
+}
+
+/// A pane's last OSC 7 report: the directory its shell says it is in, and
+/// the host that shell says it runs on.
+pub type CwdReport = (std::path::PathBuf, Option<String>);
+
+/// The remote directory to open when the ssh-pane offer for `host` is
+/// accepted (#364), from the pane's OSC 7 report now and the one it had when
+/// the offer appeared. A report is used only when it comes from another
+/// machine and is either new since the offer (the remote shell's first
+/// prompt) or names the offered host. A report from this machine, or a stale
+/// one left by an earlier session elsewhere, is never taken for the remote's
+/// directory; `None` then opens the login directory, as before.
+pub fn remote_workspace_path(
+    host: &str,
+    at_offer: Option<&CwdReport>,
+    now: Option<&CwdReport>,
+) -> Option<String> {
+    let (path, reporter) = now?;
+    let reporter = reporter.as_deref().filter(|h| !h.is_empty())?;
+    if crate::command_history::is_local_host(reporter) {
+        return None;
+    }
+    let fresh = at_offer != now;
+    if !fresh && !same_host(host, reporter) {
+        return None;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Whether an ssh alias and a shell-reported hostname name the same machine:
+/// equal ignoring case, or one is the other plus a domain (`db-1` and
+/// `db-1.internal`). `db-1` and `db-10` are different hosts.
+fn same_host(alias: &str, reported: &str) -> bool {
+    let (a, r) = (alias.to_ascii_lowercase(), reported.to_ascii_lowercase());
+    a == r
+        || r.strip_prefix(&a).is_some_and(|rest| rest.starts_with('.'))
+        || a.strip_prefix(&r).is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// The label thread's ssh verdict for each pane it named (#364). `named` is

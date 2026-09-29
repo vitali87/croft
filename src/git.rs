@@ -133,6 +133,17 @@ fn query_ignored(root: &Path) -> HashSet<PathBuf> {
         .collect()
 }
 
+/// Whether git ignores `path` under the repository at `root`: one
+/// `check-ignore` call, for a single path's verdict (#263: a save of build
+/// output or a `.env` does not rerun watched tests). Outside a repository,
+/// or when git cannot answer, nothing is ignored.
+pub fn is_ignored(root: &Path, path: &Path) -> bool {
+    let mut stdin = path.as_os_str().as_encoded_bytes().to_vec();
+    stdin.push(0);
+    git_raw(root, &["check-ignore", "-z", "--stdin"], Some(&stdin))
+        .is_some_and(|out| out.iter().any(|b| *b != 0))
+}
+
 /// Join a raw `-z` path (trailing `/` stripped) onto `root` without passing
 /// through `str`: a filename is bytes, and on unix it need not be UTF-8.
 fn join_raw(root: &Path, raw: &[u8]) -> PathBuf {
@@ -229,6 +240,32 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Keep a git child from prompting on croft's terminal. A push or pull
+/// needing a password or an ssh passphrase opened `/dev/tty`, drew over
+/// the full-screen UI and waited for input croft never passed on. With no
+/// terminal prompt and no controlling tty, git and ssh fail at once with a
+/// message the panel shows; credential helpers and agents still work.
+fn never_prompt(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    detach_from_tty(cmd);
+}
+
+#[cfg(unix)]
+fn detach_from_tty(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setsid` is async-signal-safe and the only call in the
+    // pre-exec hook; the forked child is never a process-group leader, so
+    // the call always succeeds.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
 /// Run a mutating git subcommand and return a human-readable summary.
 ///
 /// Shared by every operation the Source Control panel invokes
@@ -253,6 +290,7 @@ fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
     );
     let mut cmd = Command::new("git");
     cmd.args(["-C", path_str]).args(args);
+    never_prompt(&mut cmd);
     let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
@@ -673,6 +711,25 @@ pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> 
     String::from_utf8(output.stdout).map_err(|_| format!("{rel_path} at HEAD is not UTF-8"))
 }
 
+/// The contents of `rel_path` (relative to `root`) at revision `rev`, via
+/// `git show <rev>:./<rel_path>`. The `./` makes the path relative to
+/// `root` rather than to the repository top, so a workspace opened in a
+/// subdirectory of a repo still reads the right file. `Err` when the file
+/// did not exist at that revision or is not UTF-8.
+pub fn read_file_at_rev(root: &Path, rev: &str, rel_path: &str) -> Result<String, String> {
+    let spec = format!("{rev}:./{rel_path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", &spec])
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    String::from_utf8(output.stdout).map_err(|_| format!("{rel_path} at {rev} is not UTF-8"))
+}
+
 /// Read one index stage of an unmerged path via `git show :N:<rel_path>`
 /// — 1 = common ancestor (base), 2 = ours, 3 = theirs. The merge
 /// editor's input source (#253). Errors when the stage does not exist
@@ -703,6 +760,40 @@ pub fn read_file_at_stage(root: &Path, rel_path: &str, stage: u8) -> Result<Stri
         .map_err(|_| format!("{rel_path} at stage {stage} is not UTF-8"))
 }
 
+#[derive(Clone, Copy)]
+enum HunkSide {
+    Old,
+    New,
+}
+
+/// `patch` with each `@@ -a,b +c,d @@` header's two starts set to the
+/// `side` one, counts untouched.
+fn retarget_hunk_starts(patch: &str, side: HunkSide) -> String {
+    let fix = |line: &str| -> Option<String> {
+        let rest = line.strip_prefix("@@ -")?;
+        let (old, rest) = rest.split_once(" +")?;
+        let (new, tail) = rest.split_once(" @@")?;
+        let start = |range: &str| range.split(',').next().map(str::to_string);
+        let count = |range: &str| range.split_once(',').map(|(_, c)| format!(",{c}"));
+        let pick = match side {
+            HunkSide::Old => start(old)?,
+            HunkSide::New => start(new)?,
+        };
+        Some(format!(
+            "@@ -{pick}{} +{pick}{} @@{tail}",
+            count(old).unwrap_or_default(),
+            count(new).unwrap_or_default()
+        ))
+    };
+    // Split on `\n` only: a CRLF file's patch lines end in `\r`, which
+    // `str::lines` would strip.
+    patch
+        .split('\n')
+        .map(|l| fix(l).unwrap_or_else(|| l.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Apply a unified-diff patch fed on stdin via `git apply`. `cached`
 /// targets the index (stage), `reverse` un-applies (`cached + reverse` =
 /// unstage, `reverse` alone = revert the working tree). Logged to the
@@ -725,6 +816,19 @@ pub fn apply_patch(
         args.push("-R");
     }
     args.push("-");
+    // The diff's `@@ -old +new @@` counts HEAD lines on one side and
+    // working-tree lines on the other, and `git apply` starts its offset
+    // search at the side it writes to. A single-hunk patch lands on a target
+    // where no earlier hunk was applied, so each side's number is right for
+    // one target only: staging writes the index (HEAD's numbering), a revert
+    // writes the working tree (its own). With the other number, a file with
+    // repeated context took the patch at the wrong place.
+    let retargeted = match (cached, reverse) {
+        (true, false) => retarget_hunk_starts(patch, HunkSide::Old),
+        (false, true) => retarget_hunk_starts(patch, HunkSide::New),
+        _ => patch.to_string(),
+    };
+    let patch = retargeted.as_str();
     crate::output::push(
         crate::output::CHANNEL_GIT,
         crate::output::OutputLevel::Info,
@@ -805,8 +909,10 @@ pub fn push_current_branch(root: &Path) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let output = Command::new("git")
-        .args(["-C", path_str, "push"])
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", path_str, "push"]);
+    never_prompt(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -941,7 +1047,50 @@ pub fn parse_file_history(out: &str, now: i64) -> Vec<FileHistoryEntry> {
 /// Raw `git show <hash> -- <rel_path>` text: the file's diff in that commit,
 /// for opening a TIMELINE entry in the side-by-side diff viewer.
 pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<String, String> {
-    diff_text(root, &["show", hash, "--", rel_path])
+    let has_diff = |raw: &str| raw.lines().any(|l| l.starts_with("diff --git"));
+    let raw = diff_text(root, &["show", hash, "--", rel_path])?;
+    if has_diff(&raw) {
+        return Ok(raw);
+    }
+    // The TIMELINE lists history with `--follow`, so a commit from before a
+    // rename touched the file under its OLD name, and showing it under the
+    // current one was an empty diff. The follow walk says what it was called.
+    match path_at_commit(root, hash, rel_path) {
+        Some(old) if old != rel_path => diff_text(root, &["show", hash, "--", &old]),
+        _ => Ok(raw),
+    }
+}
+
+/// The name `rel_path` had in commit `hash`, from the same `--follow` walk
+/// [`file_history`] lists. None when the commit is not in that history.
+fn path_at_commit(root: &Path, hash: &str, rel_path: &str) -> Option<String> {
+    let out = run_git(
+        root,
+        &[
+            "log",
+            "--follow",
+            // As deep as the TIMELINE lists (`file_history`'s 50), with room
+            // to spare: a row past it cannot be clicked, and the full walk
+            // of a long history was the slow part.
+            "-n200",
+            "--name-only",
+            "--format=%x1e%H",
+            "--",
+            rel_path,
+        ],
+    )
+    .ok()?;
+    out.split('\x1e').find_map(|record| {
+        let mut lines = record.lines();
+        let full = lines.next()?.trim();
+        if hash.is_empty() || !full.starts_with(hash) {
+            return None;
+        }
+        lines
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(unquote_porcelain_path)
+    })
 }
 
 /// The whole commit as text — header, message, diffstat, and full patch —
@@ -1217,6 +1366,150 @@ pub fn remove_worktree_lane(lane: &Path) -> Result<(), String> {
     run_git_mut(lane, &["worktree", "remove", path])
 }
 
+/// Where review mode checks pull request `number` out (#365): a sibling of
+/// `repo`, like a worktree lane, never a child git would then see.
+pub fn pr_worktree_path(repo: &Path, number: u64) -> Option<PathBuf> {
+    let name = repo.file_name()?.to_str()?;
+    Some(repo.parent()?.join(format!("{name}-pr-{number}")))
+}
+
+/// Which remote to fetch `owner/repo`'s pull requests from: the one whose
+/// URL names it (`git@github.com:o/r.git`, `https://github.com/o/r`), else
+/// the repository's own URL, which `git fetch` takes as well.
+pub fn remote_for_slug(repo: &Path, slug: &str) -> String {
+    let slug = slug.to_ascii_lowercase();
+    let names = |url: &str| {
+        let url = url.trim().to_ascii_lowercase();
+        let url = url.strip_suffix(".git").unwrap_or(&url).to_string();
+        url.ends_with(&format!("/{slug}")) || url.ends_with(&format!(":{slug}"))
+    };
+    run_git(repo, &["remote", "-v"])
+        .ok()
+        .and_then(|out| {
+            out.lines().find_map(|l| {
+                let mut parts = l.split_whitespace();
+                let (name, url) = (parts.next()?, parts.next()?);
+                names(url).then(|| name.to_string())
+            })
+        })
+        .unwrap_or_else(|| format!("https://github.com/{slug}.git"))
+}
+
+/// Whether `path` is one of `repo`'s worktrees.
+fn is_worktree_of(repo: &Path, path: &Path) -> bool {
+    let want = path.canonicalize().ok();
+    run_git(repo, &["worktree", "list", "--porcelain"]).is_ok_and(|out| {
+        out.lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .any(|w| Path::new(w).canonicalize().ok() == want)
+    })
+}
+
+/// A pull request head checked out by [`checkout_pr_worktree`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrWorktree {
+    /// The commit checked out.
+    pub oid: String,
+    /// Whether this call created the worktree. One that was already there
+    /// is the user's as much as review mode's, and leaving never removes it.
+    pub created: bool,
+}
+
+/// Fetch pull request `number` from `remote` and check its head out,
+/// detached, in a worktree at `path` (#365).
+///
+/// An existing worktree of the same repository is moved to the new head
+/// only when that loses nothing: it is clean, and its HEAD is the fetched
+/// head already or `previous`, the head review mode checked out there last.
+/// Any other HEAD holds commits that a detached checkout would leave to the
+/// reflog. Anything else already at `path` is refused, never touched.
+pub fn checkout_pr_worktree(
+    repo: &Path,
+    remote: &str,
+    number: u64,
+    path: &Path,
+    previous: Option<&str>,
+) -> Result<PrWorktree, String> {
+    let Some(path_s) = path.to_str() else {
+        return Err(String::from("worktree path is not valid UTF-8"));
+    };
+    let Some(repo_s) = repo.to_str() else {
+        return Err(String::from("repository path is not valid UTF-8"));
+    };
+    // No prompt: this runs off the UI thread, where a credential prompt,
+    // or ssh's own passphrase or host-key question on /dev/tty, would wait
+    // forever on a terminal nobody sees, or draw over the UI.
+    let mut fetch = Command::new("git");
+    fetch
+        .args(["-C", repo_s, "fetch", "--quiet", remote])
+        .arg(format!("refs/pull/{number}/head"));
+    never_prompt(&mut fetch);
+    let fetch = fetch.output().map_err(|e| e.to_string())?;
+    if !fetch.status.success() {
+        let err = String::from_utf8_lossy(&fetch.stderr);
+        return Err(err
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("git fetch failed")
+            .to_string());
+    }
+    let oid = run_git(repo, &["rev-parse", "FETCH_HEAD"])
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    if path.exists() {
+        if !is_worktree_of(repo, path) {
+            return Err(format!(
+                "{path_s} already exists and is not a worktree of this repository"
+            ));
+        }
+        let head = worktree_head(path);
+        if head.as_deref() != Some(oid.as_str()) {
+            if let Some(why) = lane_removal_block(path) {
+                return Err(format!("the existing checkout has work in it: {why}"));
+            }
+            if previous.is_none() || head.as_deref() != previous {
+                return Err(format!(
+                    "{path_s} is at a commit review mode did not check out — put that work on a branch, or remove the worktree"
+                ));
+            }
+        }
+        run_git_mut(path, &["checkout", "--quiet", "--detach", &oid])?;
+        Ok(PrWorktree {
+            oid,
+            created: false,
+        })
+    } else {
+        run_git_mut(repo, &["worktree", "add", "--detach", path_s, &oid])?;
+        Ok(PrWorktree { oid, created: true })
+    }
+}
+
+/// The commit a worktree's HEAD is on.
+pub fn worktree_head(path: &Path) -> Option<String> {
+    run_git(path, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Why leaving review must keep the pull request's checkout: uncommitted or
+/// ignored files (see [`lane_removal_block`]), or commits made on top of the
+/// checked-out head, which a detached worktree would leave unreachable.
+pub fn pr_worktree_keep_reason(path: &Path, checked_out: &str) -> Option<String> {
+    if let Some(why) = lane_removal_block(path) {
+        return Some(why);
+    }
+    match worktree_head(path) {
+        Some(head) if head == checked_out => None,
+        Some(_) => Some(String::from(
+            "it has commits beyond the pull request's head — put them on a branch first",
+        )),
+        None => Some(String::from("git cannot read its HEAD")),
+    }
+}
+
 /// The current branch's first-parent history, newest first (#371).
 ///
 /// NOT [`commit_graph`], which logs `--branches --tags HEAD` to draw the
@@ -1276,6 +1569,66 @@ pub fn branch_history_range(root: &Path, revspec: &str, limit: usize) -> Vec<Gra
     parse_commit_graph(&String::from_utf8_lossy(&output.stdout), now)
 }
 
+/// Commit `rev`'s tree under a workspace root, as [`tree_paths`] lists it
+/// for the Explorer's dimming while the scrubber sits on a commit (#371).
+#[derive(Debug, Default)]
+pub struct CommitTree {
+    /// Every path in the tree, absolute, directories included.
+    pub paths: HashSet<PathBuf>,
+    /// Submodule (gitlink) paths. `ls-tree` never lists their contents, so
+    /// anything beneath one counts as present rather than dimming a whole
+    /// submodule checkout.
+    pub submodules: Vec<PathBuf>,
+}
+
+impl CommitTree {
+    /// Whether `path` existed in the commit: listed, or inside a submodule.
+    pub fn contains(&self, path: &Path) -> bool {
+        self.paths.contains(path) || self.submodules.iter().any(|s| path.starts_with(s))
+    }
+}
+
+/// Every path in commit `rev`'s tree under `root`, absolute (`root`
+/// joined), directories included — what the Explorer dims against while
+/// the scrubber sits on a commit (#371).
+///
+/// `ls-tree` run with `-C root` and no `--full-tree` lists only the
+/// entries under `root` and prints them relative to it, the same base
+/// [`read_file_at_rev`]'s `./` gives, so a workspace opened in a
+/// subdirectory of a repo joins onto its own root rather than the
+/// toplevel. `-t` emits each directory on the way down, so a folder that
+/// existed keeps its normal colour without deriving ancestors here.
+///
+/// `None` on any failure (no repo, unknown revision), so a caller dims
+/// nothing rather than everything.
+pub fn tree_paths(root: &Path, rev: &str) -> Option<CommitTree> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["ls-tree", "-r", "-t", "-z", rev])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut tree = CommitTree::default();
+    // Each entry is `<mode> <type> <object>\t<path>`.
+    for entry in output.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let path = join_raw(root, &entry[tab + 1..]);
+        if entry[..tab].split(|b| *b == b' ').nth(1) == Some(b"commit") {
+            tree.submodules.push(path.clone());
+        }
+        tree.paths.insert(path);
+    }
+    Some(tree)
+}
+
 /// Parse the `%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct` lines emitted by
 /// [`commit_graph`], computing each commit's age relative to `now`.
 pub fn parse_commit_graph(out: &str, now: i64) -> Vec<GraphCommit> {
@@ -1327,6 +1680,10 @@ pub struct BlameLine {
     /// True for a not-yet-committed line (the zero hash `git blame` reports
     /// for working-tree changes).
     pub uncommitted: bool,
+    /// The line's text as blamed, when known: the annotation is shown only
+    /// while the buffer's line still reads the same (see
+    /// `Editor::committed_blame_annotation`).
+    pub text: Option<String>,
 }
 
 /// Per-line blame for `rel_path`, indexed 0-based by result position (result
@@ -1370,7 +1727,7 @@ pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
             author_time = rest.trim().parse().unwrap_or(now);
         } else if let Some(rest) = raw.strip_prefix("summary ") {
             summary = rest.to_string();
-        } else if raw.starts_with('\t') {
+        } else if let Some(content) = raw.strip_prefix('\t') {
             // The content line closes a group: emit the accumulated blame.
             if let Some(full) = hash.take() {
                 let uncommitted = full.chars().all(|c| c == '0');
@@ -1380,6 +1737,7 @@ pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
                     author: std::mem::take(&mut author),
                     age_secs: now - author_time,
                     uncommitted,
+                    text: Some(content.to_string()),
                 });
             }
         } else if let Some(h) = raw.split(' ').next() {
@@ -1466,7 +1824,9 @@ pub fn stage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let mut cmd = Command::new("git");
-    cmd.args(["-C", path_str, "add", "--"]);
+    // Literal: git reads a pathspec as a glob, so staging Next.js's
+    // `pages/[id].tsx` also staged `pages/i.tsx` and untracked `pages/d.tsx`.
+    cmd.args(["-C", path_str, "--literal-pathspecs", "add", "--"]);
     for p in rel_paths {
         cmd.arg(p);
     }
@@ -1503,22 +1863,36 @@ pub fn unstage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
     if rel_paths.is_empty() {
         return Ok(());
     }
-    let mut args: Vec<&str> = vec!["reset", "-q", "HEAD", "--"];
+    let mut args: Vec<&str> = vec!["--literal-pathspecs", "reset", "-q", "HEAD", "--"];
     args.extend(rel_paths.iter().map(String::as_str));
     run_mutation(root, &args).map(|_| ())
 }
 
-/// Discard a single path. For tracked entries this restores the working
-/// tree to HEAD via `git checkout HEAD -- <path>`; for Untracked entries
-/// the file (or directory) is removed from disk. Destructive: callers
+/// Discard a single path. A Changes row restores the working tree from the
+/// INDEX (`git checkout -- <path>`), so a staged part of the same file is
+/// kept, as VS Code does; restoring from HEAD threw the staged work away
+/// too. A Staged row restores both from HEAD. Untracked entries are removed
+/// from disk. Destructive: callers
 /// MUST confirm with the user before invoking — the Source Control panel
 /// shows a Y/N modal before reaching this function.
-pub fn discard_path(root: &Path, rel_path: &str, untracked: bool) -> Result<(), String> {
+pub fn discard_path(
+    root: &Path,
+    rel_path: &str,
+    untracked: bool,
+    staged: bool,
+) -> Result<(), String> {
     if untracked {
         let abs = root.join(rel_path);
         if abs.is_dir() {
-            std::fs::remove_dir_all(&abs)
-                .map_err(|e| format!("failed to remove {}: {e}", abs.display()))
+            // Porcelain folds a directory holding any untracked file into one
+            // `?? dir/` row; `remove_dir_all` took the IGNORED files inside
+            // with it (`.env`, `node_modules/`). `git clean` removes only
+            // the untracked ones.
+            run_mutation(
+                root,
+                &["--literal-pathspecs", "clean", "-fdq", "--", rel_path],
+            )
+            .map(|_| ())
         } else {
             std::fs::remove_file(&abs)
                 .map_err(|e| format!("failed to remove {}: {e}", abs.display()))
@@ -1527,8 +1901,13 @@ pub fn discard_path(root: &Path, rel_path: &str, untracked: bool) -> Result<(), 
         let path_str = root
             .to_str()
             .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-        let output = Command::new("git")
-            .args(["-C", path_str, "checkout", "HEAD", "--", rel_path])
+        let mut cmd = Command::new("git");
+        cmd.args(["-C", path_str, "--literal-pathspecs", "checkout"]);
+        if staged {
+            cmd.arg("HEAD");
+        }
+        let output = cmd
+            .args(["--", rel_path])
             .output()
             .map_err(|e| format!("failed to spawn git: {e}"))?;
         if output.status.success() {
@@ -1687,7 +2066,9 @@ pub fn clone_into(parent: &Path, url: &str) -> Result<PathBuf, String> {
     let dest = parent.join(&name);
     // run_mutation runs with `-C <parent>`, so the bare `<name>` clones into
     // parent/<name>.
-    run_mutation(parent, &["clone", url, &name]).map(|_| dest)
+    // `--`: a URL starting with `-` (`--upload-pack=<command>`) is
+    // otherwise an option, and that one runs a command.
+    run_mutation(parent, &["clone", "--", url, &name]).map(|_| dest)
 }
 
 // --- Commit variants -----------------------------------------------------
@@ -2439,6 +2820,29 @@ mod tests {
     }
 
     #[test]
+    fn one_paths_ignore_verdict_matches_the_rules() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        std::fs::write(p.join(".gitignore"), "*.log\nout/\n").unwrap();
+        assert!(is_ignored(p, &p.join("a.log")));
+        assert!(
+            is_ignored(p, &p.join("out/deep/gen.rs")),
+            "under an ignored dir"
+        );
+        assert!(!is_ignored(p, &p.join("src/lib.rs")));
+        let bare = TempDir::new().unwrap();
+        assert!(
+            !is_ignored(bare.path(), &bare.path().join("a.log")),
+            "no repo"
+        );
+    }
+
+    #[test]
     fn query_outside_a_repo_has_an_empty_ignored_set() {
         let tmp = TempDir::new().unwrap();
         let s = query(tmp.path());
@@ -2866,6 +3270,215 @@ mod tests {
         join.join().unwrap();
     }
 
+    fn sh_git(p: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn staging_a_bracketed_path_stages_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::create_dir(p.join("pages")).unwrap();
+        std::fs::write(p.join("pages/[id].tsx"), "a").unwrap();
+        std::fs::write(p.join("pages/i.tsx"), "b").unwrap();
+        stage_paths(p, &[String::from("pages/[id].tsx")]).unwrap();
+        let staged = sh_git(p, &["diff", "--cached", "--name-only"]);
+        assert_eq!(staged.trim(), "pages/[id].tsx");
+        unstage_paths(p, &[String::from("pages/[id].tsx")]).unwrap();
+        assert_eq!(sh_git(p, &["diff", "--cached", "--name-only"]).trim(), "");
+    }
+
+    #[test]
+    fn discarding_a_changes_row_keeps_the_staged_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "staged\n").unwrap();
+        sh_git(p, &["add", "seed.txt"]);
+        std::fs::write(p.join("seed.txt"), "staged\nunstaged\n").unwrap();
+        discard_path(p, "seed.txt", false, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("seed.txt")).unwrap(),
+            "staged\n"
+        );
+        assert_eq!(
+            sh_git(p, &["diff", "--cached", "--name-only"]).trim(),
+            "seed.txt"
+        );
+    }
+
+    #[test]
+    fn discarding_an_untracked_folder_keeps_its_ignored_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join(".gitignore"), ".env\n").unwrap();
+        sh_git(p, &["add", ".gitignore"]);
+        sh_git(p, &["commit", "-qm", "ignore"]);
+        std::fs::create_dir(p.join("app")).unwrap();
+        std::fs::write(p.join("app/new.rs"), "x").unwrap();
+        std::fs::write(p.join("app/.env"), "SECRET=1").unwrap();
+        discard_path(p, "app/", true, false).unwrap();
+        assert!(!p.join("app/new.rs").exists());
+        assert!(
+            p.join("app/.env").exists(),
+            "an ignored file is not the discard's to delete"
+        );
+    }
+
+    #[test]
+    fn a_single_hunk_stages_and_reverts_at_its_own_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        // Repeated context, and an earlier unstaged hunk that shifts every
+        // later working-tree line by three.
+        let head: String = (0..12)
+            .map(|i| if i % 2 == 0 { "a\n" } else { "c\n" })
+            .collect();
+        std::fs::write(p.join("f.txt"), &head).unwrap();
+        sh_git(p, &["add", "f.txt"]);
+        sh_git(p, &["commit", "-qm", "f"]);
+        let mut work: Vec<&str> = head.lines().collect();
+        work.insert(9, "cz");
+        for _ in 0..3 {
+            work.insert(0, "top");
+        }
+        let work_text = work.join("\n") + "\n";
+        std::fs::write(p.join("f.txt"), &work_text).unwrap();
+        // The later hunk alone: `cz` after HEAD line 9, context a/c around it.
+        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -9,2 +12,3 @@\n a\n+cz\n c\n";
+        apply_patch(p, patch, true, false).unwrap();
+        let staged = sh_git(p, &["show", ":f.txt"]);
+        let mut want: Vec<&str> = head.lines().collect();
+        want.insert(9, "cz");
+        assert_eq!(staged, want.join("\n") + "\n", "staged at HEAD line 9");
+        sh_git(p, &["reset", "-q"]);
+        apply_patch(p, patch, false, true).unwrap();
+        let reverted = std::fs::read_to_string(p.join("f.txt")).unwrap();
+        let mut want: Vec<&str> = work_text.lines().collect();
+        want.remove(12);
+        assert_eq!(
+            reverted,
+            want.join("\n") + "\n",
+            "reverted at working line 12"
+        );
+    }
+
+    /// #365: review mode's checkout fetches `refs/pull/N/head` into a
+    /// detached sibling worktree, moves it on a re-run after a new push,
+    /// refuses a directory that is not its worktree, and says why leaving
+    /// must keep a checkout with edits or new commits in it.
+    #[test]
+    fn a_pull_request_head_checks_out_into_a_sibling_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let up = tmp.path().join("up");
+        std::fs::create_dir(&up).unwrap();
+        init_repo_with_commit(&up);
+        let pr_commit = |msg: &str| {
+            std::fs::write(up.join("pr.txt"), msg).unwrap();
+            git(&up, &["add", "."]);
+            git(&up, &["commit", "-q", "-m", msg]);
+            let sha = git(&up, &["rev-parse", "HEAD"]);
+            git(&up, &["update-ref", "refs/pull/7/head", &sha]);
+            sha
+        };
+        let first = pr_commit("one");
+        let app = tmp.path().join("app");
+        git(tmp.path(), &["clone", "-q", up.to_str().unwrap(), "app"]);
+        git(&app, &["config", "user.email", "a@b"]);
+        git(&app, &["config", "user.name", "a"]);
+
+        let path = pr_worktree_path(&app, 7).unwrap();
+        assert_eq!(path, tmp.path().join("app-pr-7"));
+        let remote = remote_for_slug(&app, "o/r");
+        assert_eq!(remote, "https://github.com/o/r.git", "no remote names o/r");
+        assert_eq!(
+            checkout_pr_worktree(&app, "origin", 7, &path, None),
+            Ok(PrWorktree {
+                oid: first.clone(),
+                created: true
+            })
+        );
+        assert_eq!(std::fs::read_to_string(path.join("pr.txt")).unwrap(), "one");
+        assert_eq!(pr_worktree_keep_reason(&path, &first), None);
+
+        // A new push moves the checkout review mode made, and only that:
+        // not knowing what it last checked out there, it refuses.
+        let second = pr_commit("two");
+        let err = checkout_pr_worktree(&app, "origin", 7, &path, None).unwrap_err();
+        assert!(err.contains("did not check out"), "{err}");
+        assert_eq!(
+            checkout_pr_worktree(&app, "origin", 7, &path, Some(&first)),
+            Ok(PrWorktree {
+                oid: second.clone(),
+                created: false
+            })
+        );
+        assert_eq!(std::fs::read_to_string(path.join("pr.txt")).unwrap(), "two");
+
+        // Edits and new commits are reasons to keep it.
+        std::fs::write(path.join("pr.txt"), "edited").unwrap();
+        assert!(pr_worktree_keep_reason(&path, &second).is_some());
+        git(&path, &["commit", "-q", "-am", "mine"]);
+        let why = pr_worktree_keep_reason(&path, &second).expect("a new commit keeps it");
+        assert!(why.contains("commits"), "{why}");
+        // ...and a refresh will not detach away from that commit either.
+        let mine = git(&path, &["rev-parse", "HEAD"]);
+        let third = pr_commit("three");
+        let err = checkout_pr_worktree(&app, "origin", 7, &path, Some(&second)).unwrap_err();
+        assert!(err.contains("did not check out"), "{err}");
+        assert_eq!(worktree_head(&path).as_deref(), Some(mine.as_str()));
+        assert_ne!(mine, third);
+
+        // Something else at the path is never touched.
+        let stray = pr_worktree_path(&app, 8).unwrap();
+        std::fs::create_dir(&stray).unwrap();
+        let second_pr = git(&up, &["rev-parse", "HEAD"]);
+        git(&up, &["update-ref", "refs/pull/8/head", &second_pr]);
+        let err = checkout_pr_worktree(&app, "origin", 8, &stray, None).unwrap_err();
+        assert!(err.contains("not a worktree"), "{err}");
+    }
+
+    #[test]
+    fn the_pull_request_remote_is_the_one_naming_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo_with_commit(tmp.path());
+        for (name, url) in [
+            ("origin", "git@github.com:me/fork.git"),
+            ("upstream", "https://github.com/Owner/Repo"),
+        ] {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["remote", "add", name, url])
+                .status();
+        }
+        assert_eq!(remote_for_slug(tmp.path(), "owner/repo"), "upstream");
+        assert_eq!(remote_for_slug(tmp.path(), "me/fork"), "origin");
+    }
+
     fn init_repo_with_commit(p: &Path) {
         let _ = Command::new("git")
             .args(["-C"])
@@ -3188,6 +3801,61 @@ mod tests {
         );
     }
 
+    /// #371: a file added in HEAD is absent from HEAD~1's tree and present
+    /// in HEAD's — the positive control, so an absence is about the commit
+    /// rather than about the listing being empty. Directories are listed,
+    /// and a workspace in a repo subdirectory gets paths joined onto itself.
+    #[test]
+    fn tree_paths_lists_a_commits_files_and_folders_under_the_root() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let git = |args: &[&str]| {
+            let _ = Command::new("git").args(["-C"]).arg(p).args(args).status();
+        };
+        std::fs::create_dir_all(p.join("sub/deep")).unwrap();
+        std::fs::write(p.join("sub/deep/new.txt"), "n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add new"]);
+
+        let before = tree_paths(p, "HEAD~1").expect("HEAD~1 lists");
+        assert!(before.contains(&p.join("seed.txt")));
+        assert!(!before.contains(&p.join("sub/deep/new.txt")));
+        assert!(!before.contains(&p.join("sub")));
+
+        let head = tree_paths(p, "HEAD").expect("HEAD lists");
+        assert!(head.contains(&p.join("sub/deep/new.txt")));
+        assert!(head.contains(&p.join("sub")), "folders are listed too");
+        assert!(head.contains(&p.join("sub/deep")));
+
+        // Opened in a subdirectory: only its entries, joined onto it.
+        let sub = p.join("sub");
+        let nested = tree_paths(&sub, "HEAD").expect("subdir lists");
+        assert!(nested.contains(&sub.join("deep/new.txt")));
+        assert!(!nested.paths.iter().any(|q| q.ends_with("seed.txt")));
+
+        assert!(tree_paths(p, "no-such-rev").is_none());
+
+        // A submodule's contents are never listed, so they count as present.
+        let head_sha = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let cacheinfo = format!("160000,{},vendored", head_sha.trim());
+        git(&["update-index", "--add", "--cacheinfo", &cacheinfo]);
+        git(&["commit", "-q", "-m", "add submodule"]);
+        let with_sub = tree_paths(p, "HEAD").expect("HEAD lists");
+        assert_eq!(with_sub.submodules, vec![p.join("vendored")]);
+        assert!(with_sub.contains(&p.join("vendored/src/lib.rs")));
+        assert!(!with_sub.contains(&p.join("vendoredx")));
+    }
+
     /// What plain `--porcelain` (no `--ignored`) reports, as the positive
     /// control for the ignored-file case: it must see NOTHING there, or the
     /// assertion that `lane_removal_block` catches it proves nothing.
@@ -3370,6 +4038,39 @@ mod tests {
             out.contains("+three"),
             "diff vs branch must include the new +three line: {out}"
         );
+    }
+
+    #[test]
+    fn a_commit_from_before_a_rename_shows_its_diff_under_the_old_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(p.join("old.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "add"]);
+        std::fs::write(p.join("old.txt"), "one\ntwo\nthree\nFOUR\n").unwrap();
+        git(&["commit", "-qam", "edit"]);
+        let edit = git(&["rev-parse", "--short", "HEAD"]);
+        git(&["mv", "old.txt", "new.txt"]);
+        git(&["commit", "-qm", "rename"]);
+        let diff = show_commit_file_diff(p, &edit, "new.txt").unwrap();
+        assert!(diff.contains("+FOUR"), "{diff}");
     }
 
     #[test]

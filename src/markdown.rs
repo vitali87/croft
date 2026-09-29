@@ -65,6 +65,93 @@ pub struct MarkdownPreview {
     /// True when `doc_path` names a MEDIA file (#183): the rebuild
     /// dispatch probes headers instead of walking document XML.
     pub media: bool,
+    /// Scroll sync (#619): `(source line, built line)` at each block's
+    /// start, ascending in both. Empty for views with no Markdown source
+    /// (notebooks, documents, media).
+    pub source_map: SourceMap,
+    /// Frame truth, written by the editor's render: the first VISUAL row of
+    /// each built line under the current wrap, so a built line can become a
+    /// scroll offset. Cached on `wrap_key` like `anchor_rows`.
+    pub row_of_line: Vec<usize>,
+    /// A source line the next render should scroll to (#619): set when the
+    /// preview opens or a split's source pane scrolls, and resolved once the
+    /// wrap width is known.
+    pub scroll_to_source: Option<usize>,
+}
+
+impl MarkdownPreview {
+    /// The visual row showing `source_line`, when the map covers it.
+    ///
+    /// Interpolated in visual ROWS, not built lines: a wrapped paragraph is
+    /// one built line however many source lines and rows it spans, so
+    /// interpolating built lines landed past it, and past the last anchor
+    /// read a built line number as a row. Clamped to the last line's row.
+    pub fn row_for_source_line(&self, source_line: usize) -> Option<usize> {
+        row_for_source(&self.source_map, &self.row_of_line, source_line)
+    }
+
+    /// The source line under the preview's top row, when the map covers it.
+    pub fn source_line_at_top(&self) -> Option<usize> {
+        let top = self.scroll as usize;
+        let built = self
+            .row_of_line
+            .partition_point(|&r| r <= top)
+            .saturating_sub(1);
+        source_line_for_built(&self.source_map, built)
+    }
+}
+
+/// Interpolate along `map` from `from` (key `a`) to `to` (key `b`): exact at
+/// an anchor, linear between two, clamped past the ends. Linear is right
+/// for the long stretches the anchors skip, a code block or a wrapped
+/// paragraph, where source and output advance together.
+fn interpolate(map: &[(usize, usize)], x: usize, forward: bool) -> Option<usize> {
+    let key = |p: &(usize, usize)| if forward { p.0 } else { p.1 };
+    let val = |p: &(usize, usize)| if forward { p.1 } else { p.0 };
+    let first = map.first()?;
+    let i = map.partition_point(|p| key(p) <= x);
+    if i == 0 {
+        return Some(val(first));
+    }
+    let lo = &map[i - 1];
+    let Some(hi) = map.get(i) else {
+        return Some(val(lo) + (x - key(lo)));
+    };
+    let span = key(hi) - key(lo);
+    if span == 0 {
+        return Some(val(lo));
+    }
+    let out_span = val(hi).saturating_sub(val(lo));
+    Some(val(lo) + (x - key(lo)) * out_span / span)
+}
+
+/// The visual row showing `source_line`, given each built line's first row.
+fn row_for_source(
+    map: &[(usize, usize)],
+    row_of_line: &[usize],
+    source_line: usize,
+) -> Option<usize> {
+    let Some(&last) = row_of_line.last() else {
+        return built_line_for_source(map, source_line);
+    };
+    let rows: SourceMap = map
+        .iter()
+        .map(|&(src, built)| (src, row_of_line.get(built).copied().unwrap_or(last)))
+        .collect();
+    Some(interpolate(&rows, source_line, true)?.min(last))
+}
+
+/// `(source line, built line)` anchors, one per block start (#619).
+pub type SourceMap = Vec<(usize, usize)>;
+
+/// The built line that renders `source_line` (#619).
+pub fn built_line_for_source(map: &[(usize, usize)], source_line: usize) -> Option<usize> {
+    interpolate(map, source_line, true)
+}
+
+/// The source line a built line came from (#619).
+pub fn source_line_for_built(map: &[(usize, usize)], built_line: usize) -> Option<usize> {
+    interpolate(map, built_line, false)
 }
 
 /// One runnable fenced block in a rendered preview (#353): a shell (or,
@@ -108,6 +195,10 @@ pub struct MdRunnable {
     /// the author wrote is worse than doing the odd thing they asked for,
     /// and the box makes the outcome legible either way.
     pub capture_timeout: Option<u64>,
+    /// A notebook code cell (#355): its index in the notebook's `cells`.
+    /// It runs in the notebook's kernel, not in a pane, so the other
+    /// fields above do not apply to it.
+    pub kernel_cell: Option<usize>,
 }
 
 /// The play glyph a runnable fence wears in place of its first bar.
@@ -632,6 +723,7 @@ fn lang_for_fence(info: &str) -> Option<LangKind> {
         "typescript" => LangKind::TypeScript,
         "golang" => LangKind::Go,
         "shell" | "console" | "terminal" => LangKind::Bash,
+        "codeql" => LangKind::Ql,
         other => return lang_for_extension(other),
     })
 }
@@ -687,6 +779,13 @@ struct Renderer<'r> {
     /// runnable check (#353).
     code_info: String,
     code_lines: (usize, usize),
+    /// The source line of the open block's first code line (#619): after a
+    /// fence's opener, or the block's own first line when indented.
+    code_first: usize,
+    /// `(source line, built row)` of every code line (#619). Exact anchors
+    /// inside a block, so interpolation never runs across the captured
+    /// output rows a run adds under it.
+    code_anchors: Vec<(usize, usize)>,
     runnables: Vec<MdRunnable>,
     /// Captured runs to show under their fences (#354). Empty for a
     /// document nothing has been run from, which is the common case.
@@ -805,6 +904,7 @@ impl Renderer<'_> {
                     capture_timeout: attrs
                         .iter()
                         .find_map(|a| a.strip_prefix("timeout=").and_then(|v| v.parse().ok())),
+                    kernel_cell: None,
                 }
             });
         let bar = Span::styled("\u{258e} ", Style::default().fg(self.theme.accent()));
@@ -833,6 +933,8 @@ impl Renderer<'_> {
                 Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi, code_fg)),
                 _ => spans.push(Span::styled(line.to_string(), Style::default().fg(code_fg))),
             }
+            self.code_anchors
+                .push((self.code_first + i, self.out.len()));
             self.out.push(Line::from(spans));
         }
         if let Some(r) = runnable {
@@ -996,6 +1098,20 @@ pub fn render_markdown_full(
     base_dir: Option<&std::path::Path>,
     outputs: BlockOutputs,
 ) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>) {
+    let (lines, images, runnables, _) =
+        render_markdown_mapped(text, theme, registry, base_dir, outputs);
+    (lines, images, runnables)
+}
+
+/// [`render_markdown_full`] plus the source map scroll sync reads (#619).
+pub fn render_markdown_mapped(
+    text: &str,
+    theme: Theme,
+    registry: &mut LangRegistry,
+    base_dir: Option<&std::path::Path>,
+    outputs: BlockOutputs,
+) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>, SourceMap) {
+    let mut source_map: Vec<(usize, usize)> = Vec::new();
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut r = Renderer {
@@ -1014,6 +1130,8 @@ pub fn render_markdown_full(
         code_block: None,
         code_info: String::new(),
         code_lines: (0, 0),
+        code_first: 0,
+        code_anchors: Vec::new(),
         runnables: Vec::new(),
         outputs,
         table: None,
@@ -1031,6 +1149,22 @@ pub fn render_markdown_full(
             .saturating_sub(1)
     };
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        // A block's start is an anchor: its source line, and the built line
+        // its first output lands on once the arm below has pushed any blank
+        // separator.
+        let block_start = matches!(
+            event,
+            Event::Start(
+                Tag::Heading { .. }
+                    | Tag::Paragraph
+                    | Tag::CodeBlock(_)
+                    | Tag::Item
+                    | Tag::BlockQuote(_)
+                    | Tag::Table(_)
+                    | Tag::HtmlBlock
+            ) | Event::Rule
+        );
+        let block_line = line_of(range.start);
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -1056,6 +1190,8 @@ pub fn render_markdown_full(
                         line_of(range.start),
                         line_of(range.end.saturating_sub(1)) + 1,
                     );
+                    r.code_first =
+                        r.code_lines.0 + usize::from(matches!(kind, CodeBlockKind::Fenced(_)));
                     r.code_block = Some((lang, String::new()));
                 }
                 Tag::List(start) => {
@@ -1092,10 +1228,22 @@ pub fn render_markdown_full(
                     // (#176). Remote URLs and misses keep the labelled
                     // placeholder - the preview never fetches.
                     let local = (!dest_url.contains("://"))
-                        .then(|| r.base_dir.as_ref().map(|d| d.join(dest_url.as_ref())))
+                        .then(|| {
+                            r.base_dir
+                                .as_ref()
+                                .map(|d| local_image_path(d, dest_url.as_ref()))
+                        })
                         .flatten()
-                        .filter(|p| p.is_file());
-                    let dims = local.as_ref().and_then(|p| image::image_dimensions(p).ok());
+                        .flatten();
+                    // Capped like the editor's image tab and the notebook
+                    // viewer: the preview reads and decodes the whole file
+                    // on the render thread, and any README could name a
+                    // huge one.
+                    let dims = local
+                        .as_ref()
+                        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() <= 25 * 1024 * 1024))
+                        .and_then(|p| image::image_dimensions(p).ok())
+                        .filter(|&(w, h)| u64::from(w) * u64::from(h) <= 64_000_000);
                     if let (Some(path), Some((px_w, px_h))) = (local, dims) {
                         r.ensure_blank();
                         // Cells are roughly twice as tall as wide; the
@@ -1237,6 +1385,10 @@ pub fn render_markdown_full(
             }
             _ => {}
         }
+        if block_start {
+            let row = r.out.len() + usize::from(!r.cur.is_empty());
+            source_map.push((block_line, row));
+        }
     }
     r.flush_line();
     // Trim the leading/trailing blank separators so the preview starts at
@@ -1248,6 +1400,8 @@ pub fn render_markdown_full(
         .map(|i| i.first_line + i.rows as usize)
         .max()
         .unwrap_or(0);
+    source_map.append(&mut r.code_anchors);
+    source_map.sort_unstable();
     let mut removed_front = 0usize;
     // Runnables are anchored to a row exactly as images are, so the guard
     // and the shift below have to cover both. They did not: a runnable's
@@ -1268,6 +1422,9 @@ pub fn render_markdown_full(
     for img in &mut r.images {
         img.first_line -= removed_front;
     }
+    for anchor in &mut source_map {
+        anchor.1 = anchor.1.saturating_sub(removed_front);
+    }
     for run in &mut r.runnables {
         run.first_line -= removed_front;
     }
@@ -1276,7 +1433,11 @@ pub fn render_markdown_full(
     {
         r.out.pop();
     }
-    (r.out, r.images, r.runnables)
+    // Anchors must ascend in both coordinates for interpolation; a nested
+    // block that starts on its parent's line would repeat it, so keep the
+    // first of any run that does not advance.
+    source_map.dedup_by(|b, a| b.0 <= a.0 || b.1 < a.1);
+    (r.out, r.images, r.runnables, source_map)
 }
 
 impl MarkdownPreview {
@@ -1353,9 +1514,115 @@ impl MarkdownPreview {
     }
 }
 
+/// The file a markdown image destination names under `base`, if it exists.
+/// A destination is a URL: `Screen%20Shot.png` is how CommonMark writes a
+/// space, and GitHub READMEs add `?raw=true`, so the query and fragment are
+/// dropped and escapes decoded. The literal spelling is tried first, for a
+/// file whose name really holds a `%`.
+fn local_image_path(base: &std::path::Path, dest: &str) -> Option<std::path::PathBuf> {
+    let literal = base.join(dest);
+    if literal.is_file() {
+        return Some(literal);
+    }
+    let bare = dest.split(['?', '#']).next().unwrap_or(dest);
+    let decoded = crate::shell_integration::percent_decode(bare.as_bytes());
+    let decoded = String::from_utf8(decoded).ok()?;
+    Some(base.join(decoded)).filter(|p| p.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_destinations_are_url_decoded_without_query_or_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Screen Shot.png"), b"x").unwrap();
+        std::fs::write(dir.path().join("100%.png"), b"x").unwrap();
+        let hit =
+            |d: &str| local_image_path(dir.path(), d).map(|p| p.file_name().unwrap().to_owned());
+        assert_eq!(hit("Screen%20Shot.png").unwrap(), "Screen Shot.png");
+        assert_eq!(
+            hit("Screen%20Shot.png?raw=true").unwrap(),
+            "Screen Shot.png"
+        );
+        assert_eq!(hit("Screen%20Shot.png#top").unwrap(), "Screen Shot.png");
+        assert_eq!(hit("100%.png").unwrap(), "100%.png");
+        assert!(hit("missing.png").is_none());
+    }
+
+    #[test]
+    fn scroll_sync_interpolates_rows_through_a_wrapped_paragraph() {
+        let rows = [0, 40, 41];
+        let mid = row_for_source(&[(0, 0), (11, 2)], &rows, 6).unwrap();
+        assert!(mid < 40, "inside the paragraph, got {mid}");
+        assert_eq!(
+            row_for_source(&[(0, 0), (2, 2)], &rows, 7),
+            Some(41),
+            "past the end clamps"
+        );
+    }
+
+    fn line_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_source_map_lands_each_block_on_its_rendered_line() {
+        let md = "# Title\n\nfirst para\n\n```\na\nb\nc\n```\n\n## Next\n\nlast para\n";
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        for (src, needle) in [
+            (0, "Title"),
+            (2, "first para"),
+            (10, "Next"),
+            (12, "last para"),
+        ] {
+            let built = built_line_for_source(&map, src).expect("mapped");
+            assert!(
+                line_text(&lines[built]).contains(needle),
+                "source line {src} should land on {needle:?}, got {:?}",
+                line_text(&lines[built])
+            );
+            assert_eq!(source_line_for_built(&map, built), Some(src), "and back");
+        }
+    }
+
+    #[test]
+    fn a_line_inside_a_run_fence_maps_to_its_code_not_the_output_box() {
+        let md = "```sh\necho a\necho b\necho c\n```\n\nafter\n";
+        let mut outputs = BlockOutputs::new();
+        outputs.insert(
+            0,
+            BlockOutput {
+                text: (1..=10).map(|i| format!("out{i}\n")).collect(),
+                exit: Some(0),
+                timed_out: false,
+            },
+        );
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, outputs);
+        for (src, needle) in [(1, "echo a"), (2, "echo b"), (3, "echo c"), (6, "after")] {
+            let built = built_line_for_source(&map, src).expect("mapped");
+            assert!(
+                line_text(&lines[built]).contains(needle),
+                "source line {src} should land on {needle:?}, got {:?}",
+                line_text(&lines[built])
+            );
+        }
+    }
+
+    #[test]
+    fn interpolation_is_exact_at_anchors_linear_between_and_clamped() {
+        let map = vec![(0, 0), (10, 20)];
+        assert_eq!(built_line_for_source(&map, 0), Some(0));
+        assert_eq!(built_line_for_source(&map, 5), Some(10));
+        assert_eq!(built_line_for_source(&map, 12), Some(22), "past the end");
+        assert_eq!(source_line_for_built(&map, 10), Some(5));
+        assert_eq!(built_line_for_source(&[], 3), None);
+    }
 
     fn render(text: &str) -> Vec<Line<'static>> {
         render_markdown(text, Theme::default(), &mut LangRegistry::new())
@@ -1489,6 +1756,12 @@ mod tests {
                 .contains(Modifier::CROSSED_OUT)
         );
         assert_eq!(span_with("code()").style.fg, Some(CODE));
+    }
+
+    #[test]
+    fn codeql_fences_resolve_by_name_and_extension() {
+        assert_eq!(lang_for_fence("codeql"), Some(LangKind::Ql));
+        assert_eq!(lang_for_fence("ql"), Some(LangKind::Ql));
     }
 
     /// #353: shell fences wear the play glyph and are recorded with their
@@ -2096,6 +2369,9 @@ mod preview_selection_tests {
             notebook: false,
             doc_path: None,
             media: false,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         }
     }
 

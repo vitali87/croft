@@ -61,24 +61,27 @@ impl PageLinks {
 /// text run and is not reported — the common case (hyperref/beamer URLs)
 /// is always text.
 pub fn page_links(pdf: &Path, page: u32) -> std::io::Result<PageLinks> {
-    which("pdftohtml")
+    let program = which("pdftohtml")
         .ok_or_else(|| std::io::Error::other("install poppler (pdftohtml) to open PDF links"))?;
     let p = page.to_string();
-    // .output(), never .status(): the child must not inherit croft's TTY
-    // (the pdftoppm trailer-dictionary spray, same class).
-    let out = Command::new("pdftohtml")
-        .args(["-xml", "-stdout", "-i", "-f", &p, "-l", &p])
-        .arg(pdf)
-        .output()?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    // Bounded: this runs on the UI thread from a click, and a wedged
+    // pdftohtml (a file pdflatex is still writing) would otherwise freeze
+    // the editor for as long as it hangs. The runner also keeps the child
+    // off croft's TTY.
+    let flags = ["-xml", "-stdout", "-i", "-f", &p, "-l", &p];
+    let args: Vec<&std::ffi::OsStr> = flags
+        .iter()
+        .map(std::ffi::OsStr::new)
+        .chain(std::iter::once(pdf.as_os_str()))
+        .collect();
+    let (status, out) = run_bounded_stdout(&program, &args, PDF_LINKS_BUDGET)
+        .ok_or_else(|| std::io::Error::other("pdftohtml did not finish in time"))?;
+    if !status.success() {
         return Err(std::io::Error::other(format!(
-            "pdftohtml exited with {}: {}",
-            out.status,
-            stderr.trim()
+            "pdftohtml exited with {status}"
         )));
     }
-    Ok(parse_pdf2xml_links(&String::from_utf8_lossy(&out.stdout), page).unwrap_or_default())
+    Ok(parse_pdf2xml_links(&out, page).unwrap_or_default())
 }
 
 /// Parse pdftohtml's `-xml` output, returning the links of `page` (matched
@@ -409,7 +412,22 @@ fn run_bounded_stdout(
         let _ = stdout.by_ref().take(MAX_PROBE_STDOUT).read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
+    let started = std::time::Instant::now();
     let out = rx.recv_timeout(budget).ok();
+    // Stdout reaching EOF does not mean the child has exited: it may still
+    // be tearing down, and killing it then reports SIGKILL for a run that
+    // succeeded. So it gets the rest of the budget to exit on its own.
+    if out.is_some() {
+        while started.elapsed() < budget {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return out.map(|b| (status, String::from_utf8_lossy(&b).into_owned()));
+                }
+                Ok(None) => std::thread::sleep(EXIT_POLL_TICK),
+                Err(_) => break,
+            }
+        }
+    }
     let _ = child.kill();
     // Reap either way: on the timeout path the kill needs collecting, and on
     // the success path the child has exited but is still a zombie.
@@ -426,6 +444,10 @@ const PDF_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 /// one still running after two seconds is wedged, not slow. Overrunning costs
 /// only the page count, and the viewer degrades to the single-page path.
 const PDF_INFO_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Deadline for one page's link extraction. pdftohtml parses a single page
+/// without rasterising, so this sits between the probe and render budgets.
+const PDF_LINKS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Cap on a page-count probe's stdout. `pdfinfo` prints a header block of a
 /// few hundred bytes and `mdls -raw` prints one number, so this is orders

@@ -1,7 +1,9 @@
 # croft web: a browser client for the session host
 
-Design RFC. Nothing here has shipped; this document exists to settle the
-protocol and the trust boundary before any listener code lands.
+Design RFC, now built. The WebSocket transport (#341), its token, TLS and
+listener lifecycle (#343), and the page (#342) have shipped. What shipped is
+described under [The transport](#the-transport), [The page](#the-page) and
+[Threat model](#threat-model), at the end.
 
 The session host already fans one inner croft out to N clients, enforces write
 control server-side, sizes everyone to the smallest window, and survives
@@ -240,3 +242,149 @@ not make.
 - IME, which needs a browser-side prototype rather than a reading of this tree.
 - Per-browser preventability of the contested chords above, which is platform
   behaviour and should be verified per browser rather than asserted here.
+
+## The transport
+
+`croft web [WORKSPACE] [--bind ADDR]` serves the running session of a
+workspace (the one `croft attach` started) over WebSocket. It is a bridge, not
+a second host: each WebSocket connection opens its own connection to the
+session host's Unix socket, so a browser tab is an ordinary participant. It
+has its own output queue, attaches read-only unless it is first or is granted
+control in `Session: Participants`, and leaves the roster when the tab closes,
+exactly as a terminal client that detaches.
+
+**Framing.** RFC 6455 over a hand-rolled HTTP/1.1 upgrade (`src/web/ws.rs`),
+no framework and no new crates. The host's frames map one to one:
+
+| Session host frame | WebSocket message |
+|---|---|
+| `Frame::Bytes` (PTY output, keystrokes) | binary |
+| `Frame::Control` (`hello`, `resize`, `presence`, ...) | text, the same `{"t": ...}` JSON |
+
+A client opens with a text `{"t":"hello","name":...,"cols":...,"rows":...}`,
+then sends keystrokes as binary messages and `resize` as text. A text message
+the host would not accept is dropped, as the host drops malformed control
+frames. Client frames must be masked; an unmasked frame, a message over 1 MiB,
+or non-UTF-8 text closes the connection.
+
+**Connecting.** Every connection presents the per-run token printed at
+start-up, as a WebSocket subprotocol: the client offers two, `croft` and
+`croft.token.<token>`, and the server selects `croft`. From a browser:
+
+```js
+new WebSocket("ws://127.0.0.1:7681/", ["croft", "croft.token." + token]);
+```
+
+A browser cannot set headers on a WebSocket, but subprotocols travel in the
+`Sec-WebSocket-Protocol` header, so the token never sits in a URL. The reply
+names only `croft`, never the token.
+
+**Options.**
+
+| | |
+|---|---|
+| `--bind ADDR` | Listen on `ADDR` instead of `127.0.0.1:7681`. A non-loopback address is served, with a warning on stderr naming the exposure (and, without `--tls`, that the token and the screen cross the network in plain text). |
+| `--tls CERT KEY` | Serve TLS (`wss://`) with a PEM certificate chain and private key. croft does not generate certificates. |
+| `--rotate-token` | Stop this workspace's listener and start one with a new token, on the same address unless `--bind` says otherwise. |
+| `--off` | Stop this workspace's listener. The session keeps running. |
+
+**Lifecycle.** A listener serves one workspace's session and exits when that
+session ends. It records its address beside the session socket
+(`<hash>.mux.sock.web`, mode 0600, never the token), so `croft ls` shows
+`web: ws://...` for an exposed session, and `--off` and `--rotate-token` find
+the listener to stop. A second `croft web` for the same workspace is refused
+while one is running. A record whose listener was killed is cleared the next
+time it is read.
+
+**Remote access.** The recommended way to reach a session from another
+machine is to leave `croft web` on loopback and put something in front of it:
+
+- Tailscale Serve, which terminates TLS with a real certificate and only
+  answers your tailnet: `tailscale serve --bg 7681`.
+- Caddy as a reverse proxy: `reverse_proxy 127.0.0.1:7681` in a site block.
+- A certificate from `mkcert` for `--tls`, when the browser is on the same
+  machine or you install mkcert's root on the other.
+
+## The page
+
+`croft web` prints `http://127.0.0.1:7681/#token=...`. Opening it loads a page
+the listener serves from the binary: `/`, `/term.js`, `/app.js` and
+`/icons.woff2`, about 65 KB together, with a Content-Security-Policy that
+allows the page's own scripts, `data:` images and a WebSocket back to the
+host it came from, and nothing else. The token sits in the fragment, which
+the browser never sends; the page moves it into memory and clears it from
+the address bar before connecting.
+
+**Rendering.** `term.js` is a terminal model written for what croft emits,
+not a general emulator: cursor addressing, SGR colour (16, 256, truecolor,
+and the colon forms) and attributes, erase and insert/delete, scroll
+regions, the alternate screen, the private modes croft sets, kitty keyboard
+flags (push, pop and the SET form croft re-asserts on every resize), and
+wide and combining characters. `app.js` paints its grid on a canvas.
+
+- **Icons.** `icons.woff2` holds the Nerd Font glyphs croft's source uses and
+  nothing else (150 glyphs, 21 KB). `scripts/web_icon_font.py` rebuilds it
+  from the Meslo Nerd Font; `scripts/tests/test_web_page.py` fails while an
+  icon in `src/` is missing from it.
+- **Images.** Kitty (`APC G`, chunked PNG, placements replaced by id, `a=d`
+  deletes) and iTerm2 (`OSC 1337;File=`) images become `<img>` elements over
+  the cells they cover, removed when those cells are written or the screen is
+  cleared. Sixel is not decoded.
+- **Queries.** DA1, cursor position, kitty flags, window and cell size, and
+  default colours are answered, so croft's probes get a reply. Only the
+  write-control holder's replies reach croft, as for any client.
+
+**Input.**
+
+- Keys: with kitty flags on, a key with Ctrl, Alt or Cmd is sent as
+  `CSI code;mods u`, so `Cmd+K` reaches croft as `CSI 107;9u` exactly as
+  from iTerm2 or Ghostty. Without them, the legacy encodings. Plain text goes
+  through a hidden textarea, so IME composition, dead keys and phone
+  keyboards send what they show. The chords a browser keeps for itself are
+  the ones listed under [Input](#input); `Cmd+K` and the palette reach
+  everything they would.
+- Mouse: SGR reports for the modes croft enables, including drags (pane
+  seams resize) and the wheel. Touch scrolling becomes wheel reports.
+- Paste: bracketed when croft asked for it.
+- Clipboard: croft's OSC 52 copies go to the system clipboard in a secure
+  context (HTTPS, or `localhost`); elsewhere the page says the copy was not
+  made.
+
+**Size.** The page sizes the grid to the window and sends `resize`; the
+host's smallest-window rule applies, so a small browser window shrinks the
+session for everyone attached, as a small terminal would.
+
+## Threat model
+
+What croft web defends against:
+
+- **Other local users.** The loopback port is open to every account on the
+  machine. The token (128 bits from the system RNG, printed once) is the
+  credential; the session socket behind it stays 0600.
+- **Other web pages.** WebSockets are not bound by CORS, so any page the user
+  has open can try to connect. A request with an `Origin` must match the
+  scheme and `Host` it arrived on; on a loopback listener the `Host` must also
+  be a loopback name, which closes DNS rebinding (a hostile name resolved to
+  127.0.0.1 agrees with its own `Host`, but not with loopback). The page also
+  lacks the token.
+- **Token leakage.** The token is not in any URL, so it stays out of history,
+  `Referer` and proxy logs, and it is not in the listener record. It is
+  compared in constant time.
+- **The network, with `--tls`.** Everything, the token included, is inside
+  TLS.
+
+What it does not do, deliberately:
+
+- **No accounts or per-user tokens.** Anyone with the token is one more
+  participant. Write control is still the host's, per participant: a new
+  connection is read-only unless it is the first or is granted control in
+  `Session: Participants`.
+- **No certificate generation or ACME.** Bring a certificate, or front the
+  listener with Tailscale or Caddy.
+- **No protection on a routable `--bind` without `--tls`.** croft serves it,
+  and warns that anyone on the path sees the token and the screen.
+- **No rate limiting.** 128 bits of token make guessing pointless; a flood
+  of connections is a denial of service croft does not try to stop.
+- **Nothing against the local account itself.** Whoever can read the
+  terminal croft web was started in has the token, as whoever owns the
+  account already owns the session socket.

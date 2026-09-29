@@ -17,6 +17,10 @@ pub const RUN_DEBUG_SRC_SVG: &[u8] = include_bytes!("../assets/icons/debug-alt.s
 pub const EXTENSIONS_SRC_SVG: &[u8] = include_bytes!("../assets/icons/extensions.svg");
 /// Codicon `beaker`, the Testing activity icon.
 pub const TESTING_SRC_SVG: &[u8] = include_bytes!("../assets/icons/beaker.svg");
+/// The QL mark (#578): the letters QL in a rounded square, croft's own
+/// drawing in the codicon outline style, for the CodeQL activity icon.
+#[allow(dead_code)] // baked once the activity bar gains the icon
+pub const CODEQL_SRC_SVG: &[u8] = include_bytes!("../assets/icons/ql.svg");
 /// Codicon `gear`, the bottom-anchored "Manage" button (Color Theme picker).
 pub const SETTINGS_GEAR_SRC_SVG: &[u8] = include_bytes!("../assets/icons/settings_gear.svg");
 /// VS Code's title-bar layout codicons for the Customize Layout toolbar.
@@ -1057,6 +1061,9 @@ pub const KITTY_ID_MARKDOWN: u32 = KITTY_ID_BASE + 26;
 /// slot table; one fixed id in croft's namespace keeps its placement
 /// distinct from the editor's own images should both share a terminal.
 pub const KITTY_ID_PLOT: u32 = KITTY_ID_BASE + 27;
+/// The CodeQL (QL) activity-bar icon (#578).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const KITTY_ID_CODEQL: u32 = KITTY_ID_BASE + 28;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it
@@ -1158,6 +1165,7 @@ mod tests {
             ("EXPLORER_BADGE", KITTY_ID_EXPLORER_BADGE),
             ("REMOTE_BADGE", KITTY_ID_REMOTE_BADGE),
             ("TESTING", KITTY_ID_TESTING),
+            ("CODEQL", KITTY_ID_CODEQL),
             ("TESTING_BADGE", KITTY_ID_TESTING_BADGE),
             ("PROBLEMS_BADGE", KITTY_ID_PROBLEMS_BADGE),
         ];

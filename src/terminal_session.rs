@@ -59,6 +59,12 @@ pub struct PaneRecord {
     /// still parses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transcript: Vec<String>,
+    /// The pane host holding the pane's shell (#694), when one does: a
+    /// croft that died without closing its panes left it running, and the
+    /// next one reattaches instead of starting a fresh shell. Omitted
+    /// otherwise, so an older store still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 /// How many trailing lines of a pane's output are carried across a restart.
@@ -88,7 +94,9 @@ impl SessionRecord {
     pub fn is_trivial(&self, root: &str) -> bool {
         match self.panes.as_slice() {
             [] => true,
-            [only] => only.name.is_none() && same_dir(&only.cwd, root),
+            // A hosted pane is never trivial: its record is how a croft
+            // that crashes finds the shell again (#694).
+            [only] => only.name.is_none() && only.host.is_none() && same_dir(&only.cwd, root),
             _ => false,
         }
     }
@@ -162,6 +170,7 @@ mod tests {
         std::fs::write(&store, "{ not valid json").unwrap();
         let record = SessionRecord {
             panes: vec![PaneRecord {
+                host: None,
                 cwd: String::from("/w/a/sub"),
                 name: Some(String::from("srv")),
                 transcript: Vec::new(),
@@ -201,12 +210,14 @@ mod tests {
         let rec = SessionRecord {
             panes: vec![
                 PaneRecord {
+                    host: None,
                     cwd: String::from("/work/repo"),
                     name: None,
                     transcript: Vec::new(),
                     lane: None,
                 },
                 PaneRecord {
+                    host: None,
                     cwd: String::from("/work/repo-fix-login"),
                     name: Some(String::from("Lane: fix-login")),
                     transcript: Vec::new(),
@@ -237,12 +248,14 @@ mod tests {
         let rec = SessionRecord {
             panes: vec![
                 PaneRecord {
+                    host: None,
                     cwd: String::from("/repo"),
                     name: None,
                     transcript: Vec::new(),
                     lane: None,
                 },
                 PaneRecord {
+                    host: None,
                     cwd: String::from("/repo/sub"),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
@@ -261,6 +274,7 @@ mod tests {
             "/repo",
             SessionRecord {
                 panes: vec![PaneRecord {
+                    host: None,
                     cwd: String::from("/repo"),
                     name: None,
                     transcript: Vec::new(),

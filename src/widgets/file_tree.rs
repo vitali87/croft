@@ -38,6 +38,13 @@ pub struct FileTree {
     /// in the set — or under a dir in the set — render their name in the
     /// theme's dimmed foreground, VS Code's ignored-resource decoration.
     pub ignored: Arc<HashSet<PathBuf>>,
+    /// While the history scrubber sits on a commit (#371): the directory
+    /// the listing covers and every path in that commit's tree under it,
+    /// absolute, folders included. A row under that directory and absent
+    /// from it (submodule contents count as present) did not exist there,
+    /// and its name takes the same dimmed foreground as an ignored one.
+    /// `None` everywhere else, including at the working tree.
+    pub scrub_tree: Option<(PathBuf, Arc<crate::git::CommitTree>)>,
     /// Workspace files an agent changed and the user has not reviewed
     /// (#345), absolute. Rows in this set take a TRAILING dot in the theme's
     /// yellow; it clears when the file is marked reviewed.
@@ -48,13 +55,19 @@ pub struct FileTree {
     /// Membership is EXACT, unlike `ignored`, which covers a directory's
     /// descendants. A directory is not something an agent wrote and not
     /// something "mark reviewed" can clear, so a dot on one would be a mark
-    /// no gesture removes. Fed from `AgentLedger` on the app's sync.
+    /// no gesture removes. A collapsed folder's dimmer rollup dot is derived
+    /// from this set at paint time instead (see
+    /// [`Self::hides_agent_touched`]). Fed from `AgentLedger` on the app's
+    /// sync.
     pub agent_touched: Arc<HashSet<PathBuf>>,
     /// Text painted after a ROOT row's name (#348): a worktree lane's
     /// branch and the badge of the agent seated in its pane, keyed by the
     /// root path. Swapped in by the app whenever a lane or a seat changes;
     /// a root with no entry paints as before.
     pub root_badges: Arc<HashMap<PathBuf, String>>,
+    /// Unresolved sticky notes per file (#367), painted as a count after
+    /// the name.
+    pub note_counts: Arc<HashMap<PathBuf, usize>>,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -111,7 +124,9 @@ impl FileTree {
             focus_gradient: false,
             theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
+            scrub_tree: None,
             agent_touched: Arc::default(),
+            note_counts: Arc::default(),
             root_badges: Arc::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
@@ -151,6 +166,7 @@ impl FileTree {
         // The old workspace's ignore set is meaningless under the new root;
         // the git worker re-queries after its SetRoot and repopulates.
         self.ignored = Arc::default();
+        self.scrub_tree = None;
         // Same reasoning for the lane badges (#348): keyed by absolute root
         // path, so a re-root would otherwise carry the old roots' entries
         // until the next sync rebuilt them.
@@ -269,11 +285,37 @@ impl FileTree {
         }
     }
 
+    /// True when the scrubber sits on a commit whose tree lacks `path`
+    /// (#371). Only paths strictly under the listed directory count: the
+    /// root row itself, and rows of another workspace root the listing
+    /// never covered, keep their colour.
+    pub fn is_absent_at_scrub(&self, path: &Path) -> bool {
+        let Some((base, present)) = self.scrub_tree.as_ref() else {
+            return false;
+        };
+        path != base && path.starts_with(base) && !present.contains(path)
+    }
+
     /// Whether `path` is a file an agent changed that is still unreviewed.
     ///
     /// Exact membership, deliberately: see [`Self::agent_touched`].
     pub fn is_agent_touched(&self, path: &Path) -> bool {
         !self.agent_touched.is_empty() && self.agent_touched.contains(path)
+    }
+
+    /// Whether a collapsed folder at `dir` hides a file an agent changed and
+    /// the user has not reviewed (#345), for its dimmer rollup dot.
+    ///
+    /// Derived at paint time from [`Self::agent_touched`], never stored: the
+    /// dot clears by itself when the last file under it is reviewed, which
+    /// is what keeps it from being the mark no gesture removes that the
+    /// field's exact membership guards against.
+    pub fn hides_agent_touched(&self, dir: &Path) -> bool {
+        !self.agent_touched.is_empty()
+            && self
+                .agent_touched
+                .iter()
+                .any(|p| p != dir && p.starts_with(dir))
     }
 
     /// Map a screen y coordinate to a node index, if any. Screen rows map
@@ -1116,21 +1158,62 @@ mod android_trash {
 /// (same name) returns Ok with the original path unchanged so the user
 /// can hit Enter on the prompt without typing.
 pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
+    let target = rename_target(parent, old_path, new_name)?;
+    if target != old_path {
+        std::fs::rename(old_path, &target)?;
+    }
+    Ok(target)
+}
+
+/// Whether renaming `old_path` to `new_name` in `parent` only respells the
+/// same entry on a case-insensitive volume (macOS by default), where
+/// `README.md` "exists" while `readme.md` is renamed to it. True only when
+/// the directory does not list `new_name` as an entry of its own (so a
+/// separate file, or a hard link to the same file, is still a clash) and
+/// the name resolves to the entry being renamed.
+fn is_case_only_respelling(parent: &Path, old_path: &Path, new_name: &str) -> bool {
+    let listed = std::fs::read_dir(parent).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
+    });
+    if listed {
+        return false;
+    }
+    let target = parent.join(new_name);
+    match (
+        std::fs::symlink_metadata(&target),
+        std::fs::symlink_metadata(old_path),
+    ) {
+        #[cfg(unix)]
+        (Ok(a), Ok(b)) => {
+            use std::os::unix::fs::MetadataExt;
+            a.dev() == b.dev() && a.ino() == b.ino()
+        }
+        // No inode to compare: a name the directory does not list that
+        // still resolves can only be the same entry respelled.
+        #[cfg(not(unix))]
+        (Ok(_), Ok(_)) => true,
+        _ => false,
+    }
+}
+
+/// Where [`rename_in`] would put `old_path`, with the same validation and
+/// without touching the disk, so a caller can ask language servers about
+/// the rename before it happens (#610).
+pub fn rename_target(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
     let trimmed = new_name.trim();
     if let Err(msg) = validate_new_name(trimmed) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     }
     let target = parent.join(trimmed);
-    if target == old_path {
-        return Ok(target);
-    }
-    if target.exists() {
+    if target != old_path && target.exists() && !is_case_only_respelling(parent, old_path, trimmed)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("{} already exists", target.display()),
         ));
     }
-    std::fs::rename(old_path, &target)?;
     Ok(target)
 }
 
@@ -1521,7 +1604,7 @@ impl Widget for &mut FileTree {
 
             // Git-ignored rows dim the *name* only — icons keep their color,
             // matching VS Code's ignored-resource decoration.
-            let name_fg = if self.is_ignored(&node.path) {
+            let name_fg = if self.is_ignored(&node.path) || self.is_absent_at_scrub(&node.path) {
                 self.theme.ignored_fg()
             } else {
                 self.theme.ui(Color::White)
@@ -1548,6 +1631,16 @@ impl Widget for &mut FileTree {
                 ));
                 let base = Style::default().fg(name_fg).add_modifier(Modifier::BOLD);
                 push_name_spans(&mut spans, &name, &query, base, self.theme);
+                // A collapsed folder hiding an unreviewed agent write shows a
+                // dimmer copy of the file dot (#345), so the lane's changes
+                // stay findable without expanding every folder. Only while
+                // collapsed: expanded, the file's own dot is on screen.
+                if !node.expanded && self.hides_agent_touched(&node.path) {
+                    spans.push(Span::styled(
+                        format!(" {AGENT_DOT}"),
+                        Style::default().fg(self.theme.ui(Color::Gray)),
+                    ));
+                }
                 // A lane root wears its branch and its agent after the name
                 // (#348), dim so the folder name stays the thing the eye
                 // lands on; trailing for the same reason as the agent dot.
@@ -1589,6 +1682,12 @@ impl Widget for &mut FileTree {
                     spans.push(Span::styled(
                         format!(" {AGENT_DOT}"),
                         Style::default().fg(self.theme.ui(Color::Yellow)),
+                    ));
+                }
+                if let Some(n) = self.note_counts.get(&node.path) {
+                    spans.push(Span::styled(
+                        format!(" \u{270e}{n}"),
+                        Style::default().fg(self.theme.ui(Color::Gray)),
                     ));
                 }
             }
@@ -1712,7 +1811,8 @@ impl Widget for &mut FileTree {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| node.path.display().to_string());
-                let name_fg = if self.is_ignored(&node.path) {
+                let name_fg = if self.is_ignored(&node.path) || self.is_absent_at_scrub(&node.path)
+                {
                     self.theme.ignored_fg()
                 } else {
                     self.theme.ui(Color::White)
@@ -2409,6 +2509,53 @@ mod tests {
         assert!(!tree.is_agent_touched(&root.join("src/main.rs")));
     }
 
+    /// #345: a collapsed folder with an unreviewed agent write anywhere
+    /// under it takes the dimmer rollup dot; expanded it does not (the
+    /// file's own dot shows), and it clears once the write is reviewed.
+    #[test]
+    fn a_collapsed_folder_rolls_up_an_unreviewed_agent_write() {
+        let (_tmp, mut tree) = fixture();
+        let root = tree.root.clone();
+        let src = root.join("src");
+        let row = |tree: &mut FileTree, name: &str| -> String {
+            let area = Rect::new(0, 0, 40, 12);
+            let mut buf = Buffer::empty(area);
+            tree.render(area, &mut buf);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .find(|l| l.contains(name))
+                .unwrap_or_default()
+        };
+        tree.agent_touched =
+            std::sync::Arc::new(std::collections::HashSet::from([src.join("lib.rs")]));
+        assert!(tree.hides_agent_touched(&src));
+        assert!(tree.hides_agent_touched(&root), "any depth rolls up");
+        assert!(
+            !tree.hides_agent_touched(&src.join("lib.rs")),
+            "not the file itself"
+        );
+        let dir_idx = tree.nodes.iter().position(|n| n.path == src).unwrap();
+        assert!(!tree.nodes[dir_idx].expanded);
+        assert!(
+            row(&mut tree, "src").contains(AGENT_DOT),
+            "{:?}",
+            row(&mut tree, "src")
+        );
+        // Expanded: the folder drops its dot; the file shows its own.
+        tree.selected = dir_idx;
+        tree.expand_selected();
+        let expanded = row(&mut tree, "src");
+        assert!(!expanded.contains(AGENT_DOT), "{expanded:?}");
+        assert!(row(&mut tree, "lib.rs").contains(AGENT_DOT));
+        // Reviewed: nothing left to roll up.
+        tree.agent_touched = std::sync::Arc::new(std::collections::HashSet::new());
+        assert!(!tree.hides_agent_touched(&src));
+    }
+
     #[test]
     fn is_ignored_covers_set_members_and_their_descendants() {
         let (_tmp, mut tree) = fixture();
@@ -2473,6 +2620,69 @@ mod tests {
             Color::White,
             "non-ignored names keep the normal foreground"
         );
+    }
+
+    /// #371: while scrubbing, a row absent from the commit's tree dims its
+    /// name; present files and folders, the root row, and another root the
+    /// listing never covered keep the normal foreground.
+    #[test]
+    fn rows_missing_from_the_scrubbed_commit_render_dimmed() {
+        let (_tmp, second, mut tree) = two_root_fixture();
+        let root = tree.root.clone();
+        tree.scrub_tree = Some((
+            root.clone(),
+            std::sync::Arc::new(crate::git::CommitTree {
+                paths: std::collections::HashSet::from([
+                    root.join("src"),
+                    root.join("src/lib.rs"),
+                    root.join("README.md"),
+                ]),
+                submodules: Vec::new(),
+            }),
+        ));
+        assert!(tree.is_absent_at_scrub(&root.join("main.rs")));
+        assert!(!tree.is_absent_at_scrub(&root.join("README.md")));
+        assert!(!tree.is_absent_at_scrub(&root), "the root row stays");
+        assert!(!tree.is_absent_at_scrub(&second.path().join("Cargo.toml")));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let dim = tree.theme.ignored_fg();
+        let row_fg = |needle: &str| {
+            for y in 0..area.height {
+                let cells: Vec<String> = (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                let joined = cells.concat();
+                let Some(target) = joined.find(needle) else {
+                    continue;
+                };
+                let mut acc = 0usize;
+                for (x, s) in cells.iter().enumerate() {
+                    if acc == target {
+                        return buf[(x as u16, y)].fg;
+                    }
+                    acc += s.len();
+                }
+            }
+            panic!("{needle} not on screen");
+        };
+        assert_eq!(row_fg("main.rs"), dim, "absent at the commit: dimmed");
+        assert_eq!(row_fg("README.md"), Color::White, "present: normal");
+        assert_eq!(row_fg("src"), Color::White, "a present folder: normal");
+        assert_eq!(
+            row_fg("Cargo.toml"),
+            Color::White,
+            "another root is outside the listing"
+        );
+        // The working tree: nothing dims.
+        tree.scrub_tree = None;
+        assert!(!tree.is_absent_at_scrub(&root.join("main.rs")));
     }
 
     #[test]
@@ -2989,6 +3199,26 @@ mod tests {
         // Both originals must still exist intact.
         assert!(a.exists());
         assert!(b.exists());
+    }
+
+    #[test]
+    fn a_hard_link_under_the_new_name_is_still_a_clash() {
+        // A second directory entry for the same file is a separate name:
+        // renaming onto it would succeed without moving anything.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("readme.md");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::hard_link(&a, tmp.path().join("README.md")).unwrap();
+        for err in [
+            rename_target(tmp.path(), &a, "README.md").unwrap_err(),
+            rename_in(tmp.path(), &a, "README.md").unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        assert!(a.exists());
+        // On a case-sensitive volume a name nothing answers to is no
+        // respelling of anything.
+        assert!(!is_case_only_respelling(tmp.path(), &a, "Readme.md"));
     }
 
     #[test]

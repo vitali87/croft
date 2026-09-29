@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod config;
+pub mod file_ops;
 pub mod install;
 pub mod languages;
 pub mod log_file;

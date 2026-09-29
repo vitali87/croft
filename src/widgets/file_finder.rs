@@ -83,7 +83,6 @@ impl FileFinder {
         me
     }
 
-    #[cfg(test)]
     pub fn set_query(&mut self, q: &str) {
         if q == self.query {
             return;
@@ -484,32 +483,31 @@ pub fn fuzzy_score(needle: &str, hay_lower: &str, filename_start: usize) -> Opti
     if needle.is_empty() {
         return Some(0);
     }
-    let needle_bytes = needle.as_bytes();
-    let hay_bytes = hay_lower.as_bytes();
+    // Chars, not bytes: comparing UTF-8 bytes let the pieces of two
+    // different characters combine into a match (`é` found inside `ã©`),
+    // which translated command titles and non-ASCII names hit. Offsets stay
+    // byte offsets, which is what `filename_start` counts.
+    let mut needle_chars = needle.chars().peekable();
     let mut score: i32 = 0;
     let mut consecutive: i32 = 0;
-    let mut needle_idx = 0usize;
     let mut prev_match: Option<usize> = None;
-    for (i, &b) in hay_bytes.iter().enumerate() {
-        if needle_idx >= needle_bytes.len() {
+    let mut prev: Option<(usize, char)> = None;
+    for (i, c) in hay_lower.char_indices() {
+        let Some(&want) = needle_chars.peek() else {
             break;
-        }
-        if b == needle_bytes[needle_idx] {
+        };
+        if c == want {
             let mut bonus: i32 = 1;
             if i >= filename_start {
                 bonus += 4;
             }
-            let prev_byte = if i == 0 { None } else { Some(hay_bytes[i - 1]) };
             let at_word_boundary = i == 0
                 || i == filename_start
-                || matches!(
-                    prev_byte,
-                    Some(b'/') | Some(b'_') | Some(b'-') | Some(b'.') | Some(b' ')
-                );
+                || matches!(prev, Some((_, '/' | '_' | '-' | '.' | ' ')));
             if at_word_boundary {
                 bonus += 5;
             }
-            if prev_match == Some(i.saturating_sub(1)) && i > 0 {
+            if prev_match.is_some() && prev_match == prev.map(|(p, _)| p) {
                 consecutive += 1;
                 bonus += consecutive * 5;
             } else {
@@ -521,11 +519,12 @@ pub fn fuzzy_score(needle: &str, hay_lower: &str, filename_start: usize) -> Opti
             }
             score += bonus;
             prev_match = Some(i);
-            needle_idx += 1;
+            needle_chars.next();
         }
+        prev = Some((i, c));
     }
-    if needle_idx == needle_bytes.len() {
-        Some(score - (hay_bytes.len() as i32 / 4))
+    if needle_chars.peek().is_none() {
+        Some(score - (hay_lower.len() as i32 / 4))
     } else {
         None
     }
@@ -878,9 +877,9 @@ pub fn render_file_finder(
     center: bool,
 ) {
     let width = area.width.saturating_mul(7) / 10;
-    let width = width.clamp(40, 100.min(area.width));
+    let width = width.clamp(40, 100).min(area.width);
     let height = area.height.saturating_mul(6) / 10;
-    let height = height.clamp(10, area.height);
+    let height = height.max(10).min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     // Quick Input Position: Top anchors in the upper third (VS Code's
     // default); Center pins it to the vertical middle.
@@ -1061,6 +1060,12 @@ fn split_dir_file(rel: &str, filename_start: usize) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzzy_matching_compares_characters_not_bytes() {
+        assert_eq!(fuzzy_score("é", "ã©", 0), None);
+        assert!(fuzzy_score("é", "café", 0).is_some());
+    }
 
     /// The click hit-test starts three rows below the popup top (border,
     /// prompt, separator), scrolls with the list, refuses the bottom border

@@ -54,17 +54,25 @@ impl FrameDecoder {
     /// Pop the next complete message, or `None` if one isn't fully buffered yet.
     /// Call in a loop after each [`feed`](Self::feed) until it returns `None`.
     pub fn next_message(&mut self) -> Option<Value> {
-        let sep = find_subslice(&self.buf, HEADER_SEP)?;
-        let header = std::str::from_utf8(&self.buf[..sep]).ok()?;
-        let len = content_length(header)?;
-        let body_start = sep + HEADER_SEP.len();
-        let body_end = body_start + len;
-        if self.buf.len() < body_end {
-            return None; // body not fully arrived yet
+        // A complete frame whose body does not parse is skipped, not
+        // returned as `None`: the reader stops at the first `None`, and the
+        // good frames already buffered behind a bad one (a `stopped` event)
+        // would wait for bytes the adapter never sends.
+        loop {
+            let sep = find_subslice(&self.buf, HEADER_SEP)?;
+            let header = std::str::from_utf8(&self.buf[..sep]).ok()?;
+            let len = content_length(header)?;
+            let body_start = sep + HEADER_SEP.len();
+            let body_end = body_start + len;
+            if self.buf.len() < body_end {
+                return None; // body not fully arrived yet
+            }
+            let value = serde_json::from_slice(&self.buf[body_start..body_end]).ok();
+            self.buf.drain(..body_end);
+            if value.is_some() {
+                return value;
+            }
         }
-        let value = serde_json::from_slice(&self.buf[body_start..body_end]).ok();
-        self.buf.drain(..body_end);
-        value
     }
 }
 
@@ -399,6 +407,16 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(declared, body.len());
+    }
+
+    #[test]
+    fn a_malformed_frame_does_not_strand_the_frames_behind_it() {
+        let mut d = FrameDecoder::new();
+        let mut bytes = b"Content-Length: 5\r\n\r\n{bad}".to_vec();
+        bytes.extend(encode(&json!({"type": "event", "event": "stopped"})));
+        d.feed(&bytes);
+        assert_eq!(d.next_message().unwrap()["event"], "stopped");
+        assert!(d.next_message().is_none());
     }
 
     #[test]

@@ -94,7 +94,7 @@ pub const TABLE: &[Mapping] = &[
         vscode: "golang.go",
         croft: "lsp-go",
         status: Status::Builtin,
-        note: "gopls ships built in; Go debugging is tracked in #264",
+        note: "gopls, delve debugging and the go test runner ship built in",
     },
     Mapping {
         vscode: "ms-vscode.cpptools",

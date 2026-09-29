@@ -19,6 +19,12 @@ use ratatui::{
 /// Why the picker is open, so the App dispatches the right git op on Enter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListPurpose {
+    /// Source Control: Review Pull Request (#365): the open PRs, `id` the
+    /// PR's URL, or [`PR_BY_NUMBER`] for the typed-number prompt.
+    ReviewPullRequest,
+    /// Agents: Review a Changed File (#345): the agent lanes' files, `id`
+    /// an index into the App's pending lane picks.
+    AgentLaneFile,
     StashApply,
     StashPop,
     StashDrop,
@@ -45,10 +51,28 @@ pub enum ListPurpose {
     /// compounds, or a bare index into its discovered-config list. Compounds
     /// carry their own id prefix so the two index spaces cannot collide.
     DebugConfig,
+    /// Debug: Add Configuration… (#250), first step: the adapter, `id` a
+    /// type from `dap::configs::DRAFT_TYPES`.
+    DebugConfigType,
+    /// Second step: `id` is `launch` or `attach`.
+    DebugConfigRequest,
     /// The searchable Settings hub (Preferences: Open Settings). Rows toggle a
     /// boolean setting (`id` = `toggle:<field>`) or run a follow-up command
     /// (`id` = `cmd:<command_id>`, e.g. open a JSON file or the theme picker).
     Settings,
+    /// Preferences: Open Keyboard Shortcuts (#612): one row per command,
+    /// `id` = `kb:<command id>`; choosing one records its new chord.
+    KeyboardShortcuts,
+    /// Profiles: Switch Profile (#618). `id` is `profile:<name>`,
+    /// `profile:` for the default, or an action (`new`, `workspace`,
+    /// `workspace-clear`).
+    Profiles,
+    /// Review: Submit Review (#366): the verdict, `id` = `COMMENT`,
+    /// `APPROVE` or `REQUEST_CHANGES`.
+    ReviewVerdict,
+    /// Source Control: Export Comments to Pull Request (#368): a `post` row,
+    /// then one row per comment to be posted.
+    ExportComments,
     /// Multiplayer session roster (Session: Participants): the rows are the
     /// clients attached to this session's host; `id` is the participant id.
     /// Enter opens the per-participant action picker.
@@ -56,7 +80,19 @@ pub enum ListPurpose {
     /// Action on one participant: `id` is `grant:<id>` / `revoke:<id>` /
     /// `kick:<id>`, applied through the session host's control channel.
     SessionParticipantAction,
+    /// `"processId": "${command:pickProcess}"` (#250): the rows are the
+    /// user's processes; `id` is the pid the parked attach launches against.
+    AttachProcess,
+    /// GitHub code scanning (#577): the rows are the repository's recent
+    /// analyses; `id` is the analysis id, opened as a SARIF log.
+    CodeScanningAnalysis,
+    /// Why a code scanning alert is dismissed: `id` is `<alert>:<reason>`,
+    /// the reason an index into `DismissReason::ALL`.
+    DismissAlert,
 }
+
+/// The Review Pull Request row that asks for a number or URL instead.
+pub const PR_BY_NUMBER: &str = "#by-number";
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a
 /// remote/tag name) and the `label` shown.
@@ -183,8 +219,12 @@ pub fn render_list_picker(
     buf: &mut Buffer,
     theme: crate::theme::Theme,
 ) {
-    let width = (screen.width.saturating_mul(6) / 10).clamp(36, 96.min(screen.width));
-    let height = (screen.height.saturating_mul(6) / 10).clamp(8, screen.height);
+    let width = (screen.width.saturating_mul(6) / 10)
+        .clamp(36, 96)
+        .min(screen.width);
+    let height = (screen.height.saturating_mul(6) / 10)
+        .max(8)
+        .min(screen.height);
     let rect = Rect {
         x: screen.x + (screen.width.saturating_sub(width)) / 2,
         y: screen.y + (screen.height.saturating_sub(height)) / 4,

@@ -55,6 +55,14 @@ pub enum Event {
     // TODO(#344): construct this from the agent-lane sampler and drop the allow.
     #[allow(dead_code)]
     AgentWaiting { pane: String },
+    /// An agent proposed an edit that waits for approval (#359). `token` is
+    /// the proposal's one-time secret: the notification's Approve and Deny
+    /// carry it, and it answers that proposal once.
+    ApprovalPending {
+        agent: String,
+        file: String,
+        token: String,
+    },
 }
 
 impl Event {
@@ -65,6 +73,7 @@ impl Event {
             Event::TestsFailed { .. } => "tests_failed",
             Event::Osc9 { .. } => "osc9",
             Event::AgentWaiting { .. } => "agent_waiting",
+            Event::ApprovalPending { .. } => "approval_pending",
         }
     }
 }
@@ -78,6 +87,16 @@ pub struct Notification {
     pub workspace: String,
     pub host: String,
     /// `croft://attach?host=…&path=…`, for a phone-side consumer.
+    pub link: String,
+    /// Buttons a sink that has them shows beside the notification, each a
+    /// `croft://` link: Approve and Deny for a pending edit (#359).
+    pub actions: Vec<Action>,
+}
+
+/// One notification button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Action {
+    pub label: &'static str,
     pub link: String,
 }
 
@@ -125,8 +144,29 @@ impl Notification {
             }
             Event::Osc9 { pane, message } => format!("{pane}: {message}"),
             Event::AgentWaiting { pane } => format!("Agent in {pane} is waiting for input"),
+            Event::ApprovalPending { agent, file, .. } => {
+                format!("{agent} wants to edit {file}")
+            }
         };
         let path = workspace.display().to_string();
+        let target = format!("host={}&path={}", encode(host), encode(&path));
+        let actions = match event {
+            Event::ApprovalPending { token, .. } => ["allow", "deny"]
+                .into_iter()
+                .map(|decision| Action {
+                    label: if decision == "allow" {
+                        "Approve"
+                    } else {
+                        "Deny"
+                    },
+                    link: format!(
+                        "croft://decide?{target}&token={}&decision={decision}",
+                        encode(token)
+                    ),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         Self {
             event: event.kind(),
             title: format!("croft \u{b7} {name}"),
@@ -134,10 +174,15 @@ impl Notification {
             workspace: path.clone(),
             host: host.to_string(),
             link: format!(
-                "croft://attach?host={}&path={}",
-                encode(host),
-                encode(&path)
+                "croft://attach?{target}{}",
+                match event {
+                    Event::TestsFailed { .. } => "",
+                    Event::ApprovalPending { .. } => "&focus=approval",
+                    // What waits is in a terminal: land there.
+                    _ => "&focus=terminal",
+                }
             ),
+            actions,
         }
     }
 }
@@ -225,11 +270,26 @@ pub fn ntfy_request(sink: &NotificationSink, n: &Notification) -> Option<Request
     }
     Some(Request {
         url: format!("{server}/{topic}"),
-        headers: vec![
-            (String::from("Title"), n.title.clone()),
-            (String::from("Click"), n.link.clone()),
-            (String::from("Tags"), n.event.replace('_', "-")),
-        ],
+        headers: {
+            let mut h = vec![
+                (String::from("Title"), n.title.clone()),
+                (String::from("Click"), n.link.clone()),
+                (String::from("Tags"), n.event.replace('_', "-")),
+            ];
+            // ntfy's action buttons: each opens its link and clears the
+            // notification, since a proposal is answered once.
+            if !n.actions.is_empty() {
+                h.push((
+                    String::from("Actions"),
+                    n.actions
+                        .iter()
+                        .map(|a| format!("view, {}, {}, clear=true", a.label, a.link))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ));
+            }
+            h
+        },
         body: n.body.clone(),
     })
 }
@@ -248,6 +308,11 @@ pub fn webhook_request(sink: &NotificationSink, n: &Notification) -> Option<Requ
         "workspace": n.workspace,
         "host": n.host,
         "link": n.link,
+        "actions": n
+            .actions
+            .iter()
+            .map(|a| serde_json::json!({"label": a.label, "link": a.link}))
+            .collect::<Vec<_>>(),
     });
     let mut headers = vec![(
         String::from("content-type"),
@@ -267,13 +332,28 @@ pub fn webhook_request(sink: &NotificationSink, n: &Notification) -> Option<Requ
 /// escaping and does not show in `ps`.
 pub fn command_argv(sink: &NotificationSink, n: &Notification) -> Option<Vec<String>> {
     match sink.kind.as_str() {
-        "termux" => Some(vec![
-            String::from("termux-notification"),
-            String::from("--title"),
-            n.title.clone(),
-            String::from("--content"),
-            n.body.clone(),
-        ]),
+        "termux" => {
+            let mut argv = vec![
+                String::from("termux-notification"),
+                String::from("--title"),
+                n.title.clone(),
+                String::from("--content"),
+                n.body.clone(),
+            ];
+            // Termux runs an action as a shell command; the links are
+            // croft's own percent-encoding, which leaves no quote in them.
+            if !n.actions.is_empty() {
+                argv.push(String::from("--action"));
+                argv.push(format!("croft open-link '{}'", n.link));
+            }
+            for (i, a) in n.actions.iter().enumerate().take(3) {
+                argv.push(format!("--button{}", i + 1));
+                argv.push(a.label.to_string());
+                argv.push(format!("--button{}-action", i + 1));
+                argv.push(format!("croft open-link '{}'", a.link));
+            }
+            Some(argv)
+        }
         "command" if !sink.argv.is_empty() => Some(sink.argv.clone()),
         _ => None,
     }
@@ -349,6 +429,12 @@ pub fn deliver(sink: &NotificationSink, n: &Notification) -> Result<(), Failure>
                 .env("CROFT_BODY", &n.body)
                 .env("CROFT_LINK", &n.link)
                 .env("CROFT_EVENT", n.event)
+                .envs(n.actions.iter().map(|a| {
+                    (
+                        format!("CROFT_{}_LINK", a.label.to_ascii_uppercase()),
+                        a.link.clone(),
+                    )
+                }))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped());
@@ -639,7 +725,7 @@ mod tests {
         assert_eq!(n.host, "box.local");
         assert_eq!(
             n.link,
-            "croft://attach?host=box.local&path=/home/t/my%20proj"
+            "croft://attach?host=box.local&path=/home/t/my%20proj&focus=terminal"
         );
         let n = Notification::new(
             &Event::TestsFailed {
@@ -720,6 +806,101 @@ mod tests {
         assert_eq!(v["event"], "command_finished");
         assert_eq!(v["link"], n.link);
         assert_eq!(v["body"], n.body);
+    }
+
+    fn approval() -> Event {
+        Event::ApprovalPending {
+            agent: "claude-code".into(),
+            file: "src/a b.rs".into(),
+            token: "0123456789abcdef0123456789abcdef".into(),
+        }
+    }
+
+    #[test]
+    fn an_approval_notification_carries_approve_and_deny_links_that_parse_back() {
+        let n = Notification::new(&approval(), Path::new("/srv/my app"), "devbox");
+        assert_eq!(n.event, "approval_pending");
+        assert_eq!(n.body, "claude-code wants to edit src/a b.rs");
+        // Tapping the notification lands on the popup.
+        let open = crate::deep_link::parse(&n.link).unwrap();
+        assert_eq!(open.focus, Some(crate::deep_link::Focus::Approval));
+        assert_eq!(open.decide, None);
+        let labels: Vec<_> = n.actions.iter().map(|a| a.label).collect();
+        assert_eq!(labels, ["Approve", "Deny"]);
+        for (action, allow) in n.actions.iter().zip([true, false]) {
+            let l = crate::deep_link::parse(&action.link).unwrap();
+            assert_eq!(l.host.as_deref(), Some("devbox"));
+            assert_eq!(l.path.as_deref(), Some("/srv/my app"));
+            assert_eq!(
+                l.decide,
+                Some(crate::deep_link::Decide {
+                    token: "0123456789abcdef0123456789abcdef".into(),
+                    allow,
+                })
+            );
+        }
+        // Nothing else grows buttons.
+        assert!(
+            Notification::new(&finished(30), Path::new("/w"), "h")
+                .actions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn every_sink_kind_offers_the_approval_buttons() {
+        let n = Notification::new(&approval(), Path::new("/w"), "h");
+        let (approve, deny) = (&n.actions[0].link, &n.actions[1].link);
+
+        let mut s = sink("ntfy");
+        s.topic = Some("t".into());
+        let actions = ntfy_request(&s, &n)
+            .unwrap()
+            .headers
+            .into_iter()
+            .find(|(k, _)| k == "Actions")
+            .map(|(_, v)| v)
+            .expect("an Actions header");
+        assert_eq!(
+            actions,
+            format!("view, Approve, {approve}, clear=true; view, Deny, {deny}, clear=true")
+        );
+        let plain = Notification::new(&finished(30), Path::new("/w"), "h");
+        assert!(
+            !ntfy_request(&s, &plain)
+                .unwrap()
+                .headers
+                .iter()
+                .any(|(k, _)| k == "Actions")
+        );
+
+        let mut w = sink("webhook");
+        w.url = Some("https://hooks.example.org/x".into());
+        let body: serde_json::Value =
+            serde_json::from_str(&webhook_request(&w, &n).unwrap().body).unwrap();
+        assert_eq!(body["actions"][0]["label"], "Approve");
+        assert_eq!(body["actions"][1]["link"], deny.as_str());
+
+        let t = command_argv(&sink("termux"), &n).unwrap();
+        let after = |flag: &str| {
+            let i = t.iter().position(|a| a == flag).expect(flag);
+            t[i + 1].clone()
+        };
+        assert_eq!(after("--action"), format!("croft open-link '{}'", n.link));
+        assert_eq!(after("--button1"), "Approve");
+        assert_eq!(
+            after("--button1-action"),
+            format!("croft open-link '{approve}'")
+        );
+        assert_eq!(after("--button2"), "Deny");
+        assert_eq!(
+            after("--button2-action"),
+            format!("croft open-link '{deny}'")
+        );
+        // The links are single-quoted for Termux's shell: none may hold a
+        // quote of its own.
+        assert!(n.actions.iter().all(|a| !a.link.contains('\'')));
+        assert!(!n.link.contains('\''));
     }
 
     #[test]

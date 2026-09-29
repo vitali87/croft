@@ -571,6 +571,7 @@ pub fn adapter_for_type(type_name: &str) -> Option<AdapterKind> {
     match type_name {
         "python" | "debugpy" => Some(AdapterKind::Debugpy),
         "lldb" | "lldb-dap" | "cppdbg" | "codelldb" => Some(AdapterKind::LldbDap),
+        "go" => Some(AdapterKind::Delve),
         "node" | "pwa-node" | "node-terminal" | "javascript" => Some(AdapterKind::JsDebug),
         _ => None,
     }
@@ -686,9 +687,15 @@ pub struct ResolvedConfig {
     pub env: BTreeMap<String, String>,
     pub cwd: Option<PathBuf>,
     pub pre_launch_task: Option<String>,
+    /// The task to run when this configuration's debug run ends (#250),
+    /// by the user stopping it or the debuggee finishing, not on relaunch.
+    pub post_debug_task: Option<String>,
     pub stop_on_entry: bool,
     pub port: Option<u16>,
     pub process_id: Option<i64>,
+    /// `"processId": "${command:pickProcess}"` (#250): the user chooses the
+    /// process at launch, so `process_id` is `None` until they have.
+    pub pick_process: bool,
     pub extra: Map<String, Value>,
 }
 
@@ -704,6 +711,7 @@ const MAPPED_KEYS: &[&str] = &[
     "envFile",
     "cwd",
     "preLaunchTask",
+    "postDebugTask",
     "stopOnEntry",
     "port",
     "processId",
@@ -719,11 +727,23 @@ const MAPPED_KEYS: &[&str] = &[
 pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, String> {
     let kind = adapter_for_type(&cfg.type_name).ok_or_else(|| {
         format!(
-            "config \"{}\": unsupported type \"{}\" (python, lldb, and node families are supported)",
+            "config \"{}\": unsupported type \"{}\" (python, lldb, node and go families are supported)",
             cfg.name, cfg.type_name
         )
     })?;
-    let raw = Value::Object(cfg.raw.clone());
+    // `${command:pickProcess}` is not a substitution but a request for a
+    // picker at launch (#250), so it is taken out before substitution would
+    // reject it as an unknown variable.
+    let mut raw_obj = cfg.raw.clone();
+    let pick_process = raw_obj
+        .get("processId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        == Some("${command:pickProcess}");
+    if pick_process {
+        raw_obj.remove("processId");
+    }
+    let raw = Value::Object(raw_obj);
     let raw = substitute_value(&raw, ctx).map_err(|e| format!("config \"{}\": {e}", cfg.name))?;
     let obj = raw.as_object().expect("substitution preserves the object");
 
@@ -781,14 +801,33 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         env,
         cwd: get_str("cwd").map(|c| absolute_in(&c, &ctx.workspace_folder)),
         pre_launch_task: get_str("preLaunchTask"),
+        post_debug_task: get_str("postDebugTask"),
         stop_on_entry: obj
             .get("stopOnEntry")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         port,
         process_id,
+        pick_process,
         extra,
     })
+}
+
+/// The current user's processes as `(pid, command name)` from
+/// `ps -x -o pid=,comm=` output (BSD-style flags, which both macOS and
+/// procps accept), for the attach picker (#250). `skip` (croft's own pid) is
+/// left out: attaching a debugger to the editor running it would freeze it.
+pub fn parse_ps_processes(output: &str, skip: i64) -> Vec<(i64, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (pid, comm) = line.split_once(char::is_whitespace)?;
+            let pid: i64 = pid.parse().ok()?;
+            let comm = comm.trim();
+            (pid != skip && !comm.is_empty()).then(|| (pid, comm.to_string()))
+        })
+        .collect()
 }
 
 /// Resolve a possibly-relative path against the workspace folder (VS Code
@@ -919,6 +958,30 @@ pub fn lldb_request(rc: &ResolvedConfig) -> Value {
     }
 }
 
+/// Build the delve `launch`/`attach` request (#264). `mode` passes through
+/// from the config and defaults to delve's own defaults: `debug` to launch
+/// (build and run the package at `program`), `local` to attach to `processId`.
+pub fn delve_request(rc: &ResolvedConfig) -> Value {
+    let mut args = base_arguments(rc);
+    if !rc.env.is_empty() {
+        args.insert("env".into(), json!(rc.env));
+    }
+    match rc.request {
+        RequestKind::Launch => {
+            args.entry("mode").or_insert_with(|| json!("debug"));
+            request_value("launch", args)
+        }
+        RequestKind::Attach => {
+            args.entry("mode").or_insert_with(|| json!("local"));
+            if let Some(pid) = rc.process_id {
+                args.insert("processId".into(), json!(pid));
+            }
+            args.remove("stopOnEntry");
+            request_value("attach", args)
+        }
+    }
+}
+
 /// Build the vscode-js-debug `launch`/`attach` request (`pwa-node`, the
 /// canonical Node type — croft already normalises onto it for zero-config).
 pub fn js_request(rc: &ResolvedConfig) -> Value {
@@ -948,6 +1011,377 @@ pub fn js_request(rc: &ResolvedConfig) -> Value {
             request_value("attach", args)
         }
     }
+}
+
+/// A field of the **Debug: Add Configuration…** flow (#250), in the order
+/// [`ConfigDraft::next_field`] asks for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftField {
+    Name,
+    Program,
+    Args,
+    Cwd,
+    Env,
+    PreLaunchTask,
+    /// The port a python or node debuggee listens on (attach).
+    Port,
+    /// The process id to attach lldb or delve to.
+    ProcessId,
+}
+
+/// The adapters the flow offers: `(type, label)`, the type as written into
+/// launch.json. One per [`AdapterKind`], so every choice resolves.
+pub const DRAFT_TYPES: [(&str, &str); 4] = [
+    ("python", "Python — debugpy"),
+    ("lldb", "Rust / C / C++ — lldb-dap"),
+    ("go", "Go — delve"),
+    ("node", "JavaScript / TypeScript — Node"),
+];
+
+/// A configuration being built by **Debug: Add Configuration…** (#250):
+/// the native form for what a launch.json entry says, written to
+/// `.croft/launch.json` when it is complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigDraft {
+    pub type_name: String,
+    pub request: RequestKind,
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub env: Vec<(String, String)>,
+    pub pre_launch_task: String,
+    pub port: Option<u16>,
+    pub process_id: Option<u32>,
+}
+
+impl ConfigDraft {
+    pub fn new(type_name: &str, request: RequestKind) -> Self {
+        Self {
+            type_name: type_name.to_string(),
+            request,
+            name: String::new(),
+            program: String::new(),
+            args: Vec::new(),
+            cwd: String::new(),
+            env: Vec::new(),
+            pre_launch_task: String::new(),
+            port: None,
+            process_id: None,
+        }
+    }
+
+    /// Attaching to python or node means a port the debuggee listens on;
+    /// lldb and delve attach to a process.
+    fn attaches_by_port(&self) -> bool {
+        matches!(
+            adapter_for_type(&self.type_name),
+            Some(AdapterKind::Debugpy | AdapterKind::JsDebug)
+        )
+    }
+
+    /// The field to ask for after `after` (`None`: the first), or `None`
+    /// when the draft is complete.
+    pub fn next_field(&self, after: Option<DraftField>) -> Option<DraftField> {
+        use DraftField::*;
+        let order: &[DraftField] = match self.request {
+            RequestKind::Launch => &[Name, Program, Args, Cwd, Env, PreLaunchTask],
+            RequestKind::Attach if self.attaches_by_port() => &[Name, Port],
+            RequestKind::Attach => &[Name, ProcessId],
+        };
+        match after {
+            None => order.first().copied(),
+            Some(f) => order
+                .iter()
+                .position(|&o| o == f)
+                .and_then(|i| order.get(i + 1).copied()),
+        }
+    }
+
+    /// Whether `field` may be left blank (then it is left out).
+    pub fn optional(field: DraftField) -> bool {
+        matches!(
+            field,
+            DraftField::Args | DraftField::Cwd | DraftField::Env | DraftField::PreLaunchTask
+        )
+    }
+
+    /// The prompt's title, hint, and the value it starts with.
+    pub fn prompt(&self, field: DraftField) -> (String, &'static str, String) {
+        let seed = match field {
+            DraftField::Name => {
+                let label = DRAFT_TYPES
+                    .iter()
+                    .find(|(t, _)| *t == self.type_name)
+                    .map_or(self.type_name.as_str(), |(_, l)| {
+                        l.split(" — ").next().unwrap_or(l)
+                    });
+                match self.request {
+                    RequestKind::Launch => format!("Launch {label}"),
+                    RequestKind::Attach => format!("Attach to {label}"),
+                }
+            }
+            DraftField::Program => match adapter_for_type(&self.type_name) {
+                Some(AdapterKind::LldbDap) => String::from("${workspaceFolder}/target/debug/"),
+                Some(AdapterKind::Delve) => String::from("${workspaceFolder}"),
+                _ => String::from("${file}"),
+            },
+            DraftField::Cwd => String::from("${workspaceFolder}"),
+            _ => String::new(),
+        };
+        let (title, hint) = match field {
+            DraftField::Name => ("Name", "What the configuration is called"),
+            DraftField::Program => ("Program", "The program to debug"),
+            DraftField::Args => (
+                "Arguments",
+                "Space-separated, \"quoted\" for spaces; Enter on blank for none",
+            ),
+            DraftField::Cwd => ("Working directory", "Enter on blank for the default"),
+            DraftField::Env => ("Environment", "NAME=value pairs; Enter on blank for none"),
+            DraftField::PreLaunchTask => (
+                "Pre-launch task",
+                "A task label to run first; Enter on blank for none",
+            ),
+            DraftField::Port => ("Port", "The port the debuggee listens on"),
+            DraftField::ProcessId => ("Process id", "The process to attach to"),
+        };
+        (format!("Add Configuration: {title}"), hint, seed)
+    }
+
+    /// Take the typed value for `field`, or say why it does not fit.
+    pub fn set(&mut self, field: DraftField, value: &str) -> Result<(), String> {
+        let value = value.trim();
+        match field {
+            DraftField::Name => self.name = value.to_string(),
+            DraftField::Program => self.program = value.to_string(),
+            DraftField::Args => self.args = split_args(value)?,
+            DraftField::Cwd => self.cwd = value.to_string(),
+            DraftField::Env => self.env = parse_env_pairs(value)?,
+            DraftField::PreLaunchTask => self.pre_launch_task = value.to_string(),
+            DraftField::Port => {
+                self.port = Some(
+                    value
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|p| *p > 0)
+                        .ok_or_else(|| format!("Not a port: {value}"))?,
+                );
+            }
+            DraftField::ProcessId => {
+                self.process_id = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|p| *p > 0)
+                        .ok_or_else(|| format!("Not a process id: {value}"))?,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The launch.json entry, in the fields [`resolve`] maps: python and
+    /// node attach by `port`, lldb and delve by `processId` (delve in its
+    /// `local` mode).
+    pub fn to_json(&self) -> Value {
+        let mut o = Map::new();
+        o.insert("name".into(), json!(self.name));
+        o.insert("type".into(), json!(self.type_name));
+        let request = match self.request {
+            RequestKind::Launch => "launch",
+            RequestKind::Attach => "attach",
+        };
+        o.insert("request".into(), json!(request));
+        let adapter = adapter_for_type(&self.type_name);
+        match self.request {
+            RequestKind::Launch => {
+                o.insert("program".into(), json!(self.program));
+                if !self.args.is_empty() {
+                    o.insert("args".into(), json!(self.args));
+                }
+                if !self.cwd.is_empty() {
+                    o.insert("cwd".into(), json!(self.cwd));
+                }
+                if !self.env.is_empty() {
+                    let env: Map<String, Value> = self
+                        .env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), json!(v)))
+                        .collect();
+                    o.insert("env".into(), Value::Object(env));
+                }
+                if !self.pre_launch_task.is_empty() {
+                    o.insert("preLaunchTask".into(), json!(self.pre_launch_task));
+                }
+            }
+            RequestKind::Attach => {
+                if self.attaches_by_port() {
+                    o.insert("port".into(), json!(self.port));
+                } else {
+                    if adapter == Some(AdapterKind::Delve) {
+                        o.insert("mode".into(), json!("local"));
+                    }
+                    o.insert("processId".into(), json!(self.process_id));
+                }
+            }
+        }
+        Value::Object(o)
+    }
+}
+
+/// Split an argument line the way a shell would for the simple cases:
+/// whitespace separates, and "double" or 'single' quotes keep spaces.
+fn split_args(line: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_arg = false;
+    let mut quote: Option<char> = None;
+    for c in line.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_arg = true;
+            }
+            None if c.is_whitespace() => {
+                if in_arg {
+                    out.push(std::mem::take(&mut cur));
+                    in_arg = false;
+                }
+            }
+            None => {
+                cur.push(c);
+                in_arg = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err(String::from("Unclosed quote in the arguments"));
+    }
+    if in_arg {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+/// `NAME=value` pairs, separated by whitespace or `;`. A value keeps
+/// everything after the first `=`.
+fn parse_env_pairs(line: &str) -> Result<Vec<(String, String)>, String> {
+    split_args(&line.replace(';', " "))?
+        .into_iter()
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+            _ => Err(format!("Not NAME=value: {pair}")),
+        })
+        .collect()
+}
+
+/// Add `draft` to `.croft/launch.json` under `root`, creating the file when
+/// there is none; returns the file written.
+///
+/// croft owns that file, so it is rewritten whole, but only when it parses
+/// as plain JSON: a file with comments or trailing commas would lose them,
+/// so it is left alone and the entry is handed back to add by hand. A name
+/// the file already uses is refused, since the picker lists by name.
+///
+/// The new file is written aside and renamed into place, so a kill or a full
+/// disk mid-write leaves the old one whole. The workspace controls `.croft`,
+/// so a symlink there (or at the file) is refused rather than followed: the
+/// rewrite must not land somewhere else.
+pub fn add_to_croft_launch_json(root: &Path, draft: &ConfigDraft) -> Result<PathBuf, String> {
+    let dir = root.join(".croft");
+    let path = dir.join("launch.json");
+    for p in [&dir, &path] {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!(
+                "{} is a symlink; not rewriting it",
+                p.strip_prefix(root).unwrap_or(p).display()
+            ));
+        }
+    }
+    let entry = draft.to_json();
+    let mut doc = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<Value>(&text).map_err(|_| {
+            format!(
+                ".croft/launch.json has comments or trailing commas, which rewriting it would lose; add this by hand: {entry}"
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            json!({ "version": "0.2.0", "configurations": [] })
+        }
+        Err(e) => return Err(format!("Could not read .croft/launch.json: {e}")),
+    };
+    let list = match &mut doc {
+        Value::Array(list) => list,
+        Value::Object(o) => match o
+            .entry("configurations")
+            .or_insert_with(|| Value::Array(Vec::new()))
+        {
+            Value::Array(list) => list,
+            _ => {
+                return Err(String::from(
+                    ".croft/launch.json: \"configurations\" is not a list",
+                ));
+            }
+        },
+        _ => {
+            return Err(String::from(
+                ".croft/launch.json is neither a list nor an object",
+            ));
+        }
+    };
+    if list
+        .iter()
+        .any(|c| c.get("name").and_then(Value::as_str) == Some(draft.name.as_str()))
+    {
+        return Err(format!(
+            ".croft/launch.json already has a configuration named \"{}\"",
+            draft.name
+        ));
+    }
+    list.push(entry);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create .croft: {e}"))?;
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    let (tmp, mut file) =
+        create_fresh_temp(&dir).map_err(|e| format!("Could not write .croft/launch.json: {e}"))?;
+    use std::io::Write as _;
+    file.write_all((text + "\n").as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Could not write .croft/launch.json: {e}")
+        })?;
+    Ok(path)
+}
+
+/// The name [`create_fresh_temp`] tries `n`th for this process.
+fn temp_candidate(dir: &Path, n: u32) -> PathBuf {
+    dir.join(format!("launch.json.{}.{n}.tmp", std::process::id()))
+}
+
+/// A new, empty temp file beside `launch.json` that nothing else could have
+/// put there: created exclusively, so an existing path (a symlink the
+/// workspace planted at a guessable name included) is never opened or
+/// followed; the next name is tried instead.
+fn create_fresh_temp(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    for n in 0..64 {
+        let tmp = temp_candidate(dir, n);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free temporary file name beside it",
+    ))
 }
 
 #[cfg(test)]
@@ -1027,8 +1461,44 @@ mod tests {
         assert_eq!(cfgs[1].name, "Worker");
     }
 
+    /// #264: a `type: "go"` config defaults delve's `mode` the way delve
+    /// does, and an explicit `mode` (e.g. `test`) passes through.
     #[test]
-    fn maps_the_three_adapter_families_and_rejects_unknown_types() {
+    fn delve_request_defaults_mode_and_passes_an_explicit_one_through() {
+        let launch = resolve(
+            &config(
+                r#"[{ "name": "G", "type": "go", "request": "launch", "program": "./cmd/app" }]"#,
+            ),
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(launch.kind, AdapterKind::Delve);
+        let req = delve_request(&launch);
+        assert_eq!(req["command"], "launch");
+        assert_eq!(req["arguments"]["mode"], "debug");
+        assert_eq!(req["arguments"]["program"], "./cmd/app");
+
+        let test = resolve(
+            &config(r#"[{ "name": "T", "type": "go", "request": "launch", "mode": "test", "program": "." }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(delve_request(&test)["arguments"]["mode"], "test");
+
+        let attach = resolve(
+            &config(r#"[{ "name": "A", "type": "go", "request": "attach", "processId": 77 }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        let req = delve_request(&attach);
+        assert_eq!(req["command"], "attach");
+        assert_eq!(req["arguments"]["mode"], "local");
+        assert_eq!(req["arguments"]["processId"], 77);
+        assert!(req["arguments"].get("stopOnEntry").is_none());
+    }
+
+    #[test]
+    fn maps_the_adapter_families_and_rejects_unknown_types() {
         use AdapterKind::*;
         for (t, k) in [
             ("python", Debugpy),
@@ -1037,13 +1507,47 @@ mod tests {
             ("cppdbg", LldbDap),
             ("node", JsDebug),
             ("pwa-node", JsDebug),
+            ("go", Delve),
         ] {
             assert_eq!(adapter_for_type(t), Some(k), "{t}");
         }
-        assert_eq!(adapter_for_type("go"), None);
-        let cfg = config(r#"[{ "name": "Go", "type": "go", "program": "main.go" }]"#);
+        let cfg = config(r#"[{ "name": "J", "type": "java", "program": "Main.java" }]"#);
         let err = resolve(&cfg, &ctx()).unwrap_err();
-        assert!(err.contains("unsupported type \"go\""), "{err}");
+        assert!(err.contains("unsupported type \"java\""), "{err}");
+        assert!(err.contains("go"), "the supported list names go: {err}");
+    }
+
+    /// `${command:pickProcess}` asks for a picker at launch (#250) rather
+    /// than failing as an unknown variable; a literal pid is unchanged.
+    #[test]
+    fn pick_process_resolves_to_a_picker_request_not_an_error() {
+        let cfg = config(
+            r#"[{ "name": "Attach", "type": "lldb", "request": "attach",
+                 "processId": "${command:pickProcess}" }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).expect("pickProcess resolves");
+        assert!(rc.pick_process);
+        assert_eq!(rc.process_id, None);
+        assert!(!rc.extra.contains_key("processId"));
+
+        let cfg = config(
+            r#"[{ "name": "Attach", "type": "lldb", "request": "attach", "processId": 4242 }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        assert!(!rc.pick_process);
+        assert_eq!(rc.process_id, Some(4242));
+    }
+
+    #[test]
+    fn ps_output_parses_to_pids_and_names_without_our_own() {
+        let out = "  101 /usr/bin/zsh\n  202 server\n\n  303 croft\n bad line\n  404 \n";
+        assert_eq!(
+            parse_ps_processes(out, 303),
+            vec![
+                (101, String::from("/usr/bin/zsh")),
+                (202, String::from("server"))
+            ]
+        );
     }
 
     #[test]
@@ -1107,6 +1611,7 @@ mod tests {
                 "env": { "MODE": "dev", "RETRIES": 3 },
                 "cwd": "${workspaceFolder}",
                 "preLaunchTask": "build",
+                "postDebugTask": "cleanup",
                 "stopOnEntry": true,
                 "justMyCode": true,
                 "subProcess": "${workspaceFolderBasename}"
@@ -1119,6 +1624,9 @@ mod tests {
         assert_eq!(rc.env["RETRIES"], "3");
         assert_eq!(rc.cwd.as_deref(), Some(Path::new("/work/proj")));
         assert_eq!(rc.pre_launch_task.as_deref(), Some("build"));
+        // A mapped key, so croft runs it rather than handing it to the adapter.
+        assert_eq!(rc.post_debug_task.as_deref(), Some("cleanup"));
+        assert!(!rc.extra.contains_key("postDebugTask"));
         assert!(rc.stop_on_entry);
         // Unmapped fields survive, substituted, for verbatim passthrough.
         assert_eq!(rc.extra["justMyCode"], json!(true));
@@ -2040,5 +2548,212 @@ mod tests {
             vec!["Server", "Client"],
             "compound order wins over the order in `configurations`"
         );
+    }
+
+    /// #250: the flow asks what each request needs, in order: a launch its
+    /// program and the optional rest, an attach only where to attach.
+    #[test]
+    fn a_draft_asks_for_what_its_request_needs() {
+        use DraftField::*;
+        let fields = |d: &ConfigDraft| {
+            let mut out = Vec::new();
+            let mut at = d.next_field(None);
+            while let Some(f) = at {
+                out.push(f);
+                at = d.next_field(Some(f));
+            }
+            out
+        };
+        let launch = ConfigDraft::new("python", RequestKind::Launch);
+        assert_eq!(
+            fields(&launch),
+            [Name, Program, Args, Cwd, Env, PreLaunchTask]
+        );
+        for t in ["python", "node"] {
+            assert_eq!(
+                fields(&ConfigDraft::new(t, RequestKind::Attach)),
+                [Name, Port]
+            );
+        }
+        for t in ["lldb", "go"] {
+            assert_eq!(
+                fields(&ConfigDraft::new(t, RequestKind::Attach)),
+                [Name, ProcessId]
+            );
+        }
+        // Every offered type resolves to an adapter.
+        for (t, _) in DRAFT_TYPES {
+            assert!(adapter_for_type(t).is_some(), "{t}");
+        }
+    }
+
+    /// #250: typed values are checked as they are entered, and what is
+    /// written reads back as the configuration that was described.
+    #[test]
+    fn a_launch_draft_writes_an_entry_that_reads_back() {
+        let mut d = ConfigDraft::new("python", RequestKind::Launch);
+        assert_eq!(d.prompt(DraftField::Name).2, "Launch Python");
+        assert_eq!(d.prompt(DraftField::Program).2, "${file}");
+        d.set(DraftField::Name, "Serve").unwrap();
+        d.set(DraftField::Program, "${workspaceFolder}/api.py")
+            .unwrap();
+        d.set(DraftField::Args, r#"--port 8000 "a b" 'c d'"#)
+            .unwrap();
+        assert_eq!(d.args, ["--port", "8000", "a b", "c d"]);
+        assert!(d.set(DraftField::Args, r#"--x "open"#).is_err());
+        d.set(DraftField::Cwd, "").unwrap();
+        d.set(DraftField::Env, "DEBUG=1; URL=http://x?a=b").unwrap();
+        assert!(d.set(DraftField::Env, "NOEQUALS").is_err());
+        d.set(DraftField::PreLaunchTask, "build").unwrap();
+        let text = serde_json::to_string(&json!({ "configurations": [d.to_json()] })).unwrap();
+        let cfgs = parse_launch_json(&text, ".croft/launch.json");
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].name, "Serve");
+        assert_eq!(cfgs[0].request, RequestKind::Launch);
+        let raw = d.to_json();
+        assert_eq!(raw["args"], json!(["--port", "8000", "a b", "c d"]));
+        assert_eq!(raw["env"], json!({ "DEBUG": "1", "URL": "http://x?a=b" }));
+        assert_eq!(raw["preLaunchTask"], json!("build"));
+        assert!(raw.get("cwd").is_none(), "a blank field is left out");
+    }
+
+    /// #250: each adapter is attached to the way it reads the request.
+    #[test]
+    fn an_attach_draft_uses_each_adapters_own_fields() {
+        let attach = |t: &str, field: DraftField, value: &str| {
+            let mut d = ConfigDraft::new(t, RequestKind::Attach);
+            d.set(DraftField::Name, "A").unwrap();
+            d.set(field, value).unwrap();
+            d.to_json()
+        };
+        assert_eq!(
+            attach("python", DraftField::Port, "5678")["port"],
+            json!(5678)
+        );
+        assert_eq!(
+            attach("node", DraftField::Port, "9229")["port"],
+            json!(9229)
+        );
+        assert_eq!(
+            attach("lldb", DraftField::ProcessId, "42")["processId"],
+            json!(42)
+        );
+        let go = attach("go", DraftField::ProcessId, "7");
+        assert_eq!(
+            (go["processId"].clone(), go["mode"].clone()),
+            (json!(7), json!("local"))
+        );
+        // And each resolves to the attach request its adapter is sent.
+        let resolved = |t: &str, field: DraftField, value: &str| {
+            let text = json!({ "configurations": [attach(t, field, value)] }).to_string();
+            resolve(&config(&text), &ctx()).unwrap()
+        };
+        let py = debugpy_request(
+            &resolved("python", DraftField::Port, "5678"),
+            Path::new("/usr/bin/python3"),
+        );
+        assert_eq!(py["arguments"]["connect"]["port"], 5678);
+        let lldb = lldb_request(&resolved("lldb", DraftField::ProcessId, "42"));
+        assert_eq!(lldb["arguments"]["pid"], 42);
+        let dlv = delve_request(&resolved("go", DraftField::ProcessId, "7"));
+        assert_eq!(dlv["arguments"]["processId"], 7);
+        let mut d = ConfigDraft::new("node", RequestKind::Attach);
+        assert!(d.set(DraftField::Port, "0").is_err());
+        assert!(d.set(DraftField::Port, "70000").is_err());
+        assert!(d.set(DraftField::ProcessId, "pid").is_err());
+    }
+
+    /// #250: the entry goes into `.croft/launch.json`, created when absent
+    /// and added to when present; a duplicate name and a file whose
+    /// comments rewriting would lose are refused, the file untouched.
+    #[test]
+    fn a_draft_is_added_to_croft_launch_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut d = ConfigDraft::new("node", RequestKind::Launch);
+        d.set(DraftField::Name, "Web").unwrap();
+        d.set(DraftField::Program, "${workspaceFolder}/index.js")
+            .unwrap();
+        let path = add_to_croft_launch_json(tmp.path(), &d).unwrap();
+        assert_eq!(path, tmp.path().join(".croft/launch.json"));
+        let mut d2 = d.clone();
+        d2.name = String::from("Web 2");
+        add_to_croft_launch_json(tmp.path(), &d2).unwrap();
+        let names: Vec<String> = discover_configs(tmp.path())
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["Web", "Web 2"]);
+        let err = add_to_croft_launch_json(tmp.path(), &d).unwrap_err();
+        assert!(err.contains("already has"), "{err}");
+        // A bare list is added to as a list.
+        let bare = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bare.path().join(".croft")).unwrap();
+        std::fs::write(bare.path().join(".croft/launch.json"), "[]").unwrap();
+        add_to_croft_launch_json(bare.path(), &d).unwrap();
+        assert_eq!(discover_configs(bare.path()).len(), 1);
+        // Comments would be lost: refused, and the file is as it was.
+        let jsonc = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(jsonc.path().join(".croft")).unwrap();
+        let text = "{ // mine\n \"configurations\": [] }";
+        std::fs::write(jsonc.path().join(".croft/launch.json"), text).unwrap();
+        let err = add_to_croft_launch_json(jsonc.path(), &d).unwrap_err();
+        assert!(err.contains("by hand") && err.contains("\"Web\""), "{err}");
+        // Written aside and renamed: nothing is left beside the file.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path().join(".croft"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from("launch.json")]);
+        assert_eq!(
+            std::fs::read_to_string(jsonc.path().join(".croft/launch.json")).unwrap(),
+            text
+        );
+    }
+
+    /// #250: `.croft` is workspace content, so a symlink there or at the
+    /// file is refused rather than followed, and its target is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn adding_a_configuration_refuses_a_symlinked_croft_launch_json() {
+        let mut d = ConfigDraft::new("node", RequestKind::Launch);
+        d.set(DraftField::Name, "Web").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("victim.json");
+        std::fs::write(&target, "[]").unwrap();
+        let file_link = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(file_link.path().join(".croft")).unwrap();
+        std::os::unix::fs::symlink(&target, file_link.path().join(".croft/launch.json")).unwrap();
+        let err = add_to_croft_launch_json(file_link.path(), &d).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        let dir_link = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir_link.path().join(".croft")).unwrap();
+        let err = add_to_croft_launch_json(dir_link.path(), &d).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "[]");
+        assert!(!elsewhere.path().join("launch.json").exists());
+
+        // A link planted at the temp file's name is not written through: the
+        // real file keeps what it had until the new one replaces it whole.
+        let planted = tempfile::tempdir().unwrap();
+        let dir = planted.path().join(".croft");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = ConfigDraft::new("node", RequestKind::Launch);
+        first.set(DraftField::Name, "First").unwrap();
+        add_to_croft_launch_json(planted.path(), &first).unwrap();
+        let before = std::fs::read_to_string(dir.join("launch.json")).unwrap();
+        let bait = elsewhere.path().join("bait.json");
+        std::fs::write(&bait, "bait").unwrap();
+        std::os::unix::fs::symlink(&bait, temp_candidate(&dir, 0)).unwrap();
+        add_to_croft_launch_json(planted.path(), &d).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&bait).unwrap(),
+            "bait",
+            "the link is not followed"
+        );
+        let names: Vec<String> = discover_configs(planted.path())
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["First", "Web"], "and the file is whole: {before}");
     }
 }

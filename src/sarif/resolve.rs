@@ -49,6 +49,44 @@ pub fn location_parts(run: &Run, loc: &ArtifactLocation) -> Option<(String, Opti
     Some((uri, base))
 }
 
+/// A file's contents carried in the log itself (§3.24.8, `artifacts[].contents`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Embedded {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+/// The contents the log embeds for `loc`'s artifact (#577): the artifact
+/// `loc.index` names, else the one whose location has the same `uri` and
+/// `uriBaseId`. Text is preferred to binary; binary is base64 (§3.3.2).
+pub fn embedded_contents(run: &Run, loc: &ArtifactLocation) -> Option<Embedded> {
+    use base64::Engine;
+    let by_index = loc
+        .index
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| run.artifacts.get(i));
+    let by_uri = || {
+        let uri = loc.uri.as_deref()?;
+        run.artifacts.iter().find(|a| {
+            a.location
+                .as_ref()
+                .is_some_and(|l| l.uri.as_deref() == Some(uri) && l.uri_base_id == loc.uri_base_id)
+        })
+    };
+    let contents = by_index
+        .filter(|a| a.contents.is_some())
+        .or_else(by_uri)?
+        .contents
+        .as_ref()?;
+    if let Some(text) = &contents.text {
+        return Some(Embedded::Text(text.clone()));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(contents.binary.as_deref()?.trim())
+        .ok()?;
+    Some(Embedded::Binary(bytes))
+}
+
 /// Whether `uri` carries a scheme (RFC 3986 §3.1), making it absolute. A
 /// single letter before the colon is a Windows drive, not a scheme.
 fn has_scheme(uri: &str) -> bool {
@@ -133,7 +171,7 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(percent_decode(uri)))
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -152,6 +190,45 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn prefixes_path() -> PathBuf {
+    crate::app::croft_cache_dir().join("sarif-locations.json")
+}
+
+/// Path prefixes learned for `workspace` (from Locate… and earlier matches),
+/// as the resolver's `learned` list. Empty when none were saved.
+pub fn saved_prefixes(workspace: &Path) -> Vec<(String, PathBuf)> {
+    let all: BTreeMap<String, Vec<(String, PathBuf)>> = std::fs::read_to_string(prefixes_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    all.get(&workspace.display().to_string())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Remember that `artifact_uri` lives at `local` for `workspace`, as the
+/// prefix pair [`Resolver::learn`] derives. Newest first, no duplicates.
+pub fn save_prefix(workspace: &Path, artifact_uri: &str, local: &Path) -> std::io::Result<()> {
+    let mut r = Resolver::default();
+    r.learn(artifact_uri, local);
+    let Some(pair) = r.learned.into_iter().next() else {
+        return Ok(());
+    };
+    let path = prefixes_path();
+    let mut all: BTreeMap<String, Vec<(String, PathBuf)>> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let list = all.entry(workspace.display().to_string()).or_default();
+    list.retain(|(from, _)| *from != pair.0);
+    list.insert(0, pair);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = serde_json::to_string_pretty(&all).map_err(std::io::Error::other)?;
+    std::fs::write(path, text)
+}
+
 /// The state resolution needs beyond the log itself.
 #[derive(Debug, Default, Clone)]
 pub struct Resolver {
@@ -163,6 +240,10 @@ pub struct Resolver {
     pub learned: Vec<(String, PathBuf)>,
     /// File name → every workspace path with that name.
     pub names: HashMap<String, Vec<PathBuf>>,
+    /// Files open in the editor (#577). An artifact that resolves nowhere
+    /// else is the one open document whose path ends with the artifact's
+    /// path, compared by whole components, when exactly one does.
+    pub open: Vec<PathBuf>,
 }
 
 impl Resolver {
@@ -211,7 +292,49 @@ impl Resolver {
             }
         }
 
-        // 5. A unique file name.
+        // 5. An open document ending with the artifact's path: the longest
+        //    match wins, and a tie between two is no answer.
+        let parts: Vec<String> = expanded
+            .uri
+            .split('/')
+            .filter(|s| !s.is_empty() && !s.contains(':'))
+            .map(percent_decode)
+            .collect();
+        let trailing = |p: &Path| {
+            let comps: Vec<String> = p
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            comps
+                .iter()
+                .rev()
+                .zip(parts.iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        let mut best: Option<(usize, &PathBuf)> = None;
+        let mut tied = false;
+        for p in &self.open {
+            let n = trailing(p);
+            if n == 0 {
+                continue;
+            }
+            match best {
+                Some((m, _)) if n < m => {}
+                Some((m, _)) if n == m => tied = true,
+                _ => {
+                    best = Some((n, p));
+                    tied = false;
+                }
+            }
+        }
+        if let (Some((_, p)), false) = (best, tied)
+            && let Some(p) = found(p.clone())
+        {
+            return Some(p);
+        }
+
+        // 6. A unique file name.
         let name = expanded.uri.rsplit('/').next().map(percent_decode)?;
         match self.names.get(&name).map(Vec::as_slice) {
             Some([only]) => found(only.clone()),
@@ -241,6 +364,36 @@ impl Resolver {
             self.learned.insert(0, (from, to));
         }
     }
+}
+
+/// Where `uri`, a location in `run`, sits on GitHub, when the run names a
+/// GitHub repository and commit in its `versionControlProvenance`: the
+/// case of a variant analysis, whose results are in other repositories.
+/// `line` (1-based, 0 for none) becomes the URL's fragment.
+pub fn github_blob_url(run: &Run, uri: &str, line: i64) -> Option<String> {
+    let vcs = run.version_control_provenance.first()?;
+    let repo = vcs
+        .repository_uri
+        .as_deref()?
+        .strip_prefix("https://github.com/")?
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let rev = vcs.revision_id.as_deref().unwrap_or("HEAD");
+    let path = uri
+        .strip_prefix("file:///")
+        .unwrap_or(uri)
+        .trim_start_matches('/');
+    if repo.is_empty() || path.is_empty() || path.contains("://") {
+        return None;
+    }
+    let fragment = if line > 0 {
+        format!("#L{line}")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "https://github.com/{repo}/blob/{rev}/{path}{fragment}"
+    ))
 }
 
 #[cfg(test)]
@@ -390,6 +543,82 @@ mod tests {
     }
 
     #[test]
+    fn an_open_document_ending_with_the_path_resolves_it() {
+        // The build ran elsewhere (/build/...); the file is open from a
+        // checkout the roots do not cover (#577).
+        let mut r = resolver(&["/ws"]);
+        r.open = vec![
+            PathBuf::from("/elsewhere/proj/src/db/query.rs"),
+            PathBuf::from("/elsewhere/proj/src/api/query.rs"),
+            PathBuf::from("/elsewhere/proj/README.md"),
+        ];
+        let files = [
+            "/elsewhere/proj/src/db/query.rs",
+            "/elsewhere/proj/src/api/query.rs",
+            "/elsewhere/proj/README.md",
+        ];
+        let at = |uri: &str| {
+            r.resolve(
+                &run("{}"),
+                &loc(&format!(r#"{{"uri":"{uri}"}}"#)),
+                &disk(&files),
+            )
+        };
+        assert_eq!(
+            at("file:///build/proj/src/db/query.rs"),
+            Some(PathBuf::from("/elsewhere/proj/src/db/query.rs")),
+            "the longest trailing match"
+        );
+        assert_eq!(
+            at("file:///build/other/query.rs"),
+            None,
+            "two tie on the name alone"
+        );
+        assert_eq!(at("file:///build/xyz.rs"), None, "nothing open matches");
+        // Whole components: `ery.rs` is not a match for `query.rs`.
+        r.open = vec![PathBuf::from("/elsewhere/proj/src/db/query.rs")];
+        let at = |uri: &str| {
+            r.resolve(
+                &run("{}"),
+                &loc(&format!(r#"{{"uri":"{uri}"}}"#)),
+                &disk(&files),
+            )
+        };
+        assert_eq!(at("file:///build/ery.rs"), None);
+    }
+
+    #[test]
+    fn embedded_contents_are_found_by_index_or_uri() {
+        let run = run(r#"{"artifacts":[
+                {"location":{"uri":"gen/a.c"},"contents":{"text":"int a;"}},
+                {"location":{"uri":"b.bin","uriBaseId":"SRC"},"contents":{"binary":"AAEC/w=="}},
+                {"location":{"uri":"none.c"}}]}"#);
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"index":0}"#)),
+            Some(Embedded::Text(String::from("int a;")))
+        );
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"uri":"gen/a.c"}"#)),
+            Some(Embedded::Text(String::from("int a;")))
+        );
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"uri":"b.bin","uriBaseId":"SRC"}"#)),
+            Some(Embedded::Binary(vec![0, 1, 2, 255]))
+        );
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"uri":"b.bin"}"#)),
+            None,
+            "another base"
+        );
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"index":2}"#)),
+            None,
+            "no contents"
+        );
+        assert_eq!(embedded_contents(&run, &loc(r#"{"uri":"x.c"}"#)), None);
+    }
+
+    #[test]
     fn user_base_override_wins() {
         let mut r = resolver(&["/ws"]);
         r.base_overrides
@@ -462,5 +691,27 @@ mod tests {
             r.resolve(&run("{}"), &loc(r#"{"uri":"nope.rs"}"#), &disk(&[])),
             None
         );
+    }
+    #[test]
+    fn a_location_in_a_github_repository_links_to_its_commit() {
+        use super::super::model::VersionControlDetails;
+        let mut run = Run::default();
+        assert_eq!(github_blob_url(&run, "src/a.py", 3), None, "no provenance");
+        run.version_control_provenance = vec![VersionControlDetails {
+            repository_uri: Some("https://github.com/a/b".into()),
+            revision_id: Some("abc".into()),
+            ..Default::default()
+        }];
+        assert_eq!(
+            github_blob_url(&run, "src/a.py", 3).as_deref(),
+            Some("https://github.com/a/b/blob/abc/src/a.py#L3")
+        );
+        assert_eq!(
+            github_blob_url(&run, "/src/a.py", 0).as_deref(),
+            Some("https://github.com/a/b/blob/abc/src/a.py")
+        );
+        assert_eq!(github_blob_url(&run, "https://x/y", 1), None);
+        run.version_control_provenance[0].repository_uri = Some("https://gitlab.com/a/b".into());
+        assert_eq!(github_blob_url(&run, "src/a.py", 3), None);
     }
 }

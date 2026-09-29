@@ -1,0 +1,17 @@
+# Bundled croft extension: Go debugger.
+# Launches a Go package or test under delve (`dlv dap`, delve's native DAP
+# server since v1.6) over TCP, through the shared DAP session machinery. `dlv`
+# is found on PATH, in $GOBIN or $GOPATH/bin, or in croft's own servers
+# directory. The launch flow stays native; this manifest declares the file
+# types that route to the delve mechanism.
+id = "dap-go"
+name = "Go Debugger"
+description = "Debug Go programs and tests with delve."
+builtin = true
+api_version = 1
+
+[[debug_adapters]]
+id = "dap-go"
+label = "delve"
+kind = "delve"
+extensions = ["go"]

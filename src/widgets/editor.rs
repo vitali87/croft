@@ -24,7 +24,21 @@ use crate::widgets::scrollbar;
 /// PDF / spreadsheet branches in `open`, so larger media keep their
 /// own per-format limits.
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+/// The colour of a SARIF analysis step drawn after its line (#577).
+const STEP_MARK_COLOR: Color = Color::Rgb(0x4f, 0xc1, 0xff);
 const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+
+/// An image's pixel size from its header alone. Opening a tab decoded the
+/// whole picture on the render thread just to read these two numbers: a
+/// 48-megapixel photo meant a ~190 MB decode per open, and one past the
+/// decoder's memory limit refused to open although only a downscale shows.
+fn image_dimensions_of(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
 
 /// Read-only image preview attached to a tab. Holds the raw file bytes so
@@ -53,6 +67,13 @@ pub struct ImageView {
 /// bumped on every byte (re)load anywhere.
 fn next_image_generation() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A fresh id for an undo step, unique across every editor, so a symbol-tab
+/// sibling can tell one of its source's steps from the next (#369).
+fn next_undo_step_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1931,13 +1952,33 @@ pub struct TextSpanEdit {
     pub start: (usize, usize),
     pub end: (usize, usize),
     pub new_text: String,
+    /// The columns are UTF-16 code units, as a language server sends them,
+    /// not chars. Converted against the lines at apply time: read as char
+    /// columns, every edit after an emoji on its line landed off by one per
+    /// astral character, and a rename wrote `xrenamed+ 1` over `x + 1`.
+    pub utf16: bool,
 }
 
 /// Apply `edits` to `lines` (char-indexed coords), bottom-to-top so an
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
+    // Every edit names the ORIGINAL text, so its UTF-16 columns convert
+    // against the lines as they are before any edit lands.
+    let col = |row: usize, c: usize| lines.get(row).map_or(c, |l| utf16_to_char_col(l, c as u32));
+    let converted: Vec<TextSpanEdit> = edits
+        .iter()
+        .map(|e| match e.utf16 {
+            true => TextSpanEdit {
+                start: (e.start.0, col(e.start.0, e.start.1)),
+                end: (e.end.0, col(e.end.0, e.end.1)),
+                new_text: e.new_text.clone(),
+                utf16: false,
+            },
+            false => e.clone(),
+        })
+        .collect();
+    let mut order: Vec<&TextSpanEdit> = converted.iter().collect();
     order.sort_by_key(|e| std::cmp::Reverse(e.start));
     let mut applied = 0;
     for e in order {
@@ -2057,9 +2098,26 @@ struct Snapshot {
     /// with it, so a cycle never credits lines to whoever wrote a different
     /// buffer.
     provenance: crate::provenance::Provenance,
+    /// The text this step holds, each line's `String` header included,
+    /// measured once when it is taken (see [`UNDO_BYTES_LIMIT`]).
+    bytes: usize,
 }
 
 const UNDO_STACK_LIMIT: usize = 500;
+
+/// Bytes of text the undo steps of one buffer may hold (#694). Every step is
+/// a whole copy of the buffer, so the 500-step cap alone let a 10 MB file
+/// keep 5 GB of history. The oldest steps go first; the newest
+/// [`UNDO_MIN_STEPS`] always stay, so a large file can still be undone.
+const UNDO_BYTES_LIMIT: usize = if cfg!(test) {
+    1024 * 1024
+} else {
+    256 * 1024 * 1024
+};
+
+/// Undo steps kept whatever their size (see [`UNDO_BYTES_LIMIT`]).
+const UNDO_MIN_STEPS: usize = 16;
+
 /// Max selected-text length that still drives occurrence highlighting, matching
 /// VS Code's default `editor.selectionHighlightMaxLength`.
 const SELECTION_HIGHLIGHT_MAX_LEN: usize = 200;
@@ -2356,6 +2414,9 @@ struct SnippetSession {
     anchor: (usize, usize),
     /// Placeholder length (chars) of the current stop, selected on landing.
     cur_len: usize,
+    /// The placeholder's text on landing, to tell an edit from a plain Tab
+    /// when the replacement happens to be the same length.
+    cur_text: String,
     /// Remaining stops to visit, in order: `(row, col, placeholder_len)`.
     stops: std::collections::VecDeque<(usize, usize, usize)>,
 }
@@ -2425,6 +2486,11 @@ pub struct Editor {
     /// logpoint. The adapter interpolates `{expr}` holes and prints instead
     /// of pausing. Rendered as an amber diamond in the gutter.
     pub breakpoint_logs:
+        std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
+    /// Optional hit count per breakpoint line (path -> line -> DAP
+    /// `hitCondition`, #611): pause only once the line has been hit that
+    /// many times.
+    pub breakpoint_hit_conditions:
         std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
     /// Reader bookmarks (VS Code's Bookmarks extension, nvim's `m` marks),
     /// keyed by file path as 1-based line numbers — the same shape as
@@ -2509,6 +2575,16 @@ pub struct Editor {
     /// frame: `(screen y, x range, header row, resolution)`. Cleared at
     /// render start so the hit test always describes the painted frame.
     pub merge_action_spans: Vec<(u16, std::ops::Range<u16>, usize, crate::merge::Resolution)>,
+    /// The language server's code lenses for this buffer (#608), painted at
+    /// the end of their line while it still reads as it did when they came.
+    pub code_lenses: Vec<crate::code_lens::EditorLens>,
+    /// Clickable lens spans painted this frame: `(screen y, x range, index
+    /// into code_lenses)`. Cleared at render start, like the merge spans.
+    pub code_lens_spans: Vec<(u16, std::ops::Range<u16>, usize)>,
+    /// An inline AI suggestion (#607): `(row, col, edit_seq, text)`, painted
+    /// as ghost text at the caret while the caret, the buffer and the row
+    /// are all still where the suggestion was asked for.
+    pub ghost: Option<(usize, usize, u64, String)>,
     /// Per-source-line git blame for the current file, index 0 = line 1. Set
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
@@ -2714,6 +2790,22 @@ pub struct Editor {
     /// and show a thumb-tack glyph in place of the close `\u{2715}`. A pinned
     /// tab is never the replaceable preview slot (pinning clears `preview`).
     pub pinned: bool,
+    /// Set on a symbol tab (#369): the tab holds the whole file, as a split
+    /// does, but shows, scrolls and edits only this symbol's lines.
+    pub symbol_view: Option<crate::symbol_range::SymbolView>,
+    /// The `edit_seq` at which the App last mirrored this buffer against its
+    /// symbol-tab siblings. `None` = not (yet) mirrored with them, so this
+    /// buffer is a copy that may predate them and never a mirror source.
+    pub mirror_seq: Option<u64>,
+    /// Id of this buffer's latest undo step (or undo/redo), 0 before any.
+    /// A mirrored sibling takes one step per source step, so undo walks it
+    /// back as far as the source's own undo would.
+    pub undo_step_id: u64,
+    /// The source step the last mirrored edit was folded into.
+    mirrored_step: Option<u64>,
+    /// Where the source's caret sat after the edit last mirrored in: the
+    /// symbol view settles an ambiguous edit against it (#369).
+    pub mirror_caret: Option<(usize, usize)>,
     undo_stack: Vec<Snapshot>,
     /// States popped off `undo_stack` by `undo`, awaiting `redo`. Cleared by any
     /// fresh edit (`push_undo`) so a new edit branches history like VS Code.
@@ -2743,6 +2835,16 @@ pub struct Editor {
     /// Whether the file on disk began with a byte-order mark. `decode` strips
     /// it, so without remembering it every save silently dropped it.
     bom: bool,
+    /// Whether the file on disk ended with a line break. The buffer keeps
+    /// no line for it (a trailing newline is not a line of its own), so
+    /// without remembering it every save stripped it: `a\nb\n` came back
+    /// as `a\nb`.
+    final_newline: bool,
+    /// Whether decoding the file met bytes invalid in its encoding, now
+    /// shown as U+FFFD. Saving writes those as `EF BF BD`, destroying the
+    /// original bytes, so it takes the same explicit consent as an encoding
+    /// that cannot represent the text.
+    pub decode_lossy: bool,
     /// Indentation guides (VS Code `editor.guides.indentation`): dim vertical
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
@@ -2781,6 +2883,10 @@ pub struct Editor {
     /// stop from the VARIABLES data and cleared on resume/step/terminate.
     /// Painted like the blame trailer; the cursor-line blame yields to it.
     pub inline_values: std::collections::BTreeMap<usize, String>,
+    /// Live Run's latest report for this buffer (`crate::live_run`): value
+    /// trailers and line coverage, set by the app when a run lands. Each
+    /// line paints only while it still matches the text that ran.
+    pub live_run: Option<crate::live_run::View>,
     /// Per-tab override for soft-wrap (VS Code "View: Toggle Word Wrap",
     /// Alt+Z). `None` means follow the language default (`wrap_enabled`
     /// wraps Markdown only); `Some(true)`/`Some(false)` force it on/off for
@@ -2823,6 +2929,11 @@ pub struct Editor {
     /// file after a tab switch, exactly as `diagnostics_path` does.
     inlay_hints: Vec<crate::lsp::manager::InlayHintItem>,
     inlay_path: Option<PathBuf>,
+    /// The selected SARIF result's analysis steps in this file (#577), as
+    /// `(0-based line, label)`, drawn after their lines' text. `step_path`
+    /// guards them like `inlay_path`: steps belong to one file only.
+    step_marks: Vec<(usize, String)>,
+    step_path: Option<PathBuf>,
     /// Occurrences of the symbol under the caret (LSP documentHighlight),
     /// already converted to `(row, start_char, end_char, write)` against the
     /// current buffer. Cleared on every edit — the server's columns are
@@ -2907,6 +3018,15 @@ pub struct Editor {
     /// archive; Enter extracts one member to scratch and opens it
     /// through the normal dispatch. Read-only.
     pub archive: Option<crate::archive::ArchiveView>,
+    /// A pull request under review (#365): its files, checks and viewed
+    /// marks. Read-only; the tab has no file behind it.
+    pub pr_review: Option<crate::widgets::pr_review::PrReviewView>,
+    /// A fleet run's results as tiles (#363).
+    pub fleet: Option<crate::widgets::fleet::FleetView>,
+    /// SARIF results viewer (#577): every result of a `.sarif` log, grouped
+    /// and filterable; Enter opens a result's location. Read-only; "Reopen
+    /// as Text" shows the JSON.
+    pub sarif: Option<crate::sarif::view::SarifView>,
     /// Three-way merge editor (#253). UNLIKE the other view kinds this is
     /// not read-only and not in `has_non_text_view`: `lines` holds the
     /// editable Result and keeps the whole text path (LSP, undo, save);
@@ -2922,6 +3042,12 @@ pub struct Editor {
     /// same-path reloads, so the FS-sync sweep cannot flip the tab back
     /// to a preview, and clears when the tab opens a different file.
     pub force_text: bool,
+    /// Notebook code cells (indices into `cells`) running or queued in the
+    /// notebook's kernel: the preview shows them as `In [*]` (#355).
+    pub notebook_running: Vec<usize>,
+    /// Coverage marks for this file from the last coverage run (#263),
+    /// painted in the git bar's lane while shown.
+    pub coverage: Option<crate::testing::coverage::CoverageLens>,
     /// Hit-test rect for the "previous change" arrow painted in the diff
     /// header. Empty when the tab isn't a diff or the header was clipped.
     /// `App` consults this on left-click to jump to the previous hunk.
@@ -2972,10 +3098,16 @@ impl Editor {
             unverified_breakpoints: std::collections::HashMap::new(),
             breakpoint_conditions: std::collections::HashMap::new(),
             breakpoint_logs: std::collections::HashMap::new(),
+            breakpoint_hit_conditions: std::collections::HashMap::new(),
             bookmarks: std::collections::HashMap::new(),
             bookmark_shadow: None,
             bookmark_sync_paused: false,
             edit_seq: 0,
+            symbol_view: None,
+            mirror_seq: None,
+            undo_step_id: 0,
+            mirrored_step: None,
+            mirror_caret: None,
             ruler_search_cache: None,
             ruler_starts_cache: None,
             collab_synced_seq: 0,
@@ -2989,6 +3121,9 @@ impl Editor {
             auto_pair_at: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
+            code_lenses: Vec::new(),
+            code_lens_spans: Vec::new(),
+            ghost: None,
             conflicts_seq: u64::MAX,
             blame_lines: None,
             blame_for: None,
@@ -3052,6 +3187,8 @@ impl Editor {
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
             bom: false,
+            final_newline: false,
+            decode_lossy: false,
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
@@ -3060,6 +3197,7 @@ impl Editor {
             whitespace_mode: WhitespaceMode::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
+            live_run: None,
             wrap_override: None,
             highlights: Vec::new(),
             semantic_overlay: Vec::new(),
@@ -3072,6 +3210,8 @@ impl Editor {
             diagnostic_spans: Vec::new(),
             inlay_hints: Vec::new(),
             inlay_path: None,
+            step_marks: Vec::new(),
+            step_path: None,
             occurrences: Vec::new(),
             inlay_spans: Vec::new(),
             doc_links: Vec::new(),
@@ -3092,9 +3232,14 @@ impl Editor {
             hex: None,
             log: None,
             archive: None,
+            pr_review: None,
+            fleet: None,
+            sarif: None,
             merge: None,
             merge_edit_row: 0,
             force_text: false,
+            notebook_running: Vec::new(),
+            coverage: None,
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
@@ -3142,6 +3287,12 @@ impl Editor {
                 logs.remove(&line);
                 if logs.is_empty() {
                     self.breakpoint_logs.remove(&path);
+                }
+            }
+            if let Some(hits) = self.breakpoint_hit_conditions.get_mut(&path) {
+                hits.remove(&line);
+                if hits.is_empty() {
+                    self.breakpoint_hit_conditions.remove(&path);
                 }
             }
             false
@@ -3377,6 +3528,15 @@ impl Editor {
             .unwrap_or(0)
     }
 
+    /// Whether `path` has any line-keyed breakpoint state to carry through
+    /// edits (see [`Self::sync_bookmarks_to_buffer`]).
+    fn has_breakpoints_in(&self, path: &Path) -> bool {
+        self.breakpoints.contains_key(path)
+            || self.breakpoint_conditions.contains_key(path)
+            || self.breakpoint_logs.contains_key(path)
+            || self.breakpoint_hit_conditions.contains_key(path)
+    }
+
     /// Record the text the open file's bookmarks describe, ahead of an edit
     /// (called from [`push_undo`](Self::push_undo), which every user edit
     /// passes through before it mutates). A no-op when the file has no marks
@@ -3385,7 +3545,7 @@ impl Editor {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        if !self.bookmarks.contains_key(path)
+        if !(self.bookmarks.contains_key(path) || self.has_breakpoints_in(path))
             || self
                 .bookmark_shadow
                 .as_ref()
@@ -3413,23 +3573,66 @@ impl Editor {
             self.bookmark_shadow = None;
             return;
         };
-        let Some(set) = self.bookmarks.get_mut(&path) else {
+        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
             self.bookmark_shadow = None;
             return;
-        };
+        }
+        let len = self.lines.len();
         let mut shadow = match self.bookmark_shadow.take() {
             Some((shadow_path, old)) if shadow_path == path => {
-                if old.len() != self.lines.len() {
-                    *set = shift_bookmark_lines(set, &old, &self.lines);
+                let map = line_mapper(&old, &self.lines);
+                if let Some(set) = self.bookmarks.get_mut(&path) {
+                    *set = set.iter().filter_map(|&l| map(l)).collect();
                 }
+                // Breakpoints follow the same edits: they were plain line
+                // numbers, so an Enter above one left it on the line that
+                // moved into its place, and the debugger stopped there.
+                if let Some(set) = self.breakpoints.get_mut(&path) {
+                    *set = set.iter().filter_map(|&l| map(l)).collect();
+                }
+                for per_line in [
+                    &mut self.breakpoint_conditions,
+                    &mut self.breakpoint_logs,
+                    &mut self.breakpoint_hit_conditions,
+                ] {
+                    if let Some(m) = per_line.get_mut(&path) {
+                        *m = std::mem::take(m)
+                            .into_iter()
+                            .filter_map(|(l, v)| map(l).map(|n| (n, v)))
+                            .collect();
+                    }
+                }
+                drop(map);
                 old
             }
             _ => Vec::new(),
         };
-        let len = self.lines.len();
-        set.retain(|&l| (1..=len).contains(&l));
-        if set.is_empty() {
-            self.bookmarks.remove(&path);
+        let in_range = |l: &usize| (1..=len).contains(l);
+        if let Some(set) = self.bookmarks.get_mut(&path) {
+            set.retain(in_range);
+            if set.is_empty() {
+                self.bookmarks.remove(&path);
+            }
+        }
+        if let Some(set) = self.breakpoints.get_mut(&path) {
+            set.retain(in_range);
+            if set.is_empty() {
+                self.breakpoints.remove(&path);
+            }
+        }
+        for per_line in [
+            &mut self.breakpoint_conditions,
+            &mut self.breakpoint_logs,
+            &mut self.breakpoint_hit_conditions,
+        ] {
+            if let Some(m) = per_line.get_mut(&path) {
+                m.retain(|l, _| in_range(l));
+                if m.is_empty() {
+                    per_line.remove(&path);
+                }
+            }
+        }
+        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
             return;
         }
         // Bring the shadow up to date in place rather than cloning the whole
@@ -3479,12 +3682,14 @@ impl Editor {
     ) -> Vec<crate::dap::session::SourceBreakpoint> {
         let conds = self.breakpoint_conditions.get(path);
         let logs = self.breakpoint_logs.get(path);
+        let hits = self.breakpoint_hit_conditions.get(path);
         lines
             .iter()
             .map(|&l| crate::dap::session::SourceBreakpoint {
                 line: l as u32,
                 condition: conds.and_then(|c| c.get(&l)).cloned(),
                 log_message: logs.and_then(|m| m.get(&l)).cloned(),
+                hit_condition: hits.and_then(|h| h.get(&l)).cloned(),
             })
             .collect()
     }
@@ -3592,6 +3797,16 @@ impl Editor {
             return None;
         }
         let line = blame.get(self.cursor_row)?;
+        // Same count is not same lines: a cut and paste further down keeps
+        // the count and shifts every row between, each then wearing the
+        // blame of the line that used to sit there.
+        if line
+            .text
+            .as_ref()
+            .is_some_and(|t| Some(t) != self.lines.get(self.cursor_row))
+        {
+            return None;
+        }
         if line.uncommitted {
             return Some("Uncommitted changes".to_string());
         }
@@ -3853,6 +4068,54 @@ impl Editor {
             }
         }
         out
+    }
+
+    /// A read-only view of `path` as it was at some commit (#371): `text` is
+    /// the file then, `baseline` the parent commit's version, so the git
+    /// gutter shows that commit's own change (a root commit, or a file the
+    /// commit added, has an empty baseline and marks every line added).
+    pub fn historical(path: &Path, text: &str, baseline: Vec<String>) -> Editor {
+        let mut e = Editor::new();
+        e.path = Some(path.to_path_buf());
+        e.lines = split_into_lines(text);
+        if e.lines.is_empty() {
+            e.lines.push(String::new());
+        }
+        e.lang = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .and_then(lang_for_extension);
+        e.recompute_highlights();
+        e.set_git_head_lines(path.to_path_buf(), Some(baseline));
+        // Never edited, so the marks are computed once, here.
+        e.refresh_git_marks();
+        e.warm_render_caches();
+        e
+    }
+
+    /// [`Self::historical`] without the expensive parts: the text alone, no
+    /// highlighting and no gutter marks. What the history scrubber shows for
+    /// the frame or two until the full view is built off the UI thread
+    /// (#371); cheap enough for every step of a held arrow key.
+    pub fn historical_plain(path: &Path, text: &str) -> Editor {
+        let mut e = Editor::new();
+        e.path = Some(path.to_path_buf());
+        e.lines = split_into_lines(text);
+        if e.lines.is_empty() {
+            e.lines.push(String::new());
+        }
+        e.highlights = vec![Vec::new(); e.lines.len()];
+        e.warm_render_caches();
+        e
+    }
+
+    /// Fill the whole-buffer caches a first paint would otherwise compute
+    /// (fold tables, conflict markers, the widest line), so a view built on
+    /// another thread (#371) costs the UI thread only its visible rows.
+    fn warm_render_caches(&mut self) {
+        self.refresh_fold_tables();
+        self.conflicts();
+        self.content_cols();
     }
 
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
@@ -4125,11 +4388,17 @@ impl Editor {
     /// Number of visual rows a logical line occupies. Avoids allocating the
     /// segment vector for the common case of a line that already fits.
     fn line_visual_rows(&self, line: usize, width: usize) -> usize {
+        // A line inside a collapsed fold is not drawn: no rows. Counted, it
+        // put Down/Up onto the hidden line (which then unfolded) and threw
+        // the scrollbar and wheel off by the hidden rows.
+        if self.is_line_hidden(line) {
+            return 0;
+        }
         if width == 0 {
             return 1;
         }
         let len = self.line_char_len(line);
-        if len <= width {
+        if len <= width && self.lines.get(line).is_none_or(|l| l.is_ascii()) {
             1
         } else {
             self.line_segments(line, width).len()
@@ -4141,6 +4410,9 @@ impl Editor {
     /// (totals, viewport top, cursor row, decomposition) speaks group rows
     /// so boxes shift everything below them consistently.
     fn group_visual_rows(&self, line: usize, width: usize) -> usize {
+        if self.is_line_hidden(line) {
+            return 0;
+        }
         self.line_visual_rows(line, width) + self.box_rows_at_line(line, width)
     }
 
@@ -4220,6 +4492,9 @@ impl Editor {
     fn logical_pos_at_visual_row(&self, target: usize, width: usize) -> (usize, usize) {
         let mut acc = 0;
         for line in 0..self.lines.len() {
+            if self.is_line_hidden(line) {
+                continue;
+            }
             let segs = self.line_segments(line, width);
             let group = segs.len() + self.box_rows_at_line(line, width);
             if acc + group > target {
@@ -4240,7 +4515,7 @@ impl Editor {
         let mut acc = 0;
         for line in 0..self.lines.len() {
             let segs = self.line_visual_rows(line, width);
-            let group = segs + self.box_rows_at_line(line, width);
+            let group = self.group_visual_rows(line, width);
             if acc + group > target {
                 return target - acc >= segs;
             }
@@ -4324,13 +4599,38 @@ impl Editor {
     }
 
     pub fn open(&mut self, path: &Path) -> Result<()> {
+        // A FIFO, socket or device blocks the first read until some other
+        // process writes to it, freezing the UI thread indefinitely; none of
+        // them is a document. (Directories and missing paths go on to the
+        // handling they always had.)
+        // Process substitution (`croft <(git show HEAD:f)`) hands over a
+        // `/dev/fd/N` pipe whose writer is already running, so it reads.
+        let substituted = path.starts_with("/dev/fd") || path.starts_with("/proc/self/fd");
+        if let Ok(meta) = std::fs::metadata(path)
+            && !meta.is_file()
+            && !meta.is_dir()
+            && !substituted
+        {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         // The Reopen-as-Text override is PER TAB and per file: a path
         // change is a different document, which routes normally again.
         if self.path.as_deref() != Some(path) {
             self.force_text = false;
         }
+        // Why a `.sarif` file is showing as text, when it is: the text path
+        // below reports it instead of a bare "Opened".
+        let mut sarif_refusal = None;
         if !self.force_text {
+            // SARIF results viewer (#577). A log that does not load (bad
+            // JSON, another SARIF version) opens as text with the reason.
+            if crate::sarif::view::extension_is_sarif(ext) {
+                match self.open_sarif(path) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => sarif_refusal = Some(e.to_string()),
+                }
+            }
             // Rendered ANSI log (#257): a colour-bearing log paints through
             // the theme palette instead of showing raw escapes. Sniffed, so a
             // plain .txt with pytest output routes here too; a failure falls
@@ -4554,7 +4854,10 @@ impl Editor {
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
-        let text = enc.decode(&bytes).0.into_owned();
+        let (decoded, _, decode_lossy) = enc.decode(&bytes);
+        let text = decoded.into_owned();
+        self.decode_lossy = decode_lossy;
+        self.final_newline = text.ends_with(['\n', '\r']);
         // Detect the file's line-ending style before normalisation so a save
         // preserves it (and the status bar reports it). A single `\r\n` marks
         // the file CRLF, matching VS Code's "files.eol auto" heuristic.
@@ -4621,6 +4924,13 @@ impl Editor {
             // file in the previous one's debug state. The same-path reload
             // keeps them — the next stop rebuilds them anyway.
             self.inline_values.clear();
+            // A symbol tab reused for another file is an ordinary tab of
+            // that file: its clip and mirror state described the old one.
+            self.leave_symbol_view();
+            // Live Run answered for the old file's text, same as above.
+            self.live_run = None;
+            self.code_lenses.clear();
+            self.ghost = None;
         } else if !self.folded.is_empty() {
             // The retained headers were measured against text that has just
             // been replaced. Re-measure their spans, or a reload that keeps the
@@ -4643,11 +4953,17 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
         self.diff = None;
         self.merge = None;
-        self.status = format!("Opened {}", path.display());
+        self.status = match sarif_refusal {
+            Some(why) => format!("Opened {} as text: {why}", path.display()),
+            None => format!("Opened {}", path.display()),
+        };
         // The buffer now matches disk; bump the edit seq so the LSP doc sync
         // sees the new content (an external reload lands here too, and without
         // the bump the server keeps analysing the old text and never sends
@@ -4698,9 +5014,8 @@ impl Editor {
             anyhow::bail!("Image too large ({} bytes)", meta.len());
         }
         let bytes = std::fs::read(path)?;
-        let (pixel_w, pixel_h) = image::load_from_memory(&bytes)
-            .map(|img| (img.width(), img.height()))
-            .map_err(|e| anyhow::anyhow!("Could not decode image: {e}"))?;
+        let (pixel_w, pixel_h) =
+            image_dimensions_of(&bytes).ok_or_else(|| anyhow::anyhow!("Could not decode image"))?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let format_label = image_format_label_from_ext(ext);
         self.path = Some(path.to_path_buf());
@@ -4751,6 +5066,9 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
         self.status = format!("Opened image {}", path.display());
         Ok(())
     }
@@ -4805,6 +5123,9 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -4821,6 +5142,9 @@ impl Editor {
             notebook: false,
             doc_path: Some(path.to_path_buf()),
             media: true,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         });
         self.status = format!("Opened media info {}", path.display());
         Ok(())
@@ -4878,6 +5202,9 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -4894,6 +5221,9 @@ impl Editor {
             notebook: false,
             doc_path: Some(path.to_path_buf()),
             media: false,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         });
         self.status = format!("Opened document {}", path.display());
         Ok(())
@@ -4937,6 +5267,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.markdown_preview = None;
+        self.sarif = None;
         self.archive = Some(view);
         self.status = format!("Opened archive {}", path.display());
         Ok(())
@@ -4992,6 +5323,9 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
         self.markdown_preview = None;
         self.image = Some(ImageView {
             bytes: png,
@@ -5049,6 +5383,9 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
     }
@@ -5069,9 +5406,8 @@ impl Editor {
         };
         let bytes = crate::pdf::rasterize_page(path, page, backend)
             .map_err(|e| anyhow::anyhow!("PDF render failed: {e}"))?;
-        let (pixel_w, pixel_h) = image::load_from_memory(&bytes)
-            .map(|img| (img.width(), img.height()))
-            .map_err(|e| anyhow::anyhow!("Could not decode rasterised PDF: {e}"))?;
+        let (pixel_w, pixel_h) = image_dimensions_of(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("Could not decode rasterised PDF"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
@@ -5127,6 +5463,9 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
     }
@@ -5142,6 +5481,9 @@ impl Editor {
             || self.image.is_some()
             || self.hex.is_some()
             || self.archive.is_some()
+            || self.pr_review.is_some()
+            || self.fleet.is_some()
+            || self.sarif.is_some()
             // A rendered log's text side is an empty stub, so a save would
             // write one blank line over the file — the #185 truncation class.
             || self.log.is_some()
@@ -5180,7 +5522,7 @@ impl Editor {
     /// provenance map to the text it describes (#349). `None` when the
     /// encoding cannot represent the text, since a save would refuse it too.
     pub fn bytes_for_disk(&self) -> Option<Vec<u8>> {
-        let content = self.lines.join(self.eol.sequence());
+        let content = self.content_for_disk();
         let (encoded, had_errors) = self.encode_for_disk(&content);
         (!had_errors).then_some(encoded)
     }
@@ -5233,9 +5575,72 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.archive = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
         self.hex = None;
         self.log = Some(view);
         self.status = format!("Opened {} as a rendered log", path.display());
+        Ok(())
+    }
+
+    /// The file's (mtime, length) when this tab last matched disk; `None` for
+    /// a buffer with no file behind it.
+    pub fn disk_stamp(&self) -> Option<(SystemTime, u64)> {
+        self.disk_stamp
+    }
+
+    /// Open `path` in the SARIF results viewer (#577). Fails with the
+    /// loader's explanation (position of a JSON error, an unsupported
+    /// version) so the caller can fall back to text and say why.
+    pub fn open_sarif(&mut self, path: &Path) -> Result<()> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > crate::sarif::view::MAX_LOG_BYTES {
+            anyhow::bail!("SARIF log too large to load ({} bytes)", meta.len());
+        }
+        let bytes = std::fs::read(path)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let log = crate::sarif::load::parse_log(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let view = crate::sarif::view::SarifView::open(path, log);
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        self.encoding_loss = false;
+        self.lossy_save_armed = false;
+        self.lines = vec![String::new()];
+        // The map described the text this swap replaced (#349); a viewer's
+        // placeholder line was written by no seat, and a save from the
+        // viewer must not persist the old map against the new bytes.
+        self.provenance = crate::provenance::Provenance::new();
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.lang = None;
+        self.scroll = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.dirty = false;
+        self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit_kind = None;
+        self.highlights = vec![Vec::new()];
+        // Same supersede-every-other-kind reset the other preview openers do.
+        self.diff = None;
+        self.merge = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        self.image = None;
+        self.sheet = None;
+        self.markdown_preview = None;
+        self.archive = None;
+        self.hex = None;
+        self.log = None;
+        let n = view.entries.len();
+        self.sarif = Some(view);
+        self.status = format!(
+            "Opened {} · {n} SARIF result{}",
+            path.display(),
+            if n == 1 { "" } else { "s" }
+        );
         Ok(())
     }
 
@@ -5335,6 +5740,9 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.archive = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
         // The render dispatch checks `log` BEFORE `hex`, so a stale log would
         // keep painting after "Reopen as Hex" reported success.
         self.log = None;
@@ -5423,7 +5831,13 @@ impl Editor {
                     Some(d) => d,
                     None => anyhow::bail!("No worksheet"),
                 };
-                let bytes = crate::sheet::serialize_delimited(data, delim);
+                // The file's own line ending, read from its first line.
+                let crlf = std::fs::read(&path).is_ok_and(|b| {
+                    b.iter()
+                        .position(|&c| c == b'\n')
+                        .is_some_and(|i| i > 0 && b[i - 1] == b'\r')
+                });
+                let bytes = crate::sheet::serialize_delimited(data, delim, crlf);
                 std::fs::write(&path, &bytes)
                     .map_err(|e| anyhow::anyhow!("Sheet save failed: {e}"))?;
                 view.dirty = false;
@@ -5548,9 +5962,8 @@ impl Editor {
                 return false;
             }
         };
-        let (pixel_w, pixel_h) = match image::load_from_memory(&bytes) {
-            Ok(img) => (img.width(), img.height()),
-            Err(_) => return false,
+        let Some((pixel_w, pixel_h)) = image_dimensions_of(&bytes) else {
+            return false;
         };
         image.bytes = bytes;
         image.generation = next_image_generation();
@@ -5632,7 +6045,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables) = crate::markdown::render_markdown_full(
+        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
@@ -5641,6 +6054,7 @@ impl Editor {
         );
         if let Some(md) = self.markdown_preview.as_mut() {
             md.lines = lines;
+            md.source_map = source_map;
             md.images = images;
             md.runnables = runnables;
             md.built_seq = self.edit_seq;
@@ -5862,7 +6276,10 @@ impl Editor {
         let colors_same_file = self.color_path.as_deref() == self.path.as_deref();
         let hints_live = same_file && !self.inlay_hints.is_empty();
         let colors_live = colors_same_file && !self.color_infos.is_empty();
-        if !hints_live && !colors_live {
+        let steps_live = self.step_path.is_some()
+            && self.step_path.as_deref() == self.path.as_deref()
+            && !self.step_marks.is_empty();
+        if !hints_live && !colors_live && !steps_live {
             self.inlay_spans = Vec::new();
             return;
         }
@@ -5892,10 +6309,34 @@ impl Editor {
                 ));
             }
         }
+        // SARIF analysis steps (#577): after the line's own text.
+        if steps_live {
+            for (line, label) in &self.step_marks {
+                let Some(text) = self.lines.get(*line) else {
+                    continue;
+                };
+                spans[*line].push((
+                    text.chars().count(),
+                    format!("  \u{25c2} {label}"),
+                    Some(STEP_MARK_COLOR),
+                ));
+            }
+        }
         for line in &mut spans {
             line.sort_by_key(|(c, _, _)| *c);
         }
         self.inlay_spans = spans;
+    }
+
+    /// Show the selected SARIF result's analysis steps that lie in `path`
+    /// (#577), or none. A tab showing another file draws nothing.
+    pub fn set_step_marks(&mut self, path: Option<PathBuf>, marks: Vec<(usize, String)>) {
+        if self.step_path == path && self.step_marks == marks {
+            return;
+        }
+        self.step_path = path;
+        self.step_marks = marks;
+        self.recompute_inlay_spans();
     }
 
     /// Inlay hints of logical line `line`, or nothing in wrap mode: the
@@ -5907,6 +6348,11 @@ impl Editor {
             return &[];
         }
         self.inlay_spans.get(line).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    #[cfg(test)]
+    pub fn inlay_spans_for_test(&self, line: usize) -> &[(usize, String, Option<Color>)] {
+        self.row_inlay_spans(line)
     }
 
     /// The buffer text to key a semantic-token cache entry on, but only when
@@ -6051,7 +6497,12 @@ impl Editor {
     /// Markdown: Toggle Preview (Cmd/Ctrl+Shift+V). Returns false when the
     /// active tab is not a Markdown text buffer (the caller reports why).
     pub fn toggle_markdown_preview(&mut self) -> bool {
-        if self.markdown_preview.take().is_some() {
+        if let Some(md) = self.markdown_preview.take() {
+            // Back to the source where the preview was (#619).
+            if let Some(line) = md.source_line_at_top() {
+                self.scroll = line.min(self.lines.len().saturating_sub(1));
+                self.scroll_sub = 0;
+            }
             return true;
         }
         let is_notebook = self
@@ -6074,13 +6525,15 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables) = crate::markdown::render_markdown_full(
+        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
             base.as_deref(),
             self.md_outputs.clone(),
         );
+        // Open where the source is scrolled (#619).
+        let scroll_to_source = Some(self.scroll);
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -6097,6 +6550,9 @@ impl Editor {
             notebook: false,
             doc_path: None,
             media: false,
+            source_map,
+            row_of_line: Vec::new(),
+            scroll_to_source,
         });
         true
     }
@@ -6114,12 +6570,13 @@ impl Editor {
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let scratch = std::env::temp_dir().join("croft-notebook-outputs");
-        let Some((lines, images)) = crate::notebook::render(
+        let Some((lines, images, runnables)) = crate::notebook::render(
             &text,
             self.theme,
             &mut self.registry,
             base.as_deref(),
             &scratch,
+            &self.notebook_running,
         ) else {
             return false;
         };
@@ -6132,13 +6589,16 @@ impl Editor {
             built_seq: self.edit_seq,
             images,
             anchor_rows: Vec::new(),
-            runnables: Vec::new(),
+            runnables,
             run_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: Rect::default(),
             notebook: true,
             doc_path: None,
             media: false,
+            source_map: Vec::new(),
+            row_of_line: Vec::new(),
+            scroll_to_source: None,
         });
         true
     }
@@ -6334,6 +6794,38 @@ impl Editor {
         true
     }
 
+    /// [`Self::apply_span_edits`] for text another seat wrote (#349): the line
+    /// provenance map is spliced edit by edit, bottom-up like the edits, so
+    /// rows below a multi-line insertion keep their own seats, and the rows
+    /// each edit wrote are credited to `seat`. One undo step.
+    pub fn apply_span_edits_as(
+        &mut self,
+        edits: &[TextSpanEdit],
+        seat: crate::provenance::Seat,
+    ) -> usize {
+        if edits.is_empty() {
+            return 0;
+        }
+        self.pin_on_edit();
+        self.push_undo(EditKind::Paste);
+        let n = apply_span_edits_to_lines(&mut self.lines, edits);
+        if n > 0 {
+            let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
+            order.sort_by_key(|e| std::cmp::Reverse(e.start));
+            for e in order {
+                let removed = e.end.0.saturating_sub(e.start.0) + 1;
+                let added = e.new_text.matches('\n').count() + 1;
+                self.provenance.splice(e.start.0, removed, added);
+                self.provenance
+                    .record(e.start.0..e.start.0 + added, seat.clone());
+            }
+            self.provenance.truncate(self.lines.len());
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+        }
+        n
+    }
+
     /// Apply LSP rename edits to this buffer in-memory as a single undo step,
     /// marking the tab dirty (the user saves to persist). Returns the number
     /// of edits applied.
@@ -6426,12 +6918,14 @@ impl Editor {
         // in when the file carries one, returning what it actually used. Take
         // that, or the buffer would hold text decoded one way while claiming to
         // be another — and the save would then re-encode it wrongly.
-        let (decoded, used, _) = enc.decode(&bytes);
+        let (decoded, used, decode_lossy) = enc.decode(&bytes);
         let text = decoded.into_owned();
         self.encoding = used;
+        self.decode_lossy = decode_lossy;
         // Re-sniff against the bytes just read: reinterpreting the file under a
         // new encoding must not carry the previous one's BOM answer over.
         self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
+        self.final_newline = text.ends_with(['\n', '\r']);
         self.eol = if text.contains("\r\n") {
             LineEnding::Crlf
         } else {
@@ -6517,7 +7011,10 @@ impl Editor {
         // One bookmark sync for the whole paste, diffed against the text
         // `push_undo` recorded above, not one per character.
         self.bookmark_sync_paused = true;
-        for c in s.chars() {
+        // CRLF and bare CR are line breaks too: only `\n` was, so a paste
+        // from Windows text (or a terminal sending CR) left a raw `\r` inside
+        // lines, which a save then wrote as `\r\r\n`.
+        for c in normalize_newlines(s).chars() {
             if c == '\n' {
                 self.insert_newline_raw();
             } else {
@@ -6626,6 +7123,7 @@ impl Editor {
             self.snippet = Some(SnippetSession {
                 anchor: (first.0, first.1),
                 cur_len: first.2,
+                cur_text: self.span_text(first.0, first.1, first.2),
                 stops: abs,
             });
         }
@@ -6644,6 +7142,17 @@ impl Editor {
         if self.cursor_row == sess.anchor.0 {
             let typed = self.cursor_col as isize - sess.anchor.1 as isize;
             let shift = typed - sess.cur_len as isize;
+            let now = self.span_text(sess.anchor.0, sess.anchor.1, typed.max(0) as usize);
+            if now != sess.cur_text {
+                // Stops nested inside the placeholder just replaced
+                // (`${1:foo(${2:x})}`) name text that is gone: drop them, or
+                // the next Tab selects whatever now sits at their offset,
+                // a same-length replacement included.
+                let after = sess.anchor.1 + sess.cur_len;
+                let anchor = sess.anchor;
+                sess.stops
+                    .retain(|s| !(s.0 == anchor.0 && s.1 >= anchor.1 && s.1 < after));
+            }
             if shift != 0 {
                 let after = sess.anchor.1 + sess.cur_len;
                 for s in sess.stops.iter_mut() {
@@ -6660,9 +7169,18 @@ impl Editor {
         if !sess.stops.is_empty() {
             sess.anchor = (next.0, next.1);
             sess.cur_len = next.2;
+            sess.cur_text = self.span_text(next.0, next.1, next.2);
             self.snippet = Some(sess);
         }
         true
+    }
+
+    /// `len` chars of row `row` from char column `col`, clamped to the line.
+    fn span_text(&self, row: usize, col: usize, len: usize) -> String {
+        self.lines
+            .get(row)
+            .map(|l| l.chars().skip(col).take(len).collect())
+            .unwrap_or_default()
     }
 
     /// Move the caret to a resolved tab stop, selecting its placeholder text so
@@ -6757,6 +7275,9 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        if self.at_symbol_edge(false) {
+            return;
+        }
         self.pin_on_edit();
         self.push_undo(EditKind::Backspace);
         // Between an empty auto-close pair, backspace eats both sides —
@@ -6787,7 +7308,7 @@ impl Editor {
     /// Backspace body without snapshotting or re-highlighting. Callers that
     /// batch multiple edits (multi-cursor) snapshot once and recompute once.
     fn backspace_raw(&mut self) {
-        if self.delete_selection_inner() {
+        if self.delete_selection_inner() || self.at_symbol_edge(false) {
             return;
         }
         if self.cursor_col > 0 {
@@ -6808,6 +7329,9 @@ impl Editor {
     }
 
     pub fn delete_forward(&mut self) {
+        if self.at_symbol_edge(true) {
+            return;
+        }
         self.pin_on_edit();
         self.push_undo(EditKind::DeleteForward);
         self.delete_forward_raw();
@@ -6816,7 +7340,7 @@ impl Editor {
 
     /// Forward-delete body without snapshotting or re-highlighting.
     fn delete_forward_raw(&mut self) {
-        if self.delete_selection_inner() {
+        if self.delete_selection_inner() || self.at_symbol_edge(true) {
             return;
         }
         let row = self.cursor_row;
@@ -6830,6 +7354,24 @@ impl Editor {
             let next = self.lines.remove(row + 1);
             self.lines[row].push_str(&next);
             self.mark_buffer_changed();
+        }
+    }
+
+    /// On a symbol tab, true when a bare Backspace (`forward` false) or
+    /// Delete would join the symbol's first or last line with a line outside
+    /// the tab: the caret sits on the clip's first character or after its
+    /// last, with no selection to delete instead.
+    fn at_symbol_edge(&self, forward: bool) -> bool {
+        let Some((first, end)) = self.symbol_clip() else {
+            return false;
+        };
+        if self.selection.is_some_and(|s| s.has_area()) {
+            return false;
+        }
+        if forward {
+            self.cursor_row + 1 == end && self.cursor_col >= self.line_char_len(end - 1)
+        } else {
+            self.cursor_row == first && self.cursor_col == 0
         }
     }
 
@@ -6864,7 +7406,9 @@ impl Editor {
             return 0;
         }
         let mut occ: Vec<EditorSelection> = Vec::new();
-        for (row, line) in self.lines.iter().enumerate() {
+        // A symbol tab matches only inside its symbol.
+        let (lo, hi) = self.symbol_clip().unwrap_or((0, self.lines.len()));
+        for (row, line) in self.lines.iter().enumerate().take(hi).skip(lo) {
             let chars: Vec<char> = line.chars().collect();
             for col in find_word_occurrences(&chars, &word) {
                 occ.push(EditorSelection {
@@ -6936,7 +7480,9 @@ impl Editor {
         // Every occurrence in document order, and the set already selected
         // (the primary plus each existing caret), keyed by its start.
         let mut occ: Vec<(usize, usize)> = Vec::new();
-        for (row, line) in self.lines.iter().enumerate() {
+        // A symbol tab matches only inside its symbol.
+        let (lo, hi) = self.symbol_clip().unwrap_or((0, self.lines.len()));
+        for (row, line) in self.lines.iter().enumerate().take(hi).skip(lo) {
             let chars: Vec<char> = line.chars().collect();
             for col in find_word_occurrences(&chars, &word) {
                 occ.push((row, col));
@@ -7006,8 +7552,12 @@ impl Editor {
         // Clear so the per-caret raw ops can't see stale carets.
         self.carets.clear();
 
-        let mut new_primary = (self.cursor_row, self.cursor_col);
-        let mut new_secondary: Vec<(usize, usize)> = Vec::new();
+        // Each caret's place, kept as (rows from the bottom, chars from its
+        // line's end): the later edits happen above or to the left of it, and
+        // leave everything after it untouched, so those two stay true where a
+        // plain (row, col) goes stale on its row (`abcd` with carets at 1 and
+        // 3, typing X then Y, gave `aXYbcYXd`).
+        let mut placed: Vec<(bool, usize, usize)> = Vec::new();
         for (is_primary, sel) in items {
             if sel.has_area() {
                 self.selection = Some(sel);
@@ -7018,19 +7568,38 @@ impl Editor {
             self.cursor_row = sel.head.0.min(last);
             self.cursor_col = sel.head.1.min(self.line_char_len(self.cursor_row));
             self.apply_caret_edit_raw(edit);
-            let pos = (self.cursor_row, self.cursor_col);
+            let from_bottom = self.lines.len().saturating_sub(1) - self.cursor_row;
+            let from_end = self
+                .line_char_len(self.cursor_row)
+                .saturating_sub(self.cursor_col);
+            placed.push((is_primary, from_bottom, from_end));
+        }
+
+        self.selection = None;
+        let last = self.lines.len().saturating_sub(1);
+        let resolve = |this: &Self, from_bottom: usize, from_end: usize| {
+            let row = last.saturating_sub(from_bottom);
+            (row, this.line_char_len(row).saturating_sub(from_end))
+        };
+        let mut new_primary = (self.cursor_row, self.cursor_col);
+        let mut new_secondary: Vec<(usize, usize)> = Vec::new();
+        for (is_primary, from_bottom, from_end) in placed {
+            let pos = resolve(self, from_bottom, from_end);
             if is_primary {
                 new_primary = pos;
             } else {
                 new_secondary.push(pos);
             }
         }
-
-        self.selection = None;
-        let last = self.lines.len().saturating_sub(1);
         self.cursor_row = new_primary.0.min(last);
         self.cursor_col = new_primary.1.min(self.line_char_len(self.cursor_row));
+        // Carets an edit brought together are one caret from here on: kept
+        // apart, the next key edited the same spot twice (one Backspace
+        // deleting two line breaks).
+        let primary = (self.cursor_row, self.cursor_col);
         new_secondary.sort_unstable();
+        new_secondary.dedup();
+        new_secondary.retain(|&p| p != primary);
         self.carets = new_secondary
             .into_iter()
             .map(|(r, c)| EditorSelection::new(r, c))
@@ -7917,6 +8486,43 @@ impl Editor {
         }
     }
 
+    /// The inline suggestion (#607) when it still applies: the caret where it
+    /// was asked for and no edit since.
+    pub fn live_ghost(&self) -> Option<&str> {
+        let (row, col, seq, text) = self.ghost.as_ref()?;
+        (*row == self.cursor_row && *col == self.cursor_col && *seq == self.edit_seq)
+            .then_some(text.as_str())
+    }
+
+    /// Indices of the code lenses on 0-based `line` whose line still reads
+    /// as it did when they arrived (#608).
+    pub fn lenses_on_line(&self, line: usize) -> Vec<usize> {
+        let Some(text) = self.lines.get(line) else {
+            return Vec::new();
+        };
+        self.code_lenses
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.line == line && &l.line_text == text)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The code lens painted under screen cell `(col, row)` this frame.
+    pub fn code_lens_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.code_lens_spans
+            .iter()
+            .find(|(y, xs, _)| *y == row && xs.contains(&col))
+            .map(|(_, _, idx)| *idx)
+    }
+
+    /// Live Run's trailer for 0-based `line`, when the line still reads as
+    /// it did in the run that produced it.
+    fn live_note(&self, line: usize) -> Option<&crate::live_run::Note> {
+        let text = self.lines.get(line)?;
+        self.live_run.as_ref()?.note(line, text)
+    }
+
     /// Column distance between indentation guides: the indent width for
     /// space-indented buffers, one column for tab indentation (a leading tab
     /// occupies a single cell, so each tab is one nesting level).
@@ -8032,6 +8638,8 @@ impl Editor {
     /// already inside the span being built is skipped: an inner fold's range is
     /// contained by its outer's, so it can add nothing.
     fn rebuild_hidden_ranges(&mut self) {
+        // Hidden lines take no wrap rows, so the cached totals change too.
+        self.wrap_total_cache.clear();
         #[cfg(test)]
         FOLD_RANGE_REBUILDS.with(|c| c.set(c.get() + 1));
         let mut out: Vec<(usize, usize)> = Vec::new();
@@ -8046,6 +8654,34 @@ impl Editor {
             }
         }
         self.hidden_ranges = out;
+    }
+
+    /// Drop every fold that touches rows `start..=end`, before an edit that
+    /// reorders those rows without changing the line count. Folds are line
+    /// numbers and are only reset when the count changes, so after Move Line
+    /// or Sort Lines a fold kept hiding the same numbers over different text.
+    fn forget_folds_in(&mut self, start: usize, end: usize) {
+        if self.folded.is_empty() {
+            return;
+        }
+        let touched: Vec<usize> = self
+            .folded
+            .iter()
+            .copied()
+            .filter(|&h| {
+                (start..=end).contains(&h)
+                    || self
+                        .fold_range(h)
+                        .is_some_and(|(s, e)| s <= end && e >= start)
+            })
+            .collect();
+        if touched.is_empty() {
+            return;
+        }
+        for h in touched {
+            self.folded.remove(&h);
+        }
+        self.rebuild_hidden_ranges();
     }
 
     /// Unfold whatever collapsed region the cursor is sitting inside. Movement
@@ -8146,8 +8782,14 @@ impl Editor {
     }
 
     fn snapshot(&self) -> Snapshot {
+        let lines = self.lines.clone();
+        let bytes = lines
+            .iter()
+            .map(|l| l.capacity() + std::mem::size_of::<String>())
+            .sum();
         Snapshot {
-            lines: self.lines.clone(),
+            lines,
+            bytes,
             cursor_row: self.cursor_row,
             cursor_col: self.cursor_col,
             selection: self.selection,
@@ -8156,6 +8798,30 @@ impl Editor {
             save_seq: self.save_seq,
             provenance: self.provenance.clone(),
         }
+    }
+
+    /// Drop the oldest undo steps past [`UNDO_STACK_LIMIT`] steps or
+    /// [`UNDO_BYTES_LIMIT`] bytes, keeping at least [`UNDO_MIN_STEPS`].
+    fn trim_undo_stack(&mut self) {
+        let mut total: usize = self.undo_stack.iter().map(|s| s.bytes).sum();
+        let mut drop = 0;
+        while self.undo_stack.len() - drop > UNDO_MIN_STEPS
+            && (self.undo_stack.len() - drop > UNDO_STACK_LIMIT || total > UNDO_BYTES_LIMIT)
+        {
+            total -= self.undo_stack[drop].bytes;
+            drop += 1;
+        }
+        self.undo_stack.drain(..drop);
+    }
+
+    /// Undo and redo steps held, and the bytes of text they hold, for the
+    /// memory report (#694).
+    pub fn undo_history_size(&self) -> (usize, usize) {
+        let steps = self.undo_stack.iter().chain(&self.redo_stack);
+        (
+            self.undo_stack.len() + self.redo_stack.len(),
+            steps.map(|s| s.bytes).sum(),
+        )
     }
 
     /// Push an undo entry tagged with the kind of edit about to happen.
@@ -8174,9 +8840,9 @@ impl Editor {
             kind == EditKind::InsertChar && self.last_edit_kind == Some(EditKind::InsertChar);
         if !coalesce {
             self.undo_stack.push(self.snapshot());
-            if self.undo_stack.len() > UNDO_STACK_LIMIT {
-                self.undo_stack.remove(0);
-            }
+            self.trim_undo_stack();
+            self.undo_step_id = next_undo_step_id();
+            self.mirrored_step = None;
         }
         // A fresh edit branches history: whatever was undone can no longer be
         // redone (VS Code's model). Cleared even on a coalesced keystroke so a
@@ -8193,6 +8859,7 @@ impl Editor {
         // Stash the pre-undo state so `redo` can reinstate it.
         self.redo_stack.push(self.snapshot());
         self.restore_snapshot(snap);
+        self.undo_step_id = next_undo_step_id();
         true
     }
 
@@ -8205,6 +8872,7 @@ impl Editor {
         };
         self.undo_stack.push(self.snapshot());
         self.restore_snapshot(snap);
+        self.undo_step_id = next_undo_step_id();
         true
     }
 
@@ -8349,7 +9017,13 @@ impl Editor {
         // second render after the open left a window where that render's
         // transient failure lost the reader's place (#72).
         self.pdf_restore_page = self.pdf_page().filter(|&p| p > 1);
+        // A SARIF viewer keeps the reader's place, and the logs added to
+        // it, across a rewrite of its log (#577).
+        let old_sarif = self.sarif.take();
         let result = self.open(&path);
+        if let (Some(old), Some(view)) = (old_sarif.as_ref(), self.sarif.as_mut()) {
+            view.carry_from(old);
+        }
         // Cleared even when the open bailed before reaching `open_pdf`, so
         // the request can never leak into an unrelated later open.
         self.pdf_restore_page = None;
@@ -8521,6 +9195,16 @@ impl Editor {
         out
     }
 
+    /// The text a save writes: the lines joined with the file's EOL, and
+    /// the final newline the file had. An emptied buffer writes nothing.
+    fn content_for_disk(&self) -> String {
+        let mut content = self.lines.join(self.eol.sequence());
+        if self.final_newline && !content.is_empty() {
+            content.push_str(self.eol.sequence());
+        }
+        content
+    }
+
     fn write_buffer_to_disk(&mut self) -> Result<SaveOutcome> {
         // Preview tabs (image/PDF, sheet, diff, hex) hold the whole-
         // buffer-swap PLACEHOLDER in `lines`, not the file's content:
@@ -8536,16 +9220,20 @@ impl Editor {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No file open"))?
             .clone();
-        let content = self.lines.join(self.eol.sequence());
+        let content = self.content_for_disk();
         let (encoded, had_errors) = self.encode_for_disk(&content);
         // The single choke point every save funnels through, so no caller can
         // route around the guard. The consent flag survives a failed write
         // (the user still consented) and is cleared only once the bytes land.
-        if had_errors && !self.lossy_save_armed {
+        // The decode's replacement characters are only a loss while they are
+        // still in the text: a buffer rewritten past them saves freely.
+        let writes_replacements = self.decode_lossy && content.contains('\u{fffd}');
+        if (had_errors || writes_replacements) && !self.lossy_save_armed {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
         }
         std::fs::write(&path, encoded)?;
+        self.decode_lossy = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.dirty = false;
@@ -8646,8 +9334,11 @@ impl Editor {
         self.push_undo(EditKind::DeleteLines);
         self.clear_selection();
         let n = count.max(1);
-        let start = self.cursor_row;
-        let end = (start + n).min(self.lines.len());
+        // On a symbol tab the lines deleted stay inside the symbol: a count
+        // stops at its last line, and a caret above it starts at its first.
+        let (first, limit) = self.symbol_clip().unwrap_or((0, self.lines.len()));
+        let start = self.cursor_row.max(first);
+        let end = (start + n).min(limit).max(start + 1).min(self.lines.len());
         let yanked = self.lines_slice_text(start, end - start);
         self.lines.drain(start..end);
         if self.lines.is_empty() {
@@ -8858,6 +9549,105 @@ impl Editor {
         self.recompute_highlights();
     }
 
+    /// Take a sibling's text, replacing only the lines that differ so a
+    /// caret or selection below the change moves with its line rather than
+    /// staying on a row number that now holds different text.
+    ///
+    /// `source_step` is the sibling's [`Self::undo_step_id`]: edits it made
+    /// within one of its undo steps (a typing burst) fold into one step
+    /// here, so undo in this tab walks back as far as it would there.
+    /// `source_caret` is where the sibling's caret sits after the edit.
+    /// Returns whether the text changed.
+    pub fn mirror_lines_from(
+        &mut self,
+        new_lines: &[String],
+        source_step: u64,
+        source_caret: (usize, usize),
+    ) -> bool {
+        if self.lines == new_lines || new_lines.is_empty() {
+            return false;
+        }
+        let prefix = self
+            .lines
+            .iter()
+            .zip(new_lines)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let room = self.lines.len().min(new_lines.len()) - prefix;
+        let suffix = self
+            .lines
+            .iter()
+            .rev()
+            .zip(new_lines.iter().rev())
+            .take(room)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let old_end = self.lines.len() - suffix;
+        let new_end = new_lines.len() - suffix;
+        self.pin_on_edit();
+        if self.mirrored_step == Some(source_step) {
+            self.seed_bookmark_shadow();
+            self.redo_stack.clear();
+        } else {
+            self.push_undo(EditKind::Replace);
+            self.mirrored_step = Some(source_step);
+        }
+        // A selection clear of the changed lines survives, moving with its
+        // lines; one touching them is cleared.
+        let shift = |row: usize| row + new_end - old_end;
+        if let Some(sel) = self.selection.as_mut() {
+            let (lo, hi) = (sel.anchor.0.min(sel.head.0), sel.anchor.0.max(sel.head.0));
+            if lo >= old_end {
+                sel.anchor.0 = shift(sel.anchor.0);
+                sel.head.0 = shift(sel.head.0);
+            } else if hi >= prefix {
+                self.selection = None;
+            }
+        }
+        // Extra carets follow the same rule as the selection.
+        self.carets.retain_mut(|c| {
+            let (lo, hi) = (c.anchor.0.min(c.head.0), c.anchor.0.max(c.head.0));
+            if lo >= old_end {
+                c.anchor.0 = shift(c.anchor.0);
+                c.head.0 = shift(c.head.0);
+                true
+            } else {
+                hi < prefix
+            }
+        });
+        self.mirror_caret = Some(source_caret);
+        self.lines
+            .splice(prefix..old_end, new_lines[prefix..new_end].iter().cloned());
+        if self.cursor_row >= old_end {
+            self.cursor_row = shift(self.cursor_row);
+        }
+        self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        true
+    }
+
+    /// Start a fresh tab from a sibling's unsaved text, without an undo step:
+    /// the tab never held the disk text as far as the user can tell, so
+    /// undo must not walk back to it.
+    pub fn seed_unsaved(&mut self, lines: Vec<String>, dirty: bool) {
+        self.lines = lines;
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.mark_buffer_changed();
+        self.dirty = dirty;
+        self.recompute_highlights();
+    }
+
+    /// Record that this buffer matches the file on disk: a sibling holding
+    /// the same text was just saved (or undone back to its saved state).
+    pub fn mark_clean_like_sibling(&mut self) {
+        self.dirty = false;
+        self.mark_synced_with_disk();
+    }
+
     fn lines_slice_text(&self, start: usize, count: usize) -> String {
         if count == 0 || start >= self.lines.len() {
             return String::new();
@@ -8930,6 +9720,9 @@ impl Editor {
     /// step via the dedicated `EditKind::DuplicateLines`.
     pub fn duplicate_lines_down(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
+        // A single-caret command: extra carets would be left pointing at
+        // rows and columns the edit moved.
+        self.carets.clear();
         let (start_row, end_row) = self.selected_or_cursor_row_range();
         let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
         let block_len = block.len();
@@ -8953,6 +9746,7 @@ impl Editor {
     /// it started at (the original is pushed down by `block_len`).
     pub fn duplicate_lines_up(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
+        self.carets.clear();
         let (start_row, end_row) = self.selected_or_cursor_row_range();
         let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
         for (i, line) in block.into_iter().enumerate() {
@@ -9009,10 +9803,14 @@ impl Editor {
     /// No-op when the block already touches the last line.
     pub fn move_lines_down(&mut self) {
         let (start, end) = self.selected_or_cursor_row_range();
-        if end + 1 >= self.lines.len() {
+        // A symbol tab's block stops at the symbol's last line.
+        let limit = self.symbol_clip().map_or(self.lines.len(), |(_, e)| e);
+        if end + 1 >= limit {
             return;
         }
         self.push_undo(EditKind::MoveLines);
+        self.carets.clear();
+        self.forget_folds_in(start, end + 1);
         self.lines[start..=end + 1].rotate_right(1);
         self.cursor_row += 1;
         if let Some(sel) = self.selection.as_mut() {
@@ -9028,10 +9826,12 @@ impl Editor {
     /// when the block already touches the first line.
     pub fn move_lines_up(&mut self) {
         let (start, end) = self.selected_or_cursor_row_range();
-        if start == 0 {
+        if start <= self.symbol_clip().map_or(0, |(first, _)| first) {
             return;
         }
         self.push_undo(EditKind::MoveLines);
+        self.carets.clear();
+        self.forget_folds_in(start - 1, end);
         self.lines[start - 1..=end].rotate_left(1);
         self.cursor_row -= 1;
         if let Some(sel) = self.selection.as_mut() {
@@ -9061,6 +9861,7 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
+        self.carets.clear();
         let all_commented = non_blank
             .iter()
             .all(|&r| self.lines[r].trim_start().starts_with(token));
@@ -9116,6 +9917,7 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
+        self.carets.clear();
         let wrapped = trimmed.starts_with(open)
             && trimmed.ends_with(close)
             && trimmed.len() >= open.len() + close.len();
@@ -9126,10 +9928,26 @@ impl Editor {
         } else {
             format!("{open} {trimmed} {close}")
         };
-        self.replace_char_range(start, end, &new);
+        // Only the trimmed core is replaced: the whitespace around it (the
+        // line's indent, and the line break a whole-line selection ends
+        // with) stays as it was. Replacing the whole range joined the next
+        // line into this one and dropped the indent.
+        let lead = &text[..text.len() - text.trim_start().len()];
+        let trail = &text[text.trim_end().len()..];
+        let before = format!("{lead}{new}");
+        self.replace_char_range(start, end, &format!("{before}{trail}"));
         self.selection = None;
-        self.cursor_row = start.0;
-        self.cursor_col = self.line_char_len(start.0);
+        // The caret lands just after the (un)commented text.
+        match before.rsplit_once('\n') {
+            Some((head, tail)) => {
+                self.cursor_row = start.0 + head.matches('\n').count() + 1;
+                self.cursor_col = tail.chars().count();
+            }
+            None => {
+                self.cursor_row = start.0;
+                self.cursor_col = start.1 + before.chars().count();
+            }
+        }
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -9143,10 +9961,12 @@ impl Editor {
     pub fn join_lines(&mut self) {
         let (start, end) = self.selected_or_cursor_row_range();
         let last = if start == end { start + 1 } else { end };
-        if last >= self.lines.len() {
+        // A symbol tab's last line has nothing below it to join.
+        if last >= self.symbol_clip().map_or(self.lines.len(), |(_, e)| e) {
             return;
         }
         self.push_undo(EditKind::JoinLines);
+        self.carets.clear();
         let mut result = self.lines[start].trim_end().to_string();
         let cursor_col = result.chars().count();
         for line in &self.lines[start + 1..=last] {
@@ -9183,6 +10003,7 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::TransformCase);
+        self.carets.clear();
         let new = match kind {
             CaseTransform::Upper => text.to_uppercase(),
             CaseTransform::Lower => text.to_lowercase(),
@@ -9209,12 +10030,21 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::SortLines);
+        self.carets.clear();
         let mut block: Vec<String> = self.lines[start..=end].to_vec();
         block.sort();
         if !ascending {
             block.reverse();
         }
         self.lines.splice(start..=end, block);
+        // The rows changed under the cursor and selection: a column past the
+        // new line's end made the next word motion index out of bounds.
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        if let Some(sel) = self.selection.as_mut() {
+            sel.anchor.1 = sel.anchor.1.min(self.lines[sel.anchor.0].chars().count());
+            sel.head.1 = sel.head.1.min(self.lines[sel.head.0].chars().count());
+        }
+        self.forget_folds_in(start, end);
         self.mark_buffer_changed();
         self.recompute_highlights();
     }
@@ -9231,6 +10061,7 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::TrimWhitespace);
+        self.carets.clear();
         for line in &mut self.lines {
             let trimmed_len = line.trim_end_matches([' ', '\t']).len();
             line.truncate(trimmed_len);
@@ -9286,7 +10117,10 @@ impl Editor {
             // element IS the final newline. An empty buffer is left alone:
             // a zero-byte file has no last line to terminate.
             let empty_buffer = self.lines.len() == 1 && self.lines[0].is_empty();
-            if !empty_buffer && !self.lines.last().is_some_and(String::is_empty) {
+            if !empty_buffer
+                && !self.final_newline
+                && !self.lines.last().is_some_and(String::is_empty)
+            {
                 self.push_undo(EditKind::InsertFinalNewline);
                 self.lines.push(String::new());
                 self.mark_buffer_changed();
@@ -9554,6 +10388,7 @@ impl Editor {
         // open reuses it and the bump is lost with it.
         self.pin_on_edit();
         self.push_undo(EditKind::BumpNumber);
+        self.carets.clear();
         // Never coalesce: a run of bumps must undo one at a time, the way
         // holding Ctrl-A in vim does.
         self.last_edit_kind = None;
@@ -9802,7 +10637,7 @@ impl Editor {
             .max()
             .unwrap_or(self.cursor_row);
         let target = max_row + 1;
-        if target >= self.lines.len() {
+        if target >= self.symbol_clip().map_or(self.lines.len(), |(_, end)| end) {
             return;
         }
         let col = self.cursor_col.min(self.line_char_len(target));
@@ -9925,7 +10760,7 @@ impl Editor {
             .chain(std::iter::once(self.cursor_row))
             .min()
             .unwrap_or(self.cursor_row);
-        if min_row == 0 {
+        if min_row <= self.symbol_clip().map_or(0, |(first, _)| first) {
             return;
         }
         let target = min_row - 1;
@@ -10078,6 +10913,7 @@ impl Editor {
     pub fn move_word_left(&mut self) {
         loop {
             let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+            self.cursor_col = self.cursor_col.min(chars.len());
             while self.cursor_col > 0 && !is_word_char(chars[self.cursor_col - 1]) {
                 self.cursor_col -= 1;
             }
@@ -10266,20 +11102,121 @@ impl Editor {
         }
     }
 
+    /// Turn a symbol tab into an ordinary tab of its whole file: the
+    /// buffer already holds the whole file, so only the clip and the
+    /// mirror state go.
+    pub fn leave_symbol_view(&mut self) {
+        self.symbol_view = None;
+        self.mirror_seq = None;
+        self.mirrored_step = None;
+        self.mirror_caret = None;
+    }
+
+    /// Turn a symbol tab into an ordinary tab of its whole file while its
+    /// text stays in step with its siblings: only the clip and the pending
+    /// caret go, and the mirror state is kept. Callers: only right after a
+    /// mirror pass settled the tab, or on a file a collab session keeps in
+    /// step; a tab reused for other text needs `leave_symbol_view`.
+    pub fn drop_symbol_clip(&mut self) {
+        self.symbol_view = None;
+        self.mirror_caret = None;
+    }
+
+    /// A symbol tab's visible lines as `(first, end)`, `end` exclusive,
+    /// kept inside the buffer. `None` on an ordinary tab.
+    pub fn symbol_clip(&self) -> Option<(usize, usize)> {
+        let v = self.symbol_view.as_ref()?;
+        let end = (v.last + 1).min(self.lines.len()).max(1);
+        Some((v.first.min(end - 1), end))
+    }
+
+    /// The lines find and replace work over, and the row of the first: a
+    /// symbol tab's symbol, or the whole buffer.
+    pub fn find_scope(&self) -> (&[String], usize) {
+        match self.symbol_clip() {
+            Some((first, end)) => (&self.lines[first..end], first),
+            None => (&self.lines, 0),
+        }
+    }
+
+    /// The clip in the scrollbar's units: content rows above it, and rows
+    /// in it. Visual rows when wrapping, else lines plus comment-box rows.
+    fn clip_content_rows(&self, width: usize, wrap: bool) -> Option<(usize, usize)> {
+        let (first, end) = self.symbol_clip()?;
+        let rows = |a: usize, b: usize| -> usize {
+            if wrap {
+                (a..b).map(|l| self.group_visual_rows(l, width)).sum()
+            } else {
+                (b - a) + self.box_rows_between(a, b, width)
+            }
+        };
+        Some((rows(0, first), rows(first, end)))
+    }
+
+    /// Keep a symbol tab's caret, selections and viewport on its symbol's
+    /// lines. Positions above the clip snap to its first character, below
+    /// it to its last, so every motion that would leave the symbol stops at
+    /// its edge instead. Secondary carets outside the clip are dropped
+    /// rather than snapped, and duplicates removed.
+    pub fn clamp_to_symbol_view(&mut self) {
+        let Some((first, end)) = self.symbol_clip() else {
+            return;
+        };
+        let last = end - 1;
+        let last_len = self.line_char_len(last);
+        let clamp = |p: (usize, usize)| -> (usize, usize) {
+            if p.0 < first {
+                (first, 0)
+            } else if p.0 > last {
+                (last, last_len)
+            } else {
+                p
+            }
+        };
+        (self.cursor_row, self.cursor_col) = clamp((self.cursor_row, self.cursor_col));
+        let clamp_sel = |sel: &mut EditorSelection| {
+            sel.anchor = clamp(sel.anchor);
+            sel.head = clamp(sel.head);
+        };
+        if let Some(sel) = self.selection.as_mut() {
+            clamp_sel(sel);
+        }
+        // A secondary caret outside the symbol is dropped, not clamped:
+        // clamped, several would stack on one edge and each type there.
+        self.carets.retain(|c| (first..=last).contains(&c.head.0));
+        self.carets.iter_mut().for_each(clamp_sel);
+        let primary = self
+            .selection
+            .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
+        let mut seen = vec![primary];
+        self.carets.retain(|c| {
+            let fresh = !seen.contains(c);
+            seen.push(*c);
+            fresh
+        });
+        if self.scroll < first || self.scroll > last {
+            self.scroll = self.scroll.clamp(first, last);
+            self.scroll_sub = 0;
+        }
+    }
+
     pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
         let viewport = self.text_rows();
         if self.wrap_enabled() {
             let width = self.visible_text_width();
-            let total = self.total_visual_rows(width);
+            let (base, total) = match self.clip_content_rows(width, true) {
+                Some(clip) => clip,
+                None => (0, self.total_visual_rows(width)),
+            };
             let Some(metrics) = scrollbar::vertical_metrics(
                 self.last_scrollbar,
                 total,
                 viewport,
-                self.top_visual_row(width),
+                self.top_visual_row(width).saturating_sub(base),
             ) else {
                 return false;
             };
-            self.wrap_set_top(scrollbar::scroll_for_y(metrics, y));
+            self.wrap_set_top(base + scrollbar::scroll_for_y(metrics, y));
             return true;
         }
         // Same content length the render sized the bar with: lines plus
@@ -10287,16 +11224,19 @@ impl Editor {
         // of a short file with a tall navigator comment dead (metrics said
         // "no overflow") and a long file's thumb run away from the pointer.
         let bw = self.visible_text_width();
-        let content = self.lines.len() + self.box_rows_between(0, self.lines.len(), bw);
+        let (base, content) = self.clip_content_rows(bw, false).unwrap_or((
+            0,
+            self.lines.len() + self.box_rows_between(0, self.lines.len(), bw),
+        ));
         let Some(metrics) = scrollbar::vertical_metrics(
             self.last_scrollbar,
             content,
             viewport,
-            self.nonwrap_top_content_row(),
+            self.nonwrap_top_content_row().saturating_sub(base),
         ) else {
             return false;
         };
-        self.nonwrap_set_top(scrollbar::scroll_for_y(metrics, y));
+        self.nonwrap_set_top(base + scrollbar::scroll_for_y(metrics, y));
         true
     }
 
@@ -10345,6 +11285,12 @@ impl Editor {
         Some((start.0, end.0))
     }
 
+    /// The lines the minimap draws, as `(first, end)` with `end` exclusive:
+    /// a symbol tab's symbol (#369), else the whole buffer.
+    pub fn minimap_span(&self) -> (usize, usize) {
+        self.symbol_clip().unwrap_or((0, self.lines.len()))
+    }
+
     /// Move the cursor to `line` and center the viewport on it (minimap click /
     /// drag navigation). The cursor moves too because the render's scroll-follow
     /// snaps the viewport back to keep the caret visible; centering the caret
@@ -10389,17 +11335,21 @@ impl Editor {
             px[2] = bg.2;
             px[3] = 0xff;
         }
-        let total = self.lines.len().max(1) as u64;
-        for (i, line) in self.lines.iter().enumerate() {
+        let (first, end) = self.minimap_span();
+        let total = (end - first).max(1) as u64;
+        for (i, line) in self.lines[first..end].iter().enumerate() {
             let y0 = (i as u64 * content_h as u64 / total) as u32;
             if y0 >= h {
                 break;
             }
             let y1 = (((i as u64 + 1) * content_h as u64 / total) as u32).clamp(y0 + 1, h);
             let merged = merge_overlay(
-                self.highlights.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                self.highlights
+                    .get(first + i)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
                 self.semantic_overlay
-                    .get(i)
+                    .get(first + i)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
             );
@@ -10887,7 +11837,9 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         | Some(LangKind::Tsx)
         | Some(LangKind::Go)
         | Some(LangKind::C)
-        | Some(LangKind::Cpp) => Some("//"),
+        | Some(LangKind::Cpp)
+        | Some(LangKind::Ql)
+        | Some(LangKind::Dbscheme) => Some("//"),
         Some(LangKind::Python)
         | Some(LangKind::Yaml)
         | Some(LangKind::Toml)
@@ -10910,7 +11862,9 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Go)
         | Some(LangKind::C)
         | Some(LangKind::Cpp)
-        | Some(LangKind::Css) => Some(("/*", "*/")),
+        | Some(LangKind::Css)
+        | Some(LangKind::Ql)
+        | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
         Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         // Python has no true block comment; VS Code's language config maps
@@ -11515,6 +12469,8 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::C) => "C",
         Some(LangKind::Cpp) => "C++",
         Some(LangKind::Lua) => "Lua",
+        Some(LangKind::Ql) => "CodeQL",
+        Some(LangKind::Dbscheme) => "CodeQL Database Scheme",
     }
 }
 
@@ -11541,6 +12497,8 @@ pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::C) => "c",
         Some(LangKind::Cpp) => "cpp",
         Some(LangKind::Lua) => "lua",
+        Some(LangKind::Ql) => "ql",
+        Some(LangKind::Dbscheme) => "dbscheme",
     }
 }
 
@@ -11563,6 +12521,8 @@ pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
     LangKind::C,
     LangKind::Cpp,
     LangKind::Lua,
+    LangKind::Ql,
+    LangKind::Dbscheme,
 ];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
@@ -11600,7 +12560,8 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
         | Some(LangKind::Json)
         | Some(LangKind::Go)
         | Some(LangKind::Css)
-        | Some(LangKind::Lua) => matches!(last, '(' | '[' | '{'),
+        | Some(LangKind::Lua)
+        | Some(LangKind::Ql) => matches!(last, '(' | '[' | '{'),
         _ => false,
     }
 }
@@ -11617,6 +12578,7 @@ fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Optio
             | Some(LangKind::Go)
             | Some(LangKind::Css)
             | Some(LangKind::Lua)
+            | Some(LangKind::Ql)
     );
     if !bracket_aware {
         return false;
@@ -11676,7 +12638,7 @@ fn byte_index_of_char(line: &str, chars_in: usize) -> usize {
 /// positions count UTF-16 code units; the editor lays out by character, so a
 /// line containing astral-plane characters (which take two UTF-16 units) needs
 /// this conversion. An offset past the line clamps to the line's char length.
-fn utf16_to_char_col(line: &str, u16_off: u32) -> usize {
+pub(crate) fn utf16_to_char_col(line: &str, u16_off: u32) -> usize {
     let mut units: u32 = 0;
     for (char_idx, ch) in line.chars().enumerate() {
         if units >= u16_off {
@@ -11699,6 +12661,20 @@ fn is_wrap_break_after(c: char) -> bool {
         )
 }
 
+/// Screen cells a char takes in the editor: its display width, with a tab
+/// drawn as one cell (the editor paints tabs as a single glyph).
+fn char_cells(c: char) -> usize {
+    if c == '\t' {
+        1
+    } else {
+        unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+}
+
+fn cells_of(chars: &[char]) -> usize {
+    chars.iter().map(|&c| char_cells(c)).sum()
+}
+
 /// Soft-wrap a logical line into visual segments for word-wrap mode.
 ///
 /// Each segment is a half-open `(start_char, end_char)` range over `chars`;
@@ -11710,17 +12686,30 @@ fn is_wrap_break_after(c: char) -> bool {
 /// still occupies a row. Mirrors VS Code's monospace wrap: pick the rightmost
 /// break opportunity within the column, else split the over-long token.
 fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
-    if width == 0 || chars.len() <= width {
+    if width == 0 || chars.len() <= width && cells_of(chars) <= width {
         return vec![(0, chars.len())];
     }
     let mut segs = Vec::new();
     let mut start = 0;
     while start < chars.len() {
-        if chars.len() - start <= width {
+        if cells_of(&chars[start..]) <= width {
             segs.push((start, chars.len()));
             break;
         }
-        let limit = start + width;
+        // The hard limit counts CELLS, as the renderer clips: counted in
+        // chars, a row of wide (CJK) characters was twice as wide as the
+        // pane and its second half was never shown on any row. At least one
+        // char per row, so a char wider than the pane cannot stall.
+        let mut limit = start;
+        let mut used = 0;
+        while limit < chars.len() {
+            let w = char_cells(chars[limit]);
+            if used + w > width && limit > start {
+                break;
+            }
+            used += w;
+            limit += 1;
+        }
         // Scan back from the hard limit for the rightmost break-after char;
         // `i` is the char count, so the char sits at `chars[i - 1]` and the
         // segment becomes `[start, i)`. Stop at `start + 1` so a break right
@@ -11753,11 +12742,41 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 /// otherwise collapses onto the run's last new line (the join line a
 /// backspace or a partial-line selection delete leaves behind); a mark on a
 /// line deleted outright is dropped.
+#[cfg_attr(not(test), allow(dead_code))]
 fn shift_bookmark_lines(
     marks: &std::collections::BTreeSet<usize>,
     old: &[String],
     new: &[String],
 ) -> std::collections::BTreeSet<usize> {
+    let map = shift_line_mapper(old, new);
+    marks.iter().filter_map(|&line| map(line)).collect()
+}
+
+/// Where each 1-based line of `old` lands in `new` after an edit, for any
+/// line-keyed marks (bookmarks, breakpoints): through [`shift_bookmark_lines`]'s
+/// diff when the line count changed, through [`follow_moved_bookmark_lines`]'s
+/// move tracking when it did not. None for a line deleted outright.
+fn line_mapper<'a>(
+    old: &'a [String],
+    new: &'a [String],
+) -> Box<dyn Fn(usize) -> Option<usize> + 'a> {
+    if old.len() != new.len() {
+        shift_line_mapper(old, new)
+    } else {
+        Box::new(move |line| {
+            let one = std::collections::BTreeSet::from([line]);
+            follow_moved_bookmark_lines(&one, old, new)
+                .into_iter()
+                .next()
+        })
+    }
+}
+
+/// The line mapping behind [`shift_bookmark_lines`].
+fn shift_line_mapper<'a>(
+    old: &'a [String],
+    new: &'a [String],
+) -> Box<dyn Fn(usize) -> Option<usize> + 'a> {
     use similar::DiffOp;
     let common = old.len().min(new.len());
     let prefix = old
@@ -11784,7 +12803,7 @@ fn shift_bookmark_lines(
         &new[prefix..new_end],
         Some(deadline),
     );
-    let map_middle = |row: usize| -> Option<usize> {
+    let map_middle = move |row: usize| -> Option<usize> {
         let r = row - prefix;
         for op in &ops {
             match *op {
@@ -11811,18 +12830,52 @@ fn shift_bookmark_lines(
         }
         None
     };
+    Box::new(move |line: usize| {
+        let row = line.checked_sub(1)?;
+        let mapped = if row < prefix {
+            row
+        } else if row >= old_end {
+            row - old_end + new_end
+        } else {
+            map_middle(row)?
+        };
+        Some(mapped + 1)
+    })
+}
+
+/// Marks after an edit that kept the line count: a marked line whose text
+/// now sits, once, elsewhere in the changed span moved there (Move Line
+/// Up/Down, a swap, undoing either); any other mark keeps its row, as a
+/// line edited in place does.
+fn follow_moved_bookmark_lines(
+    marks: &std::collections::BTreeSet<usize>,
+    old: &[String],
+    new: &[String],
+) -> std::collections::BTreeSet<usize> {
+    let Some(first) = old.iter().zip(new).position(|(a, b)| a != b) else {
+        return marks.clone();
+    };
+    let last = old.len()
+        - 1
+        - old
+            .iter()
+            .rev()
+            .zip(new.iter().rev())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
     marks
         .iter()
-        .filter_map(|&line| {
-            let row = line.checked_sub(1)?;
-            let mapped = if row < prefix {
-                row
-            } else if row >= old_end {
-                row - old_end + new_end
-            } else {
-                map_middle(row)?
-            };
-            Some(mapped + 1)
+        .map(|&line| {
+            let row = line - 1;
+            if !(first..=last).contains(&row) || old.get(row) == new.get(row) {
+                return line;
+            }
+            let text = &old[row];
+            let mut hits = (first..=last).filter(|&j| &new[j] == text);
+            match (hits.next(), hits.next()) {
+                (Some(j), None) => j + 1,
+                _ => line,
+            }
         })
         .collect()
 }
@@ -11836,7 +12889,12 @@ fn shift_bookmark_lines(
 /// position past that `\r` (semantic tokens, diagnostics, hover, definition)
 /// would then resolve one row off. Normalizing first keeps the two in lockstep
 /// and is a no-op for clean `\n`-only files.
-fn split_into_lines(text: &str) -> Vec<String> {
+pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
+    // Most text has no `\r` at all; skip the two whole-text copies that
+    // normalising would make (#371 splits a 35k-line file per scrub step).
+    if !text.contains('\r') {
+        return text.lines().map(str::to_string).collect();
+    }
     normalize_newlines(text)
         .lines()
         .map(|s| s.to_string())
@@ -11984,6 +13042,7 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
 
 impl Widget for &mut Editor {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        self.clamp_to_symbol_view();
         let block_style = if self.focused {
             Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
@@ -12005,6 +13064,7 @@ impl Widget for &mut Editor {
         self.last_scrollbar = Rect::default();
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
+        self.code_lens_spans.clear();
         // Every rect this frame publishes is cleared up front, so a frame
         // that paints nothing leaves nothing behind for the mouse path to
         // hit-test against. `render_log` sets its own when it paints; the
@@ -12053,6 +13113,18 @@ impl Widget for &mut Editor {
         }
         if let Some(view) = self.archive.as_mut() {
             render_archive(view, self.path.as_deref(), inner, buf, cbg, self.theme);
+            return;
+        }
+        if let Some(view) = self.pr_review.as_mut() {
+            crate::widgets::pr_review::render(view, inner, buf, cbg, self.theme);
+            return;
+        }
+        if let Some(view) = self.fleet.as_mut() {
+            crate::widgets::fleet::render(view, inner, buf, cbg, self.theme);
+            return;
+        }
+        if let Some(view) = self.sarif.as_mut() {
+            crate::sarif::render::render(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
         }
         if let Some(view) = self.log.as_mut() {
@@ -12169,9 +13241,16 @@ impl Widget for &mut Editor {
             let wide = inner.width.saturating_sub(gutter_width + 2) as usize;
             // Overflow at the wide width forces the vbar, which narrows the
             // column and only ever adds rows, so the decision is stable.
-            let vbar = self.total_visual_rows(wide) > text_height;
+            let vbar = match self.clip_content_rows(wide, true) {
+                Some((_, rows)) => rows > text_height,
+                None => self.total_visual_rows(wide) > text_height,
+            };
             let tw = if vbar { wide.saturating_sub(1) } else { wide };
-            let content_rows = self.total_visual_rows(tw);
+            // A symbol tab measures only its clip: `base` rows sit above it.
+            let (base, content_rows) = match self.clip_content_rows(tw, true) {
+                Some(clip) => clip,
+                None => (0, self.total_visual_rows(tw)),
+            };
 
             // Keep the cursor's visual row inside the viewport.
             if text_height > 0 {
@@ -12182,14 +13261,16 @@ impl Widget for &mut Editor {
                 } else if cursor_vrow >= top + text_height {
                     top = cursor_vrow + 1 - text_height;
                 }
-                top = top.min(content_rows.saturating_sub(text_height));
+                top = top
+                    .min(base + content_rows.saturating_sub(text_height))
+                    .max(base);
                 self.set_top_to_visual_row(top, tw);
             }
             let metrics = scrollbar::vertical_metrics(
                 scrollbar_area,
                 content_rows,
                 text_height,
-                self.top_visual_row(tw),
+                self.top_visual_row(tw).saturating_sub(base),
             );
             (tw as u16, metrics)
         } else {
@@ -12224,18 +13305,42 @@ impl Widget for &mut Editor {
                     }
                 }
             }
+            if let Some((first, end)) = self.symbol_clip() {
+                // The lowest top that still fills the pane with the clip's
+                // tail, so scrolling never strands one clip line at the top.
+                let bw = inner.width.saturating_sub(gutter_width + 3) as usize;
+                let (mut top, mut rows) = (end, 0);
+                while top > first {
+                    let line = top - 1;
+                    let need = if self.is_line_hidden(line) {
+                        0
+                    } else {
+                        1 + self.box_rows_between(line, top, bw)
+                    };
+                    if rows + need > text_height {
+                        break;
+                    }
+                    rows += need;
+                    top = line;
+                }
+                self.scroll = self.scroll.clamp(first, top.min(end - 1));
+            }
             if self.scroll != scroll_before {
                 self.scroll_sub = 0;
             }
             let bw = inner.width.saturating_sub(gutter_width + 3) as usize;
-            let box_rows = self.box_rows_between(0, self.lines.len(), bw);
+            let (base, content) = self.clip_content_rows(bw, false).unwrap_or((
+                0,
+                self.lines.len() + self.box_rows_between(0, self.lines.len(), bw),
+            ));
             let metrics = scrollbar::vertical_metrics(
                 scrollbar_area,
-                self.lines.len() + box_rows,
+                content,
                 text_height,
                 // Content-row top: lines above plus box rows above plus the
                 // rows scrolled into the top line's own box.
-                self.scroll + self.box_rows_between(0, self.scroll, bw) + self.scroll_sub,
+                (self.scroll + self.box_rows_between(0, self.scroll, bw) + self.scroll_sub)
+                    .saturating_sub(base),
             );
             let sw = u16::from(metrics.is_some());
             let tw = inner.width.saturating_sub(gutter_width + 2 + sw);
@@ -12297,11 +13402,13 @@ impl Widget for &mut Editor {
                 }
             }
         };
+        // A symbol tab stops painting at its symbol's last line.
+        let clip_end = self.symbol_clip().map_or(self.lines.len(), |(_, end)| end);
         if wrap {
             let tw = text_width as usize;
             let mut line = self.scroll;
             let mut skip = self.scroll_sub;
-            while line < self.lines.len() && visual_rows.len() < text_height {
+            while line < clip_end && visual_rows.len() < text_height {
                 if self.is_line_hidden(line) {
                     line += 1;
                     continue;
@@ -12333,7 +13440,7 @@ impl Widget for &mut Editor {
             // = rows into its comment box, so the viewport can start
             // mid-box exactly like the wrap path.
             let mut skip = self.scroll_sub;
-            while line < self.lines.len() && visual_rows.len() < text_height {
+            while line < clip_end && visual_rows.len() < text_height {
                 if !self.is_line_hidden(line) {
                     if skip == 0 && visual_rows.len() < text_height {
                         visual_rows.push(VisRow::Text {
@@ -12411,8 +13518,20 @@ impl Widget for &mut Editor {
                     line_idx + 1,
                     width = gutter_width as usize - 1
                 );
-                let gutter =
-                    Line::from(Span::styled(line_no, Style::default().fg(Color::DarkGray)));
+                // Live Run coverage tints the number: green for a statement
+                // that ran, a muted red for one that never did.
+                let number_fg = match self
+                    .live_run
+                    .as_ref()
+                    .and_then(|v| v.coverage(line_idx, &self.lines[line_idx]))
+                {
+                    Some(crate::live_run::Coverage::Ran) => self.theme.git_added(),
+                    Some(crate::live_run::Coverage::NeverRan) => {
+                        self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
+                    }
+                    None => Color::DarkGray,
+                };
+                let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
                 buf.set_line(inner.x, y, &gutter, gutter_width);
             } else {
                 buf.set_line(
@@ -12446,10 +13565,16 @@ impl Widget for &mut Editor {
                     .unverified_breakpoints
                     .get(path)
                     .is_some_and(|s| s.contains(&here));
+                // A hit count is a condition on the pause (#611), so it wears
+                // the conditional diamond too, as in VS Code.
                 let is_conditional = self
                     .breakpoint_conditions
                     .get(path)
-                    .is_some_and(|c| c.contains_key(&here));
+                    .is_some_and(|c| c.contains_key(&here))
+                    || self
+                        .breakpoint_hit_conditions
+                        .get(path)
+                        .is_some_and(|h| h.contains_key(&here));
                 let is_logpoint = self
                     .breakpoint_logs
                     .get(path)
@@ -12565,6 +13690,32 @@ impl Widget for &mut Editor {
                     Style::default().fg(color),
                 );
             }
+            // Coverage lens (#263): the same lane, painted over the git bar
+            // while a coverage report is shown. Green run, red never run,
+            // amber run with a branch missed; dimmed once the file changed
+            // after the run. `Coverage: Clear` gives the lane back to git.
+            if (!wrap || row_start == 0)
+                && let Some(lens) = self.coverage.as_ref()
+                && let Some(cov) = lens.lines.get(&line_idx)
+            {
+                use crate::testing::coverage::LineCov;
+                let (rgb, glyph) = match cov {
+                    LineCov::Covered => ((0x4e, 0xc9, 0x7a), "\u{258c}"),
+                    LineCov::Uncovered => ((0xe0, 0x55, 0x55), "\u{258c}"),
+                    LineCov::Partial => ((0xe0, 0xb0, 0x40), "\u{2596}"),
+                };
+                let (r, g, b) = if lens.stale {
+                    (rgb.0 / 2, rgb.1 / 2, rgb.2 / 2)
+                } else {
+                    rgb
+                };
+                buf.set_string(
+                    inner.x + gutter_width,
+                    y,
+                    glyph,
+                    Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
+                );
+            }
             // Provenance overlay (#349): the same lane, a thinner bar in the
             // seat's hue, painted over the git bar while the lens is on
             // because the user asked who typed the line, not whether it
@@ -12590,9 +13741,16 @@ impl Widget for &mut Editor {
             // same code paints both modes.
             let raw = &self.lines[line_idx];
             let line_len = self.line_char_len(line_idx);
-            let row_width = (row_end - row_start) as u16;
             let byte_start = byte_index_of_char(raw, row_start);
             let byte_end = byte_index_of_char(raw, row_end);
+            // A wrapped row's width in CELLS, which is what the painters clip
+            // by: its char count cut a row of wide characters in half.
+            let row_width = if wrap {
+                let cells: usize = raw[byte_start..byte_end].chars().map(char_cells).sum();
+                cells.max(row_end - row_start).min(text_width as usize) as u16
+            } else {
+                (row_end - row_start) as u16
+            };
             let visible_raw = &raw[byte_start..byte_end];
             let seg_bytes = byte_end - byte_start;
             let empty: Vec<HiSpan> = Vec::new();
@@ -13057,6 +14215,9 @@ impl Widget for &mut Editor {
                 && line_idx == self.cursor_row
                 && row_end >= line_len
                 && !self.inline_values.contains_key(&line_idx)
+                && self.live_note(line_idx).is_none()
+                && self.lenses_on_line(line_idx).is_empty()
+                && self.live_ghost().is_none()
                 && let Some(note) = self.current_line_blame_annotation()
             {
                 let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
@@ -13097,6 +14258,119 @@ impl Widget for &mut Editor {
                             .fg(self.theme.ignored_fg())
                             .add_modifier(Modifier::ITALIC),
                     );
+                }
+            }
+
+            // Inline suggestion (#607): the first line as ghost text right at
+            // the caret (suggestions are only asked for at a line's end), with
+            // a count of the lines that come with it. It owns the line's tail,
+            // so the trailers below stand aside.
+            let ghost_here = self.focused
+                && line_idx == self.cursor_row
+                && row_end >= line_len
+                && self.live_ghost().is_some();
+            if ghost_here && let Some(text) = self.live_ghost() {
+                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let x = text_x + text_cols as u16;
+                let right = inner.x + inner.width;
+                if x < right {
+                    let mut lines = text.split('\n');
+                    let first = lines.next().unwrap_or("");
+                    let more = lines.count();
+                    let shown = if more > 0 {
+                        format!(
+                            "{first}  (+{more} line{})",
+                            if more == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        first.to_string()
+                    };
+                    let clipped: String = shown.chars().take((right - x) as usize).collect();
+                    buf.set_string(
+                        x,
+                        y,
+                        &clipped,
+                        Style::default()
+                            .fg(self.theme.ignored_fg())
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
+            }
+
+            // Code lenses (#608): the server's "3 references | Run" at the end
+            // of the symbol's line, clickable, yielding to the debugger's and
+            // Live Run's trailers, which describe this very run.
+            if row_end >= line_len
+                && !ghost_here
+                && !self.inline_values.contains_key(&line_idx)
+                && self.live_note(line_idx).is_none()
+            {
+                let lenses = self.lenses_on_line(line_idx);
+                if !lenses.is_empty() {
+                    let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                    let mut x = text_x + text_cols as u16 + 2;
+                    let right = inner.x + inner.width;
+                    let style = Style::default()
+                        .fg(self.theme.ignored_fg())
+                        .add_modifier(Modifier::UNDERLINED);
+                    for (n, idx) in lenses.into_iter().enumerate() {
+                        if n > 0 && x + 3 < right {
+                            buf.set_string(
+                                x,
+                                y,
+                                " | ",
+                                Style::default().fg(self.theme.ignored_fg()),
+                            );
+                            x += 3;
+                        }
+                        if x >= right {
+                            break;
+                        }
+                        let title = &self.code_lenses[idx].title;
+                        let shown: String = title.chars().take((right - x) as usize).collect();
+                        let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                        buf.set_string(x, y, &shown, style);
+                        self.code_lens_spans.push((y, x..x + w, idx));
+                        x += w;
+                    }
+                }
+            }
+
+            // Live Run trailer: what this line did on the last run, painted
+            // where the debugger's values go and yielding to them, since a
+            // paused session is the more specific answer.
+            if row_end >= line_len
+                && !ghost_here
+                && !self.inline_values.contains_key(&line_idx)
+                && let Some(note) = self.live_note(line_idx)
+            {
+                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let mut x = text_x + text_cols as u16 + 2;
+                let right = inner.x + inner.width;
+                for (text, kind) in note {
+                    if x >= right {
+                        break;
+                    }
+                    let color = match kind {
+                        crate::live_run::Kind::Value => self.theme.ignored_fg(),
+                        crate::live_run::Kind::Output => {
+                            self.theme.ui(Color::Rgb(0x3b, 0x9e, 0xff))
+                        }
+                        crate::live_run::Kind::Error => self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+                        crate::live_run::Kind::Timeout => {
+                            self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))
+                        }
+                    };
+                    let avail = (right - x) as usize;
+                    let shown: String = text.chars().take(avail).collect();
+                    let width = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                    buf.set_string(
+                        x,
+                        y,
+                        &shown,
+                        Style::default().fg(color).add_modifier(Modifier::ITALIC),
+                    );
+                    x = x.saturating_add(width + 2);
                 }
             }
 
@@ -13279,7 +14553,7 @@ impl Editor {
                 .path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images, runnables) = crate::markdown::render_markdown_full(
+            let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
                 &text,
                 self.theme,
                 &mut self.registry,
@@ -13288,6 +14562,7 @@ impl Editor {
             );
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
+                md.source_map = source_map;
                 md.images = images;
                 md.runnables = runnables;
                 md.built_seq = self.edit_seq;
@@ -13332,7 +14607,27 @@ impl Editor {
                 .iter()
                 .map(|r| visual_row(r.first_line))
                 .collect();
+            // Scroll sync (#619): each built line's first visual row. A
+            // paragraph wraps line by line, so per-line counts sum exactly.
+            let mut row = 0usize;
+            md.row_of_line = md
+                .lines
+                .iter()
+                .map(|l| {
+                    let here = row;
+                    row += Paragraph::new(Text::from(vec![l.clone()]))
+                        .wrap(Wrap { trim: false })
+                        .line_count(text_area.width)
+                        .max(1);
+                    here
+                })
+                .collect();
             md.wrap_key = (md.built_seq, text_area.width);
+        }
+        if let Some(line) = md.scroll_to_source.take()
+            && let Some(row) = md.row_for_source_line(line)
+        {
+            md.scroll = row.min(usize::from(max_scroll)) as u16;
         }
         md.last_area = text_area;
         para.scroll((md.scroll, 0)).render(text_area, buf);
@@ -13448,7 +14743,14 @@ impl Editor {
             // its last cell (end of line / blank line — where the user is
             // about to type). Bail only when the cell would fall outside the
             // text column: past the pane edge or onto the vertical scrollbar.
-            let visible_col = self.cursor_col - start;
+            // In cells, as the row was painted: wide characters before the
+            // caret push it right by two each.
+            let visible_col: usize = self.lines[self.cursor_row]
+                .chars()
+                .skip(start)
+                .take(self.cursor_col - start)
+                .map(char_cells)
+                .sum();
             let x = text_x as usize + visible_col;
             let right = (self.last_inner.x + self.last_inner.width)
                 .saturating_sub(u16::from(self.last_scrollbar.width > 0))
@@ -13952,6 +15254,13 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
     if quote.is_some() || depth > 0 {
         return None;
     }
+    // Already closed: the `>` was deleted and is being retyped before an
+    // existing one (`<div|>`), or the end tag is already there on the line
+    // (`<div|</div>`). Closing again would double it.
+    let after = &line[byte..];
+    if after.trim_start().starts_with('>') || after.contains(&format!("</{name}>")) {
+        return None;
+    }
     // A `>` already inside means that `<` is closed and the caret is past
     // the tag (or inside an attribute value holding a `>`); either way this
     // keystroke is not closing THIS tag.
@@ -14145,6 +15454,10 @@ pub struct Crumb {
 type BreadcrumbRange = (u16, u16, Option<(u32, u32)>);
 
 pub struct EditorTabs {
+    /// The active editor's rect below the tab strip and breadcrumbs, from
+    /// the last frame: where a view standing in for it (the history
+    /// scrubber's, #371) paints.
+    pub last_body: Rect,
     pub editors: Vec<Editor>,
     active: usize,
     /// Breadcrumb segments for the active file, set by `App` each frame from
@@ -14189,6 +15502,7 @@ pub struct EditorTabs {
 impl EditorTabs {
     pub fn new() -> Self {
         Self {
+            last_body: Rect::default(),
             editors: vec![Editor::new()],
             active: 0,
             breadcrumbs: Vec::new(),
@@ -14337,8 +15651,21 @@ impl EditorTabs {
     /// path so subsequent saves and the tab label track the new name.
     pub fn rename_open_path(&mut self, old: &Path, new: &Path) {
         for e in &mut self.editors {
-            if e.path.as_deref() == Some(old) {
-                e.path = Some(new.to_path_buf());
+            // Under a moved folder too: a tab of `dir/a.rs` follows `dir` to
+            // its new place, or its next save recreates the old path.
+            let moved = e
+                .path
+                .as_deref()
+                .and_then(|p| p.strip_prefix(old).ok())
+                .map(|rest| {
+                    if rest.as_os_str().is_empty() {
+                        new.to_path_buf()
+                    } else {
+                        new.join(rest)
+                    }
+                });
+            if let Some(moved) = moved {
+                e.path = Some(moved);
                 // Re-anchor the disk stamp to the new path so the rename
                 // isn't mistaken for an external content change on the next
                 // FS-sync sweep.
@@ -14361,6 +15688,25 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// Insert a pinned tab for `path` without reading it (None: untitled),
+    /// reusing the blank initial tab. The caller fills the buffer: this is
+    /// for text whose only copy is in memory, like a session handoff's
+    /// unsaved edits to a file that can no longer be opened.
+    pub fn open_unreadable_tab(&mut self, path: Option<PathBuf>) -> &mut Editor {
+        if !self.is_blank_initial() {
+            let mut e = Editor::new();
+            e.focused = self.editors[self.active].focused;
+            let pos = self.active + 1;
+            self.editors.insert(pos, e);
+            self.editors[self.active].focused = false;
+            self.active = pos;
+        }
+        let e = &mut self.editors[self.active];
+        e.path = path;
+        e.preview = false;
+        e
+    }
+
     /// Test-only / disk-less helper: insert a tab whose path is set but
     /// whose contents are empty. Production code should call
     /// `open_in_new_tab` so the file is actually loaded from disk.
@@ -14378,6 +15724,28 @@ impl EditorTabs {
     /// tab remains — closing the last would leave the editor pane empty.
     pub fn close_active(&mut self) -> bool {
         self.close_tab(self.active)
+    }
+
+    /// Close every tab showing `path` or a file under it (a deleted file or
+    /// folder), except tabs with unsaved edits: those stay open, dirty, so
+    /// the edits can still be saved (recreating the file) or discarded.
+    /// Returns how many dirty tabs were kept.
+    pub fn close_clean_tabs_under(&mut self, path: &Path) -> usize {
+        let mut kept = 0;
+        let mut i = self.editors.len();
+        while i > 0 {
+            i -= 1;
+            let e = &self.editors[i];
+            if !e.path.as_deref().is_some_and(|p| p.starts_with(path)) {
+                continue;
+            }
+            if e.dirty {
+                kept += 1;
+            } else {
+                self.close_tab(i);
+            }
+        }
+        kept
     }
 
     /// Close the tab at `idx`. When more than one tab is open the tab is
@@ -14574,7 +15942,17 @@ impl EditorTabs {
     /// literal equality or by canonicalised equality (so symlink + relative
     /// path aliases dedupe to the same tab). Returns `None` if no tab is
     /// currently holding that file.
+    ///
+    /// A symbol tab (#369) is not "the file's tab": opening, previewing or
+    /// selecting a file must land on a tab showing all of it, so this skips
+    /// them. [`Self::find_any_tab_with_path`] includes them.
     pub fn find_tab_with_path(&self, target: &Path) -> Option<usize> {
+        self.find_tab_matching(target, |e| e.symbol_view.is_none())
+    }
+
+    /// Like [`Self::find_tab_with_path`], symbol tabs included: for closing
+    /// every tab of a file, or editing whichever buffer holds it.
+    pub fn find_any_tab_with_path(&self, target: &Path) -> Option<usize> {
         self.find_tab_matching(target, |_| true)
     }
 
@@ -14586,7 +15964,9 @@ impl EditorTabs {
         path: &Path,
         edits: &[TextSpanEdit],
     ) -> Option<usize> {
-        let idx = self.find_tab_with_path(path)?;
+        let idx = self
+            .find_tab_with_path(path)
+            .or_else(|| self.find_any_tab_with_path(path))?;
         Some(self.editors[idx].apply_span_edits(edits))
     }
 
@@ -14936,6 +16316,54 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// Show a fleet run's results in the `Fleet` tab (#363), replacing the
+    /// previous run's, so one tab always holds the latest comparison.
+    pub fn open_fleet(&mut self, view: crate::widgets::fleet::FleetView) {
+        let label = PathBuf::from("Fleet");
+        if let Some(idx) = self.find_tab_with_path(&label) {
+            self.editors[idx].fleet = Some(view);
+            self.select(idx);
+            return;
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(label);
+        e.fleet = Some(view);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return;
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+    }
+
+    /// Open a pull request for review in a fresh tab labelled `PR #n`
+    /// (#365), or re-select the tab already showing it.
+    pub fn open_pr_review(&mut self, view: crate::widgets::pr_review::PrReviewView) {
+        let label = PathBuf::from(format!("PR #{}", view.pr.number));
+        if let Some(idx) = self.find_tab_with_path(&label) {
+            self.editors[idx].pr_review = Some(view);
+            self.select(idx);
+            return;
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(label);
+        e.pr_review = Some(view);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return;
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+    }
+
     /// Open arbitrary text in a scratch tab labelled `label` (no file on
     /// disk). Used by "Show Git Output" to surface the git command log. The
     /// tab has no `disk_stamp`, so the FS-sync layer never tries to reload
@@ -14973,7 +16401,9 @@ impl EditorTabs {
         // editable view of it, so skip diffs here: Enter on a diff (or a
         // double-click) opens the real file beside the diff rather than just
         // re-selecting the diff tab.
-        if let Some(idx) = self.find_tab_matching(path, |e| e.diff.is_none()) {
+        if let Some(idx) =
+            self.find_tab_matching(path, |e| e.diff.is_none() && e.symbol_view.is_none())
+        {
             self.editors[idx].preview = false;
             self.select(idx);
             return Ok(());
@@ -15273,6 +16703,7 @@ impl Widget for &mut EditorTabs {
             };
         }
 
+        self.last_body = body;
         let active_editor = &mut self.editors[active];
         Widget::render(active_editor, body, buf);
     }
@@ -15306,7 +16737,10 @@ pub(crate) fn disambiguated_tab_labels(editors: &[Editor]) -> Vec<String> {
     let mut groups: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     for (i, e) in editors.iter().enumerate() {
+        // A symbol tab's label already differs from its file's tab, and the
+        // two share a path, so no parent suffix could tell them apart.
         if e.diff.is_none()
+            && e.symbol_view.is_none()
             && let Some(name) = e.path.as_deref().and_then(|p| p.file_name())
         {
             groups
@@ -15450,6 +16884,9 @@ fn tab_label(e: &Editor) -> String {
     // the tab says which flavour of the file it is showing.
     let name = if e.merge.is_some() {
         format!("{name} (merge)")
+    } else if let Some(view) = e.symbol_view.as_ref() {
+        // A symbol tab (#369) leads with its symbol; the file says where.
+        format!("{} \u{b7} {name}", view.name)
     } else {
         name
     };
@@ -15462,6 +16899,22 @@ fn tab_label(e: &Editor) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #369: a symbol tab turned into its file's tab keeps the step it
+    /// last mirrored, so should a sibling's undo step span the change, the
+    /// rest of it folds in rather than taking another undo step.
+    #[test]
+    fn dropping_the_symbol_clip_keeps_folding_the_siblings_burst() {
+        let lines = |s: &[&str]| s.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let mut e = Editor::new();
+        e.lines = lines(&["fn m() {}"]);
+        e.mirror_lines_from(&lines(&["fn m() {}x"]), 7, (0, 10));
+        e.drop_symbol_clip();
+        e.mirror_lines_from(&lines(&["fn m() {}xy"]), 7, (0, 11));
+        assert_eq!(e.undo_stack.len(), 1);
+        assert!(e.undo());
+        assert_eq!(e.lines, lines(&["fn m() {}"]));
+    }
+
     /// An over-cap document reaches the hex viewer WITH a reason (#506).
     ///
     /// End to end rather than by inspection: this drives the real `open`
@@ -15524,6 +16977,7 @@ mod tests {
             author: author.into(),
             age_secs: age,
             uncommitted,
+            text: None,
         }
     }
 
@@ -15549,6 +17003,31 @@ mod tests {
         );
         // The last stop ends the session.
         assert!(!e.snippet_active());
+    }
+
+    #[test]
+    fn replacing_an_outer_placeholder_drops_the_stops_nested_in_it() {
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        assert_eq!(e.selection_text(), "foo(x)");
+        e.insert_str("bar");
+        assert!(e.snippet_next());
+        assert_eq!(
+            e.selection_text(),
+            "z",
+            "the nested $2 went with its placeholder"
+        );
+        // A same-length replacement is still a replacement.
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        e.insert_str("barbaz");
+        assert!(e.snippet_next());
+        assert_eq!(e.selection_text(), "z");
+        // A plain Tab through an untouched placeholder keeps the nested stop.
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        assert!(e.snippet_next());
+        assert_eq!(e.selection_text(), "x");
     }
 
     /// On-type formatting (#254) keys off real keystrokes only: the typed
@@ -15764,6 +17243,28 @@ mod tests {
     }
 
     #[test]
+    fn blame_is_not_shown_on_a_row_that_holds_another_lines_text() {
+        let mut e = editor_with("one\ntwo\nthree\n");
+        e.path = Some(PathBuf::from("f.rs"));
+        let with_text = |author: &str, text: &str| crate::git::BlameLine {
+            text: Some(text.into()),
+            ..blame_line(author, "s", 90, false)
+        };
+        e.set_blame(
+            PathBuf::from("f.rs"),
+            Some(vec![
+                with_text("A", "one"),
+                with_text("B", "two"),
+                with_text("C", "three"),
+            ]),
+        );
+        // A cut and paste that keeps the count: `one` moved to the end.
+        e.lines = vec!["two".into(), "three".into(), "one".into()];
+        e.cursor_row = 0;
+        assert_eq!(e.current_line_blame_annotation(), None);
+    }
+
+    #[test]
     fn current_line_blame_annotation_marks_uncommitted_lines() {
         let mut e = editor_with("edited\n");
         e.path = Some(PathBuf::from("f.rs"));
@@ -15817,6 +17318,46 @@ mod tests {
         assert!(
             e.current_line_blame_annotation().is_none(),
             "a.rs blame painted on b.rs while its own fetch was still in flight"
+        );
+    }
+
+    #[test]
+    fn opening_a_fifo_is_refused_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skipping: mkfifo unavailable");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut e = Editor::new();
+            let _ = tx.send(e.open(&fifo).map_err(|e| e.to_string()));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open returned instead of blocking on the pipe");
+        assert!(result.unwrap_err().contains("not a regular file"));
+    }
+
+    #[test]
+    fn deleting_closes_clean_tabs_under_the_path_and_keeps_dirty_ones() {
+        let mut tabs = EditorTabs::new();
+        tabs.add_tab_with_path(PathBuf::from("/w/dir/a.rs"));
+        tabs.add_tab_with_path(PathBuf::from("/w/dir/sub/b.rs"));
+        tabs.editors[2].dirty = true;
+        tabs.add_tab_with_path(PathBuf::from("/w/other.rs"));
+        tabs.add_tab_with_path(PathBuf::from("/w/dirt.rs"));
+        assert_eq!(tabs.close_clean_tabs_under(Path::new("/w/dir")), 1);
+        let left: Vec<_> = tabs.editors.iter().filter_map(|e| e.path.clone()).collect();
+        assert_eq!(
+            left,
+            vec![
+                PathBuf::from("/w/dir/sub/b.rs"),
+                PathBuf::from("/w/other.rs"),
+                PathBuf::from("/w/dirt.rs"),
+            ]
         );
     }
 
@@ -16259,6 +17800,25 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_breakpoint_drops_its_hit_condition() {
+        let mut e = Editor::new();
+        let p = PathBuf::from("/x/a.py");
+        e.path = Some(p.clone());
+        e.lines = vec!["a".into(), "b".into()];
+        e.toggle_breakpoint_line(1);
+        e.breakpoint_hit_conditions
+            .entry(p.clone())
+            .or_default()
+            .insert(1, String::from(">= 5"));
+        e.toggle_breakpoint_line(1);
+        e.toggle_breakpoint_line(1);
+        assert!(
+            !e.breakpoint_hit_conditions.contains_key(&p),
+            "a fresh breakpoint on the line must not inherit the old hit count"
+        );
+    }
+
+    #[test]
     fn toggle_breakpoint_line_targets_an_explicit_line_not_the_cursor() {
         let mut e = Editor::new();
         e.path = Some(PathBuf::from("/x/a.py"));
@@ -16336,6 +17896,73 @@ mod tests {
         assert_eq!(e.bookmarked_lines(), vec![4]);
         assert_eq!(e.toggle_bookmark(), Some(false), "second toggle clears it");
         assert!(e.bookmarked_lines().is_empty());
+    }
+
+    #[test]
+    fn a_bookmark_moves_with_its_line_on_move_line_down_and_back() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 3;
+        e.toggle_bookmark();
+        e.move_lines_down();
+        assert_eq!(e.lines[4], "line 4");
+        assert_eq!(e.bookmarked_lines(), vec![5]);
+        e.move_lines_up();
+        assert_eq!(e.bookmarked_lines(), vec![4]);
+        // An in-place edit keeps the mark on its row.
+        e.cursor_col = 0;
+        e.insert_char('x');
+        assert_eq!(e.bookmarked_lines(), vec![4]);
+    }
+
+    #[test]
+    fn breakpoints_and_their_conditions_follow_edits_like_bookmarks() {
+        let (mut e, _tmp) = bookmark_editor(10);
+        let f = e.path.clone().unwrap();
+        e.toggle_breakpoint_line(4);
+        e.breakpoint_conditions
+            .entry(f.clone())
+            .or_default()
+            .insert(4, String::from("x > 1"));
+        // Enter at the very top pushes every line down one.
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.insert_newline();
+        assert_eq!(e.breakpoint_lines(&f), vec![5]);
+        assert_eq!(
+            e.breakpoint_conditions[&f].get(&5).map(String::as_str),
+            Some("x > 1")
+        );
+        // Moving the line carries its breakpoint along.
+        e.cursor_row = 4;
+        e.move_lines_down();
+        assert_eq!(e.breakpoint_lines(&f), vec![6]);
+        // Deleting the line drops it rather than leaving it on a neighbour.
+        e.cursor_row = 5;
+        e.selection = Some(EditorSelection {
+            anchor: (5, 0),
+            head: (6, 0),
+        });
+        e.backspace();
+        assert!(
+            e.breakpoint_lines(&f).is_empty(),
+            "{:?}",
+            e.breakpoint_lines(&f)
+        );
+    }
+
+    #[test]
+    fn mirrored_edits_above_move_the_extra_carets_too() {
+        let (mut e, _f) = bookmark_editor(5);
+        e.cursor_row = 4;
+        e.carets = vec![EditorSelection {
+            anchor: (3, 0),
+            head: (3, 0),
+        }];
+        let mut new = e.lines.clone();
+        new.drain(0..2);
+        assert!(e.mirror_lines_from(&new, 1, (0, 0)));
+        assert_eq!(e.cursor_row, 2);
+        assert_eq!(e.carets[0].head, (1, 0));
     }
 
     #[test]
@@ -19282,6 +20909,39 @@ mod tests {
     }
 
     #[test]
+    fn markdown_preview_opens_where_the_source_was_and_returns_there() {
+        // #619: the preview scrolls to the source's top line, and toggling
+        // back puts the source at the preview's top line.
+        let mut body = String::from("# Top\n\n");
+        for i in 0..40 {
+            body.push_str(&format!("para {i}\n\n"));
+        }
+        body.push_str("## Deep heading\n\n");
+        for i in 0..20 {
+            body.push_str(&format!("after {i}\n\n"));
+        }
+        let mut e = editor_with(&body);
+        e.lang = Some(LangKind::Markdown);
+        let deep = e.lines.iter().position(|l| l == "## Deep heading").unwrap();
+        e.scroll = deep;
+        assert!(e.toggle_markdown_preview());
+        let text = first_row_screen(&mut e, 60, 8);
+        // The first painted content row, inside the pane border.
+        let top = text
+            .lines()
+            .skip(1)
+            .find(|l| {
+                !l.trim_matches(|c: char| c == '\u{2502}' || c.is_whitespace())
+                    .is_empty()
+            })
+            .unwrap_or("");
+        assert!(top.contains("Deep heading"), "preview top: {top:?}\n{text}");
+        e.scroll = 0;
+        assert!(e.toggle_markdown_preview(), "back to source");
+        assert_eq!(e.scroll, deep, "the source comes back to the same place");
+    }
+
+    #[test]
     fn markdown_preview_refuses_non_markdown_tabs() {
         let mut e = editor_with("fn main() {}");
         e.lang = Some(LangKind::Rust);
@@ -19412,6 +21072,25 @@ mod tests {
     }
 
     #[test]
+    fn carets_on_one_line_keep_their_places_across_keystrokes() {
+        let mut e = editor_with("abcd");
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        e.carets = vec![EditorSelection::new(0, 3)];
+        e.multi_insert_char('X');
+        e.multi_insert_char('Y');
+        assert_eq!(e.lines, vec!["aXYbcXYd".to_string()]);
+        // A backspace that joins lines moves the carets below it up.
+        let mut e = editor_with("ab\ncd\nef");
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.carets = vec![EditorSelection::new(2, 1)];
+        e.multi_backspace();
+        e.multi_insert_char('X');
+        assert_eq!(e.lines, vec!["abXcd".to_string(), "Xf".to_string()]);
+    }
+
+    #[test]
     fn multi_backspace_deletes_at_every_caret() {
         let mut e = editor_with("ab ab ab");
         e.cursor_row = 0;
@@ -19441,11 +21120,13 @@ mod tests {
                 start: (0, 0),
                 end: (0, 3),
                 new_text: "baz".to_string(),
+                utf16: false,
             },
             TextSpanEdit {
                 start: (0, 8),
                 end: (0, 11),
                 new_text: "baz".to_string(),
+                utf16: false,
             },
         ];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
@@ -19467,6 +21148,7 @@ mod tests {
             start: (0, 0),
             end: (3, 9),
             new_text: "import logging\nimport re\nimport typing\n\nimport pandas".to_string(),
+            utf16: false,
         }];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
         assert_eq!(
@@ -19490,6 +21172,7 @@ mod tests {
             start: (0, 2),
             end: (0, 4),
             new_text: "C\nD".to_string(),
+            utf16: false,
         }];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
         assert_eq!(lines, vec!["abC".to_string(), "Def".to_string()]);
@@ -19503,11 +21186,13 @@ mod tests {
                 start: (0, 0),
                 end: (0, 4),
                 new_text: "label".to_string(),
+                utf16: false,
             },
             TextSpanEdit {
                 start: (1, 6),
                 end: (1, 10),
                 new_text: "label".to_string(),
+                utf16: false,
             },
         ];
         assert_eq!(e.apply_span_edits(&edits), 2);
@@ -19830,6 +21515,30 @@ mod tests {
         assert_eq!(e.lines, vec!["    pass".to_string()]);
         assert!(e.undo());
         assert_eq!(e.lines, vec!["        pass".to_string()]);
+    }
+
+    /// #694: undo history is bounded in bytes as well as steps, keeping the
+    /// newest steps (and at least `UNDO_MIN_STEPS` of them).
+    #[test]
+    fn undo_history_of_a_large_buffer_is_bounded_in_bytes() {
+        let big = vec!["x".repeat(255); 1024].join("\n");
+        let mut e = editor_with(&big);
+        for i in 0..40 {
+            e.push_undo(EditKind::Paste);
+            e.lines[0] = format!("edit {i}");
+        }
+        let held: usize = e.undo_stack.iter().map(|s| s.bytes).sum();
+        assert_eq!(e.undo_stack.len(), UNDO_MIN_STEPS, "held {held} bytes");
+        // The newest steps survive: one undo brings back the text before
+        // the last edit.
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "edit 38");
+        // A small buffer keeps its full step count.
+        let mut small = editor_with("a");
+        for _ in 0..40 {
+            small.push_undo(EditKind::Paste);
+        }
+        assert_eq!(small.undo_stack.len(), 40);
     }
 
     #[test]
@@ -20763,8 +22472,8 @@ mod tests {
             .read_to_end(&mut raw)
             .unwrap();
         assert_eq!(
-            raw, b"alpha\r\nbeta",
-            "save re-applies CRLF, no trailing EOL"
+            raw, b"alpha\r\nbeta\r\n",
+            "save re-applies CRLF, final newline included"
         );
     }
 
@@ -21160,6 +22869,63 @@ mod tests {
     }
 
     #[test]
+    fn saving_keeps_the_files_final_newline() {
+        for (disk, want) in [
+            ("a\nb\n", "xa\nb\n"),
+            ("a\r\nb\r\n", "xa\r\nb\r\n"),
+            ("a\n\n", "xa\n\n"),
+            ("a", "xa"),
+        ] {
+            let tmp = NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), disk).unwrap();
+            let mut e = Editor::new();
+            e.open(tmp.path()).unwrap();
+            e.insert_char('x');
+            e.save_to_disk().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(tmp.path()).unwrap(),
+                want,
+                "from {disk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_over_invalid_bytes_asks_first() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"caf\xe9 ok\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert!(e.decode_lossy, "a lone 0xE9 is not UTF-8");
+        e.insert_char('x');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::EncodingLoss);
+        assert_eq!(
+            std::fs::read(tmp.path()).unwrap(),
+            b"caf\xe9 ok\n",
+            "untouched"
+        );
+        e.lossy_save_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(!e.decode_lossy);
+    }
+
+    #[test]
+    fn a_language_servers_utf16_columns_land_after_an_emoji() {
+        let mut lines = vec![String::from("let s = \"😀\"; x + 1")];
+        let n = apply_span_edits_to_lines(
+            &mut lines,
+            &[TextSpanEdit {
+                start: (0, 14),
+                end: (0, 15),
+                new_text: String::from("renamed"),
+                utf16: true,
+            }],
+        );
+        assert_eq!(n, 1);
+        assert_eq!(lines[0], "let s = \"😀\"; renamed + 1");
+    }
+
+    #[test]
     fn save_round_trips_content() {
         let tmp = NamedTempFile::new().unwrap();
         let mut e = Editor::new();
@@ -21485,7 +23251,7 @@ mod tests {
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
         assert_eq!(
             std::fs::read(tmp.path()).unwrap(),
-            b"&#26085;&#26412;&#35486; costs 5\x80",
+            b"&#26085;&#26412;&#35486; costs 5\x80\n",
             "consent writes encoding_rs' references, and € as the 0x80 byte"
         );
         assert!(!e.encoding_loss);
@@ -21503,7 +23269,7 @@ mod tests {
         e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
         e.lines = vec![String::from("café")];
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
-        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9");
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9\n");
         assert!(e.unmappable_chars().is_empty());
         // The same text in UTF-8 is always representable.
         let mut u = Editor::new();
@@ -21885,6 +23651,57 @@ mod tests {
         // the slash rather than mid-segment.
         let segs = wrap_segments(&chars("abc/defgh"), 6);
         assert_eq!(segs, vec![(0, 4), (4, 9)]);
+    }
+
+    #[test]
+    fn wrap_segments_count_wide_characters_as_two_cells() {
+        let line: String = std::iter::repeat_n('漢', 60).collect();
+        let segs = wrap_segments(&chars(&line), 30);
+        assert_eq!(segs.len(), 4, "{segs:?}");
+        assert!(segs.iter().all(|&(s, e)| e - s == 15), "{segs:?}");
+        // A char wider than the pane still makes progress.
+        assert_eq!(wrap_segments(&chars("漢漢"), 1), vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn down_in_wrap_mode_steps_over_a_collapsed_fold() {
+        let mut e = editor_with("fn a() {\n    one\n    two\n}\nafter");
+        e.wrap_override = Some(true);
+        e.last_inner = Rect::new(0, 0, 40, 10);
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1) && e.is_line_hidden(2));
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.move_down();
+        assert!(
+            !e.is_line_hidden(e.cursor_row),
+            "landed on hidden line {}",
+            e.cursor_row
+        );
+        assert!(e.is_line_hidden(1), "the fold stays collapsed");
+    }
+
+    #[test]
+    fn a_wrapped_cjk_line_shows_every_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.md");
+        let text: String = (0..60)
+            .map(|i| char::from_u32(0x4e00 + i).unwrap())
+            .collect();
+        std::fs::write(&p, &text).unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        e.wrap_override = Some(true);
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        let shown: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        for c in text.chars() {
+            assert!(shown.contains(c), "{c} missing from the wrapped render");
+        }
     }
 
     #[test]
@@ -24762,6 +26579,16 @@ mod tests {
     }
 
     #[test]
+    fn toggle_line_comment_codeql_uses_slashes() {
+        let mut e = editor_with("select 1");
+        e.lang = crate::highlight::lang_for_extension("ql");
+        e.cursor_row = 0;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["// select 1"]);
+        assert_eq!(language_label(e.lang), "CodeQL");
+    }
+
+    #[test]
     fn toggle_line_comment_refreshes_highlights() {
         // Commenting a line must re-run tree-sitter so the line repaints as a
         // comment, not keep the stale pre-comment code spans. Without the
@@ -24868,6 +26695,79 @@ mod tests {
         });
         assert!(e.toggle_block_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    #[test]
+    fn toggle_block_comment_keeps_the_indent_and_the_next_line() {
+        let mut e = editor_with("    foo\nbar");
+        e.lang = Some(LangKind::Rust);
+        // A whole-line selection, as Shift+Down makes it.
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 0),
+        });
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["    /* foo */", "bar"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 13));
+        // No selection: the current line, indent kept, and back again.
+        e.cursor_row = 0;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["    foo", "bar"]);
+    }
+
+    #[test]
+    fn carets_that_meet_merge_so_the_next_key_edits_once() {
+        let mut e = editor_with("ab\ncd\nef");
+        e.cursor_row = 2;
+        e.cursor_col = 2;
+        e.carets = vec![EditorSelection::new(2, 1)];
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["ab", "cd", ""]);
+        assert!(e.carets.is_empty(), "{:?}", e.carets);
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["ab", "cd"]);
+    }
+
+    #[test]
+    fn pasting_crlf_or_cr_text_splits_lines_without_stray_returns() {
+        let mut e = editor_with("");
+        e.insert_str_as("a\r\nb\rc", crate::provenance::Seat::Me);
+        assert_eq!(e.lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn moving_or_sorting_lines_drops_the_folds_over_them() {
+        let mut e = editor_with("let y = 1;\nfn a() {\n    body\n}\ntail");
+        e.toggle_fold(1);
+        assert!(e.is_line_hidden(2));
+        e.cursor_row = 0;
+        e.move_lines_down();
+        assert_eq!(e.lines[0], "fn a() {");
+        assert!(
+            !e.is_line_hidden(2),
+            "the fold no longer hides `let y` 's neighbours"
+        );
+        let mut e = editor_with("b\n  b1\n  b2\na");
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1));
+        e.sort_lines(true);
+        assert!((0..4).all(|r| !e.is_line_hidden(r)), "{:?}", e.lines);
+    }
+
+    #[test]
+    fn sorting_lines_clamps_the_cursor_so_word_motion_cannot_panic() {
+        let mut e = editor_with("zzzzzzzzzz\nb\na");
+        e.cursor_row = 0;
+        e.cursor_col = 10;
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (2, 1),
+        });
+        e.sort_lines(true);
+        assert_eq!(e.lines, vec!["a", "b", "zzzzzzzzzz"]);
+        assert!(e.cursor_col <= 1);
+        e.selection = None;
+        e.move_word_left();
     }
 
     // ---- Join Lines ----
@@ -26394,6 +28294,63 @@ mod tests {
         );
     }
 
+    fn live_view(lines: &[&str], notes: &[(usize, &str)]) -> crate::live_run::View {
+        let mut report = crate::live_run::Report::default();
+        for &(line, text) in notes {
+            report
+                .notes
+                .insert(line, vec![(text.to_string(), crate::live_run::Kind::Value)]);
+            report.coverage.insert(line, crate::live_run::Coverage::Ran);
+        }
+        crate::live_run::View {
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+            report,
+        }
+    }
+
+    #[test]
+    fn render_paints_a_live_run_trailer_and_tints_the_line_number() {
+        let mut e = editor_with("x = f()\ny = 2");
+        e.live_run = Some(live_view(&["x = f()", "y = 2"], &[(0, "x = 7")]));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        let start = text_x + 7 + 2;
+        assert_eq!(buf[(start, y0)].symbol(), "x");
+        assert_eq!(buf[(start + 4, y0)].symbol(), "7");
+        let number_x = (e.last_inner.x..text_x)
+            .find(|&x| buf[(x, y0)].symbol() == "1")
+            .expect("line number painted");
+        assert_eq!(
+            buf[(number_x, y0)].fg,
+            e.theme.git_added(),
+            "a line that ran is green"
+        );
+    }
+
+    #[test]
+    fn a_live_run_trailer_hides_once_its_line_is_edited() {
+        let mut e = editor_with("x = f() + 1");
+        e.live_run = Some(live_view(&["x = f()"], &[(0, "x = 7")]));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(
+            buf[(text_x + 11 + 2, e.last_inner.y)].symbol(),
+            " ",
+            "the value belongs to the text that ran, not this one"
+        );
+    }
+
+    #[test]
+    fn debugger_inline_values_outrank_the_live_run_trailer() {
+        let mut e = editor_with("x = f()");
+        e.live_run = Some(live_view(&["x = f()"], &[(0, "x = 7")]));
+        e.inline_values.insert(0, String::from("x = 9"));
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        assert_eq!(buf[(text_x + 7 + 2 + 4, e.last_inner.y)].symbol(), "9");
+    }
+
     #[test]
     fn identifier_tokens_split_on_word_boundaries() {
         assert_eq!(
@@ -27848,6 +29805,16 @@ mod tests {
         let mut e = tag_editor("<div></div", LangKind::Html);
         e.insert_char('>');
         assert_eq!(e.lines[0], "<div></div>");
+    }
+
+    #[test]
+    fn retyping_the_angle_of_an_already_closed_tag_adds_no_second_close() {
+        for (text, want) in [("<div</div>", "<div></div>"), ("<div>", "<div>>")] {
+            let mut e = tag_editor(text, LangKind::Html);
+            e.cursor_col = 4;
+            e.insert_char('>');
+            assert_eq!(e.lines[0], want);
+        }
     }
 
     #[test]

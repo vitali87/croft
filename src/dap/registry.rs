@@ -25,6 +25,7 @@ fn kind_of(decl: AdapterKindDecl) -> AdapterKind {
         AdapterKindDecl::Debugpy => AdapterKind::Debugpy,
         AdapterKindDecl::Lldb => AdapterKind::LldbDap,
         AdapterKindDecl::JsDebug => AdapterKind::JsDebug,
+        AdapterKindDecl::Delve => AdapterKind::Delve,
     }
 }
 
@@ -125,6 +126,7 @@ mod tests {
         for ext in ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"] {
             assert_eq!(resolve(&s, &none, ext), Some(AdapterKind::JsDebug), "{ext}");
         }
+        assert_eq!(resolve(&s, &none, "go"), Some(AdapterKind::Delve));
         assert_eq!(resolve(&s, &none, "txt"), None);
         assert_eq!(resolve(&s, &none, ""), None);
     }
@@ -139,6 +141,34 @@ mod tests {
         // ...but the other adapters are unaffected.
         assert_eq!(resolve(&s, &disabled, "rs"), Some(AdapterKind::LldbDap));
         assert_eq!(resolve(&s, &disabled, "ts"), Some(AdapterKind::JsDebug));
+    }
+
+    /// #264: the Go adapter toggles off from the Extensions panel like the
+    /// others: disabled, `.go` resolves to nothing and the disabled
+    /// extension is the one named, and nothing else changes.
+    #[test]
+    fn disabling_the_go_adapter_releases_go_files_and_nothing_else() {
+        let s = bundled();
+        let mut disabled = BTreeSet::new();
+        disabled.insert("dap-go".to_string());
+        assert_eq!(resolve(&s, &disabled, "go"), None);
+        let claims: Vec<String> = matches(&s, "go")
+            .into_iter()
+            .map(|m| m.extension_id)
+            .collect();
+        assert_eq!(claims, ["dap-go"], "the one to name in the message");
+        for (ext, kind) in [
+            ("py", AdapterKind::Debugpy),
+            ("rs", AdapterKind::LldbDap),
+            ("ts", AdapterKind::JsDebug),
+        ] {
+            assert_eq!(resolve(&s, &disabled, ext), Some(kind), "{ext}");
+        }
+        assert_eq!(
+            resolve(&s, &BTreeSet::new(), "go"),
+            Some(AdapterKind::Delve),
+            "enabling it again restores it"
+        );
     }
 
     #[test]

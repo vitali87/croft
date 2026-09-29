@@ -45,6 +45,11 @@ fn launcher_script(croft_bin: &str, open_dir: &str) -> String {
 	do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of inner
 end run
 
+on open location theURL
+	set inner to quoted form of {bin} & " open-link " & quoted form of theURL
+	do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of inner
+end open location
+
 on open theFiles
 	repeat with f in theFiles
 		set inner to quoted form of {bin} & " " & quoted form of (POSIX path of f) & " --zen"
@@ -82,6 +87,11 @@ fn plist_edits() -> Vec<String> {
         "Add :CFBundleDocumentTypes:0:LSHandlerRank string Alternate",
         "Add :CFBundleDocumentTypes:0:LSItemContentTypes array",
         "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string public.item",
+        // croft:// links (#359) arrive as `on open location`.
+        "Add :CFBundleURLTypes array",
+        "Add :CFBundleURLTypes:0:CFBundleURLName string com.vitali87.croft-link",
+        "Add :CFBundleURLTypes:0:CFBundleURLSchemes array",
+        "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string croft",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -96,10 +106,14 @@ fn plist_edits() -> Vec<String> {
 /// also the ordering `Delete :CFBundleDocumentTypes` needs, clearing the
 /// applet's legacy wildcard array before the edits rebuild it.
 fn plist_cleanup_deletes() -> Vec<String> {
-    ["Delete :CFBundleIconName", "Delete :CFBundleDocumentTypes"]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect()
+    [
+        "Delete :CFBundleIconName",
+        "Delete :CFBundleDocumentTypes",
+        "Delete :CFBundleURLTypes",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 /// Where the bundle lives: system-wide `/Applications` (default) or per-user

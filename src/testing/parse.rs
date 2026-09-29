@@ -12,6 +12,10 @@ pub fn parse_test_line(line: &str) -> Option<TestCase> {
     // no " ... " infix. Test paths never contain " ... ", so the split is safe.
     let rest = line.strip_prefix("test ")?;
     let (name, outcome) = rest.rsplit_once(" ... ")?;
+    // `#[should_panic]` tests print `test boom - should panic ... ok`, but
+    // `--list` names them `boom`: without the suffix stripped the result
+    // never lands on the discovered row, and a phantom row appears instead.
+    let name = name.strip_suffix(" - should panic").unwrap_or(name);
     let status = match outcome.trim() {
         "ok" => TestStatus::Passed,
         "FAILED" => TestStatus::Failed,
@@ -214,6 +218,10 @@ mod tests {
             parse_test_line("test a::b::c ... ok").unwrap().name,
             "a::b::c"
         );
+        // `#[should_panic]` results carry a suffix `--list` does not.
+        let r = parse_test_line("test a::boom - should panic ... ok").unwrap();
+        assert_eq!(r.name, "a::boom");
+        assert_eq!(r.status, TestStatus::Passed);
         // Chrome and the summary line are not test cases.
         assert!(parse_test_line("test result: ok. 1 passed; 0 failed; 0 ignored;").is_none());
         assert!(parse_test_line("   Compiling croft v0.1.0").is_none());

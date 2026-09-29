@@ -25,7 +25,7 @@ use crate::session_state::dirs_cache_croft;
 /// Directory holding one `<hash>.sock` dtach control socket per persistent
 /// workspace, each with a `<hash>.json` sidecar recording which workspace it
 /// belongs to. Same `$HOME/.cache/croft/sessions` path the remote wrapper uses.
-fn sessions_dir() -> PathBuf {
+pub(crate) fn sessions_dir() -> PathBuf {
     dirs_cache_croft().join("sessions")
 }
 
@@ -46,7 +46,7 @@ fn socket_path(workspace: &Path) -> PathBuf {
 /// Socket for a mux (session-host) session. A distinct name from the legacy
 /// dtach socket, so a client never speaks croft's frame protocol at a live
 /// dtach server (which would feed the frames into the PTY as input).
-fn mux_socket_path(workspace: &Path) -> PathBuf {
+pub(crate) fn mux_socket_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.mux.sock", socket_name(workspace)))
 }
 
@@ -392,10 +392,22 @@ pub fn attach(path: Option<PathBuf>, solo: bool) -> Result<()> {
     Ok(())
 }
 
+/// One live session in `croft ls`.
+#[derive(Debug)]
+struct SessionRow {
+    id: String,
+    workspace: String,
+    uptime: String,
+    /// The host survived a binary update (#238).
+    stale: bool,
+    /// Where `croft web` serves it, if it does (#343).
+    web: Option<String>,
+}
+
 /// The live persistent sessions under `dir`, pruning any dead session
-/// sockets. One row per session: (id, workspace, uptime).
-fn session_rows(dir: &Path) -> Vec<(String, String, String, bool)> {
-    let mut rows: Vec<(String, String, String, bool)> = Vec::new();
+/// sockets.
+fn session_rows(dir: &Path) -> Vec<SessionRow> {
+    let mut rows: Vec<SessionRow> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let socket = entry.path();
@@ -418,6 +430,7 @@ fn session_rows(dir: &Path) -> Vec<(String, String, String, bool)> {
             if !is_alive(&socket) {
                 let _ = std::fs::remove_file(&socket);
                 let _ = std::fs::remove_file(meta_path(&socket));
+                let _ = std::fs::remove_file(crate::web::record_path(&socket));
                 continue;
             }
             let meta = read_meta(&socket);
@@ -438,7 +451,14 @@ fn session_rows(dir: &Path) -> Vec<(String, String, String, bool)> {
             // #238: the host wrote its stale-image marker — it survived a
             // binary update and keeps running the old code until restarted.
             let stale = crate::session_host::stale_marker_path(&socket).exists();
-            rows.push((id, workspace, uptime, stale));
+            let web = crate::web::live_record(&crate::web::record_path(&socket)).map(|r| r.url);
+            rows.push(SessionRow {
+                id,
+                workspace,
+                uptime,
+                stale,
+                web,
+            });
         }
     }
     rows
@@ -452,13 +472,20 @@ pub fn list() -> Result<()> {
         return Ok(());
     }
     println!("{:<10}  {:<44}  UPTIME", "SESSION", "WORKSPACE");
-    for (id, ws, up, stale) in rows {
-        let hint = if stale {
+    for row in rows {
+        let hint = if row.stale {
             "  (host pre-dates a binary update; reattach to refresh)"
         } else {
             ""
         };
-        println!("{id:<10}  {ws:<44}  {up}{hint}");
+        let web = row
+            .web
+            .map(|url| format!("  web: {url}"))
+            .unwrap_or_default();
+        println!(
+            "{:<10}  {:<44}  {}{hint}{web}",
+            row.id, row.workspace, row.uptime
+        );
     }
     Ok(())
 }
@@ -567,6 +594,34 @@ mod tests {
         assert_eq!(read_pair_record(&path).as_ref(), Some(&record));
     }
 
+    /// #343: `croft ls` says which sessions `croft web` exposes, and where.
+    #[test]
+    fn ls_shows_where_a_session_is_served_on_the_web() {
+        let dir = tempfile::tempdir().unwrap();
+        let mux = dir.path().join("0123456789abcdef.mux.sock");
+        let _mux_listener = bind_socket_0600(&mux).unwrap();
+        write_meta(
+            &mux,
+            &SessionMeta {
+                workspace: PathBuf::from("/tmp/ws"),
+                created_unix: now_unix(),
+            },
+        )
+        .unwrap();
+        assert_eq!(session_rows(dir.path())[0].web, None);
+        std::fs::write(
+            crate::web::record_path(&mux),
+            format!(
+                r#"{{"pid":{},"url":"wss://127.0.0.1:7681/"}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        let rows = session_rows(dir.path());
+        assert_eq!(rows.len(), 1, "the record is not a session: {rows:?}");
+        assert_eq!(rows[0].web.as_deref(), Some("wss://127.0.0.1:7681/"));
+    }
+
     /// A workspace's collab relay socket (`<hash>.collab.sock`) shares the
     /// sessions directory and hash keying with the real session socket, and
     /// is a live listener whenever `croft pair` seated a navigator. It is not
@@ -597,7 +652,7 @@ mod tests {
             1,
             "only the session is a session; the relay must not be listed: {rows:?}"
         );
-        assert_eq!(rows[0].1, "/tmp/ws");
+        assert_eq!(rows[0].workspace, "/tmp/ws");
         assert!(
             collab.exists(),
             "ls must not prune the relay socket either — its lifecycle belongs to the relay"

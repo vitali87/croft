@@ -49,6 +49,9 @@ pub const CHANNEL_PROVISION: &str = "Server Provisioning";
 pub const CHANNEL_TESTS: &str = "Test Runner";
 /// Fleet run results, one line per host plus the summary (#363).
 pub const CHANNEL_FLEET: &str = "Fleet";
+/// Remote provisioning: which hosts got croft installed, and why an install
+/// failed (#364).
+pub const CHANNEL_REMOTE: &str = "Remote";
 /// Notification-sink delivery failures (#358).
 pub const CHANNEL_NOTIFICATIONS: &str = "Notifications";
 
@@ -64,6 +67,24 @@ pub struct OutputLine {
 /// scrollback; the oldest line drops off the front so a chatty server can't
 /// grow the buffer without bound.
 const MAX_LINES: usize = 5000;
+
+/// Per-line cap. `MAX_LINES` alone bounded the count, not the size: with RPC
+/// tracing on, every JSON-RPC body is one line, and a semantic-tokens or
+/// workspace-diagnostics reply can be megabytes, so 5000 of them held
+/// gigabytes (#694). The rest of an over-long line is dropped with a note.
+const MAX_LINE_BYTES: usize = 16 * 1024;
+
+/// `text` cut to [`MAX_LINE_BYTES`] at a char boundary, with how much went.
+fn capped_line(text: &str) -> String {
+    if text.len() <= MAX_LINE_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_LINE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} more bytes)", &text[..end], text.len() - end)
+}
 
 struct Registry {
     channels: BTreeMap<String, VecDeque<OutputLine>>,
@@ -116,7 +137,7 @@ pub fn push(channel: &str, level: OutputLevel, text: &str) {
     buf.push_back(OutputLine {
         ts: now(),
         level,
-        text: text.to_string(),
+        text: capped_line(text),
     });
     while buf.len() > MAX_LINES {
         buf.pop_front();
@@ -129,6 +150,23 @@ pub fn channel_names() -> Vec<String> {
     registry()
         .lock()
         .map(|r| r.channels.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Each channel's name, line count and bytes of line text, for the memory
+/// report (#694). Counts under the lock rather than cloning the lines.
+pub fn channel_sizes() -> Vec<(String, usize, usize)> {
+    registry()
+        .lock()
+        .map(|r| {
+            r.channels
+                .iter()
+                .map(|(name, buf)| {
+                    let bytes = buf.iter().map(|l| l.text.len()).sum();
+                    (name.clone(), buf.len(), bytes)
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -166,6 +204,46 @@ mod tests {
         assert_eq!(lines[1].text, "second");
         assert_eq!(lines[1].level, OutputLevel::Error);
         assert!(channel_names().iter().any(|c| c == ch));
+    }
+
+    /// #694: the memory report reads each channel's line count and text
+    /// bytes.
+    #[test]
+    fn channel_sizes_count_lines_and_text_bytes() {
+        let ch = "test-channel-sizes";
+        push(ch, OutputLevel::Info, "abc");
+        push(ch, OutputLevel::Info, "de");
+        let sizes = channel_sizes();
+        let (_, lines, bytes) = sizes.iter().find(|(n, _, _)| n == ch).unwrap();
+        assert_eq!((*lines, *bytes), (2, 5));
+    }
+
+    /// #694: a multi-megabyte traced JSON-RPC body is held as one capped
+    /// line, cut on a char boundary, with a note of what was dropped.
+    #[test]
+    fn an_over_long_line_is_capped() {
+        let ch = "test-line-cap";
+        let body = format!(
+            "{}é{}",
+            "x".repeat(MAX_LINE_BYTES - 1),
+            "y".repeat(3 * 1024 * 1024)
+        );
+        push(ch, OutputLevel::Info, &body);
+        let line = &snapshot(ch).unwrap()[0].text;
+        assert!(
+            line.len() < MAX_LINE_BYTES + 64,
+            "{} bytes held",
+            line.len()
+        );
+        let dropped = body.len() - (MAX_LINE_BYTES - 1);
+        assert!(
+            line.ends_with(&format!("… ({dropped} more bytes)")),
+            "{}",
+            &line[line.len() - 40..]
+        );
+        assert!(line.starts_with(&"x".repeat(MAX_LINE_BYTES - 1)));
+        push(ch, OutputLevel::Info, "short");
+        assert_eq!(snapshot(ch).unwrap()[1].text, "short");
     }
 
     #[test]

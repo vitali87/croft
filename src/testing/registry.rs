@@ -28,6 +28,8 @@ fn kind_of(decl: RunnerKindDecl) -> Runner {
         RunnerKindDecl::Pytest => Runner::Pytest,
         RunnerKindDecl::Vitest => Runner::Vitest,
         RunnerKindDecl::Jest => Runner::Jest,
+        RunnerKindDecl::Go => Runner::Go,
+        RunnerKindDecl::Codeql => Runner::Codeql,
     }
 }
 
@@ -52,8 +54,13 @@ fn package_declares(root: &Path, deps: &[String]) -> bool {
 }
 
 /// Whether the workspace at `root` matches one runner declaration: any marker
-/// file exists, or package.json names one of its dependency markers.
+/// file exists, or package.json names one of its dependency markers. CodeQL's
+/// markers are pack files, and every CodeQL repo has those: only one that
+/// declares a test pack, at the root or a few folders below, counts.
 fn decl_matches(decl: &TestRunnerDecl, root: &Path) -> bool {
+    if decl.kind == RunnerKindDecl::Codeql {
+        return !super::codeqltest::test_packs(root, &decl.markers).is_empty();
+    }
     decl.markers.iter().any(|m| root.join(m).is_file())
         || package_declares(root, &decl.package_deps)
 }
@@ -166,6 +173,45 @@ mod tests {
         std::fs::write(jest_cfg.path().join("package.json"), "{}").unwrap();
         std::fs::write(jest_cfg.path().join("jest.config.js"), "").unwrap();
         assert_eq!(resolve(&s, &none(), jest_cfg.path()), Some(Runner::Jest));
+    }
+
+    #[test]
+    fn a_go_module_routes_to_go_test() {
+        let s = bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module example.com/m\n").unwrap();
+        assert_eq!(resolve(&s, &none(), tmp.path()), Some(Runner::Go));
+        let off: BTreeSet<String> = [String::from("test-go")].into();
+        assert_eq!(resolve(&s, &off, tmp.path()), None);
+    }
+
+    #[test]
+    fn a_codeql_test_pack_routes_to_codeql_but_a_query_pack_does_not() {
+        let s = bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        // A plain query pack is not a test project.
+        write(
+            "src/qlpack.yml",
+            "name: acme/queries\ndependencies:\n  codeql/go-all: '*'\n",
+        );
+        write("src/Find.ql", "select 1");
+        assert_eq!(resolve(&s, &none(), tmp.path()), None);
+        // A test pack below the root is.
+        write(
+            "test/qlpack.yml",
+            "name: acme/tests\nextractor: go\ntests: .\n",
+        );
+        assert_eq!(resolve(&s, &none(), tmp.path()), Some(Runner::Codeql));
+        let off: BTreeSet<String> = [String::from("test-codeql")].into();
+        assert_eq!(resolve(&s, &off, tmp.path()), None);
+        // Another project's marker at the root still wins.
+        write("go.mod", "module example.com/m\n");
+        assert_eq!(resolve(&s, &none(), tmp.path()), Some(Runner::Go));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! mouse clicks hit the rows the user sees.
 
 use super::semantics::{BaselineState, Level, SuppressionState};
-use super::view::{Row, SarifView, Tab};
+use super::view::{DetailTab, Row, SarifView, Tab};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -29,7 +29,7 @@ pub fn level_glyph(level: Level) -> &'static str {
     }
 }
 
-fn baseline_label(b: BaselineState) -> &'static str {
+pub(crate) fn baseline_label(b: BaselineState) -> &'static str {
     match b {
         BaselineState::New => "new",
         BaselineState::Unchanged => "unchanged",
@@ -39,7 +39,7 @@ fn baseline_label(b: BaselineState) -> &'static str {
     }
 }
 
-fn suppression_label(s: SuppressionState) -> &'static str {
+pub(crate) fn suppression_label(s: SuppressionState) -> &'static str {
     match s {
         SuppressionState::Unknown | SuppressionState::NotSuppressed => "not suppressed",
         SuppressionState::UnderReview => "suppression under review",
@@ -102,6 +102,7 @@ pub fn render(
         (Tab::Locations, "Locations"),
         (Tab::Rules, "Rules"),
         (Tab::Logs, "Logs"),
+        (Tab::Run, "Run"),
     ] {
         let style = if view.tab == tab {
             Style::default()
@@ -164,7 +165,13 @@ pub fn render(
     view.list_x = inner.x;
     view.list_width = list_w;
 
-    let rows = view.rows();
+    // The Run tab lists facts, not results: nothing to select or click.
+    let rows = if view.tab == Tab::Run {
+        view.rows_visible = 0;
+        Vec::new()
+    } else {
+        view.rows()
+    };
     if !rows.is_empty() {
         view.selected = view.selected.min(rows.len() - 1);
     }
@@ -178,7 +185,22 @@ pub fn render(
         .scroll
         .min(rows.len().saturating_sub(visible.min(rows.len())));
 
-    if rows.is_empty() {
+    if view.tab == Tab::Run {
+        for (i, line) in view.run_lines().into_iter().take(visible).enumerate() {
+            let style = if line.starts_with("  ") {
+                text
+            } else {
+                text.add_modifier(Modifier::BOLD)
+            };
+            buf.set_stringn(
+                inner.x + 1,
+                body_top + i as u16,
+                &line,
+                (list_w as usize).saturating_sub(1),
+                style,
+            );
+        }
+    } else if rows.is_empty() {
         let msg = if view.entries.is_empty() {
             " No results in this log."
         } else {
@@ -224,7 +246,13 @@ pub fn render(
                 } else {
                     String::from("—")
                 };
-                let base = if selected { sel_style } else { text };
+                let base = if selected {
+                    sel_style
+                } else if e.fixed {
+                    dim.add_modifier(Modifier::CROSSED_OUT)
+                } else {
+                    text
+                };
                 buf.set_stringn(inner.x, y, "   ", list_w as usize, base);
                 let glyph_style = if selected {
                     sel_style
@@ -232,10 +260,35 @@ pub fn render(
                     Style::default().fg(level_color(e.level)).bg(bg)
                 };
                 buf.set_stringn(inner.x + 2, y, level_glyph(e.level), 1, glyph_style);
-                let rest = format!(" {pos:<8} {}", e.message);
+                let mut cells = String::new();
+                for col in &view.columns {
+                    let w = col.width();
+                    let cell: String = col.cell(e).chars().take(w).collect();
+                    cells.push_str(&format!("{cell:<w$} "));
+                }
+                let lead = format!(" {pos:<8} {cells}");
+                let rest = format!("{lead}{}", e.message);
                 let rest_w = (list_w as usize).saturating_sub(3);
                 let padded = format!("{rest:<rest_w$}");
                 buf.set_stringn(inner.x + 3, y, &padded, rest_w, base);
+                // The filter's words, marked where the message shows them.
+                if !view.query_text.is_empty() {
+                    use unicode_width::UnicodeWidthStr;
+                    let q = super::view::parse_query(&view.query_text);
+                    let lead_w = lead.width();
+                    for (a, b) in super::view::highlight_ranges(&q, &e.message) {
+                        let x0 = lead_w + e.message[..a].width();
+                        let x1 = (lead_w + e.message[..b].width()).min(rest_w);
+                        for x in x0..x1 {
+                            if let Some(cell) = buf.cell_mut((inner.x + 3 + x as u16, y)) {
+                                cell.set_style(
+                                    Style::default()
+                                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -245,13 +298,24 @@ pub fn render(
             buf.set_stringn(dx - 1, y, "│", 1, dim);
         }
         let dw = (inner.x + inner.width).saturating_sub(dx + 1) as usize;
-        render_details(view, dx + 1, body_top, dw, body_h, buf, text, dim, bg);
+        render_details(
+            view,
+            dx + 1,
+            body_top,
+            dw,
+            body_h,
+            buf,
+            text,
+            dim,
+            bg,
+            theme,
+        );
     }
 
     let hint = if view.editing_query {
-        " type to filter · terms AND · a|b OR · -x exclude · rule: file: level: tag: tool: msg: · Enter done · Esc clear "
+        " type to filter · terms AND · a|b OR · -x exclude · rule: file: level: tag: tool: msg: cwe: · Enter done · Esc clear "
     } else {
-        " ↑↓ move · ←→ fold · Enter open · / filter · Tab view · s sort · 1-4 levels · u suppressed · a absent · x clear "
+        " ↑↓ move · Enter open · Space preview · / filter · Tab view · f fix · o add log · b baseline · E export · X dismiss alert · s sort · C columns · 1-4 levels · u suppressed · a absent · K non-problems · W close added logs · x clear · ←→ fold · d/D details tab · [ ] scroll details · n/N next/prev step · L follow link "
     };
     buf.set_stringn(
         inner.x,
@@ -266,7 +330,7 @@ pub fn render(
 
 #[allow(clippy::too_many_arguments)]
 fn render_details(
-    view: &SarifView,
+    view: &mut SarifView,
     x: u16,
     top: u16,
     w: usize,
@@ -275,56 +339,332 @@ fn render_details(
     text: Style,
     dim: Style,
     bg: Color,
+    theme: crate::theme::Theme,
 ) {
-    if w < 10 {
+    if w < 10 || h < 2 {
         return;
     }
-    let Some(e) = view.selected_entry() else {
+    if let Some(p) = view.current_preview().cloned() {
+        render_preview(&p, x, top, w, h, buf, text, dim, theme);
+        return;
+    }
+    let tab = view.detail_tab;
+    let cursor = view.nav_cursor;
+    let raw = if tab == DetailTab::Raw {
+        view.raw().map(str::to_string)
+    } else {
+        None
+    };
+    let fix_lines = if tab == DetailTab::Fix {
+        view.fix_preview()
+    } else {
+        Vec::new()
+    };
+    let Some(d) = view.details() else {
         buf.set_stringn(x, top, "Select a result to see its details.", w, dim);
         return;
     };
-    let mut lines: Vec<(String, Style)> = Vec::new();
-    let rule = if e.rule_name.is_empty() {
-        e.rule_id.clone()
-    } else {
-        format!("{} · {}", e.rule_id, e.rule_name)
-    };
-    lines.push((rule, text.add_modifier(Modifier::BOLD)));
-    lines.push((
-        format!(
-            "{} · {} · {}",
-            e.level.as_str(),
-            baseline_label(e.baseline),
-            suppression_label(e.suppression)
-        ),
-        Style::default().fg(level_color(e.level)).bg(bg),
-    ));
-    lines.push((String::new(), text));
-    for wrapped in wrap(&e.message, w) {
-        lines.push((wrapped, text));
-    }
-    lines.push((String::new(), text));
-    if !e.file.is_empty() {
-        let at = if e.line > 0 {
-            format!("at {}:{}:{}", e.file, e.line, e.column.max(1))
-        } else {
-            format!("at {}", e.file)
+    let steps: usize = d.threads.iter().map(|t| t.steps.len()).sum();
+    let frames: usize = d.stacks.iter().map(|s| s.frames.len()).sum();
+    // Tab strip.
+    let mut tx = x;
+    for t in [
+        DetailTab::Info,
+        DetailTab::Steps,
+        DetailTab::Stacks,
+        DetailTab::Raw,
+        DetailTab::Fix,
+    ] {
+        let label = match t {
+            DetailTab::Steps => format!(" Steps {steps} "),
+            DetailTab::Stacks => format!(" Stacks {frames} "),
+            other => format!(" {} ", other.label()),
         };
-        lines.push((at, text));
+        let style = if t == tab {
+            Style::default()
+                .fg(theme.accent_contrast_fg())
+                .bg(theme.accent())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            text
+        };
+        if (tx - x) as usize + label.chars().count() > w {
+            break;
+        }
+        buf.set_stringn(tx, top, &label, w, style);
+        tx += label.chars().count() as u16 + 1;
     }
-    if !e.tool.is_empty() {
-        lines.push((format!("tool {}", e.tool), dim));
+    let at = |l: &super::details::LocRef| -> String {
+        if l.line > 0 {
+            format!("{}:{}:{}", l.label, l.line, l.column.max(1))
+        } else {
+            l.label.clone()
+        }
+    };
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    let sel = Style::default()
+        .fg(theme.accent_contrast_fg())
+        .bg(theme.accent());
+    match tab {
+        DetailTab::Info => {
+            let rule = if d.rule_name.is_empty() {
+                d.rule_id.clone()
+            } else {
+                format!("{} · {}", d.rule_id, d.rule_name)
+            };
+            lines.push((rule, text.add_modifier(Modifier::BOLD)));
+            lines.push((
+                format!(
+                    "{} · {} · {}",
+                    d.level.as_str(),
+                    baseline_label(d.baseline),
+                    suppression_label(d.suppression)
+                ),
+                Style::default().fg(level_color(d.level)).bg(bg),
+            ));
+            if let Some(j) = &d.justification {
+                lines.push((format!("justification: {j}"), dim));
+            }
+            lines.push((String::new(), text));
+            let message: String = d
+                .message
+                .iter()
+                .map(|s| match s {
+                    super::semantics::Segment::Text(t) => t.clone(),
+                    super::semantics::Segment::LocationLink { text, .. } => format!("[{text}]"),
+                    super::semantics::Segment::UriLink { text, uri } => format!("{text} <{uri}>"),
+                })
+                .collect();
+            match &d.message_markdown {
+                Some(md) => push_markdown(&mut lines, md, w, text, dim),
+                None => {
+                    for l in wrap(&message, w) {
+                        lines.push((l, text));
+                    }
+                }
+            }
+            lines.push((String::new(), text));
+            for l in &d.locations {
+                lines.push((format!("at {}", at(l)), text));
+            }
+            for l in &d.related {
+                let id = l.id.map(|i| format!("[{i}] ")).unwrap_or_default();
+                let msg = if l.message.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", l.message)
+                };
+                lines.push((format!("↳ {id}{}{msg}", at(l)), text));
+            }
+            if !d.description.is_empty() {
+                lines.push((String::new(), text));
+                if d.description_markdown {
+                    push_markdown(&mut lines, &d.description, w, dim, dim);
+                } else {
+                    for l in wrap(&d.description, w) {
+                        lines.push((l, dim));
+                    }
+                }
+            }
+            if !d.help.is_empty() {
+                lines.push((String::new(), text));
+                lines.push(("help".to_string(), text.add_modifier(Modifier::BOLD)));
+                if d.help_markdown {
+                    push_markdown(&mut lines, &d.help, w, text, dim);
+                } else {
+                    for l in wrap(&d.help, w) {
+                        lines.push((l, text));
+                    }
+                }
+            }
+            if let Some(u) = &d.help_uri {
+                lines.push((u.clone(), dim));
+            }
+            if !d.taxa.is_empty() {
+                lines.push((String::new(), text));
+                lines.push(("taxa".to_string(), text.add_modifier(Modifier::BOLD)));
+                for t in &d.taxa {
+                    for l in wrap(t, w) {
+                        lines.push((l, text));
+                    }
+                }
+            }
+            if !d.properties.is_empty() || !d.fingerprints.is_empty() {
+                lines.push((String::new(), text));
+            }
+            for (k, val) in d.properties.iter().chain(d.fingerprints.iter()) {
+                lines.push((format!("{k} = {val}"), dim));
+            }
+            if let Some(g) = &d.guid {
+                lines.push((format!("guid = {g}"), dim));
+            }
+            if let Some(r) = d.rank {
+                lines.push((format!("rank = {r}"), dim));
+            }
+            if let Some(n) = d.occurrence_count {
+                lines.push((format!("occurrences = {n}"), dim));
+            }
+        }
+        DetailTab::Steps => {
+            if d.threads.is_empty() {
+                lines.push(("No analysis steps in this result.".to_string(), dim));
+            }
+            let mut n = 0usize;
+            for t in &d.threads {
+                let head = if t.message.is_empty() {
+                    t.label.clone()
+                } else {
+                    format!("{} · {}", t.label, t.message)
+                };
+                lines.push((head, text.add_modifier(Modifier::BOLD)));
+                for s in &t.steps {
+                    let mark = match s.importance.as_str() {
+                        "essential" => "●",
+                        "unimportant" => "·",
+                        _ => "○",
+                    };
+                    let loc = s.location.as_ref().map(&at).unwrap_or_default();
+                    let state = if s.state.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "  [{}]",
+                            s.state
+                                .iter()
+                                .map(|(k, v)| format!("{k} = {v}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    let line = format!(
+                        "{:>3}. {}{mark} {}  {loc}{state}",
+                        n + 1,
+                        "  ".repeat(s.depth),
+                        s.message
+                    );
+                    let style = if cursor == Some(n) { sel } else { text };
+                    if s.location.is_some() {
+                        n += 1;
+                    }
+                    lines.push((line, style));
+                }
+            }
+        }
+        DetailTab::Stacks => {
+            if d.stacks.is_empty() {
+                lines.push(("No stacks in this result.".to_string(), dim));
+            }
+            let mut n = 0usize;
+            for (i, s) in d.stacks.iter().enumerate() {
+                let head = if s.message.is_empty() {
+                    format!("Stack {}", i + 1)
+                } else {
+                    s.message.clone()
+                };
+                lines.push((head, text.add_modifier(Modifier::BOLD)));
+                for f in &s.frames {
+                    let loc = f.location.as_ref().map(&at).unwrap_or_default();
+                    let module = if f.module.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({})", f.module)
+                    };
+                    let style = if cursor == Some(n) { sel } else { text };
+                    if f.location.is_some() {
+                        n += 1;
+                    }
+                    lines.push((format!("  {}  {loc}{module}", f.text), style));
+                }
+            }
+        }
+        DetailTab::Fix => {
+            for l in fix_lines {
+                let style = if l.starts_with("+ ") {
+                    Style::default().fg(Color::Rgb(0x5d, 0xbb, 0x85)).bg(bg)
+                } else if l.starts_with("- ") {
+                    Style::default().fg(Color::Rgb(0xf1, 0x4c, 0x4c)).bg(bg)
+                } else if l.starts_with("Fix ") {
+                    text.add_modifier(Modifier::BOLD)
+                } else {
+                    text
+                };
+                lines.push((l, style));
+            }
+        }
+        DetailTab::Raw => match raw {
+            Some(json) => {
+                for l in json.lines() {
+                    lines.push((l.to_string(), text));
+                }
+            }
+            None => lines.push((
+                "The result could not be read back from the log.".to_string(),
+                dim,
+            )),
+        },
     }
-    if !e.tags.is_empty() {
-        lines.push((format!("tags {}", e.tags.join(", ")), dim));
+    let rows = (h - 1) as usize;
+    let scroll = view.detail_scroll.min(lines.len().saturating_sub(rows));
+    view.detail_scroll = scroll;
+    for (i, (line, style)) in lines.into_iter().skip(scroll).take(rows).enumerate() {
+        buf.set_stringn(x, top + 1 + i as u16, &line, w, style);
     }
-    for (i, (line, style)) in lines.into_iter().take(h as usize).enumerate() {
-        buf.set_stringn(x, top + i as u16, &line, w, style);
+}
+
+/// Markdown laid out for the details pane: headings bold, code dim.
+fn push_markdown(lines: &mut Vec<(String, Style)>, md: &str, w: usize, text: Style, dim: Style) {
+    use super::md::LineKind;
+    for (l, kind) in super::md::lines(md, w) {
+        let style = match kind {
+            LineKind::Text => text,
+            LineKind::Heading => text.add_modifier(Modifier::BOLD),
+            LineKind::Code => dim,
+        };
+        lines.push((l, style));
+    }
+}
+
+/// Space's source preview (#577): the file, then its numbered lines with
+/// the result's line marked.
+#[allow(clippy::too_many_arguments)]
+fn render_preview(
+    p: &super::view::SourcePreview,
+    x: u16,
+    top: u16,
+    w: usize,
+    h: u16,
+    buf: &mut Buffer,
+    text: Style,
+    dim: Style,
+    theme: crate::theme::Theme,
+) {
+    buf.set_stringn(
+        x,
+        top,
+        format!("Preview · {} · Space closes", p.title),
+        w,
+        text.add_modifier(Modifier::BOLD),
+    );
+    let digits = (p.first + p.lines.len()).to_string().len();
+    let mark = Style::default()
+        .fg(theme.accent_contrast_fg())
+        .bg(theme.accent());
+    for (i, line) in p.lines.iter().take((h - 1) as usize).enumerate() {
+        let n = p.first + i;
+        let row = top + 1 + i as u16;
+        let style = if n == p.target { mark } else { text };
+        let gutter = format!("{n:>digits$} ");
+        buf.set_stringn(x, row, &gutter, w, if n == p.target { mark } else { dim });
+        let gw = gutter.chars().count();
+        if w > gw {
+            let body = format!("{:<width$}", line.replace('\t', "    "), width = w - gw);
+            buf.set_stringn(x + gw as u16, row, &body, w - gw, style);
+        }
     }
 }
 
 /// Greedy word wrap to `width` columns; a word longer than a line is split.
-fn wrap(s: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(s: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     for para in s.lines() {
         let mut line = String::new();

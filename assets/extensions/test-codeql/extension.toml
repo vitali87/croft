@@ -1,0 +1,19 @@
+# Bundled croft extension: CodeQL test runner.
+# Points the Testing view's `codeql test run` mechanism
+# (src/testing/codeqltest.rs) at CodeQL test packs. The commands and parsers
+# stay native; this manifest only declares which pack files route to the
+# codeql mechanism. A pack file counts only when it declares a test pack
+# (`tests:`, or `extractor:` with tests beside it), at the root or a few
+# folders below it. Disabling this extension stops the Testing view from
+# detecting CodeQL tests.
+id = "test-codeql"
+name = "CodeQL Test Runner"
+description = "Discover and run CodeQL query tests with codeql test run in the Testing view."
+builtin = true
+api_version = 1
+
+[[test_runners]]
+id = "test-codeql"
+label = "codeql test run"
+kind = "codeql"
+markers = ["qlpack.yml", "codeql-pack.yml"]

@@ -269,6 +269,14 @@ impl PortsPanel {
         Some((local, port))
     }
 
+    /// The local port `port` is already forwarded to, if it is.
+    pub fn forwarded_local_port(&self, port: u16) -> Option<u16> {
+        self.entries
+            .iter()
+            .find(|e| e.port == port && e.forwarded)
+            .and_then(|e| e.local_port)
+    }
+
     /// Record that a remote port is now forwarded to `local_port`.
     pub fn mark_forwarded(&mut self, port: u16, local_port: u16) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.port == port) {

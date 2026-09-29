@@ -30,6 +30,7 @@ use crate::lsp::install::{ArchiveKind, Provision};
 pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/core-languages/extension.toml"),
     include_str!("../../assets/extensions/pdf/extension.toml"),
+    include_str!("../../assets/extensions/codeql/extension.toml"),
     include_str!("../../assets/extensions/csv/extension.toml"),
     include_str!("../../assets/extensions/vim/extension.toml"),
     include_str!("../../assets/extensions/lsp-python/extension.toml"),
@@ -47,12 +48,17 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/dap-python/extension.toml"),
     include_str!("../../assets/extensions/dap-lldb/extension.toml"),
     include_str!("../../assets/extensions/dap-js/extension.toml"),
+    include_str!("../../assets/extensions/dap-go/extension.toml"),
     // Runner order is detection priority: cargo, then the JS runners, then
     // pytest — a mixed repo's root is usually the crate.
     include_str!("../../assets/extensions/test-cargo/extension.toml"),
     include_str!("../../assets/extensions/test-vitest/extension.toml"),
     include_str!("../../assets/extensions/test-jest/extension.toml"),
     include_str!("../../assets/extensions/test-pytest/extension.toml"),
+    include_str!("../../assets/extensions/test-go/extension.toml"),
+    // Last: a CodeQL repo often carries other projects' marker files too,
+    // and those runners should keep claiming them.
+    include_str!("../../assets/extensions/test-codeql/extension.toml"),
     include_str!("../../assets/extensions/themes/extension.toml"),
 ];
 
@@ -211,6 +217,8 @@ pub enum AdapterKindDecl {
     Lldb,
     /// vscode-js-debug, launches a Node program over its TCP multi-session.
     JsDebug,
+    /// delve (`dlv dap`), launches a Go package or test over TCP (#264).
+    Delve,
 }
 
 /// One `[[test_runners]]` entry: a test runner contributed by an extension.
@@ -253,6 +261,10 @@ pub enum RunnerKindDecl {
     Vitest,
     /// jest `--json` document output (JS/TS).
     Jest,
+    /// `go test -json` event stream (Go).
+    Go,
+    /// `codeql test run` text output (CodeQL test packs).
+    Codeql,
 }
 
 /// One `[[themes]]` entry: a complete IDE color palette. All colors are
@@ -979,6 +991,8 @@ provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { 
             "test-pytest",
             "test-vitest",
             "test-jest",
+            "test-go",
+            "test-codeql",
         ] {
             assert!(ids.contains(&id), "missing {id} in {ids:?}");
         }

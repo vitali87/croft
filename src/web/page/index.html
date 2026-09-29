@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+<meta name="referrer" content="no-referrer">
+<title>croft</title>
+<style>
+  @font-face { font-family: "croft-icons"; src: url(icons.woff2) format("woff2"); font-display: block; }
+  html, body { margin: 0; height: 100%; background: #1e1e1e; overflow: hidden; }
+  #screen { position: fixed; inset: 0; cursor: text; touch-action: none; }
+  #grid { display: block; }
+  #images { position: absolute; inset: 0; pointer-events: none; }
+  #images img { position: absolute; }
+  #input {
+    position: absolute; left: 0; top: 0; width: 1px; height: 1px; opacity: 0;
+    border: 0; padding: 0; resize: none; overflow: hidden; caret-color: transparent;
+  }
+  #banner {
+    position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+    background: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; border-radius: 4px;
+    padding: 8px 14px; font: 13px system-ui, sans-serif; max-width: 90vw;
+  }
+</style>
+</head>
+<body>
+<div id="screen">
+  <canvas id="grid"></canvas>
+  <div id="images"></div>
+  <textarea id="input" aria-label="Terminal input" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+</div>
+<div id="banner" role="status" hidden></div>
+<script src="term.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

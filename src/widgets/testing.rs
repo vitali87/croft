@@ -48,7 +48,19 @@ pub enum RowHit {
     ShowCase(String),
     /// The play glyph of a suite header: run the whole suite.
     RunSuite(String),
+    /// A row's eye glyph: watch that test or suite, or stop (#263).
+    ToggleWatch(crate::testing::watch::WatchScope),
+    /// A case's coverage glyph: run that test with coverage (#263).
+    CoverCase(String),
+    /// A suite header's coverage glyph: run the suite with coverage.
+    CoverSuite(String),
 }
+
+/// The watch toggle's glyph (codicon `eye`).
+const GLYPH_WATCH: char = '\u{ea70}';
+
+/// The run-with-coverage glyph (codicon `graph`, a bar chart).
+const GLYPH_COVERAGE: char = '\u{eb03}';
 
 pub struct TestingPanel {
     /// All known cases, kept sorted by name; status is updated in place as
@@ -67,6 +79,19 @@ pub struct TestingPanel {
     /// A run just ended red; consumed once by the app (#358), so a failing
     /// run notifies once, not once per test.
     failed_run: bool,
+    /// The last coverage run's report (#263).
+    pub coverage: Option<crate::testing::coverage::Coverage>,
+    coverage_error: Option<crate::testing::worker::CoverageError>,
+    coverage_fresh: bool,
+    /// A run or discovery just ended, with its `ok`; consumed once by the
+    /// app to judge a watched rerun (#263).
+    finished: Option<Option<bool>>,
+    /// Watch mode (#263): what reruns on save.
+    pub watch: crate::testing::watch::TestWatch,
+    /// The header's watch-all toggle, as last drawn.
+    pub last_watch_all: Rect,
+    /// The TESTING header's run-all-with-coverage glyph (#263).
+    pub last_cover_all: Rect,
     /// Latest cargo build-status line while busy (e.g. "Compiling ratatui"), so
     /// a long compile shows movement instead of a static "Discovering tests".
     progress: Option<String>,
@@ -101,6 +126,13 @@ impl TestingPanel {
             last_run_ok: None,
             run_reported_failed: false,
             failed_run: false,
+            coverage: None,
+            coverage_error: None,
+            coverage_fresh: false,
+            finished: None,
+            watch: crate::testing::watch::TestWatch::default(),
+            last_watch_all: Rect::default(),
+            last_cover_all: Rect::default(),
             progress: None,
             refused: false,
             prerun: Vec::new(),
@@ -148,6 +180,9 @@ impl TestingPanel {
         self.refused = false;
         self.prerun.clear();
         self.scroll = 0;
+        self.finished = None;
+        // The watched names described the old project.
+        self.watch.clear();
     }
 
     /// Update the live compile-progress line shown while busy.
@@ -255,6 +290,31 @@ impl TestingPanel {
         if ok == Some(false) {
             self.failed_run = true;
         }
+        self.finished = Some(ok);
+    }
+
+    /// Consume the run-ended latch: `Some(ok)` once per finished run.
+    pub fn take_finished(&mut self) -> Option<Option<bool>> {
+        self.finished.take()
+    }
+
+    /// The first failing case, in tree order.
+    pub fn first_failed(&self) -> Option<String> {
+        self.cases
+            .iter()
+            .find(|c| c.status == TestStatus::Failed)
+            .map(|c| c.name.clone())
+    }
+
+    /// The column of the rows' watch glyph: the last one before the
+    /// scrollbar lane. Render and hit-test both use it.
+    fn watch_col(&self) -> u16 {
+        self.last_area.x + self.last_area.width.saturating_sub(3)
+    }
+
+    /// The run-with-coverage glyphs' column, just left of the eyes (#263).
+    fn cover_col(&self) -> u16 {
+        self.watch_col().saturating_sub(2)
     }
 
     /// Consume the failed-run latch (one notification per red run). Cleared
@@ -268,6 +328,33 @@ impl TestingPanel {
     /// error or a runner that died, when the tally is meaningless.
     pub fn run_reported_failed(&self) -> bool {
         self.run_reported_failed
+    }
+
+    /// A coverage run's report arrived (#263): keep it for the explorer
+    /// percentages, the gutter and the status bar, or keep why there is
+    /// none for the app to offer the install.
+    pub fn on_coverage(
+        &mut self,
+        result: Result<crate::testing::coverage::Coverage, crate::testing::worker::CoverageError>,
+    ) {
+        match result {
+            Ok(coverage) => {
+                self.coverage = Some(coverage);
+                self.coverage_error = None;
+                self.coverage_fresh = true;
+            }
+            Err(e) => self.coverage_error = Some(e),
+        }
+    }
+
+    /// Consume the "a new coverage report arrived" latch.
+    pub fn take_coverage_fresh(&mut self) -> bool {
+        std::mem::take(&mut self.coverage_fresh)
+    }
+
+    /// Consume why the last coverage run produced nothing.
+    pub fn take_coverage_error(&mut self) -> Option<crate::testing::worker::CoverageError> {
+        self.coverage_error.take()
     }
 
     /// The worker refused a queued request because no enabled runner claims
@@ -394,7 +481,25 @@ impl TestingPanel {
         }
         let inner_x = self.last_area.x + 1;
         let shown = (y - self.first_row_y) as usize;
-        match self.rows.get(self.scroll + shown)? {
+        let row = self.rows.get(self.scroll + shown)?;
+        if x == self.cover_col() {
+            return match row {
+                RenderRow::Case(idx) => Some(RowHit::CoverCase(self.cases[*idx].name.clone())),
+                RenderRow::Header(idx) => Some(RowHit::CoverSuite(
+                    self.cases[*idx].suite_and_leaf().0?.to_string(),
+                )),
+            };
+        }
+        if x == self.watch_col() {
+            use crate::testing::watch::WatchScope;
+            return Some(RowHit::ToggleWatch(match row {
+                RenderRow::Case(idx) => WatchScope::Test(self.cases[*idx].name.clone()),
+                RenderRow::Header(idx) => {
+                    WatchScope::Suite(self.cases[*idx].suite_and_leaf().0?.to_string())
+                }
+            }));
+        }
+        match row {
             RenderRow::Case(idx) => {
                 let name = self.cases[*idx].name.clone();
                 if x < inner_x + 4 {
@@ -497,11 +602,43 @@ impl Widget for &mut TestingPanel {
         // scrollbar (drawn at `right - 1`) has its own column and no string
         // bleeds past the panel into the neighbouring pane.
         let right = inner.x + inner.width;
-        let text_right = right.saturating_sub(1);
-        // Column budget up to the scrollbar lane. `set_stringn` clips by
-        // DISPLAY width, so a double-width (CJK) name stops at the budget
-        // instead of painting twice it and bleeding through the border.
-        let avail = |start_x: u16| text_right.saturating_sub(start_x) as usize;
+        // Column budget up to the watch glyphs, which sit just left of the
+        // scrollbar lane. `set_stringn` clips by DISPLAY width, so a
+        // double-width (CJK) name stops at the budget instead of painting
+        // twice it and bleeding through the border.
+        let watch_col = self.watch_col();
+        let cover_col = self.cover_col();
+        let avail = |start_x: u16| watch_col.saturating_sub(start_x + 1) as usize;
+        // Tree names stop short of the coverage glyphs too.
+        let row_avail = |start_x: u16| cover_col.saturating_sub(start_x + 1) as usize;
+        let dim = Style::default().fg(self.theme.ui(COLOR_DIM));
+        let theme = self.theme;
+        let eye = move |watched: bool| {
+            let color = if watched {
+                theme.accent()
+            } else {
+                theme.ui(COLOR_DIM)
+            };
+            (GLYPH_WATCH.to_string(), Style::default().fg(color))
+        };
+        {
+            use crate::testing::watch::WatchScope;
+            let (glyph, style) = eye(self.watch.is_watching(&WatchScope::All));
+            buf.set_string(watch_col, inner.y, glyph, style);
+            self.last_watch_all = Rect {
+                x: watch_col,
+                y: inner.y,
+                width: 1,
+                height: 1,
+            };
+            buf.set_string(cover_col, inner.y, GLYPH_COVERAGE.to_string(), dim);
+            self.last_cover_all = Rect {
+                x: cover_col,
+                y: inner.y,
+                width: 1,
+                height: 1,
+            };
+        }
 
         // Summary line: busy state, the pass/fail/skip tally, or a kickoff hint.
         let (passed, failed, skipped) = self.counts();
@@ -539,7 +676,10 @@ impl Widget for &mut TestingPanel {
             // green tally: say so.
             let run_failed = self.last_run_ok == Some(false) && !self.run_reported_failed;
             // The marker leads so a narrow panel cannot clip it away.
-            let tally = format!("{passed} passed · {failed} failed · {skipped} skipped");
+            let mut tally = format!("{passed} passed · {failed} failed · {skipped} skipped");
+            if let Some(pct) = self.coverage.as_ref().and_then(|c| c.percent()) {
+                tally.push_str(&format!(" · {pct:.0}% covered"));
+            }
             let summary = if run_failed {
                 format!("run failed · {tally}")
             } else {
@@ -605,15 +745,33 @@ impl Widget for &mut TestingPanel {
                         GLYPH_PLAY.to_string(),
                         Style::default().fg(self.theme.ui(COLOR_DIM)),
                     );
+                    // The suite's own file's coverage, right-aligned before
+                    // its coverage glyph, when the last report has it.
+                    let pct = self
+                        .coverage
+                        .as_ref()
+                        .and_then(|c| c.suite_percent(suite))
+                        .map(|p| format!("{p:.0}%"));
+                    let pct_w = pct.as_ref().map_or(0, |p| p.len() as u16 + 1);
+                    let name_room = row_avail(inner.x + 3).saturating_sub(pct_w as usize);
                     buf.set_stringn(
                         inner.x + 3,
                         y,
                         suite,
-                        avail(inner.x + 3),
+                        name_room,
                         Style::default()
                             .fg(self.theme.ui(COLOR_HEADER))
                             .add_modifier(Modifier::BOLD),
                     );
+                    if let Some(pct) = pct
+                        && cover_col >= inner.x + 3 + pct_w
+                    {
+                        buf.set_string(cover_col - pct_w, y, &pct, dim);
+                    }
+                    buf.set_string(cover_col, y, GLYPH_COVERAGE.to_string(), dim);
+                    let scope = crate::testing::watch::WatchScope::Suite(suite.to_string());
+                    let (glyph, style) = eye(self.watch.is_watching(&scope));
+                    buf.set_string(watch_col, y, glyph, style);
                 }
                 RenderRow::Case(case_idx) => {
                     let case = &self.cases[*case_idx];
@@ -629,9 +787,13 @@ impl Widget for &mut TestingPanel {
                         inner.x + 4,
                         y,
                         leaf,
-                        avail(inner.x + 4),
+                        row_avail(inner.x + 4),
                         Style::default().fg(self.theme.ui(COLOR_CASE)),
                     );
+                    buf.set_string(cover_col, y, GLYPH_COVERAGE.to_string(), dim);
+                    let scope = crate::testing::watch::WatchScope::Test(case.name.clone());
+                    let (glyph, style) = eye(self.watch.is_watching(&scope));
+                    buf.set_string(watch_col, y, glyph, style);
                 }
             }
         }
@@ -1076,5 +1238,91 @@ mod tests {
         assert_eq!(running, ["suite_a::one", "suite_a::two"]);
         let other = p.cases.iter().find(|c| c.name == "suite_b::three").unwrap();
         assert_eq!(other.status, TestStatus::Passed, "other suites untouched");
+    }
+
+    #[test]
+    fn the_watch_column_toggles_the_row_under_it_and_names_stop_before_it() {
+        use crate::testing::watch::WatchScope;
+        let mut panel = TestingPanel::new();
+        for n in ["parse::a", "parse::b"] {
+            panel.apply_case(crate::testing::model::TestCase {
+                name: n.into(),
+                status: TestStatus::Passed,
+            });
+        }
+        let area = Rect::new(0, 0, 30, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut panel).render(area, &mut buf);
+        let eye = area.width - 3;
+        let body = panel.first_row_y;
+        assert_eq!(
+            panel.hit_at(eye, body),
+            Some(RowHit::ToggleWatch(WatchScope::Suite("parse".into())))
+        );
+        assert_eq!(
+            panel.hit_at(eye, body + 1),
+            Some(RowHit::ToggleWatch(WatchScope::Test("parse::a".into())))
+        );
+        // One column left of the eye is the row's own hit, as before.
+        assert_eq!(
+            panel.hit_at(eye - 1, body + 1),
+            Some(RowHit::ShowCase("parse::a".into()))
+        );
+        assert_eq!(panel.last_watch_all, Rect::new(eye, 1, 1, 1));
+        // A watched row's eye is drawn in the accent colour.
+        panel.watch.toggle(WatchScope::Test("parse::a".into()));
+        let mut buf = Buffer::empty(area);
+        (&mut panel).render(area, &mut buf);
+        assert_eq!(buf[(eye, body + 1)].fg, panel.theme.accent());
+        assert_ne!(buf[(eye, body + 2)].fg, panel.theme.accent());
+    }
+
+    #[test]
+    fn the_coverage_column_runs_its_row_with_coverage_and_suites_show_their_percentage() {
+        // #263: a coverage glyph two columns left of each eye (and one in
+        // the header) runs that scope with coverage; a suite whose file is
+        // in the last report shows its percentage before the glyph.
+        let mut panel = TestingPanel::new();
+        for n in ["parse::tests::a", "parse::tests::b"] {
+            panel.apply_case(crate::testing::model::TestCase {
+                name: n.into(),
+                status: TestStatus::Passed,
+            });
+        }
+        let area = Rect::new(0, 0, 40, 10);
+        let row_text = |buf: &Buffer, y: u16| -> String {
+            (0..area.width).map(|x| buf[(x, y)].symbol()).collect()
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut panel).render(area, &mut buf);
+        let cover = area.width - 5;
+        let body = panel.first_row_y;
+        assert_eq!(
+            panel.hit_at(cover, body),
+            Some(RowHit::CoverSuite("parse::tests".into()))
+        );
+        assert_eq!(
+            panel.hit_at(cover, body + 1),
+            Some(RowHit::CoverCase("parse::tests::a".into()))
+        );
+        assert_eq!(panel.last_cover_all, Rect::new(cover, 1, 1, 1));
+        assert_eq!(buf[(cover, body)].symbol(), GLYPH_COVERAGE.to_string());
+        assert!(
+            !row_text(&buf, body).contains('%'),
+            "no report, no percentage"
+        );
+
+        panel.on_coverage(Ok(crate::testing::coverage::Coverage::from_lcov(
+            "SF:src/parse.rs\nDA:1,1\nDA:2,1\nDA:3,0\nDA:4,1\nend_of_record\n",
+            std::path::Path::new("/w"),
+        )));
+        let mut buf = Buffer::empty(area);
+        (&mut panel).render(area, &mut buf);
+        let header = row_text(&buf, body);
+        let cells: String = (cover - 4..cover)
+            .map(|x| buf[(x, body)].symbol())
+            .collect();
+        assert_eq!(cells, "75% ", "right-aligned against the glyph: {header:?}");
+        assert!(header.contains("parse::tests"), "{header:?}");
     }
 }

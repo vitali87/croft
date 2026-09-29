@@ -44,10 +44,13 @@ sudo apt install rust-analyzer gopls nodejs npm   # adjust per distro; rust-anal
 
 ## Remote: `croft remote <host>`
 
-`croft remote <host>` launches croft over SSH on a Linux server, installing itself on first connect with no manual prep. `<host>` comes from your `~/.ssh/config`. The install takes one of two paths:
+`croft remote <host>` launches croft over SSH on a Linux server, installing itself on first connect with no manual prep. `<host>` comes from your `~/.ssh/config`. The install takes the first of these that works:
 
-1. It cross-compiles a static musl binary on your Mac and copies it over (fastest path; needs the musl target installed locally).
-2. Failing that, it compiles on the host, provisioning a C toolchain and `pkg-config` across whichever package manager the box has: `apt`, `dnf`/`yum`, `apk`, `pacman`, or `zypper`.
+1. **The release binary.** If your croft came from crates.io (`cargo install croft-software`), your machine downloads that version's `croft-<target>.tar.gz` and `SHA256SUMS` from the GitHub release. If [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/) is installed, it first checks that `SHA256SUMS` was signed by croft's release workflow for that exact tag, and refuses the release if not. Without `cosign` the file is trusted over HTTPS, and the install log says the signature was not checked. It then checks the digest, caches the binary under `~/.cache/croft/prebuilt/`, and copies it over. The server needs no internet access and no toolchain. A version with no release assets skips this step.
+2. **A cross-compile.** croft builds a static musl binary on your machine and copies it over. This needs the musl target installed locally (`croft setup-cross`).
+3. **A build on the host.** croft compiles on the server, first installing a C toolchain and `pkg-config` with whichever package manager the box has: `apt`, `dnf`/`yum`, `apk`, `pacman`, or `zypper`.
+
+`croft remote <host> --build` skips the release binary and builds from source. Each connect logs the path it took, and why it skipped the others, to `~/.cache/croft/install.log` on your machine.
 
 A stock cloud image works as-is, and behaviour, keybindings, latency, and the filesystem-sync invariants are identical to a local session.
 

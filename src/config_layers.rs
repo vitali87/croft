@@ -4,7 +4,10 @@
 //! stacks layers over it, later layers winning per key:
 //!
 //! 1. built-in defaults (what `Prefs::default()` says)
-//! 2. `~/.config/croft/config.json` — user
+//! 2. `~/.config/croft/config.json` — user, then
+//!    `~/.config/croft/config.synced.json` — what config sync brought from
+//!    the machine the user connected from (#262): only the appearance and
+//!    editor keys a workspace may set, never trust state
 //! 3. `~/.config/croft/config.local.json` — machine-local user overrides,
 //!    dotfile-repo friendly
 //! 4. `<root>/.vscode/settings.json` — a small mapped subset, so existing
@@ -37,6 +40,7 @@ use crate::prefs::Prefs;
 pub enum LayerKind {
     Default,
     User,
+    Synced,
     UserLocal,
     VsCodeWorkspace,
     Workspace,
@@ -48,6 +52,7 @@ impl LayerKind {
         match self {
             LayerKind::Default => "default",
             LayerKind::User => "user",
+            LayerKind::Synced => "synced",
             LayerKind::UserLocal => "user-local",
             LayerKind::VsCodeWorkspace => ".vscode",
             LayerKind::Workspace => "workspace",
@@ -55,11 +60,16 @@ impl LayerKind {
         }
     }
 
-    /// Repo-controlled layers get the allowlist; user layers do not.
-    fn is_workspace(self) -> bool {
+    /// Layers written by something other than this machine's user get the
+    /// allowlist: repo-controlled ones, and what config sync brought from
+    /// another machine. The user's own layers do not.
+    fn is_allowlisted(self) -> bool {
         matches!(
             self,
-            LayerKind::VsCodeWorkspace | LayerKind::Workspace | LayerKind::WorkspaceLocal
+            LayerKind::Synced
+                | LayerKind::VsCodeWorkspace
+                | LayerKind::Workspace
+                | LayerKind::WorkspaceLocal
         )
     }
 }
@@ -107,6 +117,31 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "explorer_views",
 ];
 
+/// The synced layer's file name (#262). Config sync pushes the projection
+/// of the connecting machine's `config.json` here: a file of its own, so
+/// the push can never overwrite consent or fingerprints the remote keeps in
+/// its own `config.json`, and above that `config.json` in the merge, so the
+/// theme follows the user. `config.local.json` still wins on the box.
+pub const SYNCED_CONFIG_NAME: &str = "config.synced.json";
+
+/// The keys of a `config.json` document that may travel to another machine
+/// (#262): the [`WORKSPACE_ALLOWED_KEYS`] appearance and editor toggles,
+/// read from the flat top level. `None` when the document has none of
+/// them, so a machine with nothing to share pushes nothing.
+pub fn synced_projection(doc: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let out: Map<String, Value> = doc
+        .iter()
+        .filter(|(k, _)| WORKSPACE_ALLOWED_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// Where the synced layer is read from: beside the user's `config.json`.
+pub fn synced_config_path() -> PathBuf {
+    user_layers_dir().join(SYNCED_CONFIG_NAME)
+}
+
 /// Path of the workspace layer files under a root.
 pub fn workspace_config_path(root: &Path) -> PathBuf {
     root.join(".croft").join("config.json")
@@ -136,7 +171,11 @@ fn user_layers_dir() -> PathBuf {
     if cfg!(test) {
         std::env::temp_dir().join(format!("croft-test-config-{}", std::process::id()))
     } else {
-        crate::prefs::config_dir()
+        // The active profile's dir (#618), which is where every settings
+        // change is saved; reading the bare config dir dropped them all.
+        crate::profiles::file("config.json")
+            .parent()
+            .map_or_else(crate::prefs::config_dir, Path::to_path_buf)
     }
 }
 
@@ -161,6 +200,7 @@ pub fn load_merged_from(
 ) -> MergedConfig {
     let mut layers: Vec<(LayerKind, PathBuf)> = vec![
         (LayerKind::User, user_dir.join("config.json")),
+        (LayerKind::Synced, user_dir.join(SYNCED_CONFIG_NAME)),
         (LayerKind::UserLocal, user_dir.join("config.local.json")),
     ];
     if let Some(root) = workspace_root {
@@ -187,10 +227,11 @@ pub fn load_merged_from(
         };
         let Some(doc) = doc else { continue };
         for (key, value) in doc {
-            if kind.is_workspace() && !WORKSPACE_ALLOWED_KEYS.contains(&key.as_str()) {
+            if kind.is_allowlisted() && !WORKSPACE_ALLOWED_KEYS.contains(&key.as_str()) {
                 warnings.push(format!(
-                    "{}: \"{key}\" is user-config only and was ignored (workspace layers may set: appearance and editor toggles)",
-                    path.display()
+                    "{}: \"{key}\" is user-config only and was ignored ({} layers may set: appearance and editor toggles)",
+                    path.display(),
+                    kind.label()
                 ));
                 continue;
             }
@@ -816,15 +857,74 @@ mod tests {
         let (_tmp, user, root) = setup();
         let m = load_merged_from(&user, Some(&root), "macos");
         assert_eq!(m.prefs, Prefs::default());
-        assert_eq!(
-            m.chain.len(),
-            5,
-            "all five layer files are watch candidates"
-        );
+        assert_eq!(m.chain.len(), 6, "all six layer files are watch candidates");
         assert!(m.warnings.is_empty());
-        // Without a workspace only the two user layers are in play.
+        // Without a workspace only the three user layers are in play.
         let m = load_merged_from(&user, None, "macos");
-        assert_eq!(m.chain.len(), 2);
+        assert_eq!(m.chain.len(), 3);
+    }
+
+    /// #262: the synced layer carries the connecting machine's appearance to
+    /// this one. It wins over this machine's `config.json` (the theme follows
+    /// the user) and loses to `config.local.json` (a box can still pin its
+    /// own), and like a workspace layer it can set no trust state: a synced
+    /// file naming MCP consent is refused with a warning, not merged.
+    #[test]
+    fn the_synced_layer_sits_between_user_and_local_and_sets_no_trust() {
+        let (_tmp, user, _root) = setup();
+        std::fs::write(
+            user.join("config.json"),
+            r#"{ "theme": "light", "format_on_save": false, "mcp_consented": ["local-srv"] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            user.join(SYNCED_CONFIG_NAME),
+            r#"{ "theme": "solarized", "format_on_save": true, "mcp_consented": ["evil"] }"#,
+        )
+        .unwrap();
+        let m = load_merged_from(&user, None, "linux");
+        assert_eq!(
+            m.prefs.theme, "solarized",
+            "the synced theme wins over config.json"
+        );
+        assert!(m.prefs.format_on_save);
+        assert_eq!(layer_of(&m.provenance, "theme"), LayerKind::Synced);
+        assert!(
+            m.prefs.mcp_consented.contains("local-srv") && !m.prefs.mcp_consented.contains("evil"),
+            "consent comes from this machine only: {:?}",
+            m.prefs.mcp_consented
+        );
+        assert!(
+            m.warnings
+                .iter()
+                .any(|w| w.contains("mcp_consented") && w.contains("synced")),
+            "{:?}",
+            m.warnings
+        );
+        std::fs::write(user.join("config.local.json"), r#"{ "theme": "dark" }"#).unwrap();
+        let m = load_merged_from(&user, None, "linux");
+        assert_eq!(
+            m.prefs.theme, "dark",
+            "config.local.json still pins this box"
+        );
+    }
+
+    /// #262: the projection that travels keeps the appearance and editor
+    /// keys of a `config.json` and nothing that says what croft trusts.
+    #[test]
+    fn the_synced_projection_keeps_appearance_and_drops_trust() {
+        let doc: Map<String, Value> = serde_json::from_str(
+            r#"{ "theme": "light", "render_whitespace": "all",
+                 "mcp_consented": ["a"], "mcp_tool_fingerprints": {"a": "x"},
+                 "disabled_extensions": ["b"], "host_accents": [] }"#,
+        )
+        .unwrap();
+        let p = synced_projection(&doc).unwrap();
+        let keys: Vec<&str> = p.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["render_whitespace", "theme"]);
+        let trust_only: Map<String, Value> =
+            serde_json::from_str(r#"{ "mcp_consented": ["a"] }"#).unwrap();
+        assert_eq!(synced_projection(&trust_only), None, "nothing to share");
     }
 
     #[test]

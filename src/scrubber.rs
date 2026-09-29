@@ -128,17 +128,78 @@ impl Scrubber {
         self.position = Position::At(index.min(self.commits.len() - 1));
     }
 
+    /// Move to the stop nearest `f` along the slider, 0.0 the oldest loaded
+    /// commit and 1.0 the working tree: the inverse of [`Self::fraction`],
+    /// which is what a click or drag on the slider calls.
+    pub fn seek_fraction(&mut self, f: f32) {
+        let stops = self.commits.len();
+        if stops == 0 {
+            self.position = Position::Working;
+            return;
+        }
+        let p = (f.clamp(0.0, 1.0) * stops as f32).round() as usize;
+        self.position = if p >= stops {
+            Position::Working
+        } else {
+            Position::At(stops - 1 - p)
+        };
+    }
+
+    /// The commits worth having ready around the cursor, most urgent
+    /// first: the one it is on, then the ones a held arrow key reaches
+    /// next. Older before newer, because scrubbing starts at the present
+    /// and mostly walks back.
+    pub fn around(&self) -> Vec<&crate::git::GraphCommit> {
+        let at = match self.position {
+            Position::Working => None,
+            Position::At(i) => Some(i),
+        };
+        // From the working tree, HEAD (index 0) is the next step back.
+        let offsets: [(Option<usize>, isize); 6] = match at {
+            Some(i) => [
+                (Some(i), 0),
+                (Some(i), 1),
+                (Some(i), -1),
+                (Some(i), 2),
+                (Some(i), 3),
+                (Some(i), 4),
+            ],
+            None => [
+                (Some(0), 0),
+                (Some(0), 1),
+                (Some(0), 2),
+                (Some(0), 3),
+                (None, 0),
+                (None, 0),
+            ],
+        };
+        let mut out: Vec<&crate::git::GraphCommit> = Vec::new();
+        for (base, d) in offsets {
+            let Some(base) = base else { continue };
+            let Some(i) = base.checked_add_signed(d) else {
+                continue;
+            };
+            if let Some(c) = self.commits.get(i)
+                && !out.iter().any(|o| o.hash == c.hash)
+            {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// How many commits are loaded.
+    pub fn len(&self) -> usize {
+        self.commits.len()
+    }
+
     /// Where the slider's handle sits, as a fraction from 0.0 (oldest loaded)
     /// to 1.0 (the working tree).
-    ///
-    /// Same as [`Self::seek`]: the widget that reads this does not exist
-    /// yet.
     ///
     /// The working tree is its own stop at the far right rather than sharing
     /// HEAD's position, because they are different views and a slider that
     /// showed them at the same place would give the user no way to tell
     /// which one they are looking at.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn fraction(&self) -> f32 {
         let stops = self.commits.len();
         if stops == 0 {
@@ -154,9 +215,277 @@ impl Scrubber {
     }
 }
 
+/// One file at one commit, to be built into a read-only view.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ViewKey {
+    pub hash: String,
+    /// Workspace-relative path.
+    pub rel: String,
+}
+
+/// Views kept for the scrubber to step back to, least recently used first.
+pub type KeptViews = std::collections::VecDeque<(ViewKey, crate::widgets::editor::Editor)>;
+
+/// What [`ViewBuilder`] needs to build a view for a [`ViewKey`].
+#[derive(Clone, Debug)]
+pub struct ViewJob {
+    pub key: ViewKey,
+    /// The file's absolute path: picks the grammar and labels the view.
+    pub path: std::path::PathBuf,
+    /// git's abbreviation of the commit, for the "did not exist" note.
+    pub short: String,
+    /// The commit's first parent, whose version of the file the gutter
+    /// marks are drawn against.
+    pub parent: Option<String>,
+    /// The file's text at the commit and at the parent when the app already
+    /// has them (`Some(None)`: it did not exist there), so a lane only runs
+    /// `git show` for a version nobody has read yet.
+    pub text: Option<Option<std::sync::Arc<str>>>,
+    pub parent_text: Option<Option<std::sync::Arc<str>>>,
+}
+
+/// A view the builder produced, with the texts it read on the way so the
+/// app's text cache learns them too.
+pub struct BuiltView {
+    pub key: ViewKey,
+    /// The finished view (highlighted, gutter-marked) rather than the plain
+    /// stand-in shown until it lands.
+    pub finished: bool,
+    pub text: Option<std::sync::Arc<str>>,
+    pub parent_text: Option<(String, Option<std::sync::Arc<str>>)>,
+    pub view: crate::widgets::editor::Editor,
+    /// The file's outline at the commit, from its own syntax tree: built
+    /// with the finished view, since parsing a big file takes far longer
+    /// than a frame. `None` from the plain lane.
+    pub outline: Option<Vec<crate::lsp::manager::OutlineSymbol>>,
+}
+
+/// A queue a worker drains, most urgent first, which the app REPLACES on
+/// every step rather than appending to, so holding an arrow key leaves no
+/// backlog of commits already passed. `None` tells the worker to stop.
+type Lane = std::sync::Arc<(std::sync::Mutex<Option<Vec<ViewJob>>>, std::sync::Condvar)>;
+
+/// Builds historical views off the UI thread (#371), in two lanes.
+///
+/// Highlighting and diffing a big file costs far more than a frame (the
+/// 35k-line `src/app/mod.rs` takes over half a second), and even splitting
+/// it into lines takes several milliseconds. So a step never does either:
+/// the PLAIN lane has the text of the commits around the cursor split and
+/// waiting, which a step shows at once, and the FINISHED lane swaps the
+/// highlighted view in behind it when it lands. Separate threads, so a
+/// slow finished build never holds up the plain views a held key needs.
+pub struct ViewBuilder {
+    plain: Lane,
+    finished: Lane,
+    done: std::sync::mpsc::Receiver<BuiltView>,
+}
+
+impl ViewBuilder {
+    pub fn start(root: std::path::PathBuf) -> Self {
+        let lane = || -> Lane {
+            std::sync::Arc::new((
+                std::sync::Mutex::new(Some(Vec::new())),
+                std::sync::Condvar::new(),
+            ))
+        };
+        let (plain, finished) = (lane(), lane());
+        let (tx, done) = std::sync::mpsc::channel();
+        for (name, queue, full) in [
+            ("scrub-plain", &plain, false),
+            ("scrub-views", &finished, true),
+        ] {
+            let (root, queue, tx) = (root.clone(), std::sync::Arc::clone(queue), tx.clone());
+            std::thread::Builder::new()
+                .name(name.into())
+                .spawn(move || Self::run(&root, &queue, &tx, full))
+                .ok();
+        }
+        Self {
+            plain,
+            finished,
+            done,
+        }
+    }
+
+    fn run(
+        root: &std::path::Path,
+        queue: &(std::sync::Mutex<Option<Vec<ViewJob>>>, std::sync::Condvar),
+        tx: &std::sync::mpsc::Sender<BuiltView>,
+        full: bool,
+    ) {
+        let (lock, ready) = queue;
+        loop {
+            let job = {
+                let Ok(mut pending) = lock.lock() else { return };
+                loop {
+                    let Some(jobs) = pending.as_mut() else { return };
+                    if !jobs.is_empty() {
+                        break jobs.remove(0);
+                    }
+                    let Ok(next) = ready.wait(pending) else {
+                        return;
+                    };
+                    pending = next;
+                }
+            };
+            let read = |known: Option<Option<std::sync::Arc<str>>>, rev: &str| {
+                known.unwrap_or_else(|| {
+                    crate::git::read_file_at_rev(root, rev, &job.key.rel)
+                        .ok()
+                        .map(std::sync::Arc::from)
+                })
+            };
+            let text = read(job.text.clone(), &job.key.hash);
+            let built = if full {
+                let parent_text = job
+                    .parent
+                    .as_ref()
+                    .map(|p| (p.clone(), read(job.parent_text.clone(), p)));
+                let baseline = parent_text
+                    .as_ref()
+                    .and_then(|(_, t)| t.as_deref())
+                    .map(crate::widgets::editor::split_into_lines)
+                    .unwrap_or_default();
+                let view = historical_view(
+                    &job.path,
+                    &job.key.rel,
+                    &job.short,
+                    text.as_deref(),
+                    baseline,
+                );
+                // A file the commit predates has no outline; its view is a
+                // note, not the file.
+                let outline = Some(if text.is_some() {
+                    crate::outline_syntax::symbols_for_lines(&job.path, &view.lines)
+                } else {
+                    Vec::new()
+                });
+                BuiltView {
+                    key: job.key,
+                    finished: true,
+                    text,
+                    parent_text,
+                    view,
+                    outline,
+                }
+            } else {
+                let view = plain_view(&job.path, &job.key.rel, &job.short, text.as_deref());
+                BuiltView {
+                    key: job.key,
+                    finished: false,
+                    text,
+                    parent_text: None,
+                    view,
+                    outline: None,
+                }
+            };
+            if tx.send(built).is_err() {
+                return;
+            }
+        }
+    }
+
+    fn replace(lane: &Lane, jobs: Vec<ViewJob>) {
+        let (lock, ready) = &**lane;
+        if let Ok(mut pending) = lock.lock()
+            && let Some(slot) = pending.as_mut()
+        {
+            *slot = jobs;
+            ready.notify_one();
+        }
+    }
+
+    /// Replace what waits in each lane: `plain` wants stand-ins, `finished`
+    /// wants highlighted views, each most urgent first. A job already under
+    /// way finishes regardless.
+    pub fn want(&self, plain: Vec<ViewJob>, finished: Vec<ViewJob>) {
+        Self::replace(&self.plain, plain);
+        Self::replace(&self.finished, finished);
+    }
+
+    /// Every view produced since the last call.
+    pub fn drain(&self) -> Vec<BuiltView> {
+        self.done.try_iter().collect()
+    }
+}
+
+impl Drop for ViewBuilder {
+    fn drop(&mut self) {
+        for lane in [&self.plain, &self.finished] {
+            let (lock, ready) = &**lane;
+            if let Ok(mut pending) = lock.lock() {
+                *pending = None;
+            }
+            ready.notify_one();
+        }
+    }
+}
+
+/// The stand-in for `rel` at commit `short` until its finished view lands:
+/// the text alone, or the note that the file did not exist yet.
+pub fn plain_view(
+    path: &std::path::Path,
+    rel: &str,
+    short: &str,
+    text: Option<&str>,
+) -> crate::widgets::editor::Editor {
+    match text {
+        Some(text) => crate::widgets::editor::Editor::historical_plain(path, text),
+        None => missing_view(rel, short),
+    }
+}
+
+/// The finished read-only view of `rel` at commit `short`: highlighted and
+/// marked against `baseline`, or a note when the file did not exist yet.
+pub fn historical_view(
+    path: &std::path::Path,
+    rel: &str,
+    short: &str,
+    text: Option<&str>,
+    baseline: Vec<String>,
+) -> crate::widgets::editor::Editor {
+    match text {
+        Some(text) => crate::widgets::editor::Editor::historical(path, text, baseline),
+        None => missing_view(rel, short),
+    }
+}
+
+/// The view shown for `rel` at a commit (`short`) where it did not exist.
+pub fn missing_view(rel: &str, short: &str) -> crate::widgets::editor::Editor {
+    crate::widgets::editor::Editor::historical(
+        std::path::Path::new("history.txt"),
+        &format!("({rel} did not exist at {short})"),
+        Vec::new(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seeking_by_fraction_inverts_the_handle_position() {
+        let mut s = Scrubber::new((0..4).map(commit).collect());
+        for p in [
+            Position::Working,
+            Position::At(0),
+            Position::At(2),
+            Position::At(3),
+        ] {
+            let mut probe = Scrubber::new((0..4).map(commit).collect());
+            probe.position = p;
+            s.seek_fraction(probe.fraction());
+            assert_eq!(s.position(), p);
+        }
+        s.seek_fraction(-3.0);
+        assert_eq!(
+            s.position(),
+            Position::At(3),
+            "past the left end is the oldest"
+        );
+        s.seek_fraction(9.0);
+        assert_eq!(s.position(), Position::Working);
+    }
 
     fn commit(i: usize) -> crate::git::GraphCommit {
         crate::git::GraphCommit {
@@ -305,5 +634,21 @@ mod tests {
         // which of the two they are looking at.
         s.seek(0);
         assert!(s.fraction() < 1.0, "HEAD must not sit on top of the tree");
+    }
+
+    #[test]
+    fn around_lists_the_cursor_then_the_steps_a_held_key_reaches() {
+        let mut s = scrubber(8);
+        let hashes = |s: &Scrubber| -> Vec<String> {
+            s.around().into_iter().map(|c| c.hash.clone()).collect()
+        };
+        // From the working tree, HEAD is next, then further back.
+        assert_eq!(hashes(&s), ["c0", "c1", "c2", "c3"]);
+        s.seek(3);
+        assert_eq!(hashes(&s), ["c3", "c4", "c2", "c5", "c6", "c7"]);
+        // Near the oldest end nothing is listed past it.
+        s.seek(7);
+        assert_eq!(hashes(&s), ["c7", "c6"]);
+        assert!(Scrubber::new(Vec::new()).around().is_empty());
     }
 }

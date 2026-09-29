@@ -147,6 +147,18 @@ mod tests {
         assert_eq!(from_extension("xyz"), None);
     }
 
+    /// #578: the bundled CodeQL extension maps `.ql` queries and `.qll`
+    /// libraries to the `ql` language, rooted at the nearest pack file.
+    #[test]
+    fn codeql_sources_map_to_the_ql_language() {
+        assert_eq!(from_extension("ql"), Some(Language("ql")));
+        assert_eq!(from_extension("qll"), Some(Language("ql")));
+        assert_eq!(
+            root_markers(Language("ql")),
+            &["qlpack.yml", "codeql-pack.yml"]
+        );
+    }
+
     /// #27: the workspace-open scan behind server pre-warm. A marker at
     /// the root makes its language evident; nothing recurses, so a marker
     /// buried in a subdirectory does not.

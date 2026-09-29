@@ -1,0 +1,20 @@
+# Bundled croft extension: CodeQL.
+# The language server is the CodeQL CLI's own (`codeql execute language-server`),
+# expected on the user's PATH alongside the rest of the CLI.
+id = "codeql"
+name = "CodeQL"
+description = "CodeQL databases, queries, query history, the AST viewer and the QL language server."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "ql"
+extensions = ["ql", "qll"]
+root_markers = ["qlpack.yml", "codeql-pack.yml"]
+
+[[language_servers]]
+name = "codeql"
+command = "codeql"
+args = ["execute", "language-server", "--check-errors", "ON_CHANGE"]
+language = "ql"
+priority = 0

@@ -225,9 +225,125 @@ fn download_to_file(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Where `dlv` is, for Go debugging (#264), in delve's own resolution order:
+/// `PATH`, then `$GOBIN`, then `$GOPATH/bin` (default `~/go/bin`), then
+/// croft's servers directory. Pure over its inputs so the order is testable.
+pub fn find_dlv(
+    path_env: Option<&std::ffi::OsStr>,
+    gobin: Option<&Path>,
+    gopath: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path_env
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    dirs.extend(gobin.map(Path::to_path_buf));
+    match gopath {
+        Some(gp) => dirs.push(gp.join("bin")),
+        None => dirs.extend(home.map(|h| h.join("go").join("bin"))),
+    }
+    dirs.extend(home.map(|h| h.join(".croft").join("servers").join("go")));
+    dirs.into_iter()
+        .map(|d| d.join("dlv"))
+        .find(|p| p.is_file())
+}
+
+/// The command "Debug: Install Go Debugger (delve)" runs, visibly, in a
+/// terminal pane (#264). `GOBIN` puts `dlv` in croft's servers directory,
+/// the last place [`find_dlv`] looks, so it never shadows a delve the user
+/// installed themselves.
+///
+/// The delve it installs is one that debugs with the Go on this machine:
+/// delve refuses a Go older than it supports (1.27 wants Go 1.25 or later),
+/// so Go 1.24 and older get delve 1.25.2, the last release that takes them,
+/// and anything newer gets `@latest`. Wrapped in `sh -c`, since it is typed
+/// into whatever shell the pane runs, fish included.
+pub const DLV_INSTALL: &str = "sh -c 'case \"$(go env GOVERSION)\" in go1.[0-9]|go1.[0-9].*|go1.1[0-9]*|go1.2[0-4]*) v=v1.25.2 ;; *) v=latest ;; esac; GOBIN=\"$HOME/.croft/servers/go\" go install github.com/go-delve/delve/cmd/dlv@$v'";
+
+/// Whether the `go` toolchain is on PATH: installing delve needs it.
+pub fn go_on_path() -> bool {
+    which("go")
+}
+
+/// Why Go debugging cannot start, and the next step. Without Go there is
+/// nothing to install delve with, which is a different fix.
+pub fn dlv_missing_message(go_available: bool) -> String {
+    if go_available {
+        String::from(
+            "Go debugging needs delve: run Debug: Install Go Debugger (delve) to `go install` it",
+        )
+    } else {
+        String::from(
+            "Go debugging needs delve, and installing delve needs Go: install Go from https://go.dev/dl, then run Debug: Install Go Debugger (delve)",
+        )
+    }
+}
+
+/// `dlv` for this machine, or an error that says how to install it.
+pub fn dlv_program() -> Result<PathBuf> {
+    let gobin = std::env::var_os("GOBIN").map(PathBuf::from);
+    let gopath = std::env::var_os("GOPATH").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    find_dlv(
+        std::env::var_os("PATH").as_deref(),
+        gobin.as_deref(),
+        gopath.as_deref(),
+        home.as_deref(),
+    )
+    .ok_or_else(|| anyhow::anyhow!(dlv_missing_message(go_on_path())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #264: the install picks the delve that debugs with this machine's
+    /// Go: 1.25.2 for Go 1.24 and older (delve 1.27 refuses them), latest
+    /// otherwise. Run as the pane would, through `sh`, against a stub `go`.
+    #[cfg(unix)]
+    #[test]
+    fn the_delve_install_follows_the_local_go_version() {
+        use std::os::unix::fs::PermissionsExt;
+        for (goversion, want) in [
+            ("go1.24.7", "dlv@v1.25.2"),
+            ("go1.22rc1", "dlv@v1.25.2"),
+            ("go1.9", "dlv@v1.25.2"),
+            ("go1.25.0", "dlv@latest"),
+            ("go1.26.1", "dlv@latest"),
+            ("go1.30", "dlv@latest"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("go.log");
+            let go = tmp.path().join("go");
+            std::fs::write(
+                &go,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = env ]; then echo {goversion}; exit 0; fi\necho \"GOBIN=$GOBIN $*\" > \"{}\"\n",
+                    log.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(DLV_INSTALL)
+                .env("PATH", format!("{}:/usr/bin:/bin", tmp.path().display()))
+                .env("HOME", tmp.path())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{goversion}");
+            let ran = std::fs::read_to_string(&log).unwrap();
+            assert!(ran.trim_end().ends_with(want), "{goversion}: {ran}");
+            assert!(
+                ran.starts_with(&format!(
+                    "GOBIN={}/.croft/servers/go install ",
+                    tmp.path().display()
+                )),
+                "{ran}"
+            );
+        }
+    }
 
     /// A login shell with a chatty rc (a `fastfetch` banner, `set -x`
     /// tracing) can emit more than the OS pipe buffer. The child then blocks
@@ -256,5 +372,54 @@ mod tests {
     fn node_bin_dir_is_none_for_a_bare_command() {
         // A bare `node` (already on PATH) has no directory to inject.
         assert_eq!(node_bin_dir("node"), None);
+    }
+
+    #[test]
+    fn a_missing_delve_says_whether_go_is_there_to_install_it() {
+        let with_go = dlv_missing_message(true);
+        assert!(with_go.contains("Debug: Install Go Debugger (delve)"));
+        assert!(!with_go.contains("go.dev"));
+        let without = dlv_missing_message(false);
+        assert!(without.contains("installing delve needs Go"));
+        assert!(without.contains("https://go.dev/dl"));
+        // The install lands where find_dlv looks last.
+        assert!(DLV_INSTALL.contains("GOBIN=\"$HOME/.croft/servers/go\" go install "));
+    }
+
+    /// #264: delve's own resolution order, PATH first; `~/go/bin` stands in
+    /// for an unset GOPATH, and croft's servers dir comes last.
+    #[test]
+    fn find_dlv_searches_path_then_gobin_then_gopath_then_croft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |rel: &str| {
+            let dir = tmp.path().join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("dlv"), "").unwrap();
+            dir
+        };
+        let on_path = mk("path");
+        let gobin = mk("gobin");
+        let home = tmp.path().join("home");
+        let home_go = mk("home/go/bin");
+        let croft = mk("home/.croft/servers/go");
+        let path_env = std::env::join_paths([on_path.clone()]).unwrap();
+        assert_eq!(
+            find_dlv(Some(&path_env), Some(&gobin), None, Some(&home)),
+            Some(on_path.join("dlv"))
+        );
+        assert_eq!(
+            find_dlv(None, Some(&gobin), None, Some(&home)),
+            Some(gobin.join("dlv"))
+        );
+        assert_eq!(
+            find_dlv(None, None, None, Some(&home)),
+            Some(home_go.join("dlv"))
+        );
+        std::fs::remove_file(home_go.join("dlv")).unwrap();
+        assert_eq!(
+            find_dlv(None, None, None, Some(&home)),
+            Some(croft.join("dlv"))
+        );
+        assert_eq!(find_dlv(None, None, None, None), None, "nowhere to look");
     }
 }

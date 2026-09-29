@@ -19,6 +19,12 @@ on:
     branches: [main]
   pull_request:
 
+# Every job here only reads the checkout; none writes to the repo, its issues
+# or its PRs. Without this the token gets the repository default, which can be
+# read-write. A job that ever needs more asks for it in its own block.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1

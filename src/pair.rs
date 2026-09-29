@@ -4261,23 +4261,35 @@ mod tests {
         let id_b = host.add_note("demo.txt", 1, "second thought").unwrap();
         assert_ne!(id_a, id_b, "every note gets its own id");
 
-        let snap = host.notes_snapshot("demo.txt");
+        // Each read polls to the resolved value: `notes_snapshot` serves its
+        // cache on a contended try_lock, which a loaded runner hits (see
+        // `settle`).
+        let expected = vec![
+            (id_a, 0, "turn summary".to_string()),
+            (id_b, 1, "second thought".to_string()),
+        ];
         assert_eq!(
-            snap,
-            vec![
-                (id_a, 0, "turn summary".to_string()),
-                (id_b, 1, "second thought".to_string()),
-            ]
+            settle(&expected, || host.notes_snapshot("demo.txt")),
+            expected
         );
 
         host.append_to_note(id_a, "you: tell me more");
-        let snap = host.notes_snapshot("demo.txt");
-        assert_eq!(snap[0].2, "turn summary\nyou: tell me more");
+        let expected = vec![
+            (id_a, 0, "turn summary\nyou: tell me more".to_string()),
+            (id_b, 1, "second thought".to_string()),
+        ];
+        assert_eq!(
+            settle(&expected, || host.notes_snapshot("demo.txt")),
+            expected
+        );
 
         host.remove_note(id_a);
-        let snap = host.notes_snapshot("demo.txt");
-        assert_eq!(snap.len(), 1, "only the ignored note is gone");
-        assert_eq!(snap[0].0, id_b);
+        let expected = vec![(id_b, 1, "second thought".to_string())];
+        assert_eq!(
+            settle(&expected, || host.notes_snapshot("demo.txt")),
+            expected,
+            "only the ignored note is gone"
+        );
         drop(host);
     }
 

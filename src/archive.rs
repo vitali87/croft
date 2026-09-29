@@ -258,8 +258,8 @@ fn write_out(dest: &Path, read: &mut dyn std::io::Read) -> std::io::Result<()> {
 /// REFUSING any component that exists as a symlink (#198 review:
 /// create_dir_all + File::create follow existing links, so a planted
 /// `dest/nested -> /elsewhere` redirected the write outside the root).
-/// The leaf is created with create_new after removing only a REGULAR
-/// file, so an existing symlink leaf is refused too.
+/// An existing symlink leaf is refused too; a regular file there is only
+/// replaced once the new content is complete.
 fn prepare_no_follow(root: &Path, dest: &Path) -> std::io::Result<()> {
     let rel = dest.strip_prefix(root).map_err(std::io::Error::other)?;
     let mut cur = root.to_path_buf();
@@ -287,10 +287,9 @@ fn prepare_no_follow(root: &Path, dest: &Path) -> std::io::Result<()> {
         Ok(m) if m.file_type().is_symlink() => Err(std::io::Error::other(
             "refusing to overwrite a symlink at the extraction target",
         )),
-        Ok(m) if m.is_file() => {
-            std::fs::remove_file(dest)?;
-            Ok(())
-        }
+        // An existing file is kept until the member has fully extracted:
+        // `write_out_capped` renames over it only on success.
+        Ok(m) if m.is_file() => Ok(()),
         Ok(_) => Err(std::io::Error::other("extraction target is a directory")),
         Err(_) => Ok(()),
     }
@@ -299,21 +298,35 @@ fn prepare_no_follow(root: &Path, dest: &Path) -> std::io::Result<()> {
 /// Copy at most `cap` bytes; a stream that keeps going past it (a
 /// member whose DECLARED size lied - deflate does not bound its output
 /// to the metadata, #198 review) fails and the partial file is removed.
+///
+/// Written to a fresh temp file beside `dest` and renamed over it only once
+/// complete: a member that fails midway (a bad checksum, an unsupported
+/// method, the cap) used to cost the user the file already at `dest`, which
+/// was unlinked up front, and leave a partial file in its place.
 fn write_out_capped(dest: &Path, read: &mut dyn std::io::Read, cap: u64) -> std::io::Result<()> {
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)?;
-    let mut limited = std::io::Read::take(read, cap + 1);
-    let copied = std::io::copy(&mut limited, &mut out)?;
-    if copied > cap {
-        drop(out);
-        let _ = std::fs::remove_file(dest);
-        return Err(std::io::Error::other(
-            "member stream exceeded the size cap; partial output removed",
-        ));
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dest.with_file_name(format!(".{name}.croft-extract-{}", std::process::id()));
+    let result = (|| {
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let mut limited = std::io::Read::take(read, cap + 1);
+        let copied = std::io::copy(&mut limited, &mut out)?;
+        if copied > cap {
+            return Err(std::io::Error::other(
+                "member stream exceeded the size cap; partial output removed",
+            ));
+        }
+        std::fs::rename(&tmp, dest)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
 
 /// Join `member` under `dir`, refusing absolute paths, drive prefixes,
@@ -699,6 +712,31 @@ mod tests {
         let mut small = &b"ok"[..];
         write_out_capped(&dest, &mut small, 1024).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn a_failed_extraction_keeps_the_file_already_there() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf[0] = b'X';
+                static CALLS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    Ok(1)
+                } else {
+                    Err(std::io::Error::other("Invalid checksum"))
+                }
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("notes.txt");
+        std::fs::write(&dest, "PRECIOUS").unwrap();
+        prepare_no_follow(tmp.path(), &dest).unwrap();
+        assert!(write_out_capped(&dest, &mut Broken, 1024).is_err());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "PRECIOUS");
+        let left: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "no partial file left behind");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.1005"
+version = "0.1.1205"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -69,6 +69,12 @@ tree-sitter-xml = "0.7"
 tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
 tree-sitter-lua = "0.5"
+# CodeQL `.ql` / `.qll` highlighting and outline (#578). MIT, same
+# `LanguageFn` shape as the other 0.23+ grammars.
+tree-sitter-ql = "0.23"
+# CodeQL `.dbscheme` highlighting (#578). MIT; ships no highlights query,
+# so croft carries its own.
+tree-sitter-ql-dbscheme = "0.23"
 
 # CommonMark parser behind the rendered Markdown preview (Cmd+Shift+V).
 # rustdoc / mdBook's engine; parser only, no HTML output needed.
@@ -120,6 +126,9 @@ base64 = "0.22"
 # version to the lock and no new build surface — ring already compiles on every
 # croft target, Termux included.
 ring = "0.17"
+# TLS for `croft web --tls` (#343). Already in the graph through ureq, with
+# the same ring provider; no default features so aws-lc never comes in.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.10"
 regex = "1.12"
 # Log highlighting for the rendered log view (#466): tailspin as a library,
