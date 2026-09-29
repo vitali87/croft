@@ -15779,7 +15779,8 @@ impl EditorTabs {
     }
 
     /// Close every tab whose index ≠ `keep_idx`, except pinned tabs, which
-    /// always survive (VS Code "Close Others" never closes a pinned tab). The
+    /// always survive (VS Code "Close Others" never closes a pinned tab), and
+    /// tabs with unsaved changes, which a sweep never drops (#862). The
     /// kept tab stays active. Returns how many tabs were actually removed (0
     /// when `keep_idx` is out of range or nothing else is closeable). Mirrors
     /// VS Code's "Close Others" context-menu action.
@@ -15794,7 +15795,7 @@ impl EditorTabs {
             if i == keep_idx {
                 new_active = kept.len();
                 kept.push(ed);
-            } else if ed.pinned {
+            } else if ed.pinned || ed.dirty {
                 kept.push(ed);
             }
         }
@@ -15809,9 +15810,9 @@ impl EditorTabs {
 
     /// Close every tab whose index > `from_idx`, except pinned tabs, which
     /// always survive (VS Code "Close to the Right" never closes a pinned
-    /// tab). The tab at `from_idx` stays active; tabs to the left are
-    /// untouched. Returns the number of tabs removed. Matches VS Code's
-    /// "Close to the Right".
+    /// tab), and tabs with unsaved changes (#862). The tab at `from_idx`
+    /// stays active; tabs to the left are untouched. Returns the number of
+    /// tabs removed. Matches VS Code's "Close to the Right".
     pub fn close_to_right(&mut self, from_idx: usize) -> usize {
         if from_idx >= self.editors.len() {
             return 0;
@@ -15822,7 +15823,7 @@ impl EditorTabs {
         let mut pivot_pos = 0;
         let mut kept: Vec<Editor> = Vec::with_capacity(before);
         for (i, ed) in std::mem::take(&mut self.editors).into_iter().enumerate() {
-            if i <= from_idx || ed.pinned {
+            if i <= from_idx || ed.pinned || ed.dirty {
                 if i == from_idx {
                     pivot_pos = kept.len();
                 }
@@ -15846,15 +15847,12 @@ impl EditorTabs {
     /// Close every tab, resetting the editor pane to the single blank
     /// just-launched state — mirrors `close_tab` on the last remaining
     /// tab. Returns how many tabs were collapsed away (always ≥ 1 when
-    /// the editor had any content). Matches VS Code's "Close All".
+    /// the editor had any content). Matches VS Code's "Close All", except
+    /// that tabs with unsaved changes stay open (#862): VS Code asks about
+    /// each, croft leaves them for a Cmd+W that asks. That makes it the
+    /// same sweep as [`Self::close_saved`], pinned tabs going in both.
     pub fn close_all(&mut self) -> usize {
-        let n = self.editors.len();
-        let was_focused = self.editors[self.active].focused;
-        let mut fresh = Editor::new();
-        fresh.focused = was_focused;
-        self.editors = vec![fresh];
-        self.active = 0;
-        n
+        self.close_saved()
     }
 
     /// Close every saved (non-dirty) tab, keeping any with unsaved changes.
@@ -26194,6 +26192,38 @@ mod tests {
         let removed = t.close_saved();
         assert_eq!(removed, 0, "nothing saved means nothing to close");
         assert_eq!(t.tab_count(), 2, "both dirty tabs stay open");
+    }
+
+    /// #862: the bulk closes never drop unsaved edits: Close Others, Close
+    /// to the Right and Close All each leave a dirty tab open.
+    #[test]
+    fn bulk_closes_keep_tabs_with_unsaved_changes() {
+        let tabs = || {
+            let mut t = EditorTabs::new();
+            t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+            t.add_tab_with_path(std::path::PathBuf::from("/b"));
+            t.add_tab_with_path(std::path::PathBuf::from("/c"));
+            t.editors[2].dirty = true;
+            t
+        };
+        let paths = |t: &EditorTabs| -> Vec<Option<std::path::PathBuf>> {
+            t.editors.iter().map(|e| e.path.clone()).collect()
+        };
+        let path = |p: &str| Some(std::path::PathBuf::from(p));
+
+        let mut t = tabs();
+        assert_eq!(t.close_others(0), 1, "only the clean /b goes");
+        assert_eq!(paths(&t), vec![path("/a"), path("/c")]);
+        assert_eq!(t.active_index(), 0, "the kept tab stays active");
+
+        let mut t = tabs();
+        assert_eq!(t.close_to_right(0), 1, "only the clean /b goes");
+        assert_eq!(paths(&t), vec![path("/a"), path("/c")]);
+
+        let mut t = tabs();
+        assert_eq!(t.close_all(), 2);
+        assert_eq!(paths(&t), vec![path("/c")], "the dirty tab survives");
+        assert!(t.editors[0].dirty);
     }
 
     #[test]

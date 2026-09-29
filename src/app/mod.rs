@@ -2550,6 +2550,44 @@ struct PendingRevertHunk {
     patch: String,
 }
 
+/// What an unsaved-changes prompt (#862) goes on to do once it is answered.
+/// Everything that would drop a dirty buffer asks first: croft keeps no copy
+/// of unsaved text across a quit, so the prompt is the last chance to save.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UnsavedExit {
+    /// Quit croft (Ctrl+Q, vim `:qa`).
+    Quit,
+    /// Hand a remote croft back to the local one (Cmd+Shift+L), which
+    /// ends this process as a quit does.
+    DropToLocal,
+    /// Leave this croft for a workspace on `host`: the local session ends
+    /// and a later return starts a fresh one.
+    RemoteLaunch { host: String, path: Option<String> },
+    /// Close the focused group's tab at `idx`. `path` is the file it showed
+    /// when asked, so an answer never lands on a tab that moved into its
+    /// place meanwhile.
+    CloseTab { idx: usize, path: Option<PathBuf> },
+}
+
+impl UnsavedExit {
+    /// The prompt's name for going on: "Save all and quit", "Did not quit".
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Quit => "quit",
+            Self::DropToLocal => "return to local",
+            Self::RemoteLaunch { .. } => "connect",
+            Self::CloseTab { .. } => "close",
+        }
+    }
+}
+
+/// Whether closing `ed` would lose text only it holds (#862): unsaved
+/// changes to a file, or an untitled buffer that was typed into and still
+/// holds something.
+fn holds_unsaved(ed: &Editor) -> bool {
+    ed.dirty && (ed.path.is_some() || ed.lines.iter().any(|l| !l.is_empty()))
+}
+
 /// Why the branch picker is open, deciding what its Enter does. `Checkout`
 /// is the default (click the branch name / "Checkout to"); the others are
 /// reached from the Branch submenu and act on the highlighted *existing*
@@ -3486,6 +3524,9 @@ pub struct App {
     /// Armed by R in a Source-Control diff; reverting a hunk destroys
     /// uncommitted work, so the confirm modal always runs first.
     pending_revert_hunk: Option<PendingRevertHunk>,
+    /// An unsaved-changes prompt (#862) waiting on S / D / Esc, holding what
+    /// it goes on to do. While `Some`, the modal eats every key and click.
+    pending_unsaved: Option<UnsavedExit>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -5633,6 +5674,7 @@ impl App {
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
+            pending_unsaved: None,
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -15974,14 +16016,15 @@ impl App {
 
     /// Record every tab the bulk closes (Close Others / Close to the Right)
     /// are about to drop: the unpinned, file-backed ones `pred` selects, in
-    /// tab order so the reopen stack pops most-recent-first.
+    /// tab order so the reopen stack pops most-recent-first. A tab with
+    /// unsaved changes is never one: the bulk closes keep those open (#862).
     fn record_closed_tabs_where(&mut self, pred: impl Fn(usize, &Editor) -> bool) {
         let picks: Vec<usize> = self
             .editor
             .editors
             .iter()
             .enumerate()
-            .filter(|(i, ed)| pred(*i, ed))
+            .filter(|(i, ed)| !ed.dirty && pred(*i, ed))
             .map(|(i, _)| i)
             .collect();
         for i in picks {
@@ -17668,6 +17711,12 @@ impl App {
     /// same workspace with the file open), then close the tab here — the file
     /// has moved to the new window. The current window is otherwise untouched.
     fn move_into_new_window(&mut self, idx: usize) {
+        // The new window reads the file from disk, so unsaved edits would
+        // stay behind in the tab this closes (#862).
+        if self.editor.editors.get(idx).is_some_and(|e| e.dirty) {
+            self.status = String::from("New Window: save the file first");
+            return;
+        }
         if !self.open_tab_in_new_window(idx) {
             return;
         }
@@ -19313,6 +19362,7 @@ impl App {
         self.render_replace_all_confirm(frame);
         self.render_broadcast_confirm(frame);
         self.render_run_block_confirm(frame);
+        self.render_unsaved_confirm(frame);
         // Terminal-pane inline image: sync after the panes have painted so
         // last_inner and the scroll offset are this frame's (all gating —
         // hidden panel, alt screen, off-screen anchor — is inside).
@@ -19802,6 +19852,91 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::raw("o / Esc"),
+            ]),
+        ]);
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// The unsaved-changes prompt (#862): what would be lost and the three
+    /// ways out. Amber like Replace All's rather than red, since its default
+    /// (S / Enter) keeps the edits and only D throws anything away.
+    fn render_unsaved_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(exit) = self.pending_unsaved.as_ref() else {
+            return;
+        };
+        let (headline, names, save, discard) = match exit {
+            UnsavedExit::CloseTab { idx, .. } => (
+                String::from("This tab has unsaved changes:"),
+                self.editor.tab_display_label(*idx),
+                String::from("ave and close"),
+                String::from("on't save"),
+            ),
+            other => {
+                let files = self.unsaved_files();
+                let verb = other.verb();
+                (
+                    if files.len() == 1 {
+                        String::from("1 file has unsaved changes:")
+                    } else {
+                        format!("{} files have unsaved changes:", files.len())
+                    },
+                    files.join(", "),
+                    format!("ave all and {verb}"),
+                    format!("iscard and {verb}"),
+                )
+            }
+        };
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let height: u16 = 8;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let rect = rect.intersection(area);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
+            .title(ratatui::text::Span::styled(
+                " UNSAVED CHANGES ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let key = |k: &'static str, color: Color| {
+            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+        };
+        let body = ratatui::text::Text::from(vec![
+            Line::from(Span::styled(
+                headline,
+                Style::default().fg(self.theme.ui(Color::White)),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                truncate_for_display(&names, inner.width as usize),
+                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                key("[S]", Color::Green),
+                Span::raw(format!("{save}   ")),
+                key("[D]", Color::Red),
+                Span::raw(format!("{discard}   ")),
+                key("[Esc]", self.theme.ui(Color::White)),
+                Span::raw(" cancel"),
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
@@ -21422,6 +21557,23 @@ impl App {
             self.handle_list_picker_key(key);
             return Ok(());
         }
+        // The unsaved-changes prompt (#862): S or Enter saves, D goes on
+        // without saving, N or Esc cancels. N is a cancel, not "don't save":
+        // every other croft confirm reads N as "stop", and a reflex N must
+        // not throw edits away. Letters count only unmodified, so a stray
+        // Ctrl+D (add next match) cannot discard either.
+        if self.pending_unsaved.is_some() {
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+            match key.code {
+                KeyCode::Char('s' | 'S') if plain => self.answer_unsaved(true),
+                KeyCode::Enter => self.answer_unsaved(true),
+                KeyCode::Char('d' | 'D') if plain => self.answer_unsaved(false),
+                KeyCode::Char('n' | 'N') if plain => self.cancel_unsaved(),
+                KeyCode::Esc => self.cancel_unsaved(),
+                _ => {}
+            }
+            return Ok(());
+        }
         if self.pending_replace_all.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -21837,8 +21989,7 @@ impl App {
             return Ok(());
         }
         if self.is_remote && is_drop_to_local_key(key) {
-            self.drop_to_local = true;
-            self.quit = true;
+            self.guard_unsaved(UnsavedExit::DropToLocal);
             return Ok(());
         }
         if self.sidebar_view == SidebarView::Search
@@ -21879,7 +22030,7 @@ impl App {
         }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
-                self.quit = true;
+                self.guard_unsaved(UnsavedExit::Quit);
                 return Ok(());
             }
             (KeyCode::F(6), _) => {
@@ -36215,6 +36366,11 @@ impl App {
     }
 
     fn request_remote_launch(&mut self, host: String, path: Option<String>) {
+        // The launch ends this croft once the remote one is up (#862).
+        self.guard_unsaved(UnsavedExit::RemoteLaunch { host, path });
+    }
+
+    fn start_remote_launch(&mut self, host: String, path: Option<String>) {
         self.status = format!("Connecting to {host}");
         match crate::remote_connect::SshAuth::start(&host) {
             Ok(auth) => {
@@ -40226,16 +40382,7 @@ impl App {
         // so without this hoist Cmd+W is silently swallowed on a diff, sheet,
         // or image tab and the tab can never be closed from the keyboard.
         if is_close_tab_key(key) {
-            self.record_closed_tab_at(self.editor.active_index());
-            if self.editor.close_active() {
-                self.sync_open_file_poll_mtime();
-                self.status = String::from("Closed tab");
-                // Closing the focused group's last tab while split closes
-                // the group: collapse back to the surviving column.
-                self.collapse_split_if_empty();
-            } else {
-                self.status = String::from("Cannot close last tab");
-            }
+            self.request_close_tab(self.editor.active_index());
             return;
         }
         if self.editor.diff.is_some() {
@@ -41202,23 +41349,18 @@ impl App {
         }
         match cmd {
             "w" | "write" => self.save(),
-            "q" | "q!" | "quit" => {
-                self.record_closed_tab_at(self.editor.active_index());
-                if self.editor.close_active() {
-                    self.sync_open_file_poll_mtime();
-                    self.status = String::from("Closed tab");
-                } else {
-                    self.quit = true;
-                }
-            }
+            "q" | "quit" => self.request_close_tab(self.editor.active_index()),
+            // vim's `!` is the answer to "discard the changes?" given up
+            // front, so these two never ask (#862).
+            "q!" => self.close_tab_now(self.editor.active_index()),
+            "qa!" => self.quit = true,
             "wq" | "x" | "wq!" => {
                 self.save();
-                self.record_closed_tab_at(self.editor.active_index());
-                if !self.editor.close_active() {
-                    self.quit = true;
-                }
+                // A save that did not land (a disk conflict, a format still
+                // running) leaves the tab dirty, and the close asks.
+                self.request_close_tab(self.editor.active_index());
             }
-            "qa" | "qa!" | "quitall" => self.quit = true,
+            "qa" | "quitall" => self.guard_unsaved(UnsavedExit::Quit),
             other => self.status = format!("Unknown command: {other}"),
         }
     }
@@ -47462,14 +47604,7 @@ impl App {
                     String::from("Nothing to redo")
                 };
             }
-            Cmd::CloseEditor => {
-                self.record_closed_tab_at(self.editor.active_index());
-                if self.editor.close_active() {
-                    self.sync_open_file_poll_mtime();
-                    self.collapse_split_if_empty();
-                    self.status = String::from("Closed tab");
-                }
-            }
+            Cmd::CloseEditor => self.request_close_tab(self.editor.active_index()),
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
@@ -50449,6 +50584,11 @@ impl App {
         if self.approval_ui.is_some() {
             return;
         }
+        // Nor does the unsaved-changes prompt (#862): a click behind it must
+        // not close or move the tabs it is asking about.
+        if self.pending_unsaved.is_some() {
+            return;
+        }
         // The history scrubber's slider (#371): a press on the track seeks
         // there, and a drag that started on it keeps seeking wherever the
         // pointer goes, so the handle can be dragged off the row and back.
@@ -52616,13 +52756,7 @@ impl App {
                             self.status = String::from("Unpinned tab");
                             self.poke_cursor();
                         } else {
-                            self.record_closed_tab_at(idx);
-                            if self.editor.close_tab(idx) {
-                                self.sync_open_file_poll_mtime();
-                                self.status = String::from("Closed tab");
-                                self.poke_cursor();
-                                self.collapse_split_if_empty();
-                            }
+                            self.request_close_tab(idx);
                         }
                     } else if let Some(idx) = self.editor.tab_at(m.column, m.row) {
                         self.focus_pane(Pane::Editor);
@@ -56707,15 +56841,7 @@ impl App {
             MenuAction::CopyTabPath(path) => self.copy_path_to_clipboard(path),
             MenuAction::CopyTabRelativePath(path) => self.copy_relative_path_to_clipboard(path),
             MenuAction::RevealInExplorer(path) => self.reveal_in_explorer(path),
-            MenuAction::CloseTab(idx) => {
-                self.record_closed_tab_at(idx);
-                if self.editor.close_tab(idx) {
-                    self.sync_open_file_poll_mtime();
-                    self.status = String::from("Closed tab");
-                    self.poke_cursor();
-                    self.collapse_split_if_empty();
-                }
-            }
+            MenuAction::CloseTab(idx) => self.request_close_tab(idx),
             MenuAction::CloseOtherTabs(keep_idx) => {
                 self.record_closed_tabs_where(|i, ed| i != keep_idx && !ed.pinned);
                 let removed = self.editor.close_others(keep_idx);
@@ -57065,16 +57191,34 @@ impl App {
     /// blank pane. A side-by-side layout (e.g. `cgr duplicates` diffs) would
     /// otherwise only empty the clicked group and look like a single close
     /// once the blank group collapsed away.
+    ///
+    /// Tabs with unsaved changes stay open, in whichever group holds them
+    /// (#862): a sweep must not decide to throw edits away, and Cmd+W on one
+    /// of them asks. Only the groups left with nothing fold away then.
     fn close_all_tabs(&mut self) {
         let mut removed = self.editor.close_all();
+        let mut kept = self.editor.editors.iter().filter(|e| e.dirty).count();
         if self.editor_layout.is_split() {
-            removed += self
+            let mut emptied = Vec::new();
+            for (g, group) in self
                 .editor_layout
-                .inactive_groups()
-                .iter()
-                .map(|g| g.editors.len())
-                .sum::<usize>();
-            self.editor_layout = editor_layout::EditorLayout::single();
+                .inactive_groups_mut()
+                .into_iter()
+                .enumerate()
+            {
+                removed += group.close_all();
+                let dirty = group.editors.iter().filter(|e| e.dirty).count();
+                if dirty == 0 {
+                    emptied.push(g);
+                }
+                kept += dirty;
+            }
+            if kept == 0 {
+                self.editor_layout = editor_layout::EditorLayout::single();
+            } else {
+                self.editor_layout.prune_inactive_at(&emptied);
+                self.collapse_split_if_empty();
+            }
             self.editor_seams.clear();
             self.disable_editor_image(1);
             self.sync_focus_flags();
@@ -57085,6 +57229,10 @@ impl App {
         } else {
             format!("Closed {removed} tabs")
         };
+        if kept > 0 {
+            self.status
+                .push_str(&format!("; kept {kept} with unsaved changes open"));
+        }
         self.poke_cursor();
     }
 
@@ -57105,6 +57253,253 @@ impl App {
         };
         self.poke_cursor();
         self.collapse_split_if_empty();
+    }
+
+    /// Go on with `exit`, unless it would drop unsaved changes (#862): then
+    /// raise the prompt that asks whether to save them first. Every quit and
+    /// every single-tab close comes through here. The update relaunch alone
+    /// does not: its session handoff carries unsaved text across the re-exec.
+    fn guard_unsaved(&mut self, exit: UnsavedExit) {
+        let at_stake = match &exit {
+            UnsavedExit::CloseTab { idx, .. } => self.tab_would_lose_edits(*idx),
+            _ => !self.unsaved_files().is_empty(),
+        };
+        if at_stake {
+            self.pending_unsaved = Some(exit);
+        } else {
+            self.finish_unsaved_exit(exit);
+        }
+    }
+
+    /// Close the focused group's tab at `idx`: at once when it holds nothing
+    /// unsaved, through the prompt when it does.
+    fn request_close_tab(&mut self, idx: usize) {
+        let path = self.editor.tab_path(idx);
+        self.guard_unsaved(UnsavedExit::CloseTab { idx, path });
+    }
+
+    /// Carry `exit` out, with nothing left to ask.
+    fn finish_unsaved_exit(&mut self, exit: UnsavedExit) {
+        match exit {
+            UnsavedExit::Quit => self.quit = true,
+            UnsavedExit::DropToLocal => {
+                self.drop_to_local = true;
+                self.quit = true;
+            }
+            UnsavedExit::RemoteLaunch { host, path } => self.start_remote_launch(host, path),
+            UnsavedExit::CloseTab { idx, .. } => self.close_tab_now(idx),
+        }
+    }
+
+    /// Answer the unsaved-changes prompt (#862). `save` writes the buffers
+    /// first and goes on only once every one of them is on disk: a file left
+    /// unsaved keeps croft (or the tab) open and is named in the status
+    /// line. Otherwise it goes on without saving.
+    fn answer_unsaved(&mut self, save: bool) {
+        let Some(exit) = self.pending_unsaved.take() else {
+            return;
+        };
+        if let UnsavedExit::CloseTab { idx, path } = &exit
+            && self.editor.tab_path(*idx) != *path
+        {
+            self.status = String::from("The tab moved while croft was asking; nothing was closed");
+            return;
+        }
+        if save {
+            let only = match &exit {
+                UnsavedExit::CloseTab { idx, .. } => Some(*idx),
+                _ => None,
+            };
+            let left = self.save_tabs_for_exit(only);
+            if !left.is_empty() {
+                self.status = format!(
+                    "Did not {}: still unsaved - {}",
+                    exit.verb(),
+                    left.join(", ")
+                );
+                return;
+            }
+        }
+        let closing = matches!(exit, UnsavedExit::CloseTab { .. });
+        self.finish_unsaved_exit(exit);
+        if closing {
+            self.status = String::from(if save {
+                "Saved and closed tab"
+            } else {
+                "Closed tab without saving"
+            });
+        }
+    }
+
+    fn cancel_unsaved(&mut self) {
+        if let Some(exit) = self.pending_unsaved.take() {
+            self.status = format!("Cancelled: did not {}", exit.verb());
+        }
+    }
+
+    /// Close the focused group's tab at `idx` without asking: the shared end
+    /// of every single-tab close (Cmd+W, the tab's close button and context
+    /// menu, View: Close Editor, vim `:q`). The tab is recorded for Reopen
+    /// Closed Editor first, while it is still in place.
+    fn close_tab_now(&mut self, idx: usize) {
+        self.record_closed_tab_at(idx);
+        if self.editor.close_tab(idx) {
+            self.sync_open_file_poll_mtime();
+            self.status = String::from("Closed tab");
+            self.poke_cursor();
+            // Closing the focused group's last tab while split closes the
+            // group: collapse back to the surviving column.
+            self.collapse_split_if_empty();
+        }
+    }
+
+    /// Whether closing the focused group's tab at `idx` throws unsaved edits
+    /// away (#862). Not when another open tab holds the very same unsaved
+    /// text: a symbol tab and its file's tab mirror one buffer (#369), so
+    /// closing either keeps the edits in the other.
+    fn tab_would_lose_edits(&self, idx: usize) -> bool {
+        let Some(ed) = self.editor.editors.get(idx).filter(|e| holds_unsaved(e)) else {
+            return false;
+        };
+        !std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .any(|other| {
+                !std::ptr::eq(other, ed)
+                    && other.dirty
+                    && other.path.is_some()
+                    && other.path == ed.path
+                    && other.lines == ed.lines
+            })
+    }
+
+    /// Every file a quit would lose (#862), one label each: the dirty tabs of
+    /// every editor group, a file open in several tabs (a split, a symbol
+    /// tab) counted once, and each untitled buffer holding text on its own.
+    fn unsaved_files(&self) -> Vec<String> {
+        let mut seen: Vec<&Path> = Vec::new();
+        let mut labels = Vec::new();
+        for ed in std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| holds_unsaved(e))
+        {
+            match ed.path.as_deref() {
+                Some(p) if seen.contains(&p) => {}
+                Some(p) => {
+                    seen.push(p);
+                    labels.push(self.status_path(p));
+                }
+                None => labels.push(String::from("untitled")),
+            }
+        }
+        labels
+    }
+
+    /// Write what an unsaved-changes prompt (#862) asked about: the focused
+    /// group's tab at `only`, or every unsaved tab in every group.
+    ///
+    /// Each write is the explicit save's, done now and unformatted (the tab
+    /// is about to go, and a formatter's reply would land after it), and it
+    /// refuses what a first Cmd+S refuses: a file changed on disk, text its
+    /// encoding cannot hold. A merge with conflicts still open is not written
+    /// blind either, and an untitled buffer has no file to go to. Returns a
+    /// line per file still unsaved; empty means everything is on disk.
+    fn save_tabs_for_exit(&mut self, only: Option<usize>) -> Vec<String> {
+        use crate::widgets::editor::SaveOutcome;
+        // The tabs of a file with a symbol tab mirror one text (#369): the
+        // first write saves them all, and writing a second would read the
+        // first as a change on disk. The sync afterwards marks them clean.
+        let mirrored: Vec<PathBuf> = self
+            .symbol_view_paths()
+            .into_iter()
+            .filter(|p| !self.symbol_path_is_live(p))
+            .collect();
+        // A collab guest never writes a shared file, and loses nothing by
+        // leaving it: its edits are already live with the owner, who saves.
+        let guest = self.is_collab_guest();
+        let root = self.tree.root.clone();
+        let collab = &self.collab;
+        let owner_saves = |p: &Path| {
+            guest
+                && collab_file_key(&root, p)
+                    .is_some_and(|f| collab.as_ref().is_some_and(|s| !s.is_local_only(&f)))
+        };
+        let mut saved: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> = Vec::new();
+        let mut left: Vec<(Option<PathBuf>, String)> = Vec::new();
+        let mut save = |ed: &mut Editor| {
+            if !holds_unsaved(ed) {
+                return;
+            }
+            let Some(path) = ed.path.clone() else {
+                left.push((None, String::from("no file to save to")));
+                return;
+            };
+            if owner_saves(&path)
+                || (mirrored.contains(&path) && saved.iter().any(|(q, ..)| *q == path))
+            {
+                return;
+            }
+            if ed.merge.as_ref().is_some_and(|m| m.unresolved_count() > 0) {
+                left.push((Some(path), String::from("merge conflicts left")));
+                return;
+            }
+            let outcome = if ed.hex.is_some() {
+                ed.hex_save(false)
+            } else if ed.sheet.is_some() {
+                ed.sheet_save(false, false)
+            } else {
+                ed.save_to_disk()
+            };
+            let why = match outcome {
+                Ok(SaveOutcome::Saved) if !ed.dirty => {
+                    saved.push((path, ed.provenance_to_record(), ed.bytes_for_disk()));
+                    return;
+                }
+                // A workbook save that held formula cells back names them.
+                Ok(SaveOutcome::Saved) => ed.status.clone(),
+                Ok(SaveOutcome::DiskConflict) => String::from("changed on disk"),
+                Ok(SaveOutcome::EncodingLoss) => {
+                    format!("{} cannot hold every character", ed.encoding.name())
+                }
+                Err(e) => e.to_string(),
+            };
+            left.push((Some(path), why));
+        };
+        match only {
+            Some(idx) => {
+                if let Some(ed) = self.editor.editors.get_mut(idx) {
+                    save(ed);
+                }
+            }
+            None => {
+                self.editor.editors.iter_mut().for_each(&mut save);
+                for group in self.editor_layout.inactive_groups_mut() {
+                    group.editors.iter_mut().for_each(&mut save);
+                }
+            }
+        }
+        if only.is_none() && !saved.is_empty() {
+            self.sync_symbol_views();
+        }
+        // The same follow-ups as every other save path.
+        for (path, ..) in &saved {
+            self.reload_config_for_path(path);
+        }
+        if let Some(lsp) = self.lsp.as_ref() {
+            for (path, ..) in &saved {
+                lsp.save_doc(path.clone());
+            }
+        }
+        for (path, seats, described) in saved {
+            self.record_history_snapshot_of(&path, seats, described);
+        }
+        left.into_iter()
+            .map(|(path, why)| match path {
+                Some(p) => format!("{} ({why})", self.status_path(&p)),
+                None => format!("untitled ({why})"),
+            })
+            .collect()
     }
 
     /// Copy `path` (an editor tab's absolute path) to the system clipboard via

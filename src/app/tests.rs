@@ -10680,6 +10680,365 @@ fn close_all_closes_every_split_group() {
     assert_eq!(app.status, format!("Closed {total} tabs"));
 }
 
+/// Type `text` into the focused editor, which leaves its buffer dirty.
+fn type_into_editor(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+fn press_ctrl_q(app: &mut App) {
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .unwrap();
+}
+
+/// An app with `a.txt` open, edited and unsaved, and the file's path (#862).
+fn app_with_unsaved_file(tmp: &std::path::Path) -> (App, PathBuf) {
+    let mut app = app_with_open_file(tmp, "a.txt", "alpha\n");
+    type_into_editor(&mut app, "x");
+    assert!(app.editor.dirty, "setup: typing leaves the buffer dirty");
+    (app, tmp.join("a.txt"))
+}
+
+/// #862: a quit with nothing unsaved is immediate, as it always was.
+#[test]
+fn ctrl_q_with_nothing_unsaved_quits_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+    press_ctrl_q(&mut app);
+    assert!(app.quit);
+    assert_eq!(app.pending_unsaved, None, "nothing to ask about");
+}
+
+/// #862: Ctrl+Q with an unsaved buffer used to exit on the spot and lose
+/// it. It asks now, naming the file, and does not quit until answered.
+#[test]
+fn ctrl_q_with_an_unsaved_tab_asks_before_quitting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    press_ctrl_q(&mut app);
+    assert!(!app.quit, "an unsaved buffer must not be dropped by Ctrl+Q");
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("UNSAVED CHANGES"), "{screen}");
+    assert!(screen.contains("1 file has unsaved changes"), "{screen}");
+    assert!(
+        screen.contains("a.txt"),
+        "the prompt names the file:\n{screen}"
+    );
+    // The prompt owns the keyboard: typing does not reach the buffer, and a
+    // second Ctrl+Q does not force the quit.
+    let before = app.editor.lines.clone();
+    type_into_editor(&mut app, "zz");
+    press_ctrl_q(&mut app);
+    assert_eq!(app.editor.lines, before);
+    assert!(!app.quit);
+}
+
+/// #862: S saves every unsaved buffer, in every split, and then quits.
+#[test]
+fn s_at_the_quit_prompt_saves_every_split_and_quits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "y");
+    assert!(app.editor_layout.is_split(), "setup: two groups");
+    press_ctrl_q(&mut app);
+    assert!(!app.quit);
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("2 files have unsaved changes"), "{screen}");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit, "saved everything, so it quits: {}", app.status);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "ybravo\n");
+}
+
+/// #862: D quits without writing anything.
+#[test]
+fn d_at_the_quit_prompt_quits_without_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+}
+
+/// #862: Esc (or N, which never means "don't save") cancels: croft stays,
+/// the edits stay, and the disk is untouched. A modified D does not discard.
+#[test]
+fn esc_or_n_at_the_quit_prompt_cancels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    for cancel in [
+        key(KeyCode::Esc, KeyModifiers::NONE),
+        key(KeyCode::Char('n'), KeyModifiers::NONE),
+    ] {
+        press_ctrl_q(&mut app);
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(!app.quit, "Ctrl+D is not the D answer");
+        app.handle_key(cancel).unwrap();
+        assert!(!app.quit);
+        assert_eq!(app.pending_unsaved, None, "the prompt closed");
+        assert!(app.editor.dirty, "the edits are still there");
+        assert_eq!(app.editor.lines[0], "xalpha");
+    }
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+}
+
+/// #862: an untitled buffer has no file to save to, so S cannot keep its
+/// text and does not quit; D is the explicit way out.
+#[test]
+fn save_all_does_not_quit_while_an_untitled_buffer_holds_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_into_editor(&mut app, "note");
+    assert!(app.editor.path.is_none() && app.editor.dirty, "setup");
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit, "the untitled text would be lost");
+    assert!(app.status.contains("untitled"), "{}", app.status);
+    assert_eq!(app.editor.lines, vec![String::from("note")]);
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('D'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.quit);
+}
+
+/// #862: an untitled buffer that holds nothing is not worth a prompt.
+#[test]
+fn an_emptied_untitled_buffer_does_not_hold_up_a_quit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_into_editor(&mut app, "x");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec![String::new()], "setup");
+    press_ctrl_q(&mut app);
+    assert!(app.quit);
+}
+
+/// #862: a save that fails keeps croft open. Here the file changed on disk
+/// under the edits: Save All must neither overwrite that nor quit.
+#[test]
+fn save_all_does_not_quit_when_a_save_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    std::fs::write(&a, "changed elsewhere\n").unwrap();
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(
+        app.status.contains("a.txt (changed on disk)"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "changed elsewhere\n",
+        "the other writer's change is not overwritten"
+    );
+    assert!(app.editor.dirty, "the edits are still in the buffer");
+}
+
+/// #862: Cmd+W on an unsaved tab used to close it, and Reopen Closed
+/// Editor brought back only the file on disk. It asks now; Esc keeps it.
+#[test]
+fn closing_an_unsaved_tab_asks_rather_than_dropping_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.select(0);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 2, "nothing closed yet");
+    assert!(matches!(
+        app.pending_unsaved,
+        Some(UnsavedExit::CloseTab { idx: 0, .. })
+    ));
+    assert_ne!(app.status, "Closed tab");
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("This tab has unsaved changes"), "{screen}");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 2);
+    assert_eq!(app.editor.lines[0], "xalpha", "the edits are kept");
+}
+
+/// #862: S at the close prompt writes the tab, then closes it.
+#[test]
+fn s_at_the_close_prompt_saves_then_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    assert_eq!(app.editor.path, None, "the tab closed");
+    assert_eq!(app.status, "Saved and closed tab");
+    assert!(!app.quit, "closing a tab never quits");
+}
+
+/// #862: D at the close prompt closes without writing, and the tab can
+/// still be reopened from disk.
+#[test]
+fn d_at_the_close_prompt_closes_without_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    assert!(app.pending_unsaved.is_some(), "View: Close Editor asks too");
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path, None, "the tab closed");
+    assert_eq!(app.status, "Closed tab without saving");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    app.reopen_closed_tab();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.lines[0], "alpha", "reopened from disk");
+}
+
+/// #862: a clean tab closes at once, exactly as before.
+#[test]
+fn closing_a_clean_tab_does_not_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.pending_unsaved, None);
+    assert_eq!(app.editor.path, None);
+    assert_eq!(app.status, "Closed tab");
+}
+
+/// #862: the tab context menu's Close asks about an unsaved tab, and its
+/// Close Others / Close All keep one open rather than dropping it.
+#[test]
+fn tab_menu_closes_keep_unsaved_tabs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    let root = tmp.path().to_path_buf();
+
+    app.dispatch_menu_action(MenuAction::CloseTab(0), root.clone());
+    assert!(
+        app.pending_unsaved.is_some(),
+        "Close on the unsaved tab asks"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+
+    app.dispatch_menu_action(MenuAction::CloseOtherTabs(1), root.clone());
+    assert_eq!(
+        app.editor.tab_count(),
+        2,
+        "Close Others keeps the unsaved a.txt"
+    );
+
+    app.dispatch_menu_action(MenuAction::CloseAllTabs, root);
+    assert_eq!(app.editor.tab_count(), 1);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert!(app.editor.dirty);
+    assert_eq!(app.status, "Closed 1 tab; kept 1 with unsaved changes open");
+}
+
+/// #862: Close All keeps a split whose other group holds unsaved edits, and
+/// folds away only the groups it emptied.
+#[test]
+fn close_all_keeps_the_split_group_holding_unsaved_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.split_editor();
+    assert!(app.editor_layout.is_split(), "setup: two groups");
+    app.dispatch_menu_action(MenuAction::CloseAllTabs, tmp.path().to_path_buf());
+    assert!(
+        !app.editor_layout.is_split(),
+        "the emptied focused group folded away"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert!(app.editor.dirty, "the unsaved group survives, promoted");
+}
+
+/// #862: a tab whose unsaved text another open tab holds too (a symbol tab
+/// and its file's tab mirror one buffer) closes without asking: nothing is
+/// lost while the other keeps it.
+#[test]
+fn a_tab_whose_edits_another_tab_holds_closes_without_asking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let edited = app.editor.lines.clone();
+    app.split_editor();
+    app.editor.lines = edited.clone();
+    app.editor.dirty = true;
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.pending_unsaved, None, "no prompt");
+    assert!(!app.editor_layout.is_split(), "the tab closed");
+    assert_eq!(app.editor.lines, edited, "the other copy kept the edits");
+    assert!(app.editor.dirty);
+}
+
+/// #862: vim's `:q` and `:qa` ask like Cmd+W and Ctrl+Q; the `!` forms are
+/// the answer given up front and discard without asking.
+#[test]
+fn vim_quits_ask_unless_forced() {
+    let (mut app, tmp) = vim_app("one\n");
+    let f = tmp.path().join("buf.txt");
+    app.editor.lines[0] = String::from("edited");
+    app.editor.dirty = true;
+    app.vim_run_ex("qa");
+    assert!(!app.quit);
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
+    app.cancel_unsaved();
+    app.vim_run_ex("q");
+    assert!(matches!(
+        app.pending_unsaved,
+        Some(UnsavedExit::CloseTab { .. })
+    ));
+    app.cancel_unsaved();
+    app.vim_run_ex("qa!");
+    assert!(app.quit, ":qa! quits without asking");
+    app.quit = false;
+    app.vim_run_ex("q!");
+    assert_eq!(app.pending_unsaved, None);
+    assert_eq!(app.editor.path, None, ":q! closed the tab");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\n");
+}
+
+/// #862: leaving a remote croft for the local one ends this process like a
+/// quit, so it asks the same way.
+#[test]
+fn drop_to_local_with_unsaved_edits_asks_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.is_remote = true;
+    let drop_key = key(
+        KeyCode::Char('l'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    app.handle_key(drop_key).unwrap();
+    assert!(!app.quit && !app.drop_to_local);
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::DropToLocal));
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.drop_to_local && app.quit);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
