@@ -1912,6 +1912,49 @@ mod tests {
         );
     }
 
+    /// #858 negative: a one-line feedback that fits is drawn whole, and an
+    /// error one is clipped at the panel's edge like a success.
+    #[test]
+    fn a_short_feedback_is_drawn_whole_and_an_error_stays_inside_the_panel() {
+        use ratatui::buffer::Buffer;
+        let draw = |feedback: &str, is_error: bool| -> (Buffer, Rect) {
+            let mut p = SourceControlPanel::new();
+            p.set_status(dummy_status_with_branch("main"), Vec::new());
+            p.commit_feedback = Some(feedback.to_string());
+            p.commit_feedback_is_error = is_error;
+            let panel_area = Rect::new(0, 0, 28, 30);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 30));
+            ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+            (buf, panel_area)
+        };
+        let text = |buf: &Buffer, area: Rect| -> String {
+            (area.top()..area.bottom())
+                .map(|y| {
+                    (area.left()..area.right())
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (buf, area) = draw("Empty commit message", true);
+        assert!(text(&buf, area).contains("Empty commit message"));
+        let (buf, area) = draw(
+            "error: pathspec 'a-very-long-file-name-that-runs-on.rs' did not match",
+            true,
+        );
+        for y in 0..30 {
+            for x in area.right()..80 {
+                let sym = buf[(x, y)].symbol();
+                assert!(
+                    sym == " " || sym.is_empty(),
+                    "cell ({x}, {y}) past the panel carries {sym:?}"
+                );
+            }
+        }
+        assert!(text(&buf, area).contains("error: pathspec"));
+    }
+
     #[test]
     fn long_commit_message_keeps_the_caret_visible_and_scrolls_to_show_the_tail() {
         use ratatui::buffer::Buffer;
