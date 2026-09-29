@@ -65560,3 +65560,414 @@ fn a_failed_push_still_names_the_error_on_one_line() {
     let logged = app.git_output_log.last().cloned().unwrap_or_default();
     assert!(logged.contains("correct access rights"), "{logged:?}");
 }
+
+/// pricing.py as `main` and `feature` both start from it (#858).
+const PRICING_858: &str = "TAX_RATE = 0.21\nFREE_SHIPPING_OVER = 50\n\n\ndef shipping(total):\n    if total >= FREE_SHIPPING_OVER:\n        return 0\n    return 3.99\n";
+
+/// A repo on `main` whose `feature` branch writes `feature_pricing` to
+/// pricing.py (and adds feature.txt) while `main` raises FREE_SHIPPING_OVER
+/// to 75 (#858). With `feature` lowering it to 40, merging or rebasing
+/// stops on a conflict in pricing.py; with [`PRICING_858`] unchanged it is
+/// clean.
+fn pricing_repo_858(feature_pricing: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git setup step failed: {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    for (key, value) in [
+        ("user.email", "a@b"),
+        ("user.name", "a"),
+        ("commit.gpgsign", "false"),
+        ("merge.autoStash", "false"),
+        ("rebase.autoStash", "false"),
+    ] {
+        git(&["config", key, value]);
+    }
+    std::fs::write(p.join("pricing.py"), PRICING_858).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(p.join("pricing.py"), feature_pricing).unwrap();
+    std::fs::write(p.join("feature.txt"), "feature\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "feature: lower free shipping"]);
+    git(&["checkout", "-q", "main"]);
+    std::fs::write(
+        p.join("pricing.py"),
+        PRICING_858.replace("OVER = 50", "OVER = 75"),
+    )
+    .unwrap();
+    git(&["commit", "-qam", "main: raise free shipping"]);
+    tmp
+}
+
+/// [`pricing_repo_858`] whose merge or rebase stops on a conflict.
+fn conflicting_pricing_repo_858() -> tempfile::TempDir {
+    pricing_repo_858(&PRICING_858.replace("OVER = 50", "OVER = 40"))
+}
+
+/// A Branch submenu verb (Merge, Rebase, Delete Branch) on `branch`, the
+/// way a user runs it: the SCM menu opens the branch picker, the name is
+/// typed, Enter.
+fn pick_branch_858(app: &mut App, action: crate::widgets::scm_menu::ScmAction, branch: &str) {
+    app.dispatch_scm_action(action);
+    assert!(app.branch_picker.is_some(), "{action:?} opens the picker");
+    for c in branch.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+}
+
+/// #858: SCM ⋯ → Branch → Merge onto a conflicting branch. Git's text
+/// starts with `Auto-merging pricing.py`, and the panel and the status bar
+/// said "Merged failed: Auto-merging pricing.py", which reads like a step
+/// that went fine and leaves the conflict out. They now name the conflict,
+/// on one line; the Git Output log keeps git's whole text.
+#[test]
+fn a_merge_stopped_on_a_conflict_names_the_conflict_not_auto_merging() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Merge: 1 conflict (pricing.py)")
+    );
+    assert_eq!(app.status, "Merge: 1 conflict (pricing.py)");
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.starts_with("$ git merge"), "{logged:?}");
+    assert!(
+        logged.contains("Auto-merging pricing.py")
+            && logged.contains("CONFLICT (content): Merge conflict in pricing.py"),
+        "the Git Output log keeps git's whole text: {logged:?}"
+    );
+}
+
+/// #858: SCM ⋯ → Branch → Rebase that stops on a conflict. Git names the
+/// conflict on stdout and `error: could not apply …` on stderr, after a
+/// `Rebasing (1/1)` progress line it redraws with a carriage return; only
+/// stderr was kept, so the conflict never reached the panel, which said
+/// "Rebased failed: Rebasing (1/1)…". It now names the conflict.
+#[test]
+fn a_rebase_stopped_on_a_conflict_names_the_conflict() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Rebase, "feature");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Rebase: 1 conflict (pricing.py)")
+    );
+    assert_eq!(app.status, "Rebase: 1 conflict (pricing.py)");
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("CONFLICT (content): Merge conflict in pricing.py")
+            && logged.contains("could not apply"),
+        "the Git Output log has both of git's streams: {logged:?}"
+    );
+}
+
+/// #858: a failed op names the operation, "Merge failed" or "Rebase
+/// failed", not the past tense its success uses ("Merged failed",
+/// "Rebased failed"), and a failure with no conflict names git's `error:`
+/// or `fatal:` line. Covers the branch picker, an input prompt and a
+/// worker op.
+#[test]
+fn a_failed_scm_op_names_the_operation_and_git_s_error_line() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    // A local edit the merge would overwrite, and that rebase refuses.
+    std::fs::write(tmp.path().join("pricing.py"), "TAX_RATE = 0.2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let one_line = |app: &App| {
+        assert!(app.source_control.commit_feedback_is_error);
+        assert_eq!(
+            app.source_control.commit_feedback.as_deref(),
+            Some(app.status.as_str())
+        );
+        assert!(!app.status.contains('\n'), "{:?}", app.status);
+    };
+
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert_eq!(
+        app.status,
+        "Merge failed: error: Your local changes to the following files would be overwritten by merge:"
+    );
+    one_line(&app);
+
+    pick_branch_858(&mut app, ScmAction::Rebase, "feature");
+    assert_eq!(
+        app.status,
+        "Rebase failed: error: cannot rebase: You have unstaged changes."
+    );
+    one_line(&app);
+
+    pick_branch_858(&mut app, ScmAction::DeleteBranch, "main");
+    assert!(
+        app.status
+            .starts_with("Delete branch failed: error: cannot delete branch 'main'"),
+        "{:?}",
+        app.status
+    );
+    one_line(&app);
+
+    crate::git::create_tag(tmp.path(), "v1").unwrap();
+    app.dispatch_scm_action(ScmAction::CreateTag);
+    for c in "v1".chars() {
+        app.input_prompt.as_mut().unwrap().push_char(c);
+    }
+    app.submit_input_prompt();
+    assert_eq!(
+        app.status,
+        "Create tag failed: fatal: tag 'v1' already exists"
+    );
+    one_line(&app);
+
+    // No upstream: a worker op, reported when it lands.
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["checkout", "-q", "--", "."])
+        .status()
+        .unwrap();
+    app.dispatch_scm_action(ScmAction::PullRebase);
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status,
+        "Pull (rebase) failed: There is no tracking information for the current branch."
+    );
+    one_line(&app);
+}
+
+/// #858: Pull, Sync and Pop Stash stop on conflicts the same way a merge
+/// does, `Auto-merging …` first; they name the conflict too, and the Git
+/// Output log keeps git's text.
+#[test]
+fn a_pull_sync_or_stash_pop_stopped_on_a_conflict_names_the_conflict() {
+    let tmp = make_committed_repo();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    std::fs::write(tmp.path().join("seed.txt"), "stashed\n").unwrap();
+    git(&["stash", "-q"]);
+    std::fs::write(tmp.path().join("seed.txt"), "committed\n").unwrap();
+    git(&["commit", "-qam", "conflicting"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.stash_pop_source_control();
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Stash pop: 1 conflict (seed.txt)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("stash pop: 1 conflict (seed.txt)")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("Auto-merging seed.txt"), "{logged:?}");
+
+    // Git's text for a pull that fetched, then stopped merging.
+    let pull = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nAutomatic merge failed; fix conflicts and then commit the result.\nFrom github.com:o/r\n   5a6cd5c..9f1e2d3  main       -> origin/main";
+    app.finish_pull(Err(String::from(pull)));
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Pull: 1 conflict (pricing.py)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pull: 1 conflict (pricing.py)")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("5a6cd5c..9f1e2d3"), "{logged:?}");
+
+    app.finish_sync(Err(String::from(pull)), None);
+    assert_eq!(app.status, "Sync failed on pull: 1 conflict (pricing.py)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("sync: pull failed: 1 conflict (pricing.py)")
+    );
+}
+
+/// #858: a clean merge that auto-merged a file, and a clean rebase, report
+/// git's result line, not the `Auto-merging` note before it or the
+/// `Rebasing (1/1)` progress git redrew over.
+#[test]
+fn a_clean_merge_or_rebase_reports_git_s_result_line_not_its_progress() {
+    use crate::widgets::scm_menu::ScmAction;
+    // `feature` changes another line of pricing.py: git auto-merges it.
+    let tmp = pricing_repo_858(&PRICING_858.replace("3.99", "4.99"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Merged: Merge made by the 'ort' strategy.");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Merged: Merge made by the 'ort' strategy.")
+    );
+
+    let tmp = pricing_repo_858(&PRICING_858.replace("3.99", "4.99"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Rebase, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Rebased: Successfully rebased and updated refs/heads/main."
+    );
+}
+
+/// #858 negative: a clean merge of another file still reports its normal
+/// one-line success, as a success.
+#[test]
+fn a_clean_merge_still_reports_its_one_line_success() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = pricing_repo_858(PRICING_858);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Merged: Merge made by the 'ort' strategy.");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Merged: Merge made by the 'ort' strategy.")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("feature.txt"), "{logged:?}");
+}
+
+/// Draw the whole app and return the frame (#858).
+fn draw_858(
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    app: &mut App,
+) -> ratatui::buffer::Buffer {
+    term.draw(|f| app.render(f)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// Assert that `feedback`, shown in the Source Control panel, changes no
+/// cell of its row from the panel's right border to the screen's edge,
+/// over whatever the editor shows there, and return that row (#858). Only
+/// that row is compared: the feedback is one line, and the editor's other
+/// rows may change between frames as the git worker reports.
+fn assert_feedback_stays_in_the_panel_858(
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    app: &mut App,
+    feedback: &str,
+) -> u16 {
+    app.source_control.commit_feedback = None;
+    draw_858(term, app);
+    let bare = draw_858(term, app);
+    app.source_control.commit_feedback = Some(feedback.to_string());
+    let shown = draw_858(term, app);
+    let panel = app.source_control.last_area;
+    let width = shown.area.width;
+    assert!(
+        panel.width > 0 && panel.right() < width,
+        "the panel sits left of the editor: {panel:?}"
+    );
+    let head: String = feedback.chars().take(12).collect();
+    let row = (panel.top()..panel.bottom())
+        .find(|&y| {
+            (panel.left()..panel.right())
+                .map(|x| shown[(x, y)].symbol())
+                .collect::<String>()
+                .contains(&head)
+        })
+        .unwrap_or_else(|| panic!("the panel shows {head:?}"));
+    for x in panel.right() - 1..width {
+        assert_eq!(
+            shown[(x, row)].symbol(),
+            bare[(x, row)].symbol(),
+            "cell ({x}, {row}) from the Source Control panel's right border on changed with feedback {feedback:?}"
+        );
+    }
+    row
+}
+
+/// Assert that `row` crosses the merge editor's source panes below their
+/// titles, where the panes paint only their text and the cells between
+/// show whatever was drawn there first, as in the issue's frames (#858).
+fn assert_row_crosses_the_merge_panes_858(app: &App, row: u16) {
+    let panes = app
+        .editor
+        .merge
+        .as_ref()
+        .expect("the merge editor is up")
+        .last_panes_area;
+    assert!(
+        row > panes.y + 1 && row + 1 < panes.bottom(),
+        "the feedback row {row} crosses the source panes {panes:?}"
+    );
+}
+
+/// #858, the issue's frames: with the merge editor open, the Source
+/// Control feedback, first the merge's conflict and then, once it is
+/// resolved, a merge commit's long subject, paints nothing past the panel.
+/// The merge editor paints only its text cells, so feedback drawn past the
+/// panel showed through between them.
+#[test]
+fn scm_feedback_paints_nothing_over_the_merge_editor() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    let conflict = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .expect("the merge reports");
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    assert!(app.editor.merge.is_some(), "the merge editor is up");
+    // Tall enough that the feedback row crosses the source panes rather
+    // than the RESULT bar, which the merge editor paints edge to edge.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 60)).unwrap();
+    let row = assert_feedback_stays_in_the_panel_858(&mut term, &mut app, &conflict);
+    assert_row_crosses_the_merge_panes_858(&app, row);
+
+    // Resolve, stage, and commit the merge with a subject longer than the
+    // panel.
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
+    app.complete_merge();
+    assert!(app.status.contains("Merge complete"), "{:?}", app.status);
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message =
+        "Merge branch 'feature': keep the lower free-shipping threshold for EU customers"
+            .to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let subject = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        subject.starts_with("[main ") && subject.ends_with("for EU customers"),
+        "the commit's first line: {subject:?}"
+    );
+    assert!(app.editor.merge.is_some(), "the merge editor is still up");
+    let row = assert_feedback_stays_in_the_panel_858(&mut term, &mut app, &subject);
+    assert_row_crosses_the_merge_panes_858(&app, row);
+}

@@ -2512,6 +2512,189 @@ mod tests {
         assert_eq!(summary_line("remote: a\nremote: b\nhint: c"), "");
         assert_eq!(error_line("hint: only a hint"), "hint: only a hint");
     }
+
+    /// Git 2.43's text for a `git merge feature` that stopped on a conflict
+    /// (all of it on stdout).
+    const MERGE_CONFLICT_858: &str = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nAutomatic merge failed; fix conflicts and then commit the result.";
+    /// The same merge with three conflicted files.
+    const MERGE_CONFLICTS_858: &str = "Auto-merging a.py\nCONFLICT (content): Merge conflict in a.py\nAuto-merging b.py\nCONFLICT (content): Merge conflict in b.py\nAuto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nAutomatic merge failed; fix conflicts and then commit the result.";
+    /// `git rebase feature` stopped on a conflict: stdout (the conflict),
+    /// then stderr, whose first line git redrew over its `Rebasing (1/1)`
+    /// progress with a carriage return.
+    const REBASE_CONFLICT_858: &str = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nRebasing (1/1)\rerror: could not apply ffb4d23... main: raise free shipping\nhint: Resolve all conflicts manually, mark them as resolved with\nhint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\".\nhint: You can instead skip this commit: run \"git rebase --skip\".\nhint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\".\nCould not apply ffb4d23... main: raise free shipping";
+    /// A `git pull` that fetched, then stopped merging on a conflict:
+    /// stdout, then the fetch's ref updates from stderr.
+    const PULL_CONFLICT_858: &str = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nAutomatic merge failed; fix conflicts and then commit the result.\nFrom github.com:o/r\n   5a6cd5c..9f1e2d3  main       -> origin/main";
+    /// `git stash pop` onto a conflicting commit.
+    const STASH_POP_CONFLICT_858: &str = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nOn branch main\nUnmerged paths:\n  (use \"git restore --staged <file>...\" to unstage)\n  (use \"git add <file>...\" to mark resolution)\n\tboth modified:   pricing.py\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\nThe stash entry is kept in case you need it again.";
+
+    /// #858: a merge, rebase, pull or stash pop that stopped on conflicts
+    /// is reported by its conflicts, not by git's first line, which is
+    /// `Auto-merging pricing.py` and reads like a step that went fine.
+    #[test]
+    fn error_line_names_the_conflicts_git_stopped_on() {
+        assert_eq!(error_line(MERGE_CONFLICT_858), "1 conflict (pricing.py)");
+        assert_eq!(
+            error_line(MERGE_CONFLICTS_858),
+            "3 conflicts (a.py, b.py, pricing.py)"
+        );
+        assert_eq!(error_line(REBASE_CONFLICT_858), "1 conflict (pricing.py)");
+        assert_eq!(
+            error_line(PULL_CONFLICT_858),
+            "1 conflict (pricing.py)",
+            "the conflict, not the fetch's ref update"
+        );
+        assert_eq!(
+            error_line(STASH_POP_CONFLICT_858),
+            "1 conflict (pricing.py)"
+        );
+    }
+
+    /// #858: with no conflict to name, git's `error:` or `fatal:` line wins
+    /// over a progress line or a fetched ref update printed before it, and
+    /// a line git redrew with a carriage return reads as its last redraw.
+    #[test]
+    fn error_line_prefers_git_s_error_and_fatal_lines() {
+        let rebase_stderr = "Rebasing (1/1)\rerror: could not apply ffb4d23... main: raise free shipping\nhint: Resolve all conflicts manually, mark them as resolved with\nCould not apply ffb4d23... main: raise free shipping";
+        assert_eq!(
+            error_line(rebase_stderr),
+            "error: could not apply ffb4d23... main: raise free shipping"
+        );
+        let pull = "From github.com:o/r\n * branch            main       -> FETCH_HEAD\nhint: Diverging branches can't be fast-forwarded.\nfatal: Not possible to fast-forward, aborting.";
+        assert_eq!(
+            error_line(pull),
+            "fatal: Not possible to fast-forward, aborting."
+        );
+    }
+
+    /// #858: git's result line, not the `Auto-merging` note printed before
+    /// it or the `Rebasing (1/1)` progress it redrew with a carriage return
+    /// and an erase-line sequence.
+    #[test]
+    fn headline_skips_auto_merging_and_reads_a_redrawn_line_as_shown() {
+        assert_eq!(
+            headline(
+                "Auto-merging pricing.py\nMerge made by the 'ort' strategy.\n pricing.py | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)"
+            ),
+            "Merge made by the 'ort' strategy."
+        );
+        assert_eq!(
+            headline("Rebasing (1/1)\r\u{1b}[KSuccessfully rebased and updated refs/heads/rb."),
+            "Successfully rebased and updated refs/heads/rb."
+        );
+    }
+
+    /// #858 negative: a text of only `Auto-merging` notes still reports
+    /// something, never an empty line.
+    #[test]
+    fn error_line_of_only_auto_merging_notes_is_never_empty() {
+        assert_eq!(
+            error_line("Auto-merging pricing.py"),
+            "Auto-merging pricing.py"
+        );
+        let two = error_line("Auto-merging a.py\nAuto-merging b.py");
+        assert!(!two.is_empty(), "{two:?}");
+        assert!(!headline("Auto-merging pricing.py").is_empty());
+    }
+
+    /// #858 negative: the lines the push and commit reports already picked
+    /// are unchanged: a rejected ref update over git's `error:` line after
+    /// it, the first `fatal:` line, and "nothing to commit" past the
+    /// `On branch` preamble.
+    #[test]
+    fn error_line_keeps_the_push_and_commit_lines_it_already_picked() {
+        let rejected = "To github.com:o/r.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'github.com:o/r.git'\nhint: Updates were rejected because the remote contains work that you do";
+        assert_eq!(
+            error_line(rejected),
+            "[rejected] main -> main (fetch first)"
+        );
+        let fatal = "fatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights";
+        assert_eq!(
+            error_line(fatal),
+            "fatal: 'origin' does not appear to be a git repository"
+        );
+        assert_eq!(
+            error_line(
+                "On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean"
+            ),
+            "nothing to commit, working tree clean"
+        );
+        assert_eq!(
+            headline("[main 5a6cd5c] fix: one line\n 1 file changed, 1 insertion(+)"),
+            "[main 5a6cd5c] fix: one line"
+        );
+    }
+    /// #858: the conflicts are counted per file and named, three at most;
+    /// a lone conflict git words without a file is git's own line; a text
+    /// with no `CONFLICT` line has no conflict summary.
+    #[test]
+    fn conflict_summary_counts_and_names_the_conflicted_files() {
+        assert_eq!(
+            conflict_summary(MERGE_CONFLICT_858).as_deref(),
+            Some("1 conflict (pricing.py)")
+        );
+        let five = (1..=5)
+            .map(|i| format!("Auto-merging f{i}.py\nCONFLICT (content): Merge conflict in f{i}.py"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            conflict_summary(&five).as_deref(),
+            Some("5 conflicts (f1.py, f2.py, f3.py, \u{2026})")
+        );
+        let twice = "CONFLICT (add/add): Merge conflict in a.py\nCONFLICT (content): Merge conflict in a.py";
+        assert_eq!(
+            conflict_summary(twice).as_deref(),
+            Some("1 conflict (a.py)")
+        );
+        let modify_delete = "CONFLICT (modify/delete): report.py deleted in feature and modified in HEAD.  Version HEAD of report.py left in tree.\nAutomatic merge failed; fix conflicts and then commit the result.";
+        assert_eq!(
+            conflict_summary(modify_delete).as_deref(),
+            Some(
+                "CONFLICT (modify/delete): report.py deleted in feature and modified in HEAD. Version HEAD of report.py left in tree."
+            )
+        );
+        let mixed = format!("{modify_delete}\n{MERGE_CONFLICT_858}");
+        assert_eq!(
+            conflict_summary(&mixed).as_deref(),
+            Some("2 conflicts (pricing.py, \u{2026})")
+        );
+        assert_eq!(conflict_summary("Auto-merging pricing.py"), None);
+        assert_eq!(
+            conflict_summary("error: cannot rebase: You have unstaged changes."),
+            None
+        );
+    }
+
+    /// #858: a failure names the operation ("Merge failed", never the
+    /// "Merged failed" its success prefix made of it); one that stopped on
+    /// conflicts names them after the operation.
+    #[test]
+    fn failure_line_names_the_operation_and_why() {
+        assert_eq!(
+            failure_line("Merge", MERGE_CONFLICT_858),
+            "Merge: 1 conflict (pricing.py)"
+        );
+        assert_eq!(
+            failure_line("Rebase", REBASE_CONFLICT_858),
+            "Rebase: 1 conflict (pricing.py)"
+        );
+        assert_eq!(
+            failure_line(
+                "Rebase",
+                "error: cannot rebase: You have unstaged changes.\nerror: Please commit or stash them."
+            ),
+            "Rebase failed: error: cannot rebase: You have unstaged changes."
+        );
+        assert_eq!(
+            failure_line("Merge", "merge: nosuch - not something we can merge"),
+            "Merge failed: merge: nosuch - not something we can merge"
+        );
+        assert_eq!(
+            failure_line("Merge", "Auto-merging pricing.py"),
+            "Merge failed: Auto-merging pricing.py",
+            "only noise: still says something, and still that the merge failed"
+        );
+    }
     use super::*;
     use tempfile::TempDir;
 
