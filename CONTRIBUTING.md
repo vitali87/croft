@@ -222,6 +222,22 @@ produces a byte-identical binary. Anything that filter is unsure about counts
 as shipped, so an unexpected bump request is the failure it prefers over a
 waived one.
 
+### crates.io publishes every 50 bumps
+
+Every merge is a version, but crates.io does not need one per merge.
+`.github/workflows/publish-crate.yml` runs on each push to `main`, counts the
+versions `main` has carried since the newest one crates.io already lists
+(`scripts/publish_cadence.py`, anchored on the crates.io index rather than a
+counter kept here), and when the count reaches 50 it publishes the head with
+crates.io Trusted Publishing, tags it `v<version>`, and dispatches
+`release.yml` on that tag for the prebuilt archives, the GitHub release and
+the Homebrew formula. To publish the current head ahead of the cadence, run
+the workflow by hand with `force` ticked (`gh workflow run publish-crate.yml
+-f force=true`). Nothing needs a token in the repo: the job exchanges its OIDC
+identity for a short-lived crates.io token, which the crate's Trusted
+Publishing settings on crates.io must allow for this repository, this
+workflow file and the `crates-io` environment.
+
 ### Version numbers count like an odometer
 
 `MINOR` and `PATCH` each stay below 1000, the same rule code-graph-rag's
