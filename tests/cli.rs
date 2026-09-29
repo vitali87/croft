@@ -561,6 +561,79 @@ fn view_from_an_empty_pipe_says_nothing_arrived() {
     );
 }
 
+/// #848 end to end: `croft edit --wait` on a file that does not exist yet
+/// creates it empty, asks the croft to open it, and returns once a probe
+/// says its tab closed. That is what `EDITOR="croft edit --wait"` needs from
+/// a tool that names a file it has not written, and it used to be refused.
+#[test]
+fn edit_wait_creates_a_new_file_opens_it_and_returns_once_it_closes() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let target = tmp.path().join("TODO.md");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    // The open, answered ok, then the wait's first probe, answered closed.
+    let server = std::thread::spawn(move || {
+        let replies: [&[u8]; 2] = [
+            b"{\"status\":\"ok\"}\n",
+            b"{\"status\":\"err\",\"message\":\"closed\"}\n",
+        ];
+        let mut requests = Vec::new();
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            stream.write_all(reply).unwrap();
+            requests.push(line);
+        }
+        requests
+    });
+
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["edit", "--wait", "TODO.md"])
+        .assert()
+        .success();
+
+    let requests = server.join().unwrap();
+    assert!(
+        !requests[0].contains("probe"),
+        "first the open: {requests:?}"
+    );
+    assert!(
+        requests[1].contains("\"probe\":true"),
+        "then the wait's probe: {requests:?}"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"",
+        "the new file was created, empty"
+    );
+}
+
+/// #848: every `croft edit` message said `croft view`. Outside croft it now
+/// names itself, and leaves no empty file behind for a path it cannot open.
+#[test]
+fn edit_outside_croft_names_itself_and_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env_remove("CROFT_VIEW_SOCK")
+        .current_dir(tmp.path())
+        .args(["edit", "new.txt"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft edit needs a croft") && !stderr.contains("croft view"),
+        "stderr must name the command the user typed, was: {stderr}"
+    );
+    assert!(!tmp.path().join("new.txt").exists());
+}
+
 /// #682 end to end: croft over a pty with an image protocol on (iTerm2's,
 /// forced) must not stream images on every keystroke. Before the fix, 20
 /// keystrokes in a file cost about 175 KB of escape output (the minimap and

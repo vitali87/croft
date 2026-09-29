@@ -164,7 +164,7 @@ Below the change list, a **COMMITS** section draws the repo-wide commit graph (V
 
 ## Interactive rebase
 
-`git rebase -i` run in a croft terminal opens its plan (`git-rebase-todo`) as a croft tab, because croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait` in every pane it spawns (a sequence editor you set yourself always wins). In that tab a single key sets the caret commit's action: `p` pick, `r` reword, `e` edit, `s` squash, `f` fixup, `d` drop (with vim mode on, those keys stay vim's). `Alt`+`Up` / `Down` reorder commits. Save and close the tab and git carries on; **Rebase: Abort** in the palette empties the plan, which makes git abort. `croft edit --wait <file>` works for any tool that wants an editor it can wait on.
+`git rebase -i` run in a croft terminal opens its plan (`git-rebase-todo`) as a croft tab, because croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait` in every pane it spawns (a sequence editor you set yourself always wins). In that tab a single key sets the caret commit's action: `p` pick, `r` reword, `e` edit, `s` squash, `f` fixup, `d` drop (with vim mode on, those keys stay vim's). `Alt`+`Up` / `Down` reorder commits. Save and close the tab and git carries on; **Rebase: Abort** in the palette empties the plan, which makes git abort. `croft edit --wait <file>` works for any tool that wants an editor it can wait on, including one that names a file it has not written yet: croft creates it empty and opens it, provided its folder exists.
 
 ## Local history
 

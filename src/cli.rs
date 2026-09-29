@@ -387,9 +387,11 @@ pub enum CliCommand {
     ///
     /// Like `croft view`, plus `--wait`: return only once the tab is
     /// closed. croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait`, so
-    /// `git rebase -i` opens its plan here.
+    /// `git rebase -i` opens its plan here. A file that does not exist yet
+    /// is created empty (its folder must exist), so `EDITOR="croft edit
+    /// --wait"` works for tools that name a new file.
     Edit {
-        /// File to open.
+        /// File to open, created empty if it does not exist yet.
         path: std::ffi::OsString,
         /// Block until the file's tab is closed.
         #[arg(long, default_value_t = false)]
@@ -736,9 +738,12 @@ impl Cli {
                 // set in this repo's CI, where the one-line-of-stderr test
                 // measured 42. Someone running `croft view` at a prompt
                 // should get a sentence about their file, not croft's stack.
-                if let Err(e) =
-                    crate::view_ipc::run(&path, as_ext.as_deref(), &crate::app::croft_cache_dir())
-                {
+                if let Err(e) = crate::view_ipc::run(
+                    crate::view_ipc::Verb::View,
+                    &path,
+                    as_ext.as_deref(),
+                    &crate::app::croft_cache_dir(),
+                ) {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }

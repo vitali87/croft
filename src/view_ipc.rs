@@ -659,9 +659,10 @@ const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// like `croft view`, and with `wait` return only once its tab is closed,
 /// which is what `$GIT_SEQUENCE_EDITOR` and `$EDITOR` callers expect. A
 /// croft that goes away counts as closed: git then carries on with the file
-/// as it was last saved, rather than hanging forever.
+/// as it was last saved, rather than hanging forever. A path that does not
+/// exist yet is created empty first, as any `$EDITOR` would start it (#848).
 pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::Result<()> {
-    run(target, None, cache_dir)?;
+    run(Verb::Edit, target, None, cache_dir)?;
     if !wait {
         return Ok(());
     }
@@ -710,16 +711,80 @@ fn wait_step(reply: std::io::Result<ViewReply>) -> WaitStep {
     }
 }
 
-/// `croft view <path>` / `croft view -`.
+/// Which command the user typed (#848). It names every message [`run`]
+/// prints, so a failed `croft edit` no longer reports itself as `croft
+/// view`, and it decides what a path that does not exist yet means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    /// `croft view`: a missing file is refused, as there is nothing to show.
+    View,
+    /// `croft edit`: a missing file is a new one, created empty.
+    Edit,
+}
+
+impl Verb {
+    /// The subcommand's name, as typed after `croft`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Verb::View => "view",
+            Verb::Edit => "edit",
+        }
+    }
+}
+
+/// The absolute path `target` names, resolved against `cwd` and checked
+/// before any croft is asked to open it. Checked here rather than at the
+/// server so the message names the path the USER typed, resolved against the
+/// cwd they typed it in.
+///
+/// A missing file is refused for `view`. For `edit` it is created empty when
+/// its directory exists, as `vim new.py` or `code --wait new.py` start one,
+/// so `EDITOR="croft edit --wait"` works for tools that name a file they
+/// have not written yet (#848). A missing directory is still an error: an
+/// editor creates a file, not the folders above it.
+fn resolve_target(verb: Verb, cwd: &Path, target: &Path) -> anyhow::Result<PathBuf> {
+    let v = verb.name();
+    let path = resolve(cwd, target);
+    if path.exists() {
+        return Ok(path);
+    }
+    if verb == Verb::View {
+        anyhow::bail!("croft {v}: no such file: {}", path.display());
+    }
+    let dir = path.parent().unwrap_or(cwd);
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "croft {v}: cannot create {}: no such directory {}",
+            path.display(),
+            dir.display()
+        );
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(_) => Ok(path),
+        // Something else created it since the check: open what is there
+        // rather than truncate it.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+        Err(e) => anyhow::bail!("croft {v}: cannot create {}: {e}", path.display()),
+    }
+}
+
+/// `croft view <path>` / `croft view -`, and the opening half of `croft
+/// edit`, with `verb` saying which of the two the user typed.
 pub fn run(
+    verb: Verb,
     target: &std::ffi::OsStr,
     as_hint: Option<&str>,
     cache_dir: &Path,
 ) -> anyhow::Result<()> {
+    let v = verb.name();
     let socket = match std::env::var_os(SOCK_ENV).filter(|s| !s.is_empty()) {
         Some(s) => PathBuf::from(s),
         None => anyhow::bail!(
-            "croft view needs a croft to view in: run it from a pane inside croft ({SOCK_ENV} is unset)"
+            "croft {v} needs a croft to {v} in: run it from a pane inside croft ({SOCK_ENV} is unset)"
         ),
     };
 
@@ -730,7 +795,7 @@ pub fn run(
     // a chosen extension, and a named file already has one.
     if target != "-" && as_hint.is_some() {
         anyhow::bail!(
-            "croft view --as applies only to piped input (`croft view - --as csv`); \
+            "croft {v} --as applies only to piped input (`croft {v} - --as csv`); \
              a named file is routed by its own extension"
         );
     }
@@ -738,23 +803,18 @@ pub fn run(
     let path = if target == "-" {
         let buf = read_capped(std::io::stdin(), MAX_STAGED_STDIN_BYTES)?;
         if buf.is_empty() {
-            anyhow::bail!("croft view -: nothing arrived on stdin");
+            anyhow::bail!("croft {v} -: nothing arrived on stdin");
         }
         stage_stdin(cache_dir, &buf, as_hint)?
     } else {
-        let cwd = std::env::current_dir()?;
-        let path = resolve(&cwd, Path::new(target));
-        // Checked here rather than at the server so the message names the
-        // path the USER typed, resolved against the cwd they typed it in.
-        if !path.exists() {
-            anyhow::bail!("croft view: no such file: {}", path.display());
-        }
-        path
+        // After the socket check, so `croft edit` run outside croft leaves
+        // no empty file behind.
+        resolve_target(verb, &std::env::current_dir()?, Path::new(target))?
     };
 
     match send(&socket, &ViewRequest::new(&path)) {
         Ok(ViewReply::Ok) => Ok(()),
-        Ok(ViewReply::Err { message }) => anyhow::bail!("croft view: {message}"),
+        Ok(ViewReply::Err { message }) => anyhow::bail!("croft {v}: {message}"),
         Err(e)
             if matches!(
                 e.kind(),
@@ -767,11 +827,11 @@ pub fn run(
             // The env var outlives the croft that set it: a dtach session
             // reattached to a new croft, or a pane that survived its parent.
             anyhow::bail!(
-                "croft view: the croft that opened this pane is gone (socket {})",
+                "croft {v}: the croft that opened this pane is gone (socket {})",
                 socket.display()
             )
         }
-        Err(e) => anyhow::bail!("croft view: {e}"),
+        Err(e) => anyhow::bail!("croft {v}: {e}"),
     }
 }
 
@@ -827,6 +887,63 @@ mod tests {
         assert_eq!(
             resolve(Path::new("/home/u"), Path::new("/etc/hosts")),
             PathBuf::from("/etc/hosts")
+        );
+    }
+
+    /// #848: `croft edit TODO.md` on a file not yet on disk was refused, so
+    /// `EDITOR="croft edit --wait"` broke for any tool that names a file it
+    /// has not written, where `vim` or `code --wait` start one.
+    #[test]
+    fn edit_creates_a_missing_file_in_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
+        assert_eq!(path, dir.path().join("TODO.md"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"",
+            "the new file is created empty"
+        );
+
+        // An existing file is opened as it is, never truncated.
+        std::fs::write(&path, "keep me").unwrap();
+        resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
+    /// #848: an editor creates a file, not the folders above it, and the
+    /// refusal names `croft edit`, the command the user typed.
+    #[test]
+    fn edit_refuses_a_missing_directory_and_says_croft_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_target(Verb::Edit, dir.path(), Path::new("no/such/TODO.md"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("croft edit: ") && err.contains("no such directory"),
+            "names the command and the reason: {err}"
+        );
+        assert!(err.contains("TODO.md"), "names the path: {err}");
+        assert!(!dir.path().join("no").exists(), "no folders were created");
+    }
+
+    /// `croft view` keeps refusing a missing file, as there is nothing to
+    /// preview, and creates nothing on the way out (#848).
+    #[test]
+    fn view_still_refuses_a_missing_file_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_target(Verb::View, dir.path(), Path::new("nope.pdf"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("croft view: no such file") && err.contains("nope.pdf"),
+            "{err}"
+        );
+        assert!(!dir.path().join("nope.pdf").exists());
+
+        std::fs::write(dir.path().join("here.pdf"), "x").unwrap();
+        assert_eq!(
+            resolve_target(Verb::View, dir.path(), Path::new("here.pdf")).unwrap(),
+            dir.path().join("here.pdf")
         );
     }
 
