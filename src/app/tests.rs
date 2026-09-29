@@ -65490,7 +65490,7 @@ fn reopening_the_codeql_view_keeps_the_walk_in_flight() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        app.codeql_queries_job = Some(rx);
+        app.codeql_queries_job = Some((app.workspace_root().to_path_buf(), rx));
         app.open_codeql_view();
         let pack = crate::codeql_query::QueryPack {
             name: String::from("acme/in-flight"),
@@ -65521,11 +65521,94 @@ fn a_query_walk_that_dies_stops_saying_it_is_discovering() {
         );
         let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::codeql_query::QueryPack>>();
         drop(tx);
-        app.codeql_queries_job = Some(rx);
+        app.codeql_queries_job = Some((app.workspace_root().to_path_buf(), rx));
         app.codeql.discovering_queries = true;
         assert!(app.drain_codeql_queries());
         assert!(!app.codeql.discovering_queries);
         assert!(app.codeql_queries_job.is_none());
         assert!(app.codeql.queries.is_empty());
+    });
+}
+
+/// A workspace folder holding one CodeQL pack named `name`.
+fn codeql_pack_workspace_840(name: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(
+        pack.join("qlpack.yml"),
+        format!("name: {name}\nextractor: go\n"),
+    )
+    .unwrap();
+    std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+    tmp
+}
+
+/// #840: the walk runs off the UI thread, so the workspace can move to
+/// another root before it lands. Its packs are the old root's: they must
+/// not be listed for the new one, and the view walks the new root.
+#[test]
+fn a_query_walk_of_a_root_the_workspace_left_never_lands() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let a = codeql_pack_workspace_840("acme/a");
+        let b = codeql_pack_workspace_840("acme/b");
+        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        assert!(
+            app.codeql_queries_job.is_some(),
+            "fixture: a's walk in flight"
+        );
+        app.change_workspace_root(b.path().to_path_buf());
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            !names.contains(&"acme/a"),
+            "a's queries landed on b: {names:?}"
+        );
+        app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/b"]);
+    });
+}
+
+/// #840: reopening the view after a workspace switch, with the old root's
+/// walk still in flight, walks the new root instead of waiting on the old.
+#[test]
+fn reopening_codeql_after_a_workspace_switch_walks_the_new_root() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let a = codeql_pack_workspace_840("acme/a");
+        let b = codeql_pack_workspace_840("acme/b");
+        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.change_workspace_root(b.path().to_path_buf());
+        // Undrained, a's walk is still in flight here, landed or not.
+        app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/b"]);
+    });
+}
+
+/// #840 negative: a walk of the root the workspace still has lands as
+/// before, and one the test holds for that root keeps its place when the
+/// view is reopened (no second walk of the same tree).
+#[test]
+fn a_query_walk_of_the_current_root_still_lands() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let a = codeql_pack_workspace_840("acme/a");
+        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/a"]);
+        assert!(!app.codeql.discovering_queries);
     });
 }
