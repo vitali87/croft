@@ -55185,6 +55185,98 @@ fn a_failed_discovery_opens_the_test_runner_output_on_click_or_o() {
     assert_eq!(app.output.selected_name().as_deref(), Some(CHANNEL_TESTS));
 }
 
+/// #856: "Running test …" stayed in the status bar long after the run it
+/// announced had finished, because only the Testing tree heard the end.
+/// End to end against a stand-in test runner (a `codeql` script), the
+/// outcome now replaces it: a pass, a failure, and a run that errored
+/// before reporting any test. A message something else put there while
+/// the run was going is left alone.
+#[cfg(unix)]
+#[test]
+fn a_finished_test_run_replaces_its_running_status_with_the_outcome() {
+    use crate::testing::model::{TestCase, TestStatus};
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("test/Find")).unwrap();
+    std::fs::write(root.join("test/qlpack.yml"), "name: acme/tests\ntests: .\n").unwrap();
+    std::fs::write(root.join("test/Find/Find.qlref"), "Find.ql\n").unwrap();
+    std::fs::write(root.join("test/Find/Find.expected"), "").unwrap();
+    // The stand-in prints `out` and exits with `code`. Each run rewrites
+    // those two, never the program, which may still be starting up.
+    let bin = tempfile::tempdir().unwrap();
+    let (out, code) = (bin.path().join("out"), bin.path().join("code"));
+    let program = bin.path().join("codeql");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\ncat '{}'\nexit \"$(cat '{}')\"\n",
+            out.display(),
+            code.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.set_codeql_program(program);
+    app.testing.apply_case(TestCase {
+        name: "test/Find::Find.qlref".into(),
+        status: TestStatus::NotRun,
+    });
+    let root_s = root.display().to_string();
+    let start = |app: &mut App, stdout: &str, exit: i32| {
+        std::fs::write(&out, stdout.replace("@ROOT@", &root_s)).unwrap();
+        std::fs::write(&code, exit.to_string()).unwrap();
+        app.run_named_test(String::from("Find.qlref"));
+        assert_eq!(app.status, "Running test test/Find::Find.qlref");
+    };
+    let finish = |app: &mut App| {
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the stand-in test run to finish",
+            || {
+                let _ = app.test_worker.drain(&mut app.testing);
+                app.tick_test_watch();
+                !app.testing.is_busy()
+            },
+        );
+    };
+    let pass = "[1/1 comp 1s eval 9ms] PASSED @ROOT@/test/Find/Find.qlref\n";
+
+    start(&mut app, pass, 0);
+    finish(&mut app);
+    assert!(
+        app.status.starts_with("Find.qlref passed ("),
+        "{}",
+        app.status
+    );
+
+    start(
+        &mut app,
+        "[1/1 comp 1s eval 9ms] FAILED(RESULT) @ROOT@/test/Find/Find.qlref\n\
+         --- expected\n+++ actual\n+| 1 |\n",
+        1,
+    );
+    finish(&mut app);
+    assert!(
+        app.status.starts_with("Find.qlref failed ("),
+        "{}",
+        app.status
+    );
+
+    start(&mut app, "A fatal error occurred: no pack here\n", 2);
+    finish(&mut app);
+    assert_eq!(app.status, "Run failed — see OUTPUT › Test Runner");
+
+    start(&mut app, pass, 0);
+    app.status = String::from("Saved Find.ql");
+    finish(&mut app);
+    assert_eq!(
+        app.status, "Saved Find.ql",
+        "a newer message is not clobbered"
+    );
+}
+
 /// A workspace with one source file and a SARIF log pointing into it.
 fn sarif_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();

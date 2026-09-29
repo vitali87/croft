@@ -86,6 +86,10 @@ pub struct TestingPanel {
     /// The summary's "see OUTPUT › Test Runner" pointer, as last drawn:
     /// clicking it opens the runner's output. Empty when not shown.
     pub last_output_hint: Rect,
+    /// What the run in flight (or the last one) reported: passed, failed,
+    /// skipped. Reset when a run starts, so it describes that run alone,
+    /// never the older results still in the tree (#856).
+    run_tally: (usize, usize, usize),
     /// The last coverage run's report (#263).
     pub coverage: Option<crate::testing::coverage::Coverage>,
     coverage_error: Option<crate::testing::worker::CoverageError>,
@@ -135,6 +139,7 @@ impl TestingPanel {
             failed_run: false,
             discovery_failed: false,
             last_output_hint: Rect::default(),
+            run_tally: (0, 0, 0),
             coverage: None,
             coverage_error: None,
             coverage_fresh: false,
@@ -169,6 +174,7 @@ impl TestingPanel {
         self.run_reported_failed = false;
         self.failed_run = false;
         self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
         self.progress = None;
         self.scroll = 0;
     }
@@ -184,6 +190,7 @@ impl TestingPanel {
         self.run_reported_failed = false;
         self.failed_run = false;
         self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
         self.progress = None;
         // The refusal latch and rollback snapshot belong to the old
         // workspace; carrying either across a re-root would surface a stale
@@ -210,6 +217,7 @@ impl TestingPanel {
         self.run_reported_failed = false;
         self.failed_run = false;
         self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
         // Snapshot the pre-run status (None = about to be inserted) so a
         // worker refusal can put the tree back exactly.
         let old = self.cases.iter().find(|c| c.name == name).map(|c| c.status);
@@ -230,6 +238,7 @@ impl TestingPanel {
         self.run_reported_failed = false;
         self.failed_run = false;
         self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
         // Snapshot each selected case's pre-run status for a refusal rollback.
         self.prerun = Vec::new();
         for c in &mut self.cases {
@@ -245,6 +254,13 @@ impl TestingPanel {
     pub fn apply_case(&mut self, case: TestCase) {
         if case.status == TestStatus::Failed {
             self.run_reported_failed = true;
+        }
+        let (passed, failed, skipped) = &mut self.run_tally;
+        match case.status {
+            TestStatus::Passed => *passed += 1,
+            TestStatus::Failed => *failed += 1,
+            TestStatus::Skipped => *skipped += 1,
+            TestStatus::NotRun | TestStatus::Running => {}
         }
         match self.cases.binary_search_by(|c| c.name.cmp(&case.name)) {
             Ok(i) => {
@@ -360,6 +376,34 @@ impl TestingPanel {
         self.activity == Activity::Idle
             && (self.discovery_failed
                 || (self.last_run_ok == Some(false) && !self.run_reported_failed))
+    }
+
+    /// How the run that just ended went, as one status-bar line (#856):
+    /// `label` names what ran, `ok` is the runner's exit success and `secs`
+    /// how long the run took. One result reads `label passed (0.4 s)`,
+    /// several `label: 1 failed, 2 passed (1.3 s)`. A run that failed with
+    /// no failing test to show points at the runner's output instead.
+    pub fn run_outcome(&self, label: &str, ok: bool, secs: f64) -> String {
+        let (passed, failed, skipped) = self.run_tally;
+        if !ok && failed == 0 {
+            return String::from("Run failed — see OUTPUT › Test Runner");
+        }
+        let took = format!("({secs:.1} s)");
+        match (passed, failed, skipped) {
+            (0, 0, 0) => format!("{label}: no test ran {took}"),
+            (1, 0, 0) => format!("{label} passed {took}"),
+            (0, 1, 0) => format!("{label} failed {took}"),
+            (0, 0, 1) => format!("{label} skipped {took}"),
+            _ => {
+                let counts: Vec<String> =
+                    [(failed, "failed"), (passed, "passed"), (skipped, "skipped")]
+                        .iter()
+                        .filter(|(n, _)| *n > 0)
+                        .map(|(n, what)| format!("{n} {what}"))
+                        .collect();
+                format!("{label}: {} {took}", counts.join(", "))
+            }
+        }
     }
 
     /// A coverage run's report arrived (#263): keep it for the explorer
@@ -1470,5 +1514,62 @@ mod tests {
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
         assert_eq!(p.last_output_hint, Rect::default());
+    }
+
+    /// #856: the status-bar line a finished run leaves is built from what
+    /// that run alone reported, never from older results still in the tree.
+    #[test]
+    fn the_run_outcome_counts_only_what_this_run_reported() {
+        let case = |name: &str, status| TestCase {
+            name: name.into(),
+            status,
+        };
+        let mut p = TestingPanel::new();
+        p.apply_case(case("m::old", TestStatus::Failed));
+        p.apply_case(case("m::skip", TestStatus::NotRun));
+
+        p.start_single("m::a");
+        p.apply_case(case("m::a", TestStatus::Passed));
+        p.on_finished(Some(true));
+        assert_eq!(p.run_outcome("a", true, 0.42), "a passed (0.4 s)");
+
+        p.start_single("m::old");
+        p.apply_case(case("m::old", TestStatus::Failed));
+        p.on_finished(Some(false));
+        assert_eq!(p.run_outcome("old", false, 2.0), "old failed (2.0 s)");
+
+        p.start_single("m::skip");
+        p.apply_case(case("m::skip", TestStatus::Skipped));
+        p.on_finished(Some(true));
+        assert_eq!(p.run_outcome("skip", true, 0.1), "skip skipped (0.1 s)");
+
+        p.start_filter("m::");
+        for (name, status) in [
+            ("m::a", TestStatus::Failed),
+            ("m::old", TestStatus::Passed),
+            ("m::skip", TestStatus::Passed),
+        ] {
+            p.apply_case(case(name, status));
+        }
+        p.on_finished(Some(false));
+        assert_eq!(
+            p.run_outcome("suite m", false, 1.26),
+            "suite m: 1 failed, 2 passed (1.3 s)"
+        );
+
+        // A run that died before reporting anything (a build failure).
+        p.start_single("m::a");
+        p.on_finished(Some(false));
+        assert_eq!(
+            p.run_outcome("a", false, 9.0),
+            "Run failed — see OUTPUT › Test Runner"
+        );
+        // One that matched nothing, and said so by exiting 0.
+        p.start_single("m::gone");
+        p.on_finished(Some(true));
+        assert_eq!(
+            p.run_outcome("gone", true, 0.1),
+            "gone: no test ran (0.1 s)"
+        );
     }
 }

@@ -2719,6 +2719,17 @@ type PendingTestDebug = (
     PathBuf,
 );
 
+/// A run that put "Running test …" in the status bar (#856), kept until it
+/// ends so the status can say how it went instead of claiming it still runs.
+struct TestRunStatus {
+    /// The status text the run set; replaced only while the bar still
+    /// shows it, so a newer message is never clobbered.
+    shown: String,
+    /// What ran, as the outcome names it: the test's own name, or `suite X`.
+    label: String,
+    started: std::time::Instant,
+}
+
 /// A COMMITS graph reply: the root and revspec it answers, and the rows.
 /// Tagged rather than bare so a reply for a since-left root or a superseded
 /// view is discarded on drain (#348).
@@ -2765,6 +2776,8 @@ pub struct App {
     pub codeql: crate::widgets::codeql::CodeqlPanel,
     /// Background `cargo test` worker feeding the Testing panel.
     test_worker: crate::testing::worker::TestWorker,
+    /// The run whose "Running test …" status awaits its outcome (#856).
+    test_run_status: Option<TestRunStatus>,
     /// The Extensions side panel: bundled + installed extensions with toggles.
     pub extensions: crate::widgets::extensions::ExtensionsPanel,
     /// Extension ids VS Code reported installed, from the last
@@ -5358,6 +5371,7 @@ impl App {
             testing: crate::widgets::testing::TestingPanel::new(),
             codeql: crate::widgets::codeql::CodeqlPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
+            test_run_status: None,
             extensions,
             vscode_listed: Vec::new(),
             disabled_extensions,
@@ -22852,8 +22866,11 @@ impl App {
     /// line adds which test and how to get to it.
     fn tick_test_watch(&mut self) -> bool {
         use crate::testing::watch::{WatchNotice, WatchScope};
-        let mut changed = false;
-        if let Some(ok) = self.testing.take_finished()
+        // The one reader of the run-ended latch also settles a run's
+        // "Running test …" status (#856).
+        let finished = self.testing.take_finished();
+        let mut changed = self.announce_test_run_end(finished);
+        if let Some(ok) = finished
             && self.testing.watch.finished(ok) == WatchNotice::NewlyRed
         {
             self.status = match self.testing.first_failed() {
@@ -23066,6 +23083,42 @@ impl App {
         }
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run}");
+        self.await_test_run_outcome(crate::testing::leaf_name(&run).to_string());
+    }
+
+    /// Keep the "Running test …" status just set until its run ends, when
+    /// [`Self::announce_test_run_end`] replaces it with the outcome (#856).
+    fn await_test_run_outcome(&mut self, label: String) {
+        self.test_run_status = Some(TestRunStatus {
+            shown: self.status.clone(),
+            label,
+            started: std::time::Instant::now(),
+        });
+    }
+
+    /// Once the run that set a "Running test …" status is over, say how it
+    /// went there (#856): the panel's tree updates, but nothing else touched
+    /// the status bar, which went on claiming a run long finished. Only
+    /// while the bar still shows what the run set, so a newer message is
+    /// never clobbered. A run that ended with no verdict (refused, the root
+    /// changed, the coverage tool missing) just lets go. `finished` is the
+    /// panel's run-ended latch, which the caller has consumed.
+    fn announce_test_run_end(&mut self, finished: Option<Option<bool>>) -> bool {
+        if self.testing.is_busy() {
+            return false;
+        }
+        let Some(run) = self.test_run_status.take() else {
+            return false;
+        };
+        let Some(Some(ok)) = finished else {
+            return false;
+        };
+        if self.status != run.shown {
+            return false;
+        }
+        let secs = run.started.elapsed().as_secs_f64();
+        self.status = self.testing.run_outcome(&run.label, ok, secs);
+        true
     }
 
     /// Testing: Run Test at Cursor with Coverage (#263): the caret's test
@@ -23100,6 +23153,7 @@ impl App {
             });
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run} with coverage");
+        self.await_test_run_outcome(crate::testing::leaf_name(&run).to_string());
     }
 
     /// A Testing-tree row's coverage glyph (#263): that test, or that whole
@@ -23126,6 +23180,12 @@ impl App {
         } else {
             format!("Running test {name} with coverage")
         };
+        let label = if suite {
+            format!("suite {name}")
+        } else {
+            crate::testing::leaf_name(&name).to_string()
+        };
+        self.await_test_run_outcome(label);
     }
 
     /// Debug the test the editor caret sits in (Cmd+K Shift+Enter, palette).
