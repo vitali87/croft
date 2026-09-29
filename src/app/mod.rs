@@ -3225,6 +3225,9 @@ pub struct App {
     /// it went (a folder's summary file or a gist's URL), how many
     /// repositories it holds, and those whose results failed.
     codeql_variant_export: Option<std::sync::mpsc::Receiver<Result<VariantExport, String>>>,
+    /// The walk for the workspace's queries in flight (#840): opening the
+    /// CodeQL view starts it off the UI thread and the packs land here.
+    codeql_queries_job: Option<std::sync::mpsc::Receiver<Vec<crate::codeql_query::QueryPack>>>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5557,6 +5560,7 @@ impl App {
             codeql_variant_polled: None,
             codeql_variant_results: None,
             codeql_variant_export: None,
+            codeql_queries_job: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -23334,6 +23338,9 @@ impl App {
 
     /// Reveal the CodeQL view (#578): the QL icon and the palette. Refused,
     /// with the reason, while the built-in CodeQL extension is disabled.
+    /// The saved lists it shows are small files read here; the workspace's
+    /// queries take a walk of the tree, which runs off the UI thread so the
+    /// view opens at once (#840).
     fn open_codeql_view(&mut self) {
         if !self.is_extension_enabled("codeql") {
             self.status = String::from(
@@ -23344,7 +23351,7 @@ impl App {
         self.show_tree = true;
         self.refresh_codeql_databases();
         self.refresh_codeql_history();
-        self.refresh_codeql_queries();
+        self.discover_codeql_queries();
         self.refresh_codeql_variant();
         self.set_sidebar_view(SidebarView::CodeQL);
     }
@@ -25740,10 +25747,51 @@ impl App {
         }
     }
 
-    /// Find the workspace's queries for the side bar's Queries section.
-    /// Called when the view opens, not every frame: it walks the tree.
+    /// Find the workspace's queries for the side bar's Queries section now,
+    /// for a caller that needs the list at once (a query just created, Run
+    /// All Queries). It walks the tree, so opening the view does this off
+    /// the UI thread instead. A walk still in flight is dropped: it may
+    /// predate what this one finds.
     fn refresh_codeql_queries(&mut self) {
+        self.codeql_queries_job = None;
+        self.codeql.discovering_queries = false;
         self.codeql.queries = crate::codeql_query::discover(self.workspace_root());
+    }
+
+    /// Find the workspace's queries on a worker thread (#840): the walk can
+    /// take seconds on a large tree, and switching to the CodeQL view must
+    /// not wait for it. [`Self::drain_codeql_queries`] lists what it finds;
+    /// until then the section keeps its last list, or says it is looking.
+    /// A walk already in flight is left to finish rather than doubled.
+    fn discover_codeql_queries(&mut self) {
+        if self.codeql_queries_job.is_some() {
+            return;
+        }
+        let root = self.workspace_root().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::codeql_query::discover(&root));
+        });
+        self.codeql_queries_job = Some(rx);
+        self.codeql.discovering_queries = true;
+    }
+
+    /// List the queries a discovery found, once it lands (#840). True when
+    /// the side bar changed.
+    pub fn drain_codeql_queries(&mut self) -> bool {
+        let Some(rx) = self.codeql_queries_job.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(queries) => self.codeql.set_queries(queries),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            // The walk died: stop saying it is looking.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.codeql.discovering_queries = false;
+            }
+        }
+        self.codeql_queries_job = None;
+        true
     }
 
     /// Ask for the name of a new query (#578, VS Code's "CodeQL: Create
@@ -67026,7 +67074,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_variant_submit()
             | app.poll_codeql_variant_runs()
             | app.drain_codeql_variant_results()
-            | app.drain_codeql_variant_export();
+            | app.drain_codeql_variant_export()
+            | app.drain_codeql_queries();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
