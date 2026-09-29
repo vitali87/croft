@@ -691,11 +691,16 @@ impl CodeqlPanel {
         out
     }
 
-    /// Whether `s` has nothing to list yet.
+    /// Whether `s` has nothing to list yet. Queries being discovered have
+    /// their "Discovering queries…" line (#840), so the section is not folded
+    /// away under a "none yet" it may not be.
     fn is_empty(&self, s: Section) -> bool {
         let v = &self.variant;
         match s {
-            Section::Queries => !self.queries.iter().any(|p| self.pack_matches_language(p)),
+            Section::Queries => {
+                !self.discovering_queries
+                    && !self.queries.iter().any(|p| self.pack_matches_language(p))
+            }
             Section::QueryHistory => self.history.is_empty(),
             Section::VariantAnalysis => {
                 !self.variant_error
