@@ -22516,8 +22516,9 @@ impl App {
         }
     }
 
-    /// Testing view keys: Enter runs all tests, `r` re-discovers, arrows scroll
-    /// the tree, Esc returns to the Explorer (mirrors the Run-and-Debug view).
+    /// Testing view keys: Enter runs all tests, `r` re-discovers, `o` shows the
+    /// runner's output, arrows scroll the tree, Esc returns to the Explorer
+    /// (mirrors the Run-and-Debug view).
     fn handle_testing_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
@@ -22526,10 +22527,25 @@ impl App {
             KeyCode::Char('w' | 'W') => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
             }
+            KeyCode::Char('o' | 'O') => self.show_test_runner_output(),
             KeyCode::Up => self.testing.scroll_up(1),
             KeyCode::Down => self.testing.scroll_down(1),
             _ => {}
         }
+    }
+
+    /// Open the bottom panel on OUTPUT with the Test Runner channel selected
+    /// (#845): where a failed discovery's or run's reason (the traceback,
+    /// the compile error) actually is. `o` in the Testing view, or a click
+    /// on its "see OUTPUT › Test Runner" pointer.
+    fn show_test_runner_output(&mut self) {
+        // The panel mirrors the bus's channels only when it syncs, and the
+        // runner may have written its first line since the last frame.
+        self.output.sync();
+        if !self.output.select_by_name(crate::output::CHANNEL_TESTS) {
+            self.status = String::from("The test runner has not written any output yet");
+        }
+        self.set_bottom_panel_tab(BottomPanelTab::Output);
     }
 
     /// Whether an enabled runner extension claims this workspace. When none
@@ -52381,6 +52397,8 @@ impl App {
                         self.toggle_test_watch(crate::testing::watch::WatchScope::All);
                     } else if rect_contains(self.testing.last_cover_all, m.column, m.row) {
                         self.run_all_tests_with_coverage();
+                    } else if rect_contains(self.testing.last_output_hint, m.column, m.row) {
+                        self.show_test_runner_output();
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
                             Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {

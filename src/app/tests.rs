@@ -55146,6 +55146,45 @@ fn watching_a_test_reruns_it_after_a_save_and_reports_it_turning_red() {
     );
 }
 
+/// #845: a discovery that failed without listing anything showed an empty
+/// tree and no reason; the reason was in OUTPUT, unannounced. The Testing
+/// view now points there, and both a click on the pointer and `o` open the
+/// bottom panel on OUTPUT with the Test Runner channel selected, whichever
+/// channel it was showing.
+#[test]
+fn a_failed_discovery_opens_the_test_runner_output_on_click_or_o() {
+    use crate::output::{CHANNEL_TESTS, OutputLevel};
+    crate::output::push(
+        CHANNEL_TESTS,
+        OutputLevel::Info,
+        "E   ModuleNotFoundError: No module named 'groceries'",
+    );
+    let other = "app-test-runner-output-other";
+    crate::output::push(other, OutputLevel::Info, "unrelated");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Testing);
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Discovering);
+    app.testing.on_finished(Some(false));
+    draw(&mut app, 100, 30);
+    let hint = app.testing.last_output_hint;
+    assert!(hint.width > 0, "the failed discovery points at its output");
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Terminal);
+    left_click(&mut app, hint.x, hint.y);
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    assert_eq!(app.output.selected_name().as_deref(), Some(CHANNEL_TESTS));
+
+    app.output.sync();
+    assert!(app.output.select_by_name(other));
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    app.focus_pane(Pane::Tree);
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    assert_eq!(app.output.selected_name().as_deref(), Some(CHANNEL_TESTS));
+}
+
 /// A workspace with one source file and a SARIF log pointing into it.
 fn sarif_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();

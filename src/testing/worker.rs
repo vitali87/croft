@@ -71,7 +71,10 @@ pub enum TestResponse {
     /// live progress while the test binary compiles, so a multi-minute
     /// discovery doesn't look frozen behind a static "Discovering tests".
     Progress(String),
-    /// `ok` is the runner's exit success for a run, `None` for discovery.
+    /// `ok` is the runner's exit success, for a discovery as for a run: a
+    /// listing that errors (a collection error, a build failure) is a failed
+    /// discovery, not an empty project (#845). `None` when nothing ran (a
+    /// coverage run refused for want of its tool).
     Finished {
         ok: Option<bool>,
     },
@@ -296,21 +299,39 @@ fn cargo_cmd(root: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-/// Absolute path to the `pytest` binary for a workspace. The project's own
-/// `.venv` wins (uv and venv projects put it there, with the project's deps
-/// importable); then `PATH`, then the usual user/tool install dirs — resolved
-/// absolutely like [`cargo_cmd`] because a GUI-launched croft inherits the
-/// stripped launchd PATH.
-fn pytest_binary(root: &Path) -> PathBuf {
-    let venv = root.join(".venv").join("bin").join("pytest");
-    if venv.is_file() {
-        return venv;
+/// How to launch pytest for a workspace: a program, and the arguments that
+/// come before pytest's own. A project venv (`.venv/`, then `venv/`) with
+/// pytest installed wins, run as `<venv>/bin/python -m pytest` the way VS
+/// Code runs it: `-m` puts the root on `sys.path`, so tests import the
+/// project's own top-level modules, which the `pytest` script alone does
+/// not (#845). Without one, the `pytest` script as before; with no script
+/// anywhere, `python3 -m pytest`, which at least fails with a reason
+/// instead of a spawn error.
+fn pytest_launch(root: &Path) -> (PathBuf, &'static [&'static str]) {
+    const MODULE: &[&str] = &["-m", "pytest"];
+    for venv in [".venv", "venv"] {
+        let bin = root.join(venv).join("bin");
+        let python = bin.join("python");
+        if python.is_file() && bin.join("pytest").is_file() {
+            return (python, MODULE);
+        }
     }
+    match pytest_script() {
+        Some(script) => (script, &[]),
+        None => (PathBuf::from("python3"), MODULE),
+    }
+}
+
+/// Absolute path to a `pytest` script outside any project venv: `PATH`,
+/// then the usual user/tool install dirs — resolved absolutely like
+/// [`cargo_cmd`] because a GUI-launched croft inherits the stripped
+/// launchd PATH.
+fn pytest_script() -> Option<PathBuf> {
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join("pytest");
             if candidate.is_file() {
-                return candidate;
+                return Some(candidate);
             }
         }
     }
@@ -320,23 +341,26 @@ fn pytest_binary(root: &Path) -> PathBuf {
             .join("bin")
             .join("pytest");
         if candidate.is_file() {
-            return candidate;
+            return Some(candidate);
         }
     }
     for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
         let candidate = PathBuf::from(dir).join("pytest");
         if candidate.is_file() {
-            return candidate;
+            return Some(candidate);
         }
     }
-    // Last resort: let the OS resolve it and fail honestly into the empty state.
-    PathBuf::from("pytest")
+    None
 }
 
-/// `pytest <args>` rooted at the workspace, with piped stdio.
+/// `pytest <args>` rooted at the workspace, launched as [`pytest_launch`]
+/// says, with piped stdio. Discovery, runs and coverage all come through
+/// here, so they always agree on the interpreter.
 fn pytest_cmd(root: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new(pytest_binary(root));
-    cmd.args(args)
+    let (program, lead) = pytest_launch(root);
+    let mut cmd = Command::new(program);
+    cmd.args(lead)
+        .args(args)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -788,10 +812,23 @@ fn run_streaming(
 /// own text in events.
 fn run_streaming_shown(
     tx: &EpochTx,
-    mut cmd: Command,
+    cmd: Command,
     show: impl Fn(&str) -> Option<String>,
     parse: impl Fn(&str) -> Vec<TestCase>,
 ) -> Option<bool> {
+    run_streaming_exit(tx, cmd, show, parse).map(|code| code == Some(0))
+}
+
+/// [`run_streaming_shown`], answering the child's exit code rather than
+/// its success, for a caller that reads a nonzero code as something other
+/// than failure. `Some(None)` when it died to a signal or could not be
+/// waited on, `None` if it never spawned.
+fn run_streaming_exit(
+    tx: &EpochTx,
+    mut cmd: Command,
+    show: impl Fn(&str) -> Option<String>,
+    parse: impl Fn(&str) -> Vec<TestCase>,
+) -> Option<Option<i32>> {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -827,7 +864,7 @@ fn run_streaming_shown(
     if let Some(h) = stderr_handle {
         let _ = h.join();
     }
-    Some(child.wait().map(|s| s.success()).unwrap_or(false))
+    Some(child.wait().ok().and_then(|s| s.code()))
 }
 
 /// The cargo build-status verbs printed to stderr (whitespace-indented on a
@@ -1253,7 +1290,10 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
 
 /// List tests without running them (`cargo test -- --list`, or pytest's
 /// `--collect-only -q`), streaming each as a `NotRun` case. The cargo path
-/// still compiles the test binary, hence the Discovering state.
+/// still compiles the test binary, hence the Discovering state. The lister's
+/// exit status goes back with `Finished`, so a listing that errors (pytest's
+/// exit 2 on a collection error, a build failure) reads as a failed
+/// discovery rather than a project with no tests (#845).
 fn discover(root: &Path, tx: &EpochTx) {
     // See run_all: refuse before `Started` so the panel keeps its tree.
     let Some(runner) = runner_for(root) else {
@@ -1265,15 +1305,19 @@ fn discover(root: &Path, tx: &EpochTx) {
         name,
         status: TestStatus::NotRun,
     };
-    match runner {
+    let ok = match runner {
         Runner::Pytest => {
             let cmd = pytest_cmd(root, &["--collect-only", "-q", "--color=no"]);
-            run_streaming(tx, cmd, |line| {
+            let show = |line: &str| Some(line.to_string());
+            run_streaming_exit(tx, cmd, show, |line| {
                 parse_pytest_collect_line(line)
                     .map(not_run)
                     .into_iter()
                     .collect()
-            });
+            })
+            // Exit 5 is pytest's "no tests were collected": a project with
+            // no tests yet, which lists fine.
+            .map(|code| matches!(code, Some(0 | 5)))
         }
         Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &["list"]);
@@ -1282,7 +1326,7 @@ fn discover(root: &Path, tx: &EpochTx) {
                     .map(not_run)
                     .into_iter()
                     .collect()
-            });
+            })
         }
         // jest can only cheaply list FILES (`--listTests`, absolute paths);
         // per-test names come from the first run's `--json` document.
@@ -1296,13 +1340,13 @@ fn discover(root: &Path, tx: &EpochTx) {
                     Ok(r) if !r.is_empty() => vec![not_run(r)],
                     _ => Vec::new(),
                 }
-            });
+            })
         }
         Runner::Cargo => {
             let cmd = cargo_cmd(root, &["test", "--color=never", "--", "--list"]);
             run_streaming(tx, cmd, |line| {
                 parse_list_line(line).map(not_run).into_iter().collect()
-            });
+            })
         }
         // `go test -list` compiles each package's tests but runs none.
         Runner::Go => {
@@ -1313,17 +1357,20 @@ fn discover(root: &Path, tx: &EpochTx) {
                     .map(not_run)
                     .into_iter()
                     .collect()
-            });
+            })
         }
-        // Tests are files; listing them needs no CLI.
+        // Tests are files; listing them needs no CLI, and cannot fail.
         Runner::Codeql => {
             let packs = super::codeqltest::test_packs(root, &codeql_markers());
             for id in super::codeqltest::discover(root, &packs) {
                 tx.send(TestResponse::Case(not_run(id)));
             }
+            Some(true)
         }
     }
-    tx.send(TestResponse::Finished { ok: None });
+    // A lister that never spawned (pytest not installed) failed too.
+    .unwrap_or(false);
+    tx.send(TestResponse::Finished { ok: Some(ok) });
 }
 
 #[cfg(test)]
@@ -1449,7 +1496,7 @@ mod tests {
                 (String::from("test/Find::Find.qlref"), TestStatus::NotRun),
             ]
         );
-        assert_eq!(finished, Some(None));
+        assert_eq!(finished, Some(Some(true)), "listing files cannot fail");
         assert_eq!(log(), "", "discovery never shells the CLI");
 
         run_all(root, &etx);
@@ -2039,5 +2086,117 @@ mod tests {
         assert!(!coverage_tool_present(Runner::Vitest, &pkg));
         std::fs::create_dir_all(tmp.path().join("node_modules/@vitest/coverage-v8")).unwrap();
         assert!(coverage_tool_present(Runner::Vitest, &pkg));
+    }
+
+    /// A stand-in project venv under `root/venv`: `bin/pytest` marks pytest
+    /// installed, and `bin/python` is a script that saves its arguments
+    /// beside itself (`bin/python.args`) and then runs `body`.
+    #[cfg(unix)]
+    fn fake_venv(root: &Path, venv: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join(venv).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let python = format!("echo \"$*\" > \"$0.args\"\n{body}");
+        for (name, text) in [("python", python.as_str()), ("pytest", "exit 0")] {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{text}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// #845: `pytest --collect-only` exits 2 on a collection error, having
+    /// listed nothing. Discovery used to drop that status and finish exactly
+    /// as an empty project does, so the view offered a run that would fail
+    /// the same way. The status now goes back with `Finished`, a listing
+    /// that works included.
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_that_errors_is_a_failed_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"g\"\n").unwrap();
+        assert_eq!(runner_for(root), Some(Runner::Pytest));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+        };
+        let discovered = || {
+            discover(root, &etx);
+            let mut cases = Vec::new();
+            let mut finished = None;
+            for (_, r) in rx.try_iter() {
+                match r {
+                    TestResponse::Case(c) => cases.push(c.name),
+                    TestResponse::Finished { ok } => finished = Some(ok),
+                    _ => {}
+                }
+            }
+            (cases, finished)
+        };
+
+        fake_venv(root, ".venv", "echo tests/test_g.py::test_total\nexit 0");
+        assert_eq!(
+            discovered(),
+            (
+                vec![String::from("tests/test_g.py::test_total")],
+                Some(Some(true))
+            )
+        );
+        fake_venv(
+            root,
+            ".venv",
+            "echo \"E   ModuleNotFoundError: No module named 'groceries'\" >&2\nexit 2",
+        );
+        assert_eq!(
+            discovered(),
+            (Vec::new(), Some(Some(false))),
+            "a collection error is a failed discovery, not an empty project"
+        );
+        // pytest's exit 5 ("no tests were collected") is an empty project.
+        fake_venv(root, ".venv", "echo 'no tests ran in 0.01s'\nexit 5");
+        assert_eq!(discovered(), (Vec::new(), Some(Some(true))));
+    }
+
+    /// #845: a project venv with pytest in it runs pytest as a module of the
+    /// venv's own python, which puts the project root on `sys.path` (the
+    /// bare `pytest` script does not, and a flat project's tests then fail
+    /// to import its modules). Discovery and runs launch it the same way.
+    #[cfg(unix)]
+    #[test]
+    fn pytest_runs_as_a_module_of_the_project_venvs_python() {
+        for venv in [".venv", "venv"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            fake_venv(root, venv, "exit 0");
+            let python = root.join(venv).join("bin").join("python");
+            assert_eq!(
+                pytest_launch(root),
+                (python.clone(), &["-m", "pytest"][..]),
+                "{venv}"
+            );
+            let args = |cmd: Command| {
+                cmd.get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            };
+            let collect = pytest_cmd(root, &["--collect-only", "-q", "--color=no"]);
+            assert_eq!(collect.get_program(), python.as_os_str());
+            assert_eq!(
+                args(collect),
+                ["-m", "pytest", "--collect-only", "-q", "--color=no"]
+            );
+            assert_eq!(
+                args(pytest_cmd(root, &["-v", "--color=no", "t.py::a"])),
+                ["-m", "pytest", "-v", "--color=no", "t.py::a"]
+            );
+        }
+        // A venv without pytest in it is not where pytest lives.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("python"), "").unwrap();
+        assert_ne!(pytest_launch(tmp.path()).0, bin.join("python"));
     }
 }
