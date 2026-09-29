@@ -31798,6 +31798,7 @@ impl App {
         self.log_git(label, &outcome);
         match outcome {
             Ok(summary) => {
+                let summary = crate::git::headline(&summary);
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     ok_prefix.to_string()
                 } else {
@@ -35582,8 +35583,10 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        let commit_summary = match crate::git::commit_all_tracked(&self.scm_root(), &message) {
-            Ok(s) => s,
+        let commit = crate::git::commit_all_tracked(&self.scm_root(), &message);
+        self.log_git("commit -am", &commit);
+        let commit_summary = match commit {
+            Ok(s) => crate::git::headline(&s).to_string(),
             Err(err) => {
                 self.source_control.commit_feedback = Some(err.clone());
                 self.source_control.commit_feedback_is_error = true;
@@ -36116,12 +36119,15 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        match crate::git::commit_all_tracked(&self.scm_root(), &message) {
+        let commit = crate::git::commit_all_tracked(&self.scm_root(), &message);
+        self.log_git("commit -am", &commit);
+        match commit {
             Ok(summary) => {
+                let headline = crate::git::headline(&summary);
                 self.source_control.clear_message();
-                self.source_control.commit_feedback = Some(summary.clone());
+                self.source_control.commit_feedback = Some(headline.to_string());
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Committed: {summary}");
+                self.status = format!("Committed: {headline}");
                 self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();

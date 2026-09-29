@@ -13188,6 +13188,40 @@ fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
 }
 
 #[test]
+fn a_commit_reports_only_git_s_first_line_in_the_panel_and_status_bar() {
+    // #858: `git commit` prints `[branch sha] subject`, then a diffstat and
+    // one `create mode` row per new file; the whole of it was the feedback.
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    });
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message = "fix: one line".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        feedback.starts_with("[main ") && feedback.ends_with("] fix: one line"),
+        "the feedback is git's first line: {feedback:?}"
+    );
+    assert_eq!(app.status, format!("Committed: {feedback}"));
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("1 file changed"),
+        "the Git Output log keeps the rest: {logged:?}"
+    );
+}
+
+#[test]
 fn ctrl_enter_in_source_control_commits_and_pushes() {
     let tmp = make_committed_repo();
     // Wire a bare remote and set it as origin so `git push` has

@@ -901,6 +901,14 @@ pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> 
     }
 }
 
+/// The first line of git's `output` (for a commit, `[branch sha] subject`):
+/// what the Source Control panel and the status bar report. The rest, a
+/// commit's diffstat and one `create mode` row per new file, ran on past
+/// both (#858); the Git Output log keeps it whole.
+pub fn headline(output: &str) -> &str {
+    output.lines().next().unwrap_or_default().trim_end()
+}
+
 /// Push the current branch to its upstream. Used by Commit & Push
 /// (Cmd+Enter in the SC message box). Returns the trimmed stdout/stderr
 /// summary verbatim so the panel can surface the host's full message —
