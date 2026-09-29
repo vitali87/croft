@@ -660,6 +660,114 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
     );
 }
 
+/// #862 hot exit end to end, on the real binary: croft killed (SIGKILL, so
+/// no quit runs, as in an OOM kill) a few seconds after an edit it never
+/// saved brings the edit back on the next launch of the workspace, as an
+/// unsaved tab, and the file itself is untouched. Before hot exit the text
+/// was gone.
+#[cfg(unix)]
+#[test]
+fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    /// croft on a fresh pty in `dir` (also its HOME), and the pty's master.
+    fn spawn(dir: &std::path::Path, args: &[&str]) -> (std::process::Child, std::fs::File) {
+        let (mut master, mut slave) = (0, 0);
+        let ws = libc::winsize {
+            ws_row: 40,
+            ws_col: 140,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &ws,
+            )
+        };
+        assert_eq!(opened, 0);
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"));
+        cmd.args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("TERM", "xterm-256color")
+            .env_remove("TERM_PROGRAM")
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        drop(slave);
+        unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        (child, unsafe { std::fs::File::from_raw_fd(master) })
+    }
+    fn drain(pty: &mut std::fs::File, for_: Duration) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1 << 16];
+        let end = Instant::now() + for_;
+        while Instant::now() < end {
+            match pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => out.extend_from_slice(&buf[..k]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join("a.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let (mut child, mut pty) = spawn(home.path(), &["a.txt"]);
+    let started = drain(&mut pty, Duration::from_secs(8));
+    assert!(started.len() > 1000, "croft drew nothing: {started:?}");
+    pty.write_all(b"\x1b").unwrap();
+    drain(&mut pty, Duration::from_secs(1));
+    pty.write_all(b"HOTEXIT").unwrap();
+    // Past the backup delay after the last edit, then killed outright.
+    drain(&mut pty, Duration::from_secs(8));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "alpha\n",
+        "never saved"
+    );
+
+    let (mut child, mut pty) = spawn(home.path(), &[]);
+    let drawn = drain(&mut pty, Duration::from_secs(8));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        drawn.contains("HOTEXITalpha"),
+        "the unsaved edit is back on the next launch"
+    );
+    assert!(
+        drawn.contains("restored 1 unsaved tab"),
+        "and croft says so"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+}
+
 /// #621: a locale as `$LANG` spells it (`de_DE.UTF-8`) seeds the template
 /// from the German catalog and names the file croft will load.
 #[test]

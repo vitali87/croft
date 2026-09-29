@@ -5590,6 +5590,14 @@ impl Editor {
         self.disk_stamp
     }
 
+    /// Anchor the disk stamp at `stamp`, the file as this buffer's edits
+    /// last matched it, for a buffer rebuilt from a copy of its unsaved text
+    /// (hot exit, #862): a file that changed since then reads as changed
+    /// externally, so a save asks before overwriting that change.
+    pub fn set_disk_stamp(&mut self, stamp: Option<(SystemTime, u64)>) {
+        self.disk_stamp = stamp;
+    }
+
     /// Open `path` in the SARIF results viewer (#577). Fails with the
     /// loader's explanation (position of a JSON error, an unsupported
     /// version) so the caller can fall back to text and say why.

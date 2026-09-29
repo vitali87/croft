@@ -2551,8 +2551,9 @@ struct PendingRevertHunk {
 }
 
 /// What an unsaved-changes prompt (#862) goes on to do once it is answered.
-/// Everything that would drop a dirty buffer asks first: croft keeps no copy
-/// of unsaved text across a quit, so the prompt is the last chance to save.
+/// Everything that would drop a dirty buffer asks first: a quit that goes
+/// ahead removes the hot-exit backup, so the prompt is the last chance to
+/// save.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum UnsavedExit {
     /// Quit croft (Ctrl+Q, vim `:qa`).
@@ -3536,6 +3537,13 @@ pub struct App {
     /// that ends this croft later goes without asking again only while
     /// nothing has changed since.
     remote_handoff_ok: Option<u64>,
+    /// Hot exit (#862): the directory this croft backs its unsaved buffers
+    /// up under (`~/.cache/croft/hot-exit`). `None` keeps no backups, as
+    /// under test unless a test points it at a tempdir.
+    pub hot_exit_dir: Option<PathBuf>,
+    /// The [`App::unsaved_stamp`] this croft's backup on disk was written
+    /// at, `None` while it has none: the tick writes only when they differ.
+    hot_exit_written: Option<u64>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -5685,6 +5693,12 @@ impl App {
             pending_revert_hunk: None,
             pending_unsaved: None,
             remote_handoff_ok: None,
+            hot_exit_dir: if cfg!(test) {
+                None
+            } else {
+                Some(croft_cache_dir().join("hot-exit"))
+            },
+            hot_exit_written: None,
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -39368,45 +39382,7 @@ impl App {
 
     fn apply_session_state(&mut self, state: &crate::session_state::SessionState) {
         for tab in &state.tabs {
-            let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
-            let opened = tab
-                .path
-                .as_deref()
-                .is_some_and(|p| self.editor.open_pinned(p).is_ok());
-            let ed = if opened {
-                let path = tab.path.as_deref();
-                self.editor
-                    .editors
-                    .iter_mut()
-                    .find(|e| e.path.as_deref() == path)
-            } else if unsaved.is_some() {
-                // An untitled buffer, or a file that can no longer be read
-                // (deleted, permissions changed while the update ran): the
-                // unsaved text is the only copy, so it comes back (below) as a
-                // dirty tab rather than being dropped.
-                Some(self.editor.open_unreadable_tab(tab.path.clone()))
-            } else {
-                None
-            };
-            let Some(ed) = ed else {
-                continue;
-            };
-            if let Some(text) = unsaved {
-                ed.lines = text.split('\n').map(str::to_string).collect();
-                if ed.lines.is_empty() {
-                    ed.lines.push(String::new());
-                }
-                ed.dirty = true;
-                // Make the restored unsaved content eligible for auto save:
-                // due() keys on last_edit_at, which a fresh Editor lacks.
-                ed.last_edit_at = Some(std::time::Instant::now());
-            }
-            let max_row = ed.lines.len().saturating_sub(1);
-            ed.cursor_row = tab.cursor_row.min(max_row);
-            let max_col = ed.lines.get(ed.cursor_row).map_or(0, |l| l.chars().count());
-            ed.cursor_col = tab.cursor_col.min(max_col);
-            ed.scroll = tab.scroll;
-            ed.scroll_col = tab.scroll_col;
+            self.restore_open_tab(tab);
         }
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
@@ -39425,6 +39401,53 @@ impl App {
         } else {
             Pane::Tree
         };
+    }
+
+    /// Reopen one captured tab, the update relaunch's or hot exit's (#862):
+    /// its file at the saved cursor and scroll, with its unsaved text over
+    /// what the file holds now. Returns the tab, or `None` when there was
+    /// nothing to bring back.
+    fn restore_open_tab(
+        &mut self,
+        tab: &crate::session_state::OpenTabState,
+    ) -> Option<&mut Editor> {
+        let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
+        let opened = tab
+            .path
+            .as_deref()
+            .is_some_and(|p| self.editor.open_pinned(p).is_ok());
+        let ed = if opened {
+            let path = tab.path.as_deref();
+            self.editor
+                .editors
+                .iter_mut()
+                .find(|e| e.path.as_deref() == path)?
+        } else if unsaved.is_some() {
+            // An untitled buffer, or a file that can no longer be read
+            // (deleted, permissions changed while the update ran): the
+            // unsaved text is the only copy, so it comes back (below) as a
+            // dirty tab rather than being dropped.
+            self.editor.open_unreadable_tab(tab.path.clone())
+        } else {
+            return None;
+        };
+        if let Some(text) = unsaved {
+            ed.lines = text.split('\n').map(str::to_string).collect();
+            if ed.lines.is_empty() {
+                ed.lines.push(String::new());
+            }
+            ed.dirty = true;
+            // Make the restored unsaved content eligible for auto save:
+            // due() keys on last_edit_at, which a fresh Editor lacks.
+            ed.last_edit_at = Some(std::time::Instant::now());
+        }
+        let max_row = ed.lines.len().saturating_sub(1);
+        ed.cursor_row = tab.cursor_row.min(max_row);
+        let max_col = ed.lines.get(ed.cursor_row).map_or(0, |l| l.chars().count());
+        ed.cursor_col = tab.cursor_col.min(max_col);
+        ed.scroll = tab.scroll;
+        ed.scroll_col = tab.scroll_col;
+        Some(ed)
     }
 
     fn tear_down_connect_auth(&mut self) {
@@ -41409,7 +41432,10 @@ impl App {
             // vim's `!` is the answer to "discard the changes?" given up
             // front, so these two never ask (#862).
             "q!" => self.close_tab_now(self.editor.active_index()),
-            "qa!" => self.quit = true,
+            "qa!" => {
+                self.clear_hot_exit();
+                self.quit = true;
+            }
             "wq" | "x" | "wq!" => {
                 self.save();
                 // A save that did not land (a disk conflict, a format still
@@ -56511,6 +56537,10 @@ impl App {
                 shell_synced = false;
             }
         }
+        // The hot-exit backup is keyed by the workspace: this croft's goes
+        // with it to the new root at the next tick, rather than staying
+        // where the old workspace's next launch would restore it (#862).
+        self.clear_hot_exit();
         self.roots.replace_primary(new_root.clone());
         // A panel the user never touched — the startup default, one unnamed
         // shell with no input ever typed and no launched program — is swapped
@@ -57337,8 +57367,14 @@ impl App {
     /// Carry `exit` out, with nothing left to ask.
     fn finish_unsaved_exit(&mut self, exit: UnsavedExit) {
         match exit {
-            UnsavedExit::Quit => self.quit = true,
+            // A quit that goes ahead kept every edit or was told to drop
+            // them, so the hot-exit backup goes with it.
+            UnsavedExit::Quit => {
+                self.clear_hot_exit();
+                self.quit = true;
+            }
             UnsavedExit::DropToLocal => {
+                self.clear_hot_exit();
                 self.drop_to_local = true;
                 self.quit = true;
             }
@@ -57348,7 +57384,10 @@ impl App {
                 self.remote_handoff_ok = self.unsaved_stamp();
                 self.start_remote_launch(host, path);
             }
-            UnsavedExit::RemoteHandoff { .. } => self.quit = true,
+            UnsavedExit::RemoteHandoff { .. } => {
+                self.clear_hot_exit();
+                self.quit = true;
+            }
             UnsavedExit::CloseTab { idx, .. } => self.close_tab_now(idx),
         }
     }
@@ -57488,6 +57527,191 @@ impl App {
             ed.edit_seq.hash(&mut h);
         }
         any.then(|| h.finish())
+    }
+
+    /// Hot exit's pause after the newest unsaved edit before it backs the
+    /// buffers up (#862): typing never waits on a write, and a crash loses
+    /// seconds of it.
+    const HOT_EXIT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Keep the hot-exit backup (#862) in step with the unsaved buffers.
+    /// Runs every tick, but writes only once they changed since the last
+    /// backup and [`Self::HOT_EXIT_DELAY`] has passed since the newest edit,
+    /// and removes the backup once nothing is unsaved.
+    pub fn tick_hot_exit(&mut self, now: std::time::Instant) {
+        if self.hot_exit_dir.is_none() {
+            return;
+        }
+        let stamp = self.unsaved_stamp();
+        if stamp == self.hot_exit_written {
+            return;
+        }
+        let settling = stamp.is_some()
+            && self
+                .newest_unsaved_edit()
+                .is_some_and(|t| now.saturating_duration_since(t) < Self::HOT_EXIT_DELAY);
+        if !settling {
+            self.write_hot_exit();
+        }
+    }
+
+    /// When the most recently edited unsaved buffer last changed.
+    fn newest_unsaved_edit(&self) -> Option<std::time::Instant> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| holds_unsaved(e))
+            .filter_map(|e| e.last_edit_at)
+            .max()
+    }
+
+    /// This croft's hot-exit backup file for its workspace, when it keeps
+    /// backups at all.
+    fn hot_exit_path(&self) -> Option<PathBuf> {
+        let dir = self.hot_exit_dir.as_deref()?;
+        Some(crate::hot_exit::own_path(dir, self.workspace_root()))
+    }
+
+    /// Write the hot-exit backup now (#862): every unsaved text buffer of
+    /// every editor group, or no backup at all once there is none. A write
+    /// that fails says so, and is tried again after the next edit.
+    fn write_hot_exit(&mut self) {
+        let Some(path) = self.hot_exit_path() else {
+            return;
+        };
+        let stamp = self.unsaved_stamp();
+        let backup = self.capture_hot_exit();
+        if backup.buffers.is_empty() {
+            crate::hot_exit::remove(&path);
+        } else if let Err(e) = backup.save(&path) {
+            self.status = format!("Could not back up unsaved changes ({e:#})");
+        }
+        self.hot_exit_written = stamp;
+    }
+
+    /// What a hot-exit backup holds (#862): each unsaved tab as the update
+    /// relaunch captures it (every group, a file once, untitled buffers
+    /// that hold text), with the file's stamp from when the buffer last
+    /// matched it. Hex and sheet tabs carry no text and are left out, as
+    /// from the relaunch.
+    fn capture_hot_exit(&self) -> crate::hot_exit::Backup {
+        let editors: Vec<&Editor> = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .collect();
+        let buffers = self
+            .capture_session_state()
+            .tabs
+            .into_iter()
+            .filter(|t| {
+                t.dirty
+                    && t.unsaved_text
+                        .as_deref()
+                        .is_some_and(|text| t.path.is_some() || !text.is_empty())
+            })
+            .map(|tab| {
+                let disk_stamp = tab.path.as_deref().and_then(|p| {
+                    editors
+                        .iter()
+                        .find(|e| e.dirty && e.path.as_deref() == Some(p))
+                        .and_then(|e| e.disk_stamp())
+                });
+                crate::hot_exit::Buffer { tab, disk_stamp }
+            })
+            .collect();
+        crate::hot_exit::Backup {
+            workspace_root: self.workspace_root().to_path_buf(),
+            buffers,
+        }
+    }
+
+    /// Remove this croft's hot-exit backup (#862): the quit ending it kept
+    /// every unsaved edit on disk, or was told to drop them.
+    fn clear_hot_exit(&mut self) {
+        if let Some(path) = self.hot_exit_path() {
+            crate::hot_exit::remove(&path);
+        }
+        self.hot_exit_written = None;
+    }
+
+    /// Bring back what hot exit kept of this workspace's unsaved buffers
+    /// (#862) when croft last ended without a clean quit: a kill, a crash,
+    /// an OOM kill. Each comes back as an unsaved tab with its text and
+    /// cursor and nothing is written to its file. A file changed on disk
+    /// since is named in the status line and keeps the stamp its edits were
+    /// made against, so its first save asks before overwriting the change;
+    /// a deleted one comes back as a tab for its path. The consumed backups
+    /// are replaced by this croft's own at once, so a crash straight after
+    /// the launch cannot lose them either. A backup that cannot be read is
+    /// left where it is, and said so. Called once, at a normal launch.
+    pub fn restore_hot_exit(&mut self) {
+        let Some(dir) = self.hot_exit_dir.clone() else {
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let mut restored = 0usize;
+        let mut changed: Vec<PathBuf> = Vec::new();
+        let mut gone: Vec<PathBuf> = Vec::new();
+        let mut unreadable: Vec<String> = Vec::new();
+        for file in crate::hot_exit::orphaned(&dir, &root) {
+            let backup = match crate::hot_exit::Backup::load(&file) {
+                Ok(backup) if backup.is_of(&root) => backup,
+                // Another workspace's, under a colliding digest.
+                Ok(_) => continue,
+                Err(_) => {
+                    unreadable.push(file.display().to_string());
+                    continue;
+                }
+            };
+            for buffer in &backup.buffers {
+                let Some(ed) = self.restore_open_tab(&buffer.tab) else {
+                    continue;
+                };
+                restored += 1;
+                let Some(path) = buffer.tab.path.clone() else {
+                    continue;
+                };
+                match ed.disk_stamp() {
+                    None => gone.push(path),
+                    Some(now) if buffer.disk_stamp.is_some_and(|then| then != now) => {
+                        ed.set_disk_stamp(buffer.disk_stamp);
+                        changed.push(path);
+                    }
+                    Some(_) => {}
+                }
+            }
+            crate::hot_exit::remove(&file);
+        }
+        let mut notes = Vec::new();
+        if restored > 0 {
+            notes.push(format!(
+                "Hot exit: restored {restored} unsaved tab{}",
+                if restored == 1 { "" } else { "s" }
+            ));
+            let names = |paths: &[PathBuf]| {
+                paths
+                    .iter()
+                    .map(|p| self.status_path(p))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            if !changed.is_empty() {
+                notes.push(format!("{} changed on disk since", names(&changed)));
+            }
+            if !gone.is_empty() {
+                notes.push(format!("{} no longer on disk", names(&gone)));
+            }
+            self.write_hot_exit();
+        }
+        if !unreadable.is_empty() {
+            notes.push(format!(
+                "Hot exit: could not read {} (kept)",
+                unreadable.join(", ")
+            ));
+        }
+        if !notes.is_empty() {
+            self.status = notes.join("; ");
+        }
     }
 
     /// Write what an unsaved-changes prompt (#862) asked about: the focused
@@ -66859,6 +67083,9 @@ pub fn run(
             Ok(state) => {
                 app.apply_session_state(&state);
                 let _ = std::fs::remove_file(session_path);
+                // The hot-exit backup follows what the relaunch brought
+                // back (#862), at once rather than after the first edit.
+                app.write_hot_exit();
             }
             // Kept: it may hold the only copy of unsaved text.
             Err(e) => {
@@ -66868,6 +67095,10 @@ pub fn run(
                 );
             }
         }
+    } else {
+        // A normal launch brings back what hot exit kept of this workspace
+        // when croft last ended without a clean quit (#862).
+        app.restore_hot_exit();
     }
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
     // window. "Move/Copy into New Window" launches the new window this way so it
@@ -67564,6 +67795,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
+        app.tick_hot_exit(std::time::Instant::now());
         let live_run_changed =
             app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
