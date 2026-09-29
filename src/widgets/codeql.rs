@@ -181,6 +181,9 @@ pub struct CodeqlPanel {
     pub queries: Vec<crate::codeql_query::QueryPack>,
     /// Folded packs, by folder, so a fold survives rediscovery.
     pub folded_packs: std::collections::HashSet<std::path::PathBuf>,
+    /// A discovery of the workspace's queries is running off the UI thread
+    /// (#840): an empty Queries section says so rather than "none found".
+    pub discovering_queries: bool,
     /// The controller repository and the repositories variant analysis
     /// runs against, from the last load of their config.
     pub variant: crate::codeql_variant::VariantConfig,
@@ -297,6 +300,22 @@ impl CodeqlPanel {
             .iter()
             .position(|l| matches!(l, Line::Action(Action::TogglePack(p), _) if *p == pack))
         {
+            self.selected = n;
+        }
+    }
+
+    /// Take a finished query discovery (#840). It lands after the view has
+    /// opened, and the rows below the Queries section move with it, so the
+    /// selection stays on the row it was on.
+    pub fn set_queries(&mut self, queries: Vec<crate::codeql_query::QueryPack>) {
+        let hit = self.selected_hit();
+        self.queries = queries;
+        self.discovering_queries = false;
+        if let Some(n) = hit.and_then(|hit| {
+            self.lines()
+                .iter()
+                .position(|l| Self::selectable(l) == Some(hit))
+        }) {
             self.selected = n;
         }
     }
@@ -561,6 +580,9 @@ impl CodeqlPanel {
                             ));
                         }
                     }
+                }
+                Section::Queries if self.discovering_queries => {
+                    out.push(Line::Text("Discovering queries\u{2026}"));
                 }
                 Section::Queries => {
                     out.push(Line::Text("We didn't find any CodeQL queries in"));
@@ -1081,6 +1103,32 @@ mod tests {
             p.lines()
                 .contains(&Line::Action(Action::RunQuery(2, 0), "  x.ql".into()))
         );
+    }
+
+    #[test]
+    fn a_discovery_in_flight_says_so_and_its_result_keeps_the_selection() {
+        // #840: the queries land after the view has opened.
+        let mut p = CodeqlPanel::new();
+        p.discovering_queries = true;
+        let lines = p.lines();
+        assert!(lines.contains(&Line::Text("Discovering queries\u{2026}")));
+        assert!(!lines.contains(&Line::Text("We didn't find any CodeQL queries in")));
+        p.selected = lines
+            .iter()
+            .position(|l| *l == Line::Header(Section::QueryHistory))
+            .unwrap();
+        p.set_queries(vec![pack(
+            "acme/go",
+            Some("go"),
+            "/w/go",
+            &["a.ql", "b.ql"],
+        )]);
+        assert!(!p.discovering_queries);
+        assert!(
+            p.lines()
+                .contains(&Line::Action(Action::RunQuery(0, 1), "  b.ql".into()))
+        );
+        assert_eq!(p.selected_hit(), Some(Hit::Header(Section::QueryHistory)));
     }
 
     #[test]
