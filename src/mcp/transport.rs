@@ -18,6 +18,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -67,11 +68,18 @@ impl LineDecoder {
     }
 }
 
+/// How long shutdown waits for the server to exit on its own after stdin
+/// closes, before the SIGKILL backstop. EOF on stdin is a stdio MCP server's
+/// cue to clean up and exit; a well-behaved one does so in milliseconds, and
+/// the bound keeps one that ignores EOF from stalling the caller.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
 /// A running MCP server connection plus its message plumbing. Owns the child
 /// process, a line-framed reader thread feeding `incoming`, and a stdin writer.
 pub struct McpTransport {
     child: Child,
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// `None` once shutdown has closed the server's stdin.
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
     /// Drained by the client: every decoded incoming message (responses,
     /// server-initiated notifications and requests alike).
     pub incoming: Receiver<Value>,
@@ -128,7 +136,7 @@ impl McpTransport {
 
         Ok(McpTransport {
             child,
-            writer: Mutex::new(Box::new(stdin)),
+            writer: Mutex::new(Some(Box::new(stdin))),
             incoming: rx,
         })
     }
@@ -137,15 +145,32 @@ impl McpTransport {
     pub fn send(&self, message: &Value) -> Result<()> {
         let bytes = encode(message);
         let mut writer = self.writer.lock().expect("mcp writer mutex poisoned");
+        let writer = writer.as_mut().context("MCP server stdin already closed")?;
         writer.write_all(&bytes).context("writing to MCP server")?;
         writer.flush().context("flushing MCP server")?;
         Ok(())
     }
 
     /// Best-effort terminate the server. MCP's stdio shutdown is "close stdin,
-    /// then signal": dropping the writer closes stdin, and `kill` is the SIGKILL
-    /// backstop.
+    /// then signal": close stdin first so the server sees EOF and can exit on
+    /// its own, give it [`SHUTDOWN_GRACE`] to do so, and only then fall back
+    /// to SIGKILL. The writer must be closed explicitly here: as a struct field
+    /// it would otherwise drop only after `Drop::drop` returns, i.e. after the
+    /// kill, so the server was SIGKILLed without ever seeing EOF (#685).
     pub fn kill(&mut self) {
+        self.writer
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                // Exited on EOF; `try_wait` has already reaped it.
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
         let _ = self.child.kill();
         // Reaped, or every finished server lingers as a zombie.
         let _ = self.child.wait();
@@ -268,6 +293,66 @@ mod tests {
         assert_ne!(
             child_sid, our_sid,
             "server must be in its own session, detached from croft's tty"
+        );
+    }
+
+    /// #685: dropping the transport (what happens when a palette tool call
+    /// finishes) must close the server's stdin BEFORE any signal, so a server
+    /// whose cleanup runs on EOF gets to run it. The stand-in answers one line,
+    /// then records reaching EOF in a marker file. The old shutdown SIGKILLed
+    /// it first, so the marker never appeared.
+    #[test]
+    fn dropping_the_transport_closes_stdin_before_killing_the_server() {
+        let dir = std::env::temp_dir().join(format!("croft-mcp-eof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("saw-eof");
+        let script = r#"while read -r _; do echo '{"jsonrpc":"2.0","id":1,"result":{}}'; done; echo eof > "$1""#;
+        let args = [
+            "-c".to_string(),
+            script.to_string(),
+            "sh".to_string(),
+            marker.display().to_string(),
+        ];
+        let t = McpTransport::spawn("sh", &args, &dir, &BTreeMap::new())
+            .expect("spawn stand-in server");
+        t.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .unwrap();
+        // The reply proves the server is up and blocked reading stdin.
+        let reply = t
+            .incoming
+            .recv_timeout(crate::test_budget::spawn_budget(Duration::from_secs(2)))
+            .expect("the stand-in server answers");
+        assert_eq!(reply["id"], 1);
+
+        drop(t);
+        // `drop` returns only once the server is reaped, so any EOF cleanup
+        // it ran has already happened.
+        let saw_eof = marker.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            saw_eof,
+            "the server was killed without ever seeing stdin EOF"
+        );
+    }
+
+    /// #685 backstop: a server that ignores stdin EOF is still killed once the
+    /// grace period runs out, so shutdown can never hang its caller.
+    #[test]
+    fn a_server_that_ignores_stdin_eof_is_still_killed() {
+        let t = McpTransport::spawn(
+            "sleep",
+            &["30".to_string()],
+            &std::env::temp_dir(),
+            &BTreeMap::new(),
+        )
+        .expect("spawn stand-in server");
+        let started = Instant::now();
+        drop(t);
+        let took = started.elapsed();
+        let budget = SHUTDOWN_GRACE + crate::test_budget::spawn_budget(Duration::from_secs(2));
+        assert!(
+            took < budget,
+            "shutdown took {took:?} (budget {budget:?}): the SIGKILL backstop did not fire"
         );
     }
 }
