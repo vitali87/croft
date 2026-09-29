@@ -2563,6 +2563,10 @@ enum UnsavedExit {
     /// Leave this croft for a workspace on `host`: the local session ends
     /// and a later return starts a fresh one.
     RemoteLaunch { host: String, path: Option<String> },
+    /// The croft on `host` is ready and this one is about to hand it the
+    /// terminal, ending here. Asked about edits made since the connect was
+    /// asked for, which can be minutes earlier (an install ran between).
+    RemoteHandoff { host: String },
     /// Close the focused group's tab at `idx`. `path` is the file it showed
     /// when asked, so an answer never lands on a tab that moved into its
     /// place meanwhile.
@@ -2575,7 +2579,7 @@ impl UnsavedExit {
         match self {
             Self::Quit => "quit",
             Self::DropToLocal => "return to local",
-            Self::RemoteLaunch { .. } => "connect",
+            Self::RemoteLaunch { .. } | Self::RemoteHandoff { .. } => "connect",
             Self::CloseTab { .. } => "close",
         }
     }
@@ -3527,6 +3531,11 @@ pub struct App {
     /// An unsaved-changes prompt (#862) waiting on S / D / Esc, holding what
     /// it goes on to do. While `Some`, the modal eats every key and click.
     pending_unsaved: Option<UnsavedExit>,
+    /// The unsaved state (see [`App::unsaved_stamp`]) the user chose to
+    /// leave behind when asked about a remote connect (#862): the handoff
+    /// that ends this croft later goes without asking again only while
+    /// nothing has changed since.
+    remote_handoff_ok: Option<u64>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -5675,6 +5684,7 @@ impl App {
             pending_discard: None,
             pending_revert_hunk: None,
             pending_unsaved: None,
+            remote_handoff_ok: None,
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -38742,17 +38752,12 @@ impl App {
             if let Some(session) = self.install_session.as_mut()
                 && let Some(adopted) = session.take_adopted()
             {
-                let host = session.host.clone();
-                let path = session.path.clone();
-                self.note_provisioning_succeeded(&host);
-                self.remote_launch = Some(RemoteLaunch {
-                    host: host.clone(),
-                    path,
+                let launch = RemoteLaunch {
+                    host: session.host.clone(),
+                    path: session.path.clone(),
                     adopted: Some(adopted),
-                });
-                self.status = format!("Launching croft on {host}");
-                self.connect_dialog = None;
-                self.quit = true;
+                };
+                self.hand_off_to_remote(launch);
             }
             return true;
         }
@@ -38774,21 +38779,39 @@ impl App {
             if let Some(mut session) = self.install_session.take()
                 && let Some(adopted) = session.take_adopted()
             {
-                let host = session.host.clone();
-                let path = session.path.clone();
-                self.note_provisioning_succeeded(&host);
-                self.remote_launch = Some(RemoteLaunch {
-                    host: host.clone(),
-                    path,
+                let launch = RemoteLaunch {
+                    host: session.host.clone(),
+                    path: session.path.clone(),
                     adopted: Some(adopted),
-                });
-                self.status = format!("Launching croft on {host}");
-                self.connect_dialog = None;
-                self.quit = true;
+                };
+                self.hand_off_to_remote(launch);
             }
             changed = true;
         }
         changed
+    }
+
+    /// The croft on the remote is ready: quit so the terminal goes to it
+    /// (the main loop launches `launch` once this one has let go). The quit
+    /// ends this croft, so edits made since the connect was asked for are
+    /// asked about first (#862); what the user already chose to leave then
+    /// goes without asking again.
+    fn hand_off_to_remote(&mut self, launch: RemoteLaunch) {
+        let host = launch.host.clone();
+        self.note_provisioning_succeeded(&host);
+        self.remote_launch = Some(launch);
+        self.status = format!("Launching croft on {host}");
+        self.connect_dialog = None;
+        let handoff = UnsavedExit::RemoteHandoff { host };
+        let left_as_agreed = self
+            .remote_handoff_ok
+            .take()
+            .is_some_and(|ok| Some(ok) == self.unsaved_stamp());
+        if left_as_agreed {
+            self.finish_unsaved_exit(handoff);
+        } else {
+            self.guard_unsaved(handoff);
+        }
     }
 
     /// Start the background self-update watcher on a remote-launched croft.
@@ -39411,6 +39434,7 @@ impl App {
         self.install_session = None;
         self.pending_remote_launch_host = None;
         self.pending_remote_launch_path = None;
+        self.remote_handoff_ok = None;
     }
 
     pub fn handle_connect_dialog_key(&mut self, key: KeyEvent) {
@@ -57318,7 +57342,13 @@ impl App {
                 self.drop_to_local = true;
                 self.quit = true;
             }
-            UnsavedExit::RemoteLaunch { host, path } => self.start_remote_launch(host, path),
+            UnsavedExit::RemoteLaunch { host, path } => {
+                // What the answer left unsaved (D) goes without a second
+                // question at the handoff; anything edited after it does not.
+                self.remote_handoff_ok = self.unsaved_stamp();
+                self.start_remote_launch(host, path);
+            }
+            UnsavedExit::RemoteHandoff { .. } => self.quit = true,
             UnsavedExit::CloseTab { idx, .. } => self.close_tab_now(idx),
         }
     }
@@ -57344,6 +57374,7 @@ impl App {
             };
             let left = self.save_tabs_for_exit(only);
             if !left.is_empty() {
+                self.drop_unsaved_exit(&exit);
                 self.status = format!(
                     "Did not {}: still unsaved - {}",
                     exit.verb(),
@@ -57365,7 +57396,18 @@ impl App {
 
     fn cancel_unsaved(&mut self) {
         if let Some(exit) = self.pending_unsaved.take() {
+            self.drop_unsaved_exit(&exit);
             self.status = format!("Cancelled: did not {}", exit.verb());
+        }
+    }
+
+    /// Let go of `exit` when the prompt ends without it going ahead. A
+    /// remote handoff is already armed (the launch waits for the quit), and
+    /// left armed it would go ahead at the next, unrelated quit.
+    fn drop_unsaved_exit(&mut self, exit: &UnsavedExit) {
+        if matches!(exit, UnsavedExit::RemoteHandoff { .. }) {
+            self.remote_launch = None;
+            self.tear_down_connect_auth();
         }
     }
 
@@ -57426,6 +57468,26 @@ impl App {
             }
         }
         labels
+    }
+
+    /// A fingerprint of every unsaved buffer as it stands (#862): which tabs
+    /// hold unsaved text and how far each has been edited, so any edit, save
+    /// or close changes it. `None` when nothing is unsaved. Cheap enough for
+    /// every tick: it hashes paths and edit counters, never text.
+    fn unsaved_stamp(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut any = false;
+        for ed in std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| holds_unsaved(e))
+        {
+            any = true;
+            ed.path.hash(&mut h);
+            ed.edit_seq.hash(&mut h);
+        }
+        any.then(|| h.finish())
     }
 
     /// Write what an unsaved-changes prompt (#862) asked about: the focused

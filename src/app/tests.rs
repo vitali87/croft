@@ -11124,6 +11124,132 @@ fn a_click_behind_the_unsaved_prompt_closes_nothing() {
     assert_eq!(app.editor.tab_count(), 1, "with no prompt it closes b.txt");
 }
 
+/// A remote connect whose install just reported `event`: the croft on the
+/// host is ready to take this terminal over (no ssh is run).
+fn ready_to_hand_off(app: &mut App, event: crate::install_session::InstallEvent) {
+    let adopted = crate::remote::AdoptedMaster {
+        host: String::from("devbox"),
+        socket_dir: PathBuf::from("/nonexistent/croft-test-ctl"),
+        socket_path: PathBuf::from("/nonexistent/croft-test-ctl/ctl"),
+    };
+    app.install_session = Some(crate::install_session::InstallSession::with_events(
+        "devbox",
+        None,
+        Some(adopted),
+        vec![event],
+    ));
+}
+
+/// The two install outcomes that hand this terminal to the remote croft:
+/// one was already there (it launches while the reinstall runs on), or the
+/// install just finished.
+fn handoff_events() -> [crate::install_session::InstallEvent; 2] {
+    use crate::install_session::InstallEvent;
+    [InstallEvent::CanLaunch, InstallEvent::Done(Ok(()))]
+}
+
+/// #862: connecting to a remote croft ends this one once the remote side is
+/// ready, which can be minutes after the connect was asked for. An edit
+/// made meanwhile went with it: the handoff set `quit` without asking. It
+/// asks now, and S saves before handing off.
+#[test]
+fn a_remote_handoff_asks_about_edits_made_during_the_install() {
+    for event in handoff_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+        // Nothing was unsaved when the connect was asked for; the edit
+        // comes while the install runs.
+        type_into_editor(&mut app, "x");
+        ready_to_hand_off(&mut app, event);
+        app.poll_install_session();
+        assert!(!app.quit, "the unsaved a.txt must not go with the handoff");
+        assert!(app.pending_unsaved.is_some(), "it asks");
+        let screen = draw_screen(&mut app);
+        assert!(screen.contains("ave all and connect"), "{screen}");
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.quit, "saved, so it hands off: {}", app.status);
+        assert!(app.remote_launch.is_some(), "to the remote croft");
+        let a = tmp.path().join("a.txt");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    }
+}
+
+/// #862 negative: with nothing unsaved the handoff goes at once, as before.
+#[test]
+fn a_remote_handoff_with_nothing_unsaved_goes_at_once() {
+    for event in handoff_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+        ready_to_hand_off(&mut app, event);
+        app.poll_install_session();
+        assert!(app.quit);
+        assert!(app.pending_unsaved.is_none(), "nothing to ask about");
+        assert!(app.remote_launch.is_some());
+    }
+}
+
+/// #862: Esc at the handoff prompt keeps this croft and the edits, and
+/// drops the launch rather than leaving it armed for a later quit.
+#[test]
+fn cancelling_the_remote_handoff_stays_here_with_the_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(app.remote_launch.is_none(), "the launch is dropped");
+    assert!(app.install_session.is_none());
+    assert!(app.editor.dirty && app.editor.lines[0] == "xalpha");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    assert!(app.status.contains("did not connect"), "{}", app.status);
+}
+
+/// #862 negative: edits the user already chose to leave behind at the
+/// connect prompt (D records them; the answer itself would start a real
+/// ssh here) go with the handoff without a second question. One more edit
+/// after that answer is asked about.
+#[test]
+fn edits_left_at_the_connect_prompt_are_not_asked_about_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.remote_handoff_ok = app.unsaved_stamp();
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    assert!(app.quit, "already answered: {}", app.status);
+    assert!(app.pending_unsaved.is_none());
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    app.remote_handoff_ok = app.unsaved_stamp();
+    type_into_editor(&mut app, "y");
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    assert!(!app.quit, "the later edit was never agreed to");
+    assert!(app.pending_unsaved.is_some());
+}
+
+/// #862 negative: S at the handoff prompt whose save is refused (the file
+/// changed on disk) stays here, and drops the launch: left armed, the next
+/// ordinary Ctrl+Q would have connected instead of quitting.
+#[test]
+fn a_refused_save_at_the_remote_handoff_drops_the_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    std::fs::write(&a, "changed elsewhere\n").unwrap();
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(app.status.contains("Did not connect"), "{}", app.status);
+    assert!(app.remote_launch.is_none(), "not left armed");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "changed elsewhere\n");
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
