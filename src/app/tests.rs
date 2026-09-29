@@ -13221,6 +13221,36 @@ fn a_commit_reports_only_git_s_first_line_in_the_panel_and_status_bar() {
     );
 }
 
+/// #858 negative: a refused commit (nothing to commit) is still reported
+/// as an error, on one line that names why, in the panel and the status
+/// bar; git's full text is in the Git Output log.
+#[test]
+fn a_refused_commit_names_the_reason_on_one_line() {
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message = "fix: nothing here".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.source_control.commit_feedback_is_error);
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    let shown = crate::git::headline(&feedback);
+    assert!(
+        shown.contains("nothing to commit"),
+        "the panel's line names the reason: {shown:?} (feedback {feedback:?})"
+    );
+    assert!(
+        !app.status.contains('\n'),
+        "one status line: {:?}",
+        app.status
+    );
+    assert!(app.status.contains("nothing to commit"), "{:?}", app.status);
+}
+
 #[test]
 fn ctrl_enter_in_source_control_commits_and_pushes() {
     let tmp = make_committed_repo();
@@ -65420,4 +65450,113 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         "{synced:?} in {:?}",
         app.settings_chain
     );
+}
+
+/// What `git push` writes to stderr for a push to GitHub: `remote:`
+/// chatter, the destination, then the ref update.
+const PUSH_OUTPUT_858: &str = "remote: \nremote: Create a pull request for 'main' on GitHub by visiting:\nremote:      https://github.com/o/r/pull/new/main\nremote: \nTo github.com:o/r.git\n   5a6cd5c..9f1e2d3  main -> main";
+
+/// #858: after Commit & Push the status bar said "Committed & pushed:"
+/// followed by git push's whole multi-line stderr, squashed into the one
+/// status row, which is what the issue asked to stop. Status and panel now
+/// carry one line (the commit's headline and the ref update); the push's
+/// full text is in the Git Output log.
+#[test]
+fn commit_and_push_reports_one_line_and_logs_the_push() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.finish_commit_and_push(
+        String::from("[main 9f1e2d3] fix: one line"),
+        Ok(String::from(PUSH_OUTPUT_858)),
+    );
+    let feedback = app.source_control.commit_feedback.clone().unwrap();
+    for text in [&app.status, &feedback] {
+        assert!(!text.contains('\n'), "one line: {text:?}");
+        assert!(!text.contains("remote:"), "no remote chatter: {text:?}");
+        assert!(text.contains("[main 9f1e2d3] fix: one line"), "{text:?}");
+        assert!(text.contains("main -> main"), "{text:?}");
+    }
+    assert!(!app.source_control.commit_feedback_is_error);
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("Create a pull request"),
+        "the Git Output log keeps the whole push: {logged:?}"
+    );
+}
+
+/// #858: Push (the commit menu's) reported `Pushed: ` and the same
+/// multi-line stderr; it now reports the ref update alone.
+#[test]
+fn push_reports_its_ref_update_on_one_line_and_logs_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.finish_push(Ok(String::from(PUSH_OUTPUT_858)));
+    assert_eq!(app.status, "Pushed: 5a6cd5c..9f1e2d3 main -> main");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pushed: 5a6cd5c..9f1e2d3 main -> main")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("github.com/o/r/pull/new/main"),
+        "{logged:?}"
+    );
+}
+
+/// #858 negative: a push whose output is only `remote:` chatter reports
+/// that it pushed and nothing of the chatter, never a stray `remote:`.
+#[test]
+fn a_push_with_only_remote_chatter_reports_just_pushed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let chatter = "remote: Resolving deltas: 100% (2/2)\nremote: \nremote: Done";
+    app.finish_push(Ok(String::from(chatter)));
+    assert_eq!(app.status, "Pushed");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pushed")
+    );
+    app.finish_commit_and_push(
+        String::from("[main 9f1e2d3] fix: one line"),
+        Ok(String::from(chatter)),
+    );
+    assert_eq!(
+        app.status,
+        "Committed & pushed: [main 9f1e2d3] fix: one line"
+    );
+    // A one-line push result is kept as git wrote it.
+    app.finish_push(Ok(String::from("Everything up-to-date")));
+    assert_eq!(app.status, "Pushed: Everything up-to-date");
+}
+
+/// #858 negative: a failed push still names the error, on one line: the
+/// rejected ref update with git's reason, or git's `fatal:` line, never the
+/// `To` destination or a `hint:`. It stays an error.
+#[test]
+fn a_failed_push_still_names_the_error_on_one_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rejected = "To github.com:o/r.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'github.com:o/r.git'\nhint: Updates were rejected because the remote contains work that you do\nhint: not have locally.";
+    app.finish_commit_and_push(
+        String::from("[main 9f1e2d3] fix: one line"),
+        Err(String::from(rejected)),
+    );
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Commit ok; push failed: [rejected] main -> main (fetch first)"
+    );
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("commit ok; push failed: [rejected] main -> main (fetch first)")
+    );
+    let fatal = "fatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.";
+    app.finish_push(Err(String::from(fatal)));
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Push failed: fatal: 'origin' does not appear to be a git repository"
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("correct access rights"), "{logged:?}");
 }

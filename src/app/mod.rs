@@ -31561,7 +31561,14 @@ impl App {
         });
     }
 
+    /// Report a finished push on one line (#858): git's ref update, or its
+    /// error, from [`crate::git::summary_line`]; the Git Output log keeps the
+    /// `remote:` chatter and the rest.
     fn finish_push(&mut self, result: Result<String, String>) {
+        self.log_git("push", &result);
+        let result = result
+            .map(|out| crate::git::summary_line(&out))
+            .map_err(|err| crate::git::error_line(&err));
         match result {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
@@ -31570,7 +31577,11 @@ impl App {
                     format!("pushed: {summary}")
                 });
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Pushed: {summary}");
+                self.status = if summary.is_empty() {
+                    String::from("Pushed")
+                } else {
+                    format!("Pushed: {summary}")
+                };
             }
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("push failed: {err}"));
@@ -31987,9 +31998,7 @@ impl App {
         let commit = crate::git::commit_all_tracked(&self.scm_root(), &message);
         self.log_git("commit -am", &commit);
         if let Err(err) = commit {
-            self.source_control.commit_feedback = Some(err.clone());
-            self.source_control.commit_feedback_is_error = true;
-            self.status = format!("Commit failed: {err}");
+            self.report_commit_failure(&err);
             return;
         }
         self.source_control.clear_message();
@@ -35544,9 +35553,7 @@ impl App {
         let commit_summary = match commit {
             Ok(s) => crate::git::headline(&s).to_string(),
             Err(err) => {
-                self.source_control.commit_feedback = Some(err.clone());
-                self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Commit failed: {err}");
+                self.report_commit_failure(&err);
                 return;
             }
         };
@@ -35562,7 +35569,14 @@ impl App {
         self.refresh_source_control();
     }
 
+    /// Report Commit & Push on one line (#858): the commit's headline and
+    /// the push's ref update, or why the push failed; the Git Output log
+    /// keeps git push's whole text.
     fn finish_commit_and_push(&mut self, commit_summary: String, push: Result<String, String>) {
+        self.log_git("push", &push);
+        let push = push
+            .map(|out| crate::git::summary_line(&out))
+            .map_err(|err| crate::git::error_line(&err));
         match push {
             Ok(push_summary) => {
                 let combined = if push_summary.is_empty() {
@@ -36088,12 +36102,18 @@ impl App {
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
-            Err(err) => {
-                self.source_control.commit_feedback = Some(err.clone());
-                self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Commit failed: {err}");
-            }
+            Err(err) => self.report_commit_failure(&err),
         }
+    }
+
+    /// A refused `git commit` (#858): the panel and the status bar name why
+    /// on one line ("nothing to commit, working tree clean", not the "On
+    /// branch main" git prints first); the Git Output log has the rest.
+    fn report_commit_failure(&mut self, err: &str) {
+        let why = crate::git::error_line(err);
+        self.source_control.commit_feedback = Some(why.clone());
+        self.source_control.commit_feedback_is_error = true;
+        self.status = format!("Commit failed: {why}");
     }
 
     /// Housekeeping for the ssh-pane offer (#364), from the top of `render`

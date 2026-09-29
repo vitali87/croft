@@ -909,6 +909,51 @@ pub fn headline(output: &str) -> &str {
     output.lines().next().unwrap_or_default().trim_end()
 }
 
+/// The one line of git's `output` the status bar and the Source Control
+/// panel report (#858); the Git Output log keeps the whole text. For a push
+/// that is its ref update (`5a6cd5c..9f1e2d3 main -> main`, `[new branch]
+/// main -> main`, `[rejected] main -> main (fetch first)`), otherwise the
+/// first line that is not `remote:` chatter, a `hint:`, the `To <url>`
+/// destination or the `On branch` / `Your branch` preamble git prints before
+/// "nothing to commit". Runs of spaces collapse to one. Empty when nothing is
+/// left, as for a push that printed only `remote:` lines.
+pub fn summary_line(output: &str) -> String {
+    const NOISE: [&str; 5] = ["remote:", "hint:", "To ", "On branch ", "Your branch "];
+    let lines = || {
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !NOISE.iter().any(|n| l.starts_with(n)))
+    };
+    let Some(line) = lines()
+        .find(|l| l.contains(" -> "))
+        .or_else(|| lines().next())
+    else {
+        return String::new();
+    };
+    let mut words = line.split_whitespace().peekable();
+    // A ref update leads with git's one-character flag (`*`, `+`, `-`, `!`,
+    // `=`, or a space, which trimming already took).
+    if words
+        .peek()
+        .is_some_and(|w| matches!(*w, "*" | "+" | "-" | "!" | "="))
+    {
+        words.next();
+    }
+    words.collect::<Vec<_>>().join(" ")
+}
+
+/// [`summary_line`] for git's error text, falling back to its first line so
+/// a refusal always says something.
+pub fn error_line(err: &str) -> String {
+    let line = summary_line(err);
+    if line.is_empty() {
+        headline(err).to_string()
+    } else {
+        line
+    }
+}
+
 /// Push the current branch to its upstream. Used by Commit & Push
 /// (Cmd+Enter in the SC message box). Returns the trimmed stdout/stderr
 /// summary verbatim so the panel can surface the host's full message —
@@ -2444,6 +2489,29 @@ pub fn git_worker_loop(
 
 #[cfg(test)]
 mod tests {
+
+    /// #858: the one line reported for git's output. A new branch's ref
+    /// update loses git's `*` flag but keeps its `[new branch]` tag; a
+    /// message with no ref update is its first line past the noise; git's
+    /// text of only noise is empty, and `error_line` then falls back to the
+    /// first line rather than saying nothing.
+    #[test]
+    fn summary_line_picks_the_ref_update_or_the_first_meaningful_line() {
+        assert_eq!(
+            summary_line("To /tmp/r.git\n * [new branch]      main -> main"),
+            "[new branch] main -> main"
+        );
+        assert_eq!(
+            summary_line("Everything up-to-date"),
+            "Everything up-to-date"
+        );
+        assert_eq!(
+            summary_line("On branch main\nYour branch is up to date.\n\nnothing to commit"),
+            "nothing to commit"
+        );
+        assert_eq!(summary_line("remote: a\nremote: b\nhint: c"), "");
+        assert_eq!(error_line("hint: only a hint"), "hint: only a hint");
+    }
     use super::*;
     use tempfile::TempDir;
 
