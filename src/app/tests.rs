@@ -65971,3 +65971,405 @@ fn scm_feedback_paints_nothing_over_the_merge_editor() {
     let row = assert_feedback_stays_in_the_panel_858(&mut term, &mut app, &subject);
     assert_row_crosses_the_merge_panes_858(&app, row);
 }
+
+/// Run git in `dir` for a #858 fixture, asserting it succeeded.
+fn git_858(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Local settings for a #858 fixture repo: an identity, no signing and
+/// no push negotiation from the user's global config, and how `git pull`
+/// reconciles (`pull.rebase`).
+fn configure_858(dir: &std::path::Path, pull_rebase: &str) {
+    for (key, value) in [
+        ("user.email", "a@b"),
+        ("user.name", "a"),
+        ("commit.gpgsign", "false"),
+        ("push.negotiate", "false"),
+        ("pull.rebase", pull_rebase),
+    ] {
+        git_858(dir, &["config", key, value]);
+    }
+}
+
+/// A bare remote on `main`; `theirs`, a clone that pushes to it; and
+/// `mine`, the clone the app opens (#858).
+struct Remote858 {
+    _dir: tempfile::TempDir,
+    bare: std::path::PathBuf,
+    theirs: std::path::PathBuf,
+    mine: std::path::PathBuf,
+}
+
+/// [`Remote858`] with f.txt ("one") on `main` in all three; `mine` pulls
+/// the way `pull_rebase` says.
+fn remote_858(pull_rebase: &str) -> Remote858 {
+    let dir = tempfile::tempdir().unwrap();
+    let bare = dir.path().join("remote.git");
+    let theirs = dir.path().join("theirs");
+    let mine = dir.path().join("mine");
+    std::fs::create_dir(&theirs).unwrap();
+    git_858(
+        dir.path(),
+        &["init", "-q", "--bare", "-b", "main", "remote.git"],
+    );
+    git_858(&theirs, &["init", "-q", "-b", "main"]);
+    configure_858(&theirs, "false");
+    std::fs::write(theirs.join("f.txt"), "one\n").unwrap();
+    git_858(&theirs, &["add", "-A"]);
+    git_858(&theirs, &["commit", "-qm", "one"]);
+    git_858(
+        &theirs,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    git_858(&theirs, &["push", "-q", "-u", "origin", "main"]);
+    git_858(dir.path(), &["clone", "-q", bare.to_str().unwrap(), "mine"]);
+    configure_858(&mine, pull_rebase);
+    Remote858 {
+        _dir: dir,
+        bare,
+        theirs,
+        mine,
+    }
+}
+
+/// Commit `text` to `file` in `repo`.
+fn commit_858(repo: &std::path::Path, file: &str, text: &str) {
+    std::fs::write(repo.join(file), text).unwrap();
+    git_858(repo, &["add", "-A"]);
+    git_858(repo, &["commit", "-qm", file]);
+}
+
+/// Assert the status bar and the Source Control panel each carry one line.
+fn assert_one_line_858(app: &App) {
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    for text in [&app.status, &feedback] {
+        assert!(!text.contains('\n'), "one line: {text:?}");
+        assert!(!text.contains("From "), "no fetch source: {text:?}");
+        assert!(!text.contains("To "), "no push destination: {text:?}");
+    }
+}
+
+/// #858: Pull reported git's whole text, "Pulled: Updating a..b\n
+/// Fast-forward\n f.txt | 1 +\n 1 file changed…", squashed into the status
+/// row. It now reports git's result line; the Git Output log keeps the
+/// rest.
+#[test]
+fn a_fast_forward_pull_reports_fast_forward_on_one_line() {
+    let r = remote_858("false");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(app.status, "Pulled: Fast-forward");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pulled: Fast-forward")
+    );
+    assert!(!app.source_control.commit_feedback_is_error);
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.starts_with("$ git pull")
+            && logged.contains("Updating ")
+            && logged.contains("f.txt"),
+        "the Git Output log keeps git's whole text: {logged:?}"
+    );
+}
+
+/// #858: a pull that rebases prints only to stderr: the fetch's `From
+/// <url>` and ref update, then `Rebasing (1/1)` redrawn into "Successfully
+/// rebased …". It reported "Pulled: From /…" and the rest; now the result.
+#[test]
+fn a_rebasing_pull_reports_the_rebase_not_the_fetch() {
+    let r = remote_858("true");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    commit_858(&r.mine, "g.txt", "mine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status,
+        "Pulled: Successfully rebased and updated refs/heads/main."
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858 negative: a pull with nothing to bring in still says so, rather
+/// than an empty "Pulled".
+#[test]
+fn a_pull_that_is_already_up_to_date_still_says_so() {
+    let r = remote_858("false");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(app.status, "Pulled: Already up to date.");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pulled: Already up to date.")
+    );
+}
+
+/// #858 negative: a pull that fails still says it failed, with git's
+/// `fatal:` line, and one stopped on conflicts still names them.
+#[test]
+fn a_failed_or_conflicted_pull_still_says_why() {
+    let r = remote_858("false");
+    git_858(&r.mine, &["config", "pull.ff", "only"]);
+    commit_858(&r.theirs, "f.txt", "one\ntheirs\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    commit_858(&r.mine, "f.txt", "one\nmine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Pull failed: fatal: Not possible to fast-forward, aborting."
+    );
+    assert_one_line_858(&app);
+
+    git_858(&r.mine, &["config", "pull.ff", "false"]);
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Pull: 1 conflict (f.txt)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pull: 1 conflict (f.txt)")
+    );
+}
+
+/// #858: Sync reported "Synced" in the status bar and, in the panel,
+/// "synced (pulled: <git pull's text> | pushed: <git push's text>)" with
+/// every line of both. It now names both halves on one line, the way
+/// Commit & Push does; the Git Output log keeps git's text.
+#[test]
+fn a_sync_reports_both_halves_on_one_line() {
+    let r = remote_858("false");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    commit_858(&r.mine, "g.txt", "mine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert!(
+        app.status
+            .starts_with("Synced: pulled: Merge made by the 'ort' strategy. | pushed: ")
+            && app.status.ends_with(" main -> main"),
+        "{:?}",
+        app.status
+    );
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some(app.status.replacen("Synced", "synced", 1).as_str())
+    );
+    assert_one_line_858(&app);
+    let log = app.git_output_log.join("\n");
+    assert!(
+        log.contains("$ git pull") && log.contains("$ git push") && log.contains("To "),
+        "{log:?}"
+    );
+}
+
+/// #858 negative: a sync with nothing to move still reports both halves,
+/// never an empty "Synced".
+#[test]
+fn a_sync_with_nothing_to_move_still_reports_both_halves() {
+    let r = remote_858("false");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status,
+        "Synced: pulled: Already up to date. | pushed: Everything up-to-date"
+    );
+}
+
+/// #858: a sync whose push the remote refuses reported "pull ok; push
+/// failed: " and git push's whole stderr (`remote:` lines, `To <url>`,
+/// the rejected ref, `error:`). It now names the rejected ref.
+#[test]
+fn a_sync_whose_push_is_refused_names_the_rejected_ref() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = remote_858("false");
+    let hook = r.bare.join("hooks").join("pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\necho 'no pushes today' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    commit_858(&r.mine, "g.txt", "mine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Sync: pull ok; push failed: [remote rejected] main -> main (pre-receive hook declined)"
+    );
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pull ok; push failed: [remote rejected] main -> main (pre-receive hook declined)")
+    );
+    let log = app.git_output_log.join("\n");
+    assert!(log.contains("no pushes today"), "{log:?}");
+}
+
+/// #858: Fetch and Push (Force) reported git's first line, the fetch's
+/// `From <url>` or the push's `To <url>`; they now report the ref update,
+/// as Push does.
+#[test]
+fn fetch_and_force_push_report_the_ref_update_not_the_url() {
+    use crate::widgets::scm_menu::ScmAction;
+    let r = remote_858("false");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.dispatch_scm_action(ScmAction::Fetch);
+    wait_for_git_net(&mut app);
+    assert!(
+        app.status.starts_with("Fetched: ") && app.status.ends_with(" main -> origin/main"),
+        "{:?}",
+        app.status
+    );
+    assert_one_line_858(&app);
+
+    git_858(&r.mine, &["merge", "-q", "--ff-only", "origin/main"]);
+    commit_858(&r.mine, "g.txt", "mine\n");
+    git_858(&r.mine, &["push", "-q"]);
+    git_858(
+        &r.mine,
+        &["commit", "-q", "--amend", "-m", "g.txt, reworded"],
+    );
+    app.dispatch_scm_action(ScmAction::PushForce);
+    wait_for_git_net(&mut app);
+    assert!(
+        app.status.starts_with("Force-pushed: ")
+            && app.status.ends_with(" main -> main (forced update)"),
+        "{:?}",
+        app.status
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: switching branch with a local edit reported git's stdout, the
+/// `M\tseed.txt` list of carried-over changes, as "Switched to: M…"; a
+/// refused switch reported git's whole error. Both are one line now.
+#[test]
+fn switching_branch_reports_one_line() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    configure_858(tmp.path(), "false");
+    git_858(tmp.path(), &["branch", "feature"]);
+    std::fs::write(tmp.path().join("seed.txt"), "edited\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Switched to feature");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Switched to feature")
+    );
+
+    // `main` moves on under the edit: switching back would overwrite it.
+    git_858(tmp.path(), &["stash", "-q"]);
+    git_858(tmp.path(), &["checkout", "-q", "main"]);
+    commit_858(tmp.path(), "seed.txt", "main moved\n");
+    git_858(tmp.path(), &["checkout", "-q", "feature"]);
+    git_858(tmp.path(), &["stash", "pop", "-q"]);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Branch: error: Your local changes to the following files would be overwritten by checkout:"
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: popping the latest stash reported git's `git status` dump
+/// ("Stash popped: On branch main\nChanges not staged…"); it now reports
+/// the stash it dropped.
+#[test]
+fn popping_a_stash_reports_the_dropped_entry_on_one_line() {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), "stashed\n").unwrap();
+    git_858(tmp.path(), &["stash", "-q"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.stash_pop_source_control();
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert!(
+        app.status
+            .starts_with("Stash popped: Dropped refs/stash@{0} ("),
+        "{:?}",
+        app.status
+    );
+    assert!(
+        app.source_control
+            .commit_feedback
+            .as_deref()
+            .is_some_and(|f| f.starts_with("popped: Dropped refs/stash@{0} (")),
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: View Changes vs previous on a one-commit repository reported git's
+/// three-line error; it now reports its `fatal:` line.
+#[test]
+fn a_failed_diff_view_names_git_s_fatal_line() {
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.view_previous_commit_diff_source_control();
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "View Changes vs previous failed: fatal: ambiguous argument 'HEAD~1': unknown revision or path not in the working tree."
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: a failed clone reported "Clone failed: Cloning into 'notrepo'...\n
+/// fatal: …\nfatal: …\n\nPlease make sure…"; it now reports git's first
+/// `fatal:` line.
+#[test]
+fn a_failed_clone_names_git_s_fatal_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let not_a_repo = tmp.path().join("elsewhere").join("notrepo");
+    std::fs::create_dir(&ws).unwrap();
+    std::fs::create_dir_all(&not_a_repo).unwrap();
+    let url = format!("file://{}", not_a_repo.display());
+    let mut app = App::new(ws).unwrap();
+    let err = crate::git::clone_into(tmp.path(), &url)
+        .map(|_| ())
+        .expect_err("nothing to clone");
+    assert!(err.contains('\n'), "git's text runs to lines: {err:?}");
+    app.finish_clone(Err(err), tmp.path());
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        format!(
+            "Clone failed: fatal: '{}' does not appear to be a git repository",
+            not_a_repo.display()
+        )
+    );
+    assert_one_line_858(&app);
+}
