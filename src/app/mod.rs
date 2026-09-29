@@ -3145,8 +3145,16 @@ pub struct App {
         std::sync::mpsc::Receiver<crate::codeql_query::RunStatus>,
         std::time::Instant,
     )>,
+    /// Raised to stop the query run in flight: its `codeql` is killed and
+    /// the run recorded as cancelled (#578).
+    codeql_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The file name of the query in flight, for its status-bar chip.
+    codeql_run_name: String,
     /// Queries "Run Queries in Pack" has yet to start, in order (#578).
-    codeql_run_queue: std::collections::VecDeque<PathBuf>,
+    codeql_run_queue: std::collections::VecDeque<crate::codeql_query::QueuedRun>,
+    /// "Run Query on Multiple Databases" being set up (#578): the query,
+    /// its text, and the databases checked so far.
+    codeql_multi_db: Option<(PathBuf, String, Vec<PathBuf>)>,
     /// How many queries the pack run holds and how many have failed so
     /// far, for the status line; the total is 0 when no pack run is on.
     codeql_batch: (usize, usize),
@@ -3160,13 +3168,32 @@ pub struct App {
     codeql_log_summary: Option<(std::sync::mpsc::Receiver<Result<(), String>>, PathBuf)>,
     /// The evaluator log viewer being prepared (#578): where the rendered
     /// tree (or why there is none) arrives, and the tab label to show it in.
-    codeql_log_viewer: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
+    codeql_log_viewer: Option<CodeqlLogViewerJob>,
+    /// The Model Editor's endpoints being read (#578): the endpoints or why
+    /// not, and the database and language they are for.
+    codeql_model_job: Option<CodeqlModelJob>,
     /// The performance comparison being prepared (#578): where the rendered
     /// table (or why there is none) arrives, and the tab label to show it in.
     codeql_perf_compare: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
+    /// The query help being rendered (#578): where the outcome arrives,
+    /// the Markdown file to preview once it lands, and the query's name.
+    codeql_query_help: Option<CodeqlQueryHelp>,
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
+    /// A CodeQL document being made (#578: View CFG, the alert and result
+    /// views): the file it writes or why not, and the status lines for
+    /// each.
+    codeql_doc_job: Option<CodeqlDocJob>,
+    /// The CodeQL results table last walked (#578), so the walk goes on
+    /// once the code it opened has the focus.
+    codeql_results_walk: Option<PathBuf>,
+    /// The AST being read for the AST Viewer (#578): the tree or why not,
+    /// and the view it fills in.
+    codeql_ast_job: Option<(
+        std::sync::mpsc::Receiver<Result<crate::codeql_ast::AstTree, String>>,
+        crate::codeql_ast::AstView,
+    )>,
     /// `codeql_cli_path` from settings (#578), kept to notice a reload
     /// changing it.
     codeql_cli_setting: Option<String>,
@@ -4076,6 +4103,11 @@ pub struct App {
     /// The SARIF location a Locate prompt is open for (#577): its URI and
     /// the 1-based line and column to land on.
     sarif_locate_pending: Option<(String, i64, i64)>,
+    /// A SARIF source download in flight (#577): the location's URI, its
+    /// 1-based line and column, and the body or why it failed.
+    sarif_download: Option<std::sync::mpsc::Receiver<SarifDownload>>,
+    /// Fetches a URL's body; a field so tests can stand in for the network.
+    sarif_fetch: fn(&str) -> Result<Vec<u8>, String>,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -4135,6 +4167,8 @@ pub struct App {
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
     /// encoding / EOL / language → their respective "change" pickers.
     status_diag_rect: Rect,
+    /// The running CodeQL query's status-bar chip; a click cancels it (#578).
+    status_codeql_rect: Rect,
     status_indent_rect: Rect,
     status_encoding_rect: Rect,
     status_eol_rect: Rect,
@@ -4938,6 +4972,37 @@ struct RemoteLaunch {
     adopted: Option<crate::remote::AdoptedMaster>,
 }
 
+/// A finished SARIF source download (#577).
+struct SarifDownload {
+    uri: String,
+    /// 1-based position to open at.
+    line: i64,
+    col: i64,
+    body: Result<Vec<u8>, String>,
+}
+
+/// GET `url`'s body, up to 64 MiB, for a SARIF location's source.
+fn fetch_sarif_source(url: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let resp = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .get(url)
+        .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(404, _) => String::from("not found (a private repository?)"),
+            ureq::Error::Status(code, _) => format!("HTTP {code}"),
+            other => other.to_string(),
+        })?;
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(64 << 20)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
 fn split_at_char_count(s: &str, count: usize) -> (String, String) {
     let left: String = s.chars().take(count).collect();
     let right: String = s.chars().skip(count).collect();
@@ -5464,14 +5529,22 @@ impl App {
             ext_index_refresh,
             codeql_program: PathBuf::from("codeql"),
             codeql_run: None,
+            codeql_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            codeql_run_name: String::new(),
             codeql_run_queue: std::collections::VecDeque::new(),
             codeql_batch: (0, 0),
+            codeql_multi_db: None,
             codeql_upgrade: None,
             codeql_version: None,
             codeql_log_summary: None,
             codeql_log_viewer: None,
+            codeql_model_job: None,
             codeql_perf_compare: None,
+            codeql_query_help: None,
             codeql_pack_job: None,
+            codeql_ast_job: None,
+            codeql_doc_job: None,
+            codeql_results_walk: None,
             codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
             codeql_cli_source: crate::codeql_cli::Source::Fallback,
             codeql_cli_latest: None,
@@ -5675,6 +5748,7 @@ impl App {
             shortcuts_modal: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
+            status_codeql_rect: Rect::default(),
             status_indent_rect: Rect::default(),
             status_encoding_rect: Rect::default(),
             status_eol_rect: Rect::default(),
@@ -5909,6 +5983,8 @@ impl App {
             gh_program: PathBuf::from("gh"),
             dismiss_target: None,
             sarif_locate_pending: None,
+            sarif_download: None,
+            sarif_fetch: fetch_sarif_source,
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
@@ -7894,8 +7970,15 @@ impl App {
     /// happens when a tab's edit_seq has actually moved, so the cost
     /// scales with edits, not with frames.
     pub fn sync_lsp(&mut self) {
-        if self.lsp.is_none() {
+        let Some(lsp) = self.lsp.as_ref() else {
             return;
+        };
+        // A language server that exited was restarted (#694). It knows no
+        // documents, so forget which ones were sent: every open tab goes out
+        // again as a fresh open below, as it does for a new manager.
+        if lsp.take_servers_restarted() {
+            self.lsp_last_seen.clear();
+            self.lsp_progress.clear();
         }
         let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         // `(is_open, path, text, seq, viewport)`. The viewport `(start, end)`
@@ -18776,6 +18859,28 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // A running CodeQL query (#578): what runs and for how long, and a
+        // click on it cancels the run.
+        let mut codeql_chip: Option<(u16, u16)> = None;
+        if let Some((_, since)) = &self.codeql_run {
+            let secs = since.elapsed().as_secs();
+            let text = format!(
+                " \u{27f3} CodeQL {} {}:{:02} \u{2715} ",
+                self.codeql_run_name,
+                secs / 60,
+                secs % 60
+            );
+            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            codeql_chip = Some((x, text.chars().count() as u16));
+            spans.push(Span::styled(
+                text,
+                Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0x2b, 0x5d, 0x8a)))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
         if let Some((_, _, started)) = &self.recording {
             // A terminal recording (#356) is the other state a user can
             // leave on; it is not the macro recorder, so it has its own
@@ -18958,6 +19063,15 @@ impl App {
         let status_rect = outer[2];
         // The F1 cheat-sheet is gone; F1 / the palette still open Shortcuts.
         self.shortcuts_hit_rect = None;
+        self.status_codeql_rect = match codeql_chip {
+            Some((x, w)) if status_h > 0 && x < status_rect.width => Rect {
+                x: status_rect.x + x,
+                y: status_rect.y,
+                width: w.min(status_rect.width - x),
+                height: 1,
+            },
+            _ => Rect::default(),
+        };
         // Diagnostics hit rect (left group), for click-to-PROBLEMS.
         self.status_diag_rect = if status_h > 0 {
             Rect {
@@ -19101,6 +19215,11 @@ impl App {
             // the frame edge, it went on answering for cells that now read
             // "Ln 1, Col 1" — opening PROBLEMS from a click on the position
             // readout, with the counts it claimed not even on screen.
+            if self.status_codeql_rect.x >= rx {
+                self.status_codeql_rect = Rect::default();
+            } else if self.status_codeql_rect.right() > rx {
+                self.status_codeql_rect.width = rx - self.status_codeql_rect.x;
+            }
             if self.status_diag_rect.x >= rx {
                 // Entirely behind the cluster: not on screen, so not a target.
                 self.status_diag_rect = Rect::default();
@@ -22779,6 +22898,53 @@ impl App {
         self.status = String::from("Running CodeQL tests");
     }
 
+    /// CodeQL: Accept Test Output (#578): make a failing CodeQL test's
+    /// actual results its expected ones, through `codeql test accept`. The
+    /// test is the one the open file belongs to (its `.ql`, `.qlref`,
+    /// `.expected` or `.actual`), else every CodeQL test the last run
+    /// failed. Only tests a run left `.actual` output for are accepted.
+    fn accept_codeql_test_output(&mut self) {
+        use crate::testing::codeqltest as ct;
+        let tests: Vec<PathBuf> = match self.editor.path.as_deref().and_then(ct::test_for_file) {
+            Some(test) => vec![test],
+            None => self
+                .testing
+                .failed_names()
+                .into_iter()
+                .map(|id| self.active_test_root.join(ct::id_path(&id)))
+                .filter(|t| t.is_file())
+                .collect(),
+        };
+        if tests.is_empty() {
+            self.status = String::from(
+                "No CodeQL test to accept: open one of its files, or run the tests first",
+            );
+            return;
+        }
+        let ready: Vec<PathBuf> = tests
+            .into_iter()
+            .filter(|t| ct::actual_output(t).is_file())
+            .collect();
+        if ready.is_empty() {
+            self.status = String::from(
+                "No actual output to accept: run the test first, and accept it once it fails",
+            );
+            return;
+        }
+        let what = match ready.as_slice() {
+            [one] => one
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            many => format!("{} tests", many.len()),
+        };
+        self.start_codeql_pack_job(
+            ct::accept_args(&ready),
+            format!("Accepting the output of {what}\u{2026}"),
+            format!("Accepted the output of {what} as expected"),
+            format!("Could not accept the output of {what}"),
+        );
+    }
+
     /// Point every CodeQL run at `program`: the side bar's queries and,
     /// through the test worker, the Testing view's CodeQL tests (#578).
     /// The one place the configured `codeql` changes, so the two never
@@ -23188,16 +23354,19 @@ impl App {
     /// On a database row, Delete removes it, F2 renames it, `e` shows its
     /// folder in the Explorer, `u` upgrades it and `w` adds its source to
     /// the workspace. On a query history row, Delete removes it, F2
-    /// renames it, `v` opens its query and `o` its results directory. `s`
+    /// renames it, `v` opens its query, `t` the query's text as it ran and
+    /// `o` its results directory. `s`
     /// steps the query history's sort order within that section and the
     /// databases' anywhere else. `n` creates a query, in the selected pack
     /// when there is one. `r` on a pack or one of its queries runs every
-    /// query in the pack; Esc then first cancels the ones still queued.
+    /// query in the pack; Esc then first cancels the ones still queued, and
+    /// once none are, the running query.
     /// In the Variant Analysis Repositories section `a` adds a repository
     /// (into the selected list), `l` a list, `o` an owner, `s` adds the
     /// repositories a GitHub Code Search finds to the selected list and `g`
     /// opens the selected repository or owner on GitHub; on a submitted run,
-    /// Enter opens its report, `v` its results and `x` exports them; Enter selects what a run
+    /// Enter opens its report, `v` its results, `x` exports them, `c` copies
+    /// its repository list and `l` opens its logs on GitHub Actions; Enter selects what a run
     /// targets, Space folds a list, F2 renames a list and Delete removes an
     /// entry, asking first for a list.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
@@ -23209,6 +23378,7 @@ impl App {
         let in_va = self.codeql.selected_section() == Some(Section::VariantAnalysis);
         match key.code {
             KeyCode::Esc if !self.codeql_run_queue.is_empty() => self.cancel_codeql_queue(),
+            KeyCode::Esc if self.codeql_run.is_some() => self.cancel_codeql_run(),
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
             KeyCode::Down => self.codeql.move_selection(true),
@@ -23239,6 +23409,15 @@ impl App {
                 } else if let Some(Item::List(i)) = va_item {
                     self.prompt_rename_codeql_variant_list(i);
                 }
+            }
+            KeyCode::Char('m') if self.codeql.selected_model_endpoint().is_some() => {
+                self.model_codeql_endpoint(self.codeql.selected_model_endpoint());
+            }
+            KeyCode::Char('c') if self.codeql.selected_variant_run().is_some() => {
+                self.copy_codeql_variant_repo_list(self.codeql.selected_variant_run());
+            }
+            KeyCode::Char('l') if self.codeql.selected_variant_run().is_some() => {
+                self.view_codeql_variant_logs(self.codeql.selected_variant_run());
             }
             KeyCode::Char('a') if in_va => self.prompt_add_codeql_variant_repo(),
             KeyCode::Char('l') if in_va => self.prompt_add_codeql_variant_list(),
@@ -23274,6 +23453,11 @@ impl App {
             KeyCode::Char('o') => {
                 if let Some(i) = run {
                     self.open_codeql_history_results_dir(i);
+                }
+            }
+            KeyCode::Char('t') => {
+                if let Some(i) = run {
+                    self.view_codeql_history_query_text(i);
                 }
             }
             KeyCode::Char('s')
@@ -23379,6 +23563,9 @@ impl App {
                     crate::codeql_query::RunStatus::Running => {
                         self.status = String::from("That query is still running");
                     }
+                    crate::codeql_query::RunStatus::Cancelled => {
+                        self.status = String::from("That run was cancelled");
+                    }
                 }
             }
             Hit::Action(Action::TogglePack(i)) => self.codeql.toggle_pack(i),
@@ -23423,8 +23610,86 @@ impl App {
             Hit::Action(Action::AddVariantOwner) => self.prompt_add_codeql_variant_owner(),
             Hit::Action(Action::OpenVariantConfig) => self.open_codeql_variant_config(),
             Hit::Action(Action::VariantRun(i)) => self.open_codeql_variant_run(i),
-            Hit::Action(Action::ViewAst) => {
-                self.status = String::from("The AST viewer is not available yet (#578)");
+            Hit::Action(Action::ViewAst) => self.view_codeql_ast(),
+            Hit::Action(Action::OpenModelEditor) => self.open_codeql_model_editor(),
+            Hit::Action(Action::ModelGroup(i)) => {
+                if let Some(view) = self.codeql.model.as_mut()
+                    && let Some(group) = view.endpoints.get(i).map(|e| e.group())
+                {
+                    view.toggle(&group);
+                }
+            }
+            Hit::Action(Action::ModelEndpoint(i)) => {
+                let Some(e) = self
+                    .codeql
+                    .model
+                    .as_ref()
+                    .and_then(|v| v.endpoints.get(i))
+                    .cloned()
+                else {
+                    return;
+                };
+                let modeled = if e.supported {
+                    "modeled by CodeQL"
+                } else {
+                    "not modeled"
+                };
+                let Some(loc) = e.location.clone() else {
+                    self.status = format!("{}: {modeled}; no location", e.label());
+                    return;
+                };
+                let Some(path) = self.codeql_source_file(&loc.path) else {
+                    self.status = format!("{} is not on this machine", loc.path.display());
+                    return;
+                };
+                let (line, column) = (loc.line.max(1) - 1, loc.column.max(1) - 1);
+                self.status = match self.open_at(&path, line as usize, column as usize) {
+                    Ok(()) => format!("{} ({}): {modeled}", e.label(), e.kind),
+                    Err(err) => format!("{}: {err}", path.display()),
+                };
+            }
+            Hit::Action(Action::ClearEvalLog) => {
+                self.codeql.evallog = None;
+                self.status = String::from("Cleared the evaluator log");
+            }
+            Hit::Action(Action::EvalPredicate(i)) => {
+                if let Some(view) = self.codeql.evallog.as_mut() {
+                    view.toggle(i);
+                }
+            }
+            Hit::Action(Action::EvalDependency(target)) => match target {
+                Some(i) => {
+                    if let Some(view) = self.codeql.evallog.as_mut() {
+                        view.open.insert(i);
+                    }
+                    self.codeql.select_evallog_predicate(i);
+                }
+                None => {
+                    self.status =
+                        String::from("That predicate is not in this log (it was cached or inlined)")
+                }
+            },
+            Hit::Action(Action::ClearAst) => {
+                self.codeql.ast = None;
+                self.status = String::from("Cleared the AST");
+            }
+            Hit::Action(Action::AstNode(i)) => {
+                let Some(view) = self.codeql.ast.as_mut() else {
+                    return;
+                };
+                view.toggle(i);
+                match view.target(i) {
+                    Some((path, line, column)) if path.is_file() => {
+                        let (line, column) = (line.max(1) - 1, column.max(1) - 1);
+                        if let Err(e) = self.open_at(&path, line as usize, column as usize) {
+                            self.status = format!("{}: {e}", path.display());
+                        }
+                    }
+                    Some((path, ..)) => {
+                        self.status = format!("{} is not on this machine", path.display());
+                    }
+                    None => {}
+                }
             }
         }
     }
@@ -24874,6 +25139,30 @@ impl App {
         }
     }
 
+    /// "View Query Text" (#578): the query of history entry `index` as it
+    /// was when it ran, which the file itself may no longer be.
+    fn view_codeql_history_query_text(&mut self, index: usize) {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.get(index) else {
+            return;
+        };
+        let text = crate::codeql_query::query_text_path(&entry.output, &entry.query);
+        if !text.is_file() {
+            self.status = format!(
+                "{} ran before croft kept query text; v opens the query file",
+                entry.query_name()
+            );
+            return;
+        }
+        match self.editor.open(&text) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = format!("{} as it was when it ran", entry.query_name());
+            }
+            Err(e) => self.status = format!("{}: {e}", text.display()),
+        }
+    }
+
     /// The evaluator log of history entry `index`, or why there is none: a
     /// run croft made before it kept logs, or one still going.
     fn codeql_history_log(&mut self, index: usize) -> Option<PathBuf> {
@@ -24894,6 +25183,38 @@ impl App {
     /// VS Code's "Show Evaluator Log (Raw JSON)" for history entry `index`.
     fn show_codeql_evaluator_log(&mut self, index: usize) {
         let Some(log) = self.codeql_history_log(index) else {
+            return;
+        };
+        match self.editor.open(&log) {
+            Ok(()) => self.sync_open_file_poll_mtime(),
+            Err(e) => self.status = format!("{}: {e}", log.display()),
+        }
+    }
+
+    /// VS Code's "Show Query Log" for history entry `index`: the newest
+    /// log `codeql` wrote into the run's `logs` folder. Runs croft made
+    /// before it passed `--logdir` have none.
+    fn show_codeql_query_log(&mut self, index: usize) {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.get(index) else {
+            return;
+        };
+        if entry.status == crate::codeql_query::RunStatus::Running {
+            self.status = format!("{} is still running", entry.query_name());
+            return;
+        }
+        let logs = std::fs::read_dir(crate::codeql_query::query_log_dir(&entry.output))
+            .map(|dir| {
+                dir.flatten()
+                    .filter_map(|e| {
+                        let meta = e.metadata().ok().filter(|m| m.is_file())?;
+                        Some((e.path(), meta.modified().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(log) = crate::codeql_query::newest_query_log(logs) else {
+            self.status = format!("{} has no query log", entry.query_name());
             return;
         };
         match self.editor.open(&log) {
@@ -24998,14 +25319,11 @@ impl App {
             .unwrap_or_default();
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        let name = query.clone();
         std::thread::spawn(move || {
-            let tree = Self::codeql_log_predicates(&program, &log)
-                .map(|parsed| crate::codeql_evallog::render(&name, &parsed));
-            let _ = tx.send(tree);
+            let _ = tx.send(Self::codeql_log_predicates(&program, &log));
         });
         self.status = String::from("Reading the evaluator log\u{2026}");
-        self.codeql_log_viewer = Some((rx, format!("Evaluator Log ({query})")));
+        self.codeql_log_viewer = Some((rx, query));
     }
 
     /// Show a prepared evaluator log tree (#578) in a tab with every
@@ -25021,10 +25339,21 @@ impl App {
                 Err(String::from("the viewer stopped unexpectedly"))
             }
         };
-        let Some((_, label)) = self.codeql_log_viewer.take() else {
+        let Some((_, query)) = self.codeql_log_viewer.take() else {
             return false;
         };
-        match outcome.and_then(|text| {
+        let label = format!("Evaluator Log ({query})");
+        match outcome.and_then(|predicates| {
+            let text = crate::codeql_evallog::render(&query, &predicates);
+            // The side bar's Evaluator Log Viewer shows the same tree.
+            self.codeql.evallog = Some(crate::codeql_evallog::LogView {
+                query: query.clone(),
+                predicates,
+                ..Default::default()
+            });
+            self.codeql
+                .collapsed
+                .remove(&crate::widgets::codeql::Section::EvaluatorLog);
             self.editor
                 .open_text_buffer(Path::new(&label), &text)
                 .map_err(|e| e.to_string())
@@ -25115,6 +25444,193 @@ impl App {
         true
     }
 
+    /// VS Code's "Export Results" (#578): ask where to copy the results of
+    /// the selected history entry, else of the newest successful run,
+    /// suggesting `<query-stem>-results.<csv|sarif>` in the workspace.
+    fn prompt_export_codeql_results(&mut self) {
+        use crate::codeql_query::{History, RunStatus};
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let history = History::load(&Self::codeql_history_path());
+        let Some(entry) = self
+            .codeql
+            .selected_history()
+            .filter(|&i| i < history.entries.len())
+            .or_else(|| history.newest_success())
+            .and_then(|i| history.entries.get(i))
+        else {
+            self.status = String::from("There is no successful CodeQL query run to export");
+            return;
+        };
+        if entry.status != RunStatus::Succeeded {
+            self.status = format!(
+                "{} did not succeed, so it has no results to export",
+                entry.query_name()
+            );
+            return;
+        }
+        if !entry.output.is_file() {
+            self.status = format!("The results of {} are gone", entry.query_name());
+            return;
+        }
+        let dest = self
+            .workspace_root()
+            .join(crate::codeql_query::export_file_name(
+                &entry.query,
+                &entry.output,
+            ));
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlExportResults {
+                    output: entry.output.clone(),
+                },
+                format!("Export the results of {}", entry.query_name()),
+                "the file to copy the results to",
+            )
+            .with_value(dest.display().to_string()),
+        );
+    }
+
+    /// Copy the results at `output` to the typed path; an existing file is
+    /// never overwritten.
+    fn submit_export_codeql_results(&mut self, output: &Path, value: &str) {
+        if value.trim().is_empty() {
+            self.status = String::from("Name a file to export the results to");
+            return;
+        }
+        let dest = self.typed_path(value);
+        // Open the results first: a missing or unreadable run then fails
+        // before anything is created at the destination.
+        let mut src = match std::fs::File::open(output) {
+            Ok(src) => src,
+            Err(e) => {
+                self.status = format!("Could not read the results at {}: {e}", output.display());
+                return;
+            }
+        };
+        // `create_new` refuses an existing file (or a dangling symlink) in
+        // the same step that creates it, so nothing can slip in between a
+        // check and the copy.
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest);
+        let mut file = match created {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.status = format!(
+                    "{} already exists; export the results to a new file",
+                    dest.display()
+                );
+                return;
+            }
+            Err(e) => {
+                self.status = format!("Could not export the results to {}: {e}", dest.display());
+                return;
+            }
+        };
+        // A copy failing midway leaves the partial file in place: removing
+        // it by name could delete a file another process put there since.
+        self.status = match std::io::copy(&mut src, &mut file) {
+            Ok(_) => format!("Exported results to {}", dest.display()),
+            Err(e) => format!(
+                "Could not finish exporting to {} ({e}); the file there is incomplete",
+                dest.display()
+            ),
+        };
+    }
+
+    /// VS Code's "CodeQL: Preview Query Help" (#578): the help of the open
+    /// `.ql` query, else of the query the selected or newest history entry
+    /// ran, rendered to Markdown by `codeql generate query-help` on a worker
+    /// thread and shown in the Markdown preview.
+    fn preview_codeql_query_help(&mut self) {
+        let query = match self.editor.path.clone() {
+            Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
+            _ => {
+                let Some(i) = self.current_codeql_history() else {
+                    self.status = String::from("Open a .ql query to preview its help");
+                    return;
+                };
+                let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+                let Some(query) = history.entries.get(i).map(|e| e.query.clone()) else {
+                    return;
+                };
+                query
+            }
+        };
+        if self.codeql_query_help.is_some() {
+            self.status = String::from("Query help is already being rendered");
+            return;
+        }
+        let stem = query
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let name = query
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let help = croft_cache_dir()
+            .join("codeql")
+            .join("help")
+            .join(format!("{stem}.md"));
+        let program = self.codeql_program.clone();
+        let args = crate::codeql_query::query_help_args(&query, &help);
+        let out = help.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // An earlier preview's file must not stand in for help the CLI
+            // did not write this time.
+            let _ = std::fs::remove_file(&out);
+            let outcome = out
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .map_err(|e| format!("{}: {e}", out.display()))
+                .and_then(|()| Self::codeql_command(&program, &args));
+            let _ = tx.send(outcome);
+        });
+        self.status = format!("Rendering the help of {name}\u{2026}");
+        self.codeql_query_help = Some((rx, help, name));
+    }
+
+    /// Preview rendered query help (#578), or say the query has none: the
+    /// CLI fails, or writes nothing, when there is no `.qhelp` or `.md`
+    /// beside the query.
+    pub fn drain_codeql_query_help(&mut self) -> bool {
+        let Some((rx, _, _)) = self.codeql_query_help.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the help rendering stopped unexpectedly"))
+            }
+        };
+        let Some((_, help, name)) = self.codeql_query_help.take() else {
+            return false;
+        };
+        let written = std::fs::metadata(&help).is_ok_and(|m| m.len() > 0);
+        match outcome {
+            Err(why) => self.status = format!("{name} has no query help: {why}"),
+            Ok(()) if !written => {
+                self.status = format!("{name} has no query help (no .qhelp or .md beside it)");
+            }
+            Ok(()) => match self.editor.open(&help) {
+                Ok(()) => {
+                    self.sync_open_file_poll_mtime();
+                    if self.editor.markdown_preview.is_none() {
+                        self.editor.toggle_markdown_preview();
+                    }
+                    self.focus_pane(Pane::Editor);
+                    self.status = format!("Query help for {name}");
+                }
+                Err(e) => self.status = format!("{}: {e}", help.display()),
+            },
+        }
+        true
+    }
+
     /// VS Code's "Compare Results" for history entry `index` (#578): its
     /// table against the latest earlier run of the same query, written
     /// beside its results as a CSV of the rows only one run has, and opened.
@@ -25179,6 +25695,19 @@ impl App {
                 };
             }
             Err(e) => self.status = format!("{}: {e}", out.display()),
+        }
+    }
+
+    /// "CodeQL: Open Query Results Directory" (#578): the folder of the
+    /// Query History run selected in the side bar, else of the newest run.
+    fn open_codeql_results_directory(&mut self) {
+        let index = self
+            .codeql
+            .selected_history()
+            .or_else(|| crate::codeql_query::History::load(&Self::codeql_history_path()).newest());
+        match index {
+            Some(i) => self.open_codeql_history_results_dir(i),
+            None => self.status = String::from("No CodeQL query has run yet"),
         }
     }
 
@@ -25398,6 +25927,59 @@ impl App {
         false
     }
 
+    /// The submitted variant analysis run `index`, else the newest; says
+    /// so when none has been submitted.
+    fn codeql_variant_run(
+        &mut self,
+        index: Option<usize>,
+    ) -> Option<crate::codeql_submit::Submitted> {
+        let runs = crate::codeql_submit::load_submitted(&Self::codeql_variant_runs_path());
+        let run = index.map_or(runs.last(), |i| runs.get(i)).cloned();
+        if run.is_none() {
+            self.status = String::from("No variant analysis has been submitted yet");
+        }
+        run
+    }
+
+    /// Copy the repositories variant analysis run `index` (else the newest)
+    /// covers, one per line (#578).
+    fn copy_codeql_variant_repo_list(&mut self, index: Option<usize>) {
+        let Some(run) = self.codeql_variant_run(index) else {
+            return;
+        };
+        self.status = match crate::codeql_submit::repository_list(&run) {
+            Some(list) => {
+                copy_to_clipboard(&list);
+                format!(
+                    "Copied the {} repositories of variant analysis {}",
+                    list.lines().count(),
+                    run.id
+                )
+            }
+            None => format!(
+                "Variant analysis {} has not reported its repositories yet",
+                run.id
+            ),
+        };
+    }
+
+    /// Open the GitHub Actions run of variant analysis run `index` (else
+    /// the newest), where its logs are (#578).
+    fn view_codeql_variant_logs(&mut self, index: Option<usize>) {
+        let Some(run) = self.codeql_variant_run(index) else {
+            return;
+        };
+        match crate::codeql_submit::workflow_run_url(&run) {
+            Some(url) => self.open_url_for_user(&url),
+            None => {
+                self.status = format!(
+                    "Variant analysis {} has no Actions run yet; GitHub starts one shortly",
+                    run.id
+                )
+            }
+        }
+    }
+
     /// Fetch the results of remembered variant analysis `index` (the newest
     /// when `None`) and open them (#578): each repository that succeeded
     /// with results has its artifact downloaded (once; later opens use the
@@ -25509,7 +26091,9 @@ impl App {
                     .ok_or_else(|| String::from("its results hold neither SARIF nor BQRS"))?;
                 let csv = repo_dir.join("results.csv");
                 if !csv.is_file() {
-                    Self::codeql_command(program, &crate::codeql_query::decode_args(&bqrs, &csv))?;
+                    Self::codeql_decode_sets(program, &bqrs, &csv, &|args| {
+                        Self::codeql_command(program, &args)
+                    })?;
                 }
                 let text = std::fs::read_to_string(&csv).map_err(|e| e.to_string())?;
                 Ok((sha, RepoResults::Table(text)))
@@ -25937,18 +26521,42 @@ impl App {
         true
     }
 
-    /// Run the open `.ql` file on the current database (#578), from the
-    /// buffer, not the disk: an unsaved edit is what the user means.
+    /// Run the open `.ql` query or `.qls` suite on the current database
+    /// (#578). The CLI reads the file from disk, so an unsaved buffer is
+    /// refused rather than silently running the saved text.
     fn run_codeql_query(&mut self) {
         let query = match self.editor.path.clone() {
-            Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
+            Some(p) if p.extension().is_some_and(|e| e == "ql" || e == "qls") => p,
             _ => {
-                self.status = String::from("Open a .ql query to run it");
+                self.status = String::from("Open a .ql query or .qls suite to run it");
                 return;
             }
         };
+        if self.editor.dirty {
+            let name = query
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.status = format!("Save {name} before running it: CodeQL reads it from disk");
+            return;
+        }
         let source = self.editor.lines.join("\n");
         self.run_codeql_file(query, &source);
+    }
+
+    /// VS Code's "CodeQL: Run Query Suite" (#578): the open `.qls` suite on
+    /// the current database, through `database analyze` into SARIF.
+    fn run_codeql_query_suite(&mut self) {
+        if !self
+            .editor
+            .path
+            .as_deref()
+            .is_some_and(crate::codeql_query::is_suite)
+        {
+            self.status = String::from("Open a .qls query suite to run it");
+            return;
+        }
+        self.run_codeql_query();
     }
 
     /// Run `query`, whose text is `source`, on the current database (#578):
@@ -25956,6 +26564,55 @@ impl App {
     /// `query run` into a table decoded as CSV. The run happens on a worker
     /// thread; [`Self::drain_codeql_run`] collects it.
     fn run_codeql_file(&mut self, query: PathBuf, source: &str) {
+        self.run_codeql_file_with(query, source, None);
+    }
+
+    /// [`Self::run_codeql_file`], or with `quick` a quick evaluation of a
+    /// span of `query` through the CLI's query server (#578), recorded in
+    /// the history like any run and decoded to a table.
+    fn run_codeql_file_with(
+        &mut self,
+        query: PathBuf,
+        source: &str,
+        quick: Option<crate::codeql_qs::QuickEval>,
+    ) {
+        let mode = match quick {
+            Some(q) => CodeqlRunMode::Quick(q),
+            None => CodeqlRunMode::Whole,
+        };
+        self.run_codeql_file_on(query, source, mode, None);
+    }
+
+    /// CodeQL: Run Queries in Published Pack (#578): ask which pack.
+    fn prompt_run_codeql_published_pack(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlRunPublishedPack,
+            String::from("Run Queries in Published Pack"),
+            "e.g. codeql/python-queries, scope/name@1.0.0, scope/name:path/in/pack",
+        ));
+    }
+
+    /// Download the pack `reference` names and run it, or the part of it
+    /// after `:`, on the current database into SARIF (#578).
+    fn run_codeql_published_pack(&mut self, reference: &str) {
+        let reference = reference.trim();
+        if crate::codeql_query::published_pack(reference).is_none() {
+            self.status = format!("{reference:?} is not a pack: write scope/name");
+            return;
+        }
+        self.run_codeql_file_on(PathBuf::from(reference), "", CodeqlRunMode::Pack, None);
+    }
+
+    /// [`Self::run_codeql_file_with`] on the database at `database`, or on
+    /// the current one when that is `None`.
+    fn run_codeql_file_on(
+        &mut self,
+        query: PathBuf,
+        source: &str,
+        mode: CodeqlRunMode,
+        database: Option<&Path>,
+    ) {
         use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         if self.codeql_run.is_some() {
             self.status = String::from("A CodeQL query is already running");
@@ -25966,8 +26623,15 @@ impl App {
             return;
         }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
-        let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
-            self.status = String::from("Add a CodeQL database and select it first");
+        let db = match database {
+            Some(path) => store.databases.iter().find(|db| db.path == path).cloned(),
+            None => store.current.and_then(|i| store.databases.get(i)).cloned(),
+        };
+        let Some(db) = db else {
+            self.status = match database {
+                Some(path) => format!("The CodeQL database {} is gone", path.display()),
+                None => String::from("Add a CodeQL database and select it first"),
+            };
             return;
         };
         let started = std::time::SystemTime::now()
@@ -25987,11 +26651,27 @@ impl App {
             n += 1;
             dir = PathBuf::from(format!("{}-{n}", base.display()));
         }
-        let kind = cq::output_for(source);
+        let kind = match mode {
+            CodeqlRunMode::Quick(_) => Output::Table,
+            CodeqlRunMode::Pack => Output::Sarif,
+            CodeqlRunMode::Whole => cq::output_of(&query, source),
+        };
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
             Output::Table => "results.csv",
         });
+        // The query as it is run, for "View Query Text": the file may change
+        // or go before anyone looks back at this run. Read-only, since
+        // editing it would change nothing.
+        let text = cq::query_text_path(&output, &query);
+        if !matches!(mode, CodeqlRunMode::Pack)
+            && let Some(parent) = text.parent()
+            && std::fs::create_dir_all(parent).is_ok()
+            && std::fs::write(&text, source).is_ok()
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&text, std::fs::Permissions::from_mode(0o444));
+        }
         let mut history = History::load(&Self::codeql_history_path());
         history.push(HistoryEntry {
             query: query.clone(),
@@ -26001,39 +26681,1131 @@ impl App {
             seconds: 0,
             status: RunStatus::Running,
             output: output.clone(),
-            name: None,
+            name: match &mode {
+                CodeqlRunMode::Quick(q) => Some(q.title()),
+                _ => None,
+            },
+            results: None,
         });
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
-        let name = query
+        let name = match &mode {
+            CodeqlRunMode::Quick(q) => q.title(),
+            CodeqlRunMode::Pack => query.display().to_string(),
+            CodeqlRunMode::Whole => query
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        // Where the query server looks for the workspace's own packs.
+        let packs: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        // The workspace's model packs (#578), which customize the run.
+        let models = crate::codeql_model::model_pack_args(self.workspace_root());
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // A fresh flag per run, so a late cancel never stops the next one.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.codeql_cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let run = |args: Vec<String>| Self::codeql_command_until(&program, &args, &cancel);
+            let outcome = std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))
+                .and_then(|()| match (mode, kind) {
+                    (CodeqlRunMode::Quick(q), _) => {
+                        let bqrs = dir.join("results.bqrs");
+                        crate::codeql_qs::run_quick_eval(
+                            &program, &db.path, &query, &bqrs, &packs, q.span, q.count, &cancel,
+                        )
+                        .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
+                    }
+                    (CodeqlRunMode::Pack, _) => {
+                        let reference = query.to_string_lossy();
+                        let pack = cq::published_pack(&reference).unwrap_or_default();
+                        run(cq::pack_download_args(&[pack.to_string()])).and_then(|()| {
+                            let mut args = cq::analyze_args(&query, &db.path, &output);
+                            args.extend(models.iter().cloned());
+                            run(args)
+                        })
+                    }
+                    (CodeqlRunMode::Whole, Output::Sarif) => {
+                        let mut args = cq::analyze_args(&query, &db.path, &output);
+                        args.extend(models.iter().cloned());
+                        if cq::is_suite(&query) {
+                            Self::check_codeql_suite(&program, &query).and_then(|()| run(args))
+                        } else {
+                            run(args)
+                        }
+                    }
+                    (CodeqlRunMode::Whole, Output::Table) => {
+                        let bqrs = dir.join("results.bqrs");
+                        let mut args = cq::run_args(&query, &db.path, &bqrs);
+                        args.extend(models.iter().cloned());
+                        run(args)
+                            .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
+                    }
+                });
+            let _ = tx.send(match outcome {
+                Ok(()) => RunStatus::Succeeded,
+                Err(_) if cancel.load(std::sync::atomic::Ordering::SeqCst) => RunStatus::Cancelled,
+                Err(e) => RunStatus::Failed(e),
+            });
+        });
+        self.codeql_run = Some((rx, std::time::Instant::now()));
+        self.codeql_run_name = name.clone();
+        self.status = format!("Running {name} on {}\u{2026}", db.name);
+    }
+
+    /// Refuse suite `suite` when it selects a query whose results are not
+    /// alerts (#578): `database analyze` cannot produce those tables.
+    fn check_codeql_suite(program: &Path, suite: &Path) -> Result<(), String> {
+        let out = std::process::Command::new(program)
+            .args(crate::codeql_query::resolve_suite_args(suite))
+            .output()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        if !out.status.success() {
+            return Err(crate::codeql_query::failure_reason(
+                &String::from_utf8_lossy(&out.stderr),
+            ));
+        }
+        let tables = crate::codeql_query::table_queries_in_suite(
+            &String::from_utf8_lossy(&out.stdout),
+            |p| std::fs::read_to_string(p).ok(),
+        )?;
+        if tables.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "the suite selects queries that are not alert queries ({}); run those on their own",
+            tables.join(", ")
+        ))
+    }
+
+    /// CodeQL: Quick Evaluation, and its count variant (#578): evaluate the
+    /// predicate under the cursor, or the selected expression, of the open
+    /// query on the current database, through the CLI's query server.
+    fn quick_eval_codeql(&mut self, count: bool) {
+        let Some(query) = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| p.extension().is_some_and(|e| e == "ql"))
+        else {
+            self.status = String::from("Open a .ql query to quick-evaluate part of it");
+            return;
+        };
+        if self.editor.dirty {
+            self.status = String::from("Save the query first: the query server reads it from disk");
+            return;
+        }
+        let selection = self.editor.selection.map(|s| s.normalised());
+        let Some((span, label)) = crate::codeql_qs::span_at(
+            &self.editor.lines,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+            selection,
+        ) else {
+            self.status = String::from("Put the cursor on a predicate, or select an expression");
+            return;
+        };
+        let source = self.editor.lines.join("\n");
+        self.run_codeql_file_with(
+            query,
+            &source,
+            Some(crate::codeql_qs::QuickEval { span, count, label }),
+        );
+    }
+
+    /// CodeQL: Debug Query (#578): evaluate the open query up to its first
+    /// breakpoint, the way VS Code's CodeQL debugger stops at one: the
+    /// predicate the breakpoint's line defines or calls is quick-evaluated.
+    /// With no breakpoints the whole query runs.
+    fn debug_codeql_query(&mut self) {
+        let Some(query) = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| p.extension().is_some_and(|e| e == "ql"))
+        else {
+            self.status = String::from("Open a .ql query to debug it");
+            return;
+        };
+        let lines: Vec<usize> = self
+            .editor
+            .breakpoints
+            .get(&query)
+            .map(|b| b.iter().copied().collect())
+            .unwrap_or_default();
+        if lines.is_empty() {
+            self.run_codeql_query();
+            return;
+        }
+        if self.editor.dirty {
+            self.status = String::from("Save the query first: the query server reads it from disk");
+            return;
+        }
+        let target = lines.iter().find_map(|&line| {
+            let text = self.editor.lines.get(line.checked_sub(1)?)?;
+            crate::codeql_qs::breakpoint_target(text, line as u32)
+        });
+        let Some((span, name)) = target else {
+            self.status = format!(
+                "No predicate at the breakpoint on line {}: put it on a line that defines or calls one",
+                lines[0]
+            );
+            return;
+        };
+        let source = self.editor.lines.join("\n");
+        let label = format!("{name} (breakpoint on line {})", span.line);
+        self.run_codeql_file_with(
+            query,
+            &source,
+            Some(crate::codeql_qs::QuickEval {
+                span,
+                count: false,
+                label,
+            }),
+        );
+    }
+
+    /// [`Self::codeql_command`], killing `codeql` as soon as `cancel` is
+    /// raised (#578). Its output is drained on threads of its own, so a
+    /// chatty CLI never blocks on a full pipe while this polls.
+    fn codeql_command_until(
+        program: &Path,
+        args: &[String],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
+        use std::io::Read as _;
+        use std::sync::atomic::Ordering;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(String::from("cancelled"));
+        }
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let mut stderr = child.stderr.take();
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(s) = stderr.as_mut() {
+                let _ = s.read_to_string(&mut text);
+            }
+            text
+        });
+        let status = loop {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(String::from("cancelled"));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(e) => return Err(format!("could not wait for codeql: {e}")),
+            }
+        };
+        let err = reader.join().unwrap_or_default();
+        if status.success() {
+            Ok(())
+        } else {
+            Err(crate::codeql_query::failure_reason(&err))
+        }
+    }
+
+    /// CodeQL: Cancel Running Query (#578): stop the query in flight, and
+    /// the queries a pack or multi-database run has queued after it.
+    fn cancel_codeql_run(&mut self) {
+        if self.codeql_run.is_none() {
+            self.status = String::from("No CodeQL query is running");
+            return;
+        }
+        self.codeql_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let queued = self.codeql_run_queue.len();
+        self.codeql_run_queue.clear();
+        self.status = match queued {
+            0 => String::from("Cancelling the running CodeQL query\u{2026}"),
+            n => format!("Cancelling the running CodeQL query and {n} queued\u{2026}"),
+        };
+    }
+
+    /// Walk a CodeQL results table (#578, VS Code's `codeQLQueryResults`
+    /// up/down/left/right): move its cursor by (`rows`, `cols`) and open
+    /// the code of the cell's entity, else of the first entity in its row.
+    /// The table is the active results sheet, else the one walked last,
+    /// so the walk goes on once the code has the focus.
+    fn walk_codeql_results(&mut self, rows: isize, cols: isize) {
+        use crate::codeql_query as cq;
+        let active = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| self.editor.sheet.is_some() && cq::locations_path(p).is_file());
+        let on_table = active.is_some();
+        let Some(table) = active.or_else(|| self.codeql_results_walk.clone()) else {
+            self.status = String::from("Open a CodeQL results table first");
+            return;
+        };
+        // The active tab when it is the table, else a tab showing it.
+        let tab = if on_table {
+            Some(&mut *self.editor)
+        } else {
+            self.editor
+                .editors
+                .iter_mut()
+                .find(|t| t.path.as_deref() == Some(table.as_path()) && t.sheet.is_some())
+        };
+        let Some(sheet) = tab.and_then(|t| t.sheet.as_mut()) else {
+            self.codeql_results_walk = None;
+            self.status = String::from("Open a CodeQL results table first");
+            return;
+        };
+        let current = sheet.current_sheet;
+        let Some(data) = sheet.sheets.get_mut(current) else {
+            return;
+        };
+        if data.rows.is_empty() {
+            self.status = String::from("The results table is empty");
+            return;
+        }
+        let step = |at: usize, by: isize, len: usize| -> usize {
+            (at as isize + by).clamp(0, len.saturating_sub(1) as isize) as usize
+        };
+        data.cur_row = step(data.cur_row, rows, data.rows.len());
+        data.cur_col = step(data.cur_col, cols, data.col_widths.len().max(1));
+        let (cells, col) = (data.rows[data.cur_row].clone(), data.cur_col);
+        let row = data.cur_row + 1;
+        self.codeql_results_walk = Some(table.clone());
+        let saved: Vec<cq::RowLocs> = std::fs::read_to_string(cq::locations_path(&table))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let Some(locs) = cq::row_locations(&saved, &cells) else {
+            self.status = format!("Result {row} has no location");
+            return;
+        };
+        let Some(loc) = locs
+            .get(col)
+            .cloned()
+            .flatten()
+            .or_else(|| locs.iter().flatten().next().cloned())
+        else {
+            self.status = format!("Result {row} has no location");
+            return;
+        };
+        let Some(path) = self.codeql_source_file(&loc.path) else {
+            self.status = format!("{} is not on this machine", loc.path.display());
+            return;
+        };
+        if self.editor.path.as_deref() == Some(table.as_path()) {
+            self.editor.pin_active();
+        }
+        let (line, column) = (loc.line.max(1) - 1, loc.column.max(1) - 1);
+        self.status = match self.open_at(&path, line as usize, column as usize) {
+            Ok(()) => format!("Result {row}: {}:{}", path.display(), loc.line),
+            Err(e) => format!("{}: {e}", path.display()),
+        };
+    }
+
+    /// A source file a CodeQL result names, on this machine: the path
+    /// itself, else its copy in an extracted source archive or in a
+    /// database's `src` folder, which both mirror the original paths.
+    fn codeql_source_file(&self, path: &Path) -> Option<PathBuf> {
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+        let rel = path.strip_prefix("/").unwrap_or(path);
+        let extracted = std::fs::read_dir(Self::codeql_source_cache_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path());
+        let src = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path())
+            .databases
+            .into_iter()
+            .map(|d| d.path.join("src"));
+        extracted
+            .chain(src)
+            .map(|root| root.join(rel))
+            .find(|p| p.is_file())
+    }
+
+    /// Decode `bqrs` to CSV, one file per result set (#578): the main set
+    /// (`#select`) to `out`, each other beside it as `results-<set>.csv`.
+    /// `bqrs decode` without a set writes them all into one CSV, header
+    /// rows and all, so that is only the fallback for a BQRS whose sets
+    /// cannot be listed. `run` runs each decode.
+    fn codeql_decode_sets(
+        program: &Path,
+        bqrs: &Path,
+        out: &Path,
+        run: &dyn Fn(Vec<String>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        use crate::codeql_query as cq;
+        let sets = Self::codeql_stdout(program, &cq::info_args(bqrs))
+            .map(|json| cq::parse_result_sets(&json))
+            .unwrap_or_default();
+        let Some(main) = cq::main_result_set(&sets).map(str::to_string) else {
+            return run(cq::decode_args(bqrs, out));
+        };
+        for (name, _) in &sets {
+            let file = cq::result_set_file(out, name, *name == main);
+            run(cq::decode_set_args(bqrs, &file, name))?;
+            // Where each cell's entity is, for walking the results in the
+            // code. Optional: a table without it still opens.
+            let raw = file.with_extension("entities.json");
+            if run(cq::decode_locations_args(bqrs, &raw, name)).is_ok()
+                && let Ok(text) = std::fs::read_to_string(&raw)
+                && let Ok(json) = serde_json::to_string(&cq::parse_row_locations(&text))
+            {
+                let _ = std::fs::write(cq::locations_path(&file), json);
+            }
+            let _ = std::fs::remove_file(&raw);
+        }
+        Ok(())
+    }
+
+    /// CodeQL: Show Result Set (#578): pick which result set of the Query
+    /// History run selected (else the newest) to open.
+    fn show_codeql_result_sets(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = self
+            .codeql
+            .selected_history()
+            .or_else(|| history.newest())
+            .and_then(|i| history.entries.get(i))
+            .cloned()
+        else {
+            self.status = String::from("No CodeQL query has run yet");
+            return;
+        };
+        let name = entry.query_name();
+        if entry.output.extension().is_none_or(|e| e != "csv") {
+            self.status = format!("{name} found alerts, which open in the SARIF viewer");
+            return;
+        }
+        let sets = crate::codeql_query::result_set_files(&entry.output);
+        if sets.len() < 2 {
+            self.status = format!("{name} has one result set");
+            return;
+        }
+        let rows = sets
+            .into_iter()
+            .map(|(set, path)| ListRow {
+                id: path.display().to_string(),
+                label: set,
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(
+                ListPurpose::CodeqlResultSet,
+                format!("Result sets of {name}"),
+                rows,
+            ),
+            "No result sets",
+        );
+    }
+
+    /// Run `codeql` with `args` and return what it printed on stdout; a
+    /// failure is read as [`Self::codeql_command`] reads it.
+    fn codeql_stdout(program: &Path, args: &[String]) -> Result<String, String> {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        Err(crate::codeql_query::failure_reason(
+            &String::from_utf8_lossy(&out.stderr),
+        ))
+    }
+
+    /// What a contextual query (AST, CFG) runs on (#578): the open file,
+    /// the current database, its language, and the file's name in that
+    /// database's source archive. Says what is missing when something is.
+    fn codeql_contextual_target(
+        &mut self,
+    ) -> Option<(PathBuf, crate::codeql_db::DbEntry, String, String)> {
+        let Some(file) = self.editor.path.clone() else {
+            self.status = String::from("Open a source file from the CodeQL database first");
+            return None;
+        };
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
+            self.status = String::from("Select a CodeQL database first");
+            return None;
+        };
+        let Some(lang) = db.language.clone() else {
+            self.status = format!("CodeQL database {} does not say its language", db.name);
+            return None;
+        };
+        // The places this database's source can be open from: its `src`
+        // folder and its extracted `src.zip`s, which both mirror the
+        // absolute paths it was built from.
+        let prefix = crate::codeql_db::source_cache_prefix(&db.path);
+        let mut roots: Vec<PathBuf> = std::fs::read_dir(Self::codeql_source_cache_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|e| e.path())
+            .collect();
+        roots.push(db.path.join("src"));
+        let archive = crate::codeql_ast::archive_path(&file, &roots);
+        Some((file, db, lang, archive))
+    }
+
+    /// A fresh folder for one contextual query run of `kind`.
+    fn codeql_contextual_dir(kind: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        croft_cache_dir()
+            .join("codeql")
+            .join(kind)
+            .join(stamp.to_string())
+    }
+
+    /// Resolve `lang`'s contextual query tagged `tag`, and make sure its
+    /// pack's dependencies are there (#578).
+    fn codeql_contextual_query(
+        program: &Path,
+        dir: &Path,
+        lang: &str,
+        tag: &str,
+    ) -> Result<PathBuf, String> {
+        use crate::codeql_ast as ast;
+        let suite = dir.join(format!("{tag}.qls"));
+        std::fs::write(&suite, ast::contextual_suite(lang, tag))
+            .map_err(|e| format!("{}: {e}", suite.display()))?;
+        let listed = Self::codeql_stdout(program, &ast::resolve_args(&suite))?;
+        let query = ast::first_query(&listed).ok_or_else(|| {
+            format!(
+                "no {tag} query for {lang}; download the codeql/{lang}-all pack \
+                 with CodeQL: Download Packs"
+            )
+        })?;
+        // A library pack downloaded on its own may lack what it depends
+        // on; installing is quick when nothing is missing.
+        if let Some(pack) = ast::pack_dir(&query) {
+            Self::codeql_command(program, &crate::codeql_query::pack_install_args(&pack))?;
+        }
+        Ok(query)
+    }
+
+    /// CodeQL: View CFG (#578): the control flow graph of the function at
+    /// the cursor, from the current database, opened as a document.
+    fn view_codeql_cfg(&mut self) {
+        use crate::codeql_ast as ast;
+        if self.codeql_doc_job.is_some() {
+            self.status = String::from("A CodeQL view is already being made");
+            return;
+        }
+        let Some((file, db, lang, archive)) = self.codeql_contextual_target() else {
+            return;
+        };
+        let (line, column) = (self.editor.cursor_row + 1, self.editor.cursor_col + 1);
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let title = format!("{name}:{line}:{column} in {}", db.name);
+        let dir = Self::codeql_contextual_dir("cfg");
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = || -> Result<PathBuf, String> {
+                let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+                std::fs::create_dir_all(&dir).map_err(io)?;
+                let query = Self::codeql_contextual_query(&program, &dir, &lang, "print-cfg")?;
+                let (f, l, c) = (
+                    dir.join("file.csv"),
+                    dir.join("line.csv"),
+                    dir.join("column.csv"),
+                );
+                std::fs::write(&f, ast::selected_file_csv(&archive)).map_err(io)?;
+                std::fs::write(&l, format!("{line}\n")).map_err(io)?;
+                std::fs::write(&c, format!("{column}\n")).map_err(io)?;
+                let bqrs = dir.join("cfg.bqrs");
+                Self::codeql_command(
+                    &program,
+                    &crate::codeql_cfg::run_args(&query, &db.path, &f, &l, &c, &bqrs),
+                )?;
+                let json = dir.join("cfg.json");
+                Self::codeql_command(&program, &ast::decode_args(&bqrs, &json))?;
+                let cfg =
+                    crate::codeql_cfg::parse_cfg(&std::fs::read_to_string(&json).map_err(io)?)?;
+                let doc = dir.join("cfg.md");
+                std::fs::write(&doc, crate::codeql_cfg::render_document(&cfg, &title))
+                    .map_err(io)?;
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o444));
+                Ok(doc)
+            };
+            let _ = tx.send(read());
+        });
+        self.status = format!("Reading the control flow graph at {name}:{line}\u{2026}");
+        self.codeql_doc_job = Some((
+            rx,
+            String::from("Control flow graph"),
+            String::from("Could not read the control flow graph"),
+        ));
+    }
+
+    /// Open a finished CodeQL document (#578), or say why there is none.
+    pub fn drain_codeql_doc(&mut self) -> bool {
+        let Some((rx, ..)) = self.codeql_doc_job.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("it stopped unexpectedly"))
+            }
+        };
+        let Some((_, done, failed)) = self.codeql_doc_job.take() else {
+            return false;
+        };
+        self.status = match outcome {
+            Ok(doc) => match self.editor.open(&doc) {
+                Ok(()) => done,
+                Err(e) => format!("{}: {e}", doc.display()),
+            },
+            Err(why) => format!("{failed}: {why}"),
+        };
+        true
+    }
+
+    /// CodeQL: Open Referenced File (#578): the query the open `.qlref`
+    /// test file names, as `codeql resolve qlref` finds it through the
+    /// test pack's dependencies.
+    fn open_codeql_referenced_file(&mut self) {
+        let Some(qlref) = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| p.extension().is_some_and(|e| e == "qlref"))
+        else {
+            self.status = String::from("Open a .qlref file first");
+            return;
+        };
+        if self.codeql_doc_job.is_some() {
+            self.status = String::from("A CodeQL view is already being made");
+            return;
+        }
+        let name = qlref
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let run = |args: Vec<String>| Self::codeql_command(&program, &args);
-            let outcome = std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("{}: {e}", dir.display()))
-                .and_then(|()| match kind {
-                    Output::Sarif => run(cq::analyze_args(&query, &db.path, &output)),
-                    Output::Table => {
-                        let bqrs = dir.join("results.bqrs");
-                        run(cq::run_args(&query, &db.path, &bqrs))
-                            .and_then(|()| run(cq::decode_args(&bqrs, &output)))
-                    }
+            let found = Self::codeql_stdout(&program, &crate::codeql_query::qlref_args(&qlref))
+                .and_then(|json| {
+                    crate::codeql_query::parse_qlref(&json)
+                        .ok_or_else(|| String::from("the CLI named no query"))
                 });
-            let _ = tx.send(match outcome {
-                Ok(()) => RunStatus::Succeeded,
-                Err(e) => RunStatus::Failed(e),
-            });
+            let _ = tx.send(found);
         });
-        self.codeql_run = Some((rx, std::time::Instant::now()));
-        self.status = format!("Running {name} on {}\u{2026}", db.name);
+        self.status = format!("Resolving {name}\u{2026}");
+        self.codeql_doc_job = Some((
+            rx,
+            format!("The query {name} references"),
+            format!("Could not resolve {name}"),
+        ));
     }
 
-    /// Run `codeql` with `args` and wait. A failure is the first line it
-    /// printed on stderr, where the CLI puts the reason.
+    /// The Query History run selected in the side bar, else the newest;
+    /// says so when nothing has run.
+    fn codeql_chosen_run(&mut self) -> Option<crate::codeql_query::HistoryEntry> {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let entry = self
+            .codeql
+            .selected_history()
+            .or_else(|| history.newest())
+            .and_then(|i| history.entries.get(i))
+            .cloned();
+        if entry.is_none() {
+            self.status = String::from("No CodeQL query has run yet");
+        }
+        entry
+    }
+
+    /// The folder of the database `entry` ran on, by its recorded path,
+    /// else by its name in the store.
+    fn codeql_run_database(entry: &crate::codeql_query::HistoryEntry) -> Option<PathBuf> {
+        entry.database_path.clone().or_else(|| {
+            crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path())
+                .databases
+                .into_iter()
+                .find(|d| d.name == entry.database)
+                .map(|d| d.path)
+        })
+    }
+
+    /// The alert views of a run (#578): "View Alerts (SARIF)" opens the
+    /// SARIF as JSON; "View Alerts (CSV)" has `codeql database
+    /// interpret-results` write the alerts as CSV from the results the
+    /// database keeps, without running the query again.
+    fn view_codeql_alerts(&mut self, csv: bool) {
+        let Some(entry) = self.codeql_chosen_run() else {
+            return;
+        };
+        let name = entry.query_name();
+        if entry.status != crate::codeql_query::RunStatus::Succeeded
+            || entry.output.extension().is_none_or(|e| e != "sarif")
+        {
+            self.status = format!("{name} did not produce alerts; its results are a table");
+            return;
+        }
+        if !csv {
+            // Opened, then reopened as text: the override holds only for
+            // the tab's own file, so it is set once the tab is on it.
+            let opened = self.editor.open(&entry.output).and_then(|()| {
+                self.editor.force_text = true;
+                self.editor.open(&entry.output)
+            });
+            self.status = match opened {
+                Ok(()) => format!("Alerts of {name} (SARIF)"),
+                Err(e) => format!("{}: {e}", entry.output.display()),
+            };
+            return;
+        }
+        let Some(db) = Self::codeql_run_database(&entry) else {
+            self.status = format!("The database {name} ran on is gone", name = entry.database);
+            return;
+        };
+        if self.codeql_doc_job.is_some() {
+            self.status = String::from("A CodeQL view is already being made");
+            return;
+        }
+        let out = entry.output.with_file_name("alerts.csv");
+        let program = self.codeql_program.clone();
+        let query = entry.query.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let made = Self::codeql_command(
+                &program,
+                &crate::codeql_query::interpret_csv_args(&db, &query, &out),
+            )
+            .map(|()| out);
+            let _ = tx.send(made);
+        });
+        self.status = format!("Writing the alerts of {name} as CSV\u{2026}");
+        self.codeql_doc_job = Some((
+            rx,
+            format!("Alerts of {name} (CSV)"),
+            format!("Could not write the alerts of {name} as CSV"),
+        ));
+    }
+
+    /// "View Results (CSV)" (#578): a run's raw results as tables. A table
+    /// run's are its results already; an alert run's are decoded from the
+    /// BQRS the database keeps for the query.
+    fn view_codeql_raw_results(&mut self) {
+        let Some(entry) = self.codeql_chosen_run() else {
+            return;
+        };
+        let name = entry.query_name();
+        if entry.status != crate::codeql_query::RunStatus::Succeeded {
+            self.status = format!("{name} has no results");
+            return;
+        }
+        if entry.output.extension().is_some_and(|e| e == "csv") {
+            self.status = match self.editor.open(&entry.output) {
+                Ok(()) => format!("Results of {name} (CSV)"),
+                Err(e) => format!("{}: {e}", entry.output.display()),
+            };
+            return;
+        }
+        let Some(db) = Self::codeql_run_database(&entry) else {
+            self.status = format!("The database {name} ran on is gone", name = entry.database);
+            return;
+        };
+        let Some(bqrs) = crate::codeql_query::kept_bqrs(&db, &entry.query) else {
+            self.status = format!("The database no longer keeps the results of {name}");
+            return;
+        };
+        if self.codeql_doc_job.is_some() {
+            self.status = String::from("A CodeQL view is already being made");
+            return;
+        }
+        let out = entry.output.with_file_name("raw-results.csv");
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let made = Self::codeql_decode_sets(&program, &bqrs, &out, &|args| {
+                Self::codeql_command(&program, &args)
+            })
+            .map(|()| out);
+            let _ = tx.send(made);
+        });
+        self.status = format!("Decoding the results of {name}\u{2026}");
+        self.codeql_doc_job = Some((
+            rx,
+            format!("Results of {name} (CSV)"),
+            format!("Could not decode the results of {name}"),
+        ));
+    }
+
+    /// CodeQL: Open Model Editor (#578): read the current database's
+    /// library endpoints with its language's model-editor query, off the
+    /// UI thread; [`Self::drain_codeql_model`] lists them under Method
+    /// Modeling.
+    fn open_codeql_model_editor(&mut self) {
+        use crate::codeql_query as cq;
+        if self.codeql_model_job.is_some() {
+            self.status = String::from("The model editor is already reading endpoints");
+            return;
+        }
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
+            self.status = String::from("Select a CodeQL database first");
+            return;
+        };
+        let Some(lang) = db.language.clone() else {
+            self.status = format!("CodeQL database {} does not say its language", db.name);
+            return;
+        };
+        let dir = Self::codeql_contextual_dir("model");
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lang_for = lang.clone();
+        std::thread::spawn(move || {
+            let read = || -> Result<Vec<crate::codeql_model::Endpoint>, String> {
+                let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+                std::fs::create_dir_all(&dir).map_err(io)?;
+                let suite = dir.join("endpoints.qls");
+                std::fs::write(&suite, crate::codeql_model::endpoints_suite(&lang_for))
+                    .map_err(io)?;
+                let listed =
+                    Self::codeql_stdout(&program, &crate::codeql_ast::resolve_args(&suite))?;
+                let query = crate::codeql_ast::first_query(&listed).ok_or_else(|| {
+                    format!(
+                        "no model-editor query for {lang_for}; download the \
+                         codeql/{lang_for}-queries pack with CodeQL: Download Packs"
+                    )
+                })?;
+                let bqrs = dir.join("endpoints.bqrs");
+                Self::codeql_command(&program, &cq::run_args(&query, &db.path, &bqrs))?;
+                let json = dir.join("endpoints.json");
+                Self::codeql_command(
+                    &program,
+                    &cq::decode_locations_args(&bqrs, &json, "#select"),
+                )?;
+                let endpoints = crate::codeql_model::parse_endpoints(
+                    &std::fs::read_to_string(&json).map_err(io)?,
+                );
+                if endpoints.is_empty() {
+                    return Err(String::from(
+                        "the database has no library endpoints to model (is it a library?)",
+                    ));
+                }
+                Ok(endpoints)
+            };
+            let _ = tx.send(read());
+        });
+        self.status = format!("Reading the endpoints of {}\u{2026}", db.name);
+        self.codeql_model_job = Some((rx, db.name, lang));
+    }
+
+    /// Model endpoint `endpoint` of the Model Editor (#578): pick what it
+    /// is, as a source at its return value, a sink at an argument, or a
+    /// summary, or remove the models made for it.
+    fn model_codeql_endpoint(&mut self, endpoint: Option<usize>) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let Some(view) = self.codeql.model.as_ref() else {
+            self.status = String::from("Open the model editor first");
+            return;
+        };
+        let Some(e) = endpoint.and_then(|i| view.endpoints.get(i)) else {
+            self.status = String::from("Select an endpoint in Method Modeling first");
+            return;
+        };
+        let choices = e.choices();
+        if choices.is_empty() {
+            self.status = format!("{} is a class; model its methods", e.label());
+            return;
+        }
+        let i = endpoint.unwrap_or(0);
+        let mut rows: Vec<ListRow> = choices
+            .iter()
+            .enumerate()
+            .map(|(j, m)| ListRow {
+                id: format!("{i}:{j}"),
+                label: m.describe(),
+            })
+            .collect();
+        let path = e.access_path();
+        if view
+            .models
+            .iter()
+            .any(|m| m.ty == e.namespace && Some(&m.path) == path.as_ref())
+        {
+            rows.push(ListRow {
+                id: format!("{i}:remove"),
+                label: String::from("remove the models made for it"),
+            });
+        }
+        let title = format!("Model {}", e.label());
+        self.open_list_picker(ListPicker::new(ListPurpose::CodeqlModel, title, rows), "");
+    }
+
+    /// A model picked for an endpoint (`<endpoint>:<choice>` or
+    /// `<endpoint>:remove`): ask for its kind, or remove its models.
+    fn choose_codeql_model(&mut self, id: &str) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some((endpoint, choice)) = id.split_once(':') else {
+            return;
+        };
+        let Ok(endpoint) = endpoint.parse::<usize>() else {
+            return;
+        };
+        if choice == "remove" {
+            let Some(view) = self.codeql.model.as_mut() else {
+                return;
+            };
+            let Some(e) = view.endpoints.get(endpoint).cloned() else {
+                return;
+            };
+            let path = e.access_path();
+            view.models
+                .retain(|m| !(m.ty == e.namespace && Some(&m.path) == path.as_ref()));
+            self.status = match self.write_codeql_models() {
+                Ok(file) => format!(
+                    "Removed the models of {} from {}",
+                    e.label(),
+                    file.display()
+                ),
+                Err(why) => format!("Could not save the models: {why}"),
+            };
+            return;
+        }
+        let Ok(choice) = choice.parse::<usize>() else {
+            return;
+        };
+        let Some(model) = self
+            .codeql
+            .model
+            .as_ref()
+            .and_then(|v| v.endpoints.get(endpoint))
+            .and_then(|e| e.choices().into_iter().nth(choice))
+        else {
+            return;
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlModelKind { endpoint, choice },
+                format!("Kind of {}", model.describe()),
+                String::from("remote, command-injection, sql-injection, taint, value, \u{2026}"),
+            )
+            .with_value(model.which.default_kind()),
+        );
+    }
+
+    /// Save choice `choice` of endpoint `endpoint` with kind `kind` in the
+    /// database's model pack (#578).
+    fn save_codeql_model(&mut self, endpoint: usize, choice: usize, kind: &str) {
+        let kind = kind.trim();
+        if kind.is_empty() {
+            self.status = String::from("A model needs a kind");
+            return;
+        }
+        let Some(view) = self.codeql.model.as_mut() else {
+            return;
+        };
+        let Some(mut model) = view
+            .endpoints
+            .get(endpoint)
+            .and_then(|e| e.choices().into_iter().nth(choice))
+        else {
+            return;
+        };
+        model.kind = kind.to_string();
+        let label = view.endpoints[endpoint].label();
+        let described = model.describe();
+        view.models.retain(|m| *m != model);
+        view.models.push(model);
+        self.status = match self.write_codeql_models() {
+            Ok(file) => format!("Modeled {label} as a {described} in {}", file.display()),
+            Err(why) => format!("Could not save the model: {why}"),
+        };
+    }
+
+    /// Write the Model Editor's models to the database's model pack: its
+    /// pack file, the data extension CodeQL reads, and croft's own list.
+    /// Returns the data extension's path.
+    fn write_codeql_models(&mut self) -> Result<PathBuf, String> {
+        use crate::codeql_model as cm;
+        let view = self
+            .codeql
+            .model
+            .as_ref()
+            .ok_or("no model editor is open")?;
+        let (dir, name) = cm::model_pack(self.workspace_root(), &view.database, &view.language);
+        let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+        std::fs::create_dir_all(dir.join("models")).map_err(io)?;
+        std::fs::write(
+            dir.join("codeql-pack.yml"),
+            cm::pack_yml(&name, &view.language),
+        )
+        .map_err(io)?;
+        let slug = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let file = dir.join("models").join(format!("{slug}.model.yml"));
+        std::fs::write(&file, cm::models_yml(&view.language, &view.models)).map_err(io)?;
+        let json = serde_json::to_string_pretty(&view.models).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("croft-models.json"), json).map_err(io)?;
+        Ok(file
+            .strip_prefix(self.workspace_root())
+            .unwrap_or(&file)
+            .to_path_buf())
+    }
+
+    /// List a finished endpoints read under Method Modeling (#578), or say
+    /// why there is none.
+    pub fn drain_codeql_model(&mut self) -> bool {
+        let Some((rx, ..)) = self.codeql_model_job.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the endpoints read stopped unexpectedly"))
+            }
+        };
+        let Some((_, database, language)) = self.codeql_model_job.take() else {
+            return false;
+        };
+        match outcome {
+            Ok(endpoints) => {
+                let modeled = endpoints.iter().filter(|e| e.supported).count();
+                self.status = format!(
+                    "{} endpoints of {database}, {modeled} modeled by CodeQL",
+                    endpoints.len()
+                );
+                // The models made before, kept beside the pack.
+                let (dir, _) =
+                    crate::codeql_model::model_pack(self.workspace_root(), &database, &language);
+                let models = std::fs::read_to_string(dir.join("croft-models.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str(&t).ok())
+                    .unwrap_or_default();
+                self.codeql.model = Some(crate::codeql_model::ModelView {
+                    database,
+                    language,
+                    endpoints,
+                    models,
+                    ..Default::default()
+                });
+                self.codeql
+                    .collapsed
+                    .remove(&crate::widgets::codeql::Section::MethodModeling);
+            }
+            Err(why) => self.status = format!("Could not read the endpoints: {why}"),
+        }
+        true
+    }
+
+    /// CodeQL: View AST (#578): the AST of the open file, read from the
+    /// current database with its language's print-AST query, off the UI
+    /// thread; [`Self::drain_codeql_ast`] shows it in the AST Viewer.
+    fn view_codeql_ast(&mut self) {
+        use crate::codeql_ast as ast;
+        if self.codeql_ast_job.is_some() {
+            self.status = String::from("An AST is already being read");
+            return;
+        }
+        let Some((file, db, lang, archive)) = self.codeql_contextual_target() else {
+            return;
+        };
+        let dir = Self::codeql_contextual_dir("ast");
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (db_path, csv) = (db.path.clone(), ast::selected_file_csv(&archive));
+        let shown = archive.clone();
+        std::thread::spawn(move || {
+            let read = || -> Result<ast::AstTree, String> {
+                let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+                std::fs::create_dir_all(&dir).map_err(io)?;
+                let query = Self::codeql_contextual_query(&program, &dir, &lang, "print-ast")?;
+                let selected = dir.join("selected-file.csv");
+                std::fs::write(&selected, csv).map_err(io)?;
+                let bqrs = dir.join("ast.bqrs");
+                Self::codeql_command(&program, &ast::run_args(&query, &db_path, &selected, &bqrs))?;
+                let json = dir.join("ast.json");
+                Self::codeql_command(&program, &ast::decode_args(&bqrs, &json))?;
+                let tree = ast::parse_graph(&std::fs::read_to_string(&json).map_err(io)?)?;
+                if tree.roots.is_empty() {
+                    return Err(format!("the database has no AST for {shown}"));
+                }
+                Ok(tree)
+            };
+            let _ = tx.send(read());
+        });
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.status = format!("Reading the AST of {name} from {}\u{2026}", db.name);
+        self.codeql_ast_job = Some((
+            rx,
+            ast::AstView {
+                file,
+                archive,
+                database: db.name,
+                ..ast::AstView::default()
+            },
+        ));
+    }
+
+    /// Show a finished AST read in the AST Viewer (#578), or say why there
+    /// is none.
+    pub fn drain_codeql_ast(&mut self) -> bool {
+        let Some((rx, _)) = self.codeql_ast_job.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the AST read stopped unexpectedly"))
+            }
+        };
+        let Some((_, mut view)) = self.codeql_ast_job.take() else {
+            return false;
+        };
+        match outcome {
+            Ok(tree) => {
+                let name = view
+                    .file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.status = format!("AST of {name}: {} nodes", tree.nodes.len());
+                view.tree = tree;
+                self.codeql.ast = Some(view);
+                self.codeql
+                    .collapsed
+                    .remove(&crate::widgets::codeql::Section::AstViewer);
+            }
+            Err(why) => self.status = format!("Could not read the AST: {why}"),
+        }
+        true
+    }
+
+    /// Run `codeql` with `args` and wait. A failure is the reason and the
+    /// fix the CLI printed on stderr ([`crate::codeql_query::failure_reason`]).
     fn codeql_command(program: &Path, args: &[String]) -> Result<(), String> {
         let out = std::process::Command::new(program)
             .args(args)
@@ -26042,13 +27814,9 @@ impl App {
         if out.status.success() {
             return Ok(());
         }
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(err
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("codeql failed")
-            .to_string())
+        Err(crate::codeql_query::failure_reason(
+            &String::from_utf8_lossy(&out.stderr),
+        ))
     }
 
     /// Collect a finished query run (#578): record how it went in the
@@ -26094,20 +27862,34 @@ impl App {
         };
         entry.status = status.clone();
         entry.seconds = seconds;
+        entry.results = (status == RunStatus::Succeeded)
+            .then(|| crate::codeql_query::count_results(&entry.output))
+            .flatten();
         let output = entry.output.clone();
-        let name = entry
-            .query
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // A published pack's run names the pack by its reference.
+        let name = match entry.query.is_relative() {
+            true => entry.query.display().to_string(),
+            false => entry
+                .query
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
         match status {
             RunStatus::Failed(why) => self.status = format!("{name} failed: {why}"),
+            RunStatus::Cancelled => self.status = format!("{name} cancelled"),
             _ => match self.editor.open(&output) {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
                     self.status = format!("{name} finished in {seconds}s");
+                    let sets = crate::codeql_query::result_set_files(&output).len();
+                    if sets > 1 && output.extension().is_some_and(|e| e == "csv") {
+                        self.status.push_str(&format!(
+                            "; {sets} result sets, see CodeQL: Show Result Set"
+                        ));
+                    }
                 }
                 Err(e) => self.status = format!("{}: {e}", output.display()),
             },
@@ -26127,18 +27909,183 @@ impl App {
         let Some(queries) = self.codeql.queries.get(pack).map(|p| p.queries.clone()) else {
             return;
         };
+        self.run_codeql_batch(queries, "That pack has no queries");
+    }
+
+    /// Run `queries` one after another on the current database, through
+    /// the queue a pack run uses; `none` is what to say when there are none.
+    fn run_codeql_batch(&mut self, queries: Vec<PathBuf>, none: &str) {
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         if store.current.and_then(|i| store.databases.get(i)).is_none() {
             self.status = String::from("Add a CodeQL database and select it first");
             return;
         }
         if queries.is_empty() {
-            self.status = String::from("That pack has no queries");
+            self.status = none.to_string();
             return;
         }
         self.codeql_batch = (queries.len(), 0);
-        self.codeql_run_queue = queries.into();
+        self.codeql_run_queue = queries
+            .into_iter()
+            .map(|query| crate::codeql_query::QueuedRun {
+                query,
+                source: None,
+                database: None,
+            })
+            .collect();
         self.start_next_queued_codeql();
+    }
+
+    /// CodeQL: Run Query on Multiple Databases (#578): check databases in
+    /// a list, then run the open query on each of them in turn.
+    fn run_codeql_query_on_databases(&mut self) {
+        let query = match self.editor.path.clone() {
+            Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
+            _ => {
+                self.status = String::from("Open a .ql query to run it");
+                return;
+            }
+        };
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let checked: Vec<PathBuf> = store
+            .current
+            .and_then(|i| store.databases.get(i))
+            .map(|db| db.path.clone())
+            .into_iter()
+            .collect();
+        self.codeql_multi_db = Some((query, self.editor.lines.join("\n"), checked));
+        self.open_codeql_multi_db_picker(0);
+    }
+
+    /// The checklist of databases for "Run Query on Multiple Databases",
+    /// with row `selected` under the cursor: Enter on a database checks or
+    /// unchecks it, Enter on the first row runs.
+    fn open_codeql_multi_db_picker(&mut self, selected: usize) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let Some((query, _, checked)) = self.codeql_multi_db.as_ref() else {
+            return;
+        };
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        if store.databases.is_empty() {
+            self.codeql_multi_db = None;
+            self.status = String::from("Add a CodeQL database first");
+            return;
+        }
+        let name = query
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut rows = vec![ListRow {
+            id: String::from("run"),
+            label: match checked.len() {
+                1 => String::from("\u{25b6} Run on the checked database"),
+                n => format!("\u{25b6} Run on the {n} checked databases"),
+            },
+        }];
+        rows.extend(store.databases.iter().enumerate().map(|(i, db)| ListRow {
+            id: i.to_string(),
+            label: format!(
+                "{} {}{}",
+                if checked.contains(&db.path) { "[x]" } else { "[ ]" },
+                db.name,
+                db.language.as_deref().map(|l| format!(" ({l})")).unwrap_or_default()
+            ),
+        }));
+        let mut picker = ListPicker::new(
+            ListPurpose::CodeqlMultiDb,
+            format!("Run {name} on databases"),
+            rows,
+        );
+        picker.selected = selected.min(picker.rows.len() - 1);
+        self.open_list_picker(picker, "");
+    }
+
+    /// A row picked in the databases checklist (#578): toggle a database,
+    /// or queue the query on every checked one.
+    fn choose_codeql_multi_db(&mut self, id: &str, selected: usize) {
+        let Some((_, _, checked)) = self.codeql_multi_db.as_mut() else {
+            return;
+        };
+        if id != "run" {
+            let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+            if let Some(db) = id
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| store.databases.get(i))
+            {
+                match checked.iter().position(|p| *p == db.path) {
+                    Some(at) => {
+                        checked.remove(at);
+                    }
+                    None => checked.push(db.path.clone()),
+                }
+            }
+            self.open_codeql_multi_db_picker(selected);
+            return;
+        }
+        if checked.is_empty() {
+            self.status = String::from("Check at least one database to run on");
+            self.open_codeql_multi_db_picker(selected);
+            return;
+        }
+        let Some((query, source, checked)) = self.codeql_multi_db.take() else {
+            return;
+        };
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
+        // In the list's order, not the order they were checked in.
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let databases: Vec<PathBuf> = store
+            .databases
+            .iter()
+            .map(|db| db.path.clone())
+            .filter(|p| checked.contains(p))
+            .collect();
+        self.codeql_batch = (databases.len(), 0);
+        self.codeql_run_queue = databases
+            .into_iter()
+            .map(|database| crate::codeql_query::QueuedRun {
+                query: query.clone(),
+                source: Some(source.clone()),
+                database: Some(database),
+            })
+            .collect();
+        self.start_next_queued_codeql();
+    }
+
+    /// CodeQL: Run All Queries in Workspace (#578): every query the side
+    /// bar's Queries section lists, pack after pack.
+    fn run_all_codeql_queries(&mut self) {
+        self.refresh_codeql_queries();
+        let queries: Vec<PathBuf> = self
+            .codeql
+            .queries
+            .iter()
+            .flat_map(|p| p.queries.iter().cloned())
+            .collect();
+        self.run_codeql_batch(queries, "No CodeQL queries in the workspace");
+    }
+
+    /// CodeQL: Run Queries in Selected Files (#578): the `.ql` files
+    /// selected in the Explorer, and every query under a selected folder.
+    fn run_selected_codeql_queries(&mut self) {
+        let mut paths: Vec<PathBuf> = self.tree.marked.iter().cloned().collect();
+        if paths.is_empty()
+            && let Some(p) = self.tree.selected_path()
+        {
+            paths.push(p.to_path_buf());
+        }
+        let queries = crate::codeql_query::queries_in(&paths);
+        self.run_codeql_batch(
+            queries,
+            "Select .ql files, or folders holding them, in the Explorer first",
+        );
     }
 
     /// Start the pack run's next query, read from disk as the side-bar rows
@@ -26148,25 +28095,40 @@ impl App {
     fn start_next_queued_codeql(&mut self) {
         let (total, _) = self.codeql_batch;
         while self.codeql_run.is_none() {
-            let Some(path) = self.codeql_run_queue.pop_front() else {
+            let Some(next) = self.codeql_run_queue.pop_front() else {
                 let failed = self.codeql_batch.1;
                 self.codeql_batch = (0, 0);
+                let queries = if total == 1 { "query" } else { "queries" };
                 self.status = match failed {
-                    0 => format!("Ran {total} CodeQL queries"),
-                    n => format!("Ran {total} CodeQL queries, {n} failed"),
+                    0 => format!("Ran {total} CodeQL {queries}"),
+                    n => format!("Ran {total} CodeQL {queries}, {n} failed"),
                 };
                 return;
             };
             let n = total - self.codeql_run_queue.len();
-            let source = match std::fs::read_to_string(&path) {
-                Ok(source) => source,
-                Err(e) => {
+            let path = next.query;
+            let source = match next.source {
+                Some(source) => source,
+                None => match std::fs::read_to_string(&path) {
+                    Ok(source) => source,
+                    Err(e) => {
+                        self.codeql_batch.1 += 1;
+                        self.status = format!("{}: {e}", path.display());
+                        continue;
+                    }
+                },
+            };
+            if let Some(database) = next.database {
+                self.run_codeql_file_on(path, &source, CodeqlRunMode::Whole, Some(&database));
+                if self.codeql_run.is_none() {
+                    // That database went away meanwhile: the others may
+                    // still be there.
                     self.codeql_batch.1 += 1;
-                    self.status = format!("{}: {e}", path.display());
                     continue;
                 }
-            };
-            self.run_codeql_file(path, &source);
+            } else {
+                self.run_codeql_file(path, &source);
+            }
             if self.codeql_run.is_none() {
                 // Refused (the database went away meanwhile): the rest
                 // would be refused too.
@@ -30371,9 +32333,17 @@ impl App {
                 self.close_input_prompt();
                 self.submit_download_codeql_packs(&value);
             }
+            InputPurpose::CodeqlRunPublishedPack => {
+                self.close_input_prompt();
+                self.run_codeql_published_pack(&value);
+            }
             InputPurpose::CodeqlExportVariantResults { index } => {
                 self.close_input_prompt();
                 self.start_export_codeql_variant_results(index, &value);
+            }
+            InputPurpose::CodeqlExportResults { output } => {
+                self.close_input_prompt();
+                self.submit_export_codeql_results(&output, &value);
             }
             InputPurpose::CodeqlVariantCodeSearch { list } => {
                 self.close_input_prompt();
@@ -30410,6 +32380,22 @@ impl App {
             InputPurpose::SarifLocate { .. } => {
                 self.close_input_prompt();
                 self.submit_sarif_locate(&value);
+            }
+            InputPurpose::CodeqlModelKind { endpoint, choice } => {
+                self.close_input_prompt();
+                self.save_codeql_model(endpoint, choice, &value);
+            }
+            InputPurpose::SarifTrustHost { uri, host, url } => {
+                self.close_input_prompt();
+                if value.trim().is_empty() {
+                    if let Err(e) = crate::sarif::resolve::trust_host(&host) {
+                        self.status = format!("Could not save {host} as trusted: {e}");
+                        return;
+                    }
+                    self.start_sarif_download(&uri, &url);
+                } else {
+                    self.submit_sarif_locate(&value);
+                }
             }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
@@ -32625,6 +34611,7 @@ impl App {
             return;
         };
         let purpose = picker.purpose;
+        let selected = picker.selected;
         self.close_list_picker();
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
@@ -32722,6 +34709,15 @@ impl App {
                         format!("Dismiss Alert #{number}"),
                         String::from("comment (optional)"),
                     ));
+                }
+            }
+            ListPurpose::CodeqlModel => self.choose_codeql_model(&row.id),
+            ListPurpose::CodeqlMultiDb => self.choose_codeql_multi_db(&row.id, selected),
+            ListPurpose::CodeqlResultSet => {
+                let path = PathBuf::from(&row.id);
+                match self.editor.open(&path) {
+                    Ok(()) => self.status = format!("Result set {}", row.label),
+                    Err(e) => self.status = format!("{}: {e}", path.display()),
                 }
             }
             ListPurpose::CodeScanningAnalysis => {
@@ -40223,7 +42219,7 @@ impl App {
         if !abs.is_file() {
             return false;
         }
-        self.open_resolved_file_ref(&abs, fr.line, fr.column)
+        self.open_resolved_file_ref(&abs, fr.line, fr.column, fr.end_line)
     }
 
     /// Extend a live log drag and finish it on release.
@@ -43057,7 +45053,7 @@ impl App {
         let Some(abs) = self.resolve_pane_path(self.active_terminal, &fr.path) else {
             return false;
         };
-        self.open_resolved_file_ref(&abs, fr.line, fr.column)
+        self.open_resolved_file_ref(&abs, fr.line, fr.column, fr.end_line)
     }
 
     /// A path printed in pane `idx`, made absolute: `~` against $HOME, a
@@ -43138,7 +45134,7 @@ impl App {
             .and_then(|fr| self.resolve_pane_path(idx, &fr.path).map(|abs| (abs, fr)))
             .filter(|(abs, _)| abs.is_file());
         let opened = match referenced {
-            Some((abs, fr)) => self.open_resolved_file_ref(&abs, fr.line, fr.column),
+            Some((abs, fr)) => self.open_resolved_file_ref(&abs, fr.line, fr.column, fr.end_line),
             None => false,
         };
         let Some(file) = self
@@ -43326,15 +45322,17 @@ impl App {
     }
 
     /// Jump the editor to an absolute `path:line[:col]`, recording where the
-    /// user was so Back returns to it, exactly like go-to-definition. False
-    /// when the file doesn't exist or won't open.
+    /// user was so Back returns to it, exactly like go-to-definition. With
+    /// `end_line`, a `path:line-end` range, the lines `line..=end_line` are
+    /// selected (#804). False when the file doesn't exist or won't open.
     fn open_resolved_file_ref(
         &mut self,
         abs: &std::path::Path,
         line: u32,
         column: Option<u32>,
+        end_line: Option<u32>,
     ) -> bool {
-        self.open_resolved_file_ref_inner(abs, line, column, true)
+        self.open_resolved_file_ref_inner(abs, line, column, end_line, true)
     }
 
     /// [`Self::open_resolved_file_ref`], but `record_nav` false skips the jump
@@ -43346,6 +45344,7 @@ impl App {
         abs: &std::path::Path,
         line: u32,
         column: Option<u32>,
+        end_line: Option<u32>,
         record_nav: bool,
     ) -> bool {
         if !abs.is_file() {
@@ -43365,7 +45364,26 @@ impl App {
                 // `explorer.autoReveal` analogue, as quick-open does: sync
                 // the tree to the landed file without stealing editor focus.
                 self.tree.reveal_path(abs);
-                self.status = format!("{}:{}", self.status_path(abs), line);
+                let range = end_line.filter(|&e| e > line).and_then(|end| {
+                    let last = self.editor.lines.len().checked_sub(1)?;
+                    let end0 = (end as usize - 1).min(last);
+                    (line0 <= end0).then_some((end0, end))
+                });
+                self.status = match range {
+                    Some((end0, end)) => {
+                        // The whole lines, caret at the top so the view
+                        // opens on the start of the range.
+                        let len = self.editor.lines[end0].chars().count();
+                        self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+                            anchor: (end0, len),
+                            head: (line0, 0),
+                        });
+                        self.editor.cursor_row = line0;
+                        self.editor.cursor_col = 0;
+                        format!("{}:{}-{}", self.status_path(abs), line, end)
+                    }
+                    None => format!("{}:{}", self.status_path(abs), line),
+                };
                 true
             }
             Err(_) => false,
@@ -43399,7 +45417,7 @@ impl App {
             });
         }
         self.focus_editor_group(true);
-        if !self.open_resolved_file_ref_inner(&lp, left.line, left.column, false) {
+        if !self.open_resolved_file_ref_inner(&lp, left.line, left.column, None, false) {
             return false;
         }
         if self.editor_layout.is_split() {
@@ -43409,7 +45427,7 @@ impl App {
             // as a preview tab; opening the right file swaps into it.
             self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
         }
-        if !self.open_resolved_file_ref_inner(&rp, right.line, right.column, false) {
+        if !self.open_resolved_file_ref_inner(&rp, right.line, right.column, None, false) {
             return false;
         }
         self.status = format!(
@@ -43447,7 +45465,7 @@ impl App {
             // file click. An unresolvable link falls through to the web-only
             // rule so its refusal still shows the real URI.
             let path = std::path::PathBuf::from(&fr.path);
-            if self.open_resolved_file_ref(&path, fr.line, fr.column) {
+            if self.open_resolved_file_ref(&path, fr.line, fr.column, fr.end_line) {
                 return;
             }
         }
@@ -45757,6 +47775,7 @@ impl App {
                 }
             }
             Cmd::CodeqlCreateQuery => self.prompt_create_codeql_query(),
+            Cmd::CodeqlRunQueryOnDatabases => self.run_codeql_query_on_databases(),
             Cmd::CodeqlRunPack => match self.codeql.selected_pack() {
                 Some(p) => self.run_codeql_pack(p),
                 None => {
@@ -45778,6 +47797,7 @@ impl App {
                 }
             },
             Cmd::CodeqlDownloadPacks => self.prompt_download_codeql_packs(),
+            Cmd::CodeqlRunPublishedPack => self.prompt_run_codeql_published_pack(),
             Cmd::CodeqlQuickQuery => self.open_codeql_quick_query(),
             Cmd::CodeqlCompareResults => {
                 if let Some(i) = self.current_codeql_history() {
@@ -45787,6 +47807,11 @@ impl App {
             Cmd::CodeqlShowEvaluatorLog => {
                 if let Some(i) = self.current_codeql_history() {
                     self.show_codeql_evaluator_log(i);
+                }
+            }
+            Cmd::CodeqlShowQueryLog => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.show_codeql_query_log(i);
                 }
             }
             Cmd::CodeqlShowEvaluatorLogSummary => {
@@ -45804,6 +47829,9 @@ impl App {
                     self.compare_codeql_performance(i);
                 }
             }
+            Cmd::CodeqlPreviewQueryHelp => self.preview_codeql_query_help(),
+            Cmd::CodeqlExportResults => self.prompt_export_codeql_results(),
+            Cmd::CodeqlRunQuerySuite => self.run_codeql_query_suite(),
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
@@ -45815,10 +47843,48 @@ impl App {
             Cmd::CodeqlExportVariantResults => {
                 self.prompt_export_codeql_variant_results(self.codeql.selected_variant_run())
             }
+            Cmd::CodeqlCopyVariantRepoList => {
+                self.copy_codeql_variant_repo_list(self.codeql.selected_variant_run())
+            }
+            Cmd::CodeqlViewVariantLogs => {
+                self.view_codeql_variant_logs(self.codeql.selected_variant_run())
+            }
             Cmd::CodeqlOpenVariantResults => {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlDebugQuery => self.debug_codeql_query(),
+            Cmd::CodeqlDebugSelection => self.quick_eval_codeql(false),
+            Cmd::CodeqlResultsUp => self.walk_codeql_results(-1, 0),
+            Cmd::CodeqlResultsDown => self.walk_codeql_results(1, 0),
+            Cmd::CodeqlResultsLeft => self.walk_codeql_results(0, -1),
+            Cmd::CodeqlResultsRight => self.walk_codeql_results(0, 1),
+            Cmd::SheetSortByColumn => self.sort_sheet_by_column(),
+            Cmd::CodeqlQuickEval => self.quick_eval_codeql(false),
+            Cmd::CodeqlQuickEvalCount => self.quick_eval_codeql(true),
+            Cmd::CodeqlViewAst => self.view_codeql_ast(),
+            Cmd::CodeqlOpenModelEditor => self.open_codeql_model_editor(),
+            Cmd::CodeqlModelEndpoint => {
+                self.model_codeql_endpoint(self.codeql.selected_model_endpoint())
+            }
+            Cmd::CodeqlOpenReferencedFile => self.open_codeql_referenced_file(),
+            Cmd::CodeqlViewAlertsCsv => self.view_codeql_alerts(true),
+            Cmd::CodeqlViewAlertsSarif => self.view_codeql_alerts(false),
+            Cmd::CodeqlViewResultsCsv => self.view_codeql_raw_results(),
+            Cmd::CodeqlShowResultSet => self.show_codeql_result_sets(),
+            Cmd::CodeqlViewCfg => self.view_codeql_cfg(),
+            Cmd::CodeqlRunAllQueries => self.run_all_codeql_queries(),
+            Cmd::CodeqlRunSelectedQueries => self.run_selected_codeql_queries(),
+            Cmd::CodeqlCancelRunningQuery => self.cancel_codeql_run(),
+            Cmd::CodeqlAcceptTestOutput => self.accept_codeql_test_output(),
+            Cmd::CodeqlFocusSideBar => {
+                // Show it and take the keys, as VS Code's "Focus" does.
+                self.open_codeql_view();
+                if self.sidebar_view == SidebarView::CodeQL {
+                    self.focus = Pane::Tree;
+                }
+            }
+            Cmd::CodeqlOpenResultsDirectory => self.open_codeql_results_directory(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
@@ -48510,6 +50576,10 @@ impl App {
             }
             if rect_contains(self.status_indent_rect, m.column, m.row) {
                 self.open_status_indent_menu(self.status_indent_rect.x, self.status_indent_rect.y);
+                return;
+            }
+            if rect_contains(self.status_codeql_rect, m.column, m.row) {
+                self.cancel_codeql_run();
                 return;
             }
             if rect_contains(self.status_diag_rect, m.column, m.row) {
@@ -56381,6 +58451,43 @@ impl App {
         }
     }
 
+    /// Sheet: Sort by Column (#578): sort the open CSV/TSV sheet's rows by
+    /// the cursor's column, reversing when it is already sorted that way.
+    /// A reorder is an edit, as in a spreadsheet: it marks the sheet
+    /// unsaved. xlsx is left out, since its edits are written back by
+    /// row, and so are the read-only kinds.
+    fn sort_sheet_by_column(&mut self) {
+        let Some(sheet) = self.editor.sheet.as_mut() else {
+            self.status = String::from("Open a CSV or TSV file to sort it");
+            return;
+        };
+        if !matches!(
+            sheet.kind,
+            crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
+        ) {
+            self.status = String::from("Sorting is for CSV and TSV sheets");
+            return;
+        }
+        let current = sheet.current_sheet;
+        let Some(data) = sheet.sheets.get_mut(current) else {
+            return;
+        };
+        let col = data.cur_col;
+        let name = data
+            .headers
+            .get(col)
+            .filter(|h| !h.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("column {}", col + 1));
+        let ascending = data.sort_by_column(col);
+        sheet.dirty = true;
+        self.editor.dirty = true;
+        self.status = format!(
+            "Sorted by {name}, {}",
+            if ascending { "ascending" } else { "descending" }
+        );
+    }
+
     fn handle_sheet_key(&mut self, key: KeyEvent) {
         let visible = sheet_visible_rows(self.editor.last_inner);
         let Some(sheet) = self.editor.sheet.as_mut() else {
@@ -57502,6 +59609,7 @@ impl App {
             uri,
             region: place,
             embedded,
+            remote,
             ..
         }) = self.sarif_selected_place()
         else {
@@ -57526,6 +59634,34 @@ impl App {
             // VS Code's Locate…: ask where the file is.
             let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
             self.sarif_locate_pending = Some((uri.clone(), line + 1, column + 1));
+            // The run names the repository it scanned: the file can be
+            // downloaded, once its host is trusted.
+            if let Some(remote) = remote {
+                if crate::sarif::resolve::trusted_hosts().contains(&remote.host) {
+                    self.start_sarif_download(&uri, &remote.url);
+                    return;
+                }
+                self.open_input_prompt(
+                    crate::widgets::input_prompt::InputPrompt::new(
+                        crate::widgets::input_prompt::InputPurpose::SarifTrustHost {
+                            uri: uri.clone(),
+                            host: remote.host.clone(),
+                            url: remote.url,
+                        },
+                        format!(
+                            "Download {name} from {}? Enter trusts {} for SARIF source",
+                            remote.host, remote.host
+                        ),
+                        format!("or type the path to {name} on this machine"),
+                    )
+                    .allowing_blank(),
+                );
+                self.status = format!(
+                    "{uri} is not on this machine; {} has it at the scanned commit",
+                    remote.host
+                );
+                return;
+            }
             self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
                 crate::widgets::input_prompt::InputPurpose::SarifLocate { uri: uri.clone() },
                 format!("Locate {name}"),
@@ -57570,6 +59706,72 @@ impl App {
             Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
             Err(e) => format!("Open failed: {e}"),
         };
+    }
+
+    /// Download `url`, the source of the SARIF location `uri`, off the UI
+    /// thread; [`App::poll_sarif_download`] opens it (#577). The line and
+    /// column come from the pending Locate.
+    fn start_sarif_download(&mut self, uri: &str, url: &str) {
+        let (line, col) = self
+            .sarif_locate_pending
+            .as_ref()
+            .filter(|(u, _, _)| u == uri)
+            .map_or((1, 1), |(_, l, c)| (*l, *c));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fetch = self.sarif_fetch;
+        let (uri, url) = (uri.to_string(), url.to_string());
+        self.status = format!("Downloading {url}…");
+        std::thread::spawn(move || {
+            let body = fetch(&url);
+            let _ = tx.send(SarifDownload {
+                uri,
+                line,
+                col,
+                body,
+            });
+        });
+        self.sarif_download = Some(rx);
+    }
+
+    /// Open a finished SARIF source download read-only at its location,
+    /// or say why it failed.
+    fn poll_sarif_download(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.sarif_download.as_ref() else {
+            return;
+        };
+        let done = match rx.try_recv() {
+            Ok(done) => done,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.sarif_download = None;
+                return;
+            }
+        };
+        self.sarif_download = None;
+        match done.body {
+            Ok(bytes) => {
+                if self
+                    .sarif_locate_pending
+                    .as_ref()
+                    .is_some_and(|(u, _, _)| *u == done.uri)
+                {
+                    self.sarif_locate_pending = None;
+                }
+                let contents = match String::from_utf8(bytes) {
+                    Ok(t) => crate::sarif::resolve::Embedded::Text(t),
+                    Err(e) => crate::sarif::resolve::Embedded::Binary(e.into_bytes()),
+                };
+                let (line, col) = (
+                    (done.line.max(1) - 1) as usize,
+                    (done.col.max(1) - 1) as usize,
+                );
+                if let Err(e) = self.open_sarif_embedded(&done.uri, &contents, line, col) {
+                    self.status = format!("Could not open the download of {}: {e}", done.uri);
+                }
+            }
+            Err(e) => self.status = format!("Could not download {}: {e}", done.uri),
+        }
     }
 
     /// Where the selected SARIF result points, looked up in the workspace,
@@ -57624,10 +59826,19 @@ impl App {
                         format!("{} is binary; Enter opens it in the hex viewer.", p.uri),
                         None,
                     ),
-                    (None, None) => (
-                        format!("{} is not on this machine; Enter to locate it.", p.uri),
-                        None,
-                    ),
+                    (None, None) => match &p.remote {
+                        Some(r) => (
+                            format!(
+                                "{} is not on this machine; Enter downloads it from {}.",
+                                p.uri, r.host
+                            ),
+                            None,
+                        ),
+                        None => (
+                            format!("{} is not on this machine; Enter to locate it.", p.uri),
+                            None,
+                        ),
+                    },
                 };
                 match text {
                     None => empty(title),
@@ -63250,14 +65461,53 @@ fn agent_ledger_key(root: &Path) -> String {
         .to_string()
 }
 
+/// What a CodeQL run evaluates (#578): the whole query, a quick
+/// evaluation of part of it, or a published pack named by its reference.
+enum CodeqlRunMode {
+    Whole,
+    Quick(crate::codeql_qs::QuickEval),
+    Pack,
+}
+
 /// What "CodeQL: Check for CLI Updates" learns (#578): the latest release,
 /// or why it could not be read, and the version in use when it runs.
 type CodeqlCliCheck = (Result<String, String>, Option<String>);
+
+/// Query help being rendered (#578): where the outcome arrives, the
+/// Markdown file to preview, and the query's name.
+type CodeqlQueryHelp = (
+    std::sync::mpsc::Receiver<Result<(), String>>,
+    PathBuf,
+    String,
+);
 
 /// A `codeql pack` install or download in flight (#578): where its outcome
 /// arrives, and the status lines for success and for failure.
 type CodeqlPackJob = (
     std::sync::mpsc::Receiver<Result<(), String>>,
+    String,
+    String,
+);
+
+/// A CodeQL document being made (#578): the file it writes, or why not,
+/// and the status lines for success and for failure.
+type CodeqlDocJob = (
+    std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    String,
+    String,
+);
+
+/// An evaluator log being read for its viewer (#578): the predicates, or
+/// why not, and the query whose log it is.
+type CodeqlLogViewerJob = (
+    std::sync::mpsc::Receiver<Result<Vec<crate::codeql_evallog::Predicate>, String>>,
+    String,
+);
+
+/// The Model Editor's endpoints being read (#578): the endpoints, or why
+/// not, and the database and language they are for.
+type CodeqlModelJob = (
+    std::sync::mpsc::Receiver<Result<Vec<crate::codeql_model::Endpoint>, String>>,
     String,
     String,
 );
@@ -64760,11 +67010,15 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
         let codeql_changed = app.drain_codeql_run()
+            | app.drain_codeql_ast()
+            | app.drain_codeql_model()
+            | app.drain_codeql_doc()
             | app.drain_codeql_upgrade()
             | app.drain_codeql_version()
             | app.drain_codeql_log_summary()
             | app.drain_codeql_log_viewer()
             | app.drain_codeql_perf_compare()
+            | app.drain_codeql_query_help()
             | app.drain_codeql_pack_job()
             | app.drain_codeql_cli_download()
             | app.drain_codeql_cli_check()
@@ -64819,6 +67073,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_sarif_selection_to_cursor();
         app.sync_sarif_step_marks();
         app.refresh_sarif_preview();
+        app.poll_sarif_download();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();

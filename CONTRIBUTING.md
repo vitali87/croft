@@ -213,13 +213,32 @@ number had to be reserved by hand between contributors. Only the current
 version's file may change in a PR: an older one describes a release that has
 already shipped.
 
-CI enforces all of it (the `version bump + release notes` job). Docs, CI, and
+CI enforces all of it (the `version bump + release notes` job), the 1000 cap
+included. Docs, CI, and
 test-only PRs are exempt: `src/app/tests.rs` and `tests/` by path, and a `.rs`
 file whose diff touches nothing outside a `#[cfg(test)]` module, since most of
 croft's unit tests sit beside the code they cover and a change confined to them
 produces a byte-identical binary. Anything that filter is unsure about counts
 as shipped, so an unexpected bump request is the failure it prefers over a
 waived one.
+
+### Version numbers count like an odometer
+
+`MINOR` and `PATCH` each stay below 1000, the same rule code-graph-rag's
+version bump uses. A bump that would take one to 1000 carries into the next
+component and resets the lower ones to 0: `0.1.999` is followed by `0.2.0`,
+never `0.1.1000`, and `0.999.999` by `1.0.0`. A version already past the cap
+carries on its next bump the same way, which is why the release after
+`0.1.1244` is `0.2.0`. Let the helper pick the number rather than adding one
+by hand:
+
+```bash
+python3 scripts/next_version.py "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)"   # next patch
+python3 scripts/next_version.py 0.2.7 minor                                          # 0.3.0
+```
+
+Skipping numbers to stay clear of other open PRs is still fine; the gate only
+refuses a version that does not go up or has a component at or above 1000.
 
 ## Insert new items AFTER a complete item, never above a doc block
 

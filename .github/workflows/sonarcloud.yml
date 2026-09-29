@@ -31,7 +31,7 @@ jobs:
       - name: Skip without a token
         if: env.SONAR_TOKEN == ''
         run: echo "::notice::SONAR_TOKEN is not available (fork PR, or the secret is not configured); skipping SonarQube Cloud analysis."
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: env.SONAR_TOKEN != ''
         with:
           # Full history: SonarQube Cloud needs blame data to attribute issues
@@ -44,7 +44,7 @@ jobs:
       - name: Install the pinned toolchain
         if: env.SONAR_TOKEN != ''
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: env.SONAR_TOKEN != ''
         with:
           key: sonarcloud
@@ -60,4 +60,7 @@ jobs:
         run: cargo clippy --all-targets --message-format=json > clippy-report.json || true
       - name: SonarQube Cloud scan
         if: env.SONAR_TOKEN != ''
-        uses: SonarSource/sonarqube-scan-action@v8
+        # Pinned to a commit, not the v8 tag: this step can read SONAR_TOKEN,
+        # and a tag can be moved to different code. .github/dependabot.yml
+        # keeps the pin current.
+        uses: SonarSource/sonarqube-scan-action@ba9859eae8dd6bd29e412f25ddbbef3d032000f4 # v8.2.2

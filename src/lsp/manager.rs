@@ -964,6 +964,9 @@ pub struct LspManager {
     semantic_refresh: Arc<AtomicBool>,
     inlay_refresh: Arc<AtomicBool>,
     diagnostic_refresh: Arc<AtomicBool>,
+    /// Set by the worker when it restarted a language server that exited
+    /// (#694); see [`LspManager::take_servers_restarted`].
+    servers_restarted: Arc<AtomicBool>,
     next_request_id: u64,
     workspace_root: PathBuf,
     _runtime: LspRuntime,
@@ -1023,6 +1026,7 @@ impl LspManager {
         let semantic_refresh = Arc::new(AtomicBool::new(false));
         let inlay_refresh = Arc::new(AtomicBool::new(false));
         let diagnostic_refresh = Arc::new(AtomicBool::new(false));
+        let servers_restarted = Arc::new(AtomicBool::new(false));
         let root = workspace_root.clone();
         // Load user-installed extensions (`~/.config/croft/extensions`) and merge
         // them with the bundled ones. The language table must be initialised
@@ -1079,6 +1083,7 @@ impl LspManager {
             semantic_refresh.clone(),
             inlay_refresh.clone(),
             diagnostic_refresh.clone(),
+            servers_restarted.clone(),
         ));
         Ok(Self {
             semantic_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1116,6 +1121,7 @@ impl LspManager {
             semantic_refresh,
             inlay_refresh,
             diagnostic_refresh,
+            servers_restarted,
             next_request_id: 1,
             workspace_root,
             _runtime: runtime,
@@ -1373,6 +1379,13 @@ impl LspManager {
     /// app re-requests tokens for the visible editor(s) when this is true.
     pub fn take_semantic_refresh(&self) -> bool {
         self.semantic_refresh.swap(false, Ordering::Relaxed)
+    }
+
+    /// Returns and clears the "a language server was restarted" flag (#694).
+    /// The restarted server knows no documents, so the app answers by
+    /// re-opening every tab against it.
+    pub fn take_servers_restarted(&self) -> bool {
+        self.servers_restarted.swap(false, Ordering::Relaxed)
     }
 
     /// Returns and clears the "a server asked us to re-pull workspace
@@ -2043,6 +2056,56 @@ struct WorkerState {
     // Cloned into every spawned client's router so server `$/progress`
     // notifications (rust-analyzer indexing, etc.) reach the status bar.
     progress_tx: std_mpsc::Sender<ProgressUpdate>,
+    restarts: ServerRestarts,
+}
+
+/// How often a (language, root)'s servers may be restarted after exiting,
+/// and within what window (#694). A server that dies on every start would
+/// otherwise respawn on every keystroke; past the limit croft leaves it
+/// down and says so, as it did before restarts existed.
+const MAX_RESTARTS: usize = 3;
+const RESTART_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Restart bookkeeping for servers that exited under a live workspace.
+#[derive(Default)]
+struct ServerRestarts {
+    /// When each key's servers were last restarted, newest last.
+    attempts: HashMap<ClientKey, Vec<std::time::Instant>>,
+    /// Keys whose servers used up [`MAX_RESTARTS`]: left down until the
+    /// workspace re-roots or croft restarts, so a crash loop cannot spin.
+    gave_up: std::collections::HashSet<ClientKey>,
+    /// Keys whose restart lost a server that ran before it, with the names
+    /// of the servers that ran. The next pass restarts them as a set again: a
+    /// non-empty list is never re-probed, and a lone missing server cannot be
+    /// added to documents the others hold.
+    incomplete: HashMap<ClientKey, Vec<String>>,
+    /// Set by [`WorkerState::restart_dead_servers`] for the respawn it has
+    /// already counted, so `ensure_clients` does not count it again: the
+    /// servers that ran before it, which the respawn must bring back.
+    respawn: Option<Vec<String>>,
+    /// Raised after a restart; the app polls it to re-open its tabs.
+    restarted: Arc<AtomicBool>,
+}
+
+impl ServerRestarts {
+    fn reporting_to(restarted: Arc<AtomicBool>) -> Self {
+        Self {
+            restarted,
+            ..Self::default()
+        }
+    }
+
+    /// Record a restart of `key` at `now` if the budget allows one.
+    fn try_restart(&mut self, key: &ClientKey, now: std::time::Instant) -> bool {
+        let attempts = self.attempts.entry(key.clone()).or_default();
+        attempts.retain(|t| now.duration_since(*t) < RESTART_WINDOW);
+        if attempts.len() >= MAX_RESTARTS {
+            self.gave_up.insert(key.clone());
+            return false;
+        }
+        attempts.push(now);
+        true
+    }
 }
 
 struct DocState {
@@ -2100,6 +2163,7 @@ async fn worker_loop(
     semantic_refresh: Arc<AtomicBool>,
     inlay_refresh: Arc<AtomicBool>,
     diagnostic_refresh: Arc<AtomicBool>,
+    servers_restarted: Arc<AtomicBool>,
 ) {
     let mut state = WorkerState {
         workspace_root,
@@ -2113,8 +2177,14 @@ async fn worker_loop(
         diagnostic_refresh,
         diagnostics_tx: tx.diagnostics.clone(),
         progress_tx: tx.progress.clone(),
+        restarts: ServerRestarts::reporting_to(servers_restarted),
     };
     while let Some(cmd) = cmd_rx.recv().await {
+        // Before any command touches a server: one the kernel killed, or
+        // that crashed, comes back here rather than staying down (#694).
+        if !matches!(cmd, Cmd::Shutdown { .. }) {
+            state.restart_dead_servers().await;
+        }
         match cmd {
             Cmd::Shutdown { done } => {
                 state.shutdown_all().await;
@@ -2557,6 +2627,85 @@ impl WorkerState {
         }
     }
 
+    /// Restart the servers of every (language, root) with a server that has
+    /// exited (#694): killed by the OOM killer, which croft asks to pick
+    /// language servers first, or crashed. Their documents are forgotten and
+    /// the app is told to re-open its tabs, since a new server knows none of
+    /// them. Past [`MAX_RESTARTS`] in [`RESTART_WINDOW`] the dead servers are
+    /// dropped and left down instead.
+    async fn restart_dead_servers(&mut self) {
+        let dead: Vec<ClientKey> = self
+            .clients
+            .iter()
+            .filter(|(key, clients)| {
+                !self.restarts.gave_up.contains(*key)
+                    && (self.restarts.incomplete.contains_key(*key)
+                        || clients.iter().any(|managed| {
+                            // A client in use is not a dead one; skip it rather
+                            // than wait on the lock.
+                            managed
+                                .client
+                                .try_lock()
+                                .is_ok_and(|client| client.has_exited())
+                        }))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in dead {
+            let Some(clients) = self.clients.remove(&key) else {
+                continue;
+            };
+            let names: Vec<&str> = clients.iter().map(|c| c.name.as_str()).collect();
+            // A server that never came up is not one the restart lost; a set
+            // still short from the last restart keeps what it is missing.
+            let expected = self
+                .restarts
+                .incomplete
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| names.iter().map(|n| n.to_string()).collect());
+            if !self.restarts.try_restart(&key, std::time::Instant::now()) {
+                let msg = format!(
+                    "{} stopped {MAX_RESTARTS} times in 10 minutes; leaving it off until croft restarts or the workspace reopens",
+                    names.join(", ")
+                );
+                log_file::log(&format!("lsp restart: {msg}"));
+                crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
+                // Keep the survivors; `gave_up` stops both this pass and the
+                // empty-list re-probe from spawning the dead ones again.
+                let alive: Vec<ManagedClient> = clients
+                    .into_iter()
+                    .filter(|m| m.client.try_lock().map_or(true, |c| !c.has_exited()))
+                    .collect();
+                self.restarts.incomplete.remove(&key);
+                self.clients.insert(key, alive);
+                continue;
+            }
+            let msg = format!("{} stopped; restarting", names.join(", "));
+            log_file::log(&format!("lsp restart: {msg} for {}", key.1.display()));
+            crate::output::push("Language Servers", crate::output::OutputLevel::Info, &msg);
+            // The survivors go too: servers for one key are spawned and
+            // opened as a set, and a half-restarted set would hold documents
+            // the new server never saw.
+            for managed in clients {
+                let mut client = managed.client.lock().await;
+                if !client.has_exited() {
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(3), client.shutdown())
+                            .await;
+                }
+            }
+            self.docs
+                .retain(|_, doc| (doc.language, doc.project_root.clone()) != key);
+            // Respawn as a re-probe, not a first attempt, so a set that comes
+            // back short is marked incomplete and tried again.
+            self.clients.insert(key.clone(), Vec::new());
+            self.restarts.respawn = Some(expected);
+            self.ensure_clients(key.0, &key.1).await;
+            self.restarts.restarted.store(true, Ordering::Relaxed);
+        }
+    }
+
     async fn ensure_clients(&mut self, lang: Language, root: &Path) -> &[ManagedClient] {
         // Re-probe when the cached list is empty: a server (e.g. the managed
         // vtsls) may have finished its background install since the first
@@ -2564,11 +2713,33 @@ impl WorkerState {
         // A non-empty list is stable and never re-probed.
         let key: ClientKey = (lang, root.to_path_buf());
         let first_attempt = !self.clients.contains_key(&key);
-        let should_try = first_attempt
-            || self
+        // A key whose servers crash-looped stays down (#694): the empty-list
+        // re-probe below would otherwise respawn them on every open.
+        let empty = !first_attempt
+            && self
                 .clients
                 .get(&key)
                 .is_some_and(|clients| clients.is_empty());
+        let respawn = self.restarts.respawn.take();
+        let prepaid = respawn.is_some();
+        let mut should_try = !self.restarts.gave_up.contains(&key) && (first_attempt || empty);
+        // An empty list left by a restart whose respawn failed is re-probed
+        // by every request. Each re-probe is another restart and spends the
+        // same budget, so a server that never comes back stops being launched.
+        if should_try
+            && empty
+            && !prepaid
+            && self.restarts.attempts.contains_key(&key)
+            && !self.restarts.try_restart(&key, std::time::Instant::now())
+        {
+            let msg = format!(
+                "language servers for {} did not come back after {MAX_RESTARTS} restarts in 10 minutes; leaving them off until croft restarts or the workspace reopens",
+                key.1.display()
+            );
+            log_file::log(&format!("lsp restart: {msg}"));
+            crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
+            should_try = false;
+        }
         if should_try {
             let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
             // Spawn every server for this root concurrently rather than awaiting
@@ -2801,6 +2972,28 @@ impl WorkerState {
                 workspace_pull_targets(spawned.iter()),
                 self.diagnostics_tx.clone(),
             );
+            // An empty list that comes back is a restart as far as the app is
+            // concerned: it sent its tabs while the list was empty, so these
+            // servers have none of them (#694).
+            if !first_attempt && !spawned.is_empty() {
+                self.restarts.restarted.store(true, Ordering::Relaxed);
+            }
+            // A restart that lost a server which ran before it is retried as
+            // a set by the next `restart_dead_servers` pass. One that never
+            // came up is not a reason to restart the others.
+            match respawn {
+                Some(expected)
+                    if !spawned.is_empty()
+                        && expected
+                            .iter()
+                            .any(|name| !spawned.iter().any(|c| &c.name == name)) =>
+                {
+                    self.restarts.incomplete.insert(key.clone(), expected);
+                }
+                _ => {
+                    self.restarts.incomplete.remove(&key);
+                }
+            }
             self.clients.insert(key.clone(), spawned);
         }
         self.clients.get(&key).map(Vec::as_slice).unwrap_or(&[])
@@ -2832,6 +3025,13 @@ impl WorkerState {
     }
 
     async fn open_doc(&mut self, path: PathBuf, text: String) {
+        // The app re-sends every tab after a restart (#694). A document whose
+        // servers did not restart is still open there, and a second didOpen
+        // would break the protocol, so it goes out as a full-text change.
+        if self.docs.contains_key(&path) {
+            self.change_doc(path, text).await;
+            return;
+        }
         let Some(lang) = path_to_language(&path) else {
             return;
         };
@@ -8623,6 +8823,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
         let never_opened = root.join("stray.py");
 
@@ -8684,6 +8885,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
         let never_opened = root.join("stray.py");
         let runtime = LspRuntime::new().expect("runtime");
@@ -8719,6 +8921,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
         let never_opened = root.join("stray.py");
         let runtime = LspRuntime::new().expect("runtime");
@@ -8814,6 +9017,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
         let never_opened = root.join("stray.py");
         let runtime = LspRuntime::new().expect("runtime");
@@ -8891,6 +9095,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
         let never_opened = root.join("stray.py");
         let runtime = LspRuntime::new().expect("runtime");
@@ -8958,6 +9163,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
         let never_opened = root.join("stray.css");
         let runtime = LspRuntime::new().expect("runtime");
@@ -9023,6 +9229,305 @@ while True:
         break
 "#;
 
+    /// #694: restarts are budgeted per (language, root), so a server that
+    /// dies on every start cannot respawn on every keystroke.
+    #[test]
+    fn server_restarts_are_budgeted_per_window() {
+        let mut restarts = ServerRestarts::default();
+        let key: ClientKey = (Language::PYTHON, PathBuf::from("/w"));
+        let other: ClientKey = (Language::PYTHON, PathBuf::from("/other"));
+        let t0 = Instant::now();
+        for i in 0..MAX_RESTARTS {
+            assert!(
+                restarts.try_restart(&key, t0),
+                "restart {i} is within budget"
+            );
+        }
+        assert!(!restarts.try_restart(&key, t0), "one more is refused");
+        assert!(restarts.gave_up.contains(&key));
+        // The budget is per key: another root is unaffected.
+        assert!(restarts.try_restart(&other, t0));
+        // Attempts age out of the window.
+        let mut fresh = ServerRestarts::default();
+        for _ in 0..MAX_RESTARTS {
+            fresh.try_restart(&key, t0);
+        }
+        assert!(fresh.try_restart(&key, t0 + RESTART_WINDOW + Duration::from_secs(1)));
+    }
+
+    /// #694: a language server the kernel kills (croft makes them its first
+    /// OOM victims) comes back on the next command, its documents are
+    /// forgotten, and the app is told to re-open its tabs.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_language_server_is_restarted() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        std::fs::write(&file, "x = 1\n").expect("write demo");
+        let script = root.join("fake_lsp.py");
+        let pids = root.join("pids.log");
+        std::fs::write(
+            &script,
+            format!(
+                "import os, sys\nopen(sys.argv[2], 'a').write(str(os.getpid()) + '\\n')\n{FAKE_LSP_RECORDER}"
+            ),
+        )
+        .expect("write fake server");
+        let log = root.join("methods.log");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-recorder",
+                command: python.display().to_string(),
+                args: vec![
+                    script.display().to_string(),
+                    log.display().to_string(),
+                    pids.display().to_string(),
+                ],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let restarted = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::reporting_to(restarted.clone()),
+        };
+        let key: ClientKey = (Language::PYTHON, root.clone());
+        let started = |n: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let seen: Vec<i32> = std::fs::read_to_string(&pids)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|l| l.trim().parse().ok())
+                    .collect();
+                if seen.len() >= n || Instant::now() >= deadline {
+                    return seen;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(file.clone(), String::from("x = 1\n")));
+        let first = started(1);
+        assert_eq!(first.len(), 1, "the server must have started once");
+        assert!(state.docs.contains_key(&file));
+
+        // What the OOM killer does.
+        // SAFETY: plain kill(2) on a pid this test's server wrote.
+        unsafe {
+            libc::kill(first[0], libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.clients[&key]
+            .iter()
+            .all(|m| m.client.try_lock().is_ok_and(|c| c.has_exited()))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the client never noticed the kill"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        handle.block_on(state.restart_dead_servers());
+        let both = started(2);
+        assert_eq!(both.len(), 2, "a new server must have been started");
+        assert_ne!(both[0], both[1]);
+        assert!(
+            restarted.load(Ordering::Relaxed),
+            "the app must be told to re-open its tabs"
+        );
+        assert!(
+            !state.docs.contains_key(&file),
+            "the new server never saw the old documents"
+        );
+        assert!(
+            state.clients[&key]
+                .iter()
+                .all(|m| m.client.try_lock().is_ok_and(|c| !c.has_exited())),
+            "the restarted client must be alive"
+        );
+        // A live server is left alone: no third start.
+        restarted.store(false, Ordering::Relaxed);
+        handle.block_on(state.restart_dead_servers());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(started(2).len(), 2);
+        assert!(!restarted.load(Ordering::Relaxed));
+
+        // The app re-sends every tab after a restart. The first open reaches
+        // the new server as didOpen; a repeat is a change, not a second open.
+        handle.block_on(state.open_doc(file.clone(), String::from("x = 1\n")));
+        handle.block_on(state.open_doc(file.clone(), String::from("x = 2\n")));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let methods = loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("textDocument/didChange") || Instant::now() >= deadline {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // Both servers share the log; count only what the new one received.
+        let new_server = methods.rsplit("initialize\n").next().unwrap_or_default();
+        assert_eq!(
+            new_server.matches("textDocument/didOpen").count(),
+            1,
+            "a document is opened once per server: {methods:?}"
+        );
+        assert!(new_server.contains("textDocument/didChange"), "{methods:?}");
+        handle.block_on(state.shutdown_all());
+
+        // A key that used up its restarts is not re-probed through an empty
+        // client list either.
+        state.restarts.gave_up.insert(key.clone());
+        state.clients.insert(key.clone(), Vec::new());
+        handle.block_on(state.ensure_clients(key.0, &key.1));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(started(2).len(), 2, "a given-up server must stay down");
+
+        // An empty list that comes back (a restart whose spawn failed, then a
+        // later re-probe that works) must tell the app too: it already sent
+        // its tabs into the empty list, so the new server never saw them.
+        state.restarts.gave_up.remove(&key);
+        restarted.store(false, Ordering::Relaxed);
+        handle.block_on(state.ensure_clients(key.0, &key.1));
+        assert_eq!(started(3).len(), 3, "the empty list must be re-probed");
+        assert!(
+            restarted.load(Ordering::Relaxed),
+            "a recovered empty list must make the app re-open its tabs"
+        );
+        handle.block_on(state.shutdown_all());
+
+        // A restart that loses a server which ran before it is tried again as
+        // a set, not left short a server until croft restarts. The flaky
+        // server runs until its flag file exists, then fails at launch.
+        let flag = root.join("flaky.off");
+        let flaky = root.join("flaky_lsp.py");
+        std::fs::write(
+            &flaky,
+            format!(
+                "import os, sys\nif os.path.exists({:?}): sys.exit(1)\n{}",
+                flag.display().to_string(),
+                std::fs::read_to_string(&script).expect("read fake server")
+            ),
+        )
+        .expect("write flaky server");
+        state.registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-flaky",
+                command: python.display().to_string(),
+                args: vec![
+                    flaky.display().to_string(),
+                    log.display().to_string(),
+                    pids.display().to_string(),
+                ],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let kill_one = |state: &WorkerState, pid: i32| {
+            // SAFETY: plain kill(2) on a pid this test's server wrote.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !state.clients[&key]
+                .iter()
+                .any(|m| m.client.try_lock().is_ok_and(|c| c.has_exited()))
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the client never noticed the kill"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        // A server that never came up is not one a restart lost: the others
+        // are restarted once for their own crash, and then left alone.
+        std::fs::write(&flag, "").expect("write flag");
+        state.restarts.attempts.clear();
+        state.clients.remove(&key);
+        handle.block_on(state.ensure_clients(key.0, &key.1));
+        let pid = *started(4).last().expect("recorder pid");
+        assert_eq!(state.clients[&key].len(), 1, "only the recorder came up");
+        kill_one(&state, pid);
+        handle.block_on(state.restart_dead_servers());
+        assert_eq!(started(5).len(), 5);
+        assert!(
+            !state.restarts.incomplete.contains_key(&key),
+            "a server that never ran must not make the set incomplete"
+        );
+        handle.block_on(state.restart_dead_servers());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(started(0).len(), 5, "a live set is not restarted again");
+        handle.block_on(state.shutdown_all());
+
+        // Both run; one crashes and the flaky one does not come back.
+        std::fs::remove_file(&flag).expect("remove flag");
+        state.restarts.attempts.clear();
+        state.clients.remove(&key);
+        handle.block_on(state.ensure_clients(key.0, &key.1));
+        let pid = *started(7).last().expect("server pid");
+        assert_eq!(state.clients[&key].len(), 2, "both servers came up");
+        assert!(!state.restarts.incomplete.contains_key(&key));
+        std::fs::write(&flag, "").expect("write flag");
+        kill_one(&state, pid);
+        restarted.store(false, Ordering::Relaxed);
+        handle.block_on(state.restart_dead_servers());
+        assert_eq!(started(8).len(), 8);
+        assert_eq!(state.clients[&key].len(), 1, "only the recorder came back");
+        assert!(restarted.load(Ordering::Relaxed));
+        assert!(state.restarts.incomplete.contains_key(&key));
+        handle.block_on(state.restart_dead_servers());
+        assert_eq!(started(9).len(), 9, "a short set must be restarted");
+        assert!(
+            state.restarts.incomplete.contains_key(&key),
+            "a restart that comes back short again must stay marked"
+        );
+
+        // A restart that brought nothing back leaves an empty list, which
+        // every request re-probes. Those re-probes spend the restart budget,
+        // so the servers stop being launched once it is gone.
+        state.restarts.incomplete.remove(&key);
+        let before = started(0).len();
+        for _ in 0..MAX_RESTARTS + 2 {
+            state.clients.insert(key.clone(), Vec::new());
+            handle.block_on(state.ensure_clients(key.0, &key.1));
+        }
+        let launched = started(0).len() - before;
+        assert!(
+            launched < MAX_RESTARTS + 2,
+            "re-probes past the budget must not launch servers ({launched})"
+        );
+        assert!(state.restarts.gave_up.contains(&key));
+        handle.block_on(state.shutdown_all());
+    }
+
     /// Issue #37: rust-analyzer re-runs its check-on-save (`cargo check`, the
     /// source of the Rust PROBLEMS entries) only when the client sends
     /// `textDocument/didSave`. Saving a file must therefore emit didSave, or
@@ -9067,6 +9572,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
 
         let runtime = LspRuntime::new().expect("runtime");
@@ -9185,6 +9691,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
 
         let (tx, rx) = std_mpsc::channel();
@@ -9365,6 +9872,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
 
         let (tx, rx) = std_mpsc::channel();
@@ -9609,6 +10117,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
 
         let (tx, rx) = std_mpsc::channel();
@@ -9731,6 +10240,7 @@ while True:
             diagnostic_refresh: Arc::new(AtomicBool::new(false)),
             diagnostics_tx: diag_tx,
             progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
         };
 
         let (tx, rx) = std_mpsc::channel();

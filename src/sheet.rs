@@ -283,6 +283,41 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
 }
 
 impl SheetData {
+    /// Sort the body rows by column `col` (#578, a sortable results
+    /// table): ascending, or descending when they already are ascending,
+    /// so sorting the same column again reverses it. Cells that both read
+    /// as numbers compare as numbers, others as text without case. The
+    /// sort is stable, and the cursor stays on the row it was on. Returns
+    /// whether the order is now ascending.
+    pub fn sort_by_column(&mut self, col: usize) -> bool {
+        fn cmp(a: &str, b: &str) -> std::cmp::Ordering {
+            match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
+                (Ok(x), Ok(y)) => x.total_cmp(&y),
+                _ => a.to_lowercase().cmp(&b.to_lowercase()),
+            }
+        }
+        let key = |r: &Vec<String>| r.get(col).cloned().unwrap_or_default();
+        let ascending = !self
+            .rows
+            .windows(2)
+            .all(|w| cmp(&key(&w[0]), &key(&w[1])).is_le());
+        let mut order: Vec<usize> = (0..self.rows.len()).collect();
+        order.sort_by(|&i, &j| {
+            let o = cmp(&key(&self.rows[i]), &key(&self.rows[j]));
+            if ascending { o } else { o.reverse() }
+        });
+        let cursor = order.iter().position(|&i| i == self.cur_row);
+        let mut old: Vec<Option<Vec<String>>> = std::mem::take(&mut self.rows)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.rows = order.iter().filter_map(|&i| old[i].take()).collect();
+        if let Some(c) = cursor {
+            self.cur_row = c;
+        }
+        ascending
+    }
+
     /// Overwrite one body cell (#177), growing a short row (the csv
     /// reader is `flexible`, so ragged rows are real) and refreshing the
     /// column widths so the grid re-lays-out immediately.
@@ -605,6 +640,23 @@ fn format_float(f: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sorting_a_column_orders_numbers_as_numbers_and_toggles() {
+        let mut d = super::parse_delimited(b"name,count\nb,10\nA,9\nc,100\n", b',', "s").unwrap();
+        d.cur_row = 2; // on "c"
+        assert!(d.sort_by_column(1), "ascending first");
+        let col = |d: &super::SheetData, c: usize| -> Vec<String> {
+            d.rows.iter().map(|r| r[c].clone()).collect()
+        };
+        assert_eq!(col(&d, 1), ["9", "10", "100"], "as numbers, not text");
+        assert_eq!(d.rows[d.cur_row][0], "c", "the cursor keeps its row");
+        assert!(!d.sort_by_column(1), "again: descending");
+        assert_eq!(col(&d, 1), ["100", "10", "9"]);
+        assert!(d.sort_by_column(0));
+        assert_eq!(col(&d, 0), ["A", "b", "c"], "text without case");
+        assert_eq!(d.headers, ["name", "count"], "the header stays put");
+    }
+
     #[test]
     fn xlsx_edits_write_back_preserving_untouched_formulas() {
         let tmp = tempfile::tempdir().unwrap();

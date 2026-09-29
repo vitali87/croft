@@ -1,7 +1,8 @@
 //! File references (`path:line[:col]`) detected in terminal text.
 //!
 //! Powers Cmd/Ctrl+click on compiler / test / grep output in any terminal
-//! pane: `src/merge.rs:127:19`, `./x.py:12`, `/abs/f.c:10`, `~/f.rs:3`, and
+//! pane: `src/merge.rs:127:19`, `./x.py:12`, `/abs/f.c:10`, `~/f.rs:3`, a
+//! line range such as `tests/t.py:62-69` (as agents print them), and
 //! Python's `File "x.py", line 12` traceback form all resolve to a jump
 //! target. Because croft owns the PTY, this works for anything printed by
 //! any command, with no per-tool "problem matcher" configuration.
@@ -22,9 +23,12 @@ pub struct FileRef {
     pub path: String,
     pub line: u32,
     pub column: Option<u32>,
+    /// The last line of a `path:line-end` range (#804), 1-based and never
+    /// before `line`.
+    pub end_line: Option<u32>,
 }
 
-/// `path:line[:col]` where the path token contains a `/` or a `.` so bare
+/// `path:line[:col]` or `path:line-end` where the path token contains a `/` or a `.` so bare
 /// numbers (`12:30`) and shell timestamps never match. Path characters
 /// mirror what compilers and grep print; quotes / brackets / whitespace
 /// terminate the token.
@@ -33,7 +37,7 @@ static PATH_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"(?x)
         (?P<path> [~]? [A-Za-z0-9_@+\-./]* [/.] [A-Za-z0-9_@+\-./]* )
         : (?P<line> \d{1,7} )
-        (?: : (?P<col> \d{1,7} ) )?
+        (?: - (?P<end> \d{1,7} ) | : (?P<col> \d{1,7} ) )?
     ",
     )
     .expect("path:line regex")
@@ -58,6 +62,7 @@ pub fn file_ref_at(text: &str, col: usize) -> Option<FileRef> {
                 path: c["path"].to_string(),
                 line: c["line"].parse().ok()?,
                 column: None,
+                end_line: None,
             });
         }
     }
@@ -66,10 +71,15 @@ pub fn file_ref_at(text: &str, col: usize) -> Option<FileRef> {
         let start = text[..m.start()].chars().count();
         let end = start + m.as_str().chars().count();
         if col >= start && col < end {
+            let line: u32 = c["line"].parse().ok()?;
             return Some(FileRef {
                 path: c["path"].to_string(),
-                line: c["line"].parse().ok()?,
+                line,
                 column: c.name("col").and_then(|v| v.as_str().parse().ok()),
+                end_line: c
+                    .name("end")
+                    .and_then(|v| v.as_str().parse().ok())
+                    .filter(|&end| end >= line),
             });
         }
     }
@@ -100,6 +110,7 @@ pub fn editor_file_uri(url: &str) -> Option<FileRef> {
             path,
             line: 1,
             column: None,
+            end_line: None,
         });
     }
     if !EDITOR_LINK_SCHEMES
@@ -114,7 +125,12 @@ pub fn editor_file_uri(url: &str) -> Option<FileRef> {
     if !path.starts_with('/') {
         path.insert(0, '/');
     }
-    Some(FileRef { path, line, column })
+    Some(FileRef {
+        path,
+        line,
+        column,
+        end_line: None,
+    })
 }
 
 /// A two-file deep link from a report's group cell:
@@ -138,6 +154,7 @@ pub fn diff_uri(url: &str) -> Option<(FileRef, FileRef)> {
             path: path.to_string(),
             line,
             column,
+            end_line: None,
         };
         match key {
             "left" => left = Some(fr),
@@ -194,6 +211,22 @@ mod tests {
         assert!(at(text, 20).is_some());
         // Clicking the arrow is not.
         assert!(at(text, 3).is_none());
+    }
+
+    #[test]
+    fn a_line_range_is_one_reference_with_its_last_line() {
+        // #804: agents print ranges as `path:start-end`.
+        let text = "see tests/test_ast_types.py:62-69 for the case";
+        let r = at(text, 6).unwrap();
+        assert_eq!(
+            (r.path.as_str(), r.line, r.column, r.end_line),
+            ("tests/test_ast_types.py", 62, None, Some(69))
+        );
+        // The end number is part of the clickable span.
+        assert_eq!(at(text, 32).map(|r| r.end_line), Some(Some(69)));
+        // A backwards range keeps the start and drops the end.
+        assert_eq!(at("a.rs:9-3", 1).unwrap().end_line, None);
+        assert_eq!(at("a.rs:9:3", 1).unwrap().end_line, None);
     }
 
     #[test]
