@@ -11039,6 +11039,91 @@ fn drop_to_local_with_unsaved_edits_asks_first() {
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
 }
 
+/// #862 negative: S at a close prompt writes the tab it asked about and no
+/// other; a second unsaved tab stays unsaved and open.
+#[test]
+fn s_at_the_close_prompt_saves_only_that_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "y");
+    app.editor.select(0);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "bravo\n",
+        "the other unsaved tab is not written"
+    );
+    assert_eq!(app.editor.tab_count(), 1);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    assert!(app.editor.dirty, "and keeps its edits");
+}
+
+/// #862 negative: an answer never lands on a tab other than the one asked
+/// about. When the tab at that index is another file by the time the answer
+/// comes, D closes nothing and discards nothing.
+#[test]
+fn an_answer_for_a_tab_that_moved_closes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.select(0);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(matches!(
+        app.pending_unsaved,
+        Some(UnsavedExit::CloseTab { idx: 0, .. })
+    ));
+    // Something other than the user reorders the tabs meanwhile.
+    app.editor.editors.swap(0, 1);
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 2, "nothing closed");
+    assert!(app.status.contains("moved"), "{}", app.status);
+    let a_tab = app
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .unwrap();
+    assert!(a_tab.dirty && a_tab.lines[0] == "xalpha", "edits kept");
+}
+
+/// #862 negative: while the prompt is up a click behind it does nothing,
+/// even on another tab's close button, which closes that tab once the
+/// prompt is gone.
+#[test]
+fn a_click_behind_the_unsaved_prompt_closes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.select(0);
+    draw_screen(&mut app);
+    let row = app.editor.tab_strip_y_for_test();
+    let col = app.editor.close_screen_x(1).expect("b.txt's close button");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    draw_screen(&mut app);
+    left_click(&mut app, col, row);
+    assert_eq!(app.editor.tab_count(), 2, "the click went nowhere");
+    assert!(app.pending_unsaved.is_some(), "the prompt is still asking");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    draw_screen(&mut app);
+    left_click(&mut app, col, row);
+    assert_eq!(app.editor.tab_count(), 1, "with no prompt it closes b.txt");
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
