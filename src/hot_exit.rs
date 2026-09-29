@@ -5,12 +5,19 @@
 //! launch of the workspace brings back what it holds as unsaved tabs.
 //!
 //! Each running croft writes its own file,
-//! `<dir>/<workspace digest>/<pid>.json`, so two windows on one workspace
-//! never overwrite, remove or restore each other's copy: a launch takes over
-//! only the files of crofts that are gone.
+//! `<dir>/<workspace digest>/<pid>-<start time>.json`, so two windows on one
+//! workspace never overwrite, remove or restore each other's copy: a launch
+//! takes over only the files of crofts that are gone. The start time tells a
+//! croft from a later process that was given its recycled pid.
+//!
+//! Limits, chosen rather than missed: a file counts as changed on disk since
+//! a backup when its modification time or size differ, the stamp croft's
+//! own on-disk change detection uses, so a rewrite that keeps both goes
+//! unnoticed. A backup that cannot be read is reported and kept for
+//! [`UNREADABLE_KEPT_FOR`], for recovery by hand, then removed.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -71,24 +78,90 @@ pub fn workspace_dir(dir: &Path, root: &Path) -> PathBuf {
     dir.join(&digest[..16])
 }
 
-/// This croft's own backup file for the workspace at `root`.
+/// How long a backup that cannot be read is kept, reported at each launch
+/// in case it can be recovered by hand, before a launch removes it.
+pub const UNREADABLE_KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// This croft's own backup file for the workspace at `root`, named for the
+/// process writing it: `<pid>-<start time>.json`, or `<pid>.json` where the
+/// platform will not tell the start time.
 pub fn own_path(dir: &Path, root: &Path) -> PathBuf {
-    workspace_dir(dir, root).join(format!("{}.json", std::process::id()))
+    let pid = std::process::id();
+    let name = match own_start() {
+        Some(start) => format!("{pid}-{start}.json"),
+        None => format!("{pid}.json"),
+    };
+    workspace_dir(dir, root).join(name)
+}
+
+/// When process `pid` started, in whole seconds since the epoch, or `None`
+/// when the platform will not say (the process is gone, or hidden from this
+/// user). With the pid it names one process: a later process given the
+/// same recycled pid started at another time.
+pub fn start_time_of(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let p = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[p]), true);
+    sys.process(p).map(|pr| pr.start_time()).filter(|&t| t > 0)
+}
+
+/// This process's start time, read once.
+fn own_start() -> Option<u64> {
+    static START: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *START.get_or_init(|| start_time_of(std::process::id()))
 }
 
 /// Remove the backup at `path`, and its workspace directory once nothing
-/// else is left in it.
-pub fn remove(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    if let Some(parent) = path.parent() {
-        // Fails, harmlessly, while another croft's backup is still there.
-        let _ = std::fs::remove_dir(parent);
+/// else is left in it. The text goes first: the file is overwritten with an
+/// empty backup of `root` before it is unlinked, so where the unlink fails
+/// (a directory made read-only) no text is left behind, and the next launch
+/// removes the empty backup instead of restoring anything. `Err` only when
+/// neither worked, and the text may still be on disk.
+pub fn remove(path: &Path, root: &Path) -> std::io::Result<()> {
+    let cleared = clear(path, root);
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                // Fails, harmlessly, while another croft's backup is there.
+                let _ = std::fs::remove_dir(parent);
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => cleared.map_err(|_| e),
     }
 }
 
+/// Overwrite the backup at `path` in place with an empty backup of `root`.
+fn clear(path: &Path, root: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let empty = Backup {
+        workspace_root: root.to_path_buf(),
+        buffers: Vec::new(),
+    };
+    let json = serde_json::to_vec(&empty).map_err(std::io::Error::other)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(&json)
+}
+
+/// Whether the backup at `path` was last written longer than
+/// [`UNREADABLE_KEPT_FOR`] ago.
+pub fn is_expired(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > UNREADABLE_KEPT_FOR)
+}
+
 /// The backups of the workspace at `root` under `dir` that no running croft
-/// owns: named for a pid that is gone, or for this process (a dead croft's
-/// pid, recycled). A running croft's file is its own, live copy.
+/// owns: their croft is gone (see [`owner_runs`]), or the file carries this
+/// process's pid (a dead croft's pid, recycled, or an earlier run in this
+/// process). A running croft's file is its own, live copy.
 pub fn orphaned(dir: &Path, root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(workspace_dir(dir, root)) else {
         return Vec::new();
@@ -97,16 +170,42 @@ pub fn orphaned(dir: &Path, root: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u32>().ok())
-                .is_some_and(|pid| pid == me || is_gone(pid))
-        })
+        .filter(|p| owner_of(p).is_some_and(|(pid, start)| pid == me || !owner_runs(pid, start)))
         .collect();
     files.sort();
     files
+}
+
+/// The croft a backup's file name records: its pid, and its start time
+/// when the name carries one. `<pid>.json`, written before hot exit
+/// recorded start times or where the platform would not say, has the pid
+/// alone. `None` for anything that is not a backup.
+fn owner_of(path: &Path) -> Option<(u32, Option<u64>)> {
+    if path.extension().is_none_or(|x| x != "json") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    match stem.split_once('-') {
+        Some((pid, start)) => Some((pid.parse().ok()?, Some(start.parse().ok()?))),
+        None => Some((stem.parse().ok()?, None)),
+    }
+}
+
+/// Whether the croft that wrote a backup still runs: its pid is alive and,
+/// when the backup names a start time, the process on that pid started
+/// then. A live pid under another start time was recycled to a later
+/// process after the croft died. A backup named by its pid alone, or a
+/// process whose start time cannot be read, is judged by the pid alone:
+/// better to leave a backup to a croft that may still run than to take it
+/// from under one that does.
+fn owner_runs(pid: u32, start: Option<u64>) -> bool {
+    if is_gone(pid) {
+        return false;
+    }
+    match (start, start_time_of(pid)) {
+        (Some(then), Some(now)) => then == now,
+        _ => true,
+    }
 }
 
 /// Whether no process `pid` exists. Signal 0 checks without delivering
@@ -170,21 +269,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = workspace_dir(dir.path(), root.path());
         std::fs::create_dir_all(&ws).unwrap();
-        // pid 1 is always running; this pid is ours; the last never exists.
-        for name in ["1.json", "999999999.json", "notes.json", "7.json.1.tmp"] {
+        // pid 1 is always running, since `init1`; 999999999 never exists.
+        let init1 = start_time_of(1).expect("pid 1's start time");
+        let names = [
+            // pid alone: judged by the pid.
+            String::from("1.json"),
+            String::from("999999999.json"),
+            // pid and start time: the same process, or a recycled pid.
+            format!("1-{init1}.json"),
+            String::from("1-1.json"),
+            String::from("999999999-7.json"),
+            // Not backups.
+            String::from("notes.json"),
+            String::from("1-x.json"),
+            String::from("7.json.1.tmp"),
+        ];
+        for name in &names {
             std::fs::write(ws.join(name), "{}").unwrap();
         }
-        std::fs::write(ws.join(format!("{}.json", std::process::id())), "{}").unwrap();
+        let own = own_path(dir.path(), root.path());
+        std::fs::write(&own, "{}").unwrap();
         let found: Vec<String> = orphaned(dir.path(), root.path())
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         let mut want = vec![
-            format!("{}.json", std::process::id()),
+            own.file_name().unwrap().to_string_lossy().into_owned(),
             String::from("999999999.json"),
+            String::from("1-1.json"),
+            String::from("999999999-7.json"),
         ];
         want.sort();
         assert_eq!(found, want);
+    }
+
+    #[test]
+    fn own_path_names_this_process_and_when_it_started() {
+        let own = own_path(Path::new("/cache"), Path::new("/nonexistent/w"));
+        let start = start_time_of(std::process::id()).expect("our own start time");
+        assert_eq!(
+            own.file_name().unwrap().to_string_lossy(),
+            format!("{}-{start}.json", std::process::id())
+        );
     }
 
     #[test]
@@ -195,9 +321,35 @@ mod tests {
         let other = mine.with_file_name("1.json");
         backup(root.path()).save(&mine).unwrap();
         backup(root.path()).save(&other).unwrap();
-        remove(&mine);
+        remove(&mine, root.path()).unwrap();
         assert!(!mine.exists() && other.exists(), "the other window's stays");
-        remove(&other);
+        remove(&other, root.path()).unwrap();
         assert!(!workspace_dir(dir.path(), root.path()).exists());
+        assert!(remove(&other, root.path()).is_ok(), "gone already is fine");
+    }
+
+    /// Clearing leaves an empty backup of the workspace: no text, and the
+    /// next launch removes it rather than restoring anything.
+    #[test]
+    fn a_cleared_backup_holds_no_text() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = own_path(dir.path(), root.path());
+        backup(root.path()).save(&path).unwrap();
+        clear(&path, root.path()).unwrap();
+        let cleared = Backup::load(&path).unwrap();
+        assert!(cleared.buffers.is_empty() && cleared.is_of(root.path()));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("xalpha"));
+    }
+
+    /// A removal that cannot happen at all (a directory in the backup's
+    /// place) is an error, not silence.
+    #[test]
+    fn a_removal_that_cannot_happen_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = own_path(dir.path(), root.path());
+        std::fs::create_dir_all(path.join("inside")).unwrap();
+        assert!(remove(&path, root.path()).is_err());
     }
 }

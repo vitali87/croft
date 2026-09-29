@@ -3543,7 +3543,20 @@ pub struct App {
     pub hot_exit_dir: Option<PathBuf>,
     /// The [`App::unsaved_stamp`] this croft's backup on disk was written
     /// at, `None` while it has none: the tick writes only when they differ.
+    /// A write that fails leaves it alone, so a later tick tries again.
     hot_exit_written: Option<u64>,
+    /// When a failed hot-exit write may be tried again (#862): a full disk
+    /// is retried every [`App::HOT_EXIT_DELAY`], not every frame. `None`
+    /// once a write lands.
+    hot_exit_retry_at: Option<std::time::Instant>,
+    /// Backups of crofts that are gone whose text this croft restored
+    /// (#862). Removed once its own backup holds that text, so a write that
+    /// fails never leaves the text in memory only.
+    hot_exit_consumed: Vec<PathBuf>,
+    /// Lines for stderr once the terminal is the shell's again, about what
+    /// the user must still hear after croft has gone: a hot-exit backup a
+    /// quit could not remove (#862).
+    exit_notes: Vec<String>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -5699,6 +5712,9 @@ impl App {
                 Some(croft_cache_dir().join("hot-exit"))
             },
             hot_exit_written: None,
+            hot_exit_retry_at: None,
+            hot_exit_consumed: Vec::new(),
+            exit_notes: Vec::new(),
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -56536,7 +56552,7 @@ impl App {
         // The hot-exit backup is keyed by the workspace: this croft's goes
         // with it to the new root at the next tick, rather than staying
         // where the old workspace's next launch would restore it (#862).
-        self.clear_hot_exit();
+        self.remove_own_hot_exit();
         self.roots.replace_primary(new_root.clone());
         // A panel the user never touched — the startup default, one unnamed
         // shell with no input ever typed and no launched program — is swapped
@@ -57539,7 +57555,10 @@ impl App {
             return;
         }
         let stamp = self.unsaved_stamp();
-        if stamp == self.hot_exit_written {
+        if stamp == self.hot_exit_written && self.hot_exit_consumed.is_empty() {
+            return;
+        }
+        if self.hot_exit_retry_at.is_some_and(|at| now < at) {
             return;
         }
         let settling = stamp.is_some()
@@ -57569,20 +57588,49 @@ impl App {
     }
 
     /// Write the hot-exit backup now (#862): every unsaved text buffer of
-    /// every editor group, or no backup at all once there is none. A write
-    /// that fails says so, and is tried again after the next edit.
-    fn write_hot_exit(&mut self) {
+    /// every editor group, or no backup at all once there is none. Once it
+    /// lands, the backups this croft restored from go (never its own file,
+    /// which may carry the same name). A write that fails says so once, is
+    /// not counted as written, and is tried again by a later tick. Returns
+    /// whether it landed.
+    fn write_hot_exit(&mut self) -> bool {
         let Some(path) = self.hot_exit_path() else {
-            return;
+            return false;
         };
+        let root = self.workspace_root().to_path_buf();
         let stamp = self.unsaved_stamp();
         let backup = self.capture_hot_exit();
-        if backup.buffers.is_empty() {
-            crate::hot_exit::remove(&path);
-        } else if let Err(e) = backup.save(&path) {
-            self.status = format!("Could not back up unsaved changes ({e:#})");
+        let result = if backup.buffers.is_empty() {
+            crate::hot_exit::remove(&path, &root).map_err(|e| {
+                format!(
+                    "Could not remove the hot-exit backup {} ({e})",
+                    path.display()
+                )
+            })
+        } else {
+            backup
+                .save(&path)
+                .map_err(|e| format!("Could not back up unsaved changes ({e:#})"))
+        };
+        match result {
+            Ok(()) => {
+                self.hot_exit_written = stamp;
+                self.hot_exit_retry_at = None;
+                for consumed in std::mem::take(&mut self.hot_exit_consumed) {
+                    if consumed != path {
+                        let _ = crate::hot_exit::remove(&consumed, &root);
+                    }
+                }
+                true
+            }
+            Err(note) => {
+                if self.hot_exit_retry_at.is_none() {
+                    self.status = note;
+                }
+                self.hot_exit_retry_at = Some(std::time::Instant::now() + Self::HOT_EXIT_DELAY);
+                false
+            }
         }
-        self.hot_exit_written = stamp;
     }
 
     /// What a hot-exit backup holds (#862): each unsaved tab as the update
@@ -57621,11 +57669,38 @@ impl App {
         }
     }
 
-    /// Remove this croft's hot-exit backup (#862): the quit ending it kept
-    /// every unsaved edit on disk, or was told to drop them.
+    /// Remove this croft's hot-exit backup and the ones it restored from
+    /// (#862): the quit ending it kept every unsaved edit on disk, or was
+    /// told to drop them. One that cannot be removed is said, in the status
+    /// line and on stderr after the quit, since it may still hold text the
+    /// user chose to discard.
     fn clear_hot_exit(&mut self) {
+        let root = self.workspace_root().to_path_buf();
+        let mut left = Vec::new();
+        let consumed = std::mem::take(&mut self.hot_exit_consumed);
+        for path in self.hot_exit_path().into_iter().chain(consumed) {
+            if let Err(e) = crate::hot_exit::remove(&path, &root) {
+                left.push(format!("{} ({e})", path.display()));
+            }
+        }
+        self.hot_exit_written = None;
+        self.hot_exit_retry_at = None;
+        if !left.is_empty() {
+            let note = format!(
+                "Could not remove the hot-exit backup {}: it may still hold the unsaved text; delete it by hand",
+                left.join(", ")
+            );
+            self.status = note.clone();
+            self.exit_notes.push(note);
+        }
+    }
+
+    /// Remove this croft's own hot-exit backup, keyed by the workspace it
+    /// was written for (#862): a re-root writes it again under the new one
+    /// at the next tick, and what it restored from stays until then.
+    fn remove_own_hot_exit(&mut self) {
         if let Some(path) = self.hot_exit_path() {
-            crate::hot_exit::remove(&path);
+            let _ = crate::hot_exit::remove(&path, self.workspace_root());
         }
         self.hot_exit_written = None;
     }
@@ -57636,10 +57711,13 @@ impl App {
     /// cursor and nothing is written to its file. A file changed on disk
     /// since is named in the status line and keeps the stamp its edits were
     /// made against, so its first save asks before overwriting the change;
-    /// a deleted one comes back as a tab for its path. The consumed backups
-    /// are replaced by this croft's own at once, so a crash straight after
-    /// the launch cannot lose them either. A backup that cannot be read is
-    /// left where it is, and said so. Called once, at a normal launch.
+    /// a deleted one comes back as a tab for its path. This croft writes its
+    /// own backup of them at once and removes the consumed ones only after
+    /// that lands, so a crash straight after the launch, or a write that
+    /// fails, cannot lose them either. A backup that cannot be read is kept
+    /// and said so, until it is older than
+    /// [`crate::hot_exit::UNREADABLE_KEPT_FOR`]. Called once, at a normal
+    /// launch.
     pub fn restore_hot_exit(&mut self) {
         let Some(dir) = self.hot_exit_dir.clone() else {
             return;
@@ -57649,16 +57727,25 @@ impl App {
         let mut changed: Vec<PathBuf> = Vec::new();
         let mut gone: Vec<PathBuf> = Vec::new();
         let mut unreadable: Vec<String> = Vec::new();
+        let mut expired = 0usize;
         for file in crate::hot_exit::orphaned(&dir, &root) {
             let backup = match crate::hot_exit::Backup::load(&file) {
                 Ok(backup) if backup.is_of(&root) => backup,
                 // Another workspace's, under a colliding digest.
                 Ok(_) => continue,
+                // Reported for a week already: past recovery by hand.
+                Err(_) if crate::hot_exit::is_expired(&file) => {
+                    if crate::hot_exit::remove(&file, &root).is_ok() {
+                        expired += 1;
+                    }
+                    continue;
+                }
                 Err(_) => {
                     unreadable.push(file.display().to_string());
                     continue;
                 }
             };
+            let before = restored;
             for buffer in &backup.buffers {
                 let Some(ed) = self.restore_open_tab(&buffer.tab) else {
                     continue;
@@ -57676,7 +57763,13 @@ impl App {
                     Some(_) => {}
                 }
             }
-            crate::hot_exit::remove(&file);
+            if restored == before {
+                // Nothing in it to keep (an emptied backup, left by a
+                // removal that failed): no write to wait on.
+                let _ = crate::hot_exit::remove(&file, &root);
+            } else {
+                self.hot_exit_consumed.push(file);
+            }
         }
         let mut notes = Vec::new();
         if restored > 0 {
@@ -57697,11 +57790,22 @@ impl App {
             if !gone.is_empty() {
                 notes.push(format!("{} no longer on disk", names(&gone)));
             }
-            self.write_hot_exit();
+            if !self.write_hot_exit() {
+                notes.push(format!(
+                    "{}; the backup they came from is kept until it can",
+                    std::mem::take(&mut self.status)
+                ));
+            }
+        }
+        if expired > 0 {
+            notes.push(format!(
+                "Hot exit: removed {expired} unreadable backup{} older than a week",
+                if expired == 1 { "" } else { "s" }
+            ));
         }
         if !unreadable.is_empty() {
             notes.push(format!(
-                "Hot exit: could not read {} (kept)",
+                "Hot exit: could not read {} (kept for a week)",
                 unreadable.join(", ")
             ));
         }
@@ -67081,7 +67185,7 @@ pub fn run(
                 let _ = std::fs::remove_file(session_path);
                 // The hot-exit backup follows what the relaunch brought
                 // back (#862), at once rather than after the first edit.
-                app.write_hot_exit();
+                let _ = app.write_hot_exit();
             }
             // Kept: it may hold the only copy of unsaved text.
             Err(e) => {
@@ -67259,6 +67363,11 @@ pub fn run(
     // that dies mid-grace-kill leaves the claude child running.
     crate::pair_host::join_teardowns();
 
+    // What croft could not do on the way out, said once the shell is the
+    // user's again (#862).
+    for note in app.exit_notes.drain(..) {
+        eprintln!("croft: {note}");
+    }
     result?;
     if app.drop_to_local {
         std::process::exit(crate::remote::DROP_TO_LOCAL_EXIT_CODE);

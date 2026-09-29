@@ -11515,6 +11515,8 @@ fn hot_exit_does_not_restore_another_workspaces_backup() {
 
 /// #862 hot exit negative: a backup another running croft owns (a second
 /// window on the workspace) is neither restored nor removed by this one.
+/// This one is named by its pid alone, as backups were before hot exit
+/// recorded start times: a live pid is then taken to be its croft.
 #[test]
 fn hot_exit_leaves_a_running_crofts_backup_alone() {
     let tmp = tempfile::tempdir().unwrap();
@@ -11535,6 +11537,240 @@ fn hot_exit_leaves_a_running_crofts_backup_alone() {
         "not taken over"
     );
     assert!(live.exists(), "and not removed");
+}
+
+/// This test's hot-exit backup of `root`, renamed as a croft that is gone
+/// left it (a pid that does not exist, in the pid-only name): a backup at a
+/// path other than the restoring croft's own.
+fn as_a_dead_crofts_backup(cache: &std::path::Path, root: &std::path::Path) -> PathBuf {
+    let mine = hot_exit_files(cache, root).remove(0);
+    let dead = mine.with_file_name("999999999.json");
+    std::fs::rename(&mine, &dead).unwrap();
+    dead
+}
+
+/// Put a non-empty directory where `app`'s own hot-exit backup goes, so
+/// writing it fails even for root (a rename cannot replace a directory
+/// that holds something). Returns the path, to clear the way again.
+fn block_hot_exit_path(app: &App) -> PathBuf {
+    let own = app.hot_exit_path().unwrap();
+    std::fs::create_dir_all(own.join("blocked")).unwrap();
+    own
+}
+
+/// #862 hot exit (review): the backup a restore consumed stays on disk
+/// until this croft's own backup of the restored tabs is written. The
+/// restore removed it first, so a failed write (a full disk) left the text
+/// in memory only; the next tick then writes it and lets the old one go.
+#[test]
+fn a_failed_rewrite_after_a_restore_keeps_the_old_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let old = as_a_dead_crofts_backup(cache.path(), tmp.path());
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let own = block_hot_exit_path(&next);
+    next.restore_hot_exit();
+    assert!(
+        next.editor.dirty && next.editor.lines[0] == "xalpha",
+        "setup: restored"
+    );
+    assert!(
+        old.exists(),
+        "the old backup stays while it is the only copy on disk"
+    );
+    assert!(next.status.contains("Could not back up"), "{}", next.status);
+    std::fs::remove_dir_all(&own).unwrap();
+    settle_hot_exit(&mut next);
+    assert!(own.is_file(), "a later tick writes it");
+    assert!(!old.exists(), "and only then the old backup goes");
+}
+
+/// #862 hot exit (review): a backup write that failed is tried again by a
+/// later tick, with no further edit. It counted as written, so nothing was
+/// backed up until the user typed again.
+#[test]
+fn a_failed_hot_exit_write_is_retried_by_a_later_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    let own = block_hot_exit_path(&app);
+    settle_hot_exit(&mut app);
+    assert!(!own.is_file(), "setup: the write failed");
+    std::fs::remove_dir_all(&own).unwrap();
+    settle_hot_exit(&mut app);
+    assert!(own.is_file(), "retried with no new edit");
+    let backup = crate::hot_exit::Backup::load(&own).unwrap();
+    assert_eq!(backup.buffers.len(), 1);
+}
+
+/// #862 hot exit negative: a restore whose rewrite lands removes the backup
+/// it consumed; this croft's own backup is never removed, even when the
+/// consumed file carries its name (a dead croft whose pid it reuses).
+#[test]
+fn a_restore_replaces_the_old_backup_and_keeps_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let old = as_a_dead_crofts_backup(cache.path(), tmp.path());
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(!old.exists(), "the consumed backup goes");
+    let own = next.hot_exit_path().unwrap();
+    assert!(own.is_file(), "its own holds the text now");
+    drop(next);
+
+    // The consumed file is this croft's own name: it is rewritten, never
+    // removed.
+    let mut again = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    again.restore_hot_exit();
+    assert!(again.editor.dirty, "setup: restored again");
+    assert!(own.is_file(), "its own backup is kept");
+    let backup = crate::hot_exit::Backup::load(&own).unwrap();
+    assert!(
+        backup.buffers[0]
+            .tab
+            .unsaved_text
+            .as_deref()
+            .unwrap()
+            .starts_with("xalpha")
+    );
+}
+
+/// #862 hot exit negative: a consumed backup that restores nothing (no
+/// buffers in it) is removed at once; there is no text to wait on a write
+/// for, and no backup of this croft's is written.
+#[test]
+fn a_backup_that_restores_nothing_is_removed_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let dir = crate::hot_exit::workspace_dir(cache.path(), tmp.path());
+    let empty = dir.join("999999999.json");
+    crate::hot_exit::Backup {
+        workspace_root: tmp.path().to_path_buf(),
+        buffers: Vec::new(),
+    }
+    .save(&empty)
+    .unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    app.restore_hot_exit();
+    assert!(!empty.exists());
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty());
+}
+
+/// #862 hot exit (review): a backup whose pid is alive again, but as a
+/// process that started at another time than the croft that wrote it, is
+/// from a croft that is gone: its pid was recycled. It is restored. Judged
+/// by the pid alone it stayed untouched as long as the newcomer ran.
+#[test]
+fn hot_exit_restores_a_backup_whose_pid_was_recycled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    // pid 1 is always running, and did not start one second into 1970.
+    let recycled = mine.with_file_name("1-1.json");
+    std::fs::rename(&mine, &recycled).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("restored");
+    assert!(ed.dirty && ed.lines[0] == "xalpha");
+    assert!(!recycled.exists(), "consumed");
+}
+
+/// #862 hot exit negative: a backup whose pid and start time are both
+/// those of a running process is that croft's live copy: neither restored
+/// nor removed.
+#[test]
+fn hot_exit_leaves_the_backup_of_a_process_still_running_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    let init = crate::hot_exit::start_time_of(1).expect("pid 1 runs");
+    let live = mine.with_file_name(format!("1-{init}.json"));
+    std::fs::rename(&mine, &live).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.editor.editors.iter().all(|e| !e.dirty),
+        "not taken over"
+    );
+    assert!(live.exists(), "and not removed");
+}
+
+/// #862 hot exit (review): a backup the quit could not remove is not
+/// dropped silently. It holds text the user chose to discard (D), so the
+/// failure is said, with the path, rather than left to be restored as
+/// unsaved at the next launch without a word.
+#[test]
+fn a_backup_a_quit_cannot_remove_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    // A directory where the backup goes: neither written nor removable.
+    let own = block_hot_exit_path(&app);
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit, "the quit still goes ahead");
+    assert!(
+        app.status.contains("Could not remove") && app.status.contains(&own.display().to_string()),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        app.exit_notes,
+        vec![app.status.clone()],
+        "and it is said again on stderr once croft has gone"
+    );
+}
+
+/// #862 hot exit (review): a backup that could not be read is not kept
+/// forever. Reported and kept for a week, in case it can be recovered by
+/// hand, it is removed once it is older than that.
+#[test]
+fn an_unreadable_backup_older_than_a_week_is_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let dir = crate::hot_exit::workspace_dir(cache.path(), tmp.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    let corrupt = dir.join("999999999.json");
+    std::fs::write(&corrupt, "{\"workspace_root\": \"/tm").unwrap();
+    let eight_days = std::time::Duration::from_secs(8 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&corrupt)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - eight_days)
+        .unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    app.restore_hot_exit();
+    assert!(!corrupt.exists(), "expired");
+    assert!(app.editor.editors.iter().all(|e| !e.dirty));
+    assert!(app.status.contains("removed"), "{}", app.status);
 }
 
 /// #862 hot exit negative: clean buffers are never backed up, and once the
