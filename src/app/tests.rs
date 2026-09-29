@@ -56019,29 +56019,82 @@ fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
         assert_eq!(app.sidebar_view, SidebarView::CodeQL);
         term.draw(|f| app.render(f)).unwrap();
         let screen = screen_lower(&term);
+        assert!(screen.contains(" codeql "), "the pane's frame:\n{screen}");
         for section in [
             "language",
-            "databases",
             "queries",
             "variant analysis",
             "query history",
-            "ast viewer",
-            "method modeling",
+            "tools",
         ] {
             assert!(
                 screen.contains(section),
                 "section {section:?} listed:\n{screen}"
             );
         }
-        // The Databases welcome offers VS Code's four ways to add one.
-        for action in [
-            "from a folder",
-            "from an archive",
-            "from a url",
-            "from github",
+        // Without a database the first-run card stands in for the Databases
+        // section: its button offers the four ways to add one in a picker.
+        for text in [
+            "query your code for bugs",
+            "+  add database",
+            "from a folder, archive,",
+            "try quick query",
+            "ast · log · model",
         ] {
-            assert!(screen.contains(action), "{action:?} offered:\n{screen}");
+            assert!(screen.contains(text), "{text:?} shown:\n{screen}");
         }
+    });
+}
+
+#[test]
+fn codeql_add_database_button_offers_the_four_sources_in_a_picker() {
+    // #578: the first-run card's one button opens a picker of the places a
+    // database comes from; each row asks for the source as its old side-bar
+    // link did.
+    use crate::widgets::codeql::{Action, Hit};
+    use crate::widgets::input_prompt::{CodeqlDbSource, InputPurpose};
+    use crate::widgets::list_picker::ListPurpose;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.select_action(Action::AddDatabase);
+        assert_eq!(
+            app.codeql.selected_hit(),
+            Some(Hit::Action(Action::AddDatabase))
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let picker = app.list_picker.as_ref().expect("the sources picker");
+        assert_eq!(picker.purpose, ListPurpose::CodeqlDbSource);
+        let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "From a folder",
+                "From an archive",
+                "From a URL (as a zip file)",
+                "From GitHub"
+            ]
+        );
+        for c in "GitHub".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.list_picker.is_none());
+        let prompt = app.input_prompt.as_ref().expect("the GitHub prompt");
+        assert_eq!(
+            prompt.purpose,
+            InputPurpose::CodeqlDatabase {
+                source: CodeqlDbSource::Github
+            }
+        );
+        assert_eq!(prompt.title, "Add CodeQL Database from GitHub");
     });
 }
 
@@ -60996,6 +61049,8 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         app.focus = Pane::Tree;
         app.codeql.language = Some(6);
         app.codeql.collapsed.insert(Section::Databases);
+        // An empty Queries section starts folded: unfold it for its row.
+        app.codeql.toggle(Section::Queries);
         let row = app
             .codeql
             .lines()
@@ -64268,7 +64323,7 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
     // #578: VS Code's Variant Analysis Repositories view: a controller
     // repository, then lists, repositories and owners to run against.
     use crate::codeql_variant::{Item, Selection, VariantConfig};
-    use crate::widgets::codeql::{Action, Line};
+    use crate::widgets::codeql::{Action, Line, Section};
     use crate::widgets::command_palette::Command;
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
@@ -64289,7 +64344,10 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
         };
         let saved = || VariantConfig::load(&App::codeql_variant_path()).unwrap();
 
-        // The welcome row asks for the controller and refuses a bad one.
+        // The welcome row asks for the controller and refuses a bad one. The
+        // empty section starts folded to its header's "set up".
+        assert!(app.codeql.folded(Section::VariantAnalysis));
+        app.codeql.toggle(Section::VariantAnalysis);
         app.codeql.select_action(Action::SetUpControllerRepository);
         press(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -65033,6 +65091,9 @@ esac
             app.status
         );
 
+        // The empty section starts folded; unfold it to reach its row.
+        app.codeql
+            .toggle(crate::widgets::codeql::Section::VariantAnalysis);
         app.codeql
             .select_action(crate::widgets::codeql::Action::SetUpControllerRepository);
         press(&mut app, KeyCode::Char('l'));

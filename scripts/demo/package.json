@@ -1,0 +1,10 @@
+{
+  "name": "croft-demo-render",
+  "private": true,
+  "description": "Renders tui_demo.py's captured frames; see CONTRIBUTING.md, \"Show it\".",
+  "type": "module",
+  "dependencies": {
+    "@xterm/xterm": "5.5.0",
+    "playwright-core": "1.63.0"
+  }
+}

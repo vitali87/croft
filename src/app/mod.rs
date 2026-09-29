@@ -17293,6 +17293,8 @@ impl App {
         self.refresh_scm_repositories();
         self.run_debug.focus_gradient = gradient;
         self.run_debug.theme = self.theme;
+        self.codeql.focus_gradient = gradient;
+        self.codeql.theme = self.theme;
         let explorer_focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.outline.focus_gradient = gradient;
@@ -23628,6 +23630,24 @@ impl App {
         }
     }
 
+    /// The four places a CodeQL database comes from, in a picker whose rows
+    /// run the matching side-bar action.
+    fn open_codeql_database_sources(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = CODEQL_DB_SOURCES
+            .iter()
+            .enumerate()
+            .map(|(i, (_, label))| ListRow {
+                id: i.to_string(),
+                label: String::from(*label),
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::CodeqlDbSource, "Add CodeQL Database", rows),
+            "",
+        );
+    }
+
     /// Run what a CodeQL side-bar row offers. Sections and query packs fold;
     /// the language and database lists select; a query row runs; "Create
     /// one" asks for a query name; a variant analysis entry becomes what a
@@ -23737,6 +23757,13 @@ impl App {
                     Err(e) => self.status = format!("{}: {e}", path.display()),
                 }
             }
+            Hit::Action(Action::AddDatabase) => self.open_codeql_database_sources(),
+            Hit::Action(Action::QuickQuery) => {
+                self.run_command(crate::widgets::command_palette::Command::CodeqlQuickQuery)
+            }
+            Hit::Action(Action::ShowEvaluatorLog) => self.run_command(
+                crate::widgets::command_palette::Command::CodeqlShowEvaluatorLogViewer,
+            ),
             Hit::Action(Action::CreateQuery) => self.prompt_create_codeql_query(),
             Hit::Action(Action::SetUpControllerRepository) => self.prompt_codeql_controller(),
             Hit::Action(Action::VariantList(i))
@@ -34863,6 +34890,11 @@ impl App {
                 }
             }
             ListPurpose::CodeqlModel => self.choose_codeql_model(&row.id),
+            ListPurpose::CodeqlDbSource => {
+                if let Some((action, _)) = CODEQL_DB_SOURCES.get(index) {
+                    self.activate_codeql(crate::widgets::codeql::Hit::Action(*action));
+                }
+            }
             ListPurpose::CodeqlMultiDb => self.choose_codeql_multi_db(&row.id, selected),
             ListPurpose::CodeqlResultSet => {
                 let path = PathBuf::from(&row.id);
@@ -65898,6 +65930,27 @@ type CodeqlLogViewerJob = (
     std::sync::mpsc::Receiver<Result<Vec<crate::codeql_evallog::Predicate>, String>>,
     String,
 );
+
+/// The rows of the Add CodeQL Database picker and the side-bar action each
+/// runs.
+const CODEQL_DB_SOURCES: [(crate::widgets::codeql::Action, &str); 4] = [
+    (
+        crate::widgets::codeql::Action::AddDatabaseFromFolder,
+        "From a folder",
+    ),
+    (
+        crate::widgets::codeql::Action::AddDatabaseFromArchive,
+        "From an archive",
+    ),
+    (
+        crate::widgets::codeql::Action::AddDatabaseFromUrl,
+        "From a URL (as a zip file)",
+    ),
+    (
+        crate::widgets::codeql::Action::AddDatabaseFromGithub,
+        "From GitHub",
+    ),
+];
 
 /// The Model Editor's endpoints being read (#578): the endpoints, or why
 /// not, and the database and language they are for.

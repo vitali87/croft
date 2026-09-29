@@ -240,6 +240,55 @@ python3 scripts/next_version.py 0.2.7 minor                                     
 Skipping numbers to stay clear of other open PRs is still fine; the gate only
 refuses a version that does not go up or has a component at or above 1000.
 
+## Show it: a visible change comes with a recording
+
+A PR that changes anything a user can see must show it in the PR description.
+That covers a new view, modal, command, status message, keybinding, layout or
+colour. Use a **GIF** when there is interaction and a **screenshot** when a still
+says it all. Tests prove the code does what the tests say. Only a recording
+shows what a user actually gets. Recording #675 found that its value prompt was
+drawn *under* the Settings editor, so users typed blind, and every unit test
+still passed.
+
+* **Record the real binary** built from the PR's head, not a mockup. If a later
+  push changes what the recording shows, record it again.
+* **Show the feature doing its job, and the edge a reviewer will ask about**:
+  the refusal, the error, the empty state. Aim for 30 seconds or less and under
+  1 MB.
+* **Stacked PRs**: put the recording on the PR that makes the feature
+  reachable, and link to it from the others.
+* **Nothing to show?** Replace the template's Demo section with one line saying
+  why, e.g. "No UI change: parser only."
+
+**By hand**, record your terminal with vhs, asciinema plus agg, or any screen
+recorder. Then drag the file into the PR description on GitHub, which hosts it.
+
+**From an agent session**, which has no browser to drag into, use
+`scripts/demo/tui_demo.py`. It drives the real binary in a sized tmux session
+with a throwaway `HOME`, renders each frame with a Nerd Font so croft's icons
+draw, and writes the GIF. `scripts/demo/examples/settings_editor.py` is a
+complete scenario to copy from:
+
+```bash
+cargo build
+python3 scripts/demo/examples/settings_editor.py target/debug/croft out.gif
+```
+
+Put the file on the `pr-media` branch, at `<pr number>/<name>.gif`. That branch
+is never merged, so binaries stay out of `main`'s history. Then embed it with
+a URL pinned to the commit, so the image reviewers saw survives later pushes:
+
+```bash
+git fetch origin pr-media && git worktree add ../pr-media origin/pr-media
+mkdir -p ../pr-media/<pr> && cp out.gif ../pr-media/<pr>/<name>.gif
+git -C ../pr-media add -A && git -C ../pr-media commit -m "pr-media: <what> (#<pr>)"
+git -C ../pr-media push origin HEAD:pr-media && git -C ../pr-media rev-parse HEAD
+```
+
+```markdown
+![what it shows](https://raw.githubusercontent.com/vitali87/croft/<sha>/<pr>/<name>.gif)
+```
+
 ## Insert new items AFTER a complete item, never above a doc block
 
 Rust attaches a `///` block to whatever item **follows** it. Insert anything
