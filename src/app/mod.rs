@@ -19332,10 +19332,12 @@ impl App {
         self.render_command_history_popup(frame);
         self.render_branch_picker(frame);
         self.render_scm_menu(frame);
+        // Below the input prompt: Enter on a number or text setting opens
+        // the prompt over the editor, and drawn after it the editor hid it.
+        self.render_settings_editor(frame);
         self.render_input_prompt(frame);
         self.render_list_picker(frame);
         self.render_shortcuts_modal(frame);
-        self.render_settings_editor(frame);
         self.render_connect_dialog(frame);
         // The startup unsupported-terminal nudge renders last so it sits above
         // every other overlay until the user dismisses it.
