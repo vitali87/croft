@@ -97,6 +97,9 @@ pub enum ListPurpose {
     /// The databases checklist of "Run Query on Multiple Databases"
     /// (#578): `id` is a database's index, or `run`.
     CodeqlMultiDb,
+    /// Where to add a CodeQL database from (#578): `id` is an index into
+    /// the App's database sources.
+    CodeqlDbSource,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.
