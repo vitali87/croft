@@ -154,21 +154,26 @@ pub fn active() -> bool {
     CATALOG.get().is_some()
 }
 
-/// A JSON template for translating into `lang`: every palette title plus the
-/// given extra strings, each mapped to its existing translation or `""`.
+/// A JSON template for translating into `lang`: every palette title, every
+/// key of every built-in catalog and the given extra strings, each mapped to
+/// its existing translation or `""`.
+///
+/// The keys come from ALL the built-in catalogs, not only `lang`'s: they are
+/// the one list of the strings `tr` translates outside the palette (Close,
+/// New File, `Saved {}`, ...), so a language with no catalog of its own got
+/// none of them (#849).
 pub fn template(lang: &str, extra: &[&str]) -> String {
     let catalog = catalog_for(lang, None);
+    let built_in_keys = BUILT_IN.iter().flat_map(|(_, json)| {
+        serde_json::from_str::<HashMap<String, String>>(json)
+            .map(|map| map.into_keys().collect::<Vec<_>>())
+            .unwrap_or_default()
+    });
     let mut keys: Vec<String> = crate::widgets::command_palette::ALL_COMMANDS
         .iter()
         .map(|c| c.title().to_string())
         .chain(extra.iter().map(|s| s.to_string()))
-        .chain(catalog.exact.keys().cloned())
-        .chain(
-            catalog
-                .patterns
-                .iter()
-                .map(|(p, s, _)| format!("{p}{{}}{s}")),
-        )
+        .chain(built_in_keys)
         .collect();
     keys.sort();
     keys.dedup();
@@ -265,5 +270,32 @@ mod tests {
         let map: HashMap<String, String> = serde_json::from_str(&t).unwrap();
         assert_eq!(map.get("New File").map(String::as_str), Some("Neue Datei"));
         assert!(map.contains_key("File: Save"));
+    }
+
+    /// #849: a language with no built-in catalog got the palette titles
+    /// only, missing every other string `tr` translates (Close, New File,
+    /// `Saved {}`, ...), since those keys came from `lang`'s own catalog.
+    #[test]
+    fn a_new_languages_template_lists_every_built_in_key() {
+        let fresh: HashMap<String, String> = serde_json::from_str(&template("xx", &[])).unwrap();
+        for (lang, json) in BUILT_IN {
+            let map: HashMap<String, String> = serde_json::from_str(json).unwrap();
+            for key in map.keys() {
+                assert!(
+                    fresh.contains_key(key),
+                    "{lang}'s {key:?} is missing from a new language's template"
+                );
+            }
+        }
+        assert!(
+            fresh.values().all(String::is_empty),
+            "a language with no catalog has nothing to fill in"
+        );
+        let de: HashMap<String, String> = serde_json::from_str(&template("de", &[])).unwrap();
+        assert_eq!(
+            de.len(),
+            fresh.len(),
+            "every language's template lists the same strings"
+        );
     }
 }

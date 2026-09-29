@@ -403,9 +403,9 @@ pub enum CliCommand {
     },
     /// Print a JSON template for translating croft's UI into `lang` (#621).
     ///
-    /// Every palette title, with the built-in translation filled in where one
-    /// exists. Fill in the rest and save it as
-    /// `<config>/locales/<lang>.json`.
+    /// Every palette title and every other string croft translates, with the
+    /// built-in translation filled in where one exists. Fill in the rest and
+    /// save it as `<config>/locales/<lang>.json`.
     LocaleTemplate {
         /// Language code, such as `de` or `fr`.
         lang: String,
