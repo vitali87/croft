@@ -1039,10 +1039,11 @@ impl Widget for &mut SourceControlPanel {
         }
 
         // Row 0: SOURCE CONTROL header (light grey bold), inside the panel.
-        buf.set_string(
+        buf.set_stringn(
             inner.x,
             inner.y,
             "SOURCE CONTROL",
+            inner.width as usize,
             Style::default()
                 .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
                 .add_modifier(Modifier::BOLD),
@@ -1293,7 +1294,9 @@ impl Widget for &mut SourceControlPanel {
         }
         y += 3 + 1; // button + 1-row gap
 
-        // Optional feedback line.
+        // Optional feedback line: its first line only, cut at the panel's
+        // edge. Git's output runs to several lines and past any sidebar, and
+        // an uncapped `set_string` painted it across the editor (#858).
         if let Some(msg) = self.commit_feedback.as_ref()
             && y < inner.y + inner.height
         {
@@ -1302,7 +1305,8 @@ impl Widget for &mut SourceControlPanel {
             } else {
                 Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
             };
-            buf.set_string(inner.x, y, msg.as_str(), style);
+            let line = crate::git::headline(msg);
+            buf.set_stringn(inner.x, y, line, inner.width as usize, style);
             y += 2;
         }
 
@@ -1353,10 +1357,11 @@ impl Widget for &mut SourceControlPanel {
             .saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
         if total == 0 {
-            buf.set_string(
+            buf.set_stringn(
                 list_area.x,
                 list_area.y,
                 "No changes",
+                list_area.width as usize,
                 Style::default().fg(Color::DarkGray),
             );
             return;
@@ -1859,6 +1864,52 @@ mod tests {
                 "typed message overflowed past the SC panel's right edge at column {x}: {sym:?} — same root cause as the placeholder leak"
             );
         }
+    }
+
+    #[test]
+    fn commit_feedback_shows_its_first_line_and_stays_inside_the_panel() {
+        // #858: git's commit output (subject, diffstat, one `create mode`
+        // row per new file) was drawn uncapped and ran on into the editor.
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.commit_feedback = Some(
+            "[main 5a6cd5c] Add per-category report with a subject longer than the panel\n \
+             3 files changed, 38 insertions(+)\n create mode 100644 report.py"
+                .to_string(),
+        );
+        let panel_area = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 30,
+        };
+        let buf_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(buf_area);
+        ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+        for y in buf_area.top()..buf_area.bottom() {
+            for x in panel_area.right()..buf_area.right() {
+                let sym = buf[(x, y)].symbol();
+                assert!(
+                    sym == " " || sym.is_empty(),
+                    "cell ({x}, {y}) past the panel's right edge carries {sym:?}"
+                );
+            }
+        }
+        let panel_text: String = (panel_area.top()..panel_area.bottom())
+            .flat_map(|y| (panel_area.left()..panel_area.right()).map(move |x| (x, y)))
+            .map(|pos| buf[pos].symbol().to_string())
+            .collect();
+        assert!(panel_text.contains("[main 5a6cd5c] Add"), "{panel_text:?}");
+        assert!(
+            !panel_text.contains("changed") && !panel_text.contains("create mode"),
+            "only git's first line belongs in the panel: {panel_text:?}"
+        );
     }
 
     #[test]
