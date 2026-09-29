@@ -353,7 +353,12 @@ mod tests {
         use crate::lsp::install::{ArchiveKind, Provision};
         let r = ServerRegistry::with_defaults();
         let md = r.for_language(Language::MARKDOWN);
-        assert_eq!(md.len(), 1, "one server for markdown");
+        let names: Vec<&str> = md.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            ["marksman", "rumdl"],
+            "marksman first, so it keeps the capabilities the two share"
+        );
         assert_eq!(md[0].name, "marksman");
         assert_eq!(md[0].command, "marksman");
         assert_eq!(md[0].args, vec!["server".to_string()]);
@@ -393,6 +398,33 @@ mod tests {
         for ext in ["md", "markdown"] {
             assert_eq!(r.for_extension(ext)[0].name, "marksman");
         }
+    }
+
+    #[test]
+    fn bundled_manifest_adds_rumdl_beside_marksman_as_a_pinned_uv_tool() {
+        // #851: rumdl lints (markdownlint's rules and more), offers quick
+        // fixes and formats. It is a binary wheel on PyPI, so uv installs it
+        // pinned; Termux packages no rumdl, so there it must not be sent to
+        // `pkg install` (it is left to a copy on PATH).
+        use crate::lsp::install::Provision;
+        let r = ServerRegistry::with_defaults();
+        let rumdl = r
+            .for_language(Language::MARKDOWN)
+            .iter()
+            .find(|s| s.name == "rumdl")
+            .expect("rumdl is registered for markdown");
+        assert_eq!(rumdl.command, "rumdl");
+        assert_eq!(rumdl.args, vec!["server".to_string()]);
+        assert_eq!(rumdl.name, crate::markdown_lint::SUPERSEDED_BY);
+        assert_eq!(
+            rumdl.provision,
+            Some(Provision::Uv {
+                package: "rumdl",
+                version: Some("0.2.77"),
+                bin: "rumdl",
+                termux_pkg: None,
+            })
+        );
     }
 
     #[test]

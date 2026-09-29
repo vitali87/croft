@@ -868,6 +868,29 @@ impl LspRequests {
             .context("workspace/diagnostic")
     }
 
+    /// `textDocument/diagnostic`, the LSP 3.17 PULL of one document's
+    /// diagnostics (#866), on a detached socket like
+    /// [`Self::workspace_diagnostics_on`] so the client is not held while the
+    /// server works. No previous result id is sent, so the answer is always a
+    /// full report: croft replaces a server's set for the file wholesale, and
+    /// has nothing to reuse an `Unchanged` against.
+    pub async fn document_diagnostics_on(
+        mut server: ServerSocket,
+        uri: Url,
+        identifier: Option<String>,
+    ) -> Result<lsp_types::DocumentDiagnosticReportResult> {
+        server
+            .document_diagnostic(lsp_types::DocumentDiagnosticParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                identifier,
+                previous_result_id: None,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .context("textDocument/diagnostic")
+    }
+
     /// `workspace/symbol`: server-side fuzzy query over every symbol in the
     /// project. Both response shapes (flat `SymbolInformation` and nested
     /// `WorkspaceSymbol`) are normalised by the manager.

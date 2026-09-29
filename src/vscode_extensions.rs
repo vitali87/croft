@@ -536,9 +536,15 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "davidanson.vscode-markdownlint",
-        croft: "Markdown lint diagnostics",
+        croft: "lsp-markdown",
         status: Status::Builtin,
-        note: "MD025/MD018/MD009/MD012 checks run on open .md tabs, surfacing as squiggles and PROBLEMS entries",
+        note: "rumdl ships built in: markdownlint's rules with quick fixes, reading .markdownlint.* configs",
+    },
+    Mapping {
+        vscode: "rvben.rumdl",
+        croft: "lsp-markdown",
+        status: Status::Builtin,
+        note: "rumdl ships built in",
     },
     Mapping {
         vscode: "arr.marksman",
