@@ -5590,6 +5590,37 @@ impl Editor {
         self.disk_stamp
     }
 
+    /// Put `text` in the buffer as unsaved edits over the file it was opened
+    /// from: the copy hot exit or the update relaunch kept of them (#862).
+    /// A whole-buffer swap, so everything measured against the opened text
+    /// is redone as an edit redoes it: syntax spans, bracket colours and the
+    /// string and comment ranges they skip, and the edit counter the LSP,
+    /// git gutter, fold tables and previews resync on. Folds and server fold
+    /// spans were line numbers into the old text and go; so does the undo
+    /// history, which would put the file's text back under the restored
+    /// edits, and the authorship map, which described the file's lines.
+    pub fn restore_unsaved_text(&mut self, text: &str) {
+        self.lines = text.split('\n').map(str::to_string).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.selection = None;
+        self.provenance = crate::provenance::Provenance::new();
+        self.folded.clear();
+        self.hidden_ranges.clear();
+        self.fold_epoch_lines = 0;
+        self.lsp_folds = None;
+        self.lsp_folds_lines = 0;
+        // Dirty, stamped as edited now (auto save's delay keys on it), and
+        // the edit counter moves.
+        self.mark_buffer_changed();
+        // Nothing was edited at a place in this session to go back to.
+        self.last_edit_pos = None;
+        self.recompute_highlights();
+    }
+
     /// Anchor the disk stamp at `stamp`, the file as this buffer's edits
     /// last matched it, for a buffer rebuilt from a copy of its unsaved text
     /// (hot exit, #862): a file that changed since then reads as changed
@@ -6361,6 +6392,16 @@ impl Editor {
     #[cfg(test)]
     pub fn inlay_spans_for_test(&self, line: usize) -> &[(usize, String, Option<Color>)] {
         self.row_inlay_spans(line)
+    }
+
+    /// Line `line`'s syntax spans as `(start, end, style)`, for tests
+    /// outside this module (#862).
+    #[cfg(test)]
+    pub fn highlights_for_test(&self, line: usize) -> Vec<(usize, usize, Style)> {
+        self.highlights
+            .get(line)
+            .map(|spans| spans.iter().map(|s| (s.start, s.end, s.style)).collect())
+            .unwrap_or_default()
     }
 
     /// The buffer text to key a semantic-token cache entry on, but only when

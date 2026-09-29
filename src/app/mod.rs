@@ -39432,14 +39432,10 @@ impl App {
             return None;
         };
         if let Some(text) = unsaved {
-            ed.lines = text.split('\n').map(str::to_string).collect();
-            if ed.lines.is_empty() {
-                ed.lines.push(String::new());
-            }
-            ed.dirty = true;
-            // Make the restored unsaved content eligible for auto save:
-            // due() keys on last_edit_at, which a fresh Editor lacks.
-            ed.last_edit_at = Some(std::time::Instant::now());
+            // As an edit, not a bare assignment: the text is re-highlighted
+            // (it kept the disk file's colours) and the LSP and the rest
+            // resync to it. It also stamps the edit time auto save keys on.
+            ed.restore_unsaved_text(text);
         }
         let max_row = ed.lines.len().saturating_sub(1);
         ed.cursor_row = tab.cursor_row.min(max_row);

@@ -11633,6 +11633,141 @@ fn hot_exit_ignores_a_corrupt_backup_without_a_panic() {
     assert!(app.status.contains("could not read"), "{}", app.status);
 }
 
+/// A comment longer than the line on disk it replaces (#862): a restore
+/// that kept the disk file's syntax spans would colour only the first few
+/// characters of it, or none.
+const RESTORED_COMMENT: &str = "# a comment that is longer than the disk line";
+
+/// The syntax spans `text` gets as line 0 of a `.py` file opened from disk,
+/// the reference a restored buffer holding the same text must match.
+fn spans_of_python_line_opened_from_disk(text: &str) -> Vec<(usize, usize, ratatui::style::Style)> {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(tmp.path(), "ref.py", &format!("{text}\n"));
+    app.editor.highlights_for_test(0)
+}
+
+/// #862 hot exit: a restored buffer is highlighted as the text it holds,
+/// not as the file on disk it was opened over. It kept the disk text's
+/// spans: here the restored comment was coloured only for the length of
+/// the disk line `x = 1`, and the rest stayed plain until the next edit.
+/// The edit counter moves too, so the LSP and everything else that follows
+/// it resync to the restored text.
+#[test]
+fn hot_exit_restored_text_is_highlighted_as_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(
+        app_with_open_file(tmp.path(), "a.py", "x = 1\n"),
+        cache.path(),
+    );
+    app.editor.lines = vec![String::from(RESTORED_COMMENT), String::new()];
+    app.editor.dirty = true;
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert_eq!(next.editor.lines[0], RESTORED_COMMENT, "setup: restored");
+    let want = spans_of_python_line_opened_from_disk(RESTORED_COMMENT);
+    assert!(
+        want.iter()
+            .any(|&(s, e, _)| s == 0 && e == RESTORED_COMMENT.len()),
+        "setup: the comment is one span over the whole line: {want:?}"
+    );
+    assert_eq!(
+        next.editor.highlights_for_test(0),
+        want,
+        "the whole restored comment carries the comment style"
+    );
+    let mut opened = crate::widgets::editor::Editor::new();
+    opened.open(&tmp.path().join("a.py")).unwrap();
+    assert_ne!(
+        next.editor.edit_seq, opened.edit_seq,
+        "the edit counter moved past the disk text's"
+    );
+}
+
+/// #862: the update relaunch restores through the same path and had the
+/// same gap: its unsaved text kept the disk file's syntax spans.
+#[test]
+fn relaunch_restored_text_is_highlighted_as_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.editor.lines = vec![String::from(RESTORED_COMMENT), String::new()];
+    app.editor.dirty = true;
+    let state = app.capture_session_state();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let a = tmp.path().join("a.py");
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .unwrap();
+    assert_eq!(ed.lines[0], RESTORED_COMMENT, "setup: restored");
+    assert_eq!(
+        ed.highlights_for_test(0),
+        spans_of_python_line_opened_from_disk(RESTORED_COMMENT)
+    );
+}
+
+/// #862 negative: an untitled buffer has no language, so its restored text
+/// gets no syntax spans at all (and no panic); a clean tab open beside the
+/// restored ones keeps its spans, its text and its edit counter.
+#[test]
+fn restoring_leaves_untitled_text_plain_and_clean_tabs_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let scratch = app.editor.open_unreadable_tab(None);
+    scratch.lines = vec![String::from(RESTORED_COMMENT)];
+    scratch.dirty = true;
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let clean = tmp.path().join("clean.py");
+    std::fs::write(&clean, "def f():\n    return 1\n").unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.editor.open_pinned(&clean).unwrap();
+    let before = (
+        next.editor.highlights_for_test(0),
+        next.editor.lines.clone(),
+        next.editor.edit_seq,
+    );
+    assert!(!before.0.is_empty(), "setup: the clean tab is highlighted");
+    next.restore_hot_exit();
+    let untitled = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.is_none() && e.dirty)
+        .expect("the untitled buffer is back");
+    assert_eq!(untitled.lines, vec![String::from(RESTORED_COMMENT)]);
+    assert!(
+        untitled.highlights_for_test(0).is_empty(),
+        "no language, no spans: {:?}",
+        untitled.highlights_for_test(0)
+    );
+    let kept = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(clean.as_path()))
+        .unwrap();
+    assert!(!kept.dirty);
+    assert_eq!(
+        (
+            kept.highlights_for_test(0),
+            kept.lines.clone(),
+            kept.edit_seq
+        ),
+        before,
+        "the clean tab is untouched"
+    );
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
