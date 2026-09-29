@@ -467,20 +467,28 @@ fn outcome_or_bail(status: ExitStatus) -> Result<RemoteOutcome> {
     }
 }
 
-/// True when the remote host has `dtach`, which croft launches its session
-/// under for persistence across an SSH transport drop. Best-effort over the
-/// existing control master; any error (host unreachable, no dtach) reports
-/// `false` so croft simply runs without persistence.
+/// True when the remote host has a supervisor croft launches its session
+/// under for persistence across an SSH transport drop: croft's own
+/// `session-host`, or `dtach` (#831). Best-effort over the existing control
+/// master; any error (host unreachable, neither supervisor) reports `false`
+/// so croft simply runs without persistence.
 fn remote_has_session_supervisor(ssh: &SshControl) -> bool {
     ssh.command()
         .arg(&ssh.host)
-        .arg("command -v dtach >/dev/null 2>&1")
+        .arg(session_supervisor_check_command())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The remote check behind [`remote_has_session_supervisor`]: the same
+/// supervisors, probed the same way, as [`remote_croft_command`] launches
+/// the session under, so the two never disagree about persistence.
+fn session_supervisor_check_command() -> &'static str {
+    "export PATH=\"$HOME/.cargo/bin:$PATH\"; croft session-host --probe >/dev/null 2>&1 || command -v dtach >/dev/null 2>&1"
 }
 
 /// Re-establish the SSH control master after a transport drop (laptop sleep,
@@ -3718,6 +3726,12 @@ if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
 # stepped. A sidecar rather than a second field, so a croft from before it,
 # which reads the marker as one pid, still pauses for this build.
 mkdir -p "$HOME/.cache/croft"
+# The script runs under the login shell, and zsh aborts on a glob that
+# matches nothing (NOMATCH), which an empty cache always is (#734).
+# null_glob makes it expand to nothing, as the `[ -f ]` below expects of
+# every other shell. Not `emulate sh`: that also clears ERR_EXIT, and a
+# failed compile would then write the install stamp.
+[ -z "${{ZSH_VERSION:-}}" ] || setopt null_glob
 CROFT_BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
 for CROFT_OLD in "$HOME/.cache/croft"/building.*; do
   [ -f "$CROFT_OLD" ] || continue
@@ -3944,6 +3958,47 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_host_or_dtach_on_the_remote_makes_the_session_persistent() {
+        // #831: the check accepted only dtach, so a host whose session
+        // survived under `croft session-host` was never reconnected to.
+        use std::os::unix::fs::PermissionsExt;
+        let exe = |path: &Path, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let check = |home: &Path, extra_path: &Path| {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(session_supervisor_check_command())
+                .env("HOME", home)
+                .env("PATH", format!("{}:/usr/bin:/bin", extra_path.display()))
+                .status()
+                .unwrap()
+                .success()
+        };
+        let home = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        assert!(!check(home.path(), bin.path()), "neither supervisor");
+
+        let croft = home.path().join(".cargo/bin/croft");
+        exe(&croft, "[ \"$1 $2\" = 'session-host --probe' ]");
+        assert!(check(home.path(), bin.path()), "croft's session host");
+
+        // A croft too old for session-host, with dtach beside it.
+        exe(&croft, "exit 2");
+        assert!(!check(home.path(), bin.path()));
+        exe(&bin.path().join("dtach"), "exit 0");
+        assert!(check(home.path(), bin.path()), "dtach");
+
+        // The check probes exactly as the launched session does.
+        let launch = remote_croft_command_for_terminal(None, None, None, false, &[], false);
+        assert!(launch.contains("croft session-host --probe >/dev/null 2>&1"));
+        assert!(launch.contains("command -v dtach >/dev/null 2>&1"));
+    }
 
     fn report(path: &str, host: Option<&str>) -> CwdReport {
         (std::path::PathBuf::from(path), host.map(str::to_string))
@@ -5444,6 +5499,20 @@ Host !blocked *.internal
         seen: &std::path::Path,
         hold: Option<&std::path::Path>,
     ) -> std::process::Command {
+        install_command_under("sh", dir, cargo_exit, systemd_run, seen, hold)
+    }
+
+    /// [`install_command`] under a given shell: the script runs under the
+    /// remote user's login shell, which is often zsh (#734).
+    #[cfg(unix)]
+    fn install_command_under(
+        shell: &str,
+        dir: &std::path::Path,
+        cargo_exit: u8,
+        systemd_run: &str,
+        seen: &std::path::Path,
+        hold: Option<&std::path::Path>,
+    ) -> std::process::Command {
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.join("bin");
         let home = dir.join("home");
@@ -5484,7 +5553,7 @@ exit {cargo_exit}"#
             ),
         );
         let path = format!("{}:/usr/bin:/bin", bin.display());
-        let mut cmd = std::process::Command::new("sh");
+        let mut cmd = std::process::Command::new(shell);
         cmd.arg("-c")
             .arg(remote_install_command("abc123"))
             .env_clear()
@@ -5704,6 +5773,49 @@ exec "$@""#,
         assert!(
             leftover_markers(tmp.path()).is_empty(),
             "a failed build left its marker behind"
+        );
+    }
+
+    /// #734: zsh aborts on a glob that matches nothing, and the marker
+    /// sweep's glob matches nothing on every host with an empty cache, so a
+    /// zsh login shell never reached cargo. It must reach it, and a failed
+    /// compile must still fail the install.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_script_reaches_cargo_under_zsh() {
+        if !crate::lsp::manager::is_on_path("zsh") {
+            eprintln!("SKIPPED: zsh not on PATH");
+            return;
+        }
+        let under_zsh = |dir: &std::path::Path, cargo_exit| {
+            let seen = dir.join("seen");
+            let status = install_command_under("zsh", dir, cargo_exit, "exit 1", &seen, None)
+                .status()
+                .unwrap();
+            (
+                status.success(),
+                std::fs::read_to_string(seen).unwrap_or_default(),
+            )
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, seen) = under_zsh(tmp.path(), 0);
+        assert!(ok, "an empty cache must not stop the install under zsh");
+        let mut fields = seen.splitn(3, ' ');
+        let own = fields.next().unwrap();
+        let marked = fields.next().expect("cargo ran under zsh");
+        assert_eq!(own, marked);
+        assert!(leftover_markers(tmp.path()).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("home/.cache/croft/install-stamp")).unwrap(),
+            "abc123"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, _) = under_zsh(tmp.path(), 3);
+        assert!(!ok, "a failing compile must fail the install under zsh");
+        assert!(
+            !tmp.path().join("home/.cache/croft/install-stamp").exists(),
+            "a failed compile must not write the install stamp"
         );
     }
 

@@ -810,6 +810,27 @@ pub fn parse_submission(
     })
 }
 
+/// The repositories `run` covers, one `owner/name` per line, in GitHub's
+/// order (#578, "copy the repository list"). `None` until GitHub has
+/// reported which repositories the run covers.
+pub fn repository_list(run: &Submitted) -> Option<String> {
+    let repos = &run.progress.as_ref()?.repos;
+    (!repos.is_empty()).then(|| {
+        repos
+            .iter()
+            .map(|r| r.nwo.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// The Actions run doing `run`'s work on its controller, whose page holds
+/// its logs (#578, "view logs"). `None` until GitHub has started one.
+pub fn workflow_run_url(run: &Submitted) -> Option<String> {
+    run.workflow_run
+        .map(|id| format!("https://github.com/{}/actions/runs/{id}", run.controller))
+}
+
 /// The submitted runs croft remembers, newest last, for following them up.
 pub fn load_submitted(path: &Path) -> Vec<Submitted> {
     std::fs::read_to_string(path)

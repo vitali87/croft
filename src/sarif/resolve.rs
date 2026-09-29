@@ -396,6 +396,98 @@ pub fn github_blob_url(run: &Run, uri: &str, line: i64) -> Option<String> {
     ))
 }
 
+/// Where a missing file can be downloaded from (#577): the raw file at the
+/// commit the run's `versionControlProvenance` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSource {
+    /// The repository's host, which must be trusted before anything is
+    /// fetched from it.
+    pub host: String,
+    pub url: String,
+}
+
+/// The raw-file URL of `loc` in the repository `run` was scanned from, for
+/// GitHub, GitLab and Bitbucket repositories over https. The provenance
+/// entry is the one whose `mappedTo` is `loc`'s base (§3.23.7), else the
+/// run's only entry when it maps nothing; the path is `loc`'s relative
+/// URI, less `mappedTo.uri` when that is set. The commit is `revisionId`,
+/// else `branch`.
+pub fn provenance_source(run: &Run, loc: &ArtifactLocation) -> Option<RemoteSource> {
+    let (uri, base) = location_parts(run, loc)?;
+    if uri.contains("://") || uri.starts_with('/') {
+        return None;
+    }
+    let vcp = &run.version_control_provenance;
+    let entry = vcp
+        .iter()
+        .find(|v| {
+            v.mapped_to
+                .as_ref()
+                .is_some_and(|m| base.is_some() && m.uri_base_id == base)
+        })
+        .or_else(|| (vcp.len() == 1 && vcp[0].mapped_to.is_none()).then(|| &vcp[0]))?;
+    let prefix = entry
+        .mapped_to
+        .as_ref()
+        .and_then(|m| m.uri.as_deref())
+        .unwrap_or("")
+        .trim_start_matches("./");
+    let path = uri.trim_start_matches("./");
+    let path = if prefix.is_empty() {
+        path
+    } else {
+        path.strip_prefix(prefix)?.trim_start_matches('/')
+    };
+    let rev = entry
+        .revision_id
+        .as_deref()
+        .or(entry.branch.as_deref())
+        .filter(|r| !r.is_empty())?;
+    let rest = entry.repository_uri.as_deref()?.strip_prefix("https://")?;
+    let (host, repo) = rest.split_once('/')?;
+    let host = host.to_ascii_lowercase();
+    let repo = repo.trim_end_matches('/').trim_end_matches(".git");
+    if path.is_empty() || repo.split('/').filter(|s| !s.is_empty()).count() < 2 {
+        return None;
+    }
+    let url = match host.as_str() {
+        "github.com" => format!("https://raw.githubusercontent.com/{repo}/{rev}/{path}"),
+        "gitlab.com" => format!("https://gitlab.com/{repo}/-/raw/{rev}/{path}"),
+        "bitbucket.org" => format!("https://bitbucket.org/{repo}/raw/{rev}/{path}"),
+        _ => return None,
+    };
+    Some(RemoteSource { host, url })
+}
+
+fn trusted_hosts_path() -> PathBuf {
+    crate::app::croft_cache_dir().join("sarif-trusted-hosts")
+}
+
+/// The hosts the user allowed croft to download SARIF source from.
+pub fn trusted_hosts() -> Vec<String> {
+    std::fs::read_to_string(trusted_hosts_path())
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Allow downloads from `host` from now on.
+pub fn trust_host(host: &str) -> std::io::Result<()> {
+    let mut hosts = trusted_hosts();
+    if hosts.iter().any(|h| h == host) {
+        return Ok(());
+    }
+    hosts.push(host.to_string());
+    let path = trusted_hosts_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, hosts.join("\n") + "\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +504,62 @@ mod tests {
     fn disk(paths: &[&str]) -> impl Fn(&Path) -> bool {
         let set: HashSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
         move |p: &Path| set.contains(p)
+    }
+
+    #[test]
+    fn provenance_source_builds_the_raw_url_at_the_scanned_commit() {
+        let r = run(
+            r#"{"tool":{"driver":{"name":"t"}},"versionControlProvenance":[
+              {"repositoryUri":"https://github.com/o/r.git","revisionId":"abc123","mappedTo":{"uriBaseId":"SRCROOT"}}]}"#,
+        );
+        assert_eq!(
+            provenance_source(&r, &loc(r#"{"uri":"src/a.rs","uriBaseId":"SRCROOT"}"#)),
+            Some(RemoteSource {
+                host: "github.com".into(),
+                url: "https://raw.githubusercontent.com/o/r/abc123/src/a.rs".into()
+            })
+        );
+        // Another base is not in that repository; an absolute URI never is.
+        assert_eq!(
+            provenance_source(&r, &loc(r#"{"uri":"a.rs","uriBaseId":"OTHER"}"#)),
+            None
+        );
+        assert_eq!(
+            provenance_source(
+                &r,
+                &loc(r#"{"uri":"file:///x/a.rs","uriBaseId":"SRCROOT"}"#)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn provenance_source_takes_a_lone_unmapped_entry_and_strips_mapped_uri() {
+        let lone = run(
+            r#"{"tool":{"driver":{"name":"t"}},"versionControlProvenance":[
+              {"repositoryUri":"https://gitlab.com/g/sub/p","branch":"main"}]}"#,
+        );
+        assert_eq!(
+            provenance_source(&lone, &loc(r#"{"uri":"./lib/x.py"}"#)).map(|s| s.url),
+            Some("https://gitlab.com/g/sub/p/-/raw/main/lib/x.py".into())
+        );
+        let mapped = run(
+            r#"{"tool":{"driver":{"name":"t"}},"versionControlProvenance":[
+              {"repositoryUri":"https://bitbucket.org/o/r","revisionId":"r1","mappedTo":{"uri":"repo/","uriBaseId":"WS"}}]}"#,
+        );
+        assert_eq!(
+            provenance_source(&mapped, &loc(r#"{"uri":"repo/src/m.c","uriBaseId":"WS"}"#))
+                .map(|s| s.url),
+            Some("https://bitbucket.org/o/r/raw/r1/src/m.c".into())
+        );
+        let unknown_host = run(
+            r#"{"tool":{"driver":{"name":"t"}},"versionControlProvenance":[
+              {"repositoryUri":"https://git.example.com/o/r","revisionId":"r1"}]}"#,
+        );
+        assert_eq!(
+            provenance_source(&unknown_host, &loc(r#"{"uri":"a.c"}"#)),
+            None
+        );
     }
 
     const BASES: &str = r#"{"originalUriBaseIds":{

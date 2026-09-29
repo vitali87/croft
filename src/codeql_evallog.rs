@@ -187,6 +187,73 @@ pub fn render(query: &str, predicates: &[Predicate]) -> String {
     out
 }
 
+/// The evaluator log the side bar's Evaluator Log Viewer shows (#578):
+/// whose it is, its predicates slowest first, and which are unfolded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogView {
+    pub query: String,
+    pub predicates: Vec<Predicate>,
+    pub open: std::collections::HashSet<usize>,
+}
+
+/// One row of the side bar's tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogRow {
+    /// Predicate `.0`'s header.
+    Predicate(usize, String),
+    /// A line under predicate `.0`: a pipeline name or one of its RA
+    /// lines.
+    Detail(usize, String),
+    /// A dependency of predicate `.0`, and the index of the predicate it
+    /// names when the log has it.
+    Dependency(usize, Option<usize>, String),
+}
+
+impl LogView {
+    /// The rows to show: every predicate, and the pipelines and
+    /// dependencies of the unfolded ones.
+    pub fn rows(&self) -> Vec<LogRow> {
+        let mut out = Vec::new();
+        for (i, p) in self.predicates.iter().enumerate() {
+            let head = header(p);
+            let head = if self.open.contains(&i) {
+                head.replacen('\u{25b8}', "\u{25be}", 1)
+            } else {
+                head
+            };
+            out.push(LogRow::Predicate(i, head));
+            if !self.open.contains(&i) {
+                continue;
+            }
+            for pipeline in &p.pipelines {
+                let runs = match pipeline.runs {
+                    0 | 1 => String::new(),
+                    n => format!(" ({n} runs)"),
+                };
+                out.push(LogRow::Detail(
+                    i,
+                    format!("  Pipeline {}{runs}", pipeline.name),
+                ));
+                for line in &pipeline.lines {
+                    out.push(LogRow::Detail(i, format!("    {}", line.trim_start())));
+                }
+            }
+            for d in &p.dependencies {
+                let target = self.predicates.iter().position(|q| &q.name == d);
+                out.push(LogRow::Dependency(i, target, format!("  \u{2192} {d}")));
+            }
+        }
+        out
+    }
+
+    /// Fold or unfold predicate `i`.
+    pub fn toggle(&mut self, i: usize) {
+        if !self.open.remove(&i) {
+            self.open.insert(i);
+        }
+    }
+}
+
 /// Which of two runs evaluated a predicate in a performance comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presence {
@@ -348,6 +415,54 @@ pub fn render_comparison(old_label: &str, new_label: &str, rows: &[Row]) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_side_bar_tree_folds_predicates_and_links_dependencies() {
+        let p = |name: &str, millis: u64, deps: &[&str]| Predicate {
+            name: name.to_string(),
+            strategy: String::from("SIMPLE"),
+            millis,
+            result_size: 3,
+            iterations: 0,
+            pipelines: vec![Pipeline {
+                name: String::from("pipeline"),
+                runs: 1,
+                lines: vec![String::from("   {1} r1 = JOIN a WITH b")],
+            }],
+            dependencies: deps.iter().map(|d| d.to_string()).collect(),
+        };
+        let mut v = LogView {
+            query: String::from("q.ql"),
+            predicates: vec![p("slow", 90, &["fast", "gone"]), p("fast", 5, &[])],
+            ..LogView::default()
+        };
+        let rows = v.rows();
+        assert_eq!(rows.len(), 2, "folded at first");
+        assert!(
+            matches!(&rows[0], LogRow::Predicate(0, h) if h.starts_with('\u{25b8}') && h.contains("slow"))
+        );
+        v.toggle(0);
+        let rows = v.rows();
+        assert!(matches!(&rows[0], LogRow::Predicate(0, h) if h.starts_with('\u{25be}')));
+        assert_eq!(
+            rows[1],
+            LogRow::Detail(0, String::from("  Pipeline pipeline"))
+        );
+        assert_eq!(
+            rows[2],
+            LogRow::Detail(0, String::from("    {1} r1 = JOIN a WITH b"))
+        );
+        assert_eq!(
+            rows[3],
+            LogRow::Dependency(0, Some(1), String::from("  \u{2192} fast")),
+            "a dependency the log has leads to it"
+        );
+        assert_eq!(
+            rows[4],
+            LogRow::Dependency(0, None, String::from("  \u{2192} gone"))
+        );
+        assert!(matches!(&rows[5], LogRow::Predicate(1, _)));
+    }
 
     const SAMPLE: &str = concat!(
         r#"{"summaryLogVersion":"0.4.0","codeqlVersion":"2.19.0","startTime":"2026-09-28T10:00:00Z"}"#,

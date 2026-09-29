@@ -408,6 +408,15 @@ impl TestingPanel {
             .collect()
     }
 
+    /// The names of the tests the last run failed, in list order.
+    pub fn failed_names(&self) -> Vec<String> {
+        self.cases
+            .iter()
+            .filter(|c| c.status == TestStatus::Failed)
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
     /// Count of failing tests — the number the beaker badge shows.
     pub fn failed_count(&self) -> usize {
         self.cases

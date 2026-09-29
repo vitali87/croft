@@ -42,6 +42,55 @@ pub fn output_for(source: &str) -> Output {
     }
 }
 
+/// Whether `query` is a query suite (`.qls`), which `database analyze`
+/// runs whole.
+pub fn is_suite(query: &Path) -> bool {
+    query.extension().is_some_and(|e| e == "qls")
+}
+
+/// `codeql` arguments listing the queries a suite selects, as JSON.
+pub fn resolve_suite_args(suite: &Path) -> Vec<String> {
+    vec![
+        String::from("resolve"),
+        String::from("queries"),
+        String::from("--format=json"),
+        path(suite),
+    ]
+}
+
+/// The file names of the queries in `resolved` (the JSON array `codeql
+/// resolve queries` prints) whose results are not alerts, going by each
+/// file's text as `read` gives it. `database analyze`, the only way to run
+/// a suite, cannot produce their tables, so a suite holding any is refused
+/// up front rather than failing inside the CLI.
+pub fn table_queries_in_suite(
+    resolved: &str,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Result<Vec<String>, String> {
+    let paths: Vec<PathBuf> = serde_json::from_str(resolved)
+        .map_err(|e| format!("could not read the suite's queries: {e}"))?;
+    Ok(paths
+        .iter()
+        .filter(|p| read(p).is_some_and(|src| output_for(&src) == Output::Table))
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect())
+}
+
+/// How the file `query`, whose text is `source`, is run and read: a suite
+/// always through `database analyze` into SARIF, since only that runs one;
+/// a single query by its `@kind`.
+pub fn output_of(query: &Path, source: &str) -> Output {
+    if is_suite(query) {
+        Output::Sarif
+    } else {
+        output_for(source)
+    }
+}
+
 fn path(p: &Path) -> String {
     p.display().to_string()
 }
@@ -50,6 +99,21 @@ fn path(p: &Path) -> String {
 /// writes one into its own folder, beside its results.
 pub fn evaluator_log(output: &Path) -> PathBuf {
     output.with_file_name("evaluator-log.jsonl")
+}
+
+/// The folder the run whose results are `output` writes its query log into
+/// (`--logdir`), beside its results.
+pub fn query_log_dir(output: &Path) -> PathBuf {
+    output.with_file_name("logs")
+}
+
+/// The newest of `logs`, each a `*.log` file with its modification time:
+/// the latest time wins, the greater file name breaks a tie.
+pub fn newest_query_log(logs: Vec<(PathBuf, std::time::SystemTime)>) -> Option<PathBuf> {
+    logs.into_iter()
+        .filter(|(p, _)| p.extension().is_some_and(|e| e == "log"))
+        .max_by(|(a, at), (b, bt)| at.cmp(bt).then_with(|| a.file_name().cmp(&b.file_name())))
+        .map(|(p, _)| p)
 }
 
 /// The human-readable summary of the run whose results are `output`, made
@@ -88,6 +152,19 @@ pub fn log_predicates_args(log: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// `codeql` arguments rendering the help of `query`, its `.qhelp` or `.md`
+/// beside it, as Markdown at `out` (VS Code's "CodeQL: Preview Query
+/// Help").
+pub fn query_help_args(query: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("generate"),
+        String::from("query-help"),
+        String::from("--format=markdown"),
+        format!("--output={}", path(out)),
+        path(query),
+    ]
+}
+
 /// `codeql` arguments running `query` on `db` into SARIF at `out`.
 /// `--rerun` because a history entry run again means run again, not
 /// "reuse the cached answer".
@@ -100,6 +177,7 @@ pub fn analyze_args(query: &Path, db: &Path, out: &Path) -> Vec<String> {
         String::from("--format=sarif-latest"),
         format!("--output={}", path(out)),
         format!("--evaluator-log={}", path(&evaluator_log(out))),
+        format!("--logdir={}", path(&query_log_dir(out))),
         String::from("--rerun"),
     ]
 }
@@ -112,6 +190,7 @@ pub fn run_args(query: &Path, db: &Path, bqrs: &Path) -> Vec<String> {
         format!("--database={}", path(db)),
         format!("--output={}", path(bqrs)),
         format!("--evaluator-log={}", path(&evaluator_log(bqrs))),
+        format!("--logdir={}", path(&query_log_dir(bqrs))),
         path(query),
     ]
 }
@@ -125,6 +204,230 @@ pub fn decode_args(bqrs: &Path, out: &Path) -> Vec<String> {
         format!("--output={}", path(out)),
         path(bqrs),
     ]
+}
+
+/// `codeql` arguments writing the alerts `query` found in `db` as CSV at
+/// `out`, from the results the database keeps (#578, "View Alerts (CSV)").
+pub fn interpret_csv_args(db: &Path, query: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("database"),
+        String::from("interpret-results"),
+        String::from("--format=csv"),
+        format!("--output={}", path(out)),
+        path(db),
+        path(query),
+    ]
+}
+
+/// The BQRS `db` keeps for `query` from its last analysis: the newest
+/// `<stem>.bqrs` under its `results` folder, which the CLI files by pack.
+pub fn kept_bqrs(db: &Path, query: &Path) -> Option<PathBuf> {
+    fn walk(dir: &Path, want: &std::ffi::OsStr, depth: usize, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if depth < 12 {
+                    walk(&p, want, depth + 1, out);
+                }
+            } else if p.file_name() == Some(want) {
+                out.push(p);
+            }
+        }
+    }
+    let want = std::ffi::OsString::from(format!("{}.bqrs", query.file_stem()?.to_string_lossy()));
+    let mut found = Vec::new();
+    walk(&db.join("results"), &want, 0, &mut found);
+    found
+        .into_iter()
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+}
+
+/// `codeql` arguments dereferencing a `.qlref` test file to the query it
+/// names (#578, "open a referenced file").
+pub fn qlref_args(qlref: &Path) -> Vec<String> {
+    vec![String::from("resolve"), String::from("qlref"), path(qlref)]
+}
+
+/// The query `codeql resolve qlref` answered with: its `resolvedPath`.
+pub fn parse_qlref(json: &str) -> Option<PathBuf> {
+    let v: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    v.get("resolvedPath")?.as_str().map(PathBuf::from)
+}
+
+/// `codeql` arguments decoding result set `set` of `bqrs` as JSON with each
+/// entity's label and location, for navigating the results (#578).
+pub fn decode_locations_args(bqrs: &Path, out: &Path, set: &str) -> Vec<String> {
+    vec![
+        String::from("bqrs"),
+        String::from("decode"),
+        String::from("--format=json"),
+        String::from("--entities=url,string"),
+        format!("--result-set={set}"),
+        format!("--output={}", path(out)),
+        path(bqrs),
+    ]
+}
+
+/// Where the locations of a results CSV's cells are kept: beside it, as
+/// `<name>.locations.json`.
+pub fn locations_path(csv: &Path) -> PathBuf {
+    csv.with_extension("locations.json")
+}
+
+/// Where a result cell's entity is: a file and a 1-based line and column.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CellLoc {
+    pub path: PathBuf,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// One result row: each cell's text as the CSV shows it, and where each
+/// cell's entity is, if it is an entity with a location.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RowLocs {
+    pub cells: Vec<String>,
+    pub locs: Vec<Option<CellLoc>>,
+}
+
+/// Read a result set decoded by [`decode_locations_args`] into rows.
+pub fn parse_row_locations(json: &str) -> Vec<RowLocs> {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let cell = |c: &serde_json::Value| -> (String, Option<CellLoc>) {
+        match c {
+            serde_json::Value::Object(o) => {
+                let text = o
+                    .get("label")
+                    .and_then(|l| l.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let loc = o.get("url").and_then(|u| {
+                    let uri = u.get("uri")?.as_str()?;
+                    let rest = uri.strip_prefix("file://")?;
+                    Some(CellLoc {
+                        path: PathBuf::from(crate::sarif::resolve::percent_decode(rest)),
+                        line: u.get("startLine")?.as_u64()? as u32,
+                        column: u.get("startColumn").and_then(|c| c.as_u64()).unwrap_or(1) as u32,
+                    })
+                });
+                (text, loc)
+            }
+            serde_json::Value::String(s) => (s.clone(), None),
+            other => (other.to_string(), None),
+        }
+    };
+    v.get("tuples")
+        .and_then(|t| t.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.as_array())
+                .map(|r| {
+                    let (cells, locs) = r.iter().map(cell).unzip();
+                    RowLocs { cells, locs }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The locations of the row whose cells read `cells`, found by content
+/// rather than position, so a sorted table still leads to the right code.
+pub fn row_locations<'a>(rows: &'a [RowLocs], cells: &[String]) -> Option<&'a [Option<CellLoc>]> {
+    rows.iter()
+        .find(|r| r.cells == cells)
+        .map(|r| r.locs.as_slice())
+}
+
+/// `codeql` arguments listing a BQRS file's result sets as JSON.
+pub fn info_args(bqrs: &Path) -> Vec<String> {
+    vec![
+        String::from("bqrs"),
+        String::from("info"),
+        String::from("--format=json"),
+        path(bqrs),
+    ]
+}
+
+/// The result sets `codeql bqrs info --format=json` lists, as (name, rows),
+/// in its order.
+pub fn parse_result_sets(json: &str) -> Vec<(String, u64)> {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    v.get("result-sets")
+        .and_then(|s| s.as_array())
+        .map(|sets| {
+            sets.iter()
+                .filter_map(|s| {
+                    Some((
+                        s.get("name")?.as_str()?.to_string(),
+                        s.get("rows").and_then(|r| r.as_u64()).unwrap_or(0),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The result set a run's results show first: `#select`, else the first.
+pub fn main_result_set(sets: &[(String, u64)]) -> Option<&str> {
+    sets.iter()
+        .find(|(n, _)| n == "#select")
+        .or(sets.first())
+        .map(|(n, _)| n.as_str())
+}
+
+/// Where result set `set` of a run whose main table is `output` is
+/// decoded: `output` itself for the main set, else `results-<set>.csv`
+/// beside it (#578). A decoded file per set, since `bqrs decode` without a
+/// set writes them all into one CSV, header rows and all.
+pub fn result_set_file(output: &Path, set: &str, main: bool) -> PathBuf {
+    if main {
+        return output.to_path_buf();
+    }
+    let name: String = set
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    output.with_file_name(format!("results-{name}.csv"))
+}
+
+/// `codeql` arguments decoding result set `set` of `bqrs` to CSV at `out`.
+pub fn decode_set_args(bqrs: &Path, out: &Path, set: &str) -> Vec<String> {
+    let mut args = decode_args(bqrs, out);
+    args.insert(3, format!("--result-set={set}"));
+    args
+}
+
+/// A finished table run's result sets, as (name, file), the main one
+/// first: the files [`result_set_file`] names that exist.
+pub fn result_set_files(output: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    if output.is_file() {
+        out.push((String::from("#select"), output.to_path_buf()));
+    }
+    let mut others: Vec<(String, PathBuf)> = output
+        .parent()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let set = name
+                .strip_prefix("results-")?
+                .strip_suffix(".csv")?
+                .to_string();
+            Some((set, e.path()))
+        })
+        .collect();
+    others.sort();
+    out.extend(others);
+    out
 }
 
 /// `codeql` arguments upgrading `db` to the CLI's current schema (VS Code's
@@ -222,6 +525,23 @@ pub fn pack_download_args(packs: &[String]) -> Vec<String> {
     args
 }
 
+/// The pack a "Run Queries in Published Pack" reference names (#578):
+/// `scope/name`, optionally `@version`, without a `:path` into the pack,
+/// which `pack download` does not take. `None` when it names no pack.
+pub fn published_pack(reference: &str) -> Option<&str> {
+    let pack = reference.split(':').next()?.trim();
+    let name = pack.split('@').next()?;
+    let (scope, rest) = name.split_once('/')?;
+    // Pack scopes and names are lowercase letters, digits and hyphens.
+    let ok = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    (ok(scope) && ok(rest)).then_some(pack)
+}
+
 /// The pack references in what the user typed: separated by spaces or
 /// commas, each `scope/name`, optionally with `@version`.
 pub fn parse_pack_list(input: &str) -> Vec<String> {
@@ -313,6 +633,107 @@ pub fn compare_tables(
     }
     let bytes = w.into_inner().map_err(|e| e.to_string())?;
     String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
+/// Why a `codeql` call failed, read from its stderr (#578): the reason
+/// and the fix the CLI suggests, rather than its first line, which is
+/// usually progress ("Compiling query plan for …"). Lines are kept in the
+/// CLI's own words: the fatal-error line leads, then each distinct `ERROR:`
+/// line, then every line suggesting
+/// what to do ("Consider running …", "Try …", "Run …", "Use --…", a hint).
+/// With none of those, the last non-empty line, where a tool usually
+/// ends on its reason.
+pub fn failure_reason(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim();
+        if !s.is_empty() && !parts.iter().any(|p| p == s || p.contains(s)) {
+            parts.push(s.to_string());
+        }
+    };
+    for l in &lines {
+        if l.starts_with("A fatal error occurred:") {
+            push(l);
+        }
+    }
+    for l in &lines {
+        if l.starts_with("ERROR:") {
+            push(l);
+        }
+    }
+    for l in &lines {
+        let lower = l.to_ascii_lowercase();
+        let suggests = ["consider ", "try ", "run ", "use --", "hint:", "please run"]
+            .iter()
+            .any(|w| lower.starts_with(w) || lower.contains(&format!("({w}")));
+        if suggests {
+            push(l);
+        }
+    }
+    if parts.is_empty() {
+        return lines
+            .last()
+            .map_or_else(|| String::from("codeql failed"), |l| l.to_string());
+    }
+    parts.join(" · ")
+}
+
+/// Where a run keeps the text of `query` as it was run (#578, "View Query
+/// Text"): a `query` folder beside the run's `output`, under the query's
+/// own file name, so the tab reads as the query.
+pub fn query_text_path(output: &Path, query: &Path) -> PathBuf {
+    let name = query
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("query.ql"));
+    output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("query")
+        .join(name)
+}
+
+/// The `.ql` queries `paths` name (#578, "run queries in selected files"):
+/// each `.ql` file itself, and every `.ql` under a folder, skipping hidden
+/// folders. Sorted and without repeats; a path that is neither is ignored.
+pub fn queries_in(paths: &[PathBuf]) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let hidden = p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+            if hidden {
+                continue;
+            }
+            if p.is_dir() {
+                if depth < 16 {
+                    walk(&p, depth + 1, out);
+                }
+            } else if p.extension().is_some_and(|e| e == "ql") {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            walk(p, 0, &mut out);
+        } else if p.is_file() && p.extension().is_some_and(|e| e == "ql") {
+            out.push(p.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// `codeql` arguments printing the CLI's bare version number.
@@ -593,8 +1014,20 @@ pub fn scaffold_query(
 pub enum RunStatus {
     Running,
     Succeeded,
-    /// The first line of what `codeql` said.
+    /// Why, in what `codeql` said.
     Failed(String),
+    /// Stopped by the user before it finished (#578).
+    Cancelled,
+}
+
+/// A query waiting in a batch run (#578): run from its file on the
+/// current database, or with `source` and `database` set, from that text
+/// on that database ("Run Query on Multiple Databases").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedRun {
+    pub query: PathBuf,
+    pub source: Option<String>,
+    pub database: Option<PathBuf>,
 }
 
 /// One query history entry.
@@ -618,6 +1051,43 @@ pub struct HistoryEntry {
     /// History saved before renaming existed reads as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// How many results a successful run produced: table rows, or SARIF
+    /// results (#578). `None` while running, after a failure, and for
+    /// history saved before counts were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<u64>,
+}
+
+/// How many results `output` holds: the rows of a CSV table (its header
+/// aside), or the results of every run of a SARIF log. `None` when it
+/// cannot be read.
+pub fn count_results(output: &Path) -> Option<u64> {
+    let is_csv = output
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+    if is_csv {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_path(output)
+            .ok()?;
+        let mut n = 0u64;
+        for record in reader.records() {
+            record.ok()?;
+            n += 1;
+        }
+        return Some(n);
+    }
+    let log: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(output).ok()?).ok()?;
+    Some(
+        log.get("runs")?
+            .as_array()?
+            .iter()
+            .filter_map(|r| r.get("results").and_then(|v| v.as_array()))
+            .map(|r| r.len() as u64)
+            .sum(),
+    )
 }
 
 impl HistoryEntry {
@@ -656,16 +1126,24 @@ impl HistoryEntry {
             let mark = match self.status {
                 RunStatus::Succeeded => '\u{2713}',
                 RunStatus::Failed(_) => '\u{2717}',
+                RunStatus::Cancelled => '\u{2298}',
                 RunStatus::Running => '\u{2026}',
             };
             return format!("{mark} {custom}");
         }
         let name = self.query_name();
         match &self.status {
-            RunStatus::Succeeded => format!(
-                "\u{2713} {name} \u{b7} {} \u{b7} {}s",
-                self.database, self.seconds
-            ),
+            RunStatus::Succeeded => {
+                let count = match self.results {
+                    Some(1) => String::from(" \u{b7} 1 result"),
+                    Some(n) => format!(" \u{b7} {n} results"),
+                    None => String::new(),
+                };
+                format!(
+                    "\u{2713} {name} \u{b7} {} \u{b7} {}s{count}",
+                    self.database, self.seconds
+                )
+            }
             RunStatus::Failed(why) => format!(
                 "\u{2717} {name} \u{b7} {} \u{b7} failed: {why}",
                 self.database
@@ -673,21 +1151,26 @@ impl HistoryEntry {
             RunStatus::Running => {
                 format!("\u{2026} {name} \u{b7} {} \u{b7} running", self.database)
             }
+            RunStatus::Cancelled => {
+                format!("\u{2298} {name} \u{b7} {} \u{b7} cancelled", self.database)
+            }
         }
     }
 }
 
-/// The orders the Query History section sorts by. VS Code also sorts by
-/// result count; croft's history does not record counts, so the third
-/// order groups runs by how they ended instead.
+/// The orders the Query History section sorts by, VS Code's three plus
+/// grouping runs by how they ended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HistSort {
     /// Newest first.
     #[default]
     Date,
     Name,
-    /// Succeeded, then failed, then running; newest first within each.
+    /// Succeeded, then failed, cancelled, running; newest first within each.
     Status,
+    /// Most results first; runs without a count last, newest first among
+    /// equals.
+    Count,
 }
 
 impl HistSort {
@@ -696,7 +1179,8 @@ impl HistSort {
         match self {
             HistSort::Date => HistSort::Name,
             HistSort::Name => HistSort::Status,
-            HistSort::Status => HistSort::Date,
+            HistSort::Status => HistSort::Count,
+            HistSort::Count => HistSort::Date,
         }
     }
 
@@ -705,6 +1189,7 @@ impl HistSort {
             HistSort::Date => "date",
             HistSort::Name => "name",
             HistSort::Status => "status",
+            HistSort::Count => "result count",
         }
     }
 }
@@ -805,10 +1290,14 @@ impl History {
                 let rank = match e.status {
                     RunStatus::Succeeded => 0,
                     RunStatus::Failed(_) => 1,
-                    RunStatus::Running => 2,
+                    RunStatus::Cancelled => 2,
+                    RunStatus::Running => 3,
                 };
                 (rank, Reverse(e.started))
             }),
+            HistSort::Count => self
+                .entries
+                .sort_by_key(|e| (e.results.is_none(), Reverse(e.results), Reverse(e.started))),
         }
         self.sort_by = by;
     }
@@ -863,11 +1352,210 @@ impl History {
             .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
             .map(|(i, _)| i)
     }
+
+    /// The index of the most recent run that succeeded, whatever the order.
+    pub fn newest_success(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.status == RunStatus::Succeeded)
+            .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+    }
+}
+
+/// The file name "CodeQL: Export Results" suggests for the results
+/// `output` of `query`: `<query-stem>-results.<csv|sarif>`.
+pub fn export_file_name(query: &Path, output: &Path) -> String {
+    let stem = query
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = output
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("csv"));
+    format!("{stem}-results.{ext}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_cells_lead_to_their_entities_code() {
+        // The real `bqrs decode --format=json --entities=url,string
+        // --result-set=#select` shape (2.27.1).
+        let json = r#"{"columns":[{"name":"f","kind":"Entity"},{"kind":"String"}],
+          "tuples":[[{"label":"Function run","url":{"uri":"file:///w/my%20app.py","startLine":3,"startColumn":1,"endLine":3,"endColumn":13}},"run"],
+                    [{"label":"Function go"},7]]}"#;
+        let rows = parse_row_locations(json);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].cells, ["Function run", "run"]);
+        assert_eq!(
+            rows[0].locs[0],
+            Some(CellLoc {
+                path: PathBuf::from("/w/my app.py"),
+                line: 3,
+                column: 1
+            })
+        );
+        assert_eq!(rows[0].locs[1], None, "a string has no location");
+        assert_eq!(rows[1].cells, ["Function go", "7"]);
+        assert_eq!(rows[1].locs, [None, None], "an entity without a url");
+        let found = row_locations(&rows, &["Function run".to_string(), "run".to_string()]);
+        assert_eq!(found.map(|l| l[0].as_ref().map(|c| c.line)), Some(Some(3)));
+        assert!(row_locations(&rows, &["nope".to_string()]).is_none());
+        assert_eq!(
+            locations_path(Path::new("/r/results-calls.csv")),
+            Path::new("/r/results-calls.locations.json")
+        );
+        assert_eq!(parse_row_locations("oops"), []);
+    }
+
+    #[test]
+    fn a_qlref_resolves_to_the_query_the_cli_names() {
+        // The real `codeql resolve qlref` answer (2.27.1).
+        let json = "{\n  \"resolvedPath\" : \"/w/src/Alert.ql\",\n  \"resolvedPostprocessingPaths\" : [ ]\n}\n";
+        assert_eq!(parse_qlref(json), Some(PathBuf::from("/w/src/Alert.ql")));
+        assert_eq!(parse_qlref("{}"), None);
+        assert_eq!(
+            qlref_args(Path::new("/w/test/A.qlref")),
+            ["resolve", "qlref", "/w/test/A.qlref"]
+        );
+    }
+
+    #[test]
+    fn an_alert_runs_kept_results_are_found_and_interpreted_as_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        // Where the CLI keeps them: results/<pack scope>/<pack>/<query>.bqrs.
+        let kept = db.join("results/me/q/Alert.bqrs");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "").unwrap();
+        std::fs::write(db.join("results/me/q/Other.bqrs"), "").unwrap();
+        assert_eq!(kept_bqrs(&db, Path::new("/w/q/Alert.ql")), Some(kept));
+        assert_eq!(kept_bqrs(&db, Path::new("/w/q/Gone.ql")), None);
+        assert_eq!(
+            interpret_csv_args(&db, Path::new("/w/q/Alert.ql"), Path::new("/r/alerts.csv")),
+            [
+                "database",
+                "interpret-results",
+                "--format=csv",
+                "--output=/r/alerts.csv",
+                &db.display().to_string(),
+                "/w/q/Alert.ql"
+            ]
+        );
+    }
+
+    #[test]
+    fn each_result_set_gets_its_own_csv() {
+        // The real `codeql bqrs info --format=json` shape (2.27.1).
+        let sets = parse_result_sets(
+            r##"{"result-sets":[{"name":"calls","rows":3,"columns":[]},{"name":"#select","rows":1,"columns":[]}],"compatible-query-kinds":["Table"]}"##,
+        );
+        assert_eq!(sets, [("calls".to_string(), 3), ("#select".to_string(), 1)]);
+        assert_eq!(main_result_set(&sets), Some("#select"));
+        assert_eq!(
+            main_result_set(&sets[..1]),
+            Some("calls"),
+            "no #select: the first"
+        );
+        assert!(parse_result_sets("oops").is_empty());
+        let out = Path::new("/r/1-q/results.csv");
+        assert_eq!(result_set_file(out, "#select", true), out);
+        assert_eq!(
+            result_set_file(out, "calls/x", false),
+            Path::new("/r/1-q/results-calls_x.csv")
+        );
+        assert_eq!(
+            decode_set_args(Path::new("/r/b.bqrs"), out, "calls"),
+            [
+                "bqrs",
+                "decode",
+                "--format=csv",
+                "--result-set=calls",
+                "--output=/r/1-q/results.csv",
+                "/r/b.bqrs"
+            ]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("results.csv");
+        for f in [
+            "results.csv",
+            "results-zeta.csv",
+            "results-alpha.csv",
+            "results.bqrs",
+        ] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let names: Vec<String> = result_set_files(&main)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["#select", "alpha", "zeta"]);
+    }
+
+    #[test]
+    fn queries_in_takes_ql_files_and_walks_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for f in [
+            "a/One.ql",
+            "a/b/Two.ql",
+            "a/lib.qll",
+            "a/.hidden/Three.ql",
+            "Top.ql",
+            "x.txt",
+        ] {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "select 1").unwrap();
+        }
+        let got = queries_in(&[
+            root.join("a"),
+            root.join("Top.ql"),
+            root.join("a/One.ql"),
+            root.join("x.txt"),
+        ]);
+        assert_eq!(
+            got,
+            [
+                root.join("Top.ql"),
+                root.join("a/One.ql"),
+                root.join("a/b/Two.ql")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failure_reads_the_reason_and_the_suggested_fix_not_the_progress() {
+        let stderr = "Compiling query plan for /w/q.ql.\n\
+            ERROR: could not resolve module cpp (/w/q.ql:1,8-11)\n\
+            Failed [1/1] /w/q.ql.\n\
+            A fatal error occurred: Could not compile the query.\n\
+            Consider running `codeql pack install` in /w to fetch its dependencies.\n";
+        assert_eq!(
+            failure_reason(stderr),
+            "A fatal error occurred: Could not compile the query. · \
+             ERROR: could not resolve module cpp (/w/q.ql:1,8-11) · \
+             Consider running `codeql pack install` in /w to fetch its dependencies."
+        );
+        // A fix given inside the fatal line is not repeated.
+        assert_eq!(
+            failure_reason(
+                "A fatal error occurred: The database is too old. Run `codeql database upgrade /db`.\n"
+            ),
+            "A fatal error occurred: The database is too old. Run `codeql database upgrade /db`."
+        );
+        // Nothing recognisable: the last line, where a tool ends on its reason.
+        assert_eq!(
+            failure_reason("starting\nno such file: x\n"),
+            "no such file: x"
+        );
+        assert_eq!(failure_reason("\n"), "codeql failed");
+    }
 
     #[test]
     fn cache_jobs_run_database_cleanup_in_their_mode() {
@@ -923,6 +1611,54 @@ mod tests {
     }
 
     #[test]
+    fn a_published_pack_reference_names_the_pack_to_download() {
+        assert_eq!(
+            published_pack("codeql/python-queries"),
+            Some("codeql/python-queries")
+        );
+        assert_eq!(published_pack(" acme/q@1.2.0 "), Some("acme/q@1.2.0"));
+        assert_eq!(
+            published_pack("codeql/python-queries:Security/CWE-078"),
+            Some("codeql/python-queries")
+        );
+        assert_eq!(published_pack("acme/q@~1.0:x.ql"), Some("acme/q@~1.0"));
+        for bad in [
+            "",
+            "python-queries",
+            "/q",
+            "acme/",
+            "a b/c",
+            "../x",
+            "Acme/q",
+        ] {
+            assert_eq!(published_pack(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_suite_holding_table_queries_is_found_out() {
+        let read = |p: &Path| -> Option<String> {
+            Some(match p.file_name()?.to_str()? {
+                "Alert.ql" => String::from("/** @kind problem */ select 1"),
+                _ => String::from("select 1"),
+            })
+        };
+        assert_eq!(
+            table_queries_in_suite(r#"["/q/Alert.ql","/q/Table.ql"]"#, read),
+            Ok(vec![String::from("Table.ql")])
+        );
+        assert_eq!(
+            table_queries_in_suite(r#"["/q/Alert.ql"]"#, read),
+            Ok(vec![])
+        );
+        assert!(table_queries_in_suite("not json", read).is_err());
+        assert_eq!(
+            resolve_suite_args(Path::new("/s.qls")),
+            ["resolve", "queries", "--format=json", "/s.qls"]
+        );
+    }
+
+    #[test]
     fn a_quick_query_imports_its_languages_library() {
         let (pack, query) = quick_query("python");
         assert!(pack.contains("name: croft/quick-query-python\n"));
@@ -957,6 +1693,7 @@ mod tests {
             status,
             output: PathBuf::from(out),
             name: None,
+            results: None,
         };
         let history = History {
             entries: vec![
@@ -982,6 +1719,42 @@ mod tests {
         assert_eq!(history.perf_partner(4), None);
         assert_eq!(history.perf_partner(2), None);
         assert_eq!(history.perf_partner(9), None);
+    }
+
+    #[test]
+    fn export_takes_the_newest_success_under_the_querys_name() {
+        let entry = |started: u64, status: RunStatus| HistoryEntry {
+            query: PathBuf::from("/w/q.ql"),
+            database: String::from("db"),
+            database_path: None,
+            started,
+            seconds: 1,
+            status,
+            output: PathBuf::from("/r/results.csv"),
+            name: None,
+            results: None,
+        };
+        let mut history = History {
+            entries: vec![
+                entry(5, RunStatus::Failed(String::from("x"))),
+                entry(3, RunStatus::Succeeded),
+                entry(4, RunStatus::Running),
+                entry(1, RunStatus::Succeeded),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(history.newest_success(), Some(1));
+        history.entries.remove(1);
+        history.entries.remove(2);
+        assert_eq!(history.newest_success(), None);
+        assert_eq!(
+            export_file_name(Path::new("/w/q.ql"), Path::new("/r/results.sarif")),
+            "q-results.sarif"
+        );
+        assert_eq!(
+            export_file_name(Path::new("/w/s.qls"), Path::new("/r/results.csv")),
+            "s-results.csv"
+        );
     }
 
     #[test]
@@ -1024,6 +1797,41 @@ mod tests {
     }
 
     #[test]
+    fn a_suite_always_reads_as_sarif() {
+        let suite = "- queries: .\n- include:\n    kind: table\n";
+        assert!(is_suite(Path::new("/w/s.qls")));
+        assert!(!is_suite(Path::new("/w/q.ql")));
+        assert_eq!(output_of(Path::new("/w/s.qls"), suite), Output::Sarif);
+        assert_eq!(output_of(Path::new("/w/q.ql"), "select 1"), Output::Table);
+        assert_eq!(output_of(Path::new("/w/q.ql"), PROBLEM), Output::Sarif);
+    }
+
+    #[test]
+    fn the_newest_query_log_is_the_latest_log_file() {
+        let t = |s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s);
+        let p = |s: &str| PathBuf::from(format!("/out/logs/{s}"));
+        assert_eq!(newest_query_log(Vec::new()), None);
+        assert_eq!(newest_query_log(vec![(p("notes.txt"), t(9))]), None);
+        assert_eq!(
+            newest_query_log(vec![
+                (p("execute-b.log"), t(2)),
+                (p("execute-a.log"), t(3)),
+                (p("later.txt"), t(4)),
+            ]),
+            Some(p("execute-a.log"))
+        );
+        assert_eq!(
+            newest_query_log(vec![(p("execute-b.log"), t(3)), (p("execute-a.log"), t(3))]),
+            Some(p("execute-b.log")),
+            "a tie goes to the greater name"
+        );
+        assert_eq!(
+            query_log_dir(Path::new("/out/r.sarif")),
+            Path::new("/out/logs")
+        );
+    }
+
+    #[test]
     fn argument_lists_name_the_database_query_and_output() {
         let (q, db) = (Path::new("/w/q.ql"), Path::new("/dbs/app"));
         assert_eq!(
@@ -1036,6 +1844,7 @@ mod tests {
                 "--format=sarif-latest",
                 "--output=/out/r.sarif",
                 "--evaluator-log=/out/evaluator-log.jsonl",
+                "--logdir=/out/logs",
                 "--rerun"
             ]
         );
@@ -1047,6 +1856,7 @@ mod tests {
                 "--database=/dbs/app",
                 "--output=/out/r.bqrs",
                 "--evaluator-log=/out/evaluator-log.jsonl",
+                "--logdir=/out/logs",
                 "/w/q.ql"
             ]
         );
@@ -1087,6 +1897,16 @@ mod tests {
             ]
         );
         assert_eq!(upgrade_args(db), vec!["database", "upgrade", "/dbs/app"]);
+        assert_eq!(
+            query_help_args(q, Path::new("/cache/help/q.md")),
+            vec![
+                "generate",
+                "query-help",
+                "--format=markdown",
+                "--output=/cache/help/q.md",
+                "/w/q.ql"
+            ]
+        );
     }
 
     #[test]
@@ -1212,6 +2032,7 @@ mod tests {
             status,
             output: PathBuf::from("/out/r.sarif"),
             name: None,
+            results: None,
         }
     }
 
@@ -1336,7 +2157,48 @@ mod tests {
         assert_eq!(History::load(&path).sort_by, HistSort::Status, "saved");
         h.sort(HistSort::Date);
         assert_eq!(started(&h), [5, 4, 3, 2, 1]);
-        assert_eq!(HistSort::Status.next(), HistSort::Date);
+        assert_eq!(HistSort::Status.next(), HistSort::Count);
+        assert_eq!(HistSort::Count.next(), HistSort::Date);
+    }
+
+    #[test]
+    fn history_sorts_by_result_count_and_labels_show_it() {
+        let mut h = History::default();
+        let counted = |q: &str, t: u64, n: Option<u64>| HistoryEntry {
+            results: n,
+            ..run(q, t, RunStatus::Succeeded)
+        };
+        h.push(counted("a.ql", 1, Some(3)));
+        h.push(counted("b.ql", 2, None));
+        h.push(counted("c.ql", 3, Some(40)));
+        h.push(counted("d.ql", 4, Some(3)));
+        h.sort(HistSort::Count);
+        assert_eq!(started(&h), [3, 4, 1, 2], "most first, uncounted last");
+        assert!(h.entries[0].label().ends_with("12s \u{b7} 40 results"));
+        assert!(h.entries[3].label().ends_with("12s"), "no count, no suffix");
+        assert!(
+            counted("e.ql", 5, Some(1))
+                .label()
+                .ends_with("\u{b7} 1 result")
+        );
+    }
+
+    #[test]
+    fn results_are_counted_from_a_table_or_a_sarif_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("results.csv");
+        std::fs::write(&csv, "col0,col1\n1,\"two\nlines\"\n3,x\n").unwrap();
+        assert_eq!(count_results(&csv), Some(2), "a quoted newline is one row");
+        std::fs::write(&csv, "col0\n").unwrap();
+        assert_eq!(count_results(&csv), Some(0));
+        let sarif = dir.path().join("results.sarif");
+        std::fs::write(
+            &sarif,
+            r#"{"version":"2.1.0","runs":[{"results":[{},{}]},{"results":[{}]},{}]}"#,
+        )
+        .unwrap();
+        assert_eq!(count_results(&sarif), Some(3));
+        assert_eq!(count_results(&dir.path().join("missing.sarif")), None);
     }
 
     #[test]

@@ -24,17 +24,19 @@ pub enum Section {
     VariantAnalysis,
     QueryHistory,
     AstViewer,
+    EvaluatorLog,
     MethodModeling,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::Language,
         Section::Databases,
         Section::Queries,
         Section::VariantAnalysis,
         Section::QueryHistory,
         Section::AstViewer,
+        Section::EvaluatorLog,
         Section::MethodModeling,
     ];
 
@@ -46,6 +48,7 @@ impl Section {
             Section::VariantAnalysis => "VARIANT ANALYSIS REPOSITORIES",
             Section::QueryHistory => "QUERY HISTORY",
             Section::AstViewer => "AST VIEWER",
+            Section::EvaluatorLog => "EVALUATOR LOG VIEWER",
             Section::MethodModeling => "METHOD MODELING",
         }
     }
@@ -61,6 +64,24 @@ pub enum Action {
     CreateQuery,
     SetUpControllerRepository,
     ViewAst,
+    /// Node `.0` of the AST shown: go to its code and fold or unfold it.
+    AstNode(usize),
+    /// Forget the AST shown.
+    ClearAst,
+    /// Predicate `.0` of the evaluator log shown, or a line under it: fold
+    /// or unfold it.
+    EvalPredicate(usize),
+    /// A dependency: go to the predicate it names, when the log has it.
+    EvalDependency(Option<usize>),
+    /// Forget the evaluator log shown.
+    ClearEvalLog,
+    /// Read, or read again, the endpoints of the current database for the
+    /// Model Editor.
+    OpenModelEditor,
+    /// Fold or unfold the Model Editor group endpoint `.0` belongs to.
+    ModelGroup(usize),
+    /// Model Editor endpoint `.0`: go to its code.
+    ModelEndpoint(usize),
     SelectLanguage(usize),
     /// Make the listed database at this index the current one.
     SelectDatabase(usize),
@@ -170,6 +191,12 @@ pub struct CodeqlPanel {
     pub folded_lists: std::collections::HashSet<String>,
     /// A line per submitted variant analysis, oldest first (#578).
     pub variant_runs: Vec<String>,
+    /// The AST the AST Viewer section shows, once one has been read.
+    pub ast: Option<crate::codeql_ast::AstView>,
+    /// The evaluator log the Evaluator Log Viewer section shows.
+    pub evallog: Option<crate::codeql_evallog::LogView>,
+    /// The endpoints the Method Modeling section shows.
+    pub model: Option<crate::codeql_model::ModelView>,
 }
 
 impl CodeqlPanel {
@@ -217,6 +244,24 @@ impl CodeqlPanel {
             .position(|l| matches!(l, Line::Action(Action::SelectDatabase(i), _) if *i == index))
         {
             self.selected = n;
+        }
+    }
+
+    /// The Model Editor endpoint whose row is selected.
+    pub fn selected_model_endpoint(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::ModelEndpoint(i))) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Select the Evaluator Log Viewer row of predicate `i`.
+    pub fn select_evallog_predicate(&mut self, i: usize) {
+        let row = self.lines().iter().position(|l| {
+            matches!(l, Line::Action(Action::EvalPredicate(p), t) if *p == i && !t.starts_with(' '))
+        });
+        if let Some(row) = row {
+            self.selected = row;
         }
     }
 
@@ -540,15 +585,113 @@ impl CodeqlPanel {
                     out.push(Line::Text("moment. Select a database to run a CodeQL"));
                     out.push(Line::Text("query and get your first results."));
                 }
-                Section::AstViewer => {
-                    out.push(Line::Text("Run 'CodeQL: View AST' on an open source"));
-                    out.push(Line::Text("file from a CodeQL database."));
-                    out.push(Line::Action(Action::ViewAst, "View AST".to_string()));
-                }
-                Section::MethodModeling => {
-                    out.push(Line::Text("Select a method in the model editor to"));
-                    out.push(Line::Text("see and edit its model here."));
-                }
+                Section::AstViewer => match &self.ast {
+                    Some(view) => {
+                        let name = view
+                            .file
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        out.push(Line::Action(
+                            Action::ClearAst,
+                            format!("Clear \u{b7} {name} in {}", view.database),
+                        ));
+                        for (depth, i) in view.visible() {
+                            let node = &view.tree.nodes[i];
+                            let mark = match (node.children.is_empty(), view.open.contains(&i)) {
+                                (true, _) => ' ',
+                                (false, true) => '\u{25be}',
+                                (false, false) => '\u{25b8}',
+                            };
+                            let at = node
+                                .location
+                                .as_ref()
+                                .map(|l| format!("  {}:{}", l.line, l.column))
+                                .unwrap_or_default();
+                            out.push(Line::Action(
+                                Action::AstNode(i),
+                                format!("{}{mark} {}{at}", "  ".repeat(depth), node.label),
+                            ));
+                        }
+                    }
+                    None => {
+                        out.push(Line::Text("Run 'CodeQL: View AST' on an open source"));
+                        out.push(Line::Text("file from a CodeQL database."));
+                        out.push(Line::Action(Action::ViewAst, "View AST".to_string()));
+                    }
+                },
+                Section::EvaluatorLog => match &self.evallog {
+                    Some(view) => {
+                        out.push(Line::Action(
+                            Action::ClearEvalLog,
+                            format!("Clear \u{b7} {}", view.query),
+                        ));
+                        use crate::codeql_evallog::LogRow;
+                        for row in view.rows() {
+                            out.push(match row {
+                                LogRow::Predicate(i, text) | LogRow::Detail(i, text) => {
+                                    Line::Action(Action::EvalPredicate(i), text)
+                                }
+                                LogRow::Dependency(_, target, text) => {
+                                    Line::Action(Action::EvalDependency(target), text)
+                                }
+                            });
+                        }
+                    }
+                    None => {
+                        out.push(Line::Text("Run 'Show Evaluator Log (Viewer)' on a"));
+                        out.push(Line::Text("query history item."));
+                    }
+                },
+                Section::MethodModeling => match &self.model {
+                    Some(view) => {
+                        out.push(Line::Action(
+                            Action::OpenModelEditor,
+                            format!("Refresh \u{b7} {} ({})", view.database, view.language),
+                        ));
+                        use crate::codeql_model::ModelRow;
+                        let rows = view.rows();
+                        for (at, row) in rows.iter().enumerate() {
+                            out.push(match row {
+                                ModelRow::Group(group, modeled, total) => {
+                                    let mark = if view.folded.contains(group) {
+                                        '\u{25b8}'
+                                    } else {
+                                        '\u{25be}'
+                                    };
+                                    // A group's endpoints follow it; one is
+                                    // enough to name the group.
+                                    let first = rows[at..].iter().find_map(|r| match r {
+                                        ModelRow::Endpoint(i, _) => Some(*i),
+                                        _ => None,
+                                    });
+                                    let first = first.unwrap_or_else(|| {
+                                        view.endpoints
+                                            .iter()
+                                            .position(|e| e.group() == *group)
+                                            .unwrap_or(0)
+                                    });
+                                    Line::Action(
+                                        Action::ModelGroup(first),
+                                        format!("{mark} {group}  {modeled}/{total} modeled"),
+                                    )
+                                }
+                                ModelRow::Endpoint(i, text) => {
+                                    Line::Action(Action::ModelEndpoint(*i), text.clone())
+                                }
+                            });
+                        }
+                    }
+                    None => {
+                        out.push(Line::Text("Model the library methods of the"));
+                        out.push(Line::Text("current database as sources, sinks"));
+                        out.push(Line::Text("or summaries."));
+                        out.push(Line::Action(
+                            Action::OpenModelEditor,
+                            "Open Model Editor".to_string(),
+                        ));
+                    }
+                },
             }
         }
         out
