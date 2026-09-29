@@ -25224,6 +25224,57 @@ fn sync_markdown_lint_settles_after_a_split_pane_is_edited() {
     assert!(!app.sync_markdown_lint(), "and it stays settled");
 }
 
+/// #851: for a file rumdl reports on, the built-in lint withdraws what it
+/// published (rumdl reports the same rules, so each would show twice) and
+/// stays quiet; a file rumdl does not report on (one only in a split's other
+/// group, never sent to the servers) keeps it; and once rumdl stops
+/// reporting on a file the lint runs on it again.
+#[test]
+fn sync_markdown_lint_stands_down_only_for_files_rumdl_reports_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.md");
+    let other = tmp.path().join("b.md");
+    std::fs::write(&file, "# Title\n\nBody.\n\n# Another\n").unwrap();
+    std::fs::write(&other, "# Title\n\nBody.\n\n# Another\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let has_md025 = |app: &App, path: &std::path::Path| {
+        app.merged_diagnostics(path)
+            .iter()
+            .any(|d| d.message.contains("MD025"))
+    };
+    assert!(app.sync_markdown_lint());
+    assert!(has_md025(&app, &file), "the built-in lint reports MD025");
+    assert!(has_md025(&app, &other));
+
+    let lsp = || app.lsp.as_ref().expect("a test App has an LSP manager");
+    lsp().set_document_servers_for_test(&file, &["marksman", "rumdl"]);
+    lsp().set_document_servers_for_test(&other, &["marksman"]);
+    assert!(app.sync_markdown_lint(), "standing down is a change");
+    assert!(!has_md025(&app, &file), "withdrawn where rumdl reports");
+    assert!(
+        app.editor
+            .diagnostic_spans_for_test()
+            .iter()
+            .all(|line| line.is_empty()),
+        "and its squiggle is gone from the open tab"
+    );
+    assert!(has_md025(&app, &other), "kept where rumdl does not report");
+    assert!(!app.sync_markdown_lint(), "and it stays quiet");
+
+    // Retired from pulls, or crashed for good: rumdl leaves the file.
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .set_document_servers_for_test(&file, &["marksman"]);
+    assert!(
+        app.sync_markdown_lint(),
+        "with rumdl gone the lint runs again"
+    );
+    assert!(has_md025(&app, &file));
+}
+
 /// Two panes can reach the same `edit_seq` with different text (one edit in
 /// each). Switching which pane is linted must still lint it: the cursor has
 /// to recognise a different buffer, not just a different sequence number.
