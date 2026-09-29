@@ -32,6 +32,9 @@ pub struct SelectedPlace {
     )>,
     /// The log's own copy of the file, when it is not on this machine.
     pub embedded: Option<super::resolve::Embedded>,
+    /// Where the file can be downloaded, when it is neither on this
+    /// machine nor in the log.
+    pub remote: Option<super::resolve::RemoteSource>,
 }
 
 /// Space's preview (#577): the lines around a result's location, drawn in
@@ -1483,9 +1486,13 @@ impl SarifView {
             .is_none()
             .then(|| super::resolve::embedded_contents(run, artifact))
             .flatten();
+        let remote = (path.is_none() && embedded.is_none())
+            .then(|| super::resolve::provenance_source(run, artifact))
+            .flatten();
         Some(SelectedPlace {
             entry,
             path,
+            remote,
             line: region.and_then(|r| r.start_line).unwrap_or(1).max(1) - 1,
             column: region.and_then(|r| r.start_column).unwrap_or(1).max(1) - 1,
             kind: super::region::column_kind(run),

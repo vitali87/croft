@@ -56,7 +56,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so the merge-base with the PR base resolves.
           fetch-depth: 0
@@ -118,6 +118,16 @@ jobs:
             echo "::error file=Cargo.toml::This PR changes shipped files but the version is still $old. Bump it (base: $old, head: $new) - two binaries must never share a version and differ only in commit hash."
             fail=1
           fi
+          # Versions count like an odometer, the same rule as code-graph-rag:
+          # MINOR and PATCH stay below 1000, and a bump that reaches 1000
+          # carries into the next component and resets the lower ones, so
+          # 0.1.999 is followed by 0.2.0 and never by 0.1.1000. A base already
+          # past the cap carries on its next bump the same way.
+          if ! python3 scripts/next_version.py --check "$new"; then
+            next="$(python3 scripts/next_version.py "$old" 2>/dev/null || true)"
+            echo "::error file=Cargo.toml::Version $new has a component at or above 1000. MINOR and PATCH stay below 1000 and carry into the next component, like an odometer; the next version after $old is ${next:-unknown} (python3 scripts/next_version.py $old)."
+            fail=1
+          fi
           # One notes file per version (#399): the check is that THIS version's
           # file exists and says something, not that a shared file was touched.
           # Two PRs adding different versions' notes then never collide.
@@ -171,7 +181,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so the merge-base with the PR base resolves.
           fetch-depth: 0
@@ -203,7 +213,7 @@ jobs:
     name: clippy + tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The suite's terminal tests drive /bin/zsh (the shim they exist to
       # cover) and the PDF tests rasterise through poppler's pdftoppm - the
       # same binaries croft needs at runtime on a Linux box. The runner
@@ -255,7 +265,7 @@ jobs:
       # installs exactly the pinned channel and its components.
       - name: Install the pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Formatting (pinned rustfmt, zero diffs)
         run: cargo fmt --check
       - name: Clippy (zero warnings)
@@ -292,7 +302,7 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show
       - name: Add the target to the PINNED toolchain
@@ -300,7 +310,7 @@ jobs:
         # Adding to the default toolchain instead is precisely the bug this
         # job exists to catch.
         run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
       - name: Install zig and cargo-zigbuild
@@ -336,12 +346,12 @@ jobs:
     name: Android build (aarch64-linux-android)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show
       - name: Add the Android target to the PINNED toolchain
         run: rustup target add aarch64-linux-android
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: aarch64-linux-android
       - name: Install cargo-ndk

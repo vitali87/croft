@@ -89,6 +89,14 @@ pub enum ListPurpose {
     /// Why a code scanning alert is dismissed: `id` is `<alert>:<reason>`,
     /// the reason an index into `DismissReason::ALL`.
     DismissAlert,
+    /// A result set of a CodeQL query run (#578): `id` is its CSV.
+    CodeqlResultSet,
+    /// What to model a Model Editor endpoint as (#578): `id` is
+    /// `<endpoint>:<choice>` or `<endpoint>:remove`.
+    CodeqlModel,
+    /// The databases checklist of "Run Query on Multiple Databases"
+    /// (#578): `id` is a database's index, or `run`.
+    CodeqlMultiDb,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.

@@ -95,6 +95,12 @@ pub enum InputPurpose {
     CodeqlAddVariantOwner,
     /// The CodeQL packs to download from the registry (#578).
     CodeqlDownloadPacks,
+    /// Where to copy the query results at `output` (#578).
+    CodeqlExportResults {
+        output: PathBuf,
+    },
+    /// CodeQL: Run Queries in Published Pack (#578): the pack reference.
+    CodeqlRunPublishedPack,
     /// A GitHub Code Search query whose repositories go into the variant
     /// analysis list called `list` (#578).
     CodeqlVariantCodeSearch {
@@ -118,6 +124,20 @@ pub enum InputPurpose {
     /// is a path; `uri` is the location the log named.
     SarifLocate {
         uri: String,
+    },
+    /// The kind of Model Editor model `choice` of endpoint `endpoint`
+    /// (#578): `remote`, `command-injection`, `taint`, …
+    CodeqlModelKind {
+        endpoint: usize,
+        choice: usize,
+    },
+    /// A missing SARIF file that can be downloaded from `host`, which is
+    /// not yet trusted (#577). An empty value trusts `host` and downloads;
+    /// a path locates the file instead, as [`InputPurpose::SarifLocate`].
+    SarifTrustHost {
+        uri: String,
+        host: String,
+        url: String,
     },
     /// Another SARIF log to merge into the open viewer (#577).
     SarifAddLog,

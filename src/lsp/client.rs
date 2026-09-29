@@ -370,9 +370,19 @@ pub struct LspClient {
     // `server` (its ServerSocket sender) is dropped, so the loop never polls
     // a closed event channel and panics with "Sender is alive" (lib.rs:553).
     mainloop_task: tokio::task::JoinHandle<()>,
+    /// Set when the main loop ends: the server exited, crashed or was
+    /// killed (the OOM killer picks language servers first, #694). The
+    /// manager restarts the servers of a client that reports it.
+    exited: Arc<AtomicBool>,
 }
 
 impl LspClient {
+    /// True once the server process is gone (exited, crashed or killed),
+    /// so nothing sent to this client will be answered.
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
+
     // Spawn wiring: each channel/flag is an independent router input;
     // bundling them into a struct would add indirection without clarity.
     #[allow(clippy::too_many_arguments)]
@@ -473,6 +483,8 @@ impl LspClient {
         let stdin = crate::lsp::trace::TraceWrite::new(stdin, name.clone());
 
         let mainloop_name = name.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_for_loop = exited.clone();
         let mainloop_task = tokio::spawn(async move {
             if let Err(e) = mainloop.run_buffered(stdout, stdin).await {
                 log_file::log(&format!("lsp[{mainloop_name}] mainloop exited: {e}"));
@@ -482,6 +494,9 @@ impl LspClient {
                     &format!("language server exited: {e}"),
                 );
             }
+            // Either way the server is gone: an EOF on its stdout ends the
+            // loop cleanly, a broken pipe ends it with an error.
+            exited_for_loop.store(true, Ordering::Release);
         });
 
         let params = serde_json::to_value(InitializeParams {
@@ -513,6 +528,7 @@ impl LspClient {
             name,
             child,
             mainloop_task,
+            exited,
         })
     }
 

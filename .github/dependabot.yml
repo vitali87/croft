@@ -1,0 +1,19 @@
+# Third-party actions are pinned to a commit SHA, not a tag: a tag can be moved
+# to point at different code, and the workflow would run it with this repo's
+# token and secrets. A pin never moves on its own, so this is what keeps the
+# pins current. Dependabot rewrites the SHA and the `# vX.Y.Z` comment beside
+# it together.
+#
+# Actions only. A Cargo update changes what ships, so it needs a version bump
+# and release notes (the release-hygiene job in ci.yml) that an automated PR
+# cannot write.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR a week for every action update rather than one per action.
+    groups:
+      actions:
+        patterns: ["*"]

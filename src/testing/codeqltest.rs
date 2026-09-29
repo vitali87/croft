@@ -177,6 +177,33 @@ pub fn select_args(id: &str) -> Vec<String> {
     vec![String::from("test"), String::from("run"), id_path(id)]
 }
 
+/// The test `path` belongs to (#578, accept output): the test itself when
+/// it is a `.ql` or `.qlref` with a `.expected`, or the test beside a
+/// `.expected` / `.actual` file.
+pub fn test_for_file(path: &Path) -> Option<PathBuf> {
+    let ext = path.extension()?.to_str()?;
+    if !matches!(ext, "ql" | "qlref" | "expected" | "actual") {
+        return None;
+    }
+    ["ql", "qlref"]
+        .iter()
+        .map(|e| path.with_extension(e))
+        .find(|t| t.is_file() && is_test(t))
+}
+
+/// The output a failed run of `test` left for accepting: `<stem>.actual`.
+pub fn actual_output(test: &Path) -> PathBuf {
+    test.with_extension("actual")
+}
+
+/// `codeql` arguments that make each test's last actual output its
+/// expected output.
+pub fn accept_args(tests: &[PathBuf]) -> Vec<String> {
+    let mut args = vec![String::from("test"), String::from("accept")];
+    args.extend(tests.iter().map(|t| t.display().to_string()));
+    args
+}
+
 /// One test's result: its id, pass or fail, the failing stage the CLI
 /// named (`RESULT`, `COMPILATION`, ...), and for a failure the diff or
 /// errors printed about it.
@@ -495,6 +522,34 @@ ERROR: could not resolve type Baz (/work/queries/B.ql:2,1-4)
 
     fn markers() -> Vec<String> {
         vec![String::from("qlpack.yml"), String::from("codeql-pack.yml")]
+    }
+
+    #[test]
+    fn a_tests_files_lead_back_to_the_test_for_accepting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "t/Find/Find.qlref", "Find.ql");
+        write(root, "t/Find/Find.expected", "");
+        write(root, "t/Find/Find.actual", "");
+        write(root, "t/Loose/Loose.ql", "select 1");
+        let find = root.join("t/Find/Find.qlref");
+        for f in ["Find.qlref", "Find.expected", "Find.actual"] {
+            assert_eq!(
+                test_for_file(&root.join("t/Find").join(f)),
+                Some(find.clone()),
+                "{f}"
+            );
+        }
+        assert_eq!(
+            test_for_file(&root.join("t/Loose/Loose.ql")),
+            None,
+            "no .expected"
+        );
+        assert_eq!(actual_output(&find), root.join("t/Find/Find.actual"));
+        assert_eq!(
+            accept_args(std::slice::from_ref(&find)),
+            ["test", "accept", find.to_str().unwrap()]
+        );
     }
 
     #[test]

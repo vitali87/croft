@@ -126,7 +126,17 @@ impl MemoryReport {
         let output_total: usize = self.channels.iter().map(|c| c.bytes).sum();
         let _ = writeln!(out, "  Total: {} (text only)", human(output_total));
 
-        let _ = writeln!(out, "\nLanguage servers ({})", self.servers.len());
+        // Only diagnostics are stored per server, so a running server that
+        // has published none has nothing here: say so rather than print a
+        // count that reads as "no servers running" (#694).
+        let count = match self.servers.len() {
+            1 => String::from("1 server"),
+            n => format!("{n} servers"),
+        };
+        let _ = writeln!(out, "\nLanguage server diagnostics ({count})");
+        if self.servers.is_empty() {
+            out.push_str("  none held\n");
+        }
         for s in &self.servers {
             let _ = writeln!(
                 out,
@@ -239,6 +249,26 @@ mod tests {
         let big = text.find("big.json").unwrap();
         let small = text.find("small.rs").unwrap();
         assert!(big < small, "{text}");
+    }
+
+    /// Only servers holding diagnostics are listed, so the heading says what
+    /// it counts, and an empty list does not read as "no server running".
+    #[test]
+    fn language_servers_are_counted_by_the_diagnostics_they_hold() {
+        let text = report().format();
+        assert!(
+            text.contains("Language server diagnostics (1 server)"),
+            "{text}"
+        );
+        let text = MemoryReport {
+            servers: Vec::new(),
+            ..report()
+        }
+        .format();
+        assert!(
+            text.contains("Language server diagnostics (0 servers)\n  none held\n"),
+            "{text}"
+        );
     }
 
     #[test]
