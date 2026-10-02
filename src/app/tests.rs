@@ -11879,7 +11879,7 @@ const RESTORED_COMMENT: &str = "# a comment that is longer than the disk line";
 fn spans_of_python_line_opened_from_disk(text: &str) -> Vec<(usize, usize, ratatui::style::Style)> {
     let tmp = tempfile::tempdir().unwrap();
     let app = app_with_open_file(tmp.path(), "ref.py", &format!("{text}\n"));
-    app.editor.highlights_for_test(0)
+    app.editor.line_spans_for_test(0)
 }
 
 /// #862 hot exit: a restored buffer is highlighted as the text it holds,
@@ -11911,7 +11911,7 @@ fn hot_exit_restored_text_is_highlighted_as_itself() {
         "setup: the comment is one span over the whole line: {want:?}"
     );
     assert_eq!(
-        next.editor.highlights_for_test(0),
+        next.editor.line_spans_for_test(0),
         want,
         "the whole restored comment carries the comment style"
     );
@@ -11944,7 +11944,7 @@ fn relaunch_restored_text_is_highlighted_as_itself() {
         .unwrap();
     assert_eq!(ed.lines[0], RESTORED_COMMENT, "setup: restored");
     assert_eq!(
-        ed.highlights_for_test(0),
+        ed.line_spans_for_test(0),
         spans_of_python_line_opened_from_disk(RESTORED_COMMENT)
     );
 }
@@ -11968,7 +11968,7 @@ fn restoring_leaves_untitled_text_plain_and_clean_tabs_alone() {
     let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
     next.editor.open_pinned(&clean).unwrap();
     let before = (
-        next.editor.highlights_for_test(0),
+        next.editor.line_spans_for_test(0),
         next.editor.lines.clone(),
         next.editor.edit_seq,
     );
@@ -11982,9 +11982,9 @@ fn restoring_leaves_untitled_text_plain_and_clean_tabs_alone() {
         .expect("the untitled buffer is back");
     assert_eq!(untitled.lines, vec![String::from(RESTORED_COMMENT)]);
     assert!(
-        untitled.highlights_for_test(0).is_empty(),
+        untitled.line_spans_for_test(0).is_empty(),
         "no language, no spans: {:?}",
-        untitled.highlights_for_test(0)
+        untitled.line_spans_for_test(0)
     );
     let kept = next
         .editor
@@ -11995,7 +11995,7 @@ fn restoring_leaves_untitled_text_plain_and_clean_tabs_alone() {
     assert!(!kept.dirty);
     assert_eq!(
         (
-            kept.highlights_for_test(0),
+            kept.line_spans_for_test(0),
             kept.lines.clone(),
             kept.edit_seq
         ),
@@ -55121,6 +55121,79 @@ fn minimap_rebakes_for_typing_at_most_every_few_hundred_ms() {
     assert_ne!(
         app.minimap_image_payload().map(|(o, _)| o.to_string()),
         before
+    );
+}
+
+/// #850: a syntax pass that outlives its keystroke lands through the tick,
+/// in the focused group and in a split's other group alike, with the colors
+/// a whole-buffer pass gives, and the minimap strip re-bakes in them.
+#[test]
+fn a_syntax_pass_that_outlives_the_keystroke_lands_on_a_later_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {\n    let x = 1;\n}\n");
+    app.split_editor();
+    let path = tmp.path().join("main.rs");
+    let type_into = |ed: &mut crate::widgets::editor::Editor| {
+        ed.defer_highlights_for_test();
+        ed.cursor_row = 1;
+        ed.cursor_col = 4;
+        ed.insert_str("let y = \"s\"; // (note)\n    ");
+        assert!(ed.highlight_pending(), "the keystroke did not wait");
+    };
+    type_into(&mut app.editor);
+    type_into(app.editor_layout.inactive_groups_mut()[0]);
+    app.cell_pixel = Some((8, 16));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    let strip = ratatui::layout::Rect {
+        x: 100,
+        y: 1,
+        width: 6,
+        height: 40,
+    };
+    app.update_minimap_overlay(strip);
+    let carried = app.minimap_image_payload().map(|(o, _)| o.to_string());
+    assert!(carried.is_some());
+
+    let pending = |app: &mut App| {
+        app.editor.highlight_pending() || app.editor_layout.inactive_groups()[0].highlight_pending()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut landed = false;
+    while pending(&mut app) {
+        landed |= app.poll_highlights();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the passes never landed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        landed,
+        "the tick reported the landing, so the frame repaints"
+    );
+    let want = |lines: &[String]| {
+        let fresh =
+            crate::widgets::editor::Editor::historical(&path, &lines.join("\n"), Vec::new());
+        format!("{:?}", fresh.highlights_for_test())
+    };
+    let inactive = &app.editor_layout.inactive_groups()[0];
+    assert_eq!(
+        format!("{:?}", inactive.highlights_for_test()),
+        want(&inactive.lines),
+        "the other group's tab"
+    );
+    assert_eq!(
+        format!("{:?}", app.editor.highlights_for_test()),
+        want(&app.editor.lines),
+        "the focused tab"
+    );
+
+    app.minimap_baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
+    app.update_minimap_overlay(strip);
+    assert_ne!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        carried,
+        "the strip re-bakes in the landed colors"
     );
 }
 
