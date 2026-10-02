@@ -323,7 +323,13 @@ fn run_mutation_with(root: &Path, args: &[&str], both_streams: bool) -> Result<S
         Ok(msg)
     } else {
         let msg = if both_streams && !stdout.is_empty() && !stderr.is_empty() {
-            format!("{stdout}\n{stderr}")
+            // Appended to stdout's own buffer rather than formatted into a
+            // new one, however long git's text is.
+            let mut both = stdout;
+            both.reserve(1 + stderr.len());
+            both.push('\n');
+            both.push_str(&stderr);
+            both
         } else if !stderr.is_empty() {
             stderr
         } else {
