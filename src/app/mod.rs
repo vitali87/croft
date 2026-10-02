@@ -4747,13 +4747,22 @@ struct MinimapBase {
     rgba: Vec<u8>,
     w: u32,
     h: u32,
-    /// (path, edit_seq, canvas_w_px, canvas_h_px, bg, lines drawn) — a
-    /// change rebakes. The lines drawn tell a symbol tab (#369) from its
-    /// file's tab.
+    /// (path, edit_seq, canvas_w_px, canvas_h_px, bg, lines drawn,
+    /// highlight generation) — a change rebakes. The lines drawn tell a
+    /// symbol tab (#369) from its file's tab; the highlight generation moves
+    /// when a syntax pass lands after its edit (#850).
     sig: MinimapSig,
 }
 
-type MinimapSig = (Option<PathBuf>, u64, u32, u32, (u8, u8, u8), (usize, usize));
+type MinimapSig = (
+    Option<PathBuf>,
+    u64,
+    u32,
+    u32,
+    (u8, u8, u8),
+    (usize, usize),
+    u64,
+);
 
 /// Re-emit key for the minimap overlay. Differs from the base sig: the
 /// viewport fields move on scroll (recomposite, no rebake), the cell fields
@@ -4768,6 +4777,9 @@ pub struct MinimapLayout {
     rows: usize,
     total: usize,
     edit_seq: u64,
+    /// The editor's `highlight_generation`: a background syntax pass that
+    /// lands after the edit (#850) recolors the strip.
+    highlight_generation: u64,
     side: MinimapSide,
     /// Theme editor bg; a change here (theme switch) forces a rebake.
     bg: (u8, u8, u8),
@@ -57998,6 +58010,7 @@ impl App {
             rows,
             total,
             edit_seq,
+            highlight_generation: self.editor.highlight_generation(),
             side: self.minimap_side,
             bg,
             selection,
@@ -58074,6 +58087,7 @@ impl App {
             canvas_h,
             bg,
             span,
+            self.editor.highlight_generation(),
         );
         if self.minimap_base.as_ref().map(|b| &b.sig) != Some(&sig) {
             let fg = if light {
@@ -58127,6 +58141,19 @@ impl App {
             );
             self.overlays.minimap.set(osc, desired);
         }
+    }
+
+    /// Swap in every tab's background syntax pass that finished since the
+    /// last tick (#850), in every editor group. True when any landed, so the
+    /// frame repaints in the new colors.
+    pub fn poll_highlights(&mut self) -> bool {
+        let groups =
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        let mut landed = false;
+        for ed in groups.flat_map(|g| g.editors.iter_mut()) {
+            landed |= ed.poll_highlights();
+        }
+        landed
     }
 
     /// True once a deferred minimap bake is due, so the loop redraws and
@@ -67221,6 +67248,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
+        let highlights_changed = app.poll_highlights();
         let live_run_changed =
             app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
@@ -67364,6 +67392,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || captures_changed
             || labels_changed
             || auto_save_changed
+            || highlights_changed
             || live_run_changed
             || code_lens_changed
             || ws_symbols_changed

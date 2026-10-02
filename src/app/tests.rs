@@ -53800,6 +53800,79 @@ fn minimap_rebakes_for_typing_at_most_every_few_hundred_ms() {
     );
 }
 
+/// #850: a syntax pass that outlives its keystroke lands through the tick,
+/// in the focused group and in a split's other group alike, with the colors
+/// a whole-buffer pass gives, and the minimap strip re-bakes in them.
+#[test]
+fn a_syntax_pass_that_outlives_the_keystroke_lands_on_a_later_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {\n    let x = 1;\n}\n");
+    app.split_editor();
+    let path = tmp.path().join("main.rs");
+    let type_into = |ed: &mut crate::widgets::editor::Editor| {
+        ed.defer_highlights_for_test();
+        ed.cursor_row = 1;
+        ed.cursor_col = 4;
+        ed.insert_str("let y = \"s\"; // (note)\n    ");
+        assert!(ed.highlight_pending(), "the keystroke did not wait");
+    };
+    type_into(&mut app.editor);
+    type_into(app.editor_layout.inactive_groups_mut()[0]);
+    app.cell_pixel = Some((8, 16));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    let strip = ratatui::layout::Rect {
+        x: 100,
+        y: 1,
+        width: 6,
+        height: 40,
+    };
+    app.update_minimap_overlay(strip);
+    let carried = app.minimap_image_payload().map(|(o, _)| o.to_string());
+    assert!(carried.is_some());
+
+    let pending = |app: &mut App| {
+        app.editor.highlight_pending() || app.editor_layout.inactive_groups()[0].highlight_pending()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut landed = false;
+    while pending(&mut app) {
+        landed |= app.poll_highlights();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the passes never landed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        landed,
+        "the tick reported the landing, so the frame repaints"
+    );
+    let want = |lines: &[String]| {
+        let fresh =
+            crate::widgets::editor::Editor::historical(&path, &lines.join("\n"), Vec::new());
+        format!("{:?}", fresh.highlights_for_test())
+    };
+    let inactive = &app.editor_layout.inactive_groups()[0];
+    assert_eq!(
+        format!("{:?}", inactive.highlights_for_test()),
+        want(&inactive.lines),
+        "the other group's tab"
+    );
+    assert_eq!(
+        format!("{:?}", app.editor.highlights_for_test()),
+        want(&app.editor.lines),
+        "the focused tab"
+    );
+
+    app.minimap_baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
+    app.update_minimap_overlay(strip);
+    assert_ne!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        carried,
+        "the strip re-bakes in the landed colors"
+    );
+}
+
 /// #682: only iTerm2 needs the idle icon keepalive.
 #[test]
 fn only_iterm2_keeps_the_activity_icons_alive() {

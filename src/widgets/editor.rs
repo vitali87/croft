@@ -2853,8 +2853,8 @@ pub struct Editor {
     /// per-line `(char column, colour index)` pairs for every `()[]{}` outside
     /// strings and comments, colour cycling by nesting depth
     /// (`UNEXPECTED_BRACKET` marks an unmatched closer). Rebuilt with the
-    /// syntax spans in `recompute_highlights` — one linear scan per edit,
-    /// never per frame. App-synced from prefs; on by default.
+    /// syntax spans by every syntax pass and carried through edits between
+    /// passes, never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
     bracket_colors: Vec<Vec<(usize, u8)>>,
     /// Inline color-literal decorations (the "no colour-swatch decorations"
@@ -2894,6 +2894,31 @@ pub struct Editor {
     /// its language default.
     wrap_override: Option<bool>,
     highlights: Vec<Vec<HiSpan>>,
+    /// The background syntax pass in flight, if any (#850). An edit never
+    /// waits on tree-sitter for a large file: `recompute_highlights` carries
+    /// the current spans through the edit and hands the text to a worker
+    /// thread, and `poll_highlights` swaps the result in when it lands. One
+    /// pass at a time: edits made while it runs are picked up by the pass
+    /// that follows it, so a burst of typing costs a pass or two, not one
+    /// per key.
+    highlight_job: Option<HighlightJob>,
+    /// Counts `recompute_highlights` calls, so a landing pass knows whether
+    /// the buffer was edited after it started.
+    highlight_requests: u64,
+    /// The text `highlights` and `bracket_colors` describe, line for line:
+    /// what an edit is diffed against to carry them over.
+    highlight_base: Vec<String>,
+    /// How long the last pass took. An edit waits for its pass only when the
+    /// last one fit the budget, so a small file still colors each keystroke
+    /// in the same frame and a large one never makes it wait.
+    highlight_cost: std::time::Duration,
+    /// How long an edit may wait for its pass before painting the carried
+    /// spans. `None` waits for it to finish: tests, which assert colors right
+    /// after an edit, and views built off the UI thread, which no tick polls.
+    highlight_budget: Option<std::time::Duration>,
+    /// Bumped whenever a pass lands, so a cache keyed on the text (the
+    /// minimap's baked strip) repaints in the new colors.
+    highlight_generation: u64,
     /// LSP semantic-token overlay decoded per line (byte offsets within
     /// the line), painted over `highlights` at render so a parameter (and
     /// other resolved symbols) keep their color everywhere they appear,
@@ -3200,6 +3225,12 @@ impl Editor {
             live_run: None,
             wrap_override: None,
             highlights: Vec::new(),
+            highlight_job: None,
+            highlight_requests: 0,
+            highlight_base: Vec::new(),
+            highlight_cost: std::time::Duration::ZERO,
+            highlight_budget: (!cfg!(test)).then_some(HIGHLIGHT_INLINE_BUDGET),
+            highlight_generation: 0,
             semantic_overlay: Vec::new(),
             semantic_data: Vec::new(),
             semantic_legend: None,
@@ -4085,7 +4116,9 @@ impl Editor {
             .extension()
             .and_then(|x| x.to_str())
             .and_then(lang_for_extension);
-        e.recompute_highlights();
+        // Built off the UI thread, and no tick polls a scrubber view: take
+        // the whole pass here rather than leaving it to land later.
+        e.recompute_highlights_within(None);
         e.set_git_head_lines(path.to_path_buf(), Some(baseline));
         // Never edited, so the marks are computed once, here.
         e.refresh_git_marks();
@@ -5980,6 +6013,8 @@ impl Editor {
     /// Called on a theme switch: cached spans carry baked colors, so without
     /// this the open file keeps the old theme's code colors until the next edit.
     pub fn rehighlight_for_theme(&mut self) {
+        // A pass already running bakes the old palette's colors.
+        self.highlight_job = None;
         self.recompute_highlights();
         // The markdown preview bakes the theme into its lines at build time
         // and rebuilds only when the buffer edits (`built_seq`), so a theme
@@ -6061,22 +6096,49 @@ impl Editor {
         }
     }
 
+    /// Bring syntax colors, bracket colors and the other per-line decorations
+    /// up to date after an edit (or a language or theme change). The syntax
+    /// pass runs on a worker thread (#850): the current spans are carried
+    /// through the edit at once, and the pass's own replace them when it
+    /// lands, within this call if it fits the budget, else on a later tick.
     fn recompute_highlights(&mut self) {
+        let wait = match self.highlight_budget {
+            Some(budget) if self.highlight_cost <= budget => Some(budget),
+            Some(_) => Some(std::time::Duration::ZERO),
+            None => None,
+        };
+        self.recompute_highlights_within(wait);
+    }
+
+    /// [`Self::recompute_highlights`], waiting at most `wait` for the syntax
+    /// pass (`None`: until it finishes).
+    fn recompute_highlights_within(&mut self, wait: Option<std::time::Duration>) {
+        self.highlight_requests = self.highlight_requests.wrapping_add(1);
         match self.lang {
             Some(kind) => {
-                let text = self.lines.join("\n");
-                let bytes = text.as_bytes();
-                let line_starts = compute_line_starts(bytes);
-                let (spans, protected) = crate::highlight::highlight_text_with_protected(
-                    &mut self.registry,
-                    kind,
-                    bytes,
-                    &line_starts,
+                carry_highlights(
+                    &mut self.highlight_base,
+                    &mut self.highlights,
+                    &mut self.bracket_colors,
+                    &self.lines,
                 );
-                self.highlights = spans;
-                self.bracket_colors = scan_bracket_colors(&self.lines, &protected);
+                // A pass for another language colors nothing this buffer shows.
+                if self
+                    .highlight_job
+                    .as_ref()
+                    .is_some_and(|job| job.kind != kind)
+                {
+                    self.highlight_job = None;
+                }
+                // One in flight already picks this edit up when it lands.
+                if self.highlight_job.is_none() {
+                    self.start_highlight_pass(kind);
+                }
+                self.await_highlight_pass(wait);
             }
             None => {
+                self.highlight_job = None;
+                self.highlight_base = Vec::new();
                 self.highlights = vec![Vec::new(); self.lines.len()];
                 // No grammar means no string/comment knowledge; brackets in
                 // plain text still colorize (VS Code does the same) — unless
@@ -6102,6 +6164,126 @@ impl Editor {
         self.recompute_semantic_overlay();
         self.recompute_diagnostic_spans();
         self.recompute_inlay_spans();
+    }
+
+    /// Hand the buffer's text to a worker thread for a syntax pass as `kind`.
+    fn start_highlight_pass(&mut self, kind: LangKind) {
+        let text = self.lines.join("\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name(String::from("croft-highlight"))
+            .spawn(move || {
+                // Nobody listening (the tab closed, or a newer pass replaced
+                // this one) is fine: the result is simply dropped.
+                let _ = tx.send(run_highlight_pass(kind, text));
+            });
+        let request = self.highlight_requests;
+        match spawned {
+            Ok(_) => self.highlight_job = Some(HighlightJob { kind, request, rx }),
+            // No thread to be had: highlight here, as before #850.
+            Err(_) => {
+                let pass = run_highlight_pass(kind, self.lines.join("\n"));
+                self.land_highlight_pass(pass, request);
+            }
+        }
+    }
+
+    /// Wait up to `wait` (`None`: however long it takes) for the pass in
+    /// flight, and for the one it starts if edits overtook it.
+    fn await_highlight_pass(&mut self, wait: Option<std::time::Duration>) {
+        use std::sync::mpsc::RecvTimeoutError;
+        // A zero budget leaves the pass to the tick, even one already done.
+        if wait == Some(std::time::Duration::ZERO) {
+            return;
+        }
+        let deadline = wait.map(|wait| std::time::Instant::now() + wait);
+        while let Some(job) = &self.highlight_job {
+            let request = job.request;
+            let received = match deadline {
+                None => job.rx.recv().ok(),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    match job.rx.recv_timeout(left) {
+                        Ok(pass) => Some(pass),
+                        Err(RecvTimeoutError::Timeout) => return,
+                        Err(RecvTimeoutError::Disconnected) => None,
+                    }
+                }
+            };
+            match received {
+                Some(pass) => {
+                    self.land_highlight_pass(pass, request);
+                }
+                // The worker died without a result; the next edit retries.
+                None => self.highlight_job = None,
+            }
+        }
+    }
+
+    /// Swap in the background syntax pass if it has finished (#850). The app
+    /// calls this every tick for every tab; true when the colors changed.
+    pub fn poll_highlights(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let Some(job) = &self.highlight_job else {
+            return false;
+        };
+        let request = job.request;
+        match job.rx.try_recv() {
+            Ok(pass) => self.land_highlight_pass(pass, request),
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.highlight_job = None;
+                false
+            }
+        }
+    }
+
+    /// Bumped each time a background syntax pass lands.
+    pub fn highlight_generation(&self) -> u64 {
+        self.highlight_generation
+    }
+
+    /// Take a finished pass's spans and bracket colors, carried through any
+    /// edits made while it ran, and start the next pass if there were any.
+    /// False when the buffer has left the pass's language since it started.
+    fn land_highlight_pass(&mut self, pass: HighlightPass, request: u64) -> bool {
+        self.highlight_job = None;
+        if self.lang != Some(pass.kind) {
+            return false;
+        }
+        self.highlight_cost = pass.cost;
+        self.highlights = pass.spans;
+        self.bracket_colors = pass.brackets;
+        self.highlight_base = pass.lines;
+        carry_highlights(
+            &mut self.highlight_base,
+            &mut self.highlights,
+            &mut self.bracket_colors,
+            &self.lines,
+        );
+        self.highlight_generation = self.highlight_generation.wrapping_add(1);
+        if request != self.highlight_requests {
+            self.start_highlight_pass(pass.kind);
+        }
+        true
+    }
+
+    /// Whether a background syntax pass is still out.
+    #[cfg(test)]
+    pub fn highlight_pending(&self) -> bool {
+        self.highlight_job.is_some()
+    }
+
+    /// Stop edits waiting for the syntax pass: each lands only through
+    /// `poll_highlights`, as it does on a file too large for the budget.
+    #[cfg(test)]
+    pub fn defer_highlights_for_test(&mut self) {
+        self.highlight_budget = Some(std::time::Duration::ZERO);
+    }
+
+    #[cfg(test)]
+    pub fn highlights_for_test(&self) -> &[Vec<HiSpan>] {
+        &self.highlights
     }
 
     /// Store a fresh semantic-token batch from the LSP and decode it into
@@ -11972,11 +12154,13 @@ fn identifier_tokens(line: &str) -> Vec<&str> {
 
 /// Colour-index marker for an unmatched closing bracket (painted red).
 const UNEXPECTED_BRACKET: u8 = u8::MAX;
+/// Per line, the `(char column, colour index)` of every colored bracket.
+type BracketColors = Vec<Vec<(usize, u8)>>;
 /// Plain-text buffers above this size skip bracket colorization: a
 /// no-grammar file has no tree-sitter pass absorbing a per-edit full scan,
 /// so typing in a large log must not pay O(total chars) per keystroke.
-/// Grammar-backed buffers are not gated here — re-highlighting already
-/// rescans the document per edit, which bounds what ever reaches this scan.
+/// Grammar-backed buffers are not gated here: their scan runs inside the
+/// syntax pass, on its worker thread (#850).
 const BRACKET_SCAN_MAX_BYTES: usize = 1_000_000;
 /// Nesting-depth colours cycle through this many entries (VS Code's default
 /// themes define three `editorBracketHighlight` foregrounds).
@@ -12030,6 +12214,282 @@ fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Ve
         abs += 1; // the '\n' separator between joined lines
     }
     out
+}
+
+/// How long an edit waits for its background syntax pass before painting
+/// with the spans carried through it (#850). Half a 60 Hz frame: a pass that
+/// fits colors the keystroke in the same frame, as before; a longer one
+/// lands on a later tick instead of holding the keystroke.
+const HIGHLIGHT_INLINE_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// A background syntax pass in flight (#850): the receiving end, and what it
+/// was started for.
+struct HighlightJob {
+    kind: LangKind,
+    /// `Editor::highlight_requests` when the pass started. A later request
+    /// (an edit) makes its result stale, so another pass follows it.
+    request: u64,
+    rx: std::sync::mpsc::Receiver<HighlightPass>,
+}
+
+/// What a background syntax pass computed, and for which text.
+struct HighlightPass {
+    kind: LangKind,
+    /// The text highlighted, line for line: the base the result is carried
+    /// from when edits landed while it ran.
+    lines: Vec<String>,
+    spans: Vec<Vec<HiSpan>>,
+    brackets: BracketColors,
+    cost: std::time::Duration,
+}
+
+/// Highlight `text` as `kind` and scan its brackets outside the strings and
+/// comments the grammar found: everything `recompute_highlights` used to do
+/// inline, now run on a worker thread (#850).
+fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
+    let started = std::time::Instant::now();
+    let line_starts = compute_line_starts(text.as_bytes());
+    let (spans, protected) = crate::highlight::highlight_text_with_protected(
+        &mut LangRegistry::new(),
+        kind,
+        text.as_bytes(),
+        &line_starts,
+    );
+    let lines: Vec<String> = text.split('\n').map(String::from).collect();
+    let brackets = scan_bracket_colors(&lines, &protected);
+    HighlightPass {
+        kind,
+        lines,
+        spans,
+        brackets,
+        cost: started.elapsed(),
+    }
+}
+
+/// How long [`carry_highlights`] may spend diffing the edited lines. An edit
+/// touches a line or a few, which diffs in microseconds; this caps the
+/// pathological case (a tab reused for a different file), where a coarser
+/// diff only means fewer lines keep their colors until the pass lands.
+const CARRY_DIFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Carry syntax spans and bracket colours computed for `base` over to
+/// `lines`, the same buffer after some edits (#850), and make `base` match
+/// `lines`. A line diff pairs old lines with new: an unchanged line keeps its
+/// colors, a changed one carries what the change left alone (see
+/// [`carry_changed_lines`]), and an inserted one has none until the next
+/// pass. Every offset stays inside its line and on a char boundary. False
+/// when `base` already matches `lines`.
+fn carry_highlights(
+    base: &mut Vec<String>,
+    spans: &mut Vec<Vec<HiSpan>>,
+    brackets: &mut BracketColors,
+    lines: &[String],
+) -> bool {
+    use similar::DiffOp;
+    if spans.len() != base.len() || brackets.len() != base.len() {
+        // Not computed for `base`, so there is nothing sound to carry.
+        *spans = vec![Vec::new(); lines.len()];
+        *brackets = vec![Vec::new(); lines.len()];
+        *base = lines.to_vec();
+        return true;
+    }
+    let prefix = base
+        .iter()
+        .zip(lines)
+        .take_while(|(old, new)| old == new)
+        .count();
+    if prefix == base.len() && prefix == lines.len() {
+        return false;
+    }
+    let room = base.len().min(lines.len()) - prefix;
+    let suffix = base
+        .iter()
+        .rev()
+        .zip(lines.iter().rev())
+        .take(room)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let (old_end, new_end) = (base.len() - suffix, lines.len() - suffix);
+    let (old, new) = (&base[prefix..old_end], &lines[prefix..new_end]);
+    let (old_spans, old_brackets) = (&spans[prefix..old_end], &brackets[prefix..old_end]);
+    let ops = similar::capture_diff_slices_deadline(
+        similar::Algorithm::Myers,
+        old,
+        new,
+        Some(std::time::Instant::now() + CARRY_DIFF_BUDGET),
+    );
+    let mut mid_spans = Vec::with_capacity(new.len());
+    let mut mid_brackets = Vec::with_capacity(new.len());
+    for op in ops {
+        match op {
+            DiffOp::Equal { old_index, len, .. } => {
+                let kept = old_index..old_index + len;
+                mid_spans.extend_from_slice(&old_spans[kept.clone()]);
+                mid_brackets.extend_from_slice(&old_brackets[kept]);
+            }
+            DiffOp::Delete { .. } => {}
+            DiffOp::Insert { new_len, .. } => {
+                mid_spans.extend(std::iter::repeat_n(Vec::new(), new_len));
+                mid_brackets.extend(std::iter::repeat_n(Vec::new(), new_len));
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                // As many lines as before: each was edited in place (several
+                // carets, an indent, a replace-all), so each carries its own.
+                let groups: Vec<(usize, usize, usize, usize)> = if old_len == new_len {
+                    (0..old_len)
+                        .map(|k| (old_index + k, 1, new_index + k, 1))
+                        .collect()
+                } else {
+                    vec![(old_index, old_len, new_index, new_len)]
+                };
+                for (oi, ol, ni, nl) in groups {
+                    let (s, b) = carry_changed_lines(
+                        &old[oi..oi + ol],
+                        &new[ni..ni + nl],
+                        &old_spans[oi..oi + ol],
+                        &old_brackets[oi..oi + ol],
+                    );
+                    mid_spans.extend(s);
+                    mid_brackets.extend(b);
+                }
+            }
+        }
+    }
+    debug_assert_eq!(mid_spans.len(), new.len());
+    spans.splice(prefix..old_end, mid_spans);
+    brackets.splice(prefix..old_end, mid_brackets);
+    base.splice(prefix..old_end, new.iter().cloned());
+    true
+}
+
+/// One changed stretch of [`carry_highlights`]: `old` became `new`, whole
+/// lines each. Both are joined and compared as text to find the one change
+/// between them. A span wholly before or after the change keeps its color
+/// (moved by the change's length); one the change falls strictly inside
+/// stretches over it, as does one that text is typed right after on the same
+/// line; one the change cuts keeps its surviving part; and the rest was
+/// replaced, so it goes. The new text is otherwise uncolored until the pass lands. Spans are
+/// then re-split at `new`'s line ends. A bracket keeps its colour wherever
+/// the change left it.
+fn carry_changed_lines(
+    old: &[String],
+    new: &[String],
+    spans: &[Vec<HiSpan>],
+    brackets: &[Vec<(usize, u8)>],
+) -> (Vec<Vec<HiSpan>>, BracketColors) {
+    let mut out_spans = vec![Vec::new(); new.len()];
+    let mut out_brackets = vec![Vec::new(); new.len()];
+    if new.is_empty() {
+        return (out_spans, out_brackets);
+    }
+    let old_text = old.join("\n");
+    let new_text = new.join("\n");
+    let (head, tail) = common_affixes(&old_text, &new_text);
+    let old_change_end = old_text.len() - tail;
+    let new_change_end = new_text.len() - tail;
+    let inserted_only = head == old_change_end;
+    // Text typed onto the end of a span, on its line, joins the span.
+    let grows = inserted_only && !new_text[head..new_change_end].contains('\n');
+    let shift = |at: usize| at - old_change_end + new_change_end;
+    let carry_span = |start: usize, end: usize| -> Option<(usize, usize)> {
+        if end < head || (end == head && !grows) {
+            Some((start, end))
+        } else if end == head {
+            // Typed right after it: the word, comment or string being
+            // written keeps its color while it grows.
+            Some((start, new_change_end))
+        } else if start >= old_change_end {
+            Some((shift(start), shift(end)))
+        } else if start < head && end > old_change_end {
+            Some((start, shift(end)))
+        } else if start < head {
+            Some((start, head))
+        } else if end > old_change_end {
+            Some((new_change_end, shift(end)))
+        } else {
+            None
+        }
+    };
+    let new_starts: Vec<usize> = new
+        .iter()
+        .scan(0usize, |next, line| {
+            let at = *next;
+            *next += line.len() + 1;
+            Some(at)
+        })
+        .collect();
+    let line_of = |at: usize| new_starts.partition_point(|&s| s <= at) - 1;
+    let mut old_start = 0usize;
+    for (i, line) in old.iter().enumerate() {
+        for span in &spans[i] {
+            let end = span.end.min(line.len());
+            if span.start >= end {
+                continue;
+            }
+            let Some((mut from, to)) = carry_span(old_start + span.start, old_start + end) else {
+                continue;
+            };
+            let mut li = line_of(from);
+            while from < to && li < new.len() {
+                let line_start = new_starts[li];
+                let piece_end = to.min(line_start + new[li].len());
+                if piece_end > from {
+                    out_spans[li].push(HiSpan {
+                        start: from - line_start,
+                        end: piece_end - line_start,
+                        style: span.style,
+                    });
+                }
+                li += 1;
+                if let Some(&next) = new_starts.get(li) {
+                    from = from.max(next);
+                }
+            }
+        }
+        // Columns ascend, so one pass over the line's chars finds them all.
+        let mut chars = line.char_indices().enumerate();
+        for &(col, depth) in &brackets[i] {
+            let Some((_, (byte, _))) = chars.find(|(c, _)| *c == col) else {
+                break;
+            };
+            let at = old_start + byte;
+            if at >= head && at < old_change_end {
+                continue;
+            }
+            let moved = if at < head { at } else { shift(at) };
+            let li = line_of(moved);
+            let in_line = moved - new_starts[li];
+            let col = new[li][..in_line].chars().count();
+            out_brackets[li].push((col, depth));
+        }
+        old_start += line.len() + 1;
+    }
+    (out_spans, out_brackets)
+}
+
+fn common_affixes(a: &str, b: &str) -> (usize, usize) {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let mut head = ab.iter().zip(bb).take_while(|(x, y)| x == y).count();
+    while !a.is_char_boundary(head) {
+        head -= 1;
+    }
+    let room = ab.len().min(bb.len()) - head;
+    let mut tail = ab
+        .iter()
+        .rev()
+        .zip(bb.iter().rev())
+        .take(room)
+        .take_while(|(x, y)| x == y)
+        .count();
+    while !a.is_char_boundary(a.len() - tail) {
+        tail -= 1;
+    }
+    (head, tail)
 }
 
 /// Perceived luminance (0..=255) of an sRGB triple, used to pick a legible
@@ -27969,6 +28429,329 @@ mod tests {
         let mut small = editor_with("f()");
         small.recompute_highlights();
         assert_eq!(small.bracket_colors[0], vec![(1, 0), (2, 0)]);
+    }
+
+    fn span_tuples(spans: &[Vec<HiSpan>]) -> Vec<Vec<(usize, usize, Style)>> {
+        spans
+            .iter()
+            .map(|line| line.iter().map(|s| (s.start, s.end, s.style)).collect())
+            .collect()
+    }
+
+    #[test]
+    fn carry_stretches_a_span_over_text_typed_inside_it_and_shifts_what_follows() {
+        let (kw, id, num) = (
+            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Green),
+            Style::default().fg(Color::Blue),
+        );
+        let span = |start, end, style| HiSpan { start, end, style };
+        let mut base = vec![String::from("let name = 1;"), String::from("f(x)")];
+        let mut spans = vec![
+            vec![span(0, 3, kw), span(4, 8, id), span(11, 12, num)],
+            Vec::new(),
+        ];
+        let mut brackets = vec![Vec::new(), vec![(1, 0), (3, 0)]];
+        let lines = vec![String::from("let naXme = 1;"), String::from("f(x)")];
+        assert!(carry_highlights(
+            &mut base,
+            &mut spans,
+            &mut brackets,
+            &lines
+        ));
+        assert_eq!(
+            span_tuples(&spans),
+            vec![vec![(0, 3, kw), (4, 9, id), (12, 13, num)], Vec::new()],
+            "the identifier covers the typed X; the number moves right"
+        );
+        assert_eq!(brackets[1], vec![(1, 0), (3, 0)], "an untouched line");
+        assert_eq!(base, lines, "the base follows the text");
+        assert!(
+            !carry_highlights(&mut base, &mut spans, &mut brackets, &lines),
+            "nothing left to carry"
+        );
+    }
+
+    #[test]
+    fn carry_lets_text_typed_onto_a_span_take_its_color() {
+        let (a, b) = (
+            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Green),
+        );
+        let span = |start, end, style| HiSpan { start, end, style };
+        for (typed, want) in [
+            // Onto the end of the first span: it grows (a word, or a line
+            // comment, being written).
+            ("abX cd", vec![(0, 3, a), (4, 6, b)]),
+            // Before the second, after a gap no span covers: nobody's.
+            ("ab Xcd", vec![(0, 2, a), (4, 6, b)]),
+        ] {
+            let mut base = vec![String::from("ab cd")];
+            let mut spans = vec![vec![span(0, 2, a), span(3, 5, b)]];
+            let mut brackets = vec![Vec::new()];
+            carry_highlights(&mut base, &mut spans, &mut brackets, &[String::from(typed)]);
+            assert_eq!(span_tuples(&spans), vec![want], "typed: {typed}");
+        }
+    }
+
+    #[test]
+    fn carry_never_paints_replacement_text_in_the_colors_it_replaced() {
+        // A tab reused for another file, or a line retyped wholesale: no
+        // color of the old text may land on unrelated new text.
+        let (comment, kw) = (
+            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::Blue),
+        );
+        let span = |start, end, style| HiSpan { start, end, style };
+        let mut base = vec![String::from("// a comment"), String::from("fn x() {}")];
+        let mut spans = vec![vec![span(0, 12, comment)], vec![span(0, 2, kw)]];
+        let mut brackets = vec![Vec::new(), vec![(4, 0), (5, 0), (7, 0), (8, 0)]];
+        let lines = vec![String::from("let y = 2;"), String::from("fn x() {}")];
+        carry_highlights(&mut base, &mut spans, &mut brackets, &lines);
+        assert!(spans[0].is_empty(), "{:?}", spans[0]);
+        assert_eq!(span_tuples(&spans)[1], vec![(0, 2, kw)]);
+        assert_eq!(brackets[1], vec![(4, 0), (5, 0), (7, 0), (8, 0)]);
+    }
+
+    #[test]
+    fn carry_keeps_the_lines_between_two_edits() {
+        // Two carets far apart: every line between them keeps its colors,
+        // and so does each edited line's untouched text.
+        let style = Style::default().fg(Color::Blue);
+        let span = |start, end| HiSpan { start, end, style };
+        let mut base: Vec<String> = (0..6).map(|i| format!("word{i} tail")).collect();
+        let mut spans: Vec<Vec<HiSpan>> = (0..6).map(|_| vec![span(6, 10)]).collect();
+        let mut brackets = vec![Vec::new(); 6];
+        let mut lines = base.clone();
+        lines[0].insert(0, 'X');
+        lines[5].insert(0, 'X');
+        carry_highlights(&mut base, &mut spans, &mut brackets, &lines);
+        let want: Vec<Vec<(usize, usize, Style)>> = (0..6)
+            .map(|i| {
+                let at = if i == 0 || i == 5 { 7 } else { 6 };
+                vec![(at, at + 4, style)]
+            })
+            .collect();
+        assert_eq!(span_tuples(&spans), want);
+    }
+
+    #[test]
+    fn carry_splits_a_span_at_a_new_line_break() {
+        let (s, z) = (
+            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Green),
+        );
+        let span = |start, end, style| HiSpan { start, end, style };
+        let mut base = vec![
+            String::from("a"),
+            String::from("\"hello\""),
+            String::from("z"),
+        ];
+        let mut spans = vec![Vec::new(), vec![span(0, 7, s)], vec![span(0, 1, z)]];
+        let mut brackets = vec![Vec::new(); 3];
+        let lines = vec![
+            String::from("a"),
+            String::from("\"hel"),
+            String::from("lo\""),
+            String::from("z"),
+        ];
+        carry_highlights(&mut base, &mut spans, &mut brackets, &lines);
+        assert_eq!(
+            span_tuples(&spans),
+            vec![
+                Vec::new(),
+                vec![(0, 4, s)],
+                vec![(0, 3, s)],
+                vec![(0, 1, z)]
+            ],
+            "the string's color follows both halves; the line below moved down"
+        );
+        assert_eq!(brackets.len(), lines.len());
+    }
+
+    #[test]
+    fn carry_moves_brackets_with_their_text_and_drops_deleted_ones() {
+        let carried = |before: &str, brackets: Vec<(usize, u8)>, after: &str| {
+            let mut base = vec![String::from(before)];
+            let mut spans = vec![Vec::new()];
+            let mut brackets = vec![brackets];
+            carry_highlights(&mut base, &mut spans, &mut brackets, &[String::from(after)]);
+            brackets.remove(0)
+        };
+        let nested = vec![(1, 0), (5, 1), (7, 1), (8, 0)];
+        assert_eq!(
+            carried("f(a, [b])", nested.clone(), "f([b])"),
+            vec![(1, 0), (2, 1), (4, 1), (5, 0)],
+            "deleting `a, ` pulls the rest left"
+        );
+        assert_eq!(
+            carried("f(a, [b])", nested, "f(a, b])"),
+            vec![(1, 0), (6, 1), (7, 0)],
+            "a deleted bracket takes its color with it"
+        );
+        assert_eq!(
+            carried("é(x)", vec![(1, 0), (3, 0)], "→é(x)"),
+            vec![(2, 0), (4, 0)],
+            "columns count chars, not bytes"
+        );
+    }
+
+    #[test]
+    fn carry_starts_clean_when_the_spans_do_not_describe_the_base() {
+        // A non-text view resets `highlights` to one empty line without
+        // touching the base; carrying from that must not misplace anything.
+        let mut base = vec![String::from("a"), String::from("b")];
+        let mut spans = vec![Vec::new()];
+        let mut brackets = Vec::new();
+        let lines = vec![String::from("x()")];
+        assert!(carry_highlights(
+            &mut base,
+            &mut spans,
+            &mut brackets,
+            &lines
+        ));
+        assert_eq!((spans.len(), brackets.len()), (1, 1));
+        assert!(spans[0].is_empty() && brackets[0].is_empty());
+        assert_eq!(base, lines);
+    }
+
+    #[test]
+    fn edits_made_while_a_pass_runs_ride_one_follow_up_pass() {
+        let mut e = editor_with("fn main() {\n    let value = compute(1, \"two\");\n}");
+        e.set_language(Some(LangKind::Rust));
+        let settled = e.highlight_generation();
+        e.defer_highlights_for_test();
+        e.cursor_row = 1;
+        e.cursor_col = 10;
+        for c in "xyz".chars() {
+            e.insert_char(c);
+        }
+        assert_eq!(e.lines[1], "    let vaxyzlue = compute(1, \"two\");");
+        assert!(e.highlight_pending(), "the keystrokes did not wait");
+        assert_eq!(
+            e.highlight_generation(),
+            settled,
+            "no pass landed during the keystrokes"
+        );
+        let covering = |at: usize| {
+            e.highlights[1]
+                .iter()
+                .find(|s| s.start <= at && at < s.end)
+                .map(|s| (s.start, s.end))
+        };
+        assert_eq!(
+            covering(8),
+            covering(12),
+            "the identifier's span stretched over the typed text"
+        );
+        // The pass the first key started saw one key; the two after it ride
+        // a single follow-up, not one pass each.
+        e.await_highlight_pass(None);
+        assert_eq!(e.highlight_generation(), settled + 2);
+        assert!(!e.highlight_pending());
+        let mut fresh = editor_with(&e.lines.join("\n"));
+        fresh.set_language(Some(LangKind::Rust));
+        assert_eq!(span_tuples(&e.highlights), span_tuples(&fresh.highlights));
+        assert_eq!(e.bracket_colors, fresh.bracket_colors);
+    }
+
+    #[test]
+    fn a_pass_for_a_language_the_buffer_left_is_dropped() {
+        let mut e = editor_with("fn a() {}");
+        e.set_language(Some(LangKind::Rust));
+        e.defer_highlights_for_test();
+        e.insert_char('x');
+        assert!(e.highlight_pending());
+        // What the non-text viewers do (`open_image` and the like).
+        e.lang = None;
+        e.highlights = vec![Vec::new()];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while e.highlight_pending() {
+            assert!(!e.poll_highlights(), "a Rust pass never lands on it");
+            assert!(std::time::Instant::now() < deadline, "the pass never ended");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(e.highlights[0].is_empty());
+    }
+
+    /// Every carried span sits inside its line on char boundaries, and every
+    /// carried bracket color still sits on a bracket.
+    fn assert_highlights_sound(e: &Editor, after: &str) {
+        assert_eq!(e.highlights.len(), e.lines.len(), "{after}");
+        assert_eq!(e.bracket_colors.len(), e.lines.len(), "{after}");
+        for (i, line) in e.lines.iter().enumerate() {
+            for s in &e.highlights[i] {
+                assert!(
+                    s.start < s.end
+                        && s.end <= line.len()
+                        && line.is_char_boundary(s.start)
+                        && line.is_char_boundary(s.end),
+                    "{after}: span {}..{} on line {i} {line:?}",
+                    s.start,
+                    s.end
+                );
+            }
+            let chars: Vec<char> = line.chars().collect();
+            for &(col, _) in &e.bracket_colors[i] {
+                assert!(
+                    matches!(chars.get(col), Some('(' | ')' | '[' | ']' | '{' | '}')),
+                    "{after}: bracket color at {col} on line {i} {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn random_edits_keep_carried_colors_sound_and_settle_on_a_fresh_pass() {
+        let docs = [
+            (
+                LangKind::Rust,
+                "// head (note)\nfn main() {\n    let s = \"a (b) é\";\n    if x[0] { call(1, [2, 3]); }\n}\n/* block\n   { comment */\nstruct P { x: i32 }",
+            ),
+            (
+                LangKind::Markdown,
+                "# Title (one)\n\nSome *em* and `code (x)` → [link](http://x).\n\n```rust\nfn f() { g(1) }\n```\n\n- item **bold** [2]",
+            ),
+        ];
+        let pool: Vec<char> = "a(]{}\"/*é→ `#\n".chars().collect();
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |n: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % n
+        };
+        for (kind, text) in docs {
+            let mut e = editor_with(text);
+            e.set_language(Some(kind));
+            e.defer_highlights_for_test();
+            for step in 0..300 {
+                e.cursor_row = next(e.lines.len());
+                e.cursor_col = next(e.lines[e.cursor_row].chars().count() + 1);
+                match next(6) {
+                    0..=2 => e.insert_char(pool[next(pool.len())]),
+                    3 => e.backspace(),
+                    4 => e.delete_forward(),
+                    _ => e.insert_newline(),
+                }
+                let after = format!("{kind:?} step {step}");
+                assert_highlights_sound(&e, &after);
+                if next(5) == 0 {
+                    e.poll_highlights();
+                    assert_highlights_sound(&e, &after);
+                }
+            }
+            e.await_highlight_pass(None);
+            let mut fresh = editor_with(&e.lines.join("\n"));
+            fresh.lines = e.lines.clone();
+            fresh.set_language(Some(kind));
+            assert_eq!(
+                span_tuples(&e.highlights),
+                span_tuples(&fresh.highlights),
+                "{kind:?}: settled colors are a whole-buffer pass's"
+            );
+            assert_eq!(e.bracket_colors, fresh.bracket_colors, "{kind:?}");
+        }
     }
 
     #[test]
