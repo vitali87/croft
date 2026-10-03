@@ -1675,7 +1675,9 @@ fn parse_diff_git_new_path(text: &str) -> Option<String> {
         && (p.len() - 3) % 2 == 0
     {
         let n = (p.len() - 3) / 2;
-        if p.is_char_boundary(n) && &p[n..n + 3] == " b/" && p[..n] == p[n + 3..] {
+        // `get` rather than indexing: either end of the window can fall
+        // inside a multi-byte character of a renamed path (#1166).
+        if p.get(n..n + 3) == Some(" b/") && p[..n] == p[n + 3..] {
             return Some(p[n + 3..].to_string());
         }
     }
@@ -2912,6 +2914,30 @@ mod tests {
             parse_diff_git_new_path("diff --git a/old.rs b/new.rs").as_deref(),
             Some("new.rs")
         );
+    }
+
+    #[test]
+    fn a_rename_whose_old_path_splits_a_character_at_the_midpoint_reads_the_new_path() {
+        // #1166: the midpoint window ends inside the emoji, so slicing it
+        // panicked and took the editor down.
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/aaaaa\u{1F600} b/x").as_deref(),
+            Some("x")
+        );
+        // Accented letters, two bytes each, straddling the window's end.
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/a\u{e9}\u{e9}\u{e9}\u{e9} b/x").as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn a_header_with_no_b_side_still_yields_no_path() {
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/\u{1F600}\u{1F600}"),
+            None
+        );
+        assert_eq!(parse_diff_git_new_path("index 0000000..1111111"), None);
     }
 
     #[test]
