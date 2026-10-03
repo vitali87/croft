@@ -10698,19 +10698,986 @@ fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
 }
 
 #[test]
-fn cmd_k_leader_is_super_only_off_termux_so_ctrl_k_stays_kill_to_eol() {
-    // The Cmd+K chord leader must arm on SUPER (macOS / forwarded), but NOT on
-    // a bare Ctrl+K off Termux — Ctrl+K is the editor's kill-to-end-of-line and
-    // must not be shadowed by the leader. (On Termux, Ctrl is the documented
-    // cmd surrogate, so the leader does claim Ctrl+K there.)
-    assert!(is_cmd_k_leader_key(key(
-        KeyCode::Char('k'),
-        KeyModifiers::SUPER
-    )));
+fn ctrl_k_leads_off_macos_except_in_the_shell_or_the_vim_editor() {
+    // Super reaches croft only over the kitty keyboard protocol, so off macOS
+    // Ctrl+K arms the leader too, as in VS Code's Linux keymap (#843). The
+    // shell keeps it for readline's kill-line and vim mode for the editor's.
+    assert!(ctrl_k_leads(false, false, false));
     assert!(
-        !is_cmd_k_leader_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL)),
-        "bare Ctrl+K off Termux must fall through to kill-to-end-of-line, not arm the leader"
+        !ctrl_k_leads(false, true, false),
+        "a focused shell keeps Ctrl+K"
     );
+    assert!(
+        !ctrl_k_leads(false, false, true),
+        "the vim editor keeps kill-line"
+    );
+    assert!(
+        !ctrl_k_leads(true, false, false),
+        "macOS: Ctrl+K kills, Cmd leads"
+    );
+    let ctrl_k = key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+    assert!(is_cmd_k_leader_key(ctrl_k, true));
+    // Off Termux (the test process), a Ctrl+K that does not lead falls
+    // through to the editor's kill-to-end-of-line.
+    assert!(!is_cmd_k_leader_key(ctrl_k, false));
+    for ctrl_leads in [false, true] {
+        let super_k = key(KeyCode::Char('k'), KeyModifiers::SUPER);
+        assert!(
+            is_cmd_k_leader_key(super_k, ctrl_leads),
+            "Cmd+K always leads"
+        );
+        let ctrl_shift_k = key(
+            KeyCode::Char('K'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(
+            !is_cmd_k_leader_key(ctrl_shift_k, ctrl_leads),
+            "Ctrl+Shift+K stays Delete Line"
+        );
+    }
+}
+
+/// #843: on desktop Linux `Ctrl+K` `B` opens Testing and leaves the buffer
+/// alone, while a focused shell and the vim-mode editor keep `Ctrl+K`, and
+/// the palette still kills to the end of the line.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "keep this line").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    let ctrl = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL);
+    let at_col_5 = |app: &mut App| {
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("keep this line")];
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 5;
+    };
+
+    at_col_5(&mut app);
+    app.handle_key(ctrl('k')).unwrap();
+    assert!(app.cmd_k_leader.is_some(), "Ctrl+K arms the leader");
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.sidebar_view, SidebarView::Testing, "Ctrl+K B: Testing");
+    assert_eq!(
+        app.editor.lines,
+        ["keep this line"],
+        "nothing killed or typed"
+    );
+
+    // Ctrl held on the second key counts as Cmd: VS Code's Linux Ctrl+K
+    // Ctrl+S opens the Keyboard Shortcuts editor.
+    at_col_5(&mut app);
+    app.handle_key(ctrl('k')).unwrap();
+    app.handle_key(ctrl('s')).unwrap();
+    assert!(
+        app.list_picker
+            .as_ref()
+            .is_some_and(|p| p.purpose == ListPurpose::KeyboardShortcuts)
+    );
+    app.list_picker = None;
+
+    // The palette still kills to the end of the line.
+    at_col_5(&mut app);
+    app.run_command(Command::KillToEndOfLine);
+    assert_eq!(app.editor.lines, ["keep "]);
+
+    // Vim mode keeps Ctrl+K as the editor's kill-line.
+    at_col_5(&mut app);
+    app.vim.enabled = true;
+    app.handle_key(ctrl('k')).unwrap();
+    assert!(app.cmd_k_leader.is_none(), "vim mode: Ctrl+K does not lead");
+    assert_eq!(app.editor.lines, ["keep "], "vim mode: Ctrl+K kills");
+    app.vim.enabled = false;
+
+    // A focused shell gets Ctrl+K for itself.
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.focus_pane(Pane::Terminal);
+    app.handle_key(ctrl('k')).unwrap();
+    assert!(
+        app.cmd_k_leader.is_none(),
+        "the shell's Ctrl+K is not captured"
+    );
+}
+
+/// #843: LINUX.md promises that off macOS a `Cmd` chord "works as the same
+/// chord with `Ctrl`", except the chords its table lists. This walks every
+/// `is_*_key` predicate over every `Cmd` chord it takes and checks the `Ctrl`
+/// spelling: taken too, unless the table lists the chord, in which case it
+/// must really not be `Ctrl` (the negative half). The table is read from
+/// LINUX.md itself, so a new Super-only chord fails here until it gets a
+/// `Ctrl` form or a row, and a row fails once its chord gains a `Ctrl` form.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
+    use std::collections::BTreeSet;
+    type Pred = fn(KeyEvent) -> bool;
+    macro_rules! preds {
+        ($($p:ident),* $(,)?) => { vec![$((stringify!($p), $p as Pred)),*] };
+    }
+    // The leader asked from the editor and from a focused shell.
+    fn leader_in_editor(key: KeyEvent) -> bool {
+        is_cmd_k_leader_key(key, ctrl_k_leads(false, false, false))
+    }
+    fn leader_in_shell(key: KeyEvent) -> bool {
+        is_cmd_k_leader_key(key, ctrl_k_leads(false, true, false))
+    }
+    let mut predicates: Vec<(&str, Pred)> = preds![
+        is_terminal_copy_key,
+        is_compare_key,
+        is_search_jump_key,
+        is_editor_find_key,
+        is_terminal_find_key,
+        is_editor_replace_key,
+        is_file_finder_key,
+        is_command_palette_key,
+        is_go_to_symbol_key,
+        is_toggle_line_comment_key,
+        is_toggle_block_comment_key,
+        is_toggle_wrap_key,
+        is_tree_zoxide_jump_key,
+        is_tree_new_file_key,
+        is_tree_new_folder_key,
+        is_tree_rename_key,
+        is_reveal_in_finder_key,
+        is_copy_path_key,
+        is_tree_make_root_key,
+        is_tree_make_parent_root_key,
+        is_explorer_jump_key,
+        is_source_control_jump_key,
+        is_run_debug_jump_key,
+        is_remote_jump_key,
+        is_extensions_jump_key,
+        is_drop_to_local_key,
+        is_run_build_task_key,
+        is_markdown_preview_key,
+        is_run_fence_key,
+        is_sidebar_toggle_key,
+        is_secondary_sidebar_toggle_key,
+        is_minimap_toggle_key,
+        is_terminal_toggle_key,
+        is_terminal_maximize_key,
+        is_quick_select_key,
+        is_copy_mode_key,
+        is_command_history_key,
+        is_terminal_split_key,
+        is_editor_split_key,
+        is_goto_bracket_key,
+        is_select_to_bracket_key,
+        is_navigate_back_key,
+        is_navigate_forward_key,
+        is_transpose_key,
+        is_indentation_to_spaces_key,
+        is_indentation_to_tabs_key,
+        is_trim_final_newlines_key,
+        is_toggle_bookmark_key,
+        is_switch_debug_session_key,
+        is_clear_bookmarks_key,
+        is_next_bookmark_key,
+        is_prev_bookmark_key,
+        is_join_lines_key,
+        is_transform_upper_key,
+        is_transform_lower_key,
+        is_copy_relative_path_key,
+        is_sort_lines_asc_key,
+        is_sort_lines_desc_key,
+        is_trim_trailing_whitespace_key,
+        is_increment_number_key,
+        is_decrement_number_key,
+        is_format_document_key,
+        is_emmet_expand_key,
+        is_quick_fix_key,
+        is_focus_group_left_key,
+        is_focus_group_right_key,
+        is_terminal_focus_key,
+        is_terminal_close_key,
+        is_terminal_cycle_key,
+        is_terminal_cycle_back_key,
+        is_delete_node_key,
+        is_completion_trigger_key,
+        is_save_key,
+        is_editor_copy_key,
+        is_editor_cut_key,
+        is_search_paste_key,
+        is_editor_paste_key,
+        is_clipboard_paste_key,
+        is_editor_select_all_key,
+        is_editor_undo_key,
+        is_editor_redo_key,
+        is_rename_symbol_key,
+        is_change_all_occurrences_key,
+        is_select_next_occurrence_key,
+        is_delete_line_key,
+        is_go_to_definition_key,
+        is_peek_definition_key,
+        is_go_to_references_key,
+        is_run_to_cursor_key,
+        is_peek_references_key,
+        is_go_to_declaration_key,
+        is_go_to_type_definition_key,
+        is_go_to_implementation_key,
+        is_vim_toggle_key,
+        is_editor_line_home_key,
+        is_editor_line_end_key,
+        is_editor_kill_to_eol_key,
+        is_editor_kill_to_bol_key,
+        is_editor_open_line_below_key,
+        is_editor_open_line_above_key,
+        is_close_tab_key,
+    ];
+    predicates.push(("is_cmd_k_leader_key", leader_in_editor));
+    predicates.push(("is_cmd_k_leader_key@shell", leader_in_shell));
+
+    // Every predicate the key router defines is walked (the scan F1's own
+    // coverage test uses), so a new one cannot slip past unexamined.
+    const APP_SRC: &str = include_str!("mod.rs");
+    let defined: BTreeSet<&str> = APP_SRC
+        .match_indices("\nfn is_")
+        .filter_map(|(i, _)| {
+            let rest = &APP_SRC[i + 4..];
+            let name = &rest[..rest.find('(')?];
+            name.ends_with("_key").then_some(name)
+        })
+        .collect();
+    let walked: BTreeSet<&str> = predicates
+        .iter()
+        .map(|(n, _)| n.split('@').next().unwrap())
+        .collect();
+    assert_eq!(defined, walked, "walk every is_*_key predicate");
+
+    // How a LINUX.md row's chord lacks a `Ctrl` form.
+    #[derive(Clone, Copy)]
+    enum NoCtrl {
+        /// The predicate refuses the `Ctrl` spelling.
+        Refused,
+        /// The predicate would take it, but this one takes it first there.
+        TakenBy(&'static str, Pred),
+        /// croft takes `Ctrl`, but a legacy terminal sends the bare key.
+        LegacySendsBareKey,
+    }
+    struct Row {
+        /// The row's first cell in LINUX.md's table.
+        doc: &'static str,
+        pred: &'static str,
+        /// The chord's key, and its modifiers besides `Cmd` (every
+        /// combination the predicate takes when empty).
+        code: &'static [KeyCode],
+        mods: &'static [KeyModifiers],
+        how: NoCtrl,
+    }
+    let any: &[KeyModifiers] = &[];
+    let rows = [
+        Row {
+            doc: "`Cmd`+`\\` split editor",
+            pred: "is_editor_split_key",
+            code: &[KeyCode::Char('\\')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Shift`+`\\` / `Cmd`+`Opt`+`\\` go to / select to bracket",
+            pred: "is_goto_bracket_key",
+            code: &[KeyCode::Char('\\')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Shift`+`\\` / `Cmd`+`Opt`+`\\` go to / select to bracket",
+            pred: "is_select_to_bracket_key",
+            code: &[KeyCode::Char('\\')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Opt`+`←` / `→` focus the left / right editor group",
+            pred: "is_focus_group_left_key",
+            code: &[KeyCode::Left],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Opt`+`←` / `→` focus the left / right editor group",
+            pred: "is_focus_group_right_key",
+            code: &[KeyCode::Right],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`]` / `Cmd`+`[` next / previous terminal",
+            pred: "is_terminal_cycle_key",
+            code: &[KeyCode::Char(']'), KeyCode::Char('}')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`]` / `Cmd`+`[` next / previous terminal",
+            pred: "is_terminal_cycle_back_key",
+            code: &[KeyCode::Char('['), KeyCode::Char('{')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`T` split terminal",
+            pred: "is_terminal_split_key",
+            code: &[KeyCode::Char('t')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd+K` chords typed in the terminal pane",
+            pred: "is_cmd_k_leader_key@shell",
+            code: &[KeyCode::Char('k')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`E` toggle vim mode",
+            pred: "is_vim_toggle_key",
+            code: &[KeyCode::Char('e')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`A` select all, in the editor",
+            pred: "is_editor_select_all_key",
+            code: &[KeyCode::Char('a')],
+            mods: &[KeyModifiers::NONE, KeyModifiers::SHIFT],
+            how: NoCtrl::TakenBy("is_editor_line_home_key", is_editor_line_home_key),
+        },
+        Row {
+            doc: "`Cmd`+`Shift`+`T` focus the terminal",
+            pred: "is_terminal_focus_key",
+            code: &[KeyCode::Char('t')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`C` / `Cmd`+`W` copy the selection / close the active terminal, in the terminal pane",
+            pred: "is_terminal_copy_key",
+            code: &[KeyCode::Char('c')],
+            mods: &[KeyModifiers::NONE, KeyModifiers::ALT],
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`C` / `Cmd`+`W` copy the selection / close the active terminal, in the terminal pane",
+            pred: "is_terminal_close_key",
+            code: &[KeyCode::Char('w')],
+            mods: &[KeyModifiers::NONE, KeyModifiers::ALT],
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`F12` go to implementations",
+            pred: "is_go_to_implementation_key",
+            code: &[KeyCode::F(12)],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Z` jump to a directory with zoxide, in the Explorer",
+            pred: "is_tree_zoxide_jump_key",
+            code: &[KeyCode::Char('z')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Enter` run the Markdown code block under the caret",
+            pred: "is_run_fence_key",
+            code: &[KeyCode::Enter],
+            mods: any,
+            how: NoCtrl::LegacySendsBareKey,
+        },
+    ];
+
+    // Every key a chord is spelled with, and every modifier set besides Cmd.
+    let mut codes: Vec<KeyCode> = ('a'..='z')
+        .chain('A'..='Z')
+        .chain('0'..='9')
+        .chain("`-=[]\\;',./~!@#$%^&*()_+{}|:\"<>?".chars())
+        .map(KeyCode::Char)
+        .collect();
+    codes.extend([
+        KeyCode::Enter,
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Backspace,
+        KeyCode::Delete,
+        KeyCode::Esc,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Home,
+        KeyCode::End,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Insert,
+    ]);
+    codes.extend((1..=12).map(KeyCode::F));
+    let extras = [
+        KeyModifiers::NONE,
+        KeyModifiers::SHIFT,
+        KeyModifiers::ALT,
+        KeyModifiers::SHIFT | KeyModifiers::ALT,
+    ];
+    let same_key = |a: KeyCode, b: KeyCode| match (a, b) {
+        (KeyCode::Char(a), KeyCode::Char(b)) => a.eq_ignore_ascii_case(&b),
+        _ => a == b,
+    };
+    let row_for = |pred: &str, code: KeyCode, extra: KeyModifiers| {
+        rows.iter().find(|r| {
+            r.pred == pred
+                && r.code.iter().any(|c| same_key(*c, code))
+                && (r.mods.is_empty() || r.mods.contains(&extra))
+        })
+    };
+    let spell = |k: KeyEvent| format!("{:?}+{:?}", k.modifiers, k.code);
+
+    let mut broken = Vec::new();
+    let mut listed_seen = BTreeSet::new();
+    for (name, pred) in &predicates {
+        for &code in &codes {
+            for extra in extras {
+                let cmd = key(code, KeyModifiers::SUPER | extra);
+                if !pred(cmd) {
+                    continue;
+                }
+                let ctrl = key(code, KeyModifiers::CONTROL | extra);
+                let Some(row) = row_for(name, code, extra) else {
+                    if !pred(ctrl) {
+                        broken.push(format!(
+                            "{name}: takes {} but not {} (give it a Ctrl form, or a LINUX.md row)",
+                            spell(cmd),
+                            spell(ctrl)
+                        ));
+                    }
+                    continue;
+                };
+                listed_seen.insert((row.doc, row.pred));
+                // The negative half: a listed chord really has no Ctrl form.
+                let holds = match row.how {
+                    NoCtrl::Refused => !pred(ctrl),
+                    NoCtrl::TakenBy(_, first) => first(ctrl),
+                    NoCtrl::LegacySendsBareKey => pred(ctrl) && !pred(key(code, extra)),
+                };
+                if !holds {
+                    broken.push(format!(
+                        "{name}: LINUX.md lists {:?} without a Ctrl form, but {} {}",
+                        row.doc,
+                        spell(ctrl),
+                        match row.how {
+                            NoCtrl::Refused => String::from("matches"),
+                            NoCtrl::TakenBy(owner, _) => format!("is not taken first by {owner}"),
+                            NoCtrl::LegacySendsBareKey =>
+                                String::from("is refused, or the bare key matches too"),
+                        }
+                    ));
+                }
+            }
+        }
+    }
+    assert!(broken.is_empty(), "{broken:#?}");
+    for row in &rows {
+        assert!(
+            listed_seen.contains(&(row.doc, row.pred)),
+            "{} does not take the Cmd chord of {:?}",
+            row.pred,
+            row.doc
+        );
+    }
+
+    // LINUX.md's table has exactly these rows, and each palette command its
+    // right-hand column names exists.
+    let doc = include_str!("../../docs/LINUX.md");
+    let table = doc
+        .split("| Chord | Why not `Ctrl` | Without `Super` |")
+        .nth(1)
+        .expect("LINUX.md still has the no-Ctrl table");
+    let cells: Vec<Vec<&str>> = table
+        .lines()
+        .skip(2)
+        .take_while(|l| l.starts_with('|'))
+        .map(|l| l.trim_matches('|').split(" | ").map(str::trim).collect())
+        .collect();
+    let documented: BTreeSet<&str> = cells.iter().map(|c| c[0]).collect();
+    let expected: BTreeSet<&str> = rows.iter().map(|r| r.doc).collect();
+    assert_eq!(documented, expected, "LINUX.md's no-Ctrl table");
+    let titles: BTreeSet<&str> = crate::widgets::command_palette::ALL_COMMANDS
+        .iter()
+        .map(|c| c.title())
+        .collect();
+    for route in cells.iter().map(|c| c[2]) {
+        for quoted in route.split('"').skip(1).step_by(2) {
+            assert!(
+                titles.contains(quoted),
+                "LINUX.md names the palette command {quoted:?}, which does not exist"
+            );
+        }
+    }
+}
+
+/// #843: the Keyboard Shortcuts view (`Ctrl`+`K` `Ctrl`+`S`) spells each
+/// chord for Linux: `Cmd` is `Ctrl` there, as LINUX.md says, and a chord
+/// without a `Ctrl` form reads `Super` rather than a `Ctrl` that does
+/// something else (`Ctrl`+`E` is end of line). Hints without `Cmd` are left
+/// as written.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn the_keyboard_shortcuts_view_spells_chords_for_linux() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_keyboard_shortcuts();
+    let picker = app.list_picker.as_ref().expect("the view opened");
+    let shown = |id: &str| {
+        let row = picker
+            .rows
+            .iter()
+            .find(|r| r.id == format!("kb:{id}"))
+            .unwrap_or_else(|| panic!("no row for {id}"));
+        row.label.rsplit("  \u{00b7}  ").next().unwrap().to_string()
+    };
+    assert_eq!(shown("toggle_line_comment"), "Ctrl+/");
+    assert_eq!(shown("join_lines"), "Ctrl+Alt+Shift+J");
+    assert_eq!(shown("toggle_vim_mode"), "Super+E");
+    assert_eq!(shown("toggle_terminal"), "Ctrl+J");
+    assert_eq!(shown("move_line_up"), "Alt+\u{2191}");
+}
+
+/// #843: Cmd+F12 has no `Ctrl` form off macOS (`Ctrl`+`F12` is Go to Type
+/// Definition), so the palette's "Go to Implementations" sends Cmd+F12's
+/// request for the symbol at the caret.
+#[test]
+fn the_palette_goes_to_implementations_at_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "lib.rs", "trait Shape {}\n");
+    app.editor.cursor_col = 7;
+    assert!(app.implementation_request_id.is_none());
+    assert!(run_from_palette(&mut app, "Go to Implementations"));
+    assert!(
+        app.implementation_request_id.is_some(),
+        "the request went to the language servers"
+    );
+}
+
+/// #843: the Explorer's Cmd+Z has no `Ctrl` form, so the palette's
+/// "Explorer: Jump to Directory (zoxide)" opens the same popup, from any pane.
+#[test]
+fn the_palette_opens_the_zoxide_jump_from_any_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(run_from_palette(
+        &mut app,
+        "Explorer: Jump to Directory (zoxide)"
+    ));
+    assert!(app.zoxide_jump.is_some());
+}
+
+/// Guard (#843): `Ctrl`+`Z` in the Explorer still opens nothing (LINUX.md
+/// lists the zoxide jump as having no `Ctrl` form), while Cmd+Z does.
+#[test]
+fn ctrl_z_in_the_explorer_does_not_open_the_zoxide_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Tree);
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_none());
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.zoxide_jump.is_some(), "Cmd+Z still opens it");
+}
+
+/// Guard (#843): "Go to Implementations" with no file open sends nothing,
+/// as Cmd+F12 would not.
+#[test]
+fn go_to_implementations_without_a_file_sends_nothing() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::GoToImplementations);
+    assert!(app.implementation_request_id.is_none());
+}
+
+/// #843: Cmd+Opt+←/→ have no `Ctrl` form off macOS (`Ctrl`+`Alt`+arrows
+/// switch desktop workspaces), so the palette carries them, doing what the
+/// chords do, from any pane.
+#[test]
+fn the_palette_focuses_the_left_and_right_editor_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "left");
+    app.split_editor();
+    assert_eq!(app.editor_layout.active_dfs_index(), 1);
+    app.focus_pane(Pane::Tree);
+    assert!(run_from_palette(&mut app, "View: Focus Left Editor Group"));
+    assert_eq!(app.editor_layout.active_dfs_index(), 0);
+    assert!(app.focus == Pane::Editor);
+    assert!(run_from_palette(&mut app, "View: Focus Right Editor Group"));
+    assert_eq!(app.editor_layout.active_dfs_index(), 1);
+}
+
+/// #843: Cmd+] / Cmd+[ have no `Ctrl` form (`Ctrl`+`[` is `Esc`), so the
+/// palette carries next / previous terminal. The chords work only in the
+/// terminal pane; the commands also focus it, as VS Code's do.
+#[test]
+fn the_palette_focuses_the_next_and_previous_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Editor);
+    assert!(run_from_palette(&mut app, "Terminal: Focus Next Terminal"));
+    assert_eq!(app.active_terminal, 1);
+    assert!(app.focus == Pane::Terminal);
+    assert!(run_from_palette(
+        &mut app,
+        "Terminal: Focus Previous Terminal"
+    ));
+    assert_eq!(app.active_terminal, 0);
+    assert!(run_from_palette(
+        &mut app,
+        "Terminal: Focus Previous Terminal"
+    ));
+    assert_eq!(app.active_terminal, 2, "it wraps like Cmd+[");
+}
+
+/// Guard (#843): with no split, "View: Focus Left/Right Editor Group" change
+/// nothing, as the chords do: focus stays where it was.
+#[test]
+fn focusing_an_editor_group_without_a_split_changes_nothing() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "only");
+    app.focus_pane(Pane::Tree);
+    for cmd in [
+        Command::FocusLeftEditorGroup,
+        Command::FocusRightEditorGroup,
+    ] {
+        app.run_command(cmd);
+        assert!(app.focus == Pane::Tree, "{cmd:?}");
+        assert!(!app.editor_layout.is_split());
+    }
+}
+
+/// Guard (#843): with one terminal, next / previous stay on it, and they
+/// skip a folded pane as Cmd+] does, never landing on one.
+#[test]
+fn the_terminal_focus_commands_stay_put_alone_and_skip_folded_panes() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::FocusNextTerminal);
+    assert_eq!(app.active_terminal, 0);
+    app.run_command(Command::FocusPreviousTerminal);
+    assert_eq!(app.active_terminal, 0);
+
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.active_terminal = 0;
+    app.terminals[1].collapsed = true;
+    app.run_command(Command::FocusNextTerminal);
+    assert_eq!(app.active_terminal, 2, "the folded pane is skipped");
+    app.run_command(Command::FocusPreviousTerminal);
+    assert_eq!(app.active_terminal, 0);
+}
+
+/// #843: Cmd+A has no `Ctrl` form in the editor off macOS (`Ctrl`+`A` is line
+/// start there), so the palette's "Select All" is the keyboard route, from
+/// any pane.
+#[test]
+fn the_palette_selects_the_whole_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "one\ntwo");
+    app.focus_pane(Pane::Tree);
+    assert!(run_from_palette(&mut app, "Select All"));
+    assert!(app.focus == Pane::Editor);
+    assert_eq!(app.editor.selection_text(), "one\ntwo");
+}
+
+/// Guard (#843): `Ctrl`+`A` in the editor is still line start, never select
+/// all: the reason LINUX.md lists Cmd+A as having no `Ctrl` form there.
+#[test]
+fn ctrl_a_in_the_editor_is_line_start_not_select_all() {
+    let mut app = editor_app_with_lines(&["hello world", "next"]);
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 0);
+    assert!(app.editor.selection.is_none());
+}
+
+/// Guard (#843): "Select All" is the same command as #852's (one id, one
+/// title, one chord), so the two branches meet on one row.
+#[test]
+fn select_all_is_one_palette_command() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    assert_eq!(Command::from_id("select_all"), Some(Command::SelectAll));
+    assert_eq!(Command::SelectAll.title(), "Select All");
+    assert_eq!(Command::SelectAll.keybinding_hint(), "Cmd+A");
+    assert_eq!(
+        ALL_COMMANDS
+            .iter()
+            .filter(|c| c.title() == "Select All")
+            .count(),
+        1
+    );
+}
+
+/// Run the Command Palette row titled `title` the way a user does: open the
+/// palette (Cmd+Shift+P), type the title, pick its row, Enter. Returns false,
+/// running nothing, when no row has that title.
+fn run_from_palette(app: &mut App, title: &str) -> bool {
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    for c in title.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let palette = app.command_palette.as_mut().expect("the palette opened");
+    let Some(row) = palette.results.iter().position(|i| i.title() == title) else {
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        return false;
+    };
+    palette.selected = row;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    true
+}
+
+/// A Markdown source with one runnable `sh` fence, the caret inside it.
+fn markdown_fence_app(dir: &Path) -> App {
+    let mut app = app_with_open_file(dir, "R.md", "# Run\n\n```sh\necho hi\n```\n");
+    app.editor.cursor_row = 3;
+    app
+}
+
+/// #843: Cmd+Enter runs the Markdown fence under the caret (#353), and off
+/// macOS `Ctrl`+`Enter` is that chord. `is_run_fence_key` took Super only,
+/// so without the kitty keyboard protocol the one way to run a fence was
+/// clicking the preview's ▷.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_enter_runs_the_markdown_fence_under_the_caret_off_macos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = markdown_fence_app(tmp.path());
+    let before = app.editor.lines.clone();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL))
+        .unwrap();
+    let pending = app
+        .pending_run_block
+        .as_ref()
+        .expect("Ctrl+Enter confirms the fence, as Cmd+Enter does");
+    assert_eq!(pending.pane_name, "R.md:1");
+    assert_eq!(app.editor.lines, before, "no line break typed");
+}
+
+/// #843: the palette's "Markdown: Run Code Block at Cursor" runs the fence on
+/// any terminal, through the same confirm popup as Cmd+Enter.
+#[test]
+fn the_palette_runs_the_markdown_code_block_at_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = markdown_fence_app(tmp.path());
+    let panes = app.terminals.len();
+    assert!(run_from_palette(
+        &mut app,
+        "Markdown: Run Code Block at Cursor"
+    ));
+    let pending = app.pending_run_block.as_ref().expect("it confirms first");
+    assert_eq!(pending.pane_name, "R.md:1");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_run_block.is_none());
+    assert_eq!(app.terminals.len(), panes, "N runs nothing");
+}
+
+/// Guard (#843): `Ctrl`+`Enter` takes only what Cmd+Enter does. In a buffer
+/// that is not Markdown it still breaks the line; in a fence `Ctrl`+`Shift`+
+/// `Enter` still opens a line above, and neither `Ctrl`+`Alt`+`Enter` nor a
+/// bare `Enter` (what a legacy terminal sends for `Ctrl`+`Enter`) runs it.
+#[test]
+fn ctrl_enter_leaves_other_buffers_and_other_enters_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "abcdef");
+    app.editor.cursor_col = 3;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.pending_run_block.is_none());
+    assert_eq!(
+        app.editor.lines,
+        ["abc", "def"],
+        "outside Markdown: a line break"
+    );
+
+    for mods in [
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+        KeyModifiers::NONE,
+    ] {
+        let mut app = markdown_fence_app(tmp.path());
+        let rows = app.editor.lines.len();
+        app.handle_key(key(KeyCode::Enter, mods)).unwrap();
+        assert!(
+            app.pending_run_block.is_none(),
+            "{mods:?}+Enter ran the fence"
+        );
+        if mods != KeyModifiers::CONTROL | KeyModifiers::ALT {
+            assert_eq!(
+                app.editor.lines.len(),
+                rows + 1,
+                "{mods:?}+Enter adds a line"
+            );
+        }
+    }
+}
+
+/// Guard (#843): Cmd+E (vim mode) gets no `Ctrl` form, because `Ctrl`+`E` is
+/// the editor's end of line, as the shell's. It stays that, and never
+/// toggles vim mode.
+#[test]
+fn ctrl_e_stays_end_of_line_and_never_toggles_vim_mode() {
+    let mut app = editor_app_with_lines(&["hello world"]);
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 11);
+    assert!(!app.vim.enabled);
+}
+
+/// Guard (#843): "Markdown: Run Code Block at Cursor" refuses, and says why,
+/// where there is nothing to run: a buffer that is not Markdown, the
+/// rendered preview (its ▷ runs blocks), a caret outside every fence.
+#[test]
+fn run_code_block_at_cursor_refuses_outside_a_markdown_fence() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "```sh\necho hi\n```\n");
+    app.editor.cursor_row = 1;
+    app.run_command(Command::RunCodeBlockAtCursor);
+    assert!(app.pending_run_block.is_none());
+    assert!(app.status.contains("Markdown"), "{}", app.status);
+
+    let mut app = markdown_fence_app(tmp.path());
+    app.toggle_markdown_preview();
+    app.status.clear();
+    app.run_command(Command::RunCodeBlockAtCursor);
+    assert!(app.pending_run_block.is_none(), "not from the preview");
+    assert!(app.status.contains("Markdown"), "{}", app.status);
+
+    let mut app = markdown_fence_app(tmp.path());
+    app.editor.cursor_row = 0;
+    app.run_command(Command::RunCodeBlockAtCursor);
+    assert!(app.pending_run_block.is_none());
+    assert!(
+        app.status.contains("inside a runnable shell fence"),
+        "{}",
+        app.status
+    );
+}
+
+/// Guard (#843): on macOS Ctrl+Enter is not the fence chord: Cmd is, and
+/// Ctrl stays the terminal's.
+#[cfg(target_os = "macos")]
+#[test]
+fn ctrl_enter_is_not_the_fence_chord_on_macos() {
+    assert!(!is_run_fence_key(key(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL
+    )));
+    assert!(is_run_fence_key(key(KeyCode::Enter, KeyModifiers::SUPER)));
+}
+
+/// #843 on the path the issue took: on desktop Linux, `Ctrl`+`K` `B` with the
+/// caret in the editor opens Testing and leaves the line alone. Before the
+/// fix `Ctrl`+`K` killed the rest of the line and `b` was typed in its place.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_k_b_opens_testing_and_leaves_the_line_off_macos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "DATA = Path(\"data\")");
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "DATA = Path(\"data\")",
+        "nothing killed, nothing typed"
+    );
+    assert_eq!(app.sidebar_view, SidebarView::Testing);
+}
+
+/// Guard (#843): a `Ctrl`+`K` that leads, then a key that completes no chord,
+/// drops the leader and the key keeps its meaning: `!` is typed where the
+/// caret was, and nothing is killed.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_k_then_a_key_that_completes_no_chord_types_it_and_kills_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "keep this");
+    app.editor.cursor_col = 4;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_none());
+    assert_eq!(app.editor.lines[0], "keep! this");
+}
+
+/// Guard (#843): the shell keeps `Ctrl`+`K` only while it has the keyboard.
+/// With the bottom panel on PROBLEMS the focused panel is not a shell, so
+/// `Ctrl`+`K` leads there as in any other pane.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_k_leads_from_the_panel_while_it_shows_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    app.focus_pane(Pane::Terminal);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_some());
+}
+
+/// Guard (#843): only the bare `Ctrl`+`K` leads. `Ctrl`+`Shift`+`K` is still
+/// Delete Line, and `Ctrl`+`Alt`+`K` arms nothing.
+#[test]
+fn ctrl_shift_k_still_deletes_the_line_and_ctrl_alt_k_never_leads() {
+    let mut app = editor_app_with_lines(&["one", "two"]);
+    app.handle_key(key(
+        KeyCode::Char('K'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(app.cmd_k_leader.is_none());
+    assert_eq!(app.editor.lines, ["two"]);
+    app.handle_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(app.cmd_k_leader.is_none());
+}
+
+/// Guard (#843): the palette's "Kill to End of Line" at the end of a line
+/// kills nothing and never joins the next line up, as `Ctrl`+`K` did not.
+#[test]
+fn kill_to_end_of_line_at_the_end_of_a_line_changes_nothing() {
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(&["hello", "next"]);
+    app.editor.cursor_col = 5;
+    app.status.clear();
+    app.run_command(Command::KillToEndOfLine);
+    assert_eq!(app.editor.lines, ["hello", "next"]);
+    assert!(app.status.is_empty(), "{}", app.status);
 }
 
 #[test]
@@ -15148,9 +16115,12 @@ fn editor_ctrl_e_jumps_to_end_of_line() {
     assert_eq!(app.editor.cursor_col, 11);
 }
 
+/// `Ctrl+K` kills where it is not the `Cmd+K` leader: on macOS, and in vim
+/// mode off it (#843).
 #[test]
 fn editor_ctrl_k_kills_to_end_of_line() {
     let mut app = editor_app_with_lines(&["hello world", "next"]);
+    app.vim.enabled = cfg!(not(target_os = "macos"));
     app.editor.cursor_col = 5;
     app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
         .unwrap();

@@ -13054,6 +13054,21 @@ impl App {
         self.status = format!("Deleted {n} {}", if n == 1 { "line" } else { "lines" });
     }
 
+    /// Kill from the caret to the end of its line, yanking the text to the
+    /// clipboard (emacs `kill-line`). `Ctrl+K` in the editor on macOS and in
+    /// vim mode; elsewhere `Ctrl+K` leads the `Cmd+K` chords (#843), and the
+    /// palette's "Kill to End of Line" is the way here.
+    fn kill_to_end_of_line(&mut self) {
+        if self.editor.has_non_text_view() {
+            return;
+        }
+        let killed = self.editor.kill_to_eol();
+        if !killed.is_empty() {
+            copy_to_clipboard(&killed);
+            self.status = format!("Killed {} chars", killed.chars().count());
+        }
+    }
+
     /// VS Code "Rename Symbol" (F2): prompt for a new name pre-filled with the
     /// identifier under the cursor; committing fires an LSP `rename` request.
     fn start_rename_symbol(&mut self) {
@@ -20926,6 +20941,17 @@ impl App {
         }
     }
 
+    /// [`ctrl_k_leads`] for the pane that has the keyboard now.
+    fn ctrl_k_leads_here(&self) -> bool {
+        let shell_focused = self.focus == Pane::Terminal
+            && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal);
+        ctrl_k_leads(
+            cfg!(target_os = "macos"),
+            shell_focused,
+            self.vim.enabled && self.focus == Pane::Editor,
+        )
+    }
+
     /// Dispatch the second key of a `Cmd+K`-prefixed chord (VS Code's two-key
     /// model). Returns `true` if the key completed a chord and was consumed,
     /// `false` if it matched nothing (the caller then processes it normally).
@@ -20934,6 +20960,10 @@ impl App {
     fn handle_cmd_k_chord(&mut self, key: KeyEvent) -> bool {
         let plain = !key.modifiers.contains(KeyModifiers::ALT);
         let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
+        // `Cmd` held on the second key, for the chords that ask for it. Off
+        // macOS `Ctrl` counts, as it does for the leader (#843): VS Code's
+        // Linux `Ctrl+K Ctrl+S` is the Keyboard Shortcuts editor.
+        let cmd_held = has_cmd_or_linux_ctrl(key.modifiers);
         match key.code {
             // Cmd+K N in the editor: leave a sticky note on this line (#367).
             // In a terminal the same chord keeps its meaning (below).
@@ -20971,9 +21001,7 @@ impl App {
             // Cmd+K Cmd+S (Cmd held on the second key): the Keyboard Shortcuts
             // editor, VS Code's binding (#612). Before the plain S arm, which
             // keeps Select for Compare.
-            KeyCode::Char(c)
-                if c.eq_ignore_ascii_case(&'s') && has_cmd(key.modifiers) && !shifted =>
-            {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') && cmd_held && !shifted => {
                 self.open_keyboard_shortcuts();
                 true
             }
@@ -21067,9 +21095,7 @@ impl App {
             // Cmd+K Cmd+Q: Go to Last Edit Location (VS Code's chord; the
             // second key carries Cmd, which keeps it distinct from the
             // navigator's plain Cmd+K Q below).
-            KeyCode::Char(c)
-                if c.eq_ignore_ascii_case(&'q') && key.modifiers.contains(KeyModifiers::SUPER) =>
-            {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') && cmd_held => {
                 self.goto_last_edit_location();
                 true
             }
@@ -21833,10 +21859,9 @@ impl App {
         }
         // Arm the `Cmd+K` leader (VS Code's two-key chord prefix). The next
         // keystroke is interpreted by `handle_cmd_k_chord`, checked at the top
-        // of this fn. Cmd is SUPER everywhere; Ctrl doubles as Cmd only on
-        // Termux — on desktop Linux a bare Ctrl+K stays the editor's
-        // kill-to-end-of-line (see `is_cmd_k_leader_key`).
-        if is_cmd_k_leader_key(key) {
+        // of this fn. Cmd is SUPER everywhere; off macOS Ctrl+K arms it too,
+        // except in a focused shell and the vim-mode editor (`ctrl_k_leads`).
+        if is_cmd_k_leader_key(key, self.ctrl_k_leads_here()) {
             self.cmd_k_leader = Some(std::time::Instant::now());
             return Ok(());
         }
@@ -40716,11 +40741,7 @@ impl App {
             return;
         }
         if is_editor_kill_to_eol_key(key) {
-            let killed = self.editor.kill_to_eol();
-            if !killed.is_empty() {
-                copy_to_clipboard(&killed);
-                self.status = format!("Killed {} chars", killed.chars().count());
-            }
+            self.kill_to_end_of_line();
             return;
         }
         if is_editor_kill_to_bol_key(key) {
@@ -42898,7 +42919,7 @@ impl App {
             .find(|(_, r)| row >= r.lines.0 && row < r.lines.1)
         else {
             self.status = String::from(
-                "Cmd+Enter: put the caret inside a runnable shell fence (sh/bash/zsh/fish; not {run=false})",
+                "Run code block: put the caret inside a runnable shell fence (sh/bash/zsh/fish; not {run=false})",
             );
             return true;
         };
@@ -47584,6 +47605,7 @@ impl App {
             }
             Cmd::JoinLines => self.editor.join_lines(),
             Cmd::DeleteLine => self.delete_current_line(),
+            Cmd::KillToEndOfLine => self.kill_to_end_of_line(),
             Cmd::TransformUpper => self.editor.transform_selection_case(CaseTransform::Upper),
             Cmd::TransformLower => self.editor.transform_selection_case(CaseTransform::Lower),
             Cmd::TransformTitle => self.editor.transform_selection_case(CaseTransform::Title),
@@ -47646,6 +47668,14 @@ impl App {
             Cmd::ToggleInlineValues => self.toggle_inline_values(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
+            // Cmd+Enter's run from any terminal (#843): the same confirm popup.
+            Cmd::RunCodeBlockAtCursor => {
+                if !self.run_fence_at_cursor() {
+                    self.status = String::from(
+                        "Run code block: open a Markdown file's source (not its preview) and put the caret in a runnable fence",
+                    );
+                }
+            }
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
             Cmd::ToggleLogHighlight => self.toggle_log_highlight(),
             Cmd::CollapseTerminalPane => self.collapse_active_terminal_pane(),
@@ -47743,6 +47773,15 @@ impl App {
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
             Cmd::PeekReferences => self.peek_references_at_cursor(),
+            // Cmd+F12's request (#843), which has no `Ctrl` form.
+            Cmd::GoToImplementations => {
+                if self.editor.diff.is_none()
+                    && self.editor.sheet.is_none()
+                    && self.editor.image.is_none()
+                {
+                    self.request_implementation_at_cursor();
+                }
+            }
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -47912,6 +47951,16 @@ impl App {
                     String::from("Nothing to redo")
                 };
             }
+            // The keyboard route on Linux, where Ctrl+A is line start and a
+            // terminal without Super forwarding never delivers Cmd+A (#852).
+            Cmd::SelectAll => {
+                self.focus_pane(Pane::Editor);
+                self.editor.select_all();
+                self.status = format!(
+                    "Selected {} chars",
+                    self.editor.selection_text().chars().count()
+                );
+            }
             Cmd::CloseEditor => {
                 self.record_closed_tab_at(self.editor.active_index());
                 if self.editor.close_active() {
@@ -47921,7 +47970,13 @@ impl App {
                 }
             }
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
+            // The Explorer's Cmd+Z (#843), which has no `Ctrl` form.
+            Cmd::ZoxideJump => self.open_zoxide_jump(),
             Cmd::SplitEditor => self.split_editor(),
+            // The chords' own moves (#843): Cmd+Opt+Left / Right have no
+            // `Ctrl` form off macOS.
+            Cmd::FocusLeftEditorGroup => self.focus_editor_group(true),
+            Cmd::FocusRightEditorGroup => self.focus_editor_group(false),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::TakeTheTour => self.start_demo(),
             Cmd::SarifNextResult => self.step_sarif_result(true),
@@ -48445,6 +48500,18 @@ impl App {
                 self.status = format!("Problems: {}", self.problems.scope.label());
             }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
+            // Cmd+] / Cmd+[ (#843), which have no `Ctrl` form. The chords
+            // work in the terminal pane; from the palette the commands bring
+            // it up and focus it first, as VS Code's do.
+            Cmd::FocusNextTerminal | Cmd::FocusPreviousTerminal => {
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                if cmd == Cmd::FocusNextTerminal {
+                    self.cycle_terminal();
+                } else {
+                    self.cycle_terminal_back();
+                }
+            }
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
                     self.terminal_status(format!(
@@ -54460,7 +54527,10 @@ impl App {
             .map(|&cmd| {
                 let shown = match self.keymap.chord_for(cmd) {
                     Some(user) => format!("{user}  (yours)"),
-                    None if !cmd.keybinding_hint().is_empty() => cmd.keybinding_hint().to_string(),
+                    None if !cmd.keybinding_hint().is_empty() => {
+                        crate::widgets::command_palette::platform_hint(cmd.keybinding_hint())
+                            .into_owned()
+                    }
                     None => String::from("\u{2014}"),
                 };
                 ListRow {
@@ -62601,6 +62671,12 @@ fn has_cmd(mods: KeyModifiers) -> bool {
     cmd_active(mods, crate::iterm2_inline::detect_termux())
 }
 
+/// [`has_cmd`], or off macOS a `Ctrl`: the command modifier LINUX.md
+/// promises there (#843), for the chords whose `Ctrl` spelling is free.
+fn has_cmd_or_linux_ctrl(mods: KeyModifiers) -> bool {
+    has_cmd(mods) || (cfg!(not(target_os = "macos")) && mods.contains(KeyModifiers::CONTROL))
+}
+
 /// Build the OSC 0 escape sequence that sets the terminal's window/icon title.
 ///
 /// Format: `ESC ] 0 ; <title> BEL`.  Control bytes that would break the escape
@@ -62974,8 +63050,9 @@ fn is_go_to_symbol_key(key: KeyEvent) -> bool {
 /// `Cmd+K` (macOS) / `Ctrl+K` (Linux / Termux): the leader for croft's
 /// `Cmd+K`-prefixed chords (Color Theme, Close to the Right, Select for /
 /// Compare with Selected, Close All). Rejects Shift and Alt so it never
-/// shadows a future `Cmd+K`+modifier chord.
-fn is_cmd_k_leader_key(key: KeyEvent) -> bool {
+/// shadows a future `Cmd+K`+modifier chord. `ctrl_leads` is
+/// [`ctrl_k_leads`] for the focused pane.
+fn is_cmd_k_leader_key(key: KeyEvent, ctrl_leads: bool) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
@@ -62985,11 +63062,19 @@ fn is_cmd_k_leader_key(key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    // SUPER everywhere; CONTROL only on Termux (where Ctrl is the cmd
-    // surrogate). Off Termux a bare Ctrl+K must fall through to the editor's
-    // kill-to-end-of-line rather than arming the leader — using `has_cmd`
-    // keeps this consistent with every other croft chord (e.g. Cmd+\ split).
-    has_cmd(key.modifiers)
+    has_cmd(key.modifiers) || (ctrl_leads && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Whether a bare `Ctrl+K` arms the `Cmd+K` leader (#843). Off macOS it
+/// does, as in VS Code's Linux keymap: Super reaches croft only over the
+/// kitty keyboard protocol, so in GNOME Terminal, Konsole, xterm or tmux no
+/// leader chord was reachable at all. Two places keep `Ctrl+K` for their
+/// own job: a focused shell (readline's kill-line) and the editor in vim
+/// mode (kill to end of line, also the palette's "Kill to End of Line").
+/// On macOS `Ctrl+K` stays kill-line and Cmd leads; on Termux `Ctrl` is
+/// the command key outright ([`cmd_active`]), so this is not consulted.
+fn ctrl_k_leads(macos: bool, shell_focused: bool, vim_editing: bool) -> bool {
+    !macos && !shell_focused && !vim_editing
 }
 
 /// `Cmd+/` (macOS) / `Ctrl+/` (Linux / Termux): Toggle Line Comment. Rejects
@@ -63278,10 +63363,13 @@ fn is_markdown_preview_key(key: KeyEvent) -> bool {
 }
 
 /// Cmd+Enter (#353): run the shell fence under the caret in a Markdown
-/// source buffer.
+/// source buffer. Off macOS `Ctrl`+`Enter` too (#843): there it only
+/// duplicated `Enter`, and Super reaches croft only over the kitty keyboard
+/// protocol. Where a terminal sends `Ctrl`+`Enter` as a bare `Enter`, the
+/// palette's "Markdown: Run Code Block at Cursor" runs it.
 fn is_run_fence_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Enter)
-        && key.modifiers.contains(KeyModifiers::SUPER)
+        && has_cmd_or_linux_ctrl(key.modifiers)
         // Cmd+Shift+Enter is "insert line above"; Alt chords stay the
         // editor's.
         && !key

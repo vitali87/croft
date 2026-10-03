@@ -165,7 +165,7 @@ croft runs on macOS, Linux, Android, and Windows (via WSL2). The cross-platform 
 
 ## Keybindings
 
-Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](docs/KEYBINDINGS.md)**. The command modifier is `Cmd` on macOS and `Ctrl` on Linux / Android; the [platform guides](#platform-setup) cover getting `Cmd` chords through your terminal.
+Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](docs/KEYBINDINGS.md)**. The command modifier is `Cmd` on macOS and `Ctrl` on Linux / Android, where `Ctrl`+`K` is also the `Cmd+K` chord leader; the [platform guides](#platform-setup) cover getting `Cmd` chords through your terminal and the few Linux chords that need `Super`.
 
 ## Goal
 

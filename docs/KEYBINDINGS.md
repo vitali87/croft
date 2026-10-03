@@ -5,6 +5,7 @@ Every action in croft is reachable from the keyboard. Press `F1` inside croft fo
 Per platform:
 
 * **macOS** — the `Cmd` chords below only reach croft after a one-time terminal setup: `croft setup-iterm2` (see [iTerm2 key mappings](#iterm2-key-mappings)) or `croft setup-ghostty` (see [Ghostty key mappings](#ghostty-key-mappings)).
+* **Linux** — `Ctrl` is the command modifier, as in VS Code: `Cmd` chords work as the same chord with `Ctrl`, the `Cmd+K` chords included (`Ctrl`+`K` leads everywhere except the terminal pane and the vim-mode editor). A handful whose `Ctrl` form is taken need `Super`; [LINUX.md](LINUX.md#the-command-modifier) lists them.
 * **Termux/Android** — there is no Cmd key, so `Ctrl` is the command modifier and every `Cmd` chord works as the same chord with `Ctrl`.
 * **Touch, no hardware keyboard** — every chord comes through croft's built-in on-screen keyboard: tap the editor, terminal, or Search input to raise it, then tap its one-shot `ctrl` / `alt` keys before a letter (e.g. `ctrl` then `p` opens Quick Open); `⌄` dismisses it.
 
@@ -22,7 +23,7 @@ Per platform:
 | `Ctrl+j` | Toggle the terminal pane |
 | `Ctrl+Shift+j` | Maximize the terminal pane (press again to restore the split) |
 | `Cmd+\` | Split the editor into two side-by-side columns; each keeps its own tabs, scroll, and cursor. Closing the last tab in a column collapses the split |
-| `Cmd+Opt+←` / `Cmd+Opt+→` | Move focus to the left / right editor group while split (or click a column) |
+| `Cmd+Opt+←` / `Cmd+Opt+→` | Move focus to the left / right editor group while split (or click a column, or the Command Palette's "View: Focus Left Editor Group" / "View: Focus Right Editor Group") |
 | `Ctrl+p` / `Cmd+p` | Quick Open: fuzzy-search workspace files and jump to one (auto-reveals it in the Explorer). Add `:236` after the name to land on that line, `:236:7` for a column, or `:236-239` to open with those lines selected. Results are mouse-friendly: click a row to open it, wheel to move the selection, and the same goes for all the quick-pick popups (Command Palette, Go to Symbol, the branch and directory pickers, and the Debug: Attach to Python Process list) |
 | `Ctrl+p` / `Cmd+p`, then `#` | Go to Symbol in Workspace: the query goes to every running language server as a `workspace/symbol` search; Enter opens the picked symbol's file at its definition (also Command Palette "Go to Symbol in Workspace") |
 | `Ctrl+Shift+p` / `Cmd+Shift+p` | Command Palette: fuzzy-search every named command and run it, with its keybinding shown alongside |
@@ -42,7 +43,7 @@ Per platform:
 
 ### `Cmd+K` chords
 
-`Cmd`/`Ctrl`+`K` is a leader (VS Code's two-key model): press it, then a second key within 1.5s. Pressing anything that completes no chord cancels the leader and keeps its normal meaning.
+`Cmd`/`Ctrl`+`K` is a leader (VS Code's two-key model): press it, then a second key within 1.5s. Pressing anything that completes no chord cancels the leader and keeps its normal meaning. On Linux `Ctrl`+`K` leads everywhere except the terminal pane, where it goes to the shell, and the editor while vim mode is on, where it kills to the end of the line; a `Cmd` on the second key (`Cmd+K` `Cmd+S`) is `Ctrl` there too.
 
 | Keys | Action |
 |------|--------|
@@ -120,7 +121,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 
 ## Command Palette
 
-`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Every command carries a chord and shows it on the right, so the palette is both a second way to reach commands and a discovery surface for their accelerators.
+`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Every command carries a chord and shows it on the right, so the palette is both a second way to reach commands and a discovery surface for their accelerators. Off macOS the chord reads with `Ctrl` for `Cmd` and `Alt` for `Opt`, and with `Super` for the few chords [LINUX.md](LINUX.md#the-command-modifier) lists without a `Ctrl` form; the Keyboard Shortcuts view does the same.
 
 | Command | Chord | Action |
 |---------|-------|--------|
@@ -133,6 +134,12 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Debug: Attach to Python Process | `Ctrl`+`F5` | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
 | Session: Participants | `Cmd`+`K` `A` | List who is attached to this multiplayer session (docs/MULTIPLAYER.md); pick a participant to grant/revoke write control or disconnect them. The status bar shows an "N attached" badge whenever someone else is on |
+| Markdown: Run Code Block at Cursor | `Cmd`+`Enter` | Run the runnable fence under the caret in a Markdown source, through the same confirm popup as the chord: the route on a terminal that sends `Ctrl`+`Enter` as a bare `Enter` |
+| Select All | `Cmd`+`A` | Select the whole active editor buffer. The palette is the Linux route: there `Ctrl`+`A` is line start |
+| View: Focus Left Editor Group / View: Focus Right Editor Group | `Cmd`+`Opt`+`←` / `Cmd`+`Opt`+`→` | Move focus to the left / right editor group while split: the Linux route, where `Ctrl`+`Alt`+arrows switch desktop workspaces |
+| Terminal: Focus Next Terminal / Terminal: Focus Previous Terminal | `Cmd`+`]` / `Cmd`+`[` | Focus the terminal pane and cycle to the next / previous terminal: the Linux route, where `Ctrl`+`[` is `Esc` |
+| Go to Implementations | `Cmd`+`F12` | Go to the concrete implementors of the trait / interface at the caret: the Linux route, where `Ctrl`+`F12` is Go to Type Definition |
+| Explorer: Jump to Directory (zoxide) | `Cmd`+`Z` in the Explorer | Open the zoxide jump popup from any pane: the Linux route, where `Ctrl`+`Z` is kept out of the Explorer |
 | Session: Detach | `Cmd`+`K` `Shift`+`Q` | Detach this client from the persistent session; the session keeps running. Run the same `croft attach` / `croft remote` command to reattach |
 
 **Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), and runs it. The terminal search becomes the Search panel's results list, so its replace-all covers every match at once (`:cdo`-style).
@@ -179,7 +186,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`C` / `Cmd`+`C` | Copy selected paths to the explorer clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut selected paths |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste into the focused folder (move on Cut, copy on Copy) |
-| `Cmd`+`Z` | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed |
+| `Cmd`+`Z` (Linux: `Super`+`Z`, or the Command Palette's "Explorer: Jump to Directory (zoxide)" from any pane) | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed |
 | Drag a row onto a folder | Move the selection into it (`Alt`-drag to copy instead) |
 | `Delete` / `Backspace` / `Cmd`+`Backspace` | Move every selected path to the OS Trash (after a confirmation popup — `Enter` to trash, `Esc` to keep) |
 | `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder |
@@ -279,11 +286,11 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor (replaces any selection) |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce; backspace, paste, cut, replace are each one step) |
 | `Shift`+`Ctrl`+`Z` / `Shift`+`Cmd`+`Z` | Redo the most recently undone step; a fresh edit after an undo discards the redo branch (also Command Palette "Redo") |
-| `Cmd`+`A` | Select the entire buffer |
+| `Cmd`+`A` | Select the entire buffer (on Linux `Ctrl`+`A` is line start: the Command Palette's "Select All") |
 | `Ctrl`+`f` / `Cmd`+`f` | Inline Find bar: pre-filled from the selection or word under the cursor; active match in orange, the rest in yellow; `Enter`/`F3` forward, `Shift+Enter`/`Shift+F3` back, `Esc` closes |
 | `Ctrl`+`Alt`+`f` / `Cmd`+`Opt`+`f` | Replace in File: the Find bar expanded with a replace row; `Tab` switches field, `Enter` in the replace row replaces the current match and advances, `Cmd`+`Opt`+`Enter` (`Ctrl`+`Alt`+`Enter` on Linux) replaces all as one undo step; `$1` capture references work in regex mode |
 | `Ctrl`+`A` / `Ctrl`+`E` | Move to start / end of line |
-| `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard) |
+| `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard). On Linux (outside vim mode) and Termux `Ctrl`+`K` is the `Cmd+K` leader instead; the Command Palette's "Kill to End of Line" kills there, or bind `ctrl+k` to `kill_to_end_of_line` in `keybindings.json` |
 | `Cmd`+`o` / `Cmd`+`Shift`+`Enter` | Open a new line below / above, inheriting indent |
 | `Ctrl`+`Shift`+`o` / `Cmd`+`Shift`+`O` | Go to Symbol in Editor: fuzzy-search the file's symbols and jump (type `:` then a number to go to a line) |
 | `Cmd`+`g` `g` | Go to the top of the file (`Cmd`+`N` `Cmd`+`g` `g` for line N) |
@@ -319,12 +326,12 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
 | `Ctrl`+`F12` | Go to Type Definition |
-| `Cmd`+`F12` | Go to Implementations (concrete implementors of a trait / interface) |
+| `Cmd`+`F12` | Go to Implementations (concrete implementors of a trait / interface). On Linux `Ctrl`+`F12` is Go to Type Definition, so it is `Super`+`F12` or the Command Palette's "Go to Implementations" |
 | Hover or click/tap (300 ms rest) | Hover popup: any diagnostic over the point first, then type / signature info. A click or tap arms the same dwell, so touch screens (Termux) get the popup by tapping an identifier and resting; releasing the press keeps it open |
 | Hover a tab (300 ms dwell) | Tooltip with the tab's full path (tells two same-named files apart) |
 | Hover a chrome control (300 ms dwell) | Button hint naming the control under the pointer: activity-bar icons (Explorer, Search, …), the EXPLORER header toolbar (New File, New Folder, Refresh Explorer, Collapse Folders, Views and More Actions), the Remote / Source Control header actions, and the SEARCH panel's actions and toggles (Refresh, Clear Search Results, Match Case, Use Regular Expression, …) |
 | Right-click | Editor symbol menu: the Go to / Rename / Change All actions above |
-| `Cmd`+`E` | Toggle native modal (vim) editing (see below) |
+| `Cmd`+`E` | Toggle native modal (vim) editing (see below). On Linux `Ctrl`+`E` stays end of line, so it is `Super`+`E` or the Command Palette's "Toggle Vim Mode" |
 | `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab) |
 
 ## Editor: vim mode (modal editing)
@@ -541,7 +548,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+K` `Shift+T` | Reopen the closed terminal: for 10s after closing a pane its process and scrollback stay alive in the background, and this brings it back exactly where it was (the browser reopen-tab convention). After the grace window the pane is disposed for real |
 | `Cmd+K` `Shift+W` | Reopen the closed editor tab (VS Code's Reopen Closed Editor, paired with `Cmd+W` the way `Shift+T` pairs with the terminal close): restores the most recently closed tab with its pin state, cursor, and scroll, walking back through the last 20 closes. Files deleted since their close are skipped. Also Command Palette "View: Reopen Closed Editor" |
 | `Ctrl+Shift+Space` | Quick select (WezTerm's hint mode): every URL, filesystem path (including `path:line:col`), git SHA, UUID, IP, hex colour/address, and long number on screen gets a short home-row label overlaid, with the bottom-most match labelled cheapest. Type a label to copy the match to the clipboard; type it in UPPERCASE to also paste it into the shell; `Backspace` erases a typed char, `Esc` cancels |
-| `Cmd+Enter` (Markdown) / click `▷` (preview) | Runnable docs: every `sh`/`bash`/`zsh`/`fish` fence (and `python`/`node` when the interpreter is on PATH) wears a `▷` on its first line in the Markdown preview. Clicking it - or `Cmd+Enter` with the caret in the fence in the source - shows a confirm popup with the whole block, the pane it will run in (`<file>:<n>`) and its directory (the document's, or the workspace root with `{cwd=root}`); `Y` types it there, reusing that pane when it sits idle at a prompt. Every block confirms, because a README is untrusted input; blocks that look destructive (`rm -rf`, `sudo`, `curl … \| sh`, redirects, `nc`, `chmod`, `--force`, `git reset --hard`) or say `{confirm}` turn the popup red. `{run=false}` removes the glyph; a block carrying a control or bidi/zero-width character is never runnable; the pane is named by the document's path under the workspace. After a block finishes, its output appears under the fence in the preview: the last twelve rows, coloured as the pane printed them, with the exit code named when it is not zero, or a note that croft stopped waiting while the block kept running. `{persist}` WRITES that output back into the document as a fence croft replaces on each run — the only attribute that touches the file on disk, and off unless asked for. `{timeout=N}` stops the capture after N seconds without stopping the block. |
+| `Cmd+Enter` (Markdown; `Ctrl+Enter` on Linux) / click `▷` (preview) | Runnable docs: every `sh`/`bash`/`zsh`/`fish` fence (and `python`/`node` when the interpreter is on PATH) wears a `▷` on its first line in the Markdown preview. Clicking it - or `Cmd+Enter` with the caret in the fence in the source, or the Command Palette's "Markdown: Run Code Block at Cursor" - shows a confirm popup with the whole block, the pane it will run in (`<file>:<n>`) and its directory (the document's, or the workspace root with `{cwd=root}`); `Y` types it there, reusing that pane when it sits idle at a prompt. Every block confirms, because a README is untrusted input; blocks that look destructive (`rm -rf`, `sudo`, `curl … \| sh`, redirects, `nc`, `chmod`, `--force`, `git reset --hard`) or say `{confirm}` turn the popup red. `{run=false}` removes the glyph; a block carrying a control or bidi/zero-width character is never runnable; the pane is named by the document's path under the workspace. After a block finishes, its output appears under the fence in the preview: the last twelve rows, coloured as the pane printed them, with the exit code named when it is not zero, or a note that croft stopped waiting while the block kept running. `{persist}` WRITES that output back into the document as a fence croft replaces on each run — the only attribute that touches the file on disk, and off unless asked for. `{timeout=N}` stops the capture after N seconds without stopping the block. |
 | Triggers (no chord) | iTerm2-style output triggers from `~/.config/croft/triggers.json` (palette: "Preferences: Open Terminal Triggers (JSON)", reloaded on save): each rule is a regex plus an action: `highlight` recolours every visible occurrence live (per-rule `#rrggbb` fg/bg, scrollback included), `notify` posts a status-bar notice (`\0` whole match, `\1`-`\9` capture groups), `bell` posts a bell notice, `capture` collects the whole matching line into the CAPTURES panel tab (iTerm2's Capture Output; click an entry there to jump its pane back to that line), `redact` masks the match (capture group 1 when the regex has one) as `••••` at paint time — the grid keeps the real text, a click on the mask pops it, copies carry the real value unless the rule says `"copy": "masked"`, and the `Cmd+K D` scrollback dump is always masked. A built-in redact set (AWS keys, `sk-`/`ghp_`/`xox` tokens, JWTs, bearer tokens) is on by default (Settings: "Terminal: Redact Secrets"); the status bar counts masks on screen, and "Terminal: Reveal Redacted Secrets for 10s" lifts them briefly. notify/bell/capture fire once per completed output line, capped and never inside full-screen apps |
 | Agents: Show Changed Files (palette) | The review queue, one row per agent, grouped by the workspace root its files are in: a worktree lane's group is named by its branch (`agent/fix-login 4`), any other root by its display label (its folder name, disambiguated by the parent when two roots share it, else its full path). A grouped row carries labels and counts (`claude: 6 to review — croft 2; agent/fix-login 4`) rather than file names, since the one-row status bar elides the middle of anything longer; a row whose files all sit under one root keeps the flat `agent: n to review (a.rs, b.rs)` shape, with a sample of at most three names ending in `…` when there are more. Should a file ever be recorded outside every root it is counted under "outside the workspace" rather than dropped |
 | Agents: Open Agent Lane (palette) | Show the Explorer's AGENT LANE section, open: each coding agent that changed files, then those files (unreviewed first, marked `●`). Clicking a file opens its diff against the reviewed snapshot; clicking an agent's row folds its files away, or back. The queue and what you marked reviewed are kept per workspace, so they survive a restart. The section is also toggled from the EXPLORER ⋯ menu, and takes no room until an agent has changed something |
@@ -564,7 +571,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+C` / `Ctrl+Shift+c` | Copy the terminal's current selection. On a remote session the text goes to the clipboard of the machine you are typing at, not the remote box's. Inside a program that has asked for mouse tracking a plain drag belongs to that program, so **Shift+drag** is what selects there. A program that has not asked still selects on a plain drag |
 | `Cmd+T` / `Ctrl+Shift+t` | Open another terminal beside the current one (each has its own PTY, scrollback, selection) |
 | `Cmd+W` / `Ctrl+Shift+w` | Close the active terminal (no-op when one is left; `Ctrl+J` hides the pane) |
-| `Cmd+]` / `Cmd+[` | Cycle to the next / previous terminal (or click one to focus it) |
+| `Cmd+]` / `Cmd+[` | Cycle to the next / previous terminal (or click one to focus it). The Command Palette's "Terminal: Focus Next Terminal" / "Terminal: Focus Previous Terminal" do the same from any pane and focus the terminal |
 | Click the `⌄` caret (beside `+`) | Drop the terminal profile menu anchored under the caret: pick a shell (from `/etc/shells` + `$SHELL`) to launch a new pane |
 | `Cmd+K` `R` | Rename the active terminal pane (a blank name clears it, restoring the auto label) |
 | `Cmd+K` `K` | Clear the active terminal's screen and scrollback (VS Code clears with `Cmd+K`) |
