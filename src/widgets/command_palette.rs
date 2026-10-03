@@ -151,6 +151,15 @@ pub enum Command {
     // --- View / navigation ---
     ShowExplorer,
     ShowSearch,
+    /// Search: Replace in Files (#860): the Search side bar with its Replace
+    /// row expanded and focused.
+    ReplaceInFiles,
+    /// The Search side bar's `Aa` / `ab` / `.*` toggles and its `...`
+    /// include / exclude row, from the keyboard (#860).
+    SearchToggleMatchCase,
+    SearchToggleWholeWord,
+    SearchToggleRegex,
+    SearchToggleDetails,
     ShowSourceControl,
     AddWorkspaceFolder,
     RemoveWorkspaceFolder,
@@ -548,6 +557,11 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::MacroReplayTimes,
     Command::ShowExplorer,
     Command::ShowSearch,
+    Command::ReplaceInFiles,
+    Command::SearchToggleMatchCase,
+    Command::SearchToggleWholeWord,
+    Command::SearchToggleRegex,
+    Command::SearchToggleDetails,
     Command::ShowSourceControl,
     Command::AddWorkspaceFolder,
     Command::RemoveWorkspaceFolder,
@@ -913,6 +927,11 @@ impl Command {
             Command::MacroReplayTimes => "Macro: Replay N Times…",
             Command::ShowExplorer => "View: Show Explorer",
             Command::ShowSearch => "View: Show Search",
+            Command::ReplaceInFiles => "Search: Replace in Files",
+            Command::SearchToggleMatchCase => "Search: Toggle Match Case",
+            Command::SearchToggleWholeWord => "Search: Toggle Match Whole Word",
+            Command::SearchToggleRegex => "Search: Toggle Use Regular Expression",
+            Command::SearchToggleDetails => "Search: Toggle Search Details",
             Command::ShowSourceControl => "View: Show Source Control",
             Command::AddWorkspaceFolder => "Workspaces: Add Folder to Workspace",
             Command::SaveWorkspaceAs => "Workspaces: Save Workspace As",
@@ -1274,6 +1293,15 @@ impl Command {
             Command::MacroReplayTimes => "",
             Command::ShowExplorer => "Cmd+Shift+E",
             Command::ShowSearch => "Cmd+Shift+F",
+            Command::ReplaceInFiles => "Cmd+Shift+H",
+            // VS Code's search-input keys, live while a Search input has
+            // focus; run from the palette they reveal the side bar first.
+            Command::SearchToggleMatchCase => "Alt+C",
+            Command::SearchToggleWholeWord => "Alt+W",
+            Command::SearchToggleRegex => "Alt+R",
+            // VS Code binds none that is free here (its Ctrl+Shift+J is
+            // croft's maximize-terminal); D for details.
+            Command::SearchToggleDetails => "Alt+D",
             Command::ShowSourceControl => "Cmd+Shift+S",
             Command::AddWorkspaceFolder => "",
             Command::SaveWorkspaceAs => "",
@@ -1630,6 +1658,11 @@ impl Command {
             Command::MacroReplayTimes => "macro_replay_times",
             Command::ShowExplorer => "show_explorer",
             Command::ShowSearch => "show_search",
+            Command::ReplaceInFiles => "replace_in_files",
+            Command::SearchToggleMatchCase => "search_toggle_match_case",
+            Command::SearchToggleWholeWord => "search_toggle_whole_word",
+            Command::SearchToggleRegex => "search_toggle_regex",
+            Command::SearchToggleDetails => "search_toggle_details",
             Command::ShowSourceControl => "show_source_control",
             Command::AddWorkspaceFolder => "add_workspace_folder",
             Command::SaveWorkspaceAs => "save_workspace_as",

@@ -22157,6 +22157,15 @@ impl App {
             self.save_all();
             return Ok(());
         }
+        // Ctrl+Shift+H in the live shell stays its command history; Cmd+Shift+H
+        // and every other pane's Ctrl+Shift+H are Replace in Files (#860).
+        let terminal_owns_ctrl_shift_h = self.focus == Pane::Terminal
+            && self.bottom_panel_tab == BottomPanelTab::Terminal
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_replace_in_files_key(key) && !terminal_owns_ctrl_shift_h {
+            self.open_replace_in_files();
+            return Ok(());
+        }
         if self.is_remote && is_drop_to_local_key(key) {
             self.drop_to_local = true;
             self.quit = true;
@@ -22307,6 +22316,17 @@ impl App {
             }
             return;
         }
+        // VS Code's Alt+C / Alt+W / Alt+R flip the Aa / ab / .* toggles from
+        // any Search input, and Alt+D opens or closes the include / exclude
+        // rows (#860).
+        if let Some(toggle) = search_toggle_for_key(key) {
+            self.toggle_search_opt(toggle);
+            return;
+        }
+        if is_search_details_key(key) {
+            self.search.toggle_details();
+            return;
+        }
         // Tab cycles through the visible inputs (Query → Replace → include →
         // exclude → Query), mirroring VS Code. Shift+Tab is left to fall
         // through to default since BackTab arrives as its own key code.
@@ -22361,6 +22381,32 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Flip one of the Search side bar's mode toggles, from a click or a key,
+    /// and re-run the query under it. The status line names the new state:
+    /// the toggle's glyph is two cells in a panel that may be off-screen.
+    fn toggle_search_opt(&mut self, toggle: crate::widgets::search::SearchToggle) {
+        use crate::widgets::search::SearchToggle;
+        let on = self.search.toggle_opt(toggle);
+        let name = match toggle {
+            SearchToggle::CaseSensitive => "Match Case",
+            SearchToggle::WholeWord => "Match Whole Word",
+            SearchToggle::UseRegex => "Use Regular Expression",
+        };
+        self.status = format!("Search: {name} {}", if on { "on" } else { "off" });
+        self.submit_search_query();
+    }
+
+    /// Search: Replace in Files (#860, `Cmd+Shift+H`): the Search side bar
+    /// with its Replace row expanded and focused, the way the chevron opens
+    /// it.
+    fn open_replace_in_files(&mut self) {
+        // As for the Search jump: a live find bar would keep painting over
+        // the editor and shadow the side bar's input.
+        self.close_editor_find();
+        self.set_sidebar_view(SidebarView::Search);
+        self.search.open_replace();
     }
 
     /// Re-run the search after a field edit, but only when the edited field
@@ -48142,6 +48188,26 @@ impl App {
             }
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
+            Cmd::ReplaceInFiles => self.open_replace_in_files(),
+            // Run from the palette the side bar may be hidden, so it is
+            // revealed first: a toggle flipped out of sight is a toggle the
+            // user cannot confirm.
+            Cmd::SearchToggleMatchCase => {
+                self.set_sidebar_view(SidebarView::Search);
+                self.toggle_search_opt(crate::widgets::search::SearchToggle::CaseSensitive);
+            }
+            Cmd::SearchToggleWholeWord => {
+                self.set_sidebar_view(SidebarView::Search);
+                self.toggle_search_opt(crate::widgets::search::SearchToggle::WholeWord);
+            }
+            Cmd::SearchToggleRegex => {
+                self.set_sidebar_view(SidebarView::Search);
+                self.toggle_search_opt(crate::widgets::search::SearchToggle::UseRegex);
+            }
+            Cmd::SearchToggleDetails => {
+                self.set_sidebar_view(SidebarView::Search);
+                self.search.toggle_details();
+            }
             Cmd::ShowSourceControl => self.set_sidebar_view(SidebarView::SourceControl),
             Cmd::AddWorkspaceFolder => self.open_add_folder_picker(),
             Cmd::SaveWorkspaceAs => {
@@ -52841,18 +52907,7 @@ impl App {
                         return;
                     }
                     if let Some(t) = self.search.toggle_at(m.column, m.row) {
-                        match t {
-                            crate::widgets::search::SearchToggle::CaseSensitive => {
-                                self.search.opts.case_sensitive = !self.search.opts.case_sensitive;
-                            }
-                            crate::widgets::search::SearchToggle::WholeWord => {
-                                self.search.opts.whole_word = !self.search.opts.whole_word;
-                            }
-                            crate::widgets::search::SearchToggle::UseRegex => {
-                                self.search.opts.use_regex = !self.search.opts.use_regex;
-                            }
-                        }
-                        self.submit_search_query();
+                        self.toggle_search_opt(t);
                         return;
                     }
                     // Click on a result row: open it. Mirrors the Explorer's
@@ -63516,6 +63571,37 @@ fn is_show_problems_key(key: KeyEvent) -> bool {
 /// "View: Toggle Output" chord (#852).
 fn is_show_output_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'u')
+}
+
+/// `Ctrl/Cmd+Shift+H`: Search: Replace in Files, VS Code's chord (#860). In
+/// the live terminal `Ctrl+Shift+H` stays `is_command_history_key`'s; the
+/// dispatcher checks that before this.
+fn is_replace_in_files_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'h')
+}
+
+/// `Alt+C` / `Alt+W` / `Alt+R` while a Search side bar input has focus: the
+/// `Aa` / `ab` / `.*` toggle each flips, VS Code's search-input keys (#860).
+/// Only a bare Alt: a macOS terminal that sends Option+C as `ç` is typing,
+/// and taking that glyph would eat it on the keyboards that have it.
+fn search_toggle_for_key(key: KeyEvent) -> Option<crate::widgets::search::SearchToggle> {
+    use crate::widgets::search::SearchToggle;
+    if key.modifiers != KeyModifiers::ALT {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('c' | 'C') => Some(SearchToggle::CaseSensitive),
+        KeyCode::Char('w' | 'W') => Some(SearchToggle::WholeWord),
+        KeyCode::Char('r' | 'R') => Some(SearchToggle::UseRegex),
+        _ => None,
+    }
+}
+
+/// `Alt+D` while a Search side bar input has focus: show or hide the "files
+/// to include / exclude" rows (#860). VS Code's own chord, `Ctrl+Shift+J`, is
+/// croft's maximize-terminal, so D for details.
+fn is_search_details_key(key: KeyEvent) -> bool {
+    key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('d' | 'D'))
 }
 
 /// `Cmd+Opt+S` / `Ctrl+Alt+S`: File: Save All (#852). VS Code's macOS chord;

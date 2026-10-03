@@ -152,6 +152,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_save_all_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+H",
+                description: "Replace in Files: the Search sidebar with its Replace row open and focused (in the terminal, Ctrl+Shift+H is command history)",
+                handler: "is_replace_in_files_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+B",
                 description: "Run the project's build task, auto-detected from its manifests (Makefile, package.json, Cargo.toml, …)",
                 handler: "is_run_build_task_key",
@@ -1045,6 +1050,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Click Aa / ab / .*",
                 description: "Case-sensitive / whole-word / regex toggles",
                 handler: "",
+            },
+            ShortcutEntry {
+                keys: "Alt+C / Alt+W / Alt+R",
+                description: "Toggle match case / whole word / regex from any Search input",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Alt+D",
+                description: "Show or hide the files to include / exclude inputs",
+                handler: "is_search_details_key",
             },
             ShortcutEntry {
                 keys: "Up / Down + Enter",

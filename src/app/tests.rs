@@ -9776,6 +9776,7 @@ fn changing_workspace_root_retargets_search_at_the_new_explorer_root() {
         path: tmp.path().join("stale.txt"),
         line_no: 1,
         line_text: String::from("stale"),
+        matches: 1,
     });
 
     app.change_workspace_root(inner.clone());
@@ -10928,6 +10929,7 @@ fn mouse_wheel_over_search_panel_scrolls_the_results_list() {
             path: tmp.path().join("a.txt"),
             line_no: i + 1,
             line_text: format!("line {i}"),
+            matches: 1,
         })
         .collect();
     app.search.scroll = 0;
@@ -11332,6 +11334,7 @@ fn search_panel_paints_a_scrollbar_when_hits_exceed_visible_rows() {
             path: tmp.path().join("a.txt"),
             line_no: i + 1,
             line_text: format!("line {i}"),
+            matches: 1,
         })
         .collect();
     let area = Rect {
@@ -66350,6 +66353,117 @@ fn save_all_writes_every_dirty_tab() {
     )));
 }
 
+/// #860: VS Code's `Alt+C` / `Alt+W` / `Alt+R` flip the Search side bar's
+/// `Aa` / `ab` / `.*` toggles from any of its inputs, and `Alt+D` opens and
+/// closes the include / exclude rows, all of which were click-only. Plain
+/// letters still type.
+#[test]
+fn search_toggles_and_details_answer_the_keyboard() {
+    use crate::widgets::search::{SearchField, SearchOpts};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    let alt = |c| key(KeyCode::Char(c), KeyModifiers::ALT);
+    assert_eq!(app.search.opts, SearchOpts::default());
+    app.handle_key(alt('c')).unwrap();
+    assert!(app.search.opts.case_sensitive);
+    assert_eq!(app.status, "Search: Match Case on");
+    app.handle_key(alt('w')).unwrap();
+    assert!(app.search.opts.whole_word);
+    app.handle_key(alt('r')).unwrap();
+    assert!(app.search.opts.use_regex);
+    assert!(
+        app.search.query.is_empty(),
+        "the keys toggle, they do not type"
+    );
+    // Alt+D reveals include / exclude, and the toggles work from there too.
+    app.handle_key(alt('d')).unwrap();
+    assert!(app.search.details_open);
+    app.search.focus_field(SearchField::Include);
+    app.handle_key(alt('c')).unwrap();
+    assert!(!app.search.opts.case_sensitive);
+    assert_eq!(app.status, "Search: Match Case off");
+    assert!(app.search.include.is_empty());
+    app.handle_key(alt('d')).unwrap();
+    assert!(!app.search.details_open);
+    assert_eq!(
+        app.search.field,
+        SearchField::Query,
+        "closing the rows hands focus back to the query"
+    );
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.search.query, "c");
+}
+
+/// #860: `Ctrl/Cmd+Shift+H` is Replace in Files: the Search side bar opens
+/// with its Replace row expanded and focused, from the editor, and a second
+/// press never collapses it. In the live terminal `Ctrl+Shift+H` stays
+/// command history.
+#[test]
+fn replace_in_files_opens_the_replace_row_from_anywhere() {
+    use crate::widgets::search::SearchField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "foo");
+    let ctrl_shift_h = key(
+        KeyCode::Char('H'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    app.handle_key(ctrl_shift_h).unwrap();
+    assert!(app.sidebar_view == SidebarView::Search);
+    assert!(app.focus == Pane::Tree);
+    assert!(app.search.replace_open);
+    assert_eq!(app.search.field, SearchField::Replace);
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.search.replace, "x", "typing lands in Replace");
+    assert!(app.search.query.is_empty());
+    app.search.focus_field(SearchField::Query);
+    app.handle_key(key(
+        KeyCode::Char('h'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(app.search.replace_open, "the chord only ever opens the row");
+    assert_eq!(app.search.field, SearchField::Replace);
+    // The live shell keeps its command history on Ctrl+Shift+H.
+    app.search.replace_open = false;
+    app.set_bottom_panel_tab(BottomPanelTab::Terminal);
+    app.handle_key(ctrl_shift_h).unwrap();
+    assert!(app.command_history_popup.is_some());
+    assert!(!app.search.replace_open);
+}
+
+/// #860: the palette carries Replace in Files and the four side bar
+/// toggles; run from there (the side bar hidden) they reveal it, so the flip
+/// is seen.
+#[test]
+fn search_commands_run_from_the_palette_reveal_the_side_bar() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    use crate::widgets::search::SearchField;
+    for cmd in [
+        Command::ReplaceInFiles,
+        Command::SearchToggleMatchCase,
+        Command::SearchToggleWholeWord,
+        Command::SearchToggleRegex,
+        Command::SearchToggleDetails,
+    ] {
+        assert!(ALL_COMMANDS.contains(&cmd), "{cmd:?} missing from palette");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "foo");
+    app.show_tree = false;
+    app.run_command(Command::SearchToggleWholeWord);
+    assert!(app.show_tree);
+    assert!(app.sidebar_view == SidebarView::Search);
+    assert!(app.search.opts.whole_word);
+    app.run_command(Command::SearchToggleDetails);
+    assert!(app.search.details_open);
+    app.run_command(Command::ReplaceInFiles);
+    assert!(app.search.replace_open);
+    assert_eq!(app.search.field, SearchField::Replace);
+}
+
 /// #852 regression, driven by keys alone: from the editor with the panel
 /// hidden, `Ctrl+Shift+M` shows PROBLEMS, `Ctrl+Shift+U` shows OUTPUT and
 /// `Cmd+Shift+T` brings TERMINAL back over them, each time with the panel
@@ -66502,6 +66616,61 @@ fn palette_new_file_with_no_file_open_uses_the_explorer_target() {
         }) => assert_eq!(target_dir, &explorer_dir),
         _ => panic!("File: New File… must open the New File prompt"),
     }
+}
+
+/// #860 negative: the Search side bar's `Alt` toggles belong to its inputs.
+/// From the editor, `Alt+C` / `W` / `R` / `D` leave the toggles and the
+/// include / exclude rows alone, and inside the inputs only a bare `Alt`
+/// flips one (`Ctrl+Alt+C` is not Match Case).
+#[test]
+fn search_alt_toggles_stay_inside_the_search_inputs() {
+    use crate::widgets::search::SearchOpts;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "foo");
+    app.set_sidebar_view(SidebarView::Search);
+    app.focus_pane(Pane::Editor);
+    for c in ['c', 'w', 'r', 'd'] {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::ALT))
+            .unwrap();
+    }
+    assert_eq!(app.search.opts, SearchOpts::default());
+    assert!(!app.search.details_open);
+    app.set_sidebar_view(SidebarView::Search);
+    assert!(
+        app.focus == Pane::Tree,
+        "fixture: the Search input has focus"
+    );
+    app.handle_key(key(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(!app.search.opts.case_sensitive, "only a bare Alt toggles");
+}
+
+/// #860 negative: Replace in Files only ever opens the row; with it open
+/// and text in both fields, the chord keeps the query, the replacement and
+/// the toggles as they were.
+#[test]
+fn replace_in_files_keeps_what_the_search_already_holds() {
+    use crate::widgets::search::SearchField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "foo");
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("foo");
+    app.search.replace = String::from("bar");
+    app.search.opts.whole_word = true;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(
+        KeyCode::Char('H'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(app.search.replace_open);
+    assert_eq!(app.search.field, SearchField::Replace);
+    assert_eq!(app.search.query, "foo");
+    assert_eq!(app.search.replace, "bar");
+    assert!(app.search.opts.whole_word);
 }
 
 /// Types `text` into whatever overlay has the keyboard, one key at a time.
