@@ -22,8 +22,11 @@ on:
   push:
     tags:
       - "v*"
-  # Building the matrix without publishing, to prove a tag would work before
-  # cutting one. Upload only ever happens on a tag.
+  # Dispatched on a branch, this builds the matrix without publishing, to
+  # prove a tag would work before cutting one. Dispatched on a tag ref (what
+  # publish-crate.yml does after a crates.io publish, because a tag pushed
+  # with the workflow token never triggers a push run), github.ref is that
+  # tag and the release publishes as if the tag push had triggered it.
   workflow_dispatch:
 
 # Read at the top level; only the publish job needs write, and only to
@@ -166,8 +169,9 @@ jobs:
       # short-lived Sigstore certificate naming this workflow and tag, so
       # there is no signing key to store, rotate or leak.
       id-token: write
-    # Only a tag publishes. A workflow_dispatch run builds and stops, which is
-    # how you prove the matrix works without cutting a release.
+    # Only a tag ref publishes. A workflow_dispatch on a branch builds and
+    # stops, which is how you prove the matrix works without cutting a
+    # release; a dispatch on a tag ref carries that tag here and publishes.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v7
