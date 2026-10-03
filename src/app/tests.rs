@@ -11635,6 +11635,118 @@ fn a_consumed_backup_that_cannot_be_removed_is_reported_and_tried_at_quit() {
     );
 }
 
+/// #862 review (CodeRabbit): a dead croft's backup can sit at this croft's
+/// own backup path, where the process start time cannot be read (the name
+/// is then `<pid>.json`) and the pid was recycled. Restoring from it, then
+/// writing this croft's own backup, then cutting it down to a held copy
+/// all hit one file: the cut wrote over the backup of what was restored.
+/// It is moved aside before anything is restored from it.
+#[test]
+fn a_backup_at_this_crofts_own_path_is_moved_aside_before_restoring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    let b_buffer = crate::hot_exit::Buffer {
+        tab: crate::session_state::OpenTabState {
+            path: Some(b.clone()),
+            dirty: true,
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll: 0,
+            scroll_col: 0,
+            unsaved_text: Some(String::from("zbravo\n")),
+        },
+        disk_stamp: None,
+    };
+    two_dead_backups_of_a(
+        tmp.path(),
+        cache.path(),
+        ["first\n", "second\n"],
+        vec![b_buffer],
+    );
+    // The older backup, holding a.txt and b.txt, sits at this croft's own
+    // path; its write time comes with it.
+    let older = hot_exit_files(cache.path(), tmp.path())
+        .into_iter()
+        .find(|f| f.ends_with("1-1.json"))
+        .unwrap();
+    let own = crate::hot_exit::own_path(cache.path(), tmp.path());
+    std::fs::rename(&older, &own).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.status.contains("restored 2 unsaved tabs"),
+        "{}",
+        next.status
+    );
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &b),
+        ["zbravo\n"],
+        "b.txt's restored text is backed up"
+    );
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        ["first\n", "second\n"],
+        "and so are both copies of a.txt"
+    );
+}
+
+/// #862 review (CodeRabbit, security): a tab closed without saving had its
+/// text left in the hot-exit backup until a later tick rewrote it, so a
+/// crash in between brought back text the user had chosen to discard. The
+/// close rewrites the backup at once.
+#[test]
+fn discarding_a_tab_takes_its_text_out_of_the_backup_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a).len(),
+        1,
+        "setup: backed up"
+    );
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.contains("without saving"), "{}", app.status);
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        Vec::<String>::new(),
+        "no tick has run, and the discarded text is gone from disk"
+    );
+}
+
+/// #862 review, the guard: discarding one tab leaves the others' unsaved
+/// text in the backup.
+#[test]
+fn discarding_a_tab_keeps_the_other_unsaved_tabs_backed_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "z");
+    settle_hot_exit(&mut app);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()), "setup");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &b),
+        Vec::<String>::new()
+    );
+    assert_eq!(hot_exit_texts_of(cache.path(), tmp.path(), &a).len(), 1);
+}
+
 /// #862 hot exit negative: only the launched workspace's backup comes back;
 /// another workspace's stays where it is for that workspace's next launch.
 #[test]
