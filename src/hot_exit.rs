@@ -94,6 +94,20 @@ pub fn own_path(dir: &Path, root: &Path) -> PathBuf {
     workspace_dir(dir, root).join(name)
 }
 
+/// Move a dead croft's backup that sits at this croft's own path (`own`) to
+/// a name of its own beside it, so restoring from it and writing this
+/// croft's backup never meet in one file. The new name reads as a dead
+/// croft's of the same pid, so a later launch still finds it. `None` when
+/// it could not be moved: it is then left where it is.
+pub fn move_aside(own: &Path) -> Option<PathBuf> {
+    let pid = std::process::id();
+    (0..1000u64)
+        .map(|n| own.with_file_name(format!("{pid}-{n}.json")))
+        .filter(|aside| aside.as_path() != own)
+        .find(|aside| std::fs::symlink_metadata(aside).is_err())
+        .filter(|aside| std::fs::rename(own, aside).is_ok())
+}
+
 /// When process `pid` started, in whole seconds since the epoch, or `None`
 /// when the platform will not say (the process is gone, or hidden from this
 /// user). With the pid it names one process: a later process given the

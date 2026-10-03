@@ -57845,6 +57845,12 @@ impl App {
             // Closing the focused group's last tab while split closes the
             // group: collapse back to the surviving column.
             self.collapse_split_if_empty();
+            // A tab closed without saving takes its text out of the
+            // hot-exit backup now (#862 review), not at a later tick: a
+            // crash in between would bring back what was discarded.
+            if self.hot_exit_written.is_some() && self.unsaved_stamp() != self.hot_exit_written {
+                self.write_hot_exit();
+            }
         }
     }
 
@@ -58128,7 +58134,32 @@ impl App {
         let mut filled: Vec<PathBuf> = Vec::new();
         let mut doubled: Vec<PathBuf> = Vec::new();
         let mut trimmed: Vec<(PathBuf, crate::hot_exit::Backup)> = Vec::new();
-        for file in crate::hot_exit::orphaned(&dir, &root) {
+        // A dead croft's backup at this croft's own path (the start time
+        // could not be read, so the name is the recycled pid alone) would be
+        // restored from, written over by this croft's backup and cut down,
+        // all as one file. It is moved aside first; one that cannot be is
+        // left alone, and this croft keeps no backup rather than write over
+        // it.
+        let own = self.hot_exit_path();
+        let mut orphans = crate::hot_exit::orphaned(&dir, &root);
+        if let Some(own) = own.as_ref().filter(|own| orphans.contains(own)) {
+            match crate::hot_exit::move_aside(own) {
+                Some(aside) => {
+                    for file in orphans.iter_mut().filter(|f| *f == own) {
+                        *file = aside.clone();
+                    }
+                }
+                None => {
+                    self.hot_exit_dir = None;
+                    self.status = format!(
+                        "Hot exit is off for this session: a backup is at its own path, {}, and could not be moved aside",
+                        own.display()
+                    );
+                    return;
+                }
+            }
+        }
+        for file in orphans {
             let backup = match crate::hot_exit::Backup::load(&file) {
                 Ok(backup) if backup.is_of(&root) => backup,
                 // Another workspace's, under a colliding digest.
