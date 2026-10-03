@@ -12,14 +12,15 @@ is Cargo.toml's version line along main's first-parent chain. Neither is a
 counter stored in the repo, so a repeated run reaches the same answer.
 
 Usage (CI):
-  publish_cadence.py --every N --head <Cargo.toml version> --from-git --fetch [--force]
+  publish_cadence.py --every N --head <Cargo.toml version> --from-git --fetch [--tagged] [--force]
 
 Usage (tests, offline):
-  publish_cadence.py --every N --head V --history FILE --published FILE [--force]
+  publish_cadence.py --every N --head V --history FILE --published FILE [--tagged] [--force]
 
   --history   one version per line, newest first (what --from-git produces)
   --published the crate's sparse-index file, one JSON object per line (what
               --fetch downloads)
+  --tagged    the tag v<head> already exists
 
 Prints `key=value` lines ready for $GITHUB_OUTPUT:
 
@@ -27,7 +28,10 @@ Prints `key=value` lines ready for $GITHUB_OUTPUT:
   latest_published=   the newest crates.io version found in main's history
   bumps=              versions main carried after it, head included
   already_published=  whether head itself is on crates.io
-  publish=            bumps >= N, or --force
+  tagged=             whether v<head> already exists
+  publish=            bumps >= N, --force, or a head that is on crates.io
+                      but not tagged: an upload whose tag and release.yml
+                      handoff never ran, which a re-run must still finish
 
 Exit status 2 means the inputs were refused: a malformed version, a history
 that does not start with --head (read from the wrong commit, or truncated),
@@ -158,20 +162,35 @@ def fetch_index(name: str) -> str:
 
 
 def decide(
-    history: list[str], published: set[str], head: str, every: int, force: bool
+    history: list[str],
+    published: set[str],
+    head: str,
+    every: int,
+    force: bool,
+    tagged: bool = False,
 ) -> dict[str, str]:
+    """The `key=value` outputs for main's head.
+
+    Uploading and handing off are separate: once head is on crates.io its
+    bump count is 0, so the cadence alone would never run the publish job
+    again, and an upload whose tagging failed would stay without its tag and
+    release. A published, untagged head is therefore due on its own.
+    """
     if history[0] != head:
         raise CadenceError(
             f"history starts at {history[0]}, not at head version {head}; "
             "it was read from the wrong commit or is truncated"
         )
     bumps, latest = bumps_since(history, published)
+    already_published = head in published
+    pending_handoff = already_published and not tagged
     return {
         "version": head,
         "latest_published": latest,
         "bumps": str(bumps),
-        "already_published": str(head in published).lower(),
-        "publish": str(force or due(bumps, every)).lower(),
+        "already_published": str(already_published).lower(),
+        "tagged": str(tagged).lower(),
+        "publish": str(force or due(bumps, every) or pending_handoff).lower(),
     }
 
 
@@ -180,6 +199,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--every", type=int, required=True)
     parser.add_argument("--head", required=True, help="Cargo.toml's version")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--tagged", action="store_true", help="v<head> exists")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--history", type=Path)
     source.add_argument("--from-git", action="store_true")
@@ -200,6 +220,7 @@ def main(argv: list[str]) -> int:
             args.head,
             args.every,
             args.force,
+            args.tagged,
         )
     except (CadenceError, OSError, subprocess.CalledProcessError) as err:
         print(f"publish_cadence: {err}", file=sys.stderr)

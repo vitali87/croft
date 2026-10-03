@@ -154,6 +154,7 @@ class Cli(unittest.TestCase):
                 "latest_published": "0.2.2",
                 "bumps": "3",
                 "already_published": "false",
+                "tagged": "false",
                 "publish": "true",
             },
         )
@@ -176,6 +177,32 @@ class Cli(unittest.TestCase):
         got = self.outputs(proc)
         self.assertEqual(got["already_published"], "true")
         self.assertEqual(got["bumps"], "0")
+
+    def test_a_published_untagged_head_is_due_without_force(self):
+        # cargo publish uploaded, then tagging failed: the count is 0, but
+        # the tag and the release.yml handoff are still owed, so a plain
+        # re-run must still run the publish job (which skips the upload).
+        self.index.write_text(index("0.2.5"))
+        proc = self.run_cli("--every", "50")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        got = self.outputs(proc)
+        self.assertEqual(got["bumps"], "0")
+        self.assertEqual(got["already_published"], "true")
+        self.assertEqual(got["tagged"], "false")
+        self.assertEqual(got["publish"], "true")
+
+    def test_a_published_tagged_head_is_not_due(self):
+        self.index.write_text(index("0.2.5"))
+        proc = self.run_cli("--every", "50", "--tagged")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        got = self.outputs(proc)
+        self.assertEqual(got["tagged"], "true")
+        self.assertEqual(got["publish"], "false")
+
+    def test_a_tag_alone_does_not_make_an_unpublished_head_due(self):
+        proc = self.run_cli("--every", "50", "--tagged")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.outputs(proc)["publish"], "false")
 
     def test_refuses_a_head_the_history_does_not_start_with(self):
         # A history whose first entry is not Cargo.toml's version was read

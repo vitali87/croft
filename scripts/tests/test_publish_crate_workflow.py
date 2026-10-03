@@ -46,6 +46,33 @@ class WorkflowContract(unittest.TestCase):
         self.assertNotIn("contents: write", decide)
         self.assertIn("id-token: write", publish)
 
+    def test_decide_refuses_a_ref_other_than_main(self):
+        # A manual dispatch can name any branch; a forced run there would
+        # publish that branch's code under the crate's identity.
+        self.assertIn("if: github.ref != 'refs/heads/main'", self.text)
+
+    def test_decide_tells_the_script_whether_the_tag_exists(self):
+        # Without it, a head that was uploaded but never tagged counts 0
+        # bumps and the publish job never runs again to finish the handoff.
+        self.assertIn('flags+=(--tagged)', self.text)
+        self.assertIn('"${flags[@]}"', self.text)
+
+    def test_upload_is_skipped_on_a_fresh_index_check(self):
+        # decide's already_published goes stale when only the publish job is
+        # re-run after an upload that landed, so the upload asks again.
+        _, publish = re.split(r"(?m)^  publish:$", self.text)
+        self.assertIn("pc.fetch_index(pc.CRATE)", publish)
+        self.assertEqual(
+            publish.count("if: steps.index.outputs.uploaded != 'true'"), 2
+        )
+        self.assertNotIn("needs.decide.outputs.already_published", publish)
+
+    def test_an_existing_tag_must_name_the_published_commit(self):
+        # release.yml builds what the tag points at; a stale tag at another
+        # commit would ship binaries that are not the crate just published.
+        self.assertIn('"refs/tags/$tag^{}"', self.text)
+        self.assertIn('if [ "$target" != "$GITHUB_SHA" ]; then', self.text)
+
     def test_release_workflow_can_be_dispatched_on_the_tag(self):
         # The tag is pushed with the workflow token, which never triggers
         # another workflow, so release.yml is dispatched by name on the tag
