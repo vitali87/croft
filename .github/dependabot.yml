@@ -4,9 +4,9 @@
 # pins current. Dependabot rewrites the SHA and the `# vX.Y.Z` comment beside
 # it together.
 #
-# Actions only. A Cargo update changes what ships, so it needs a version bump
-# and release notes (the release-hygiene job in ci.yml) that an automated PR
-# cannot write.
+# Actions only. A Cargo update changes what ships, so it needs release notes
+# (a fragment in src/release_notes/unreleased/, checked by the `release notes`
+# job in ci.yml) that an automated PR cannot write.
 version: 2
 updates:
   - package-ecosystem: github-actions

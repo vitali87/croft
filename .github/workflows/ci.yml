@@ -31,22 +31,23 @@ env:
 
 jobs:
   release-hygiene:
-    # Every merge that changes what ships must be a release in its own right
-    # (#281): the version increments (two different binaries must never share
-    # a version and differ only in commit hash), and src/release_notes/<version>.md
-    # exists and says something, so the welcome panel's "IN THIS RELEASE" card
-    # describes THIS version instead of silently carrying the previous
-    # release's story. One file per version (#399) so two open PRs describing
-    # different changes never collide on the same file.
+    # Every merge that changes what ships carries release notes (#281), so
+    # the welcome panel's card describes the binary it is in. A pull request
+    # writes them to a fragment of its own, src/release_notes/unreleased/<name>.md,
+    # and never touches `version`: after the merge, version-bump.yml folds the
+    # pending fragments into src/release_notes/<next>.md and bumps the
+    # version once, on main. When each PR bumped the version and wrote that
+    # version's notes itself, every open PR edited the same line, so each
+    # merge put all the others in conflict.
     # Docs / CI / test-only changes ship nothing and are exempt, including a
     # diff confined to a `#[cfg(test)]` module inside a shipped file (#461).
-    name: version bump + release notes
+    name: release notes
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    # This job now runs a SCRIPT from the submitted branch, which the inline
-    # shell above it never did, so it takes the same posture the doc-ownership
-    # job below documents: only what it needs to read the diff, and no
-    # checkout token left in the local git config for that script to reach.
+    # This job runs a SCRIPT from the submitted branch, so it takes the same
+    # posture the doc-ownership job below documents: only what it needs to
+    # read the diff, and no checkout token left in the local git config for
+    # that script to reach.
     #
     # Pinning the script to the base revision instead would buy nothing on
     # this trigger: `pull_request` runs the workflow file from the merge of
@@ -61,103 +62,15 @@ jobs:
           # Full history so the merge-base with the PR base resolves.
           fetch-depth: 0
           persist-credentials: false
-      - name: Shipped changes must bump the version and replace the notes
+      - name: Shipped changes add release notes and leave the version alone
+        # scripts/release.py holds the rules and their tests
+        # (scripts/tests/test_release.py): a shipped change adds at least one
+        # fragment with a highlight in it; no PR changes `version` or any
+        # src/release_notes/<version>.md, whether or not it ships.
         run: |
           set -euo pipefail
           base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
-          # --no-renames: git collapses a rename to its destination alone, so
-          # `git mv 0.1.808.md 0.1.809.md` would look like "wrote this
-          # version's notes" while destroying the previous release's. Split
-          # into a delete plus an add, the stale guard below sees the delete.
-          changed="$(git diff --no-renames --name-only "$base" HEAD)"
-          # What ships in the binary: sources, baked-in assets, the build
-          # script, and the dependency set. src/app/tests.rs and tests/ are
-          # compiled out of release builds.
-          shipped="$(printf '%s\n' "$changed" \
-            | grep -E '^(src/|assets/|build\.rs$|Cargo\.toml$|Cargo\.lock$)' \
-            | grep -vE '^(src/app/tests\.rs|tests/)' || true)"
-          # A `.rs` file whose diff touches nothing outside a
-          # `#[cfg(test)] mod tests` produces a byte-identical binary, and
-          # croft keeps most unit tests beside the code they cover, so that
-          # is the ordinary shape of a test-only fix here (#461). The path
-          # list above only reaches whole test FILES. Anything the parse is
-          # unsure about counts as shipped: waiving a bump that was needed
-          # puts two binaries on one version, which is what this job exists
-          # to prevent.
-          # Read the list a line at a time rather than word-splitting it: an
-          # unquoted `for f in $shipped` also expands globs, so a path
-          # holding `[`, `*` or `?` would reach the filter as a pathspec git
-          # cannot resolve, and a path holding a space would arrive as two.
-          kept="$(mktemp)"
-          trap 'rm -f "$kept"' EXIT
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            if python3 scripts/ships_nothing.py "$base" HEAD "$f"; then
-              # The status says "ships nothing"; it does not say why, and the
-              # script has more than one way to reach it. Claiming the reason
-              # here asserted "confined to #[cfg(test)]" about files that had
-              # no test module at all.
-              echo "$f: ships nothing."
-            else
-              printf '%s\n' "$f" >> "$kept"
-            fi
-          done <<< "$shipped"
-          shipped="$(cat "$kept")"
-          if [ -z "$shipped" ]; then
-            echo "No shipped files changed; no release required."
-            exit 0
-          fi
-          echo "Shipped files changed:"
-          printf '  %s\n' "$shipped"
-          ver() { git show "$1:Cargo.toml" | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1; }
-          old="$(ver "$base")"
-          new="$(ver HEAD)"
-          fail=0
-          highest="$(printf '%s\n%s\n' "$old" "$new" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1)"
-          if [ "$new" = "$old" ] || [ "$highest" != "$new" ]; then
-            echo "::error file=Cargo.toml::This PR changes shipped files but the version is still $old. Bump it (base: $old, head: $new) - two binaries must never share a version and differ only in commit hash."
-            fail=1
-          fi
-          # Versions count like an odometer, the same rule as code-graph-rag:
-          # MINOR and PATCH stay below 1000, and a bump that reaches 1000
-          # carries into the next component and resets the lower ones, so
-          # 0.1.999 is followed by 0.2.0 and never by 0.1.1000. A base already
-          # past the cap carries on its next bump the same way.
-          if ! python3 scripts/next_version.py --check "$new"; then
-            next="$(python3 scripts/next_version.py "$old" 2>/dev/null || true)"
-            echo "::error file=Cargo.toml::Version $new has a component at or above 1000. MINOR and PATCH stay below 1000 and carry into the next component, like an odometer; the next version after $old is ${next:-unknown} (python3 scripts/next_version.py $old)."
-            fail=1
-          fi
-          # One notes file per version (#399): the check is that THIS version's
-          # file exists and says something, not that a shared file was touched.
-          # Two PRs adding different versions' notes then never collide.
-          notes="src/release_notes/$new.md"
-          # AUTHORSHIP, not merely existence. A file for this version can
-          # already be on main - left behind by a revert that dropped the
-          # code but not the notes - and a bump onto it would pass while the
-          # panel advertised a release the binary does not contain. This PR
-          # has to have written it.
-          if ! printf '%s\n' "$changed" | grep -qx "$notes"; then
-            echo "::error file=$notes::This PR changes shipped files but does not write $notes. Write this version's highlights there, one per line, each prefixed 'feature:' or 'fix:', so the welcome panel describes the binary it is in. A file left on main by an earlier revert does not count."
-            fail=1
-          elif ! git cat-file -e "HEAD:$notes" 2>/dev/null; then
-            echo "::error file=$notes::$notes was changed but does not exist at HEAD. This version's notes cannot be the file the PR deleted."
-            fail=1
-          elif [ -z "$(git show "HEAD:$notes" | tr -d '[:space:]')" ]; then
-            echo "::error file=$notes::$notes is empty. Write this version's highlights there, one per line, each prefixed 'feature:' or 'fix:'."
-            fail=1
-          fi
-          # A shipped release describes itself and nothing else: editing an
-          # older version's notes rewrites what a binary already out there
-          # claims to be.
-          stale="$(printf '%s\n' "$changed" | grep -E '^src/release_notes/[0-9.]+\.md$' | grep -v "^$notes$" || true)"
-          if [ -n "$stale" ]; then
-            echo "Notes for other versions were modified:"
-            printf '  %s\n' $stale
-            echo "::error::A release's notes describe that release. Only $notes may change in this PR."
-            fail=1
-          fi
-          exit $fail
+          python3 scripts/release.py check "$base" HEAD
 
   doc-ownership:
     # Rust attaches a `///` block to whatever item FOLLOWS it, so inserting a

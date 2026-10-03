@@ -6,15 +6,16 @@ path list, so `src/app/tests.rs` and `tests/` are exempt while a change
 confined to a `#[cfg(test)] mod tests` inside a shipped file is not (#461).
 croft keeps most unit tests beside the code they cover, so that is the ordinary
 shape of a test-only fix here: the release binary is byte-identical, and the
-only way to satisfy the gate is to bump a version and write user-facing notes
-for a change the binary does not contain.
+only way to satisfy the gate is to write user-facing notes for a change the
+binary does not contain.
 
-The two ways to be wrong are not symmetric. Waiving a bump that was needed puts
-two different binaries on one version, which is the thing the gate exists to
-prevent; asking for a bump that was not needed costs a version number. So every
-uncertainty resolves to "ships": a module whose opening brace is not on the
-`mod` line, a `#[cfg(test)]` on anything other than a module, a file that is not
-Rust.
+The two ways to be wrong are not symmetric. Waiving notes that were needed
+ships a change no note describes, and with no fragment pending the
+version-bump workflow releases nothing for it, so two different binaries share
+a version; asking for notes that were not needed costs a line of notes. So
+every uncertainty resolves to "ships": a module whose opening brace is not on
+the `mod` line, a `#[cfg(test)]` on anything other than a module, a file that
+is not Rust.
 
 Usage: ships_nothing.py <base> <head> <path>
 Exit 0 when the change ships nothing, 1 when it ships something.
@@ -40,7 +41,7 @@ from check_doc_ownership import (  # noqa: E402
 # The attribute on its own line, which is what rustfmt produces and what every
 # test module in this repo has. `#[cfg(test)] mod tests {` on one line is legal
 # and is deliberately not matched: it is not a shape that occurs here, and
-# missing it only costs a version bump.
+# missing it only costs a release-notes fragment.
 CFG_TEST = re.compile(r"^\s*#\[cfg\(test\)\]\s*$")
 
 MOD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*")

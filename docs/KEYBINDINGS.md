@@ -475,7 +475,9 @@ Mapped fields: `name`, `type` (`python`/`debugpy`, `lldb`/`cppdbg`, `node`/`pwa-
 | `F10` | Step over |
 | `F11` / `Shift+F11` | Step into / out |
 
-A bare `F5` / `F9` / `F10` / `F11` pressed while the **terminal pane** is focused and no debug session is live is forwarded to the app running in the shell (process-compose's `F10` Quit, htop's `F9` kill) instead of being claimed by the debugger. Modified chords keep their debug meaning everywhere, and `F9` still re-execs into a landed croft update.
+A bare `F5` / `F9` / `F10` / `F11` pressed while the **terminal pane** is focused and no debug session is live is forwarded to the app running in the shell (process-compose's `F10` Quit, htop's `F9` kill) instead of being claimed by the debugger. Modified chords keep their debug meaning everywhere.
+
+`F9` is Toggle Breakpoint whatever croft's own updater is doing. The updater has its own chord, `Ctrl+Shift+F9` (`Cmd+Shift+F9` too), also reachable by clicking the status bar's update pill or "Help: Update croft (Relaunch or Rebuild)" in the Command Palette: it relaunches into a landed update ("⟳ Update ready"), or, when croft is older than the source checkout it was built from ("⟳ croft abc1234 < repo def5678"), rebuilds and reinstalls it in the background.
 
 Right-clicking the editor **gutter** (the glyph margin / line-number column) opens a breakpoint menu on the clicked line, mirroring VS Code's glyph-margin menu: **Add Breakpoint** / **Remove Breakpoint** and **Add Conditional Breakpoint** / **Edit Condition** (the cursor does not move).
 

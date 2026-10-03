@@ -676,7 +676,7 @@ pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::R
             WaitStep::Poll => continue,
             WaitStep::Closed => return Ok(()),
             WaitStep::CannotWait => anyhow::bail!(
-                "the croft hosting this pane is older than `croft edit --wait`; restart it (F9) and try again"
+                "the croft hosting this pane is older than `croft edit --wait`; restart it (Ctrl+Shift+F9, Cmd+Shift+F9 on macOS) and try again"
             ),
         }
     }
