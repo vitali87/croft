@@ -65875,6 +65875,84 @@ fn the_whole_tour_takes_enter_only_and_leaves_nothing_behind() {
     });
 }
 
+/// #863: at 80x24 every built-in step shows its whole caption and the keys
+/// that move the tour. One clamped line of progress, caption and keys cut
+/// the keys first, and the theme picker the palette step opens covered the
+/// caption's start.
+#[test]
+fn every_tour_caption_shows_whole_with_its_keys_at_80_columns() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Draw, then read the caption panel back off the screen: every
+        // row but the last is the wrapped caption, the last the keys.
+        let mut check = |app: &mut App, when: &str| {
+            let step = app.tour.as_ref().and_then(|r| r.tour.current()).unwrap();
+            let caption = step.caption_text();
+            let progress = app.tour.as_ref().unwrap().tour.progress();
+            term.draw(|f| app.render(f)).unwrap();
+            let buf = term.backend().buffer();
+            let (panel, _) = app.tour_caption_panel(buf.area).expect("a panel");
+            let row = |y: u16| {
+                (panel.x..panel.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            let body: Vec<String> = (panel.y..panel.bottom() - 1).map(row).collect();
+            assert_eq!(
+                words(&body.join(" ")),
+                words(&caption),
+                "{when}: the caption is cut: {body:#?}"
+            );
+            let keys = row(panel.bottom() - 1);
+            assert!(
+                keys.contains("Enter next \u{b7} Esc leave") && keys.contains(&progress),
+                "{when}: the keys row lost its hint: {keys:?}"
+            );
+            assert!(body.len() <= 3, "{when}: {} caption rows", body.len());
+            panel
+        };
+        let mut steps = 0;
+        let mut saw_picker = false;
+        while app.tour.is_some() && steps < 20 {
+            let action = app
+                .tour
+                .as_ref()
+                .unwrap()
+                .tour
+                .current()
+                .unwrap()
+                .action
+                .clone();
+            check(&mut app, &format!("{action:?}"));
+            if matches!(action, crate::tour::TourAction::Palette(_)) {
+                // Enter runs the typed command: the theme picker, a menu
+                // standing the frame's height along the left.
+                app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                    .unwrap();
+                assert!(app.context_menu.is_some(), "the theme picker opened");
+                let panel = check(&mut app, "the theme picker");
+                let menu = app.menu_rect().unwrap();
+                assert!(
+                    !panel.intersects(menu),
+                    "the picker {menu:?} covers the caption {panel:?}"
+                );
+                saw_picker = true;
+            }
+            app.close_all_modals_for_test();
+            app.advance_tour();
+            steps += 1;
+        }
+        assert_eq!(steps, 8, "every built-in step was checked");
+        assert!(saw_picker, "the theme picker step was checked");
+    });
+}
+
 /// #377: Esc mid-tour closes the sample's tabs too, an edited one
 /// included, so no save can write a scratch file back.
 #[test]
@@ -66275,4 +66353,194 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         "{synced:?} in {:?}",
         app.settings_chain
     );
+}
+
+/// Every cell of a drawn frame, row after row.
+fn screen_text_863(app: &mut App, w: u16, h: u16) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+/// #863 regression, drawn through base APIs only: at 80x24 each step of the
+/// tour shows the keys that move it. The caption shared one clamped line
+/// with the progress and the keys, and the keys were cut at every step.
+#[test]
+fn the_tour_keys_show_at_every_step_at_80_columns() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let mut steps = 0;
+        while app.tour.is_some() && steps < 20 {
+            app.command_palette = None;
+            app.file_finder = None;
+            app.context_menu = None;
+            let screen = screen_text_863(&mut app, 80, 24);
+            assert!(
+                screen.contains("Enter next \u{b7} Esc leave"),
+                "step {}: the keys are cut:\n{screen}",
+                steps + 1
+            );
+            app.advance_tour();
+            steps += 1;
+        }
+    });
+}
+
+/// #863 regression, drawn through base APIs only: the Quick Open step names
+/// this platform's modifier, `Ctrl+P` off macOS, where `Cmd+P` is a key that
+/// does nothing.
+#[test]
+fn the_tour_names_this_platform_s_modifier_on_screen() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        app.advance_tour();
+        app.file_finder = None;
+        let screen = screen_text_863(&mut app, 200, 50);
+        let (want, not) = if cfg!(target_os = "macos") {
+            ("Cmd+P finds", "Ctrl+P finds")
+        } else {
+            ("Ctrl+P finds", "Cmd+P finds")
+        };
+        assert!(
+            screen.contains(want) && !screen.contains(not),
+            "the Quick Open caption names {want:?}:\n{screen}"
+        );
+        app.finish_tour();
+    });
+}
+
+/// #863 negative: the caption panel keeps out of a frame too small to hold
+/// it, and drawing the tour there does not panic.
+#[test]
+fn the_tour_caption_panel_stays_out_of_a_frame_too_small_for_it() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 24)).is_some());
+        assert!(app.tour_caption_panel(Rect::new(0, 0, 19, 24)).is_none());
+        assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 3)).is_none());
+        for (w, h) in [(20, 4), (19, 24), (80, 3), (12, 2)] {
+            let _ = screen_text_863(&mut app, w, h);
+        }
+        app.finish_tour();
+        assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 24)).is_none());
+    });
+}
+
+/// #863 (issue comment): a tour ended by closing croft's terminal left its
+/// `croft-demo-<pid>-<stamp>` folder in the cache, and the next `croft demo`
+/// made its own beside it. Starting the tour now sweeps a marked folder
+/// whose croft is gone, and keeps this croft's own and an unmarked one.
+#[test]
+fn starting_the_tour_sweeps_a_dead_tour_s_scratch_folder() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let demo = croft_cache_dir().join("demo");
+        let make = |name: &str, marked: bool| {
+            let dir = demo.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("README.md"), "# old tour\n").unwrap();
+            if marked {
+                std::fs::write(dir.join(crate::tour::SCRATCH_MARKER), "scratch\n").unwrap();
+            }
+            dir
+        };
+        // A pid above any kernel's pid_max: no such process.
+        let dead = make("croft-demo-2147483647-1", true);
+        let unmarked = make("croft-demo-2147483646-1", false);
+        let mine = make(&format!("croft-demo-{}-1", std::process::id()), true);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        assert!(app.tour.is_some());
+        assert!(!dead.exists(), "the dead tour's folder is swept");
+        assert!(
+            unmarked.is_dir(),
+            "an unmarked folder is not croft's to delete"
+        );
+        assert!(mine.is_dir(), "this croft's own folder stays");
+        app.finish_tour();
+    });
+}
+
+/// #863: step 1 says Esc leaves the tour at any time and the keys row says
+/// "Esc leave", but with the theme picker a step opened, Esc closed only
+/// the picker. Esc with a modal the tour opened (the palette, Quick Open,
+/// the theme picker) now closes it and leaves the tour.
+#[test]
+fn esc_leaves_the_tour_from_a_picker_the_tour_opened() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let scratch = app.workspace_root().to_path_buf();
+        let theme = app.theme;
+        // Enter through the steps until one has a picker up.
+        let mut presses = 0;
+        while app.context_menu.is_none() && app.tour.is_some() && presses < 20 {
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            presses += 1;
+        }
+        assert!(
+            app.context_menu.is_some(),
+            "fixture: the theme picker is up"
+        );
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            app.tour.is_none(),
+            "Esc leaves the tour, as its keys row says"
+        );
+        assert!(app.context_menu.is_none(), "and the picker goes with it");
+        assert!(app.command_palette.is_none() && app.file_finder.is_none());
+        assert_eq!(app.theme, theme, "leaving picked no theme");
+        assert_eq!(app.workspace_root(), tmp.path());
+        assert!(!scratch.exists());
+    });
+}
+
+/// #863 negative: a palette the user opens themselves mid-tour is theirs:
+/// Esc closes it and the tour goes on.
+#[test]
+fn esc_in_a_palette_the_user_opened_keeps_the_tour() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        assert!(
+            app.command_palette.is_none(),
+            "fixture: step 1 opens no modal"
+        );
+        app.open_command_palette();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.command_palette.is_none());
+        assert!(app.tour.is_some(), "the tour goes on");
+        app.finish_tour();
+    });
 }

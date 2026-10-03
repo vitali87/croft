@@ -2569,6 +2569,9 @@ pub struct TourRun {
     pub tour: crate::tour::Tour,
     pub scratch: PathBuf,
     pub previous_root: PathBuf,
+    /// The current step opened a palette, Quick Open or a picker, whose Esc
+    /// then leaves the tour rather than only closing it (#863).
+    pub step_opened_modal: bool,
 }
 
 /// The live ssh-pane workspace offer (#364): which pane's foreground became
@@ -19474,7 +19477,6 @@ impl App {
         }
         self.render_port_toast(frame);
         self.render_update_toast(frame);
-        self.render_tour_caption(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
         self.render_prompt(frame);
@@ -19494,6 +19496,9 @@ impl App {
         self.render_terminal_find(frame);
         self.render_file_finder(frame);
         self.render_command_palette(frame);
+        // Above the pickers a tour step opens (#863), so they never hide
+        // the caption explaining them.
+        self.render_tour_caption(frame);
         self.render_go_to_symbol(frame);
         self.render_workspace_symbols(frame);
         self.render_process_picker(frame);
@@ -21552,6 +21557,31 @@ impl App {
         }
         if self.shortcuts_modal.is_some() {
             self.handle_shortcuts_modal_key(key);
+            return Ok(());
+        }
+        // The tour (#377): Esc leaves it at any time, as its first caption
+        // and its keys row say, from a palette, Quick Open or picker its step
+        // opened too (#863). Esc there closed only that, so at the theme
+        // picker a user taking the caption at its word stayed in the tour.
+        // A modal the user opens mid-tour is theirs: its Esc just closes it.
+        if key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && key.kind == KeyEventKind::Press
+            && self.tour.as_ref().is_some_and(|run| run.step_opened_modal)
+            && (self.command_palette.is_some()
+                || self.file_finder.is_some()
+                || self.context_menu.is_some())
+        {
+            if self.command_palette.is_some() {
+                self.close_command_palette();
+            }
+            if self.file_finder.is_some() {
+                self.close_file_finder();
+            }
+            if self.context_menu.take().is_some() {
+                self.overlays.activity.mark_dirty();
+            }
+            self.finish_tour();
             return Ok(());
         }
         if self.file_finder.is_some() {
@@ -36682,7 +36712,11 @@ impl App {
                 return;
             }
         };
-        let scratch = match crate::tour::create_scratch(&croft_cache_dir().join("demo")) {
+        // A tour ended by closing croft's terminal left its scratch folder
+        // behind (#863): clear those whose croft is gone before adding one.
+        let demo_dir = croft_cache_dir().join("demo");
+        crate::tour::sweep_dead_scratch(&demo_dir, process_is_alive);
+        let scratch = match crate::tour::create_scratch(&demo_dir) {
             Ok(d) => d,
             Err(e) => {
                 self.status = format!("The tour could not create its sample project: {e}");
@@ -36696,6 +36730,7 @@ impl App {
             tour,
             scratch,
             previous_root,
+            step_opened_modal: false,
         });
         if let Some(action) = first {
             self.perform_tour_action(action);
@@ -36742,9 +36777,14 @@ impl App {
 
     fn perform_tour_action(&mut self, action: crate::tour::TourAction) {
         use crate::tour::TourAction as A;
-        let Some(scratch) = self.tour.as_ref().map(|r| r.scratch.clone()) else {
+        let Some(run) = self.tour.as_mut() else {
             return;
         };
+        run.step_opened_modal = matches!(
+            action,
+            A::QuickOpen | A::FindFile(_) | A::CommandPalette | A::Palette(_) | A::ThemePicker
+        );
+        let scratch = run.scratch.clone();
         match action {
             A::Open(rel) => {
                 if let Err(e) = self.open_at(&scratch.join(rel), 0, 0) {
@@ -36807,41 +36847,109 @@ impl App {
         }
     }
 
-    /// The caption chip (#377): step, caption and keys, above the status bar.
+    /// The caption panel (#377): the step's caption, wrapped, over a row of
+    /// its own for the progress and the keys, above the status bar.
+    ///
+    /// The keys have that row so no caption can push them off (#863): one
+    /// clamped line of progress, caption, then keys cut the keys first, and
+    /// at 80 columns every step lost them.
     fn render_tour_caption(&mut self, frame: &mut ratatui::Frame) {
+        let Some((rect, caption)) = self.tour_caption_panel(frame.area()) else {
+            return;
+        };
         let Some(run) = self.tour.as_ref() else {
             return;
         };
-        let Some(step) = run.tour.current() else {
-            return;
+        let style = Style::default()
+            .fg(self.theme.accent_contrast_fg())
+            .bg(self.theme.accent())
+            .add_modifier(Modifier::BOLD);
+        let body = Rect {
+            x: rect.x + 1,
+            width: rect.width.saturating_sub(2),
+            height: rect.height - 1,
+            ..rect
         };
-        let area = frame.area();
-        if area.width < 20 || area.height < 4 {
-            return;
-        }
-        let text = format!(
-            " {}  {}   Enter next \u{b7} Esc leave ",
-            run.tour.progress(),
-            step.caption
-        );
-        let width = (text.chars().count() as u16 + 2).min(area.width - 2);
-        let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
-        let rect = Rect {
-            x: area.x + (area.width - width) / 2,
-            y: area.y + area.height - status_h - 2,
-            width,
+        let keys = Rect {
+            y: rect.bottom() - 1,
             height: 1,
+            ..body
         };
         frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(ratatui::widgets::Block::new().style(style), rect);
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(text).style(
-                Style::default()
-                    .fg(self.theme.accent_contrast_fg())
-                    .bg(self.theme.accent())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            rect,
+            Paragraph::new(caption).wrap(ratatui::widgets::Wrap { trim: true }),
+            body,
         );
+        let progress = run.tour.progress();
+        let gap = (keys.width as usize)
+            .saturating_sub(progress.len() + Line::from(Self::TOUR_KEYS).width());
+        // Too narrow for both, the keys win: they are what moves the tour.
+        let row = if gap >= 2 {
+            Line::from(format!("{progress}{}{}", " ".repeat(gap), Self::TOUR_KEYS))
+        } else {
+            Line::from(Self::TOUR_KEYS).right_aligned()
+        };
+        frame.render_widget(Paragraph::new(row), keys);
+    }
+
+    /// The caption panel's key hint, on the panel's last row.
+    const TOUR_KEYS: &str = "Enter next \u{b7} Esc leave";
+
+    /// Where the tour's caption panel goes in `area`, with the caption it
+    /// shows: centred above the status bar, as tall as the wrapped caption
+    /// plus the keys row. A menu it would overlap moves it beside the menu
+    /// (#863): the theme picker a step opens stands the frame's full height
+    /// on the left, and covered the caption's start. `None` between steps,
+    /// or in a frame too small to hold it.
+    fn tour_caption_panel(&self, area: Rect) -> Option<(Rect, String)> {
+        let run = self.tour.as_ref()?;
+        let step = run.tour.current()?;
+        if area.width < 20 || area.height < 4 {
+            return None;
+        }
+        let caption = step.caption_text();
+        let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
+        let bottom = area.bottom().saturating_sub(status_h);
+        // As wide as the caption on one row, or as the keys row, within the
+        // columns `left..right`; a column of padding on each side.
+        let needed = Line::from(caption.as_str())
+            .width()
+            .max(run.tour.progress().len() + 2 + Line::from(Self::TOUR_KEYS).width())
+            + 2;
+        let panel = |left: u16, right: u16| {
+            let room = right.saturating_sub(left);
+            let width = u16::try_from(needed).unwrap_or(u16::MAX).min(room);
+            let rows = Paragraph::new(caption.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .line_count(width.saturating_sub(2)) as u16;
+            let height = rows.saturating_add(1).min(bottom.saturating_sub(area.y));
+            Rect {
+                x: left + (room - width) / 2,
+                y: bottom - height,
+                width,
+                height,
+            }
+        };
+        let mut rect = panel(area.x + 1, area.right() - 1);
+        if let Some(menu) = self.menu_rect()
+            && menu.intersects(rect)
+        {
+            // The wider side of the menu, while it leaves a readable column;
+            // on a frame too narrow for that, the panel covers the menu.
+            let before = (area.x + 1, menu.x.saturating_sub(1));
+            let after = (menu.right() + 1, area.right() - 1);
+            let span = |(l, r): (u16, u16)| r.saturating_sub(l);
+            let side = if span(after) >= span(before) {
+                after
+            } else {
+                before
+            };
+            if span(side) >= 40 {
+                rect = panel(side.0, side.1);
+            }
+        }
+        Some((rect, caption))
     }
 
     /// Close every picker and palette a tour step may have opened.
