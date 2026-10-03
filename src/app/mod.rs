@@ -2762,6 +2762,58 @@ type PendingTestDebug = (
     PathBuf,
 );
 
+/// A "Running …" status an operation put in the status bar (#856), kept
+/// until the operation ends so the bar can say how it went instead of
+/// claiming it still runs: a test run, a task, a runnable fenced block.
+/// All of them end through [`RunningStatus::settle`].
+struct RunningStatus {
+    /// The status text the operation set; replaced only while the bar
+    /// still shows it, so a newer message is never clobbered.
+    shown: String,
+    /// What ran, as the outcome names it: a test's own name, `suite X`,
+    /// `CodeQL tests`, a task's label, a fenced block's pane.
+    label: String,
+    started: std::time::Instant,
+}
+
+impl RunningStatus {
+    /// The bar shows `shown`, just set by the run of `label`.
+    fn new(shown: &str, label: String) -> Self {
+        Self {
+            shown: shown.to_string(),
+            label,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// The run is over: put `outcome(label, time since it started)` in
+    /// `status`, only if that still shows what the run set. Whether it did.
+    fn settle(
+        self,
+        status: &mut String,
+        outcome: impl FnOnce(&str, std::time::Duration) -> String,
+    ) -> bool {
+        if *status != self.shown {
+            return false;
+        }
+        *status = outcome(&self.label, self.started.elapsed());
+        true
+    }
+}
+
+/// How a command a terminal pane ran ended, for the status bar (#856), from
+/// the shell's own command-finished report: `label finished (exit 0, 0.4
+/// s)`, or `label failed (exit 2, 1.3 s)`. A shell that reported no exit
+/// code gets `label finished (0.4 s)`.
+fn pane_run_outcome(label: &str, exit: Option<i32>, dur: std::time::Duration) -> String {
+    let took = format!("{:.1} s", dur.as_secs_f64());
+    match exit {
+        Some(0) => format!("{label} finished (exit 0, {took})"),
+        Some(code) => format!("{label} failed (exit {code}, {took})"),
+        None => format!("{label} finished ({took})"),
+    }
+}
+
 /// A COMMITS graph reply: the root and revspec it answers, and the rows.
 /// Tagged rather than bare so a reply for a since-left root or a superseded
 /// view is discarded on drain (#348).
@@ -2808,6 +2860,11 @@ pub struct App {
     pub codeql: crate::widgets::codeql::CodeqlPanel,
     /// Background `cargo test` worker feeding the Testing panel.
     test_worker: crate::testing::worker::TestWorker,
+    /// The run whose "Running test …" status awaits its outcome (#856).
+    test_run_status: Option<RunningStatus>,
+    /// Tasks and fenced blocks whose "Running …" status awaits their pane's
+    /// command-finished report (#856), by pane uid.
+    pane_run_statuses: Vec<(u64, RunningStatus)>,
     /// The Extensions side panel: bundled + installed extensions with toggles.
     pub extensions: crate::widgets::extensions::ExtensionsPanel,
     /// Extension ids VS Code reported installed, from the last
@@ -5449,6 +5506,8 @@ impl App {
             testing: crate::widgets::testing::TestingPanel::new(),
             codeql: crate::widgets::codeql::CodeqlPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
+            test_run_status: None,
+            pane_run_statuses: Vec::new(),
             extensions,
             vscode_listed: Vec::new(),
             disabled_extensions,
@@ -22791,8 +22850,9 @@ impl App {
         }
     }
 
-    /// Testing view keys: Enter runs all tests, `r` re-discovers, arrows scroll
-    /// the tree, Esc returns to the Explorer (mirrors the Run-and-Debug view).
+    /// Testing view keys: Enter runs all tests, `r` re-discovers, `o` shows the
+    /// runner's output, arrows scroll the tree, Esc returns to the Explorer
+    /// (mirrors the Run-and-Debug view).
     fn handle_testing_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
@@ -22801,10 +22861,25 @@ impl App {
             KeyCode::Char('w' | 'W') => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
             }
+            KeyCode::Char('o' | 'O') => self.show_test_runner_output(),
             KeyCode::Up => self.testing.scroll_up(1),
             KeyCode::Down => self.testing.scroll_down(1),
             _ => {}
         }
+    }
+
+    /// Open the bottom panel on OUTPUT with the Test Runner channel selected
+    /// (#845): where a failed discovery's or run's reason (the traceback,
+    /// the compile error) actually is. `o` in the Testing view, or a click
+    /// on its "see OUTPUT › Test Runner" pointer.
+    fn show_test_runner_output(&mut self) {
+        // The panel mirrors the bus's channels only when it syncs, and the
+        // runner may have written its first line since the last frame.
+        self.output.sync();
+        if !self.output.select_by_name(crate::output::CHANNEL_TESTS) {
+            self.status = String::from("The test runner has not written any output yet");
+        }
+        self.set_bottom_panel_tab(BottomPanelTab::Output);
     }
 
     /// Whether an enabled runner extension claims this workspace. When none
@@ -22830,6 +22905,8 @@ impl App {
         self.active_test_root = root.clone();
         self.test_worker.set_root(root);
         self.testing.reset();
+        // The old root's run will never report its end (#856).
+        self.test_run_status = None;
         // The build this armed for is being dropped (#373).
         self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
@@ -23111,8 +23188,11 @@ impl App {
     /// line adds which test and how to get to it.
     fn tick_test_watch(&mut self) -> bool {
         use crate::testing::watch::{WatchNotice, WatchScope};
-        let mut changed = false;
-        if let Some(ok) = self.testing.take_finished()
+        // The one reader of the run-ended latch also settles a run's
+        // "Running …" status (#856).
+        let finished = self.testing.take_finished();
+        let mut changed = self.announce_test_run_end(finished);
+        if let Some(ok) = finished
             && self.testing.watch.finished(ok) == WatchNotice::NewlyRed
         {
             self.status = match self.testing.first_failed() {
@@ -23171,6 +23251,7 @@ impl App {
         }
         self.run_all_tests();
         self.status = String::from("Running CodeQL tests");
+        self.await_test_run_outcome(String::from("CodeQL tests"));
     }
 
     /// CodeQL: Accept Test Output (#578): make a failing CodeQL test's
@@ -23325,6 +23406,52 @@ impl App {
         }
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run}");
+        self.await_test_run_outcome(crate::testing::leaf_name(&run).to_string());
+    }
+
+    /// Keep the "Running …" status a test run just set until the run ends,
+    /// when [`Self::announce_test_run_end`] replaces it with the outcome
+    /// (#856).
+    fn await_test_run_outcome(&mut self, label: String) {
+        self.test_run_status = Some(RunningStatus::new(&self.status, label));
+    }
+
+    /// Once the test run that set a "Running …" status is over, say how it
+    /// went there (#856): the panel's tree updates, but nothing else touched
+    /// the status bar, which went on claiming a run long finished. Only
+    /// while the bar still shows what the run set, so a newer message is
+    /// never clobbered. Nothing has ended until the run-ended latch fires: a
+    /// run-all is idle until the worker's start lands. A run that ended with
+    /// no verdict (the coverage tool missing) just lets go. `finished` is
+    /// the panel's run-ended latch, which the caller has consumed.
+    fn announce_test_run_end(&mut self, finished: Option<Option<bool>>) -> bool {
+        let Some(verdict) = finished else {
+            return false;
+        };
+        // Another run already started in the same drain: the status that
+        // waits is its, and its own end settles it.
+        if self.testing.is_busy() {
+            return false;
+        }
+        let Some(run) = self.test_run_status.take() else {
+            return false;
+        };
+        let Some(ok) = verdict else {
+            return false;
+        };
+        let testing = &self.testing;
+        run.settle(&mut self.status, |label, took| {
+            testing.run_outcome(label, ok, took.as_secs_f64())
+        })
+    }
+
+    /// Keep the "Running …" status a task or fenced block just set until
+    /// pane `pane` reports the command finished (#856). A newer run in the
+    /// same pane takes over the wait.
+    fn await_pane_outcome(&mut self, pane: u64, label: String) {
+        self.pane_run_statuses.retain(|(uid, _)| *uid != pane);
+        self.pane_run_statuses
+            .push((pane, RunningStatus::new(&self.status, label)));
     }
 
     /// Testing: Run Test at Cursor with Coverage (#263): the caret's test
@@ -23359,6 +23486,7 @@ impl App {
             });
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run} with coverage");
+        self.await_test_run_outcome(crate::testing::leaf_name(&run).to_string());
     }
 
     /// A Testing-tree row's coverage glyph (#263): that test, or that whole
@@ -23385,6 +23513,12 @@ impl App {
         } else {
             format!("Running test {name} with coverage")
         };
+        let label = if suite {
+            format!("suite {name}")
+        } else {
+            crate::testing::leaf_name(&name).to_string()
+        };
+        self.await_test_run_outcome(label);
     }
 
     /// Debug the test the editor caret sits in (Cmd+K Shift+Enter, palette).
@@ -35670,6 +35804,7 @@ impl App {
             self.focus_pane(Pane::Terminal);
             self.status = format!("Running {}", task.label);
             let uid = self.terminals[idx].uid();
+            self.await_pane_outcome(uid, task.label);
             self.assign_task_matcher(uid, matcher);
             return Some(uid);
         }
@@ -35681,6 +35816,7 @@ impl App {
                 self.insert_terminal(term);
                 self.assign_task_matcher(uid, matcher);
                 self.status = format!("Running {}", task.label);
+                self.await_pane_outcome(uid, task.label);
                 Some(uid)
             }
             Err(e) => {
@@ -42950,12 +43086,15 @@ impl App {
             self.show_terminal = true;
             self.focus_pane(Pane::Terminal);
             self.status = format!("Running {}", block.pane_name);
+            let uid = self.terminals[idx].uid();
+            self.await_pane_outcome(uid, block.pane_name);
             return;
         }
         match crate::widgets::terminal::PtyTerminal::new(&block.cwd) {
             Ok(mut term) => {
                 term.set_manual_name(Some(block.pane_name.clone()));
                 term.write_input(bytes.as_bytes());
+                let uid = term.uid();
                 self.insert_terminal(term);
                 // A fresh pane has no decorations yet, so the capture arms
                 // at zero and the block's own command is the first to
@@ -42969,6 +43108,7 @@ impl App {
                     self.arm_block_capture(&block, idx);
                 }
                 self.status = format!("Running {}", block.pane_name);
+                self.await_pane_outcome(uid, block.pane_name);
             }
             Err(e) => {
                 self.status = format!("Could not start a pane for {}: {e}", block.pane_name);
@@ -44189,7 +44329,8 @@ impl App {
         const LONG_COMMAND_NOTIFY: std::time::Duration = std::time::Duration::from_secs(10);
         let mut rang: Option<String> = None;
         let mut notes: Vec<String> = Vec::new();
-        let mut finished: Option<String> = None;
+        // The long-command notice, with the pane it is about.
+        let mut finished: Option<(u64, String)> = None;
         let mut trigger_note: Option<String> = None;
         let mut captured: Vec<crate::widgets::captures::CapturedLine> = Vec::new();
         // Finished-command outputs to run through the build matchers after
@@ -44204,6 +44345,9 @@ impl App {
         let mut settled_launch: Option<Option<i32>> = None;
         // The newest OSC 52 copy any pane's program made this tick (#678).
         let mut copied: Option<String> = None;
+        // A task's or fenced block's command ended (#856): (pane uid, exit,
+        // duration), settled against its "Running …" status after the sweep.
+        let mut runs_ended: Vec<(u64, Option<i32>, std::time::Duration)> = Vec::new();
         for t in &self.terminals {
             if let Some(text) = t.take_clipboard_store() {
                 copied = Some(text);
@@ -44284,6 +44428,15 @@ impl App {
                 {
                     settled_launch = Some(f.exit);
                 }
+                // The first command the pane finishes after the run was
+                // typed is the run's, as for a block's output capture.
+                let awaited = self
+                    .pane_run_statuses
+                    .iter()
+                    .any(|(uid, _)| *uid == t.uid());
+                if awaited {
+                    runs_ended.push((t.uid(), f.exit, f.dur));
+                }
                 if t.focused {
                     continue;
                 }
@@ -44305,13 +44458,42 @@ impl App {
                     continue;
                 }
                 let code = f.exit.map_or_else(|| String::from("?"), |c| c.to_string());
-                finished = Some(format!(
-                    "Command in {} finished: exit {code} in {}",
-                    t.label(),
-                    crate::widgets::terminal::human_duration(f.dur)
+                finished = Some((
+                    t.uid(),
+                    format!(
+                        "Command in {} finished: exit {code} in {}",
+                        t.label(),
+                        crate::widgets::terminal::human_duration(f.dur)
+                    ),
                 ));
             }
         }
+        let mut run_settled = false;
+        for (pane, exit, dur) in runs_ended {
+            let Some(i) = self
+                .pane_run_statuses
+                .iter()
+                .position(|(uid, _)| *uid == pane)
+            else {
+                continue; // a second command the same sweep saw end
+            };
+            let (_, run) = self.pane_run_statuses.remove(i);
+            if run.settle(&mut self.status, |label, _| {
+                pane_run_outcome(label, exit, dur)
+            }) {
+                run_settled = true;
+                // The outcome says what the long-command notice would, by
+                // the run's own name. Unsettled (a newer status showing),
+                // the notice still comes.
+                if finished.as_ref().is_some_and(|(uid, _)| *uid == pane) {
+                    finished = None;
+                }
+            }
+        }
+        // A pane that closed will never report its run's end.
+        let terminals = &self.terminals;
+        self.pane_run_statuses
+            .retain(|(uid, _)| terminals.iter().any(|t| t.uid() == *uid));
         if let Some(exit) = settled_launch
             && let Some(pending) = self.pending_debug_launch.take()
         {
@@ -44376,12 +44558,12 @@ impl App {
             self.status = format!("Terminal notification: {msg}");
             return true;
         }
-        if let Some(msg) = finished {
+        if let Some((_, msg)) = finished {
             self.status = msg;
             return true;
         }
         let Some(label) = rang else {
-            return copied.is_some();
+            return copied.is_some() || run_settled;
         };
         self.status = format!("Bell in terminal: {label}");
         true
@@ -52796,6 +52978,8 @@ impl App {
                         self.toggle_test_watch(crate::testing::watch::WatchScope::All);
                     } else if rect_contains(self.testing.last_cover_all, m.column, m.row) {
                         self.run_all_tests_with_coverage();
+                    } else if rect_contains(self.testing.last_output_hint, m.column, m.row) {
+                        self.show_test_runner_output();
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
                             Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
