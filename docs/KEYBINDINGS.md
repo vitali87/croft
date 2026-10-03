@@ -14,7 +14,7 @@ Per platform:
 |------|--------|
 | `Ctrl+s` / `Cmd+s` | Save the open file |
 | Typing `(` `[` `{` or a quote | Auto-closing pairs: the pair inserts with the caret between (openers never before a word, quotes never after one); typing the closer steps over; a selection is surrounded; backspace inside an empty pair deletes both. Settings gear → "Auto Closing Pairs" toggles |
-| `Ctrl+q` | Quit |
+| `Ctrl+q` | Quit. If any tab in any editor group has unsaved changes, a prompt asks first: `S` / `Enter` saves them all and quits, `D` quits without saving, `Esc` / `N` cancels. Save all stays open, naming each file, when anything cannot be saved: an untitled buffer (it has no file to go to; copy its text out or choose `D`), a file changed on disk, text its encoding cannot hold, a merge with conflicts left, a file open in two editor groups with different unsaved text (the same text in both is saved once). Unsaved buffers are also backed up a few seconds after the last edit (hot exit, under `~/.cache/croft/hot-exit/`), so a kill or crash loses only the edits since the last backup that was written, usually those few seconds. A write that fails is said in the status line and tried again every 5 s; until one lands, the last backup written is what a crash leaves. The next launch of the workspace brings them back as unsaved tabs, nothing written to their files, and names any file changed on disk since. A clean quit, `S` once the saves land, and `D` remove the backup, so for a quit the prompt is still the last chance to keep unsaved edits |
 | `F1` | Open the shortcuts modal |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
 | `Ctrl+b` / `Cmd+b` | Toggle the primary side bar (left pane) |
@@ -33,7 +33,7 @@ Per platform:
 | `Ctrl+Shift+d` / `Cmd+Shift+d` | Jump to Run and Debug |
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
 | `Ctrl+Shift+x` / `Cmd+Shift+x` | Jump to Extensions |
-| `Ctrl+Shift+l` / `Cmd+Shift+l` | While on a remote, disconnect and return to the local croft at the directory you connected from |
+| `Ctrl+Shift+l` / `Cmd+Shift+l` | While on a remote, disconnect and return to the local croft at the directory you connected from (asks first about unsaved changes, as `Ctrl+q` does) |
 | Click a pinned row in the Explorer's sticky band | Scrolled deep in a directory, its ancestor rows pin to the top of the tree; clicking one selects that directory and scrolls it to the top (right-click opens its context menu) |
 | Click activity-bar icons | Switch between Explorer, Search, Source Control, Run and Debug, Remote, Extensions, and Testing |
 | Click the settings gear | Open settings → Color Theme picker (Croft Black / Croft Dark Blue / Croft Light, a full VS Code Light Modern-style light theme that recolors the whole session including the host terminal, plus ten editor-inspired dark themes: One Dark Pro, Dracula, Monokai, Nord, Gruvbox Dark, Tokyo Night, Catppuccin Mocha, Solarized Dark, GitHub Dark, Darcula) or Customize Layout |
@@ -61,14 +61,14 @@ Per platform:
 | (box focused) type / `Backspace` / `←` `→` | Edit the box's reply draft (the buffer is untouched) |
 | (box focused) `Enter` | Send the reply to the navigator (a comment-only turn) |
 | (box focused) `Esc` | Leave the box; the keyboard returns to the buffer |
-| `Cmd+K` `→` | Close the editor tabs to the right of the active one |
+| `Cmd+K` `→` | Close the editor tabs to the right of the active one (tabs with unsaved changes stay open) |
 | `Cmd+K` `S` | Select the active file as the compare anchor |
 | `Cmd+K` `C` | Diff the active file against the compare anchor |
-| `Cmd+K` `W` | Close all editor tabs |
+| `Cmd+K` `W` | Close all editor tabs in every group, keeping tabs with unsaved changes open (close one with `Cmd+W` to be asked about it) |
 | `Cmd+K` `U` | Close all saved (non-dirty) editor tabs, keeping unsaved ones |
 | `Cmd+K` `E` | Reveal the active file in the Explorer tree (expand parents, select, focus) |
 | `Cmd+K` `O` | Copy into New Window: open the active file in a new window of your terminal, focused on just the file (Explorer + terminal hidden; the current window is untouched; Ghostty / iTerm2 / Terminal; macOS only) |
-| `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
+| `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only; save a tab with unsaved changes first) |
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
 | `Cmd+K` `V` | Toggle Live Run for the active Python file: it re-runs on every pause in typing, and each line shows the values it produced, what it printed or returned, and the exception it died with. Line numbers go green for statements that ran and red for ones that never did. Also in the palette as "Python: Toggle Live Run" |
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `r` re-discovers, `o` opens OUTPUT on the Test Runner channel (as does clicking the "see OUTPUT › Test Runner" pointer a failed discovery or run shows), click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, click a row's eye to watch that test or suite (it reruns on every save under the project; the header's eye or `w` watches everything), ↑/↓ scroll or drag the scrollbar |
@@ -325,7 +325,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | Hover a chrome control (300 ms dwell) | Button hint naming the control under the pointer: activity-bar icons (Explorer, Search, …), the EXPLORER header toolbar (New File, New Folder, Refresh Explorer, Collapse Folders, Views and More Actions), the Remote / Source Control header actions, and the SEARCH panel's actions and toggles (Refresh, Clear Search Results, Match Case, Use Regular Expression, …) |
 | Right-click | Editor symbol menu: the Go to / Rename / Change All actions above |
 | `Cmd`+`E` | Toggle native modal (vim) editing (see below) |
-| `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab) |
+| `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab). A tab with unsaved changes asks first: `S` / `Enter` saves and closes, `D` closes without saving, `Esc` / `N` cancels; the tab's `✕`, its context menu's Close and View: Close Editor ask the same way. Close Others and Close to the Right keep unsaved tabs open |
 
 ## Editor: vim mode (modal editing)
 
@@ -351,7 +351,7 @@ The toggle is global and app-wide: it works from any pane and with no file open,
 | `Ctrl`+`r` | Redo |
 | `v` `V` | Charwise / linewise Visual; a motion extends, `d` `y` `c` operate |
 | `/` `?` then `Enter`, `n` `N` | Search forward / back, jump to next / previous match |
-| `:w` `:q` `:wq` `:x` `:q!` `:qa`, `:{n}` | Write, close tab, write-and-close, quit-all, or jump to line n |
+| `:w` `:q` `:wq` `:x` `:q!` `:qa`, `:{n}` | Write, close tab, write-and-close, quit-all, or jump to line n. `:q`, `:wq` whose write did not land, and `:qa` ask about unsaved changes as `Cmd+W` and `Ctrl+q` do; `:q!` and `:qa!` discard them without asking |
 
 When vim mode is on it supersedes the always-on `Cmd`+`d` `d` / `Cmd`+`g` `g` chords; turn it off to get those back.
 
