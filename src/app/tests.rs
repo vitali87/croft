@@ -55927,6 +55927,168 @@ fn codeql_add_database_button_offers_the_four_sources_in_a_picker() {
     });
 }
 
+/// Paint `app` at 120 x 44 and find the first screen cell where `needle`
+/// starts.
+fn find_on_screen(app: &mut App, needle: &str) -> Option<(u16, u16)> {
+    let backend = ratatui::backend::TestBackend::new(120, 44);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    (0..44).find_map(|y| {
+        let text: String = (0..120).map(|x| buf[(x, y)].symbol()).collect();
+        let at = text.find(needle)?;
+        Some((text[..at].chars().count() as u16, y))
+    })
+}
+
+#[test]
+fn codeql_database_card_picker_switches_the_current_database() {
+    // #578: the database card's name row offers the databases in a picker;
+    // the one chosen becomes the current one, as a list row's Enter did.
+    use crate::widgets::codeql::{Action, Hit};
+    use crate::widgets::list_picker::ListPurpose;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        for (name, lang) in [("flask-db", "python"), ("gin-db", "go")] {
+            let db = make_codeql_db(tmp.path(), name, lang);
+            app.submit_codeql_database(
+                crate::widgets::input_prompt::CodeqlDbSource::Folder,
+                &db.display().to_string(),
+            );
+        }
+        assert_eq!(app.codeql.current_db, Some(1));
+        app.run_command(crate::widgets::command_palette::Command::CodeqlFocusSideBar);
+        assert!(find_on_screen(&mut app, "◆ gin-db").is_some(), "the card");
+        let (x, y) = find_on_screen(&mut app, "◆ gin-db").unwrap();
+        left_click(&mut app, x + 3, y);
+        assert_eq!(
+            app.codeql.selected_hit(),
+            Some(Hit::Action(Action::PickDatabase)),
+            "the click selects the name row"
+        );
+        let picker = app.list_picker.as_ref().expect("the database picker");
+        assert_eq!(picker.purpose, ListPurpose::CodeqlDatabase);
+        let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["○ flask-db · Python", "● gin-db · Go"]);
+        for c in "flask".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.list_picker.is_none());
+        assert_eq!(app.codeql.current_db, Some(0), "{}", app.status);
+        assert_eq!(app.status, "Current CodeQL database: flask-db");
+        assert_eq!(
+            crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path()).current,
+            Some(0),
+            "saved"
+        );
+        assert!(find_on_screen(&mut app, "◆ flask-db").is_some());
+        assert!(
+            find_on_screen(&mut app, "Python · ").is_some(),
+            "the meta row names the language, then the size"
+        );
+        // Enter on the name row opens it too.
+        app.codeql.select_database_card();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.list_picker.as_ref().map(|p| &p.purpose),
+            Some(&ListPurpose::CodeqlDatabase)
+        );
+    });
+}
+
+#[test]
+fn codeql_database_sizes_are_summed_off_the_input_path() {
+    // #578: the card's folder size is walked on a worker, so adding or
+    // listing a large database never stalls a key; the size lands on a tick
+    // and a cached one is not walked again.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let db = make_codeql_db(tmp.path(), "flask-db", "python");
+        std::fs::write(db.join("blob.bin"), vec![0u8; 4096]).unwrap();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Folder,
+            &db.display().to_string(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.codeql.db_sizes.contains_key(&db) && std::time::Instant::now() < deadline {
+            app.sync_explorer_panels();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let size = *app.codeql.db_sizes.get(&db).expect("the size landed");
+        assert!(size >= 4096, "{size}");
+        assert!(app.codeql_size_pending.is_empty());
+        app.refresh_codeql_databases();
+        assert!(
+            app.codeql_size_pending.is_empty(),
+            "a cached size is not walked again"
+        );
+        assert_eq!(app.codeql.db_sizes.get(&db), Some(&size));
+    });
+}
+
+#[test]
+fn codeql_history_export_chip_reaches_the_export_prompt() {
+    // #578: Space expands a history row into its details and action chips;
+    // a click on Export asks where to copy that run's results.
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::input_prompt::InputPurpose;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = |n: &str| App::codeql_results_dir().join(format!("{n}/results.csv"));
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("old.ql", 100, RunStatus::Succeeded, out("100-old")),
+                ("new.ql", 200, RunStatus::Succeeded, out("200-new")),
+            ],
+        );
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // A database, so the first-run card leaves the history in view.
+        let db = make_codeql_db(tmp.path(), "app", "python");
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Folder,
+            &db.display().to_string(),
+        );
+        app.run_command(crate::widgets::command_palette::Command::CodeqlFocusSideBar);
+        // The older run, so the export is not just the newest one's.
+        app.codeql.select_history(1);
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.codeql.is_expanded(1));
+        assert!(app.input_prompt.is_none() && app.list_picker.is_none());
+        app.codeql.select_history(0);
+        let (x, y) = find_on_screen(&mut app, "↓ Export").expect("the chip");
+        left_click(&mut app, x, y);
+        let prompt = app.input_prompt.as_ref().expect("the export prompt");
+        assert_eq!(
+            prompt.purpose,
+            InputPurpose::CodeqlExportResults {
+                output: out("100-old")
+            }
+        );
+        assert_eq!(prompt.title, "Export the results of old.ql");
+        assert_eq!(app.codeql.selected_history(), Some(1), "its row selected");
+        app.close_input_prompt();
+        // Left folds the details away again.
+        app.focus = Pane::Tree;
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.codeql.is_expanded(1));
+    });
+}
+
 #[test]
 fn codeql_view_label_round_trips_for_session_restore() {
     // Opening the CodeQL view reads croft's cache, whose test override is
@@ -56065,6 +56227,15 @@ fn make_codeql_db(root: &std::path::Path, name: &str, lang: &str) -> std::path::
     dir
 }
 
+/// Make database `index` the current one and select the side bar's
+/// database card, which acts on it.
+fn select_codeql_database(app: &mut App, index: usize) {
+    app.activate_codeql(crate::widgets::codeql::Hit::Action(
+        crate::widgets::codeql::Action::SelectDatabase(index),
+    ));
+    app.codeql.select_database_card();
+}
+
 #[test]
 fn adding_a_codeql_database_from_a_folder_lists_and_persists_it() {
     // The cache-dir override is process-global; serialize with the
@@ -56194,8 +56365,12 @@ fn codeql_databases_are_renamed_sorted_revealed_and_removed_from_the_side_bar() 
             app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
         };
 
-        // F2 renames, starting from the current name.
-        app.codeql.select_database(0);
+        // On the database card, F2 renames the current one, starting from
+        // its name.
+        app.activate_codeql(crate::widgets::codeql::Hit::Action(
+            crate::widgets::codeql::Action::SelectDatabase(0),
+        ));
+        app.codeql.select_database_card();
         press(&mut app, KeyCode::F(2));
         assert_eq!(app.input_prompt.as_ref().unwrap().value, "flask-db");
         for _ in 0.."flask-db".len() {
@@ -56221,7 +56396,7 @@ fn codeql_databases_are_renamed_sorted_revealed_and_removed_from_the_side_bar() 
             .map(|d| d.name.as_str())
             .collect();
         assert_eq!(names, ["java", "web"]);
-        assert_eq!(app.codeql.current_db, Some(0), "kafka's is still current");
+        assert_eq!(app.codeql.current_db, Some(1), "web is still current");
         assert_eq!(app.codeql.selected_database(), Some(1), "still on web");
 
         // `e` shows its folder in the Explorer.
@@ -56232,7 +56407,7 @@ fn codeql_databases_are_renamed_sorted_revealed_and_removed_from_the_side_bar() 
         app.focus = Pane::Tree;
 
         // Delete asks first; Esc keeps it.
-        app.codeql.select_database(1);
+        app.codeql.select_database_card();
         press(&mut app, KeyCode::Delete);
         assert!(
             app.input_prompt
@@ -56248,9 +56423,19 @@ fn codeql_databases_are_renamed_sorted_revealed_and_removed_from_the_side_bar() 
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.codeql.databases.len(), 1, "{}", app.status);
         assert!(mine.is_dir(), "not croft's to delete");
-        assert_eq!(app.codeql.selected_database(), Some(0), "stays in the list");
+        assert_eq!(
+            app.codeql.selected_hit(),
+            Some(crate::widgets::codeql::Hit::Action(
+                crate::widgets::codeql::Action::PickDatabase
+            )),
+            "stays on the card"
+        );
+        assert_eq!(app.codeql.current_db, None, "the current one went");
 
-        // The downloaded copy goes with its files.
+        // The downloaded copy goes with its files, once current.
+        app.activate_codeql(crate::widgets::codeql::Hit::Action(
+            crate::widgets::codeql::Action::SelectDatabase(0),
+        ));
         press(&mut app, KeyCode::Delete);
         assert!(
             app.input_prompt
@@ -56379,7 +56564,7 @@ fn codeql_query_history_is_renamed_sorted_opened_and_removed_from_the_side_bar()
             app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
         };
         assert_eq!(app.codeql.history.len(), 3);
-        assert!(app.codeql.history[0].contains("a.ql"), "newest first");
+        assert_eq!(app.codeql.history[0].name, "a.ql", "newest first");
 
         // F2 renames, starting from the query's name.
         app.codeql.select_history(0);
@@ -56392,13 +56577,13 @@ fn codeql_query_history_is_renamed_sorted_opened_and_removed_from_the_side_bar()
             press(&mut app, KeyCode::Char(c));
         }
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.codeql.history[0], "\u{2713} zeta", "{}", app.status);
+        assert_eq!(app.codeql.history[0].name, "zeta", "{}", app.status);
 
         // `s` on a history row sorts the history, not the databases.
         press(&mut app, KeyCode::Char('s'));
         assert_eq!(app.codeql.history_sort, crate::codeql_query::HistSort::Name);
         assert_eq!(app.codeql.db_sort, None, "databases untouched");
-        assert!(app.codeql.history[0].contains("b.ql"));
+        assert_eq!(app.codeql.history[0].name, "b.ql");
         assert_eq!(app.codeql.selected_history(), Some(2), "still on zeta");
         assert_eq!(
             crate::codeql_query::History::load(&App::codeql_history_path()).sort_by,
@@ -57028,8 +57213,10 @@ fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
         wait_for_codeql(&mut app);
         let opened = app.editor.path.clone().expect("the results open");
         assert_eq!(opened.extension().and_then(|e| e.to_str()), Some("sarif"));
-        assert!(
-            app.codeql.history[0].starts_with("\u{2713} s.qls \u{b7} app"),
+        let run = &app.codeql.history[0];
+        assert_eq!(
+            (&run.status, run.name.as_str(), run.database.as_str()),
+            (&crate::codeql_query::RunStatus::Succeeded, "s.qls", "app"),
             "{:?}",
             app.codeql.history
         );
@@ -57056,7 +57243,10 @@ fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
         app.run_command(Command::CodeqlRunQuerySuite);
         wait_for_codeql(&mut app);
         assert!(
-            app.codeql.history[0].contains("Table.ql"),
+            matches!(
+                &app.codeql.history[0].status,
+                crate::codeql_query::RunStatus::Failed(why) if why.contains("Table.ql")
+            ),
             "the refusal names the table query: {:?}",
             app.codeql.history
         );
@@ -58461,9 +58651,9 @@ fn quick_evaluation_runs_the_predicate_at_the_cursor_through_the_query_server() 
         );
         wait_for_codeql(&mut app);
         assert!(app.status.contains("finished"), "{}", app.status);
-        assert!(
-            app.codeql.history[0].contains("Quick evaluation of isCall"),
-            "{}",
+        assert_eq!(
+            app.codeql.history[0].name, "Quick evaluation of isCall",
+            "{:?}",
             app.codeql.history[0]
         );
         let requests: Vec<serde_json::Value> =
@@ -58488,7 +58678,11 @@ fn quick_evaluation_runs_the_predicate_at_the_cursor_through_the_query_server() 
         app.editor.cursor_col = 13;
         app.run_command(Command::CodeqlQuickEvalCount);
         wait_for_codeql(&mut app);
-        assert!(app.codeql.history[0].contains("Quick evaluation count of isCall"));
+        assert!(
+            app.codeql.history[0]
+                .name
+                .contains("Quick evaluation count of isCall")
+        );
         let last: serde_json::Value = serde_json::from_str(
             std::fs::read_to_string(bin.path().join("requests.jsonl"))
                 .unwrap()
@@ -59294,8 +59488,9 @@ fn a_problem_query_runs_on_the_current_database_and_opens_as_sarif() {
         app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
         assert!(app.status.contains("Running q.ql on app"), "{}", app.status);
         assert_eq!(app.codeql.history.len(), 1);
-        assert!(
-            app.codeql.history[0].contains("running"),
+        assert_eq!(
+            app.codeql.history[0].status,
+            crate::codeql_query::RunStatus::Running,
             "{:?}",
             app.codeql.history
         );
@@ -59308,8 +59503,10 @@ fn a_problem_query_runs_on_the_current_database_and_opens_as_sarif() {
                 .unwrap()
                 .contains("From codeql.")
         );
-        assert!(
-            app.codeql.history[0].starts_with("\u{2713} q.ql \u{b7} app"),
+        let run = &app.codeql.history[0];
+        assert_eq!(
+            (&run.status, run.name.as_str(), run.database.as_str()),
+            (&crate::codeql_query::RunStatus::Succeeded, "q.ql", "app"),
             "{:?}",
             app.codeql.history
         );
@@ -59331,9 +59528,12 @@ fn a_failed_query_run_is_recorded_with_codeqls_own_words() {
         app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
         wait_for_codeql(&mut app);
         assert_eq!(
-            app.codeql.history[0],
-            "\u{2717} q.ql \u{b7} app \u{b7} failed: ERROR: could not resolve module rust"
+            app.codeql.history[0].status,
+            crate::codeql_query::RunStatus::Failed(String::from(
+                "ERROR: could not resolve module rust"
+            ))
         );
+        assert_eq!(app.codeql.history[0].name, "q.ql");
         assert!(
             app.status.contains("could not resolve module"),
             "{}",
@@ -59363,9 +59563,10 @@ fn a_successful_query_run_records_its_result_count() {
         wait_for_codeql(&mut app);
         let history = crate::codeql_query::History::load(&App::codeql_history_path());
         assert_eq!(history.entries[0].results, Some(2), "{}", app.status);
-        assert!(
-            app.codeql.history[0].ends_with("\u{b7} 2 results"),
-            "{}",
+        assert_eq!(
+            app.codeql.history[0].results,
+            Some(2),
+            "{:?}",
             app.codeql.history[0]
         );
     });
@@ -59582,9 +59783,10 @@ fn a_running_codeql_query_shows_in_the_status_bar_and_a_click_cancels_it() {
             history.entries[0].status,
             crate::codeql_query::RunStatus::Cancelled
         );
-        assert!(
-            app.codeql.history[0].ends_with("cancelled"),
-            "{}",
+        assert_eq!(
+            app.codeql.history[0].status,
+            crate::codeql_query::RunStatus::Cancelled,
+            "{:?}",
             app.codeql.history[0]
         );
         term.draw(|f| app.render(f)).unwrap();
@@ -59681,8 +59883,10 @@ fn a_query_row_in_the_side_bar_runs_that_file_and_records_it() {
         app.handle_codeql_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.status.contains("Running r.ql on app"), "{}", app.status);
         wait_for_codeql(&mut app);
-        assert!(
-            app.codeql.history[0].starts_with("\u{2713} r.ql \u{b7} app"),
+        let run = &app.codeql.history[0];
+        assert_eq!(
+            (&run.status, run.name.as_str(), run.database.as_str()),
+            (&crate::codeql_query::RunStatus::Succeeded, "r.ql", "app"),
             "{:?}",
             app.codeql.history
         );
@@ -59947,12 +60151,22 @@ fn running_a_codeql_pack_runs_each_query_in_turn_past_a_failure() {
         assert!(app.codeql_run_queue.is_empty());
         // Newest first: one entry per query, in the order they ran.
         assert_eq!(app.codeql.history.len(), 3, "{:?}", app.codeql.history);
-        assert!(app.codeql.history[2].starts_with("\u{2713} a.ql \u{b7} app"));
+        use crate::codeql_query::RunStatus;
+        let runs: Vec<(&RunStatus, &str, &str)> = app
+            .codeql
+            .history
+            .iter()
+            .map(|r| (&r.status, r.name.as_str(), r.database.as_str()))
+            .collect();
+        let failed = RunStatus::Failed(String::from("ERROR: b is broken"));
         assert_eq!(
-            app.codeql.history[1],
-            "\u{2717} b.ql \u{b7} app \u{b7} failed: ERROR: b is broken"
+            runs,
+            [
+                (&RunStatus::Succeeded, "c.ql", "app"),
+                (&failed, "b.ql", "app"),
+                (&RunStatus::Succeeded, "a.ql", "app"),
+            ]
         );
-        assert!(app.codeql.history[0].starts_with("\u{2713} c.ql \u{b7} app"));
         let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
         let at = |q: &str| calls.find(&format!("pack/{q}.ql")).unwrap();
         assert!(at("a") < at("b") && at("b") < at("c"), "{calls}");
@@ -59977,7 +60191,13 @@ fn queued_codeql_queries_are_cancelled_from_the_palette_or_with_esc() {
         assert_eq!(app.status, "Cancelled 2 queued CodeQL queries");
         wait_for_codeql(&mut app);
         assert_eq!(app.codeql.history.len(), 1, "{:?}", app.codeql.history);
-        assert!(app.codeql.history[0].starts_with("\u{2713} a.ql"));
+        assert_eq!(
+            (
+                &app.codeql.history[0].status,
+                app.codeql.history[0].name.as_str()
+            ),
+            (&crate::codeql_query::RunStatus::Succeeded, "a.ql")
+        );
 
         // Esc in the side bar cancels first and leaves the view only after.
         app.set_sidebar_view(SidebarView::CodeQL);
@@ -60427,7 +60647,7 @@ fn upgrading_a_codeql_database_runs_the_cli_off_the_ui_thread() {
         app.codeql_program = fake_codeql(bin.path(), "", 0, "");
         app.open_codeql_view();
         app.focus = Pane::Tree;
-        app.codeql.select_database(0);
+        select_codeql_database(&mut app, 0);
         let u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
         app.handle_codeql_key(u);
         assert_eq!(app.status, "Upgrading CodeQL database app\u{2026}");
@@ -60489,7 +60709,7 @@ fn the_codeql_cache_commands_clean_up_the_selected_database() {
         let mut app = codeql_query_fixture(tmp.path(), "select 1");
         app.codeql_program = fake_codeql(bin.path(), "", 0, "");
         app.open_codeql_view();
-        app.codeql.select_database(0);
+        select_codeql_database(&mut app, 0);
         let db = tmp.path().join("dbs/app");
         app.run_command(Command::CodeqlClearCache);
         assert_eq!(
@@ -60598,7 +60818,7 @@ fn a_codeql_databases_source_is_added_to_the_workspace() {
 
         app.open_codeql_view();
         app.focus = Pane::Tree;
-        app.codeql.select_database(1);
+        select_codeql_database(&mut app, 1);
         let w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
         app.handle_codeql_key(w);
         assert_eq!(
@@ -60621,7 +60841,7 @@ fn a_codeql_databases_source_is_added_to_the_workspace() {
         assert!(!has_root(&app, &extracted));
         app.set_sidebar_view(SidebarView::CodeQL);
         app.focus = Pane::Tree;
-        app.codeql.select_database(1);
+        select_codeql_database(&mut app, 1);
         app.handle_codeql_key(w);
         assert!(has_root(&app, &extracted));
         assert!(extracted.join("mine.txt").exists());
@@ -60635,7 +60855,7 @@ fn a_codeql_databases_source_is_added_to_the_workspace() {
         z.finish().unwrap();
         app.set_sidebar_view(SidebarView::CodeQL);
         app.focus = Pane::Tree;
-        app.codeql.select_database(1);
+        select_codeql_database(&mut app, 1);
         app.handle_codeql_key(w);
         let fresh = App::codeql_source_cache_dir().join(crate::codeql_db::source_cache_name(
             &zip_db,
@@ -60649,7 +60869,7 @@ fn a_codeql_databases_source_is_added_to_the_workspace() {
         assert!(has_root(&app, &fresh));
         assert!(!extracted.exists(), "the stale extraction is removed");
 
-        app.codeql.select_database(2);
+        select_codeql_database(&mut app, 2);
         app.handle_codeql_key(w);
         assert_eq!(
             app.status,
