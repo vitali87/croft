@@ -58079,8 +58079,12 @@ impl App {
     /// a deleted one comes back as a tab for its path. This croft writes its
     /// own backup of them at once and removes the consumed ones only after
     /// that lands, so a crash straight after the launch, or a write that
-    /// fails, cannot lose them either. A backup that cannot be read is kept
-    /// and said so, until it is older than
+    /// fails, cannot lose them either. Backups come newest first, and an
+    /// older one of a file already restored (two crofts on the workspace,
+    /// both killed) is not restored over the newer: that copy stays in its
+    /// backup for a later launch.
+    /// A backup that cannot be read is kept and said so, until it is older
+    /// than
     /// [`crate::hot_exit::UNREADABLE_KEPT_FOR`]. Called once, at a normal
     /// launch.
     pub fn restore_hot_exit(&mut self) {
@@ -58093,6 +58097,15 @@ impl App {
         let mut gone: Vec<PathBuf> = Vec::new();
         let mut unreadable: Vec<String> = Vec::new();
         let mut expired = 0usize;
+        // The files this launch has filled a tab for. Another backup of one
+        // of them, older since the newest come first, is a second croft's
+        // unsaved copy (two crofts on the workspace, both killed), and
+        // restoring it into that tab would overwrite the newer text. It
+        // stays in its backup instead, held for a later launch once the
+        // newer copy is saved or closed.
+        let mut filled: Vec<PathBuf> = Vec::new();
+        let mut doubled: Vec<PathBuf> = Vec::new();
+        let mut trimmed: Vec<(PathBuf, crate::hot_exit::Backup)> = Vec::new();
         for file in crate::hot_exit::orphaned(&dir, &root) {
             let backup = match crate::hot_exit::Backup::load(&file) {
                 Ok(backup) if backup.is_of(&root) => backup,
@@ -58111,7 +58124,13 @@ impl App {
                 }
             };
             let before = restored;
+            let mut held: Vec<crate::hot_exit::Buffer> = Vec::new();
             for buffer in &backup.buffers {
+                if let Some(path) = buffer.tab.path.as_ref().filter(|p| filled.contains(p)) {
+                    doubled.push(path.clone());
+                    held.push(buffer.clone());
+                    continue;
+                }
                 let Some(ed) = self.restore_open_tab(&buffer.tab) else {
                     continue;
                 };
@@ -58119,6 +58138,7 @@ impl App {
                 let Some(path) = buffer.tab.path.clone() else {
                     continue;
                 };
+                filled.push(path.clone());
                 match ed.disk_stamp() {
                     None => gone.push(path),
                     Some(now) if buffer.disk_stamp.is_some_and(|then| then != now) => {
@@ -58128,7 +58148,20 @@ impl App {
                     Some(_) => {}
                 }
             }
-            if restored == before {
+            if !held.is_empty() {
+                // Not consumed. Once this croft's own backup holds what was
+                // restored from it, it is cut down to the held copies, so
+                // those do not come back a second time.
+                if restored > before {
+                    trimmed.push((
+                        file,
+                        crate::hot_exit::Backup {
+                            workspace_root: backup.workspace_root,
+                            buffers: held,
+                        },
+                    ));
+                }
+            } else if restored == before {
                 // Nothing in it to keep (an emptied backup, left by a
                 // removal that failed): no write to wait on.
                 let _ = crate::hot_exit::remove(&file, &root);
@@ -58155,7 +58188,26 @@ impl App {
             if !gone.is_empty() {
                 notes.push(format!("{} no longer on disk", names(&gone)));
             }
-            if !self.write_hot_exit() {
+            if !doubled.is_empty() {
+                notes.push(format!(
+                    "{} {} kept in {} backup for a later launch",
+                    names(&doubled),
+                    if doubled.len() == 1 {
+                        "has a second unsaved copy,"
+                    } else {
+                        "have second unsaved copies,"
+                    },
+                    if doubled.len() == 1 { "its" } else { "their" },
+                ));
+            }
+            if self.write_hot_exit() {
+                // A trim that fails leaves the whole backup, so its other
+                // files come back again later rather than the held copy
+                // going.
+                for (file, held) in trimmed {
+                    let _ = held.save(&file);
+                }
+            } else {
                 notes.push(format!(
                     "{}; the backup they came from is kept until it can",
                     std::mem::take(&mut self.status)
@@ -58208,6 +58260,39 @@ impl App {
                 && collab_file_key(&root, p)
                     .is_some_and(|f| collab.as_ref().is_some_and(|s| !s.is_local_only(&f)))
         };
+        // A file open in more than one editor group is a buffer per group.
+        // The same unsaved text in each is written once and the other copies
+        // marked saved: a second write would read the first as a change on
+        // disk. Different texts are not settled by writing whichever group
+        // comes first, so neither is written. Each path with more than one
+        // unsaved copy, with how many and whether they hold one text.
+        let mut copies: Vec<(PathBuf, usize, bool)> = Vec::new();
+        if only.is_none() {
+            let mut seen: Vec<(PathBuf, &Editor)> = Vec::new();
+            for ed in std::iter::once(&self.editor)
+                .chain(self.editor_layout.inactive_groups())
+                .flat_map(|g| g.editors.iter())
+                .filter(|e| holds_unsaved(e) && e.hex.is_none() && e.sheet.is_none())
+            {
+                let Some(path) = ed.path.clone() else {
+                    continue;
+                };
+                match seen.iter().find(|(p, _)| *p == path) {
+                    Some((_, first)) => {
+                        let same = first.lines == ed.lines
+                            && first.bytes_for_disk() == ed.bytes_for_disk();
+                        match copies.iter_mut().find(|(p, ..)| *p == path) {
+                            Some((_, n, one_text)) => {
+                                *n += 1;
+                                *one_text &= same;
+                            }
+                            None => copies.push((path, 2, same)),
+                        }
+                    }
+                    None => seen.push((path, ed)),
+                }
+            }
+        }
         let mut saved: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> = Vec::new();
         let mut left: Vec<(Option<PathBuf>, String)> = Vec::new();
         let mut save = |ed: &mut Editor| {
@@ -58222,6 +58307,25 @@ impl App {
                 || (mirrored.contains(&path) && saved.iter().any(|(q, ..)| *q == path))
             {
                 return;
+            }
+            let reported = left.iter().any(|(q, _)| q.as_ref() == Some(&path));
+            match copies.iter().find(|(p, ..)| *p == path) {
+                Some((_, n, false)) => {
+                    if !reported {
+                        left.push((
+                            Some(path),
+                            format!("open in {n} editor groups with different unsaved text"),
+                        ));
+                    }
+                    return;
+                }
+                Some((_, _, true)) if saved.iter().any(|(q, ..)| *q == path) => {
+                    ed.mark_clean_like_sibling();
+                    return;
+                }
+                // The first copy's save was refused; this one would be too.
+                Some((_, _, true)) if reported => return,
+                _ => {}
             }
             if ed.merge.as_ref().is_some_and(|m| m.unresolved_count() > 0) {
                 left.push((Some(path), String::from("merge conflicts left")));

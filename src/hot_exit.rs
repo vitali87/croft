@@ -166,9 +166,9 @@ pub fn is_expired(path: &Path) -> bool {
 /// process's pid (a dead croft's pid, recycled, or an earlier run in this
 /// process). A running croft's file is its own, live copy.
 ///
-/// Oldest written first, so where two backups hold the same file, the one
-/// restored last, and so kept, is the newer (#862 review). The name breaks
-/// a tie.
+/// Newest written first, so where two backups hold the same file, the
+/// newer is the one restored into its tab, and the older stays in its
+/// backup for a later launch (#862 review). The name breaks a tie.
 pub fn orphaned(dir: &Path, root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(workspace_dir(dir, root)) else {
         return Vec::new();
@@ -181,7 +181,7 @@ pub fn orphaned(dir: &Path, root: &Path) -> Vec<PathBuf> {
         .collect();
     files.sort_by_cached_key(|p| {
         let written = std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        (written, p.clone())
+        std::cmp::Reverse((written, p.clone()))
     });
     files
 }
