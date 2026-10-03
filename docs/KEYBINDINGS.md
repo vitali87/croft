@@ -28,7 +28,7 @@ Per platform:
 | `Ctrl+Shift+p` / `Cmd+Shift+p` | Command Palette: fuzzy-search every named command and run it, with its keybinding shown alongside |
 | `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar |
 | `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
-| `Ctrl+Shift+s` / `Cmd+Shift+s` | Jump to Source Control |
+| `Ctrl+Shift+s` / `Cmd+Shift+s` | Jump to Source Control. `Ctrl+Shift+s` needs a terminal that reports the `Shift` (the kitty keyboard protocol: kitty, Ghostty, WezTerm, Alacritty); others send it as `Ctrl+s`, which saves. Under tmux only 3.2 to 3.4 with `extended-keys always` reports it ([LINUX.md](LINUX.md#the-command-modifier)) |
 | `Ctrl+Shift+b` / `Cmd+Shift+b` | Run the project's build task in a named terminal pane, auto-detected from its manifests (`.vscode/tasks.json`, Makefile, justfile, package.json, Cargo.toml, pyproject.toml). "Tasks: Run Task" and "Tasks: Rerun Last Task" live in the Command Palette |
 | `Ctrl+Shift+d` / `Cmd+Shift+d` | Jump to Run and Debug |
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |

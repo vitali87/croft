@@ -6607,12 +6607,22 @@ fn key_to_bytes_unknown_returns_empty() {
 
 #[test]
 fn ctrl_s_is_save_key() {
-    assert!(is_save_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+    for kitty in [false, true] {
+        assert!(is_save_key(
+            key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            kitty
+        ));
+    }
 }
 
 #[test]
 fn cmd_s_is_save_key() {
-    assert!(is_save_key(key(KeyCode::Char('s'), KeyModifiers::SUPER)));
+    for kitty in [false, true] {
+        assert!(is_save_key(
+            key(KeyCode::Char('s'), KeyModifiers::SUPER),
+            kitty
+        ));
+    }
 }
 
 #[test]
@@ -6669,24 +6679,123 @@ fn plain_dot_and_modified_dot_are_not_quick_fix_key() {
 
 #[test]
 fn shift_ctrl_s_is_save_key() {
-    // Some terminals report capital S with Ctrl pressed.
+    // Without the kitty keyboard protocol a terminal may capitalise the
+    // letter of a plain Ctrl+S, so Ctrl+Shift+S saves there.
     let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
-    assert!(is_save_key(key(KeyCode::Char('S'), mods)));
+    assert!(is_save_key(key(KeyCode::Char('S'), mods), false));
+    // An uppercase S with Ctrl but no Shift reported saves everywhere.
+    for kitty in [false, true] {
+        assert!(is_save_key(
+            key(KeyCode::Char('S'), KeyModifiers::CONTROL),
+            kitty
+        ));
+    }
+}
+
+#[test]
+fn ctrl_shift_s_is_the_source_control_jump_where_shift_is_reported() {
+    // #857: the kitty keyboard protocol reports Shift explicitly, so
+    // Ctrl+Shift+S there is the Source Control jump the docs promise, like
+    // Cmd+Shift+S everywhere; Save lets it go.
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    for c in ['s', 'S'] {
+        assert!(!is_save_key(key(KeyCode::Char(c), ctrl_shift), true));
+        assert!(is_source_control_jump_key(key(
+            KeyCode::Char(c),
+            ctrl_shift
+        )));
+        let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+        assert!(!is_save_key(key(KeyCode::Char(c), cmd_shift), false));
+    }
+}
+
+/// #857 end to end: with the editor focused, Ctrl+Shift+S jumps to Source
+/// Control and leaves the dirty buffer unsaved, while Ctrl+S still saves.
+#[test]
+fn ctrl_shift_s_in_the_editor_jumps_to_source_control_without_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "on disk").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.kitty_keys = true;
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.insert_str("edited ");
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    app.handle_key(key(KeyCode::Char('s'), ctrl_shift)).unwrap();
+    assert_eq!(app.sidebar_view, SidebarView::SourceControl);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "on disk",
+        "not saved"
+    );
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().trim_end(),
+        "edited on disk"
+    );
+}
+
+/// #857 negative: the jump needs the Shift *reported*. Where the terminal
+/// (or tmux 3.5+, or tmux with `extended-keys on`) sends no Shift flag,
+/// Ctrl+S and a Ctrl+uppercase-S still save and the side bar stays put,
+/// and without the kitty keyboard protocol even a reported Shift saves.
+#[test]
+fn ctrl_s_without_a_reported_shift_still_saves_and_stays_put() {
+    let cases = [
+        (true, KeyCode::Char('s'), KeyModifiers::CONTROL),
+        (true, KeyCode::Char('S'), KeyModifiers::CONTROL),
+        (
+            false,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+    ];
+    for (kitty, code, mods) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "on disk").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.kitty_keys = kitty;
+        app.editor.open_pinned(&path).unwrap();
+        app.focus_pane(Pane::Editor);
+        let before = app.sidebar_view;
+        app.editor.insert_str("edited ");
+        app.handle_key(key(code, mods)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim_end(),
+            "edited on disk",
+            "{code:?} {mods:?} kitty={kitty} saves"
+        );
+        assert_eq!(app.sidebar_view, before, "{code:?} {mods:?}: no jump");
+        assert_ne!(app.sidebar_view, SidebarView::SourceControl);
+    }
 }
 
 #[test]
 fn plain_s_is_not_save_key() {
-    assert!(!is_save_key(key(KeyCode::Char('s'), KeyModifiers::NONE)));
+    assert!(!is_save_key(
+        key(KeyCode::Char('s'), KeyModifiers::NONE),
+        true
+    ));
 }
 
 #[test]
 fn ctrl_q_is_not_save_key() {
-    assert!(!is_save_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+    assert!(!is_save_key(
+        key(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        true
+    ));
 }
 
 #[test]
 fn alt_s_is_not_save_key() {
-    assert!(!is_save_key(key(KeyCode::Char('s'), KeyModifiers::ALT)));
+    assert!(!is_save_key(
+        key(KeyCode::Char('s'), KeyModifiers::ALT),
+        true
+    ));
 }
 
 #[test]

@@ -8,6 +8,10 @@ Linux is a first-class target: a session on a Linux box over SSH behaves identic
 
 croft mirrors VS Code's Linux convention: the command modifier is `Ctrl`, and every chord works as the same chord with `Ctrl` (`Ctrl`+`P` for Quick Open, `Ctrl`+`Shift`+`E` for the Explorer) with zero setup. kitty, Ghostty, WezTerm, and Alacritty also deliver `Cmd`/`Super` over the kitty keyboard protocol natively, so the `Cmd` chords from the [keybindings reference](KEYBINDINGS.md) reach croft there too if you prefer them.
 
+The same protocol is what tells `Ctrl`+`Shift`+a letter from `Ctrl`+that letter: without it both send one control byte, so `Ctrl`+`Shift`+`S` arrives as `Ctrl`+`S` and saves instead of jumping to Source Control (the activity bar icon, or the palette's "View: Show Source Control", gets there).
+
+tmux does not speak the kitty protocol, so inside it the `Shift` reaches croft only through tmux's own extended keys, and only in one setup: tmux 3.2 to 3.4 with `set -g extended-keys always`, which reports the chord as `CSI 83;6u` and so jumps to Source Control. With `extended-keys on` tmux sends extended keys only to a program that asks for xterm's modifyOtherKeys, which croft does not, and tmux 3.2 to 3.4 then drop the chord; tmux 3.5 and later send it as the plain `Ctrl`+`S` byte whatever `extended-keys` says, so there it saves.
+
 ## Nerd Font
 
 Explorer icons and the activity bar are Private Use Area Nerd Font glyphs (Codicons plus file-type icons); without a Nerd Font they render as `[?]` boxes. Install one and set it as your terminal font:

@@ -4217,6 +4217,13 @@ pub struct App {
     /// completes a `Cmd+K`-prefixed chord (VS Code's two-key model). `None`
     /// when no chord is in flight.
     cmd_k_leader: Option<std::time::Instant>,
+    /// Whether croft asked the terminal for the kitty keyboard protocol at
+    /// startup (what `croft keys` reports as `kitty=`). A terminal that
+    /// honours it reports `Shift` held with `Ctrl` explicitly, so
+    /// `Ctrl+Shift+S` can be told from `Ctrl+S` (#857); one that ignores it
+    /// sends the same control byte for both, never a `Shift`. False until
+    /// `run` asks.
+    kitty_keys: bool,
     /// Native modal (vim-style) editing for the editor pane. When enabled it
     /// supersedes the always-on `editor_vim_chord` convenience layer.
     vim: crate::vim::VimState,
@@ -5827,6 +5834,7 @@ impl App {
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
+            kitty_keys: false,
             vim: crate::vim::VimState::new(),
             vim_last_find: None,
             vim_visual_line: false,
@@ -21912,7 +21920,7 @@ impl App {
         // is what made the user's first attempt feel inert.
         let sc_focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
-        if is_save_key(key) && !sc_focused {
+        if is_save_key(key, self.kitty_keys) && !sc_focused {
             self.save();
             return Ok(());
         }
@@ -63192,6 +63200,8 @@ fn is_explorer_jump_key(key: KeyEvent) -> bool {
 /// `Ctrl/Cmd+Shift+S`: jump to the Source Control sidebar view from any pane.
 /// This is croft's Source Control gesture. Croft has no editor Save-As (Cmd+S
 /// alone saves), so claiming Cmd+Shift+S is collision-free even while editing.
+/// `Ctrl+Shift+S` gets here only when [`is_save_key`] let it go, which needs
+/// the kitty keyboard protocol to have reported the Shift (#857).
 fn is_source_control_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 's')
 }
@@ -64109,7 +64119,10 @@ fn is_completion_trigger_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-fn is_save_key(key: KeyEvent) -> bool {
+/// `Cmd+S` / `Ctrl+S`: save the open file. `kitty_keys` is
+/// [`App::kitty_keys`]: whether `Shift` held with `Ctrl` is reported
+/// explicitly.
+fn is_save_key(key: KeyEvent, kitty_keys: bool) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
@@ -64122,13 +64135,12 @@ fn is_save_key(key: KeyEvent) -> bool {
     let has_super = key.modifiers.contains(KeyModifiers::SUPER);
     let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // Cmd+Shift+S is reserved for the Source Control jump
-    // (`is_source_control_jump_key`), so reject Shift when Super is
-    // held. Ctrl+Shift+S still triggers Save because some terminals
-    // capitalise the letter when Ctrl is held and the user genuinely
-    // means Ctrl+S — that's the existing `shift_ctrl_s_is_save_key`
-    // contract we want to preserve.
-    if has_super && has_shift {
+    // Cmd+Shift+S is the Source Control jump (`is_source_control_jump_key`),
+    // and so is Ctrl+Shift+S where the kitty keyboard protocol reports the
+    // Shift explicitly (#857). Without it, a Shift beside Ctrl may be a
+    // terminal capitalising a plain Ctrl+S, so there Ctrl+Shift+S still
+    // saves; an uppercase S with Ctrl and no Shift reported saves everywhere.
+    if has_shift && (has_super || (has_ctrl && kitty_keys)) {
         return false;
     }
     has_super || has_ctrl
@@ -66949,6 +66961,7 @@ pub fn run(
         PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
     )
     .is_ok();
+    app.kitty_keys = kbd_enhanced;
     {
         use std::io::Write;
         out.write_all(&set_title_seq(&title)).ok();
