@@ -245,6 +245,17 @@ pub(crate) enum PanelAlignment {
     Justify,
 }
 
+impl PanelAlignment {
+    /// Every alignment with its picker id and label, in the Customize
+    /// Layout popup's order (View: Set Panel Alignment…, #852).
+    const OPTIONS: [(PanelAlignment, &'static str, &'static str); 4] = [
+        (PanelAlignment::Left, "left", "Left"),
+        (PanelAlignment::Center, "center", "Center"),
+        (PanelAlignment::Right, "right", "Right"),
+        (PanelAlignment::Justify, "justify", "Justify"),
+    ];
+}
+
 /// Where the quick input (command palette / Go to File) anchors vertically.
 /// VS Code's "Quick Input Position". Persisted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -253,6 +264,15 @@ pub(crate) enum QuickInputPosition {
     #[default]
     Top,
     Center,
+}
+
+impl QuickInputPosition {
+    /// Both positions with their picker id and label, in the Customize
+    /// Layout popup's order (View: Set Quick Input Position…, #852).
+    const OPTIONS: [(QuickInputPosition, &'static str, &'static str); 2] = [
+        (QuickInputPosition::Top, "top", "Top"),
+        (QuickInputPosition::Center, "center", "Center"),
+    ];
 }
 
 /// One in-flight `textDocument/selectionRange` request (#254): the
@@ -868,6 +888,44 @@ enum BottomPanelTab {
     Output,
     Ports,
     Captures,
+}
+
+impl BottomPanelTab {
+    /// Every tab, in the strip's left-to-right order (VS Code's panel-group
+    /// order). The strip paints from this list, so a tab cannot be
+    /// clickable without being in it.
+    const ALL: [BottomPanelTab; 5] = [
+        BottomPanelTab::Problems,
+        BottomPanelTab::Output,
+        BottomPanelTab::Terminal,
+        BottomPanelTab::Ports,
+        BottomPanelTab::Captures,
+    ];
+
+    /// The tab's strip label, padded to its click target.
+    fn label(self) -> &'static str {
+        match self {
+            BottomPanelTab::Problems => " PROBLEMS ",
+            BottomPanelTab::Output => " OUTPUT ",
+            BottomPanelTab::Terminal => " TERMINAL ",
+            BottomPanelTab::Ports => " PORTS ",
+            BottomPanelTab::Captures => " CAPTURES ",
+        }
+    }
+
+    /// The palette command that shows this tab (#852). No catch-all: a new
+    /// tab fails to compile until it names one, so no tab ships reachable
+    /// only by a click on the strip.
+    fn show_command(self) -> crate::widgets::command_palette::Command {
+        use crate::widgets::command_palette::Command;
+        match self {
+            BottomPanelTab::Terminal => Command::FocusTerminal,
+            BottomPanelTab::Problems => Command::ShowProblems,
+            BottomPanelTab::Output => Command::ShowOutput,
+            BottomPanelTab::Ports => Command::ShowPorts,
+            BottomPanelTab::Captures => Command::ShowCaptures,
+        }
+    }
 }
 
 /// A transient, click-only notification that a browsable port just appeared in
@@ -7791,7 +7849,8 @@ impl App {
     /// Count of open editors with unsaved edits, across the active group and any
     /// split groups, deduped by path (a file open in two splits is one unsaved
     /// file; each dirty path-less buffer counts once). Drives the Explorer
-    /// activity badge, mirroring VS Code.
+    /// activity badge, mirroring VS Code, and Save All's "Saved N editors"
+    /// (#852).
     fn unsaved_count(&self) -> usize {
         let mut paths: std::collections::HashSet<&std::path::Path> =
             std::collections::HashSet::new();
@@ -9044,6 +9103,9 @@ impl App {
                 }
                 if rect_contains(t.header_views_btn, col, row) {
                     return Some("Views and More Actions");
+                }
+                if self.open_editors.hit_save_all(col, row) {
+                    return Some("Save All");
                 }
             }
             SidebarView::Remote => {
@@ -12120,6 +12182,107 @@ impl App {
         });
     }
 
+    /// Show or hide the activity bar. The Customize Layout row and the
+    /// palette's View: Toggle Activity Bar Visibility (#852) both land here.
+    fn toggle_activity_bar(&mut self) {
+        self.activity_bar_visible = !self.activity_bar_visible;
+        // The bar is a structural auto-hide suppression, and unlike Zen
+        // it flips here on its own. A pending collapse armed against the
+        // old chrome would otherwise sit armed while `allowed()` declines
+        // for it, then fire on the first idle tick after the bar comes
+        // back, with no focus move of the user's own.
+        //
+        // Cancel the collapse. And when the bar goes AWAY, drop the pin
+        // too — for the reason `toggle_side_bar` already refuses to bank
+        // one in that state: no collapse can fire while the bar is
+        // hidden, so a pin held across that period is unconsumable, and
+        // it silently eats the first real collapse after the bar
+        // returns. Those two sites disagreed about the same question
+        // until this line; the bank-time answer is the right one.
+        //
+        // Revealing the bar leaves any pin alone: a pin banked while the
+        // bar is visible belongs to a reveal that can still be honoured.
+        self.sidebar_dwell.disarm();
+        if !self.activity_bar_visible {
+            self.sidebar_pinned_open = false;
+        }
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+    }
+
+    /// Show or hide the status bar: the Customize Layout row and View:
+    /// Toggle Status Bar Visibility (#852).
+    fn toggle_status_bar(&mut self) {
+        self.status_bar_visible = !self.status_bar_visible;
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+    }
+
+    /// Dock the primary side bar (and the activity bar with it) to `pos`:
+    /// the Customize Layout radio rows and View: Toggle Primary Side Bar
+    /// Position (#852).
+    fn set_side_bar_position(&mut self, pos: SideBarPosition) {
+        self.side_bar_position = pos;
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+    }
+
+    /// The bottom panel's alignment: the Customize Layout radio rows and
+    /// View: Set Panel Alignment… (#852).
+    fn set_panel_alignment(&mut self, al: PanelAlignment) {
+        self.panel_alignment = al;
+        self.persist_layout();
+    }
+
+    /// Where the quick input anchors: the Customize Layout radio rows and
+    /// View: Set Quick Input Position… (#852).
+    fn set_quick_input_position(&mut self, pos: QuickInputPosition) {
+        self.quick_input_position = pos;
+        self.persist_layout();
+    }
+
+    /// View: Set Panel Alignment… (#852): the popup's Panel Alignment radio
+    /// group as a keyboard picker, opened on the current alignment.
+    fn open_panel_alignment_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = PanelAlignment::OPTIONS
+            .iter()
+            .map(|(_, id, label)| ListRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        let mut picker = ListPicker::new(ListPurpose::PanelAlignment, "Panel Alignment", rows);
+        picker.selected = PanelAlignment::OPTIONS
+            .iter()
+            .position(|(al, ..)| *al == self.panel_alignment)
+            .unwrap_or(0);
+        self.open_list_picker(picker, "No panel alignments");
+    }
+
+    /// View: Set Quick Input Position… (#852): the popup's Quick Input
+    /// Position radio group as a keyboard picker, opened on the current one.
+    fn open_quick_input_position_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = QuickInputPosition::OPTIONS
+            .iter()
+            .map(|(_, id, label)| ListRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        let mut picker = ListPicker::new(
+            ListPurpose::QuickInputPosition,
+            "Quick Input Position",
+            rows,
+        );
+        picker.selected = QuickInputPosition::OPTIONS
+            .iter()
+            .position(|(pos, ..)| *pos == self.quick_input_position)
+            .unwrap_or(0);
+        self.open_list_picker(picker, "No quick input positions");
+    }
+
     /// Hide the activity bar's inline images when the bar is collapsed so the
     /// OSC-1337 icons don't ghost over the editor; arm a re-emit when shown.
     fn after_chrome_visibility_change(&mut self) {
@@ -12454,6 +12617,7 @@ impl App {
     /// their hit-test rects are zeroed so a stale click can't reach them.
     fn render_explorer_sections(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.open_editors.last_area = Rect::default();
+        self.open_editors.save_all_btn = Rect::default();
         self.outline.last_area = Rect::default();
         self.timeline.last_area = Rect::default();
         self.dependencies.last_area = Rect::default();
@@ -17514,13 +17678,7 @@ impl App {
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
-        let tabs = [
-            (BottomPanelTab::Problems, " PROBLEMS "),
-            (BottomPanelTab::Output, " OUTPUT "),
-            (BottomPanelTab::Terminal, " TERMINAL "),
-            (BottomPanelTab::Ports, " PORTS "),
-            (BottomPanelTab::Captures, " CAPTURES "),
-        ];
+        let tabs = BottomPanelTab::ALL.map(|tab| (tab, tab.label()));
 
         // Lay each tab out left to right, recording its hit rect (which, for
         // PROBLEMS, spans the label and the pill together).
@@ -17637,6 +17795,31 @@ impl App {
             self.show_terminal = true;
         }
         self.focus_pane(Pane::Terminal);
+    }
+
+    /// Output: Select Channel… (#852): the OUTPUT toolbar's channel dropdown
+    /// as a keyboard picker, opened on the channel shown now. Choosing one
+    /// shows it in the OUTPUT tab.
+    fn open_output_channel_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        // The panel only syncs while painted; a tab never shown yet would
+        // otherwise open the picker on the wrong channel.
+        self.output.sync();
+        let current = self.output.selected_name();
+        let rows: Vec<ListRow> = crate::output::channel_names()
+            .into_iter()
+            .map(|name| ListRow {
+                id: name.clone(),
+                label: name,
+            })
+            .collect();
+        let selected = rows
+            .iter()
+            .position(|r| Some(&r.id) == current.as_ref())
+            .unwrap_or(0);
+        let mut picker = ListPicker::new(ListPurpose::OutputChannel, "Output Channels", rows);
+        picker.selected = selected;
+        self.open_list_picker(picker, "No output channels yet");
     }
 
     /// Split the editor into two side-by-side columns (`Cmd+\`). The new
@@ -21086,18 +21269,7 @@ impl App {
             }
             // Cmd+K →: close the editors to the right of the active tab.
             KeyCode::Right if plain => {
-                let from = self.editor.active_index();
-                self.record_closed_tabs_where(|i, ed| i > from && !ed.pinned);
-                let removed = self.editor.close_to_right(from);
-                if removed > 0 {
-                    self.sync_open_file_poll_mtime();
-                    self.status = if removed == 1 {
-                        String::from("Closed 1 tab to the right")
-                    } else {
-                        format!("Closed {removed} tabs to the right")
-                    };
-                    self.poke_cursor();
-                }
+                self.close_tabs_to_right(self.editor.active_index());
                 true
             }
             // Cmd+K S: mark the active file as the compare anchor.
@@ -21203,17 +21375,11 @@ impl App {
             // chord below). Must precede the case-insensitive 'p' arm, which
             // would swallow the shifted press.
             KeyCode::Char('P') if shifted && plain => {
-                if self.editor.keep_open(self.editor.active_index()) {
-                    self.status = String::from("Kept tab open");
-                    self.poke_cursor();
-                }
+                self.keep_tab_open(self.editor.active_index());
                 true
             }
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'p') => {
-                let idx = self.editor.active_index();
-                let pinned = self.editor.toggle_pin(idx);
-                self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
-                self.poke_cursor();
+                self.toggle_tab_pin(self.editor.active_index());
                 true
             }
             // Cmd+K Shift+O: move the active tab into a new window. Must precede
@@ -21927,10 +22093,8 @@ impl App {
             return Ok(());
         }
         if is_terminal_focus_key(key) {
-            if !self.show_terminal {
-                self.show_terminal = true;
-            }
-            self.focus_pane(Pane::Terminal);
+            // The TERMINAL tab, not whichever panel tab was last up (#852).
+            self.set_bottom_panel_tab(BottomPanelTab::Terminal);
             return Ok(());
         }
         if is_run_build_task_key(key) {
@@ -21977,6 +22141,20 @@ impl App {
         if is_extensions_jump_key(key) {
             self.show_tree = true;
             self.set_sidebar_view(SidebarView::Extensions);
+            return Ok(());
+        }
+        // The bottom panel's tabs (#852), claimed from any pane like the
+        // side bar jumps above.
+        if is_show_problems_key(key) {
+            self.set_bottom_panel_tab(BottomPanelTab::Problems);
+            return Ok(());
+        }
+        if is_show_output_key(key) {
+            self.set_bottom_panel_tab(BottomPanelTab::Output);
+            return Ok(());
+        }
+        if is_save_all_key(key) {
+            self.save_all();
             return Ok(());
         }
         if self.is_remote && is_drop_to_local_key(key) {
@@ -35253,6 +35431,27 @@ impl App {
                     );
                 }
             }
+            ListPurpose::OutputChannel => {
+                self.output.sync();
+                self.output.select_by_name(&row.id);
+                self.set_bottom_panel_tab(BottomPanelTab::Output);
+            }
+            ListPurpose::PanelAlignment => {
+                if let Some((al, ..)) = PanelAlignment::OPTIONS
+                    .iter()
+                    .find(|(_, id, _)| *id == row.id)
+                {
+                    self.set_panel_alignment(*al);
+                }
+            }
+            ListPurpose::QuickInputPosition => {
+                if let Some((pos, ..)) = QuickInputPosition::OPTIONS
+                    .iter()
+                    .find(|(_, id, _)| *id == row.id)
+                {
+                    self.set_quick_input_position(*pos);
+                }
+            }
             ListPurpose::Settings => {
                 match row.id.as_str() {
                     "toggle:format_on_save" => self.toggle_format_on_save(),
@@ -46414,6 +46613,13 @@ impl App {
                 })
                 .collect();
         palette.set_extension_commands(ext_commands);
+        // VS Code offers Pin Editor on an unpinned tab and Unpin Editor on
+        // a pinned one (#852), never the one that would do nothing.
+        palette.set_hidden(vec![if self.editor.is_pinned(self.editor.active_index()) {
+            crate::widgets::command_palette::Command::PinEditor
+        } else {
+            crate::widgets::command_palette::Command::UnpinEditor
+        }]);
         let count = palette.results.len();
         self.command_palette = Some(palette);
         self.overlays.command_palette_clear.request();
@@ -47843,6 +48049,15 @@ impl App {
             Cmd::PreviousBookmark => self.goto_bookmark(false),
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
+            Cmd::SaveAll => self.save_all(),
+            Cmd::NewFile => {
+                let target = self.palette_create_target_dir();
+                self.open_create_prompt(CreateKind::File, target);
+            }
+            Cmd::NewFolder => {
+                let target = self.palette_create_target_dir();
+                self.open_create_prompt(CreateKind::Folder, target);
+            }
             Cmd::Undo => {
                 self.status = if self.editor.undo() {
                     String::from("Undo")
@@ -47857,6 +48072,16 @@ impl App {
                     String::from("Nothing to redo")
                 };
             }
+            // The keyboard route on Linux, where Ctrl+A is line start and a
+            // terminal without Super forwarding never delivers Cmd+A (#852).
+            Cmd::SelectAll => {
+                self.focus_pane(Pane::Editor);
+                self.editor.select_all();
+                self.status = format!(
+                    "Selected {} chars",
+                    self.editor.selection_text().chars().count()
+                );
+            }
             Cmd::CloseEditor => {
                 self.record_closed_tab_at(self.editor.active_index());
                 if self.editor.close_active() {
@@ -47866,6 +48091,15 @@ impl App {
                 }
             }
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
+            // The tab menu's rows (#852), on the active tab and through the
+            // same methods its clicks and the Cmd+K chords use.
+            Cmd::CloseOtherEditors => self.close_other_tabs(self.editor.active_index()),
+            Cmd::CloseEditorsToTheRight => self.close_tabs_to_right(self.editor.active_index()),
+            Cmd::CloseSavedEditors => self.close_saved_tabs(),
+            Cmd::CloseAllEditors => self.close_all_tabs(),
+            Cmd::PinEditor => self.set_active_tab_pinned(true),
+            Cmd::UnpinEditor => self.set_active_tab_pinned(false),
+            Cmd::KeepEditor => self.keep_tab_open(self.editor.active_index()),
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::TakeTheTour => self.start_demo(),
@@ -48288,6 +48522,34 @@ impl App {
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
+            // Each tab names the command that shows it, so the palette reads
+            // the tab from there rather than keeping a second mapping.
+            Cmd::FocusTerminal
+            | Cmd::ShowProblems
+            | Cmd::ShowOutput
+            | Cmd::ShowPorts
+            | Cmd::ShowCaptures => {
+                if let Some(tab) = BottomPanelTab::ALL
+                    .into_iter()
+                    .find(|tab| tab.show_command() == cmd)
+                {
+                    self.set_bottom_panel_tab(tab);
+                }
+            }
+            Cmd::OutputSelectChannel => self.open_output_channel_picker(),
+            // The Customize Layout popup's rows (#852), through the same
+            // setters its clicks use.
+            Cmd::ToggleActivityBar => self.toggle_activity_bar(),
+            Cmd::ToggleStatusBar => self.toggle_status_bar(),
+            Cmd::ToggleSideBarPosition => {
+                self.set_side_bar_position(match self.side_bar_position {
+                    SideBarPosition::Left => SideBarPosition::Right,
+                    SideBarPosition::Right => SideBarPosition::Left,
+                })
+            }
+            Cmd::SetPanelAlignment => self.open_panel_alignment_picker(),
+            Cmd::SetQuickInputPosition => self.open_quick_input_position_picker(),
+            Cmd::CustomizeLayout => self.open_customize_layout_menu(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
             Cmd::ProblemsToggleProjectAuto => {
                 // auto -> on -> off -> auto. Cycling rather than a boolean
@@ -52140,6 +52402,10 @@ impl App {
                     if rect_contains(self.open_editors.last_scrollbar, m.column, m.row) {
                         self.open_editors.scroll_to_bar_y(m.row);
                         self.open_editors_scrollbar_drag = true;
+                    } else if self.open_editors.hit_save_all(m.column, m.row) {
+                        // VS Code's Save All on the section header (#852),
+                        // checked first: the header row holds the button.
+                        self.save_all();
                     } else if self.open_editors.hit_header(m.column, m.row) {
                         self.open_editors.toggle_collapse();
                     } else if let Some(idx) = self.open_editors.row_at(m.row)
@@ -54117,6 +54383,14 @@ impl App {
     /// immediately but skips the editor that currently HAS focus (it has
     /// not lost it yet). Returns true when anything changed on screen.
     fn sweep_auto_save(&mut self, require_delay: bool) -> bool {
+        let skip_active = !require_delay && self.focus == Pane::Editor;
+        self.sweep_dirty_buffers(require_delay, skip_active)
+    }
+
+    /// Write every dirty buffer the auto-save rules allow, in every split,
+    /// leaving the active tab alone when `skip_active`. Shared by the
+    /// auto-save sweep and File: Save All (#852).
+    fn sweep_dirty_buffers(&mut self, require_delay: bool, skip_active: bool) -> bool {
         // Each saved tab's own map rides along (#349): the recorder must not
         // look it up by path afterwards, since a split can hold the same file
         // in a second buffer with a different map.
@@ -54137,9 +54411,9 @@ impl App {
             .filter(|p| !self.symbol_path_is_live(p))
             .collect();
         // The tab that still holds focus is not saved by the focus-change
-        // mode: only buffers that LOST focus are written.
-        let keep_focused =
-            (!require_delay && self.focus == Pane::Editor).then(|| self.editor.active_index());
+        // mode: only buffers that LOST focus are written. Save All skips it
+        // too, having just saved it the explicit way.
+        let keep_focused = skip_active.then(|| self.editor.active_index());
         // Collab guests never write shared (workspace) files; the session
         // owner is the single writer (docs/MULTIPLAYER.md, Phase D).
         let guest = self.is_collab_guest();
@@ -54277,6 +54551,45 @@ impl App {
             self.record_history_snapshot_of(&path, seats, described);
         }
         true
+    }
+
+    /// File: Save All (#852, `Cmd+Opt+S` / `Ctrl+Alt+S`): the active tab
+    /// saves exactly as `Cmd+S` would (format on save, hex and sheet edits,
+    /// the overwrite prompt), then every other dirty buffer in every split
+    /// is written by the auto-save rules, which leave a tab that must not
+    /// be written blind (a disk conflict, a lossy encoding, an unresolved
+    /// merge, a hex or sheet edit) to its own `Cmd+S`.
+    fn save_all(&mut self) {
+        let before = self.unsaved_count();
+        if before == 0 {
+            self.status = String::from("Save All: nothing to save");
+            return;
+        }
+        if self.editor.dirty {
+            self.save();
+        }
+        let active_status = self.status.clone();
+        self.sweep_dirty_buffers(false, true);
+        // A format-on-save write lands with its formatter reply: it is on
+        // its way, not left behind.
+        let pending = usize::from(self.save_after_format.is_some());
+        let left = self.unsaved_count().saturating_sub(pending);
+        self.status = if left == 0 {
+            format!(
+                "Saved {before} editor{}",
+                if before == 1 { "" } else { "s" }
+            )
+        } else if self.editor.dirty && pending == 0 {
+            // The active tab's own refusal names the reason and the key
+            // that consents; a summary would bury it.
+            active_status
+        } else {
+            format!(
+                "Save All: {left} editor{} still unsaved - open {} and press Cmd+S",
+                if left == 1 { "" } else { "s" },
+                if left == 1 { "it" } else { "each" }
+            )
+        };
     }
 
     fn toggle_auto_save(&mut self) {
@@ -57013,6 +57326,19 @@ impl App {
         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root)
     }
 
+    /// Where the palette's File: New File… / New Folder… create (#852): the
+    /// Explorer selection while the Explorer has focus, as its own chords
+    /// do; otherwise beside the active file, falling back to the selection
+    /// when no file is open.
+    fn palette_create_target_dir(&self) -> PathBuf {
+        if !self.is_explorer_focused()
+            && let Some(dir) = self.editor.path.as_deref().and_then(Path::parent)
+        {
+            return dir.to_path_buf();
+        }
+        self.explorer_create_target_dir()
+    }
+
     /// VS Code-style type-to-jump for the Explorer. Each printable
     /// keystroke arriving while the file tree is focused appends to a
     /// short-lived prefix buffer and snaps selection to the first
@@ -57113,45 +57439,12 @@ impl App {
                     self.collapse_split_if_empty();
                 }
             }
-            MenuAction::CloseOtherTabs(keep_idx) => {
-                self.record_closed_tabs_where(|i, ed| i != keep_idx && !ed.pinned);
-                let removed = self.editor.close_others(keep_idx);
-                if removed > 0 {
-                    self.sync_open_file_poll_mtime();
-                    self.status = if removed == 1 {
-                        String::from("Closed 1 other tab")
-                    } else {
-                        format!("Closed {removed} other tabs")
-                    };
-                    self.poke_cursor();
-                }
-            }
-            MenuAction::CloseTabsToRight(from_idx) => {
-                self.record_closed_tabs_where(|i, ed| i > from_idx && !ed.pinned);
-                let removed = self.editor.close_to_right(from_idx);
-                if removed > 0 {
-                    self.sync_open_file_poll_mtime();
-                    self.status = if removed == 1 {
-                        String::from("Closed 1 tab to the right")
-                    } else {
-                        format!("Closed {removed} tabs to the right")
-                    };
-                    self.poke_cursor();
-                }
-            }
+            MenuAction::CloseOtherTabs(keep_idx) => self.close_other_tabs(keep_idx),
+            MenuAction::CloseTabsToRight(from_idx) => self.close_tabs_to_right(from_idx),
             MenuAction::CloseAllTabs => self.close_all_tabs(),
             MenuAction::CloseSavedTabs => self.close_saved_tabs(),
-            MenuAction::KeepTabOpen(idx) => {
-                if self.editor.keep_open(idx) {
-                    self.status = String::from("Kept tab open");
-                    self.poke_cursor();
-                }
-            }
-            MenuAction::ToggleTabPin(idx) => {
-                let pinned = self.editor.toggle_pin(idx);
-                self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
-                self.poke_cursor();
-            }
+            MenuAction::KeepTabOpen(idx) => self.keep_tab_open(idx),
+            MenuAction::ToggleTabPin(idx) => self.toggle_tab_pin(idx),
             MenuAction::SplitEditor => self.split_editor(),
             MenuAction::SplitEditorLeft => {
                 self.split_editor_dir(editor_layout::SplitDir::Horizontal, false)
@@ -57300,29 +57593,7 @@ impl App {
             MenuAction::ToggleExplorerView(view) => self.toggle_explorer_view(view),
             MenuAction::OpenCustomizeLayout => self.open_customize_layout_menu(),
             MenuAction::ToggleActivityBar => {
-                self.activity_bar_visible = !self.activity_bar_visible;
-                // The bar is a structural auto-hide suppression, and unlike Zen
-                // it flips here on its own. A pending collapse armed against the
-                // old chrome would otherwise sit armed while `allowed()` declines
-                // for it, then fire on the first idle tick after the bar comes
-                // back, with no focus move of the user's own.
-                //
-                // Cancel the collapse. And when the bar goes AWAY, drop the pin
-                // too — for the reason `toggle_side_bar` already refuses to bank
-                // one in that state: no collapse can fire while the bar is
-                // hidden, so a pin held across that period is unconsumable, and
-                // it silently eats the first real collapse after the bar
-                // returns. Those two sites disagreed about the same question
-                // until this line; the bank-time answer is the right one.
-                //
-                // Revealing the bar leaves any pin alone: a pin banked while the
-                // bar is visible belongs to a reveal that can still be honoured.
-                self.sidebar_dwell.disarm();
-                if !self.activity_bar_visible {
-                    self.sidebar_pinned_open = false;
-                }
-                self.persist_layout();
-                self.after_chrome_visibility_change();
+                self.toggle_activity_bar();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleActivityBar);
             }
             MenuAction::ToggleSideBar => {
@@ -57343,25 +57614,19 @@ impl App {
                 self.open_customize_layout_menu_on(&MenuAction::TogglePanel);
             }
             MenuAction::ToggleStatusBar => {
-                self.status_bar_visible = !self.status_bar_visible;
-                self.persist_layout();
-                self.after_chrome_visibility_change();
+                self.toggle_status_bar();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleStatusBar);
             }
             MenuAction::SetSideBarPosition(pos) => {
-                self.side_bar_position = pos;
-                self.persist_layout();
-                self.after_chrome_visibility_change();
+                self.set_side_bar_position(pos);
                 self.open_customize_layout_menu_on(&MenuAction::SetSideBarPosition(pos));
             }
             MenuAction::SetPanelAlignment(al) => {
-                self.panel_alignment = al;
-                self.persist_layout();
+                self.set_panel_alignment(al);
                 self.open_customize_layout_menu_on(&MenuAction::SetPanelAlignment(al));
             }
             MenuAction::SetQuickInputPosition(pos) => {
-                self.quick_input_position = pos;
-                self.persist_layout();
+                self.set_quick_input_position(pos);
                 self.open_customize_layout_menu_on(&MenuAction::SetQuickInputPosition(pos));
             }
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
@@ -57457,11 +57722,92 @@ impl App {
         }
     }
 
-    /// Cmd+K W / tab context "Close All": close every tab in EVERY editor
-    /// group, not just the focused one, collapsing any split back to a single
-    /// blank pane. A side-by-side layout (e.g. `cgr duplicates` diffs) would
-    /// otherwise only empty the clicked group and look like a single close
-    /// once the blank group collapsed away.
+    /// Tab context "Close Others" and View: Close Other Editors in Group
+    /// (#852): close every tab of the focused group but `keep_idx` and the
+    /// pinned ones, recording each for Reopen Closed Editor.
+    fn close_other_tabs(&mut self, keep_idx: usize) {
+        self.record_closed_tabs_where(|i, ed| i != keep_idx && !ed.pinned);
+        let removed = self.editor.close_others(keep_idx);
+        if removed == 0 {
+            self.status = String::from("No other tabs to close");
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 other tab")
+        } else {
+            format!("Closed {removed} other tabs")
+        };
+        self.poke_cursor();
+    }
+
+    /// Cmd+K →, tab context "Close to the Right" and View: Close Editors to
+    /// the Right in Group (#852): close the focused group's unpinned tabs
+    /// right of `from_idx`, recording each for Reopen Closed Editor.
+    fn close_tabs_to_right(&mut self, from_idx: usize) {
+        self.record_closed_tabs_where(|i, ed| i > from_idx && !ed.pinned);
+        let removed = self.editor.close_to_right(from_idx);
+        if removed == 0 {
+            self.status = String::from("No tabs to the right to close");
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 tab to the right")
+        } else {
+            format!("Closed {removed} tabs to the right")
+        };
+        self.poke_cursor();
+    }
+
+    /// Cmd+K ⇧P, tab context "Keep Open" and View: Keep Editor (#852):
+    /// promote the preview tab at `idx` so the next single-click open does
+    /// not replace it.
+    fn keep_tab_open(&mut self, idx: usize) {
+        if self.editor.is_blank_initial() {
+            self.status = String::from("No editor is open");
+        } else if self.editor.keep_open(idx) {
+            self.status = String::from("Kept tab open");
+            self.poke_cursor();
+        } else {
+            self.status = String::from("Tab is already kept open");
+        }
+    }
+
+    /// Cmd+K P and tab context "Pin" / "Unpin": flip the pin of the tab at
+    /// `idx`. The welcome screen's placeholder is not a tab to pin.
+    fn toggle_tab_pin(&mut self, idx: usize) {
+        if self.editor.is_blank_initial() {
+            self.status = String::from("No editor is open");
+            return;
+        }
+        let pinned = self.editor.toggle_pin(idx);
+        self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
+        self.poke_cursor();
+    }
+
+    /// View: Pin Editor (`pin`) / View: Unpin Editor (#852): the active
+    /// tab's pin, through the tab menu's toggle. Each is a no-op on a tab
+    /// already in that state, so a key bound to one never does the other.
+    fn set_active_tab_pinned(&mut self, pin: bool) {
+        let idx = self.editor.active_index();
+        if !self.editor.is_blank_initial() && self.editor.is_pinned(idx) == pin {
+            self.status = String::from(if pin {
+                "Tab is already pinned"
+            } else {
+                "Tab is not pinned"
+            });
+            return;
+        }
+        self.toggle_tab_pin(idx);
+    }
+
+    /// Cmd+K W / tab context "Close All" / View: Close All Editors (#852):
+    /// close every tab in EVERY editor group, not just the focused one,
+    /// collapsing any split back to a single blank pane. A side-by-side
+    /// layout (e.g. `cgr duplicates` diffs) would otherwise only empty the
+    /// clicked group and look like a single close once the blank group
+    /// collapsed away.
     fn close_all_tabs(&mut self) {
         let mut removed = self.editor.close_all();
         if self.editor_layout.is_split() {
@@ -57486,8 +57832,9 @@ impl App {
     }
 
     /// Close every saved (non-dirty) editor tab, keeping any with unsaved
-    /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
-    /// surfaces produce the same status line and split-collapse behavior.
+    /// changes. Shared by the tab context menu, the `Cmd+K U` chord and View:
+    /// Close Saved Editors in Group (#852) so every surface produces the same
+    /// status line and split-collapse behavior.
     fn close_saved_tabs(&mut self) {
         let removed = self.editor.close_saved();
         if removed == 0 {
@@ -63159,6 +63506,34 @@ fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
 }
 
+/// `Ctrl/Cmd+Shift+M`: show the PROBLEMS tab from any pane, VS Code's
+/// "View: Focus Problems" (#852).
+fn is_show_problems_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'm')
+}
+
+/// `Ctrl/Cmd+Shift+U`: show the OUTPUT tab from any pane, VS Code's
+/// "View: Toggle Output" chord (#852).
+fn is_show_output_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'u')
+}
+
+/// `Cmd+Opt+S` / `Ctrl+Alt+S`: File: Save All (#852). VS Code's macOS chord;
+/// its Linux `Ctrl+K S` is croft's Select for Compare. Shift is rejected:
+/// `Cmd+Opt+Shift+S` converts indentation to spaces.
+fn is_save_all_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'s') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 /// The TurnDone status fragment for a turn's notes: the file is named only
 /// when every note landed in the SAME file. "3 comments in b.rs" was a lie
 /// when two of them sat in a.rs (F4 only cycles the active file, so the
@@ -63781,10 +64156,11 @@ fn is_focus_group_right_key(key: KeyEvent) -> bool {
 }
 
 /// `Cmd+Shift+T` (Mac SUPER+SHIFT+T): focus the Terminal pane from any
-/// pane, un-hiding it if it was collapsed via Ctrl+J. SUPER-only so the
-/// cross-platform `Ctrl+Shift+T` (split-terminal) chord keeps its
-/// historical meaning - the two chords share the same letter but are
-/// disambiguated by the modifier.
+/// pane, un-hiding it if it was collapsed via Ctrl+J and bringing its
+/// TERMINAL tab forward over PROBLEMS / OUTPUT / PORTS / CAPTURES (#852).
+/// SUPER-only so the cross-platform `Ctrl+Shift+T` (split-terminal) chord
+/// keeps its historical meaning - the two chords share the same letter but
+/// are disambiguated by the modifier.
 fn is_terminal_focus_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;

@@ -42,6 +42,8 @@ A VS Code-style tab strip over a shared region; the active tab's label is underl
 
 While the PROBLEMS or OUTPUT tab is focused the arrow / page keys scroll the list and `Esc` returns focus to the editor (in PROBLEMS, once its text filter is already empty; the first `Esc` clears the filter); the mouse wheel scrolls it from anywhere.
 
+Every tab is reachable from the keyboard as well as by clicking the strip: `Cmd`/`Ctrl`+`Shift`+`M` shows PROBLEMS and `Cmd`/`Ctrl`+`Shift`+`U` shows OUTPUT (VS Code's chords), `Cmd`+`Shift`+`T` brings TERMINAL forward, and the Command Palette carries all five ("Terminal: Focus Terminal", "View: Show Problems / Output / Ports / Captures"). "Output: Select Channel…" is the OUTPUT channel dropdown as a keyboard picker.
+
 ### Secondary side bar
 
 An optional auxiliary column on the edge *opposite* the primary side bar, hosting the active file's **Outline**. Toggle it with `Opt`+`Cmd`/`Ctrl`+`B` or from the Customize Layout popup.

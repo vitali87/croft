@@ -66150,3 +66150,1375 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         app.settings_chain
     );
 }
+
+/// #852: every bottom-panel tab is reachable from the keyboard. Each tab
+/// names the palette command that shows it (`show_command` has no
+/// catch-all, so a new tab cannot compile without one, and the strip paints
+/// from `ALL`, so a clickable tab is always in this loop); here each command
+/// must be in the palette and must land on its tab, panel shown and
+/// focused, from a hidden panel on another tab.
+#[test]
+fn every_bottom_panel_tab_is_reachable_from_the_palette() {
+    use crate::widgets::command_palette::ALL_COMMANDS;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for tab in BottomPanelTab::ALL {
+        let cmd = tab.show_command();
+        assert!(
+            ALL_COMMANDS.contains(&cmd),
+            "{cmd:?} (shows {tab:?}) is missing from the palette"
+        );
+        app.show_terminal = false;
+        app.focus_pane(Pane::Editor);
+        app.bottom_panel_tab = if tab == BottomPanelTab::Terminal {
+            BottomPanelTab::Problems
+        } else {
+            BottomPanelTab::Terminal
+        };
+        app.run_command(cmd);
+        assert_eq!(app.bottom_panel_tab, tab, "{cmd:?}");
+        assert!(app.show_terminal, "{cmd:?} must reveal the panel");
+        assert!(
+            app.focus == Pane::Terminal,
+            "{cmd:?} must focus the panel so its keys work at once"
+        );
+    }
+}
+
+/// #852: VS Code's `Ctrl/Cmd+Shift+M` and `+U` show PROBLEMS and OUTPUT from
+/// any pane, the live terminal included, and `Cmd+Shift+T` brings the
+/// TERMINAL tab back rather than focusing whichever tab was last up.
+#[test]
+fn panel_tab_chords_switch_between_problems_output_and_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('M'), ctrl_shift)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Problems);
+    assert!(app.focus == Pane::Terminal);
+    // From the PROBLEMS view itself.
+    app.handle_key(key(KeyCode::Char('u'), cmd_shift)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    app.handle_key(key(KeyCode::Char('T'), cmd_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Terminal,
+        "Cmd+Shift+T must bring the TERMINAL tab forward"
+    );
+    assert!(app.focus == Pane::Terminal);
+    // From the live shell: the chord is croft's, as the side bar jumps are.
+    app.handle_key(key(KeyCode::Char('U'), ctrl_shift)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    // Plain Ctrl+M / Ctrl+U stay the shell's (Enter, kill line).
+    assert!(!is_show_problems_key(key(
+        KeyCode::Char('m'),
+        KeyModifiers::CONTROL
+    )));
+    assert!(!is_show_output_key(key(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL
+    )));
+    // Cmd+Opt+Shift+U is Transform to Uppercase, not OUTPUT.
+    assert!(!is_show_output_key(key(
+        KeyCode::Char('U'),
+        cmd_shift | KeyModifiers::ALT
+    )));
+}
+
+/// #852: Output: Select Channel… is the OUTPUT toolbar's click-only channel
+/// dropdown as a keyboard picker; choosing a row shows that channel.
+#[test]
+fn output_select_channel_picks_a_channel_from_the_keyboard() {
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The bus is process-wide, so the channel carries a name no other test
+    // uses and the picker is narrowed to it.
+    let channel = "Keyboard Reach 852";
+    crate::output::push(channel, crate::output::OutputLevel::Info, "hello");
+    app.run_command(Command::OutputSelectChannel);
+    let picker = app.list_picker.as_mut().expect("the channel picker opens");
+    assert_eq!(picker.purpose, ListPurpose::OutputChannel);
+    for c in "reach 852".chars() {
+        picker.push_char(c);
+    }
+    assert_eq!(picker.visible_count(), 1);
+    app.confirm_list_picker();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    assert!(app.focus == Pane::Terminal);
+    assert_eq!(app.output.selected_name().as_deref(), Some(channel));
+}
+
+/// #852: File: New File… / New Folder… open the Explorer's create prompt
+/// from any pane: beside the active file from the editor, in the Explorer
+/// selection while the Explorer has focus (as its own chords do).
+#[test]
+fn new_file_and_folder_from_the_palette_open_the_create_prompt() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+    let mut app = app_with_open_file(tmp.path(), "sub/a.txt", "x");
+    let file_dir = app
+        .editor
+        .path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap();
+    assert!(file_dir.ends_with("sub"));
+    app.run_command(Command::NewFile);
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::File),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &file_dir),
+        _ => panic!("File: New File… must open the New File prompt"),
+    }
+    app.prompt = None;
+    app.focus_pane(Pane::Tree);
+    app.sidebar_view = SidebarView::Explorer;
+    app.run_command(Command::NewFolder);
+    let explorer_dir = app.explorer_create_target_dir();
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::Folder),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &explorer_dir),
+        _ => panic!("File: New Folder… must open the New Folder prompt"),
+    }
+}
+
+/// #852: Select All is on the palette, the route on Linux where `Ctrl+A` is
+/// line start; it selects the active buffer and hands the editor focus.
+#[test]
+fn select_all_from_the_palette_selects_the_active_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "one\ntwo");
+    app.focus_pane(Pane::Tree);
+    app.run_command(crate::widgets::command_palette::Command::SelectAll);
+    assert_eq!(app.editor.selection_text(), "one\ntwo");
+    assert!(app.focus == Pane::Editor);
+}
+
+/// #852: `Ctrl+Alt+S` is File: Save All: every dirty tab reaches disk, not
+/// only the active one, and a second press says there is nothing left.
+#[test]
+fn save_all_writes_every_dirty_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // App::new loads the developer's real prefs: pin every mode that would
+    // save on its own, or defer the write, off.
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.unsaved_count(), 2);
+    app.handle_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.unsaved_count(), 0, "{}", app.status);
+    assert!(std::fs::read_to_string(&a).unwrap().contains('X'));
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(app.status, "Saved 2 editors");
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(app.status, "Save All: nothing to save");
+    // Shift is Convert Indentation to Spaces; plain Ctrl+S is Save.
+    assert!(!is_save_all_key(key(
+        KeyCode::Char('S'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_save_all_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL
+    )));
+}
+
+/// #852 regression, driven by keys alone: from the editor with the panel
+/// hidden, `Ctrl+Shift+M` shows PROBLEMS, `Ctrl+Shift+U` shows OUTPUT and
+/// `Cmd+Shift+T` brings TERMINAL back over them, each time with the panel
+/// shown and focused.
+#[test]
+fn panel_tab_chords_reach_problems_output_and_terminal_by_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+    app.show_terminal = false;
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('M'), ctrl_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Problems,
+        "Ctrl+Shift+M must show PROBLEMS"
+    );
+    assert!(app.show_terminal, "Ctrl+Shift+M must reveal the panel");
+    assert!(app.focus == Pane::Terminal);
+    app.handle_key(key(KeyCode::Char('U'), ctrl_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Output,
+        "Ctrl+Shift+U must show OUTPUT"
+    );
+    app.handle_key(key(KeyCode::Char('T'), cmd_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Terminal,
+        "Cmd+Shift+T must bring TERMINAL forward"
+    );
+    assert!(app.focus == Pane::Terminal);
+}
+
+/// #852 regression, driven by keys alone: `Ctrl+Alt+S` writes every dirty
+/// tab to disk, the inactive one included, not only the active tab.
+#[test]
+fn ctrl_alt_s_writes_the_inactive_dirty_tab_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(
+        std::fs::read_to_string(&a).unwrap().contains('X'),
+        "the inactive tab a.txt must reach disk"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert!(app.editor.editors.iter().all(|e| !e.dirty));
+}
+
+/// #852 negative: Save All writes only what auto save may write blind. An
+/// inactive tab whose file changed on disk keeps the external text, stays
+/// dirty and is reported, while the other dirty tab still saves.
+#[test]
+fn save_all_never_overwrites_an_external_change_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    std::fs::write(&a, "external change wins\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "external change wins\n",
+        "Save All must not write over a file changed on disk"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(app.unsaved_count(), 1, "the conflicted tab stays dirty");
+    assert!(
+        app.status.contains("1 editor still unsaved"),
+        "the leftover tab is reported, not a clean \"Saved\": {:?}",
+        app.status
+    );
+}
+
+/// #852 negative: plain `Ctrl+S` is still File: Save, not Save All; the
+/// inactive dirty tab stays unsaved on disk.
+#[test]
+fn plain_ctrl_s_still_saves_only_the_active_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "aaa");
+    assert_eq!(app.unsaved_count(), 1);
+}
+
+/// #852 boundary: with no file open, File: New File… from the editor has
+/// no "beside the active file" and falls back to the Explorer's target.
+#[test]
+fn palette_new_file_with_no_file_open_uses_the_explorer_target() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.editor.path.is_none());
+    app.focus_pane(Pane::Editor);
+    let explorer_dir = app.explorer_create_target_dir();
+    app.run_command(Command::NewFile);
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::File),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &explorer_dir),
+        _ => panic!("File: New File… must open the New File prompt"),
+    }
+}
+
+/// Types `text` into whatever overlay has the keyboard, one key at a time.
+fn type_keys_852(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+/// Opens the Command Palette with `Cmd+Shift+P`, as a user would.
+fn open_palette_852(app: &mut App) {
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(
+        app.command_palette.is_some(),
+        "Cmd+Shift+P opens the palette"
+    );
+}
+
+/// #852 (comment 2): the Customize Layout popup opens from the keyboard.
+/// Typing its name in the palette and pressing Enter shows the popup with
+/// its rows, where before the palette said "No commands match".
+#[test]
+fn typing_customize_layout_in_the_palette_opens_the_popup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "customize layout");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("View: Customize Layout… opens the Customize Layout popup");
+    assert!(
+        menu.items.iter().any(|e| matches!(
+            e,
+            MenuEntry::Item {
+                action: MenuAction::ToggleStatusBar,
+                ..
+            }
+        )),
+        "the popup is the Customize Layout one"
+    );
+}
+
+/// #852 (comment 2): the palette query "layout" finds the layout commands,
+/// so a bar hidden with a click can be brought back from the keyboard.
+#[test]
+fn palette_query_layout_lists_the_customize_layout_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "layout");
+    let titles: Vec<String> = app
+        .command_palette
+        .as_ref()
+        .unwrap()
+        .results
+        .iter()
+        .map(|r| r.title().to_string())
+        .collect();
+    for want in [
+        "View: Customize Layout…",
+        "View: Toggle Activity Bar Visibility",
+        "View: Toggle Status Bar Visibility",
+        "View: Toggle Primary Side Bar Position",
+        "View: Set Panel Alignment…",
+        "View: Set Quick Input Position…",
+    ] {
+        assert!(
+            titles.iter().any(|t| t == want),
+            "\"layout\" must find {want:?}; got {titles:?}"
+        );
+    }
+}
+
+/// #852 (comment 2): Activity Bar, Status Bar and Primary Side Bar Position
+/// toggle from the palette, typed and run with Enter.
+#[test]
+fn palette_toggles_the_activity_bar_status_bar_and_side_bar_position() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.activity_bar_visible = true;
+    app.status_bar_visible = true;
+    app.side_bar_position = SideBarPosition::Left;
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "toggle status bar visibility");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.status_bar_visible, "the status bar hides");
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "toggle activity bar visibility");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.activity_bar_visible, "the activity bar hides");
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "toggle primary side bar position");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.side_bar_position, SideBarPosition::Right);
+}
+
+/// #852 (comment 2): Panel Alignment and Quick Input Position are set from
+/// the palette through a picker of their options.
+#[test]
+fn palette_sets_panel_alignment_and_quick_input_position_by_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.panel_alignment = PanelAlignment::Center;
+    app.quick_input_position = QuickInputPosition::Top;
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "set panel alignment");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_some(), "the alignment picker opens");
+    type_keys_852(&mut app, "justify");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.panel_alignment, PanelAlignment::Justify);
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "set quick input position");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_some(), "the position picker opens");
+    type_keys_852(&mut app, "center");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.quick_input_position, QuickInputPosition::Center);
+}
+
+/// Renders `app` at `w`x`h` and returns the frame's buffer.
+fn render_buffer_852(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let backend = ratatui::backend::TestBackend::new(w, h);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// #852 (comment 1): the OPEN EDITORS header carries VS Code's Save All
+/// action; clicking it writes every dirty tab and leaves the section as it
+/// was (the click is the button's, not the header's collapse toggle).
+#[test]
+fn clicking_save_all_on_the_open_editors_header_saves_every_dirty_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.explorer_views = Default::default();
+    app.explorer_views.toggle(ExplorerView::OpenEditors);
+    app.open_editors.collapsed = false;
+    app.sidebar_view = SidebarView::Explorer;
+    app.show_tree = true;
+    let buf = render_buffer_852(&mut app, 120, 40);
+    let hdr = app.open_editors.last_area;
+    assert!(hdr.height > 0, "OPEN EDITORS is on screen");
+    let save_all_x = (hdr.x..hdr.x + hdr.width)
+        .find(|&x| buf[(x, hdr.y)].symbol() == "\u{eb49}")
+        .expect("the OPEN EDITORS header paints a Save All (codicon save-all) action");
+    left_click(&mut app, save_all_x, hdr.y);
+    assert!(
+        std::fs::read_to_string(&a).unwrap().contains('X'),
+        "Save All writes the inactive tab"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert!(
+        !app.open_editors.collapsed,
+        "the button's click does not also collapse the section"
+    );
+}
+
+/// #852: a file dirty in two splits is one unsaved file, as the Explorer's
+/// unsaved badge counts it, so Save All does not report it twice.
+#[test]
+fn save_all_counts_a_file_dirty_in_two_splits_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.focus_editor_group(true);
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    let dirty_buffers = app
+        .editor
+        .editors
+        .iter()
+        .chain(
+            app.editor_layout
+                .inactive_groups()
+                .into_iter()
+                .flat_map(|g| g.editors.iter()),
+        )
+        .filter(|e| e.dirty && e.path.as_deref() == Some(a.as_path()))
+        .count();
+    assert_eq!(dirty_buffers, 2, "fixture: a.txt is dirty in both splits");
+    assert_eq!(app.unsaved_count(), 1, "one file, counted once");
+}
+
+/// #852: a file with a symbol tab is one file on disk; Save All writes it
+/// once and says "Saved 1 editor", not 2.
+#[test]
+fn save_all_reports_a_file_with_a_symbol_tab_as_one_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert!(
+        app.editor.editors.iter().all(|e| e.dirty),
+        "fixture: both tabs hold the edit"
+    );
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "fn a() {\n    1\n}\nfn b() {\n    27\n}"
+    );
+    assert_eq!(app.status, "Saved 1 editor");
+}
+
+/// #852 guard: no Customize Layout row ships mouse-only. Every row names
+/// the palette command that reaches it (a new row fails here until it has
+/// one), the command is in the palette and found by "layout", and running
+/// it (choosing the row's option where it opens a picker) lands on the
+/// state the row's click sets, from a state where that option is not yet
+/// the active one.
+#[test]
+fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command, LAYOUT_COMMANDS};
+    fn command_for(action: &MenuAction) -> Option<Command> {
+        match action {
+            MenuAction::ToggleActivityBar => Some(Command::ToggleActivityBar),
+            MenuAction::ToggleSideBar => Some(Command::ToggleSideBar),
+            MenuAction::ToggleSecondarySideBar => Some(Command::ToggleSecondarySideBar),
+            MenuAction::TogglePanel => Some(Command::ToggleTerminal),
+            MenuAction::ToggleStatusBar => Some(Command::ToggleStatusBar),
+            MenuAction::ToggleMinimap => Some(Command::ToggleMinimap),
+            MenuAction::ToggleAutoHideSideBar => Some(Command::ToggleAutoHideSideBar),
+            MenuAction::SetSideBarPosition(_) => Some(Command::ToggleSideBarPosition),
+            MenuAction::SetPanelAlignment(_) => Some(Command::SetPanelAlignment),
+            MenuAction::SetQuickInputPosition(_) => Some(Command::SetQuickInputPosition),
+            MenuAction::ToggleZenMode => Some(Command::ToggleZenMode),
+            _ => None,
+        }
+    }
+    // A radio row's setting moved off the row's option first.
+    fn off_option(app: &mut App, action: &MenuAction) {
+        match *action {
+            MenuAction::SetSideBarPosition(p) => {
+                app.side_bar_position = if p == SideBarPosition::Left {
+                    SideBarPosition::Right
+                } else {
+                    SideBarPosition::Left
+                };
+            }
+            MenuAction::SetPanelAlignment(al) => {
+                app.panel_alignment = if al == PanelAlignment::Left {
+                    PanelAlignment::Center
+                } else {
+                    PanelAlignment::Left
+                };
+            }
+            MenuAction::SetQuickInputPosition(p) => {
+                app.quick_input_position = if p == QuickInputPosition::Top {
+                    QuickInputPosition::Center
+                } else {
+                    QuickInputPosition::Top
+                };
+            }
+            _ => {}
+        }
+    }
+    let snapshot = |app: &App| {
+        (
+            app.activity_bar_visible,
+            app.show_tree,
+            app.secondary_side_bar_visible,
+            app.show_terminal,
+            app.status_bar_visible,
+            app.minimap_visible,
+            app.sidebar_auto_hide,
+            app.side_bar_position,
+            app.panel_alignment,
+            app.quick_input_position,
+            app.zen_mode,
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let rows: Vec<(String, MenuAction)> = App::new(tmp.path().to_path_buf())
+        .unwrap()
+        .customize_layout_items()
+        .into_iter()
+        .filter_map(|e| match e {
+            MenuEntry::Item { label, action } => Some((label, action)),
+            _ => None,
+        })
+        .collect();
+    assert!(rows.len() >= 12, "the popup's rows: {rows:?}");
+    for (label, action) in rows {
+        let cmd = command_for(&action)
+            .unwrap_or_else(|| panic!("Customize Layout row {label:?} has no palette command"));
+        assert!(ALL_COMMANDS.contains(&cmd), "{cmd:?} is not in the palette");
+        assert!(
+            LAYOUT_COMMANDS.contains(&cmd),
+            "{cmd:?} is not found by the query \"layout\""
+        );
+        let mut by_click = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut by_palette = App::new(tmp.path().to_path_buf()).unwrap();
+        off_option(&mut by_click, &action);
+        off_option(&mut by_palette, &action);
+        assert_eq!(snapshot(&by_click), snapshot(&by_palette), "fixture");
+        by_click.dispatch_menu_action(action.clone(), tmp.path().to_path_buf());
+        by_palette.run_command(cmd);
+        if let Some(picker) = by_palette.list_picker.as_mut() {
+            let option = label.trim_start_matches('\u{2713}').trim().to_lowercase();
+            for c in option.chars() {
+                picker.push_char(c);
+            }
+            assert_eq!(picker.visible_count(), 1, "{cmd:?} offers {option:?}");
+            by_palette.confirm_list_picker();
+        }
+        assert_eq!(
+            snapshot(&by_palette),
+            snapshot(&by_click),
+            "{cmd:?} must do what the row {label:?} does"
+        );
+    }
+}
+
+/// #852 negative: the palette's layout commands change the layout and
+/// nothing else; the Customize Layout popup's re-open is the click route's
+/// (it keeps the popup up between clicks) and must not pop over the editor
+/// after a palette command.
+#[test]
+fn palette_layout_commands_leave_the_customize_layout_popup_closed() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for cmd in [
+        Command::ToggleActivityBar,
+        Command::ToggleStatusBar,
+        Command::ToggleSideBarPosition,
+    ] {
+        app.run_command(cmd);
+        assert!(
+            app.context_menu.is_none(),
+            "{cmd:?} must not open the Customize Layout popup"
+        );
+    }
+    // Twice is a round trip: every toggle is back where it started.
+    let fresh = App::new(tmp.path().to_path_buf()).unwrap();
+    for cmd in [
+        Command::ToggleActivityBar,
+        Command::ToggleStatusBar,
+        Command::ToggleSideBarPosition,
+    ] {
+        app.run_command(cmd);
+    }
+    assert_eq!(app.activity_bar_visible, fresh.activity_bar_visible);
+    assert_eq!(app.status_bar_visible, fresh.status_bar_visible);
+    assert_eq!(app.side_bar_position, fresh.side_bar_position);
+}
+
+/// #852 negative: the alignment picker opens on the current alignment and
+/// Esc leaves it unchanged; only a chosen row changes it.
+#[test]
+fn dismissing_the_panel_alignment_picker_keeps_the_alignment() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.panel_alignment = PanelAlignment::Right;
+    app.run_command(Command::SetPanelAlignment);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    assert_eq!(
+        picker.selected_row().map(|r| r.id.as_str()),
+        Some("right"),
+        "the picker opens on the current alignment"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_none());
+    assert_eq!(app.panel_alignment, PanelAlignment::Right);
+}
+
+/// #852 negative: a collapsed OPEN EDITORS hides its Save All action, as
+/// VS Code hides a collapsed view's actions, and a click on the header
+/// title still just toggles the section and saves nothing.
+#[test]
+fn open_editors_save_all_hides_while_collapsed_and_the_title_click_still_toggles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.explorer_views = Default::default();
+    app.explorer_views.toggle(ExplorerView::OpenEditors);
+    app.open_editors.collapsed = true;
+    app.sidebar_view = SidebarView::Explorer;
+    app.show_tree = true;
+    let buf = render_buffer_852(&mut app, 120, 40);
+    let hdr = app.open_editors.last_area;
+    assert!(hdr.height > 0, "OPEN EDITORS is on screen");
+    assert!(
+        !(hdr.x..hdr.x + hdr.width).any(|x| buf[(x, hdr.y)].symbol() == "\u{eb49}"),
+        "a collapsed section paints no Save All"
+    );
+    assert_eq!(app.open_editors.save_all_btn, Rect::default());
+    // The rightmost header cells, where the button sits when expanded.
+    left_click(&mut app, hdr.x + hdr.width - 2, hdr.y);
+    assert!(!app.open_editors.collapsed, "the header click expands it");
+    let _ = render_buffer_852(&mut app, 120, 40);
+    left_click(&mut app, hdr.x + 3, hdr.y);
+    assert!(app.open_editors.collapsed, "the title click collapses it");
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "aaa",
+        "no header click saved anything"
+    );
+    assert!(app.editor.dirty);
+}
+
+// #852 (comment 3): the editor-tab actions (the tab menu's Close Others,
+// Close to the Right, Close Saved, Close All, Pin / Unpin and Keep Open) are
+// palette commands under VS Code's names, so they can be searched, bound in
+// keybindings.json, and run on Linux without Super.
+
+/// An app with `names` open as kept (non-preview) tabs in one group, the
+/// last one active and focused. Auto-save is off so an edited tab stays
+/// dirty.
+fn tabs_app_852(names: &[&str]) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    for name in names {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, "x\n").unwrap();
+        app.editor.open_pinned(&p).unwrap();
+    }
+    app.focus_pane(Pane::Editor);
+    (app, tmp)
+}
+
+/// A group's tabs by file name, in strip order.
+fn tab_names_852(tabs: &crate::widgets::editor::EditorTabs) -> Vec<String> {
+    tabs.editors
+        .iter()
+        .map(|e| {
+            e.path
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Runs `query` from the palette as a user does: `Cmd+Shift+P`, type it,
+/// Enter. Returns the title of the row Enter ran, `None` when none matched.
+fn run_in_palette_852(app: &mut App, query: &str) -> Option<String> {
+    open_palette_852(app);
+    type_keys_852(app, query);
+    let ran = app
+        .command_palette
+        .as_ref()
+        .and_then(|p| p.selected_item())
+        .map(|item| item.title().to_string());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    ran
+}
+
+/// The palette's rows for `query`, then Esc.
+fn palette_rows_852(app: &mut App, query: &str) -> Vec<String> {
+    open_palette_852(app);
+    type_keys_852(app, query);
+    let rows = app
+        .command_palette
+        .as_ref()
+        .map(|p| p.results.iter().map(|i| i.title().to_string()).collect())
+        .unwrap_or_default();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    rows
+}
+
+/// Makes the active tab dirty the way a user does, by typing into it.
+fn type_into_active_tab_852(app: &mut App) {
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('Z'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.dirty,
+        "fixture: the active tab has unsaved edits"
+    );
+}
+
+/// #852 (comment 3): View: Close Other Editors in Group, typed into the
+/// palette, closes every other tab and keeps the active one, as the tab
+/// menu's Close Others does. Before, the palette had no such command.
+#[test]
+fn palette_close_other_editors_keeps_only_the_active_tab() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+    app.editor.select(1);
+    let ran = run_in_palette_852(&mut app, "View: Close Other Editors in Group");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["b.rs"],
+        "the palette ran {ran:?}"
+    );
+    assert_eq!(app.status, "Closed 3 other tabs");
+}
+
+/// #852 (comment 3): View: Close Editors to the Right in Group closes the
+/// tabs right of the active one and keeps it active.
+#[test]
+fn palette_close_editors_to_the_right_closes_only_the_tabs_right_of_the_active_one() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+    app.editor.select(1);
+    let ran = run_in_palette_852(&mut app, "View: Close Editors to the Right in Group");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["a.rs", "b.rs"],
+        "the palette ran {ran:?}"
+    );
+    assert_eq!(app.editor.active_index(), 1, "b.rs stays active");
+    assert_eq!(app.status, "Closed 2 tabs to the right");
+}
+
+/// #852 (comment 3): View: Close Saved Editors in Group closes the saved
+/// tabs and keeps the one with unsaved edits, unwritten.
+#[test]
+fn palette_close_saved_editors_closes_the_saved_tabs_and_keeps_the_dirty_one() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.editor.select(1);
+    type_into_active_tab_852(&mut app);
+    let ran = run_in_palette_852(&mut app, "View: Close Saved Editors in Group");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["b.rs"],
+        "the palette ran {ran:?}"
+    );
+    assert!(app.editor.dirty, "the unsaved edit is kept");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("b.rs")).unwrap(),
+        "x\n",
+        "and not written"
+    );
+    assert_eq!(app.status, "Closed 2 saved tabs");
+}
+
+/// #852 (comment 3): View: Close All Editors closes every tab.
+#[test]
+fn palette_close_all_editors_closes_every_tab() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    let ran = run_in_palette_852(&mut app, "View: Close All Editors");
+    assert!(
+        app.editor.is_blank_initial(),
+        "the palette ran {ran:?}; tabs left: {:?}",
+        tab_names_852(&app.editor)
+    );
+    assert_eq!(app.status, "Closed 3 tabs");
+}
+
+/// #852 (comment 3): View: Pin Editor pins the active tab (it moves to the
+/// pinned block on the left) and View: Unpin Editor unpins it.
+#[test]
+fn palette_pin_editor_and_unpin_editor_pin_and_unpin_the_active_tab() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    let ran = run_in_palette_852(&mut app, "View: Pin Editor");
+    assert!(app.editor.pinned, "the palette ran {ran:?}");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["c.rs", "a.rs", "b.rs"],
+        "a pinned tab moves leftmost"
+    );
+    assert_eq!(app.status, "Pinned tab");
+    let ran = run_in_palette_852(&mut app, "View: Unpin Editor");
+    assert!(!app.editor.pinned, "the palette ran {ran:?}");
+    assert_eq!(
+        app.editor.path.as_deref().and_then(Path::file_name),
+        Some(std::ffi::OsStr::new("c.rs"))
+    );
+    assert_eq!(app.status, "Unpinned tab");
+}
+
+/// #852 (comment 3): as in VS Code, the palette offers Pin Editor on an
+/// unpinned tab and Unpin Editor on a pinned one, never the one that would
+/// do nothing.
+#[test]
+fn the_palette_offers_pin_editor_or_unpin_editor_by_the_active_tab() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs"]);
+    let rows = palette_rows_852(&mut app, "pin editor");
+    assert!(rows.iter().any(|t| t == "View: Pin Editor"), "{rows:?}");
+    assert!(
+        !rows.iter().any(|t| t == "View: Unpin Editor"),
+        "an unpinned tab has nothing to unpin: {rows:?}"
+    );
+    let idx = app.editor.active_index();
+    app.dispatch_menu_action(MenuAction::ToggleTabPin(idx), tmp.path().to_path_buf());
+    assert!(app.editor.pinned, "fixture: the tab menu pinned it");
+    let rows = palette_rows_852(&mut app, "pin editor");
+    assert!(rows.iter().any(|t| t == "View: Unpin Editor"), "{rows:?}");
+    assert!(
+        !rows.iter().any(|t| t == "View: Pin Editor"),
+        "a pinned tab is already pinned: {rows:?}"
+    );
+}
+
+/// #852 (comment 3): View: Keep Editor keeps the preview tab open, as the
+/// tab menu's Keep Open does.
+#[test]
+fn palette_keep_editor_keeps_the_preview_tab_open() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs"]);
+    let p = tmp.path().join("p.rs");
+    std::fs::write(&p, "x\n").unwrap();
+    app.editor.open_preview(&p).unwrap();
+    assert!(app.editor.preview, "fixture: p.rs is the preview tab");
+    let ran = run_in_palette_852(&mut app, "View: Keep Editor");
+    assert!(!app.editor.preview, "the palette ran {ran:?}");
+    assert_eq!(app.status, "Kept tab open");
+}
+
+/// #852 (comment 3, its GIF): the tab menu's words work in the palette too.
+/// "keep open" found no command at all; it now runs View: Keep Editor.
+#[test]
+fn typing_the_tab_menus_keep_open_in_the_palette_keeps_the_preview_tab() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs"]);
+    let p = tmp.path().join("p.rs");
+    std::fs::write(&p, "x\n").unwrap();
+    app.editor.open_preview(&p).unwrap();
+    let ran = run_in_palette_852(&mut app, "keep open");
+    assert_eq!(ran.as_deref(), Some("View: Keep Editor"));
+    assert!(!app.editor.preview, "the preview tab is kept");
+}
+
+/// #852 (comment 3): the tab commands bind from keybindings.json like any
+/// palette command, which gives Close Others (no chord of its own) and Pin
+/// a key on Linux without Super.
+#[test]
+fn keybindings_json_chords_run_pin_editor_and_close_other_editors() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[
+            { "key": "ctrl+alt+p", "command": "pin_editor" },
+            { "key": "ctrl+alt+o", "command": "close_other_editors" }
+        ]"#,
+    );
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(app.editor.pinned, "ctrl+alt+p pins the active c.rs");
+    assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
+    app.editor.select(2);
+    app.handle_key(key(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["c.rs", "b.rs"],
+        "ctrl+alt+o closes the others, the pinned tab surviving as in the tab menu"
+    );
+}
+
+/// #852 (comment 3): the Keyboard Shortcuts editor lists each tab command
+/// with the chord croft has for it, like every other palette command.
+#[test]
+fn the_keyboard_shortcuts_editor_lists_the_editor_tab_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_keyboard_shortcuts();
+    let picker = app.list_picker.as_ref().expect("the editor opens");
+    for (id, title, chord) in [
+        (
+            "close_other_editors",
+            "View: Close Other Editors in Group",
+            "\u{2014}",
+        ),
+        (
+            "close_editors_to_the_right",
+            "View: Close Editors to the Right in Group",
+            "Cmd+K →",
+        ),
+        (
+            "close_saved_editors",
+            "View: Close Saved Editors in Group",
+            "Cmd+K U",
+        ),
+        ("close_all_editors", "View: Close All Editors", "Cmd+K W"),
+        ("pin_editor", "View: Pin Editor", "Cmd+K P"),
+        ("unpin_editor", "View: Unpin Editor", "Cmd+K P"),
+        ("keep_editor", "View: Keep Editor", "Cmd+K Shift+P"),
+    ] {
+        let row = picker
+            .rows
+            .iter()
+            .find(|r| r.id == format!("kb:{id}"))
+            .unwrap_or_else(|| panic!("no Keyboard Shortcuts row for {id}"));
+        assert_eq!(row.label, format!("{title}  \u{00b7}  {chord}"));
+    }
+}
+
+/// A split whose right (active) group is `[b.rs (pinned), c.rs, p.rs
+/// (preview), d.rs (unsaved), e.rs]` with `active` selected, beside a left
+/// group `[a.rs, b.rs]`.
+fn split_tabs_app_852(active: &str) -> (App, tempfile::TempDir) {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs"]);
+    app.split_editor();
+    assert!(app.editor_layout.is_split(), "fixture: two groups");
+    for name in ["c.rs", "d.rs", "e.rs"] {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, "x\n").unwrap();
+        app.editor.open_pinned(&p).unwrap();
+    }
+    app.editor.toggle_pin(0);
+    app.editor.select(1);
+    let p = tmp.path().join("p.rs");
+    std::fs::write(&p, "x\n").unwrap();
+    app.editor.open_preview(&p).unwrap();
+    app.editor.select(3);
+    type_into_active_tab_852(&mut app);
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["b.rs", "c.rs", "p.rs", "d.rs", "e.rs"],
+        "fixture"
+    );
+    let idx = tab_names_852(&app.editor)
+        .iter()
+        .position(|n| n == active)
+        .unwrap();
+    app.editor.select(idx);
+    app.status.clear();
+    (app, tmp)
+}
+
+/// Every group's tabs as (name, pinned, preview, dirty), the active group
+/// first, then the active index, whether the layout is split, the status
+/// line and the reopen stack (by file name: each fixture has its own
+/// directory).
+type TabsSnapshot852 = (
+    Vec<Vec<(String, bool, bool, bool)>>,
+    usize,
+    bool,
+    String,
+    Vec<String>,
+);
+
+fn tabs_snapshot_852(app: &App) -> TabsSnapshot852 {
+    let group = |tabs: &crate::widgets::editor::EditorTabs| {
+        tab_names_852(tabs)
+            .into_iter()
+            .zip(&tabs.editors)
+            .map(|(n, e)| (n, e.pinned, e.preview, e.dirty))
+            .collect::<Vec<_>>()
+    };
+    let mut groups = vec![group(&app.editor)];
+    groups.extend(app.editor_layout.inactive_groups().into_iter().map(group));
+    (
+        groups,
+        app.editor.active_index(),
+        app.editor_layout.is_split(),
+        app.status.clone(),
+        app.closed_tabs
+            .iter()
+            .map(|t| t.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+/// #852 (comment 3) guard: each close / pin / keep row of the tab menu
+/// names the palette command that does its job on the active tab, and the
+/// command leaves every group's tabs, the status line and the reopen stack
+/// exactly as a click on the row does, whether the tab is plain, pinned or
+/// a preview, beside an unsaved tab and another split group.
+#[test]
+fn every_tab_menu_close_pin_and_keep_row_has_a_palette_command_that_does_the_same() {
+    use crate::widgets::command_palette::Command;
+    fn command_id(label: &str, action: &MenuAction) -> Option<&'static str> {
+        match action {
+            MenuAction::CloseOtherTabs(_) => Some("close_other_editors"),
+            MenuAction::CloseTabsToRight(_) => Some("close_editors_to_the_right"),
+            MenuAction::CloseSavedTabs => Some("close_saved_editors"),
+            MenuAction::CloseAllTabs => Some("close_all_editors"),
+            MenuAction::KeepTabOpen(_) => Some("keep_editor"),
+            MenuAction::ToggleTabPin(_) if label == "Pin" => Some("pin_editor"),
+            MenuAction::ToggleTabPin(_) => Some("unpin_editor"),
+            _ => None,
+        }
+    }
+    let mut covered: Vec<&str> = Vec::new();
+    for active in ["c.rs", "b.rs", "p.rs"] {
+        let (app, _tmp) = split_tabs_app_852(active);
+        let idx = app.editor.active_index();
+        let path = app.editor.tab_path(idx);
+        let items = build_tab_context_menu_items(
+            idx,
+            app.editor.tab_count(),
+            app.editor_layout.is_split(),
+            path.as_deref(),
+            false,
+            app.editor.is_preview(idx),
+            app.editor.is_pinned(idx),
+        );
+        for (label, action) in items.into_iter().filter_map(|e| match e {
+            MenuEntry::Item { label, action } => Some((label, action)),
+            _ => None,
+        }) {
+            let Some(id) = command_id(&label, &action) else {
+                continue;
+            };
+            let cmd = Command::from_id(id).unwrap_or_else(|| {
+                panic!("the tab menu's {label:?} (on {active}) has no palette command {id:?}")
+            });
+            let (mut by_click, tmp_click) = split_tabs_app_852(active);
+            let (mut by_palette, _tmp_palette) = split_tabs_app_852(active);
+            by_click.dispatch_menu_action(action.clone(), tmp_click.path().to_path_buf());
+            by_palette.run_command(cmd);
+            assert_eq!(
+                tabs_snapshot_852(&by_palette),
+                tabs_snapshot_852(&by_click),
+                "{cmd:?} on {active} must do what the tab menu's {label:?} does"
+            );
+            covered.push(id);
+        }
+    }
+    for id in [
+        "close_other_editors",
+        "close_editors_to_the_right",
+        "close_saved_editors",
+        "close_all_editors",
+        "pin_editor",
+        "unpin_editor",
+        "keep_editor",
+    ] {
+        assert!(
+            covered.contains(&id),
+            "{id} was never compared: {covered:?}"
+        );
+    }
+}
+
+/// #852 (comment 3) negative: Close Other Editors in Group keeps the active
+/// tab and every pinned tab, as the tab menu's Close Others does, and the
+/// tabs it closes go on the reopen stack.
+#[test]
+fn palette_close_other_editors_keeps_the_active_and_the_pinned_tabs() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+    app.dispatch_menu_action(MenuAction::ToggleTabPin(0), tmp.path().to_path_buf());
+    app.editor.select(2);
+    run_in_palette_852(&mut app, "View: Close Other Editors in Group");
+    assert_eq!(tab_names_852(&app.editor), ["a.rs", "c.rs"]);
+    assert!(app.editor.editors[0].pinned, "the pinned a.rs survives");
+    assert_eq!(app.editor.active_index(), 1, "c.rs stays active");
+    let reopen: Vec<String> = app
+        .closed_tabs
+        .iter()
+        .map(|t| t.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(reopen, ["b.rs", "d.rs"]);
+    assert_eq!(app.status, "Closed 2 other tabs");
+}
+
+/// #852 (comment 3) negative: Close Editors to the Right on the last tab
+/// closes nothing and says so, rather than touching the tabs to its left.
+#[test]
+fn palette_close_editors_to_the_right_on_the_last_tab_closes_nothing() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    run_in_palette_852(&mut app, "View: Close Editors to the Right in Group");
+    assert_eq!(tab_names_852(&app.editor), ["a.rs", "b.rs", "c.rs"]);
+    assert_eq!(app.editor.active_index(), 2);
+    assert!(app.closed_tabs.is_empty(), "nothing to reopen");
+    assert_eq!(app.status, "No tabs to the right to close");
+}
+
+/// #852 (comment 3) negative: the group-scoped tab commands act on the
+/// focused split only. The other split's tabs, including its copy of a file
+/// the command closes here, stay exactly as they were.
+#[test]
+fn palette_tab_commands_leave_the_other_split_alone() {
+    for (title, active) in [
+        ("View: Close Other Editors in Group", "c.rs"),
+        ("View: Close Editors to the Right in Group", "c.rs"),
+        ("View: Close Saved Editors in Group", "c.rs"),
+        ("View: Pin Editor", "c.rs"),
+        ("View: Unpin Editor", "b.rs"),
+        ("View: Keep Editor", "p.rs"),
+    ] {
+        let (mut app, _tmp) = split_tabs_app_852(active);
+        let before = tabs_snapshot_852(&app);
+        let ran = run_in_palette_852(&mut app, title);
+        assert_eq!(ran.as_deref(), Some(title));
+        let after = tabs_snapshot_852(&app);
+        assert!(after.2, "{title}: still split");
+        assert_ne!(after.0[0], before.0[0], "{title} changed the focused group");
+        assert_eq!(
+            after.0[1..],
+            before.0[1..],
+            "{title} must leave the other split alone"
+        );
+    }
+}
+
+/// #852 (comment 3) negative: with no file open, Pin, Unpin and Keep only
+/// say so. The welcome screen's placeholder is not pinned (Cmd+K P used to
+/// pin it) and Close Others / Close to the Right have nothing to close.
+#[test]
+fn tab_commands_with_no_editor_open_only_say_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap =
+        crate::keymap::Keymap::from_json(r#"[{ "key": "ctrl+alt+u", "command": "unpin_editor" }]"#);
+    assert!(app.editor.is_blank_initial(), "fixture: the welcome screen");
+    for (title, status) in [
+        ("View: Pin Editor", "No editor is open"),
+        ("View: Keep Editor", "No editor is open"),
+        (
+            "View: Close Other Editors in Group",
+            "No other tabs to close",
+        ),
+        (
+            "View: Close Editors to the Right in Group",
+            "No tabs to the right to close",
+        ),
+    ] {
+        let ran = run_in_palette_852(&mut app, title);
+        assert_eq!(ran.as_deref(), Some(title));
+        assert_eq!(app.status, status, "{title}");
+        assert!(app.editor.is_blank_initial(), "{title}");
+        assert!(!app.editor.pinned, "{title}");
+    }
+    app.handle_key(key(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.status, "No editor is open", "a key bound to Unpin");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.editor.pinned, "Cmd+K P pins no placeholder");
+    assert_eq!(app.status, "No editor is open");
+}
+
+/// #852 (comment 3) negative: Pin Editor and Unpin Editor are not toggles.
+/// Bound to their own keys, each leaves a tab already in its state alone,
+/// as VS Code's `when` clauses do; Keep Editor on a kept tab changes nothing.
+#[test]
+fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[
+            { "key": "ctrl+alt+p", "command": "pin_editor" },
+            { "key": "ctrl+alt+u", "command": "unpin_editor" },
+            { "key": "ctrl+alt+k", "command": "keep_editor" }
+        ]"#,
+    );
+    let press = |app: &mut App, c: char| {
+        app.handle_key(key(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .unwrap();
+    };
+    press(&mut app, 'u');
+    assert!(!app.editor.pinned, "Unpin does not pin");
+    assert_eq!(tab_names_852(&app.editor), ["a.rs", "b.rs", "c.rs"]);
+    assert_eq!(app.status, "Tab is not pinned");
+    press(&mut app, 'p');
+    assert!(app.editor.pinned);
+    press(&mut app, 'p');
+    assert!(app.editor.pinned, "a second Pin does not unpin");
+    assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
+    assert_eq!(app.status, "Tab is already pinned");
+    press(&mut app, 'k');
+    assert!(
+        !app.editor.preview && app.editor.pinned,
+        "Keep changes nothing"
+    );
+    assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
+    assert_eq!(app.status, "Tab is already kept open");
+}
