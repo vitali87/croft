@@ -546,7 +546,7 @@ fn run_croft_session(
     // `hash(launch arg)` the dtach socket uses — NOT the remote croft's
     // `workspace_root`. The workspace diverges from the launch identity (a
     // no-path launch opens the login dir, but the user may then open a
-    // subfolder, and that opened root is also preserved across the F9 re-exec),
+    // subfolder, and that opened root is also preserved across a self re-exec),
     // so a workspace-keyed relay desynced the moment the opened folder differed
     // from where the pump's `pwd` lands. The key is deterministic, so carrying
     // it in env is freeze-safe: dtach freezes it at first launch, but every
@@ -879,7 +879,7 @@ pub fn launch_croft_with(
     if remote_croft_present(&ssh).unwrap_or(false) {
         // A croft is already installed: attach to it right away. Any update
         // cross-builds and ships on a background thread, and the running
-        // remote croft offers the F9 reload once the new binary lands. The
+        // remote croft offers a relaunch once the new binary lands. The
         // user must never wait behind a build for a session that already
         // exists.
         spawn_background_install(&ssh);
@@ -1963,7 +1963,7 @@ fn write_relay_err(host: &str, socket: &Path, inbox_dir: &str, request_id: &str,
 /// from the launch identity — a no-path launch opens the login dir, the user
 /// then opens a subfolder, and the pump (which only knows the launch arg) can't
 /// see that divergence. The launch arg is the one identity both sides share and
-/// that is invariant across an in-session workspace change and the F9 re-exec.
+/// that is invariant across an in-session workspace change and a self re-exec.
 /// `DefaultHasher` has fixed SipHash keys, so the value is deterministic across
 /// croft processes.
 pub(crate) fn relay_session_id(launch_arg: &str) -> String {

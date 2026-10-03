@@ -36,14 +36,18 @@ pub struct Cli {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
+    // Ignoring a subcommand is left as-is deliberately: clap subcommands are
+    // not argument ids, so `conflicts_with = "command"` is a runtime assert
+    // failure rather than a guard. A plain comment rather than part of the
+    // doc below, because clap prints a field's `///` as its long help and
+    // this note is for maintainers, not `croft --help` readers (#853). The
+    // flag itself came from #282; the issue number stays here, not in help.
     /// Print the version with build provenance (git hash and build time) and
     /// exit. `--version` prints the plain `x.y.z`; this is the flag to quote
-    /// in a bug report, since two builds can share a version (#282).
+    /// in a bug report, since two builds can share a version.
     ///
     /// It answers before anything else runs, so pairing it with a subcommand
-    /// swallows that subcommand. Left as-is deliberately: clap subcommands are
-    /// not argument ids, so `conflicts_with = "command"` is a runtime assert
-    /// failure rather than a guard, and `--version` behaves the same way.
+    /// ignores that subcommand, as `--version` does.
     #[arg(long)]
     pub build_info: bool,
 
@@ -2125,6 +2129,118 @@ mod tests {
         let cli = Cli::try_parse_from(["croft", "--build-info"]).unwrap();
         assert!(cli.build_info);
         assert!(!Cli::try_parse_from(["croft"]).unwrap().build_info);
+    }
+
+    /// `--build-info`'s entry in rendered `help`, from its flag to the line
+    /// that opens the next option (`-x, --flag` or `--flag`), or to the end.
+    fn build_info_entry(help: &str) -> &str {
+        let start = help.find("--build-info").expect("--build-info is listed");
+        let entry = &help[start..];
+        let mut end = entry.find('\n').map_or(entry.len(), |i| i + 1);
+        for line in entry[end..].split_inclusive('\n') {
+            if line.trim_start().starts_with('-') {
+                break;
+            }
+            end += line.len();
+        }
+        &entry[..end]
+    }
+
+    /// #853 review: the entry ends where the next option starts, whichever
+    /// option that is, so reordering or renaming the flags around
+    /// `--build-info` neither breaks these tests nor lets them read past it.
+    #[test]
+    fn the_build_info_entry_ends_at_whichever_option_follows_it() {
+        let help = "Options:\n      --build-info\n          Print build provenance and exit.\n\n          Ignores that subcommand.\n\n      --zzz <WHAT>\n          Talks about clap internals.\n";
+        let entry = build_info_entry(help);
+        assert!(entry.contains("Ignores that subcommand."), "{entry:?}");
+        assert!(!entry.contains("--zzz"), "{entry:?}");
+        assert!(!entry.contains("clap"), "{entry:?}");
+        // The last option runs to the end of the page.
+        let last = "Options:\n  -V, --version  Print version\n      --build-info  Print build provenance\n";
+        assert_eq!(
+            build_info_entry(last),
+            "--build-info  Print build provenance\n"
+        );
+        // -h's one-line form, and a short flag opening the next entry.
+        let short =
+            "      --build-info  Print build provenance and exit\n  -o, --open-file <F>  Open F\n";
+        assert_eq!(
+            build_info_entry(short),
+            "--build-info  Print build provenance and exit\n"
+        );
+    }
+
+    /// #853: clap prints a field's whole `///` doc as its long help, so a
+    /// maintainer's note about clap left there shipped in `croft --help`.
+    #[test]
+    fn build_info_long_help_speaks_to_users_not_maintainers() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        let entry = build_info_entry(&help);
+        assert!(
+            entry.contains("ignores that subcommand"),
+            "the user-facing caveat stays: {entry}"
+        );
+        for leak in ["clap", "conflicts_with", "assert", "(#"] {
+            assert!(
+                !entry.contains(leak),
+                "{leak:?} leaked into --build-info's help: {entry}"
+            );
+        }
+    }
+
+    /// #853 guard: `-h` shows only a field's first paragraph, so the caveat
+    /// (and anything a maintainer might tuck after it) stays out of the
+    /// short help; `--build-info` there is its one-line summary.
+    #[test]
+    fn build_info_short_help_is_its_summary_alone() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_help()
+            .to_string();
+        let entry = build_info_entry(&help);
+        assert!(entry.contains("build provenance"), "{entry}");
+        for absent in ["subcommand", "clap", "conflicts_with", "(#"] {
+            assert!(
+                !entry.contains(absent),
+                "{absent:?} does not belong in -h's --build-info line: {entry}"
+            );
+        }
+    }
+
+    /// #853 guard: moving the note did not just move the leak. No help page,
+    /// the top level or any subcommand's, talks about clap internals.
+    #[test]
+    fn no_help_page_carries_a_note_about_clap_internals() {
+        fn walk(cmd: &mut clap::Command, path: &str) {
+            let help = cmd.render_long_help().to_string();
+            for leak in ["clap", "conflicts_with", "runtime assert"] {
+                assert!(
+                    !help.contains(leak),
+                    "{leak:?} leaked into `{path} --help`: {help}"
+                );
+            }
+            for sub in cmd.get_subcommands_mut() {
+                let path = format!("{path} {}", sub.get_name());
+                walk(sub, &path);
+            }
+        }
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        cmd.build();
+        walk(&mut cmd, "croft");
+    }
+
+    /// #853 guard against over-correcting the caveat into a clap rule:
+    /// `conflicts_with = "command"` names no argument id, so clap would
+    /// panic on it. `--build-info` beside a subcommand keeps parsing, and
+    /// `run` answers `--build-info` first, as the help now says.
+    #[test]
+    fn build_info_beside_a_subcommand_still_parses() {
+        <Cli as clap::CommandFactory>::command().debug_assert();
+        let cli = Cli::try_parse_from(["croft", "--build-info", "demo"]).unwrap();
+        assert!(cli.build_info);
+        assert!(matches!(cli.command, Some(CliCommand::Demo { tour: None })));
     }
 
     #[test]

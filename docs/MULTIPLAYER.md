@@ -210,10 +210,10 @@ displaces nothing.
 
 A remote croft is updated underneath its session: the launching machine ships
 a new binary to `~/.cargo/bin/croft` while the old one runs. The inner croft
-offers `F9` to re-exec into it; the **host** replaces its own process image,
-keeping the session alive. The listening socket, the PTY master and the inner
-child's pid ride through the `exec` by number, so the successor adopts the
-running session instead of binding and spawning a new one.
+offers `Ctrl+Shift+F9` to re-exec into it; the **host** replaces its own
+process image, keeping the session alive. The listening socket, the PTY master
+and the inner child's pid ride through the `exec` by number, so the successor
+adopts the running session instead of binding and spawning a new one.
 
 Accepted client connections cannot ride along: they are ordinary fds and die
 at the `exec`. So the host broadcasts `HostSwap` first, and a client seeing it

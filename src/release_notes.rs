@@ -5,19 +5,23 @@
 //! data, so the welcome panel needs zero network and never shells out to
 //! `git log` or a forge API — the list is an accurate property of the build.
 //!
-//! Write `src/release_notes/<version>.md` on every version bump so the panel
-//! always tells the truth about what the running binary ships. One highlight
-//! per line, each prefixed `feature:` or `fix:`; newest or most notable
-//! first, each summary one short sentence.
+//! A pull request that changes what ships writes its highlights to a
+//! fragment of its own, `src/release_notes/unreleased/<name>.md`: one per
+//! line, each prefixed `feature:` or `fix:`, each summary one short sentence.
+//! It never touches `version`. After the merge, the version-bump workflow
+//! folds the pending fragments into `src/release_notes/<version>.md` and
+//! bumps the version once, on main (`scripts/release.py`).
 //!
-//! ONE FILE PER VERSION, and a version's file describes that version alone
-//! rather than accumulating a changelog. A missing file for the current
-//! version is a BUILD error, so a binary always describes itself.
+//! A build carries the pending fragments when there are any, since those are
+//! the changes it has on top of its version's release, and its card says so
+//! (`heading`); otherwise it carries its version's notes. A build with
+//! neither does not build, so a binary always describes itself
+//! (`select::baked`).
 //!
-//! The layout exists because the single shared file was on every open pull
-//! request's rebase path (#399): two versions' notes never conflict in
-//! content, only in the file they shared, and contributors had to reserve
-//! version numbers by hand to keep the bumps from colliding.
+//! The layout exists because shared notes, and then a version bump in every
+//! pull request, put each open PR on the others' conflict path (#399): two
+//! changes' notes never conflict in content, only in the file or the version
+//! line they shared.
 
 use ratatui::style::Color;
 
@@ -62,13 +66,30 @@ pub struct ReleaseNote {
     pub summary: &'static str,
 }
 
-/// This version's highlights, as written in `src/release_notes/<version>.md`
-/// and baked in by `build.rs`.
-///
-/// One file per version rather than one shared file: two versions' notes
-/// never conflict in CONTENT, only in the file they shared, and that file was
-/// on every open pull request's rebase path (#399).
+#[cfg(test)]
+mod select;
+
+/// This build's highlights, as `build.rs` chose them (`select::baked`): the
+/// pending fragments in `src/release_notes/unreleased/` when there are any,
+/// otherwise `src/release_notes/<version>.md`.
 const NOTES_MD: &str = include_str!(concat!(env!("OUT_DIR"), "/release_notes.md"));
+
+/// Whether the baked notes are pending fragments rather than a release's:
+/// the build carries changes that no release has yet.
+pub fn unreleased() -> bool {
+    env!("CROFT_NOTES_UNRELEASED") == "1"
+}
+
+/// The card's heading. A build of a release names it; a build carrying
+/// changes past its version's release says so, since the notes below are
+/// not that release's.
+pub fn heading(unreleased: bool, version: &str) -> String {
+    if unreleased {
+        format!("IN THIS BUILD (v{version}+)")
+    } else {
+        format!("IN THIS RELEASE (v{version})")
+    }
+}
 
 /// Parse the baked notes: one highlight per line, `feature:` or `fix:` first.
 ///
@@ -157,29 +178,27 @@ mod tests {
         );
     }
 
-    /// The panel must show THIS version's notes, which is the guarantee the
-    /// single shared file used to give.
+    /// The panel must show the notes this build carries: the pending
+    /// fragments when there are any, otherwise this version's own.
     ///
-    /// Non-emptiness alone cannot check that half: ANY version's file is
+    /// Non-emptiness alone cannot check that: ANY version's file is
     /// non-empty, so a build.rs that baked the wrong one would pass. The
-    /// current version's file is read here directly, through a path built
-    /// from `CARGO_PKG_VERSION` at compile time, and the baked text must
-    /// equal it. Measured: baking a fixed `0.1.999.md` instead leaves the
-    /// non-emptiness assertions green and fails this one.
+    /// source tree is read here directly, through `select::baked` and the
+    /// path and version cargo built with, and the baked text and its
+    /// unreleased flag must equal what it chooses.
     #[test]
-    fn the_baked_notes_are_this_versions_and_are_not_empty() {
-        const FROM_SOURCE: &str = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/release_notes/",
-            env!("CARGO_PKG_VERSION"),
-            ".md"
-        ));
+    fn the_baked_notes_are_the_ones_this_build_carries_and_are_not_empty() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("release_notes");
+        let expected = select::baked(&dir, env!("CARGO_PKG_VERSION")).unwrap();
         assert_eq!(
             NOTES_MD,
-            FROM_SOURCE,
-            "the binary carries notes that are not v{}'s",
+            expected.text,
+            "the binary carries notes other than v{}'s build's",
             env!("CARGO_PKG_VERSION")
         );
+        assert_eq!(unreleased(), expected.unreleased);
 
         let notes = release_notes();
         assert!(
@@ -192,5 +211,13 @@ mod tests {
                 "a highlight with no text would paint an empty row"
             );
         }
+    }
+
+    /// A build of a release names it. A build carrying changes past its
+    /// version's release must not claim the notes below are that release's.
+    #[test]
+    fn the_heading_names_the_release_or_the_build_past_it() {
+        assert_eq!(heading(false, "0.2.11"), "IN THIS RELEASE (v0.2.11)");
+        assert_eq!(heading(true, "0.2.11"), "IN THIS BUILD (v0.2.11+)");
     }
 }

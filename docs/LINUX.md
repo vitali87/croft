@@ -56,7 +56,7 @@ A stock cloud image works as-is, and behaviour, keybindings, latency, and the fi
 
 The **launching** machine needs `rsync` on its `PATH` to sync the source tree to the host. macOS and most Linux installs ship it; a stock Termux does not (`pkg install rsync`). Without it the connect fails with `running rsync to remote: spawning streaming subprocess: No such file or directory`.
 
-Only the first connect waits for the install. Later connects attach immediately; if your local source is newer, the cross-build and ship run in the background while you work, and `F9` reloads into the new binary once it lands. Self-updates use a dedicated throttled SSH lane so install bytes never queue ahead of live keystrokes, keeping input latency at zero while a newer binary streams in.
+Only the first connect waits for the install. Later connects attach immediately; if your local source is newer, the cross-build and ship run in the background while you work, and `Ctrl+Shift+F9` (or a click on the status bar's "Update ready" pill) relaunches into the new binary once it lands. Self-updates use a dedicated throttled SSH lane so install bytes never queue ahead of live keystrokes, keeping input latency at zero while a newer binary streams in.
 
 ### "Background croft update failed; staying on current version"
 
