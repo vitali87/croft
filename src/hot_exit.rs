@@ -145,7 +145,10 @@ fn clear(path: &Path, root: &Path) -> std::io::Result<()> {
         .write(true)
         .truncate(true)
         .open(path)?;
-    file.write_all(&json)
+    file.write_all(&json)?;
+    // On disk before the unlink is tried: a power cut between the two must
+    // not leave the discarded text to come back on the next launch.
+    file.sync_all()
 }
 
 /// Whether the backup at `path` was last written longer than
@@ -162,6 +165,10 @@ pub fn is_expired(path: &Path) -> bool {
 /// owns: their croft is gone (see [`owner_runs`]), or the file carries this
 /// process's pid (a dead croft's pid, recycled, or an earlier run in this
 /// process). A running croft's file is its own, live copy.
+///
+/// Oldest written first, so where two backups hold the same file, the one
+/// restored last, and so kept, is the newer (#862 review). The name breaks
+/// a tie.
 pub fn orphaned(dir: &Path, root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(workspace_dir(dir, root)) else {
         return Vec::new();
@@ -172,7 +179,10 @@ pub fn orphaned(dir: &Path, root: &Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| owner_of(p).is_some_and(|(pid, start)| pid == me || !owner_runs(pid, start)))
         .collect();
-    files.sort();
+    files.sort_by_cached_key(|p| {
+        let written = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        (written, p.clone())
+    });
     files
 }
 
@@ -263,21 +273,48 @@ mod tests {
         assert_eq!(a.parent(), Some(dir));
     }
 
+    /// A process this test starts and owns, so its start time is readable
+    /// wherever the test runs; killed when dropped.
+    struct Running(std::process::Child);
+
+    impl Running {
+        fn start() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .expect("spawn sleep"),
+            )
+        }
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[test]
     fn only_the_backups_of_gone_crofts_are_orphaned() {
         let root = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let ws = workspace_dir(dir.path(), root.path());
         std::fs::create_dir_all(&ws).unwrap();
-        // pid 1 is always running, since `init1`; 999999999 never exists.
-        let init1 = start_time_of(1).expect("pid 1's start time");
+        // `running` runs for the whole test; 999999999 never exists.
+        let running = Running::start();
+        let pid = running.pid();
+        let started = start_time_of(pid).expect("a child's start time");
         let names = [
             // pid alone: judged by the pid.
-            String::from("1.json"),
+            format!("{pid}.json"),
             String::from("999999999.json"),
             // pid and start time: the same process, or a recycled pid.
-            format!("1-{init1}.json"),
-            String::from("1-1.json"),
+            format!("{pid}-{started}.json"),
+            format!("{pid}-1.json"),
             String::from("999999999-7.json"),
             // Not backups.
             String::from("notes.json"),
@@ -289,18 +326,45 @@ mod tests {
         }
         let own = own_path(dir.path(), root.path());
         std::fs::write(&own, "{}").unwrap();
-        let found: Vec<String> = orphaned(dir.path(), root.path())
+        let mut found: Vec<String> = orphaned(dir.path(), root.path())
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
+        found.sort();
         let mut want = vec![
             own.file_name().unwrap().to_string_lossy().into_owned(),
             String::from("999999999.json"),
-            String::from("1-1.json"),
+            format!("{pid}-1.json"),
             String::from("999999999-7.json"),
         ];
         want.sort();
         assert_eq!(found, want);
+    }
+
+    /// #862 review: where two gone crofts' backups hold the same file, the
+    /// one restored last wins its tab, so the newer backup comes last,
+    /// whatever the names would sort to.
+    #[test]
+    fn the_newest_orphaned_backup_comes_last() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = workspace_dir(dir.path(), root.path());
+        std::fs::create_dir_all(&ws).unwrap();
+        // By name, "1000000000-1" sorts before "999999998-1".
+        let older = ws.join("999999998-1.json");
+        let newer = ws.join("1000000000-1.json");
+        let at = |path: &Path, secs: u64| {
+            std::fs::write(path, "{}").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        at(&older, 1_000_000);
+        at(&newer, 2_000_000);
+        assert_eq!(orphaned(dir.path(), root.path()), vec![older, newer]);
     }
 
     #[test]

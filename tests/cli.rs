@@ -702,10 +702,13 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
+        // A child that cannot take the pty as its controlling terminal
+        // fails to spawn here, rather than running detached from it.
         unsafe {
             cmd.pre_exec(|| {
-                libc::setsid();
-                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -717,34 +720,73 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
         }
         (child, unsafe { std::fs::File::from_raw_fd(master) })
     }
-    fn drain(pty: &mut std::fs::File, for_: Duration) -> String {
-        let mut out = Vec::new();
+    /// What croft writes until `done` holds on everything read so far, or
+    /// until `limit` (a bound for a slow machine, not a wait). The end of
+    /// the terminal (croft exited) stops the read; any other read error
+    /// fails the test rather than passing for the end.
+    fn read_until(
+        pty: &mut std::fs::File,
+        limit: Duration,
+        mut done: impl FnMut(&str) -> bool,
+    ) -> String {
+        let mut out = String::new();
         let mut buf = [0u8; 1 << 16];
-        let end = Instant::now() + for_;
-        while Instant::now() < end {
+        let end = Instant::now() + limit;
+        while !done(&out) && Instant::now() < end {
             match pty.read(&mut buf) {
                 Ok(0) => break,
-                Ok(k) => out.extend_from_slice(&buf[..k]),
+                Ok(k) => out.push_str(&String::from_utf8_lossy(&buf[..k])),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10))
                 }
-                Err(_) => break,
+                // Linux reports the slave side closing as EIO.
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("reading croft's terminal: {e}"),
             }
         }
-        String::from_utf8_lossy(&out).into_owned()
+        out
     }
+    /// Whether a hot-exit backup under `dir` holds `text`.
+    fn a_backup_holds(dir: &std::path::Path, text: &str) -> bool {
+        let Ok(workspaces) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        workspaces
+            .flatten()
+            .filter_map(|ws| std::fs::read_dir(ws.path()).ok())
+            .flat_map(|files| files.flatten())
+            .filter(|f| f.path().extension().is_some_and(|x| x == "json"))
+            .any(|f| std::fs::read_to_string(f.path()).is_ok_and(|t| t.contains(text)))
+    }
+    let limit = Duration::from_secs(20);
 
     let home = tempfile::tempdir().unwrap();
     let file = home.path().join("a.txt");
     std::fs::write(&file, "alpha\n").unwrap();
+    let backups = home.path().join(".cache/croft/hot-exit");
     let (mut child, mut pty) = spawn(home.path(), &["a.txt"]);
-    let started = drain(&mut pty, Duration::from_secs(8));
-    assert!(started.len() > 1000, "croft drew nothing: {started:?}");
+    let started = read_until(&mut pty, limit, |out| out.contains("alpha"));
+    assert!(
+        started.contains("alpha"),
+        "croft never drew a.txt: {started:?}"
+    );
+    // Dismiss anything a first launch shows over the editor. A terminal
+    // reads ESC as Escape only when nothing follows it at once, so this
+    // pause is the protocol's, not a guess at how long croft takes.
     pty.write_all(b"\x1b").unwrap();
-    drain(&mut pty, Duration::from_secs(1));
+    read_until(&mut pty, Duration::from_millis(300), |_| false);
     pty.write_all(b"HOTEXIT").unwrap();
-    // Past the backup delay after the last edit, then killed outright.
-    drain(&mut pty, Duration::from_secs(8));
+    // The backup lands 5 s after the last edit; croft is killed outright
+    // once it has. The terminal is read meanwhile, so croft never blocks
+    // on a full one.
+    let end = Instant::now() + limit;
+    while !a_backup_holds(&backups, "HOTEXIT") && Instant::now() < end {
+        read_until(&mut pty, Duration::from_millis(100), |_| false);
+    }
+    assert!(
+        a_backup_holds(&backups, "HOTEXIT"),
+        "a backup holds the edit"
+    );
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(
@@ -754,7 +796,9 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
     );
 
     let (mut child, mut pty) = spawn(home.path(), &[]);
-    let drawn = drain(&mut pty, Duration::from_secs(8));
+    let drawn = read_until(&mut pty, limit, |out| {
+        out.contains("HOTEXITalpha") && out.contains("restored 1 unsaved tab")
+    });
     let _ = child.kill();
     let _ = child.wait();
     assert!(
