@@ -2,6 +2,11 @@ use std::path::Path;
 
 const CSV_BYTES_CAP: u64 = 25 * 1024 * 1024;
 const XLSX_BYTES_CAP: u64 = 50 * 1024 * 1024;
+/// The most cells one sheet's grid is built from, counting the dense
+/// rectangle between its outermost values. The compressed-size cap above
+/// doesn't bound this: repeat attributes, or two values at opposite
+/// corners, expand a few hundred bytes to gigabytes (#1156).
+const MAX_SHEET_CELLS: u64 = 10_000_000;
 const MAX_COL_DISPLAY_W: u16 = 40;
 const MIN_COL_DISPLAY_W: u16 = 3;
 
@@ -213,8 +218,18 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
                     meta.len()
                 )));
             }
-            let sheets = read_calamine_workbook(path, kind)
-                .map_err(|e| std::io::Error::other(format!("workbook open: {e}")))?;
+            // calamine expands an ODS's repeats while opening the workbook,
+            // before any sheet is asked for, so its extent is measured from
+            // the XML first.
+            if kind == SheetKind::Ods {
+                for (name, rows, cols) in ods_extents(path)? {
+                    check_sheet_extent(&name, rows, cols)?;
+                }
+            }
+            let sheets = read_calamine_workbook(path, kind).map_err(|e| match e {
+                WorkbookError::TooLarge(e) => e,
+                WorkbookError::Calamine(e) => std::io::Error::other(format!("workbook open: {e}")),
+            })?;
             if sheets.is_empty() {
                 return Err(std::io::Error::other("workbook has no sheets"));
             }
@@ -572,12 +587,191 @@ fn display_width(s: &str) -> u16 {
     s.chars().count().min(u16::MAX as usize) as u16
 }
 
-fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>, calamine::Error> {
-    use calamine::{Data, Reader};
-    // `open_workbook_auto` resolves the reader from the file EXTENSION,
-    // so a content-routed file without one (#174) needs the explicit
-    // reader for its sniffed kind.
-    let mut workbook: calamine::Sheets<_> = match calamine::open_workbook_auto(path) {
+/// Refuse a sheet whose dense extent is over [`MAX_SHEET_CELLS`]. The
+/// message says "too large" so the open is not rerouted to the text editor.
+fn check_sheet_extent(name: &str, rows: u64, cols: u64) -> std::io::Result<()> {
+    if rows.saturating_mul(cols) > MAX_SHEET_CELLS {
+        return Err(std::io::Error::other(format!(
+            "Sheet too large: {name} is {rows}x{cols} cells (max {}M)",
+            MAX_SHEET_CELLS / 1_000_000
+        )));
+    }
+    Ok(())
+}
+
+/// Each table's `(name, rows, columns)` as calamine will expand it: the
+/// rectangle from the first to the last row and column holding a value,
+/// with `number-rows-repeated` / `number-columns-repeated` counted inside
+/// it. Repeated EMPTY rows and cells past the last value (LibreOffice pads
+/// every sheet with them) expand to nothing, as in calamine. Streams
+/// content.xml without building anything.
+fn ods_extents(path: &Path) -> std::io::Result<Vec<(String, u64, u64)>> {
+    use quick_xml::events::Event;
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
+    let content = zip
+        .by_name("content.xml")
+        .map_err(|e| std::io::Error::other(format!("content.xml: {e}")))?;
+    let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(content));
+    let repeat = |e: &quick_xml::events::BytesStart, key: &[u8]| -> u64 {
+        e.try_get_attribute(key)
+            .ok()
+            .flatten()
+            .and_then(|a| std::str::from_utf8(&a.value).ok()?.trim().parse().ok())
+            .unwrap_or(1)
+    };
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    let mut table: Option<String> = None;
+    // Per row entry: its repeat count and the span of columns with values.
+    let mut rows: Vec<(u64, Option<(u64, u64)>)> = Vec::new();
+    let (mut row_repeat, mut col, mut span) = (1u64, 0u64, None::<(u64, u64)>);
+    // The open cell: where it starts, how many columns it covers, and
+    // whether it has a value yet.
+    let mut cell: Option<(u64, u64, bool)> = None;
+    loop {
+        let ev = reader
+            .read_event_into(&mut buf)
+            .map_err(|e| std::io::Error::other(format!("content.xml: {e}")))?;
+        let empty = matches!(ev, Event::Empty(_));
+        match ev {
+            Event::Start(e) | Event::Empty(e)
+                if table.is_none() && e.name().as_ref() == b"table:table" =>
+            {
+                let name = e
+                    .try_get_attribute(b"table:name")
+                    .ok()
+                    .flatten()
+                    .map(|a| String::from_utf8_lossy(&a.value).into_owned())
+                    .unwrap_or_default();
+                table = Some(name);
+                rows.clear();
+            }
+            Event::Start(e) if e.name().as_ref() == b"table:table-row" => {
+                (row_repeat, col, span) = (repeat(&e, b"table:number-rows-repeated"), 0, None);
+            }
+            Event::Empty(e) if e.name().as_ref() == b"table:table-row" => {
+                rows.push((repeat(&e, b"table:number-rows-repeated"), None));
+            }
+            Event::End(e) if e.name().as_ref() == b"table:table-row" => {
+                rows.push((row_repeat, span));
+            }
+            Event::Start(e) | Event::Empty(e)
+                if matches!(
+                    e.name().as_ref(),
+                    b"table:table-cell" | b"table:covered-table-cell"
+                ) =>
+            {
+                let n = repeat(&e, b"table:number-columns-repeated");
+                let valued = e
+                    .try_get_attribute(b"office:value-type")
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if empty {
+                    if valued {
+                        let last = col + n - 1;
+                        span = Some(span.map_or((col, last), |(a, _)| (a, last)));
+                    }
+                    col = col.saturating_add(n);
+                } else {
+                    cell = Some((col, n, valued));
+                }
+            }
+            Event::Text(t) => {
+                if let Some(c) = cell.as_mut()
+                    && t.iter().any(|b| !b.is_ascii_whitespace())
+                {
+                    c.2 = true;
+                }
+            }
+            Event::End(e)
+                if matches!(
+                    e.name().as_ref(),
+                    b"table:table-cell" | b"table:covered-table-cell"
+                ) =>
+            {
+                if let Some((start, n, valued)) = cell.take() {
+                    if valued {
+                        let last = start + n - 1;
+                        span = Some(span.map_or((start, last), |(a, _)| (a, last)));
+                    }
+                    col = start.saturating_add(n);
+                }
+            }
+            Event::End(e) if e.name().as_ref() == b"table:table" => {
+                let name = table.take().unwrap_or_default();
+                let first = rows.iter().position(|r| r.1.is_some());
+                let last = rows.iter().rposition(|r| r.1.is_some());
+                if let (Some(first), Some(last)) = (first, last) {
+                    let height: u64 = rows[first..=last].iter().map(|r| r.0).sum();
+                    let lo = rows
+                        .iter()
+                        .filter_map(|r| r.1)
+                        .map(|s| s.0)
+                        .min()
+                        .unwrap_or(0);
+                    let hi = rows
+                        .iter()
+                        .filter_map(|r| r.1)
+                        .map(|s| s.1)
+                        .max()
+                        .unwrap_or(0);
+                    out.push((name, height, hi - lo + 1));
+                } else {
+                    out.push((name, 0, 0));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(out)
+}
+
+/// Why a workbook did not load: refused for its extent, or calamine's own
+/// error.
+enum WorkbookError {
+    TooLarge(std::io::Error),
+    Calamine(calamine::Error),
+}
+
+impl From<calamine::Error> for WorkbookError {
+    fn from(e: calamine::Error) -> Self {
+        WorkbookError::Calamine(e)
+    }
+}
+
+/// The dense extent `(rows, columns)` of a sheet's values, from its cells
+/// streamed one at a time, so measuring it allocates nothing per cell.
+/// calamine builds the range from the first to the last non-empty cell.
+fn streamed_extent<E>(
+    mut next: impl FnMut() -> Result<Option<(u32, u32, bool)>, E>,
+) -> Result<(u64, u64), E> {
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    while let Some((r, c, empty)) = next()? {
+        if empty {
+            continue;
+        }
+        bounds = Some(match bounds {
+            None => (r, r, c, c),
+            Some((r0, r1, c0, c1)) => (r0.min(r), r1.max(r), c0.min(c), c1.max(c)),
+        });
+    }
+    Ok(bounds.map_or((0, 0), |(r0, r1, c0, c1)| {
+        ((r1 - r0) as u64 + 1, (c1 - c0) as u64 + 1)
+    }))
+}
+
+/// Open a workbook with calamine. `open_workbook_auto` resolves the reader
+/// from the file EXTENSION, so a content-routed file without one (#174)
+/// needs the explicit reader for its sniffed kind.
+fn open_calamine(
+    path: &Path,
+    kind: SheetKind,
+) -> Result<calamine::Sheets<std::io::BufReader<std::fs::File>>, calamine::Error> {
+    Ok(match calamine::open_workbook_auto(path) {
         Ok(w) => w,
         Err(auto_err) => match kind {
             SheetKind::Xlsx => calamine::Sheets::Xlsx(calamine::open_workbook(path)?),
@@ -586,10 +780,45 @@ fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>
             SheetKind::Xlsb => calamine::Sheets::Xlsb(calamine::open_workbook(path)?),
             SheetKind::Csv | SheetKind::Tsv | SheetKind::Sqlite => return Err(auto_err),
         },
-    };
+    })
+}
+
+fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>, WorkbookError> {
+    use calamine::{Data, Reader};
+    let mut workbook = open_calamine(path, kind)?;
     let sheet_names = workbook.sheet_names();
     let mut out: Vec<SheetData> = Vec::with_capacity(sheet_names.len());
     for name in sheet_names {
+        // xlsx and xlsb build a dense range from sparse cells, so two values
+        // at opposite corners ask for the whole grid between them.
+        let extent = match &mut workbook {
+            calamine::Sheets::Xlsx(x) => x.worksheet_cells_reader(&name).ok().and_then(|mut r| {
+                streamed_extent(|| {
+                    r.next_cell().map(|c| {
+                        c.map(|c| {
+                            let (row, col) = c.get_position();
+                            (row, col, matches!(c.get_value(), calamine::DataRef::Empty))
+                        })
+                    })
+                })
+                .ok()
+            }),
+            calamine::Sheets::Xlsb(x) => x.worksheet_cells_reader(&name).ok().and_then(|mut r| {
+                streamed_extent(|| {
+                    r.next_cell().map(|c| {
+                        c.map(|c| {
+                            let (row, col) = c.get_position();
+                            (row, col, matches!(c.get_value(), calamine::DataRef::Empty))
+                        })
+                    })
+                })
+                .ok()
+            }),
+            _ => None,
+        };
+        if let Some((rows, cols)) = extent {
+            check_sheet_extent(&name, rows, cols).map_err(WorkbookError::TooLarge)?;
+        }
         let range = match workbook.worksheet_range(&name) {
             Ok(r) => r,
             Err(_) => continue,
@@ -655,6 +884,138 @@ mod tests {
         assert!(d.sort_by_column(0));
         assert_eq!(col(&d, 0), ["A", "b", "c"], "text without case");
         assert_eq!(d.headers, ["name", "count"], "the header stays put");
+    }
+
+    /// Write a zip of `(name, text)` members.
+    fn zip_of(path: &std::path::Path, members: &[(&str, &str)]) {
+        use std::io::Write as _;
+        let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let o = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, text) in members {
+            z.start_file(*name, o).unwrap();
+            z.write_all(text.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+    }
+
+    /// A one-table .ods whose `table:table` body is `rows`.
+    fn ods_with(path: &std::path::Path, rows: &str) {
+        let content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2"><office:body><office:spreadsheet><table:table table:name="Sheet1">{rows}</table:table></office:spreadsheet></office:body></office:document-content>"#
+        );
+        zip_of(
+            path,
+            &[
+                ("mimetype", "application/vnd.oasis.opendocument.spreadsheet"),
+                (
+                    "META-INF/manifest.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.spreadsheet"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/></manifest:manifest>"#,
+                ),
+                ("content.xml", &content),
+            ],
+        );
+    }
+
+    /// A one-sheet .xlsx whose `sheetData` is `data`.
+    fn xlsx_with(path: &std::path::Path, data: &str) {
+        let sheet = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{data}</sheetData></worksheet>"#
+        );
+        zip_of(
+            path,
+            &[
+                (
+                    "[Content_Types].xml",
+                    r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+                ),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/workbook.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+                ),
+                ("xl/worksheets/sheet1.xml", &sheet),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_ods_whose_repeats_expand_past_the_cell_budget_is_refused() {
+        // #1156: a few hundred bytes of repeat attributes expand to more
+        // cells than a grid holds; calamine expands them when the workbook
+        // opens, so the size has to be known before that.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("budget.ods");
+        ods_with(
+            &p,
+            r#"<table:table-row table:number-rows-repeated="700"><table:table-cell office:value-type="string" table:number-columns-repeated="16384"><text:p>x</text:p></table:table-cell></table:table-row>"#,
+        );
+        assert!(std::fs::metadata(&p).unwrap().len() < 2048);
+        let Err(err) = super::open_sheet(&p) else {
+            panic!("must be refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("too large"), "{err}");
+        assert!(err.contains("700") && err.contains("16384"), "{err}");
+    }
+
+    #[test]
+    fn an_xlsx_with_two_cells_at_opposite_corners_is_refused() {
+        // #1156 (comment): A1 and XFD1048576 make calamine allocate the
+        // dense 17-billion-cell rectangle between them (512 GB).
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("corner.xlsx");
+        xlsx_with(
+            &p,
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>corner one</t></is></c></row><row r="1048576"><c r="XFD1048576" t="inlineStr"><is><t>corner two</t></is></c></row>"#,
+        );
+        let Err(err) = super::open_sheet(&p) else {
+            panic!("must be refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("too large"), "{err}");
+        assert!(err.contains("1048576") && err.contains("16384"), "{err}");
+    }
+
+    #[test]
+    fn libreoffice_style_trailing_empty_repeats_still_open() {
+        // Negative: LibreOffice pads a sheet with a huge repeated EMPTY
+        // row and empty repeated cells; those expand to nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("real.ods");
+        ods_with(
+            &p,
+            concat!(
+                r#"<table:table-row><table:table-cell office:value-type="string"><text:p>name</text:p></table:table-cell><table:table-cell office:value-type="string"><text:p>qty</text:p></table:table-cell><table:table-cell table:number-columns-repeated="1022"/></table:table-row>"#,
+                r#"<table:table-row table:number-rows-repeated="3"><table:table-cell office:value-type="string"><text:p>bolt</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="4"><text:p>4</text:p></table:table-cell><table:table-cell table:number-columns-repeated="1022"/></table:table-row>"#,
+                r#"<table:table-row table:number-rows-repeated="1048572"><table:table-cell table:number-columns-repeated="1024"/></table:table-row>"#,
+            ),
+        );
+        let view = super::open_sheet(&p).unwrap();
+        assert_eq!(view.sheets[0].headers, ["name", "qty"]);
+        assert_eq!(view.sheets[0].rows.len(), 3);
+        assert_eq!(view.sheets[0].cell(2, 1), "4");
+    }
+
+    #[test]
+    fn an_xlsx_within_the_budget_still_opens() {
+        // Negative: cells far apart but a modest rectangle between them.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("ok.xlsx");
+        xlsx_with(
+            &p,
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>h</t></is></c></row><row r="5000"><c r="T5000" t="inlineStr"><is><t>far</t></is></c></row>"#,
+        );
+        let view = super::open_sheet(&p).unwrap();
+        assert_eq!(view.sheets[0].rows.len(), 4999);
+        assert_eq!(view.sheets[0].cell(4998, 19), "far");
     }
 
     #[test]
