@@ -55270,6 +55270,425 @@ fn watching_a_test_reruns_it_after_a_save_and_reports_it_turning_red() {
     );
 }
 
+/// #845: a discovery that failed without listing anything showed an empty
+/// tree and no reason; the reason was in OUTPUT, unannounced. The Testing
+/// view now points there, and both a click on the pointer and `o` open the
+/// bottom panel on OUTPUT with the Test Runner channel selected, whichever
+/// channel it was showing.
+#[test]
+fn a_failed_discovery_opens_the_test_runner_output_on_click_or_o() {
+    use crate::output::{CHANNEL_TESTS, OutputLevel};
+    crate::output::push(
+        CHANNEL_TESTS,
+        OutputLevel::Info,
+        "E   ModuleNotFoundError: No module named 'groceries'",
+    );
+    let other = "app-test-runner-output-other";
+    crate::output::push(other, OutputLevel::Info, "unrelated");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Testing);
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Discovering);
+    app.testing.on_finished(Some(false));
+    draw(&mut app, 100, 30);
+    let hint = app.testing.last_output_hint;
+    assert!(hint.width > 0, "the failed discovery points at its output");
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Terminal);
+    left_click(&mut app, hint.x, hint.y);
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    assert_eq!(app.output.selected_name().as_deref(), Some(CHANNEL_TESTS));
+
+    app.output.sync();
+    assert!(app.output.select_by_name(other));
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    app.focus_pane(Pane::Tree);
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    assert_eq!(app.output.selected_name().as_deref(), Some(CHANNEL_TESTS));
+}
+
+/// #856: "Running test …" stayed in the status bar long after the run it
+/// announced had finished, because only the Testing tree heard the end.
+/// End to end against a stand-in test runner (a `codeql` script), the
+/// outcome now replaces it: a pass, a failure, and a run that errored
+/// before reporting any test. A message something else put there while
+/// the run was going is left alone.
+#[cfg(unix)]
+#[test]
+fn a_finished_test_run_replaces_its_running_status_with_the_outcome() {
+    use crate::testing::model::{TestCase, TestStatus};
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("test/Find")).unwrap();
+    std::fs::write(root.join("test/qlpack.yml"), "name: acme/tests\ntests: .\n").unwrap();
+    std::fs::write(root.join("test/Find/Find.qlref"), "Find.ql\n").unwrap();
+    std::fs::write(root.join("test/Find/Find.expected"), "").unwrap();
+    // The stand-in prints `out` and exits with `code`. Each run rewrites
+    // those two, never the program, which may still be starting up.
+    let bin = tempfile::tempdir().unwrap();
+    let (out, code) = (bin.path().join("out"), bin.path().join("code"));
+    let program = bin.path().join("codeql");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\ncat '{}'\nexit \"$(cat '{}')\"\n",
+            out.display(),
+            code.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.set_codeql_program(program);
+    app.testing.apply_case(TestCase {
+        name: "test/Find::Find.qlref".into(),
+        status: TestStatus::NotRun,
+    });
+    let root_s = root.display().to_string();
+    let start = |app: &mut App, stdout: &str, exit: i32| {
+        std::fs::write(&out, stdout.replace("@ROOT@", &root_s)).unwrap();
+        std::fs::write(&code, exit.to_string()).unwrap();
+        app.run_named_test(String::from("Find.qlref"));
+        assert_eq!(app.status, "Running test test/Find::Find.qlref");
+    };
+    let finish = |app: &mut App| {
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the stand-in test run to finish",
+            || {
+                let _ = app.test_worker.drain(&mut app.testing);
+                app.tick_test_watch();
+                !app.testing.is_busy()
+            },
+        );
+    };
+    let pass = "[1/1 comp 1s eval 9ms] PASSED @ROOT@/test/Find/Find.qlref\n";
+
+    start(&mut app, pass, 0);
+    finish(&mut app);
+    assert!(
+        app.status.starts_with("Find.qlref passed ("),
+        "{}",
+        app.status
+    );
+
+    start(
+        &mut app,
+        "[1/1 comp 1s eval 9ms] FAILED(RESULT) @ROOT@/test/Find/Find.qlref\n\
+         --- expected\n+++ actual\n+| 1 |\n",
+        1,
+    );
+    finish(&mut app);
+    assert!(
+        app.status.starts_with("Find.qlref failed ("),
+        "{}",
+        app.status
+    );
+
+    start(&mut app, "A fatal error occurred: no pack here\n", 2);
+    finish(&mut app);
+    assert_eq!(app.status, "Run failed — see OUTPUT › Test Runner");
+
+    start(&mut app, pass, 0);
+    app.status = String::from("Saved Find.ql");
+    finish(&mut app);
+    assert_eq!(
+        app.status, "Saved Find.ql",
+        "a newer message is not clobbered"
+    );
+}
+
+/// A workspace holding one CodeQL test, `test/Find/Find.qlref`, listed in
+/// the Testing tree, and an App whose `codeql` is a stand-in: each run
+/// prints what [`CodeqlStandIn::will`] last set (`@ROOT@` standing for the
+/// workspace root) and exits with its code.
+#[cfg(unix)]
+struct CodeqlStandIn {
+    app: App,
+    root: String,
+    out: std::path::PathBuf,
+    code: std::path::PathBuf,
+    _dirs: [tempfile::TempDir; 2],
+}
+
+/// The stand-in's report of `Find.qlref` passing.
+#[cfg(unix)]
+const STAND_IN_PASS: &str = "[1/1 comp 1s eval 9ms] PASSED @ROOT@/test/Find/Find.qlref\n";
+
+#[cfg(unix)]
+impl CodeqlStandIn {
+    fn new() -> Self {
+        use crate::testing::model::{TestCase, TestStatus};
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("test/Find")).unwrap();
+        std::fs::write(root.join("test/qlpack.yml"), "name: acme/tests\ntests: .\n").unwrap();
+        std::fs::write(root.join("test/Find/Find.qlref"), "Find.ql\n").unwrap();
+        std::fs::write(root.join("test/Find/Find.expected"), "").unwrap();
+        // Each run rewrites `out` and `code`, never the program, which may
+        // still be starting up.
+        let bin = tempfile::tempdir().unwrap();
+        let (out, code) = (bin.path().join("out"), bin.path().join("code"));
+        let program = bin.path().join("codeql");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ncat '{}'\nexit \"$(cat '{}')\"\n",
+                out.display(),
+                code.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.set_codeql_program(program);
+        app.testing.apply_case(TestCase {
+            name: "test/Find::Find.qlref".into(),
+            status: TestStatus::NotRun,
+        });
+        Self {
+            app,
+            root: root.display().to_string(),
+            out,
+            code,
+            _dirs: [tmp, bin],
+        }
+    }
+
+    /// What the next run prints, and the code it exits with.
+    fn will(&self, stdout: &str, exit: i32) {
+        std::fs::write(&self.out, stdout.replace("@ROOT@", &self.root)).unwrap();
+        std::fs::write(&self.code, exit.to_string()).unwrap();
+    }
+
+    /// Wait for the run in flight to end, feeding its results to the app
+    /// in the main loop's order. A run-all only turns the panel busy when
+    /// the worker's start lands, so the end is also the run's "Running …"
+    /// status being settled.
+    fn finish(&mut self) {
+        let app = &mut self.app;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the stand-in test run to finish",
+            || {
+                let _ = app.test_worker.drain(&mut app.testing);
+                if app.testing.take_refusal() {
+                    app.status = String::from(crate::testing::NO_RUNNER_STATUS);
+                }
+                app.sync_coverage();
+                app.tick_test_watch();
+                !app.testing.is_busy() && app.test_run_status.is_none()
+            },
+        );
+    }
+}
+
+/// #856 guard: a run-at-cursor asked for while a run is in flight is
+/// turned away, and does not take over the first run's pending outcome:
+/// the status still names the first run when it ends.
+#[cfg(unix)]
+#[test]
+fn a_run_asked_for_mid_run_does_not_take_over_the_first_runs_outcome() {
+    let mut s = CodeqlStandIn::new();
+    s.will(STAND_IN_PASS, 0);
+    s.app.run_named_test(String::from("Find.qlref"));
+    s.app.run_named_test(String::from("Other.qlref"));
+    assert_eq!(s.app.status, "Running test test/Find::Find.qlref");
+    s.finish();
+    assert!(
+        s.app.status.starts_with("Find.qlref passed ("),
+        "{}",
+        s.app.status
+    );
+}
+
+/// #856 guard: a coverage run that never ran (CodeQL tests have no source
+/// lines to cover) ends with no verdict. Its reason stays in the status
+/// bar rather than a made-up outcome, and the test's row goes back to
+/// how it was.
+#[cfg(unix)]
+#[test]
+fn a_coverage_run_that_never_ran_keeps_its_reason_in_the_status() {
+    let mut s = CodeqlStandIn::new();
+    s.app
+        .run_scope_with_coverage(String::from("test/Find::Find.qlref"), false);
+    assert_eq!(
+        s.app.status,
+        "Running test test/Find::Find.qlref with coverage"
+    );
+    s.finish();
+    assert_eq!(s.app.status, "Coverage is not available for CodeQL tests");
+    assert_eq!(
+        s.app.testing.status_of("test/Find::Find.qlref"),
+        Some(crate::testing::model::TestStatus::NotRun)
+    );
+}
+
+/// #856: "CodeQL: Run Tests" put "Running CodeQL tests" in the status bar
+/// and left it there after the run. It now says how the run went, as a
+/// run-at-cursor does.
+#[cfg(unix)]
+#[test]
+fn a_finished_codeql_test_run_replaces_its_running_status_with_the_outcome() {
+    let mut s = CodeqlStandIn::new();
+    s.will(STAND_IN_PASS, 0);
+    s.app.run_codeql_tests();
+    assert_eq!(s.app.status, "Running CodeQL tests");
+    s.finish();
+    assert!(
+        s.app.status.starts_with("CodeQL tests passed ("),
+        "{}",
+        s.app.status
+    );
+}
+
+/// A task that runs until the test ends it: its `sleep` outlasts any
+/// test, so the only finish its pane reports is the one a test injects.
+fn long_task(label: &str) -> crate::tasks::Task {
+    crate::tasks::Task {
+        label: label.to_string(),
+        command: String::from("sleep 600"),
+        source: String::from("test"),
+        is_build: false,
+        is_default: false,
+        problem_matcher: None,
+        vscode: None,
+    }
+}
+
+/// End the command running in pane `uid` as its shell reports it (the
+/// `133;D` mark: exit code and duration), and let the app drain the pane.
+fn finish_pane_command(app: &mut App, uid: u64, exit: Option<i32>, millis: u64) {
+    app.terminals
+        .iter()
+        .find(|t| t.uid() == uid)
+        .expect("the pane is still open")
+        .finish_command_for_test(exit, std::time::Duration::from_millis(millis));
+    app.drain_terminal_bells();
+}
+
+/// #856 (comment): a task set "Running <label>" and kept it after its pane
+/// was back at the prompt. The pane's command-finished report now replaces
+/// it with the exit code and how long the command took.
+#[test]
+fn a_finished_task_replaces_its_running_status_with_the_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("make report")).unwrap();
+    assert_eq!(app.status, "Running make report");
+    finish_pane_command(&mut app, pane, Some(0), 300);
+    assert_eq!(app.status, "make report finished (exit 0, 0.3 s)");
+
+    let pane = app.run_project_task(long_task("make check")).unwrap();
+    assert_eq!(app.status, "Running make check");
+    finish_pane_command(&mut app, pane, Some(2), 1500);
+    assert_eq!(app.status, "make check failed (exit 2, 1.5 s)");
+}
+
+/// #856 (comment): a runnable fenced block's "Running <pane>" is settled
+/// by its pane's command-finished report, as a task's is.
+#[test]
+fn a_finished_fenced_block_replaces_its_running_status_with_the_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_block_in_pane(PendingRunBlock {
+        pane_name: String::from("README.md:1"),
+        cwd: tmp.path().to_path_buf(),
+        command: String::from("sleep 600\r"),
+        code: String::from("sleep 600\n"),
+        destructive: false,
+        doc: None,
+        block_line: 0,
+        persist: false,
+        capture_timeout: None,
+    });
+    assert_eq!(app.status, "Running README.md:1");
+    let pane = app
+        .terminals
+        .iter()
+        .find(|t| t.label() == "README.md:1")
+        .expect("the block's pane")
+        .uid();
+    finish_pane_command(&mut app, pane, Some(1), 300);
+    assert_eq!(app.status, "README.md:1 failed (exit 1, 0.3 s)");
+}
+
+/// #856 guard: a task's finish settles only a status that still shows its
+/// run. Something newer in the bar (a save) stays.
+#[test]
+fn a_task_finishing_after_a_newer_status_leaves_that_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("make report")).unwrap();
+    app.status = String::from("Saved Makefile");
+    finish_pane_command(&mut app, pane, Some(0), 300);
+    assert_eq!(app.status, "Saved Makefile");
+}
+
+/// #856 guard: each task's finish settles its own status only. With task
+/// `a` started after `b`, the bar shows `a`'s run; `b` finishing first
+/// leaves it, and `a` finishing then reports `a`.
+#[test]
+fn a_second_task_finishing_leaves_the_first_tasks_running_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let b = app.run_project_task(long_task("b")).unwrap();
+    let a = app.run_project_task(long_task("a")).unwrap();
+    assert_ne!(a, b, "two tasks, two panes");
+    assert_eq!(app.status, "Running a");
+    finish_pane_command(&mut app, b, Some(0), 300);
+    assert_eq!(app.status, "Running a", "b's end is not a's");
+    finish_pane_command(&mut app, a, Some(0), 300);
+    assert_eq!(app.status, "a finished (exit 0, 0.3 s)");
+}
+
+/// #856 guard: a task's outcome stands in for the long-command notice of a
+/// pane the user left only when the outcome is shown. With a newer status
+/// in the bar, the long task's end still gets the notice.
+#[test]
+fn a_long_task_reports_its_outcome_or_else_the_long_command_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("make report")).unwrap();
+    app.focus_pane(Pane::Editor);
+    finish_pane_command(&mut app, pane, Some(0), 12_000);
+    assert_eq!(app.status, "make report finished (exit 0, 12.0 s)");
+
+    let pane = app.run_project_task(long_task("make check")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.status = String::from("Saved Makefile");
+    finish_pane_command(&mut app, pane, Some(0), 12_000);
+    assert_eq!(
+        app.status,
+        "Command in Task: make check finished: exit 0 in 12.0s"
+    );
+}
+
+/// #845 guard: `o` opens the runner's output only from the Testing view
+/// itself. With that view showing a failed discovery but the editor
+/// focused, `o` is a character typed into the buffer, and the bottom
+/// panel stays where it was.
+#[test]
+fn o_typed_in_the_editor_beside_a_failed_discovery_stays_a_character() {
+    let mut app = editor_app_with_lines(&["ab"]);
+    app.set_sidebar_view(SidebarView::Testing);
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Discovering);
+    app.testing.on_finished(Some(false));
+    draw(&mut app, 100, 30);
+    assert!(app.testing.last_output_hint.width > 0);
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_col = 2;
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["abo"]);
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Terminal);
+}
+
 /// A workspace with one source file and a SARIF log pointing into it.
 fn sarif_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();

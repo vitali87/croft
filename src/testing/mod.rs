@@ -46,3 +46,10 @@ pub(crate) fn regex_escape(s: &str) -> String {
     }
     out
 }
+
+/// A test's own name: the last `::` segment of its full name, as the
+/// Testing tree lists it under its suite (see
+/// [`model::TestCase::suite_and_leaf`]).
+pub fn leaf_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}

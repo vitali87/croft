@@ -706,6 +706,9 @@ pub struct PtyTerminal {
     /// Test-only capture of every byte written toward the child's stdin.
     #[cfg(test)]
     written_for_test: Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Test-only sender into `finished_rx`, as the reader thread holds.
+    #[cfg(test)]
+    finished_tx_for_test: std::sync::mpsc::Sender<FinishedCommand>,
 }
 
 /// One captured inline image at its recording-time anchor, keyed on the
@@ -1984,6 +1987,8 @@ impl PtyTerminal {
         // than a visible fault. `Instant` cannot go backwards.
         let rewind_epoch = std::time::Instant::now();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel::<FinishedCommand>();
+        #[cfg(test)]
+        let finished_tx_for_test = finished_tx.clone();
         let osc7_cwd = Arc::new(std::sync::Mutex::new(Option::<std::path::PathBuf>::None));
         let osc7_for_thread = osc7_cwd.clone();
         let notifications = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -2379,6 +2384,8 @@ impl PtyTerminal {
             rewind,
             #[cfg(test)]
             written_for_test: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            finished_tx_for_test,
         })
     }
 
@@ -3753,6 +3760,21 @@ impl PtyTerminal {
     #[cfg(test)]
     pub fn written_bytes_for_test(&self) -> Vec<u8> {
         self.written_for_test.lock().unwrap().clone()
+    }
+
+    /// Test-only: report a finished command as the reader thread does at
+    /// its `133;D` mark, so app tests can end a pane's command without a
+    /// shell that speaks OSC 133.
+    #[cfg(test)]
+    pub fn finish_command_for_test(&self, exit: Option<i32>, dur: std::time::Duration) {
+        let _ = self.finished_tx_for_test.send(FinishedCommand {
+            exit,
+            dur,
+            cmd: String::new(),
+            cwd: None,
+            host: None,
+            output: String::new(),
+        });
     }
 
     /// True when the child program has enabled any mouse-tracking mode
