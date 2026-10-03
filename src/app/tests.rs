@@ -12614,6 +12614,220 @@ fn a_completion_accept_tracks_the_caret_and_is_one_generated_undo_step() {
     assert_eq!(app.editor.lines, before, "one accept is one undo step");
 }
 
+/// A completion reply opens only while the caret is still in the word it was
+/// asked for. One that landed after Enter opened on the next line with an
+/// empty prefix, and the next Enter inserted its first item (#842).
+#[test]
+fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
+    use crate::lsp::manager::CompletionResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "import lo").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    let reply = |request_id| CompletionResult {
+        request_id,
+        path: path.clone(),
+        items: vec![crate::lsp::CompletionItem {
+            label: String::from("load"),
+            ..Default::default()
+        }],
+    };
+    let ask_at = |app: &mut App, id, col| {
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = col;
+        app.completion_request_id = Some(id);
+        app.completion_origin = Some((0, col));
+    };
+    let press = |app: &mut App, code| app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+
+    // Asked at `import lo|`, then Enter before the reply landed.
+    ask_at(&mut app, 1, 9);
+    press(&mut app, KeyCode::Enter);
+    draw(&mut app, 100, 30);
+    assert!(!app.apply_completion_result(reply(1)));
+    assert!(app.completion_popup.is_none(), "no popup on the next line");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.editor.lines,
+        ["import lo", "", ""],
+        "Enter breaks the line"
+    );
+
+    // A letter typed since keeps the caret in the word: the reply opens.
+    app.editor.lines = vec![String::from("import lo")];
+    ask_at(&mut app, 2, 9);
+    press(&mut app, KeyCode::Char('a'));
+    draw(&mut app, 100, 30);
+    assert!(app.apply_completion_result(reply(2)));
+    assert_eq!(
+        app.completion_popup.take().map(|p| p.prefix),
+        Some(String::from("loa"))
+    );
+
+    // Backspaced left of the request point, or a non-word character typed
+    // since: the caret left the word, and the reply is dropped.
+    ask_at(&mut app, 3, 10);
+    press(&mut app, KeyCode::Backspace);
+    draw(&mut app, 100, 30);
+    assert!(!app.apply_completion_result(reply(3)));
+    ask_at(&mut app, 4, 9);
+    press(&mut app, KeyCode::Char(' '));
+    draw(&mut app, 100, 30);
+    assert!(!app.apply_completion_result(reply(4)));
+    assert!(app.completion_popup.is_none());
+
+    // A reply for another buffer never opens in this one.
+    ask_at(&mut app, 5, 9);
+    assert!(!app.apply_completion_result(CompletionResult {
+        path: tmp.path().join("other.txt"),
+        ..reply(5)
+    }));
+    assert!(app.completion_popup.is_none());
+}
+
+/// A buffer holding `import lo` with the caret at its end, and a sender that
+/// lands completion replies where a server's do, so a test can deliver one
+/// at the moment a slow server would: after the keys typed since the ask.
+fn completion_reply_app() -> (
+    tempfile::TempDir,
+    PathBuf,
+    App,
+    std::sync::mpsc::Sender<crate::lsp::manager::CompletionResult>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "import lo").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9;
+    let tx = app
+        .lsp
+        .as_mut()
+        .expect("a test-built App runs a manager")
+        .completion_reply_sender_for_test();
+    (tmp, path, app, tx)
+}
+
+/// One completion reply for `path`, offering each of `labels`.
+fn completion_reply(
+    request_id: u64,
+    path: &Path,
+    labels: &[&str],
+) -> crate::lsp::manager::CompletionResult {
+    crate::lsp::manager::CompletionResult {
+        request_id,
+        path: path.to_path_buf(),
+        items: labels
+            .iter()
+            .map(|label| crate::lsp::CompletionItem {
+                label: (*label).to_string(),
+                ..Default::default()
+            })
+            .collect(),
+    }
+}
+
+/// #842 through the path a real reply takes: asked at `import lo|`, Enter
+/// pressed before the reply landed. The reply must not open a popup on the
+/// new line, where the next Enter accepted its first item (`load`) instead
+/// of breaking the line.
+#[test]
+fn a_completion_reply_landing_after_enter_leaves_the_next_enter_to_break_the_line() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let id = app.completion_request_id.expect("the ask went out");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(completion_reply(id, &path, &["load"])).unwrap();
+    app.drain_lsp_completion();
+    assert!(
+        app.completion_popup.is_none(),
+        "a reply for the word left behind opened on the next line"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines,
+        ["import lo", "", ""],
+        "the second Enter breaks the line, it does not accept `load`"
+    );
+}
+
+/// Guard (#842): the common case, a reply that lands with the caret exactly
+/// where it was asked (nothing typed since), still opens. The fix drops
+/// replies once the caret LEFT the word; it must not drop this boundary.
+#[test]
+fn a_completion_reply_with_the_caret_where_it_was_asked_still_opens() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let id = app.completion_request_id.expect("the ask went out");
+    draw(&mut app, 100, 30);
+    tx.send(completion_reply(id, &path, &["load"])).unwrap();
+    assert!(app.drain_lsp_completion());
+    assert_eq!(
+        app.completion_popup.as_ref().map(|p| p.prefix.as_str()),
+        Some("lo")
+    );
+}
+
+/// Guard (#842): non-ASCII letters and `_` typed since the ask keep the caret
+/// in the word, so the reply still opens. The caret is a char index, and a
+/// byte-based check (or an ASCII-only word test) would drop it.
+#[test]
+fn a_completion_reply_still_opens_after_non_ascii_word_chars_typed_since() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let id = app.completion_request_id.expect("the ask went out");
+    for c in ['ö', '_'] {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    draw(&mut app, 100, 30);
+    tx.send(completion_reply(id, &path, &["loö_value"]))
+        .unwrap();
+    assert!(app.drain_lsp_completion());
+    assert_eq!(
+        app.completion_popup.as_ref().map(|p| p.prefix.as_str()),
+        Some("loö_")
+    );
+}
+
+/// Guard (#842): a stale reply (an earlier request's id) is skipped without
+/// cancelling the request still pending, so the fresh reply behind it opens.
+/// Dropping a reply clears the pending id only when the caret left the word
+/// it was asked for; a stale id must not reach that path first.
+#[test]
+fn a_stale_completion_reply_does_not_cancel_the_pending_one() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let stale = app.completion_request_id.expect("the first ask went out");
+    app.trigger_completion();
+    let fresh = app.completion_request_id.expect("the second ask went out");
+    assert_ne!(stale, fresh);
+    draw(&mut app, 100, 30);
+    tx.send(completion_reply(stale, &path, &["lost"])).unwrap();
+    tx.send(completion_reply(fresh, &path, &["load"])).unwrap();
+    assert!(app.drain_lsp_completion());
+    let popup = app
+        .completion_popup
+        .as_ref()
+        .expect("the fresh reply opens");
+    assert_eq!(popup.request_id, fresh);
+    assert_eq!(
+        popup
+            .items
+            .iter()
+            .map(|i| i.label.as_str())
+            .collect::<Vec<_>>(),
+        ["load"]
+    );
+}
+
 /// A completion is accepted by the server's own edit: TypeScript's `?.foo`
 /// replaces the `.` before the word (croft produced `a.?.foo`), letters
 /// typed since the request go too, and an auto-import lands with it.

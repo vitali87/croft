@@ -7312,6 +7312,21 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    impl LspManager {
+        /// Test seam for App-level completion tests: swap the completion
+        /// reply channel for one the test holds, so a reply lands in
+        /// `drain_completion` at a chosen moment, as a slow server's does.
+        /// The worker's own sender then goes nowhere, which a test-built App
+        /// (no real servers) never uses anyway.
+        pub(crate) fn completion_reply_sender_for_test(
+            &mut self,
+        ) -> std_mpsc::Sender<CompletionResult> {
+            let (tx, rx) = std_mpsc::channel();
+            self.completion_rx = rx;
+            tx
+        }
+    }
+
     #[test]
     fn normalise_inlay_hint_flattens_parts_and_folds_padding() {
         // vtsls sends parts labels; rust-analyzer sends plain strings with

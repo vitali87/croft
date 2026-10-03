@@ -8765,55 +8765,83 @@ impl App {
     /// ids so a slow earlier reply cannot clobber a fresher popup. Returns
     /// true when the popup state changed and the next frame should redraw.
     pub fn drain_lsp_completion(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
-            return false;
-        };
         let mut changed = false;
-        while let Some(result) = lsp.drain_completion() {
-            if Some(result.request_id) != self.completion_request_id {
-                continue;
-            }
-            let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
-                continue;
-            };
-            let prefix = self.editor.word_before_cursor();
-            let server_count = result.items.len();
-            // Merge user snippets whose prefix matches the typed word into the
-            // suggestion list (VS Code shows snippets in the suggest widget);
-            // the popup's own prefix filter narrows them further.
-            let mut items = result.items;
-            let lang = self.editor.scope_id();
-            for snip in self.snippets.matching(&prefix, lang) {
-                items.push(snippet_completion_item(snip));
-            }
-            if items.is_empty() {
-                if self.completion_popup.is_some() {
-                    self.completion_popup = None;
-                    changed = true;
-                }
-                continue;
-            }
-            let popup = crate::widgets::completion_popup::CompletionPopup::new(
-                items,
-                prefix.clone(),
-                (cx, cy),
-                result.path,
-                result.request_id,
-            );
-            let filtered = popup.visible_indices().len();
-            crate::lsp::log_file::log(&format!(
-                "popup filter: prefix={prefix:?} server={server_count} visible={filtered}"
-            ));
-            if popup.visible_is_empty() {
-                self.completion_popup = None;
-                self.status =
-                    format!("No completions match '{prefix}' ({server_count} from server)");
-            } else {
-                self.completion_popup = Some(popup);
-            }
-            changed = true;
+        while let Some(result) = self.lsp.as_ref().and_then(|lsp| lsp.drain_completion()) {
+            changed |= self.apply_completion_result(result);
         }
         changed
+    }
+
+    /// Open the popup for one completion reply; the drain loop delegates here
+    /// because the reply channel's sender lives inside the LSP worker. Returns
+    /// true when the popup state changed.
+    fn apply_completion_result(&mut self, result: crate::lsp::manager::CompletionResult) -> bool {
+        if Some(result.request_id) != self.completion_request_id {
+            return false;
+        }
+        // A matching id is not enough: nothing but the open popup clears the
+        // id, so a reply that lands after an Enter moved the caret would open
+        // on the next line with an empty prefix, and the next Enter accepted
+        // its first item instead of breaking the line (#842).
+        if !self.completion_origin_covers_caret(&result.path) {
+            self.completion_request_id = None;
+            return false;
+        }
+        let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
+            return false;
+        };
+        let prefix = self.editor.word_before_cursor();
+        let server_count = result.items.len();
+        // Merge user snippets whose prefix matches the typed word into the
+        // suggestion list (VS Code shows snippets in the suggest widget);
+        // the popup's own prefix filter narrows them further.
+        let mut items = result.items;
+        let lang = self.editor.scope_id();
+        for snip in self.snippets.matching(&prefix, lang) {
+            items.push(snippet_completion_item(snip));
+        }
+        if items.is_empty() {
+            return self.completion_popup.take().is_some();
+        }
+        let popup = crate::widgets::completion_popup::CompletionPopup::new(
+            items,
+            prefix.clone(),
+            (cx, cy),
+            result.path,
+            result.request_id,
+        );
+        let filtered = popup.visible_indices().len();
+        crate::lsp::log_file::log(&format!(
+            "popup filter: prefix={prefix:?} server={server_count} visible={filtered}"
+        ));
+        if popup.visible_is_empty() {
+            self.completion_popup = None;
+            self.status = format!("No completions match '{prefix}' ({server_count} from server)");
+        } else {
+            self.completion_popup = Some(popup);
+        }
+        true
+    }
+
+    /// Whether the caret is still in the word the pending completion was
+    /// requested for: the same buffer and row, not left of the request point,
+    /// and only word characters typed since. VS Code likewise cancels its
+    /// suggest session the moment the caret leaves the word.
+    fn completion_origin_covers_caret(&self, path: &Path) -> bool {
+        let Some((row, col)) = self.completion_origin else {
+            return false;
+        };
+        let caret = self.editor.cursor_col;
+        if self.editor.path.as_deref() != Some(path) || self.editor.cursor_row != row || caret < col
+        {
+            return false;
+        }
+        self.editor.lines.get(row).is_some_and(|line| {
+            line.chars()
+                .skip(col)
+                .take(caret - col)
+                .all(is_word_continuation)
+        })
     }
 
     /// Tab in the editor: advance a live snippet, else expand a user snippet
