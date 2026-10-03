@@ -206,6 +206,12 @@ fix: A copy larger than the cap no longer splits a character.
 A missing file for the current version is a **build** error, not an empty
 panel, so a binary always describes itself.
 
+Every merge to `main` that bumps the version is then tagged `v<version>` by
+`.github/workflows/tag.yml`, which also starts `release.yml` for that tag, so a
+merged version is a published release without anyone cutting it by hand. A
+merge that ships nothing keeps the previous version, whose tag already exists,
+and is left untagged.
+
 Notes live in one file per version rather than one shared file because two
 versions' notes never conflict in content, only in the file they shared: with
 several PRs open, every merge forced a rebase through it, and the version

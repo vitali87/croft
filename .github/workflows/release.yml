@@ -23,7 +23,9 @@ on:
     tags:
       - "v*"
   # Building the matrix without publishing, to prove a tag would work before
-  # cutting one. Upload only ever happens on a tag.
+  # cutting one. Upload only ever happens on a tag: tag.yml creates one for
+  # every merge to main and dispatches this workflow on it, because a tag
+  # pushed with github.token does not fire the `push: tags` trigger above.
   workflow_dispatch:
 
 # Read at the top level; only the publish job needs write, and only to
@@ -166,8 +168,9 @@ jobs:
       # short-lived Sigstore certificate naming this workflow and tag, so
       # there is no signing key to store, rotate or leak.
       id-token: write
-    # Only a tag publishes. A workflow_dispatch run builds and stops, which is
-    # how you prove the matrix works without cutting a release.
+    # Only a tag publishes. A workflow_dispatch run on a branch builds and
+    # stops, which is how you prove the matrix works without cutting a
+    # release; one on a tag ref (as tag.yml dispatches) publishes.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v7
