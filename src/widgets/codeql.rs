@@ -23,6 +23,9 @@ pub enum Section {
     Databases,
     Queries,
     VariantAnalysis,
+    /// The query run in flight, with its progress, shown only while one
+    /// runs (#578).
+    Running,
     QueryHistory,
     AstViewer,
     EvaluatorLog,
@@ -33,11 +36,12 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 9] = [
+    pub const ALL: [Section; 10] = [
         Section::Language,
         Section::Databases,
         Section::Queries,
         Section::VariantAnalysis,
+        Section::Running,
         Section::QueryHistory,
         Section::AstViewer,
         Section::EvaluatorLog,
@@ -51,6 +55,7 @@ impl Section {
             Section::Databases => "DATABASES",
             Section::Queries => "QUERIES",
             Section::VariantAnalysis => "VARIANT ANALYSIS",
+            Section::Running => "RUNNING",
             Section::QueryHistory => "QUERY HISTORY",
             Section::AstViewer => "AST VIEWER",
             Section::EvaluatorLog => "EVALUATOR LOG VIEWER",
@@ -122,6 +127,17 @@ pub enum Action {
     QuickQuery,
     /// Run CodeQL: Show Evaluator Log (Viewer).
     ShowEvaluatorLog,
+    /// Offer the databases in a picker whose choice becomes the current one.
+    PickDatabase,
+    /// Run the open query on the current database, as "Run Query on
+    /// Selected Database" does.
+    RunOpenQuery,
+    /// Compare the results of query history entry `.0` with its last run.
+    CompareHistory(usize),
+    /// Export the results of query history entry `.0`.
+    ExportHistory(usize),
+    /// Show the query log of query history entry `.0`.
+    HistoryLog(usize),
 }
 
 /// The languages CodeQL analyses, as VS Code's Language view lists them.
@@ -166,6 +182,15 @@ pub enum Line {
     /// Row `.1` of the three-row button for `.0`; its label row is the one
     /// selected, and a click on any of the three runs it.
     Button(Action, ButtonRow),
+    /// A row of the current database's card; its name row is the one
+    /// selected, and opens the database picker.
+    DbCard(DbCard),
+    /// Query history entry `.0`: its glyph, name, count and duration.
+    History(usize),
+    /// A detail line under expanded query history entry `.0`.
+    HistoryDetail(usize, Detail),
+    /// A row of the Running section, drawn and never selected.
+    Running(RunRow),
 }
 
 /// The rows of the first-run card, top to bottom.
@@ -188,6 +213,268 @@ pub enum ButtonRow {
     Top,
     Label,
     Bottom,
+}
+
+/// The rows of the database card, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbCard {
+    /// The top edge, titled.
+    Top,
+    /// The language mark, the name and the switch chevron.
+    Name,
+    /// The language, size and age; left out with no current database.
+    Meta,
+    Blank,
+    /// The Run, Quick Query and AST chips.
+    Chips,
+    Bottom,
+}
+
+/// The detail lines of an expanded query history row, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// The result count and the format it is in.
+    Summary,
+    /// The database and when it ran.
+    Where,
+    /// Line `.0` of the action chips, which wrap to the width.
+    Chips(usize),
+}
+
+/// The rows of the Running section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunRow {
+    Name,
+    /// The progress bar and the time elapsed.
+    Progress,
+}
+
+/// A chip: what it runs, its label, and the key that runs it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chip {
+    pub action: Action,
+    pub label: &'static str,
+    pub key: Option<char>,
+}
+
+/// The database card's chips.
+pub const DB_CHIPS: [Chip; 3] = [
+    Chip {
+        action: Action::RunOpenQuery,
+        label: "\u{25b6} Run",
+        key: Some('r'),
+    },
+    Chip {
+        action: Action::QuickQuery,
+        label: "\u{bb} Quick",
+        key: Some('q'),
+    },
+    Chip {
+        action: Action::ViewAst,
+        label: "AST",
+        key: Some('a'),
+    },
+];
+
+/// The column of an expanded history row's chips, right of its tree line.
+const HISTORY_CHIP_X: u16 = 6;
+
+/// The chips under expanded query history entry `i`.
+pub fn history_chips(i: usize) -> [Chip; 4] {
+    let chip = |action, label| Chip {
+        action,
+        label,
+        key: None,
+    };
+    [
+        chip(Action::OpenHistory(i), "\u{2197} Open"),
+        chip(Action::CompareHistory(i), "\u{2194} Compare"),
+        chip(Action::ExportHistory(i), "\u{2193} Export"),
+        chip(Action::HistoryLog(i), "\u{2261} Log"),
+    ]
+}
+
+/// Lay `chips` out from column `x0` of a row, left of column `limit`: with
+/// their keys and a gap between, else with no gap, else without their
+/// keys, dropping from the end those that still do not fit. Each placed
+/// chip comes with its column, its width and whether its key shows.
+fn lay_out_chips(chips: &[Chip], x0: u16, limit: u16) -> Vec<(u16, u16, Chip, bool)> {
+    let width = |c: &Chip, keys: bool| {
+        let key = if keys && c.key.is_some() { 2 } else { 0 };
+        c.label.chars().count() as u16 + 2 + key
+    };
+    let place = |keys: bool, gap: u16| {
+        let mut out = Vec::new();
+        let mut x = x0;
+        for c in chips {
+            let w = width(c, keys);
+            if x + w > limit {
+                break;
+            }
+            out.push((x, w, *c, keys && c.key.is_some()));
+            x += w + gap;
+        }
+        out
+    };
+    for (keys, gap) in [(true, 1), (true, 0)] {
+        let all = place(keys, gap);
+        if all.len() == chips.len() {
+            return all;
+        }
+    }
+    place(false, 1)
+}
+
+/// One Query History row (#578): what its glyph, name and columns show,
+/// and what its details say once expanded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRow {
+    pub status: crate::codeql_query::RunStatus,
+    /// The user's label, else the query's file name.
+    pub name: String,
+    pub database: String,
+    pub results: Option<u64>,
+    pub seconds: u64,
+    /// When it started, in unix seconds.
+    pub started: u64,
+    /// The SARIF or CSV the run wrote, which also tells the entry apart.
+    pub output: std::path::PathBuf,
+}
+
+impl HistoryRow {
+    pub fn new(entry: &crate::codeql_query::HistoryEntry) -> Self {
+        Self {
+            status: entry.status.clone(),
+            name: entry.display_name(),
+            database: entry.database.clone(),
+            results: entry.results,
+            seconds: entry.seconds,
+            started: entry.started,
+            output: entry.output.clone(),
+        }
+    }
+
+    fn is_sarif(&self) -> bool {
+        self.output
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("sarif"))
+    }
+
+    /// The count column: the count, `err` for a failure, a dash when there
+    /// is none, and nothing while it runs.
+    fn count_text(&self) -> String {
+        use crate::codeql_query::RunStatus;
+        match (&self.status, self.results) {
+            (RunStatus::Succeeded, Some(n)) => n.to_string(),
+            (RunStatus::Failed(_), _) => String::from("err"),
+            (RunStatus::Running, _) => String::new(),
+            _ => String::from("\u{2014}"),
+        }
+    }
+
+    /// The duration column, empty while it runs.
+    fn duration_text(&self) -> String {
+        match self.status {
+            crate::codeql_query::RunStatus::Running => String::new(),
+            _ => duration(self.seconds),
+        }
+    }
+}
+
+/// A run's length as the history's duration column shows it: `4s`,
+/// `1m08`, `2h05`.
+fn duration(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m{:02}", secs / 60, secs % 60),
+        _ => format!("{}h{:02}", secs / 3600, secs / 60 % 60),
+    }
+}
+
+/// How long ago something was, in the card's short form: `2h ago`.
+fn short_age(secs: u64) -> String {
+    const DAY: u64 = 86_400;
+    match secs {
+        0..60 => String::from("just now"),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..DAY => format!("{}h ago", secs / 3600),
+        _ if secs < 30 * DAY => format!("{}d ago", secs / DAY),
+        _ if secs < 365 * DAY => format!("{}mo ago", secs / (30 * DAY)),
+        _ => format!("{}y ago", secs / (365 * DAY)),
+    }
+}
+
+/// A size in the card's short form: `214 MB`.
+fn short_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let n = bytes as f64;
+    if n < KB {
+        format!("{bytes} B")
+    } else if n < KB * KB {
+        format!("{:.0} KB", n / KB)
+    } else if n < KB * KB * KB {
+        format!("{:.0} MB", n / (KB * KB))
+    } else {
+        format!("{:.1} GB", n / (KB * KB * KB))
+    }
+}
+
+/// Seconds since the Unix epoch.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// When a run started: the local `HH:MM` within the last day, else how
+/// long ago.
+fn clock(started: u64, now: u64) -> String {
+    let ago = now.saturating_sub(started);
+    if ago >= 86_400 {
+        return short_age(ago);
+    }
+    // libc's localtime, as the terminal's timestamps take it: no date
+    // crate for one field. The alias is deprecated on musl; see there.
+    #[allow(deprecated)]
+    let secs = started as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return short_age(ago);
+    }
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// The colour the Explorer gives files of CodeQL language `lang`.
+fn language_color(lang: &str) -> Option<Color> {
+    let suffix = match lang {
+        "cpp" | "c" | "c-cpp" => ".cpp",
+        "csharp" => ".cs",
+        "actions" => ".yml",
+        "go" => ".go",
+        "java" | "java-kotlin" => ".java",
+        "kotlin" => ".kt",
+        "javascript" | "javascript-typescript" => ".js",
+        "typescript" => ".ts",
+        "python" => ".py",
+        "ruby" => ".rb",
+        "rust" => ".rs",
+        "swift" => ".swift",
+        _ => return None,
+    };
+    Some(crate::icons::for_path("", suffix).color)
+}
+
+/// Which of a bar's `n` cells the indeterminate sweep lights `elapsed`
+/// seconds into a run: a third of the bar, crossing it two cells a second
+/// and starting over. The CLI reports no progress to fill it by.
+pub fn sweep(n: u16, elapsed: u64) -> std::ops::Range<u16> {
+    let len = (n / 3).max(1);
+    // The head runs from the first cell to the last cell past the end that
+    // still leaves one lit, so the bar is never dark.
+    let span = u64::from(n + len - 1).max(1);
+    let head = 1 + ((elapsed * 2 + u64::from(len) - 1) % span) as u16;
+    head.saturating_sub(len)..head.min(n)
 }
 
 /// The checklist on the first-run card: the first step is the one to do.
@@ -294,8 +581,8 @@ pub struct CodeqlPanel {
     pub current_db: Option<usize>,
     /// The order the store keeps the databases in, shown on the sort row.
     pub db_sort: Option<crate::codeql_db::DbSort>,
-    /// Query history labels, in the store's order (#578).
-    pub history: Vec<String>,
+    /// The query history rows, in the store's order (#578).
+    pub history: Vec<HistoryRow>,
     /// The order the store keeps the history in, shown on the sort row.
     pub history_sort: crate::codeql_query::HistSort,
     /// The workspace's queries by pack, from the last discovery.
@@ -330,6 +617,15 @@ pub struct CodeqlPanel {
     /// The rows inside the frame, from the last painted frame: clicks map
     /// to them and the card wraps to their width.
     pub last_inner: Rect,
+    /// The output of the query history entry shown expanded, which keeps
+    /// it expanded through a sort.
+    pub expanded: Option<std::path::PathBuf>,
+    /// The query in flight and the seconds it has run. Set by the app each
+    /// frame.
+    pub running: Option<(String, u64)>,
+    /// The bytes under each database's folder, by folder: summed by the
+    /// app when the list loads or changes, never while painting.
+    pub db_sizes: std::collections::HashMap<std::path::PathBuf, u64>,
 }
 
 impl CodeqlPanel {
@@ -361,20 +657,84 @@ impl CodeqlPanel {
         }
     }
 
-    /// The store index of the database whose row is selected.
+    /// The store index of the database the selection acts on: the current
+    /// one, while the card's name row is selected.
     pub fn selected_database(&self) -> Option<usize> {
         match self.selected_hit() {
-            Some(Hit::Action(Action::SelectDatabase(i))) => Some(i),
+            Some(Hit::Action(Action::PickDatabase)) => self.current_db,
             _ => None,
         }
     }
 
-    /// Put the selection on database `index`'s row, when it shows.
-    pub fn select_database(&mut self, index: usize) {
+    /// Put the selection on the database card's name row, when it shows.
+    pub fn select_database_card(&mut self) {
         if let Some(n) = self
             .lines()
             .iter()
-            .position(|l| matches!(l, Line::Action(Action::SelectDatabase(i), _) if *i == index))
+            .position(|l| *l == Line::DbCard(DbCard::Name))
+        {
+            self.selected = n;
+        }
+    }
+
+    /// The databases the picker offers, under the selected language: each
+    /// one's store index and its row, the current one marked.
+    pub fn database_choices(&self) -> Vec<(usize, String)> {
+        self.databases
+            .iter()
+            .enumerate()
+            .filter(|(_, db)| self.db_matches_language(db))
+            .map(|(i, db)| {
+                let mark = if self.current_db == Some(i) {
+                    "\u{25cf}"
+                } else {
+                    "\u{25cb}"
+                };
+                let lang = db
+                    .language
+                    .as_deref()
+                    .map(|l| crate::codeql_db::language_label(l).unwrap_or(l))
+                    .map(|l| format!(" \u{b7} {l}"))
+                    .unwrap_or_default();
+                (i, format!("{mark} {}{lang}", db.name))
+            })
+            .collect()
+    }
+
+    /// Expand or collapse query history entry `index`'s details, keeping
+    /// the selection on its row.
+    pub fn toggle_history(&mut self, index: usize) {
+        let Some(output) = self.history.get(index).map(|r| r.output.clone()) else {
+            return;
+        };
+        self.expanded = if self.expanded.as_ref() == Some(&output) {
+            None
+        } else {
+            Some(output)
+        };
+        self.select_history(index);
+    }
+
+    /// Whether query history entry `index` shows its details.
+    pub fn is_expanded(&self, index: usize) -> bool {
+        self.expanded.is_some()
+            && self.history.get(index).map(|r| &r.output) == self.expanded.as_ref()
+    }
+
+    /// Say which query runs and for how long. The Running section coming
+    /// or going moves the rows under it, so the selection follows its row.
+    pub fn set_running(&mut self, running: Option<(String, u64)>) {
+        if running.is_some() == self.running.is_some() {
+            self.running = running;
+            return;
+        }
+        let hit = self.selected_hit();
+        self.running = running;
+        if let Some(hit) = hit
+            && let Some(n) = self
+                .lines()
+                .iter()
+                .position(|l| Self::selectable(l) == Some(hit))
         {
             self.selected = n;
         }
@@ -408,11 +768,7 @@ impl CodeqlPanel {
 
     /// Put the selection on history entry `index`'s row, when it shows.
     pub fn select_history(&mut self, index: usize) {
-        if let Some(n) = self
-            .lines()
-            .iter()
-            .position(|l| matches!(l, Line::Action(Action::OpenHistory(i), _) if *i == index))
-        {
+        if let Some(n) = self.lines().iter().position(|l| *l == Line::History(index)) {
             self.selected = n;
         }
     }
@@ -620,6 +976,65 @@ impl CodeqlPanel {
         }
     }
 
+    /// Whether query history entry `i` is the run the Running section
+    /// shows, which the history leaves to it.
+    fn in_running(&self, i: usize) -> bool {
+        self.running.is_some()
+            && self
+                .history
+                .get(i)
+                .is_some_and(|r| r.status == crate::codeql_query::RunStatus::Running)
+    }
+
+    /// The current database, when there is one.
+    fn current(&self) -> Option<&crate::codeql_db::DbEntry> {
+        self.current_db.and_then(|i| self.databases.get(i))
+    }
+
+    /// The chips under expanded history entry `i`, a line of them at a
+    /// time as they fit between the tree's column and the frame.
+    fn history_chip_lines(&self, i: usize) -> Vec<Vec<Chip>> {
+        let limit = self.row_width().saturating_sub(1) as u16;
+        let mut lines: Vec<Vec<Chip>> = Vec::new();
+        let mut x = HISTORY_CHIP_X;
+        for chip in history_chips(i) {
+            let w = chip.label.chars().count() as u16 + 2;
+            // Too wide for a line of its own: `lay_out_chips` would drop
+            // it, so it never claims a row that paints empty.
+            if HISTORY_CHIP_X + w > limit {
+                continue;
+            }
+            if x > HISTORY_CHIP_X && x + w > limit {
+                x = HISTORY_CHIP_X;
+            }
+            if x == HISTORY_CHIP_X {
+                lines.push(Vec::new());
+            }
+            if let Some(line) = lines.last_mut() {
+                line.push(chip);
+            }
+            x += w + 1;
+        }
+        lines
+    }
+
+    /// The chips `line` shows, placed: each one's column from the row's
+    /// start, its width, and whether its key shows.
+    fn chips_on(&self, line: &Line) -> Vec<(u16, u16, Chip, bool)> {
+        let w = self.row_width() as u16;
+        match line {
+            // Inside the card, whose edges are its second and last but one
+            // columns.
+            Line::DbCard(DbCard::Chips) => lay_out_chips(&DB_CHIPS, 3, w.saturating_sub(2)),
+            Line::HistoryDetail(i, Detail::Chips(k)) => self
+                .history_chip_lines(*i)
+                .get(*k)
+                .map(|chips| lay_out_chips(chips, HISTORY_CHIP_X, w.saturating_sub(1)))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The first-run card, shown while there is no database, and the Quick
     /// Query button under it.
     fn welcome_lines(&self, out: &mut Vec<Line>) {
@@ -668,6 +1083,7 @@ impl CodeqlPanel {
     fn shows(&self, s: Section) -> bool {
         match s {
             Section::Databases => !self.databases.is_empty(),
+            Section::Running => self.running.is_some(),
             Section::AstViewer => self.ast.is_some(),
             Section::EvaluatorLog => self.evallog.is_some(),
             Section::MethodModeling => self.model.is_some(),
@@ -739,7 +1155,9 @@ impl CodeqlPanel {
                 .filter(|p| self.pack_matches_language(p))
                 .map(|p| p.queries.len())
                 .sum(),
-            Section::QueryHistory => self.history.len(),
+            Section::QueryHistory => (0..self.history.len())
+                .filter(|&i| !self.in_running(i))
+                .count(),
             Section::VariantAnalysis => {
                 let v = &self.variant;
                 v.lists.iter().map(|l| l.repos.len()).sum::<usize>() + v.repos.len()
@@ -763,6 +1181,8 @@ impl CodeqlPanel {
                     .collect::<Vec<_>>()
                     .join(" \u{b7} "),
             ),
+            // The key that cancels it.
+            Section::Running => Some("esc".to_string()),
             Section::VariantAnalysis if self.is_empty(s) => Some("set up".to_string()),
             Section::Queries | Section::QueryHistory if self.is_empty(s) => {
                 Some("none yet".to_string())
@@ -800,41 +1220,27 @@ impl CodeqlPanel {
                     }
                 }
                 Section::Databases => {
-                    if !self.databases.is_empty() {
+                    // The current database's card stands in for the list,
+                    // which its name row offers in a picker.
+                    out.push(Line::DbCard(DbCard::Top));
+                    out.push(Line::DbCard(DbCard::Name));
+                    if self.current().is_some() {
+                        out.push(Line::DbCard(DbCard::Meta));
+                    }
+                    out.push(Line::DbCard(DbCard::Blank));
+                    out.push(Line::DbCard(DbCard::Chips));
+                    out.push(Line::DbCard(DbCard::Bottom));
+                    out.push(Line::Action(
+                        Action::AddDatabase,
+                        "Add Database".to_string(),
+                    ));
+                    if self.databases.len() > 1 {
                         let by = self.db_sort.map_or("date added", |b| b.label());
                         out.push(Line::Action(
                             Action::SortDatabases,
                             format!("Sort by: {by}"),
                         ));
                     }
-                    let mut shown = 0;
-                    for (i, db) in self.databases.iter().enumerate() {
-                        if !self.db_matches_language(db) {
-                            continue;
-                        }
-                        shown += 1;
-                        let mark = if self.current_db == Some(i) {
-                            "●"
-                        } else {
-                            "○"
-                        };
-                        let lang = db
-                            .language
-                            .as_deref()
-                            .map(|l| format!(" ({l})"))
-                            .unwrap_or_default();
-                        out.push(Line::Action(
-                            Action::SelectDatabase(i),
-                            format!("{mark} {}{lang}", db.name),
-                        ));
-                    }
-                    if shown == 0 && !self.databases.is_empty() {
-                        out.push(Line::Text("No databases in this language."));
-                    }
-                    out.push(Line::Action(
-                        Action::AddDatabase,
-                        "Add Database".to_string(),
-                    ));
                 }
                 Section::Queries if self.queries.iter().any(|p| self.pack_matches_language(p)) => {
                     for (i, pack) in self.queries.iter().enumerate() {
@@ -884,9 +1290,23 @@ impl CodeqlPanel {
                         Action::SortHistory,
                         format!("Sort by: {}", self.history_sort.label()),
                     ));
-                    for (i, label) in self.history.iter().enumerate() {
-                        out.push(Line::Action(Action::OpenHistory(i), label.clone()));
+                    for i in 0..self.history.len() {
+                        if self.in_running(i) {
+                            continue;
+                        }
+                        out.push(Line::History(i));
+                        if self.is_expanded(i) {
+                            out.push(Line::HistoryDetail(i, Detail::Summary));
+                            out.push(Line::HistoryDetail(i, Detail::Where));
+                            for k in 0..self.history_chip_lines(i).len() {
+                                out.push(Line::HistoryDetail(i, Detail::Chips(k)));
+                            }
+                        }
                     }
+                }
+                Section::Running => {
+                    out.push(Line::Running(RunRow::Name));
+                    out.push(Line::Running(RunRow::Progress));
                 }
                 Section::QueryHistory => {
                     out.push(Line::Text("Run a query to see results."));
@@ -998,6 +1418,8 @@ impl CodeqlPanel {
         match line {
             Line::Header(s) => Some(Hit::Header(*s)),
             Line::Action(a, _) | Line::Button(a, ButtonRow::Label) => Some(Hit::Action(*a)),
+            Line::DbCard(DbCard::Name) => Some(Hit::Action(Action::PickDatabase)),
+            Line::History(i) => Some(Hit::Action(Action::OpenHistory(*i))),
             _ => None,
         }
     }
@@ -1067,15 +1489,32 @@ impl CodeqlPanel {
     }
 
     /// The row under a screen position, from the last painted frame. A
-    /// button's edges count as the button.
-    pub fn hit_at(&self, _x: u16, y: u16) -> Option<(usize, Hit)> {
+    /// button's edges count as the button. On a row of chips, the chip
+    /// under `x`, with the row it belongs to (the card's name row, or the
+    /// history entry's) as the one to select.
+    pub fn hit_at(&self, x: u16, y: u16) -> Option<(usize, Hit)> {
         let a = self.last_inner;
         if a.height == 0 || y < a.y || y >= a.y + a.height {
             return None;
         }
         let idx = self.scroll + (y - a.y) as usize;
         let lines = self.lines();
-        let idx = match lines.get(idx)? {
+        let line = lines.get(idx)?;
+        if matches!(
+            line,
+            Line::DbCard(DbCard::Chips) | Line::HistoryDetail(_, Detail::Chips(_))
+        ) {
+            let dx = x.checked_sub(a.x)?;
+            let (_, _, chip, _) = self
+                .chips_on(line)
+                .into_iter()
+                .find(|&(cx, w, ..)| dx >= cx && dx < cx + w)?;
+            let owner = (0..idx)
+                .rev()
+                .find(|&i| Self::selectable(&lines[i]).is_some())?;
+            return Some((owner, Hit::Action(chip.action)));
+        }
+        let idx = match line {
             Line::Button(_, ButtonRow::Top) => idx + 1,
             Line::Button(_, ButtonRow::Bottom) => idx.checked_sub(1)?,
             _ => idx,
@@ -1121,6 +1560,9 @@ impl CodeqlPanel {
             button: pick(crate::gradient::PRIMARY_BTN_BG, t.button()),
             badge: t.accent_chip_bg(),
             selection: t.selection(),
+            ember: pick(crate::gradient::GRAD_TR, t.accent()),
+            added: t.git_added(),
+            deleted: t.git_deleted(),
         }
     }
 
@@ -1330,38 +1772,322 @@ impl CodeqlPanel {
         );
     }
 
-    /// Paint an action row: a database with its mark and language, or a
-    /// label behind its glyph.
+    /// Paint the chips `line` shows on `row`: the label in the accent on
+    /// the chip fill, its key after it in bold.
+    fn paint_chips(&self, buf: &mut Buffer, row: Rect, line: &Line, p: &Palette) {
+        for (dx, w, chip, key) in self.chips_on(line) {
+            let x = row.x + dx;
+            let fill = Style::default().bg(p.badge);
+            buf.set_string(x, row.y, " ".repeat(w as usize), fill);
+            buf.set_string(x + 1, row.y, chip.label, fill.fg(p.accent));
+            if let (true, Some(k)) = (key, chip.key) {
+                buf.set_string(
+                    x + w - 2,
+                    row.y,
+                    k.to_string(),
+                    fill.fg(p.bright).add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+    }
+
+    /// Paint one row of the current database's card: its titled edge, the
+    /// language mark and name with the switch chevron, the language, size
+    /// and age, and the chips.
+    fn paint_db_card(&self, buf: &mut Buffer, row: Rect, card: DbCard, p: &Palette) {
+        let w = row.width;
+        if w < 8 {
+            return;
+        }
+        let (left, right) = (row.x + 1, row.x + w - 2);
+        let border = Style::default().fg(p.card);
+        let (l, r) = match card {
+            DbCard::Top => ("╭", "╮"),
+            DbCard::Bottom => ("╰", "╯"),
+            _ => ("│", "│"),
+        };
+        buf.set_string(left, row.y, l, border);
+        buf.set_string(right, row.y, r, border);
+        let db = self.current();
+        match card {
+            DbCard::Top | DbCard::Bottom => {
+                for x in left + 1..right {
+                    buf.set_string(x, row.y, "─", border);
+                }
+                if card == DbCard::Top {
+                    buf.set_stringn(
+                        left + 2,
+                        row.y,
+                        " DATABASE ",
+                        right.saturating_sub(left + 3) as usize,
+                        Style::default().fg(p.bright).add_modifier(Modifier::BOLD),
+                    );
+                }
+            }
+            DbCard::Name => {
+                let chevron = right - 2;
+                buf.set_string(chevron, row.y, "▾", Style::default().fg(p.dim));
+                let room = chevron.saturating_sub(left + 5) as usize;
+                match db {
+                    Some(db) => {
+                        let mark = db
+                            .language
+                            .as_deref()
+                            .and_then(language_color)
+                            .map_or(p.dim, |c| self.theme.ui(c));
+                        buf.set_string(left + 2, row.y, "◆", Style::default().fg(mark));
+                        buf.set_stringn(
+                            left + 4,
+                            row.y,
+                            &db.name,
+                            room,
+                            Style::default().fg(p.bright).add_modifier(Modifier::BOLD),
+                        );
+                    }
+                    None => {
+                        buf.set_stringn(
+                            left + 2,
+                            row.y,
+                            "Select a database",
+                            room + 2,
+                            Style::default().fg(p.dim),
+                        );
+                    }
+                }
+            }
+            DbCard::Meta => {
+                let Some(db) = db else {
+                    return;
+                };
+                let mut parts = Vec::new();
+                if let Some(lang) = db.language.as_deref() {
+                    parts.push(
+                        crate::codeql_db::language_label(lang)
+                            .unwrap_or(lang)
+                            .to_string(),
+                    );
+                }
+                if let Some(&bytes) = self.db_sizes.get(&db.path) {
+                    parts.push(short_size(bytes));
+                }
+                if db.added > 0 {
+                    parts.push(short_age(now().saturating_sub(db.added)));
+                }
+                // Whole parts only: a narrow card drops the age, then the
+                // size, rather than cutting "3d ago" to "3d a".
+                let room = right.saturating_sub(left + 5) as usize;
+                while parts.len() > 1 && parts.join(" \u{b7} ").chars().count() > room {
+                    parts.pop();
+                }
+                buf.set_stringn(
+                    left + 4,
+                    row.y,
+                    parts.join(" \u{b7} "),
+                    room,
+                    Style::default().fg(p.dim),
+                );
+            }
+            DbCard::Blank => {}
+            DbCard::Chips => self.paint_chips(buf, row, &Line::DbCard(card), p),
+        }
+    }
+
+    /// Paint query history entry `i`: its status glyph, its name cut to
+    /// fit, and the count and duration columns, right-aligned in the
+    /// widths the frame measured so every row lines up.
+    fn paint_history(
+        &self,
+        buf: &mut Buffer,
+        row: Rect,
+        i: usize,
+        (count_w, dur_w): (u16, u16),
+        p: &Palette,
+    ) {
+        use crate::codeql_query::RunStatus;
+        let Some(h) = self.history.get(i) else {
+            return;
+        };
+        let end = row.x + row.width.saturating_sub(1);
+        let (glyph, glyph_fg, name_fg, dur_fg) = match h.status {
+            RunStatus::Succeeded => ("✓", p.added, p.fg, p.dim),
+            RunStatus::Failed(_) => ("✗", p.deleted, p.fg, p.dim),
+            RunStatus::Running => ("◌", p.ember, p.bright, p.dim),
+            RunStatus::Cancelled => ("−", p.dim, p.dim, p.faint),
+        };
+        let name_x = row.x + 4;
+        let mut room = end.saturating_sub(name_x);
+        // The columns go when the row is too narrow for a name beside them.
+        let cols = count_w + dur_w + 3;
+        if end >= name_x + cols + 6 {
+            let dur = h.duration_text();
+            let dur_x = end - dur.chars().count() as u16;
+            buf.set_string(dur_x, row.y, &dur, Style::default().fg(dur_fg));
+            let count = h.count_text();
+            let count_end = end - dur_w - 2;
+            let count_style = match (&h.status, h.results) {
+                (RunStatus::Failed(_), _) => Style::default().fg(p.deleted),
+                (RunStatus::Succeeded, Some(_)) => {
+                    Style::default().fg(p.bright).add_modifier(Modifier::BOLD)
+                }
+                _ => Style::default().fg(p.faint),
+            };
+            buf.set_string(
+                count_end - count.chars().count() as u16,
+                row.y,
+                &count,
+                count_style,
+            );
+            room = (count_end - count_w).saturating_sub(name_x + 1);
+        }
+        buf.set_string(row.x + 2, row.y, glyph, Style::default().fg(glyph_fg));
+        let name = if h.name.chars().count() > room as usize {
+            let cut: String = h
+                .name
+                .chars()
+                .take((room as usize).saturating_sub(1))
+                .collect();
+            format!("{cut}…")
+        } else {
+            h.name.clone()
+        };
+        let style = Style::default().fg(name_fg);
+        let style = if h.status == RunStatus::Running {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        };
+        buf.set_stringn(name_x, row.y, &name, room as usize, style);
+    }
+
+    /// Paint a detail line under expanded history entry `i`, on the tree
+    /// line that joins them to its row.
+    fn paint_detail(&self, buf: &mut Buffer, row: Rect, i: usize, detail: Detail, p: &Palette) {
+        use crate::codeql_query::RunStatus;
+        let Some(h) = self.history.get(i) else {
+            return;
+        };
+        let end = row.x + row.width.saturating_sub(1);
+        let (x, text_x) = (row.x + 4, row.x + HISTORY_CHIP_X);
+        if text_x + 2 >= end {
+            return;
+        }
+        let branch = match detail {
+            Detail::Chips(0) => "└",
+            Detail::Chips(_) => "",
+            _ => "├",
+        };
+        buf.set_string(x, row.y, branch, Style::default().fg(p.faint));
+        let room = |from: u16| end.saturating_sub(from) as usize;
+        match detail {
+            Detail::Summary => {
+                let format = if h.is_sarif() { "SARIF" } else { "CSV" };
+                let mut room = room(text_x);
+                if format.len() + 12 < room {
+                    buf.set_string(
+                        end - format.len() as u16,
+                        row.y,
+                        format,
+                        Style::default().fg(p.dim),
+                    );
+                    room -= format.len() + 1;
+                }
+                let noun = match (h.is_sarif(), h.results) {
+                    (true, Some(1)) => "alert",
+                    (true, _) => "alerts",
+                    (false, Some(1)) => "row",
+                    (false, _) => "rows",
+                };
+                let (text, style) = match (&h.status, h.results) {
+                    (RunStatus::Succeeded, Some(n)) => {
+                        (format!("{n} {noun}"), Style::default().fg(p.fg))
+                    }
+                    (RunStatus::Succeeded, None) => {
+                        (format!("{noun} not counted"), Style::default().fg(p.dim))
+                    }
+                    (RunStatus::Failed(why), _) => {
+                        (format!("failed: {why}"), Style::default().fg(p.deleted))
+                    }
+                    (RunStatus::Running, _) => ("running".to_string(), Style::default().fg(p.dim)),
+                    (RunStatus::Cancelled, _) => {
+                        ("cancelled".to_string(), Style::default().fg(p.dim))
+                    }
+                };
+                buf.set_stringn(text_x, row.y, text, room, style);
+            }
+            Detail::Where => {
+                let text = format!("{} \u{b7} {}", h.database, clock(h.started, now()));
+                buf.set_stringn(
+                    text_x,
+                    row.y,
+                    text,
+                    room(text_x),
+                    Style::default().fg(p.dim),
+                );
+            }
+            Detail::Chips(_) => {
+                self.paint_chips(buf, row, &Line::HistoryDetail(i, detail), p);
+            }
+        }
+    }
+
+    /// Paint a row of the Running section: the query's name, or the sweep
+    /// in the gradient with the time elapsed.
+    fn paint_running(&self, buf: &mut Buffer, row: Rect, part: RunRow, p: &Palette) {
+        let Some((name, secs)) = &self.running else {
+            return;
+        };
+        let end = row.x + row.width.saturating_sub(1);
+        match part {
+            RunRow::Name => {
+                buf.set_string(row.x + 2, row.y, "◌", Style::default().fg(p.ember));
+                buf.set_stringn(
+                    row.x + 4,
+                    row.y,
+                    name,
+                    end.saturating_sub(row.x + 4) as usize,
+                    Style::default().fg(p.bright).add_modifier(Modifier::BOLD),
+                );
+            }
+            RunRow::Progress => {
+                let time = format!("{}:{:02}", secs / 60, secs % 60);
+                let time_x = end.saturating_sub(time.chars().count() as u16);
+                let x0 = row.x + 4;
+                if time_x < x0 + 6 {
+                    return;
+                }
+                buf.set_string(time_x, row.y, &time, Style::default().fg(p.ember));
+                let n = time_x - 2 - x0;
+                let lit = sweep(n, *secs);
+                for c in 0..n {
+                    let (cell, fg) = if lit.contains(&c) {
+                        let fg = if self.focus_gradient {
+                            let t = if n > 1 {
+                                f32::from(c) / f32::from(n - 1)
+                            } else {
+                                0.0
+                            };
+                            crate::gradient::rgb_color(crate::gradient::lerp_rgb(
+                                crate::gradient::GRAD_TL,
+                                crate::gradient::GRAD_TR,
+                                t,
+                            ))
+                        } else {
+                            p.accent
+                        };
+                        ("━", fg)
+                    } else {
+                        ("─", p.faint)
+                    };
+                    buf.set_string(x0 + c, row.y, cell, Style::default().fg(fg));
+                }
+            }
+        }
+    }
+
+    /// Paint an action row: a label behind its glyph.
     fn paint_action(&self, buf: &mut Buffer, row: Rect, action: Action, label: &str, p: &Palette) {
         let w = row.width;
         let end = row.x + w.saturating_sub(1);
-        if let Action::SelectDatabase(i) = action
-            && let Some(db) = self.databases.get(i)
-        {
-            let current = self.current_db == Some(i);
-            let mut room = end.saturating_sub(row.x + 4);
-            if let Some(lang) = db.language.as_deref() {
-                let lang = crate::codeql_db::language_label(lang).unwrap_or(lang);
-                let n = lang.chars().count() as u16;
-                if n + 10 < w {
-                    let x = end - n;
-                    buf.set_string(x, row.y, lang, Style::default().fg(p.dim));
-                    room = x.saturating_sub(row.x + 5);
-                }
-            }
-            let (mark, mark_style, name_style) = if current {
-                (
-                    "●",
-                    Style::default().fg(p.accent),
-                    Style::default().fg(p.bright).add_modifier(Modifier::BOLD),
-                )
-            } else {
-                ("○", Style::default().fg(p.faint), Style::default().fg(p.fg))
-            };
-            buf.set_string(row.x + 2, row.y, mark, mark_style);
-            buf.set_stringn(row.x + 4, row.y, &db.name, room as usize, name_style);
-            return;
-        }
         let glyph = match action {
             Action::RunQuery(..) => Some("▶"),
             Action::AddDatabase
@@ -1423,6 +2149,11 @@ struct Palette {
     button: Color,
     badge: Color,
     selection: Color,
+    /// The gradient's warm end: what runs, and for how long.
+    ember: Color,
+    /// Succeeded and failed, as Source Control colours added and deleted.
+    added: Color,
+    deleted: Color,
 }
 
 impl Widget for &mut CodeqlPanel {
@@ -1481,6 +2212,19 @@ impl Widget for &mut CodeqlPanel {
             self.scroll = self.selected + 1 - rows;
         }
         let focused_row = self.focused.then_some(self.selected);
+        // The count and duration columns are as wide as their widest entry,
+        // measured once a frame rather than once a row.
+        let widest = |f: fn(&HistoryRow) -> String| {
+            self.history
+                .iter()
+                .map(|r| f(r).chars().count() as u16)
+                .max()
+                .unwrap_or(0)
+        };
+        let columns = (
+            widest(HistoryRow::count_text),
+            widest(HistoryRow::duration_text),
+        );
         for (r, line) in lines.iter().enumerate().skip(self.scroll).take(rows) {
             let y = inner.y + (r - self.scroll) as u16;
             let row = Rect::new(inner.x, y, inner.width, 1);
@@ -1490,8 +2234,13 @@ impl Widget for &mut CodeqlPanel {
                 Line::Button(_, ButtonRow::Bottom) => Some(r) == focused_row.map(|s| s + 1),
                 _ => focused_row == Some(r),
             };
-            if selected && matches!(line, Line::Header(_) | Line::Action(..)) {
+            if selected && matches!(line, Line::Header(_) | Line::Action(..) | Line::History(_)) {
                 buf.set_style(row, Style::default().bg(p.selection));
+            }
+            // The card's name row fills inside the card's edges.
+            if selected && *line == Line::DbCard(DbCard::Name) && row.width > 4 {
+                let inside = Rect::new(row.x + 2, y, row.width - 4, 1);
+                buf.set_style(inside, Style::default().bg(p.selection));
             }
             match line {
                 Line::Header(s) => self.paint_header(buf, row, *s, &p),
@@ -1508,6 +2257,10 @@ impl Widget for &mut CodeqlPanel {
                 Line::Blank => {}
                 Line::Card(card) => self.paint_card(buf, row, card, &p),
                 Line::Button(a, part) => self.paint_button(buf, row, *a, *part, &p),
+                Line::DbCard(card) => self.paint_db_card(buf, row, *card, &p),
+                Line::History(i) => self.paint_history(buf, row, *i, columns, &p),
+                Line::HistoryDetail(i, detail) => self.paint_detail(buf, row, *i, *detail, &p),
+                Line::Running(part) => self.paint_running(buf, row, *part, &p),
             }
             // The Explorer-style accent bar marks the selected row.
             if selected {
@@ -1540,6 +2293,7 @@ mod tests {
         }
         for s in [
             Section::Databases,
+            Section::Running,
             Section::AstViewer,
             Section::EvaluatorLog,
             Section::MethodModeling,
@@ -1637,23 +2391,51 @@ mod tests {
         ];
         p.current_db = Some(1);
         let lines = p.lines();
-        assert!(lines.contains(&Line::Action(
-            Action::SelectDatabase(0),
-            "○ a-db (python)".into()
-        )));
-        assert!(lines.contains(&Line::Action(
-            Action::SelectDatabase(1),
-            "● b-db (go)".into()
-        )));
-        assert!(
-            lines.contains(&Line::Action(Action::AddDatabase, "Add Database".into())),
-            "adding more stays on offer"
+        let dbs: Vec<Line> = lines
+            .iter()
+            .skip_while(|l| **l != Line::Header(Section::Databases))
+            .skip(1)
+            .take_while(|l| !matches!(l, Line::Header(_)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            dbs,
+            [
+                Line::DbCard(DbCard::Top),
+                Line::DbCard(DbCard::Name),
+                Line::DbCard(DbCard::Meta),
+                Line::DbCard(DbCard::Blank),
+                Line::DbCard(DbCard::Chips),
+                Line::DbCard(DbCard::Bottom),
+                Line::Action(Action::AddDatabase, "Add Database".into()),
+                Line::Action(Action::SortDatabases, "Sort by: date added".into()),
+            ],
+            "the card stands in for the list; adding and sorting stay on offer"
         );
         assert!(
             !lines.iter().any(|l| matches!(l, Line::Card(_))),
             "no first-run card once there is a database"
         );
         assert_eq!(p.count(Section::Databases), Some(2));
+        p.select_database_card();
+        assert_eq!(p.selected_hit(), Some(Hit::Action(Action::PickDatabase)));
+        assert_eq!(
+            p.selected_database(),
+            Some(1),
+            "the card acts on the current one"
+        );
+        // One database: no sort row. None current: no meta row.
+        p.databases.pop();
+        p.current_db = None;
+        let lines = p.lines();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| matches!(l, Line::Action(Action::SortDatabases, _)))
+        );
+        assert!(!lines.contains(&Line::DbCard(DbCard::Meta)));
+        assert!(lines.contains(&Line::DbCard(DbCard::Name)));
+        assert_eq!(p.selected_database(), None);
     }
 
     #[test]
@@ -1671,6 +2453,7 @@ mod tests {
             db("web", Some("typescript")),
             db("odd", None),
         ];
+        p.current_db = Some(1);
         assert!(
             p.lines().contains(&Line::Action(
                 Action::SortDatabases,
@@ -1683,30 +2466,27 @@ mod tests {
             p.lines()
                 .contains(&Line::Action(Action::SortDatabases, "Sort by: name".into()))
         );
+        assert_eq!(
+            p.database_choices(),
+            [
+                (0, "○ gin · Go".to_string()),
+                (1, "● web · JavaScript / TypeScript".to_string()),
+                (2, "○ odd".to_string()),
+            ],
+            "the picker marks the current one"
+        );
         // JavaScript / TypeScript (index 5) hides the Go database.
         p.language = Some(5);
-        let dbs: Vec<Action> = p
-            .lines()
-            .into_iter()
-            .filter_map(|l| match l {
-                Line::Action(a @ Action::SelectDatabase(_), _) => Some(a),
-                _ => None,
-            })
-            .collect();
+        let ids: Vec<usize> = p.database_choices().into_iter().map(|(i, _)| i).collect();
         assert_eq!(
-            dbs,
-            [Action::SelectDatabase(1), Action::SelectDatabase(2)],
+            ids,
+            [1, 2],
             "store indices, and the unknown language shows under any"
         );
-        p.select_database(1);
-        assert_eq!(p.selected_database(), Some(1));
         // Swift: nothing but the one of unknown language.
         p.databases.pop();
         p.language = Some(9);
-        assert!(
-            p.lines()
-                .contains(&Line::Text("No databases in this language."))
-        );
+        assert!(p.database_choices().is_empty());
     }
 
     #[test]
@@ -1729,22 +2509,17 @@ mod tests {
             p.lines()
                 .contains(&Line::Text("Run a query to see results."))
         );
+        use crate::codeql_query::RunStatus;
         p.history = vec![
-            String::from("\u{2713} a.ql \u{b7} app \u{b7} 3s"),
-            String::from("\u{2717} b.ql \u{b7} app \u{b7} failed: x"),
+            hist("a.ql", RunStatus::Succeeded, Some(2), 3),
+            hist("b.ql", RunStatus::Failed("x".into()), None, 1),
         ];
         let lines = p.lines();
         assert!(!lines.contains(&Line::Text("Run a query to see results.")));
         assert_eq!(p.count(Section::QueryHistory), Some(2));
         assert_eq!(p.summary(Section::QueryHistory), None);
-        assert!(lines.contains(&Line::Action(
-            Action::OpenHistory(0),
-            "\u{2713} a.ql \u{b7} app \u{b7} 3s".into()
-        )));
-        assert!(lines.contains(&Line::Action(
-            Action::OpenHistory(1),
-            "\u{2717} b.ql \u{b7} app \u{b7} failed: x".into()
-        )));
+        assert!(lines.contains(&Line::History(0)));
+        assert!(lines.contains(&Line::History(1)));
         assert!(
             lines.contains(&Line::Action(Action::SortHistory, "Sort by: date".into())),
             "the list offers its order"
@@ -1756,6 +2531,23 @@ mod tests {
         );
         p.select_history(1);
         assert_eq!(p.selected_history(), Some(1));
+    }
+
+    fn hist(
+        name: &str,
+        status: crate::codeql_query::RunStatus,
+        results: Option<u64>,
+        seconds: u64,
+    ) -> HistoryRow {
+        HistoryRow {
+            status,
+            name: name.into(),
+            database: "app".into(),
+            results,
+            seconds,
+            started: 0,
+            output: format!("/r/{name}/results.sarif").into(),
+        }
     }
 
     fn pack(
@@ -1960,10 +2752,15 @@ mod tests {
 
     /// Paint `p` focused, under the Black theme, into a 32 x 44 side bar.
     fn draw(p: &mut CodeqlPanel) -> Buffer {
+        draw_w(p, 32)
+    }
+
+    /// [`draw`] into a side bar `w` columns wide.
+    fn draw_w(p: &mut CodeqlPanel, w: u16) -> Buffer {
         p.focused = true;
         p.focus_gradient = true;
         p.theme = crate::theme::Theme::BLACK;
-        let backend = ratatui::backend::TestBackend::new(32, 44);
+        let backend = ratatui::backend::TestBackend::new(w, 44);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| f.render_widget(&mut *p, f.area())).unwrap();
         term.backend().buffer().clone()
@@ -2037,9 +2834,13 @@ mod tests {
     #[test]
     fn databases_and_history_show_count_badges_and_no_card() {
         let mut p = CodeqlPanel::new();
+        use crate::codeql_query::RunStatus;
         p.databases = vec![db("croft-core", "rust"), db("flask", "python")];
         p.current_db = Some(0);
-        p.history = vec!["✓ a.ql · app · 3s".into(), "✓ b.ql · app · 4s".into()];
+        p.history = vec![
+            hist("a.ql", RunStatus::Succeeded, Some(1), 3),
+            hist("b.ql", RunStatus::Succeeded, Some(1), 4),
+        ];
         let buf = draw(&mut p);
         assert!(find(&buf, "Query your code").is_none());
         let (_, y) = find(&buf, "DATABASES").unwrap();
@@ -2047,14 +2848,11 @@ mod tests {
         assert_eq!(buf[(28, y)].bg, crate::theme::Theme::BLACK.accent_chip_bg());
         let (_, y) = find(&buf, "QUERY HISTORY").unwrap();
         assert!(row(&buf, y).ends_with(" 2  │"), "{}", row(&buf, y));
-        let (x, y) = find(&buf, "● croft-core").expect("the current database");
-        assert_eq!(
-            buf[(x, y)].fg,
-            crate::gradient::rgb_color(crate::gradient::CARD_ACCENT)
+        assert!(find(&buf, "◆ croft-core").is_some(), "the current database");
+        assert!(
+            find(&buf, "flask").is_none(),
+            "the others are in the picker"
         );
-        assert!(buf[(x + 2, y)].modifier.contains(Modifier::BOLD));
-        assert!(row(&buf, y).ends_with("Rust │"), "language on the right");
-        assert!(row(&buf, y + 1).contains("○ flask"));
         assert!(find(&buf, "+ Add Database").is_some(), "adding more stays");
         let (_, y) = find(&buf, "QUERIES").unwrap();
         assert!(row(&buf, y).contains("none yet"));
@@ -2148,5 +2946,329 @@ mod tests {
             p.hit_at(x, y).map(|(_, h)| h),
             Some(Hit::Action(Action::QuickQuery))
         );
+    }
+
+    #[test]
+    fn the_database_card_shows_the_mark_name_meta_and_chips() {
+        let mut p = CodeqlPanel::new();
+        let mut core = db("croft-core", "rust");
+        core.added = now() - 2 * 3600 - 30;
+        p.databases = vec![core, db("flask", "python")];
+        p.current_db = Some(0);
+        p.db_sizes
+            .insert("/x/croft-core".into(), 214 * 1024 * 1024 + 1000);
+        let buf = draw(&mut p);
+        let (x, y) = find(&buf, " DATABASE ").expect("the card's title");
+        assert_eq!(buf[(x - 1, y)].symbol(), "─");
+        assert_eq!(buf[(2, y)].symbol(), "╭");
+        assert!(buf[(x + 1, y)].modifier.contains(Modifier::BOLD));
+        let (x, y) = find(&buf, "◆ croft-core").expect("the name row");
+        assert_eq!((x, y), (4, y), "the mark inside the card");
+        let t = crate::theme::Theme::BLACK;
+        assert_eq!(
+            buf[(x, y)].fg,
+            t.ui(crate::icons::for_path("main.rs", ".rs").color),
+            "the Explorer's colour for Rust files"
+        );
+        assert!(buf[(x + 2, y)].modifier.contains(Modifier::BOLD));
+        assert!(row(&buf, y).ends_with("▾ │ │"), "{}", row(&buf, y));
+        assert_eq!(
+            p.hit_at(x + 3, y).map(|(_, h)| h),
+            Some(Hit::Action(Action::PickDatabase)),
+            "the name row switches databases"
+        );
+        let (mx, my) = find(&buf, "Rust · 214 MB · 2h ago").expect("the meta row");
+        assert_eq!((mx, my), (6, y + 1));
+        assert_eq!(buf[(mx, my)].fg, p.palette().dim);
+        // Too long for the card: the age goes whole, never cut to "3d a".
+        p.databases[1].added = now() - 3 * 86400 - 30;
+        p.db_sizes.insert("/x/flask".into(), 900 * 1024);
+        p.current_db = Some(1);
+        let buf = draw_w(&mut p, 30);
+        let (_, fy) = find(&buf, "◆ flask").expect("the name row");
+        let meta = row(&buf, fy + 1);
+        assert!(meta.contains("Python · 900 KB "), "{meta}");
+        assert!(!meta.contains("3d"), "{meta}");
+        p.current_db = Some(0);
+        let buf = draw(&mut p);
+        let (_, y) = find(&buf, "◆ croft-core").expect("the name row");
+        // Too narrow for the keys at 32 columns: the chips keep their
+        // labels; wider, the keys show.
+        let (cx, cy) = find(&buf, "▶ Run").expect("the Run chip");
+        assert_eq!(cy, y + 3, "under a blank row");
+        assert_eq!(buf[(cx - 1, cy)].bg, t.accent_chip_bg(), "a chip fill");
+        assert!(find(&buf, "» Quick").is_some());
+        assert!(find(&buf, "AST").is_some());
+        assert!(find(&buf, "▶ Run r").is_none());
+        assert!(row(&buf, cy + 1).contains("╰"), "the card's bottom");
+        let buf = draw_w(&mut p, 36);
+        let (x, y) = find(&buf, "▶ Run r").expect("the key after the label");
+        assert!(buf[(x + 6, y)].modifier.contains(Modifier::BOLD));
+        assert!(find(&buf, "» Quick q").is_some());
+        assert!(find(&buf, "AST a").is_some());
+
+        // No current database: the card asks for one.
+        p.current_db = None;
+        let buf = draw(&mut p);
+        let (x, y) = find(&buf, "Select a database").expect("the prompt");
+        assert_eq!(buf[(x, y)].fg, p.palette().dim);
+        assert!(row(&buf, y).ends_with("▾ │ │"));
+        assert!(find(&buf, "214 MB").is_none(), "no meta row");
+    }
+
+    #[test]
+    fn history_rows_align_their_glyph_count_and_duration() {
+        use crate::codeql_query::RunStatus;
+        let mut p = CodeqlPanel::new();
+        p.history = vec![
+            hist("UnsafeDeref", RunStatus::Succeeded, Some(17), 4),
+            hist("Broken.ql", RunStatus::Failed("x".into()), None, 68),
+            hist("SlowJoin.ql", RunStatus::Cancelled, None, 160),
+        ];
+        let buf = draw(&mut p);
+        let pal = p.palette();
+        let (_, y0) = find(&buf, "✓ UnsafeDeref").expect("the succeeded row");
+        let rows: Vec<String> = (y0..y0 + 3).map(|y| row(&buf, y)).collect();
+        assert!(rows[0].ends_with("  17    4s │"), "{}", rows[0]);
+        assert!(rows[1].ends_with(" err  1m08 │"), "{}", rows[1]);
+        assert!(rows[2].ends_with("   —  2m40 │"), "{}", rows[2]);
+        assert!(rows[1].contains("✗ Broken.ql"));
+        assert!(rows[2].contains("− SlowJoin.ql"));
+        let glyphs = [pal.added, pal.deleted, pal.dim];
+        for (dy, fg) in glyphs.into_iter().enumerate() {
+            assert_eq!(buf[(3, y0 + dy as u16)].fg, fg, "glyph {dy}");
+        }
+        // The count column in bold white, `err` in red, the dash faint;
+        // the durations dim, a cancelled one fainter.
+        assert_eq!(buf[(23, y0)].fg, pal.bright);
+        assert!(buf[(23, y0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(23, y0 + 1)].fg, pal.deleted);
+        assert_eq!(buf[(23, y0 + 2)].fg, pal.faint);
+        assert_eq!(buf[(29, y0)].fg, pal.dim);
+        assert_eq!(buf[(29, y0 + 2)].fg, pal.faint);
+
+        // A long name is cut with an ellipsis clear of the count column.
+        p.history[0].name = "AVeryLongQueryNameThatDoesNotFit.ql".into();
+        let buf = draw(&mut p);
+        let text = row(&buf, y0);
+        assert!(text.contains("AVeryLongQuery…"), "{text}");
+        assert!(text.contains("AVeryLongQuery…  17    4s │"), "{text}");
+    }
+
+    #[test]
+    fn the_running_section_sweeps_the_gradient_with_the_elapsed_time() {
+        use crate::codeql_query::RunStatus;
+        let mut p = CodeqlPanel::new();
+        p.history = vec![
+            hist("TaintedPath.ql", RunStatus::Running, None, 0),
+            hist("a.ql", RunStatus::Succeeded, Some(1), 3),
+        ];
+        p.running = Some(("TaintedPath.ql".into(), 77));
+        let buf = draw(&mut p);
+        // The history leaves the run in flight to the section.
+        assert!(!p.lines().contains(&Line::History(0)));
+        assert_eq!(p.count(Section::QueryHistory), Some(1));
+        let pal = p.palette();
+        let (_, y) = find(&buf, "RUNNING").expect("the section");
+        assert!(row(&buf, y).ends_with("esc │"), "the key that cancels");
+        let (_, hy) = find(&buf, "QUERY HISTORY").unwrap();
+        assert!(hy > y + 2, "above the history");
+        let (x, ny) = find(&buf, "◌ TaintedPath.ql").expect("what runs");
+        assert_eq!((x, ny), (3, y + 1));
+        assert_eq!(
+            buf[(x, ny)].fg,
+            crate::gradient::rgb_color(crate::gradient::GRAD_TR)
+        );
+        assert!(buf[(x + 2, ny)].modifier.contains(Modifier::BOLD));
+        let by = ny + 1;
+        assert!(row(&buf, by).ends_with("1:17 │"), "{}", row(&buf, by));
+        assert_eq!(buf[(26, by)].fg, pal.ember);
+        // The bar runs from column 5 to two short of the timer.
+        let n = 26 - 2 - 5;
+        let lit = sweep(n, 77);
+        assert_eq!(lit, 10..16, "a third of the bar, mid-sweep");
+        for c in 0..n {
+            let cell = &buf[(5 + c, by)];
+            if lit.contains(&c) {
+                assert_eq!(cell.symbol(), "━", "cell {c}");
+                let t = f32::from(c) / f32::from(n - 1);
+                assert_eq!(
+                    cell.fg,
+                    crate::gradient::rgb_color(crate::gradient::lerp_rgb(
+                        crate::gradient::GRAD_TL,
+                        crate::gradient::GRAD_TR,
+                        t
+                    ))
+                );
+            } else {
+                assert_eq!(cell.symbol(), "─", "cell {c}");
+                assert_eq!(cell.fg, pal.faint);
+            }
+        }
+        assert_eq!(buf[(5 + n, by)].symbol(), " ");
+        // The sweep moves with the time, the same at the same second.
+        assert_eq!(sweep(19, 0), 0..6);
+        assert_eq!(sweep(19, 3), 6..12);
+        assert_eq!(sweep(19, 9), 18..19, "leaving at the right");
+        assert_eq!(sweep(19, 12), sweep(19, 0), "and starting over");
+        assert_ne!(sweep(19, 77), sweep(19, 78));
+        assert!((0..40).all(|t| !sweep(19, t).is_empty()), "never dark");
+
+        // The section goes with the run, and the selection keeps its row.
+        p.select_history(1);
+        p.set_running(None);
+        assert!(!p.lines().contains(&Line::Header(Section::Running)));
+        assert!(p.lines().contains(&Line::History(0)), "back in the history");
+        assert_eq!(p.selected_history(), Some(1));
+        p.set_running(Some(("b.ql".into(), 1)));
+        assert_eq!(p.selected_history(), Some(1));
+    }
+
+    #[test]
+    fn a_narrow_row_never_lists_a_chip_line_it_cannot_paint() {
+        use crate::codeql_query::RunStatus;
+        let mut p = CodeqlPanel::new();
+        p.history = vec![hist("UnsafeDeref", RunStatus::Succeeded, Some(17), 4)];
+        for w in [12, 14, 16, 18, 22, 36] {
+            let _ = draw_w(&mut p, w);
+            p.select_history(0);
+            if !p.is_expanded(0) {
+                p.toggle_history(0);
+            }
+            let _ = draw_w(&mut p, w);
+            for line in p.lines() {
+                if matches!(line, Line::HistoryDetail(_, Detail::Chips(_))) {
+                    assert!(!p.chips_on(&line).is_empty(), "an empty chip row at {w}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_history_row_expands_into_details_and_chips_and_collapses() {
+        use crate::codeql_query::RunStatus;
+        let mut p = CodeqlPanel::new();
+        p.history = vec![
+            hist("UnsafeDeref", RunStatus::Succeeded, Some(17), 4),
+            hist("b.ql", RunStatus::Succeeded, Some(1), 2),
+        ];
+        let _ = draw(&mut p);
+        p.select_history(0);
+        p.toggle_history(0);
+        assert!(p.is_expanded(0) && !p.is_expanded(1));
+        assert_eq!(p.selected_history(), Some(0), "the selection stays");
+        let buf = draw(&mut p);
+        let (_, y) = find(&buf, "✓ UnsafeDeref").unwrap();
+        assert!(
+            row(&buf, y + 1).contains("├ 17 alerts"),
+            "{}",
+            row(&buf, y + 1)
+        );
+        assert!(row(&buf, y + 1).ends_with("SARIF │"));
+        assert!(
+            row(&buf, y + 2).contains("├ app · "),
+            "{}",
+            row(&buf, y + 2)
+        );
+        assert!(
+            row(&buf, y + 3).contains("└  ↗ Open   ↔ Compare "),
+            "{}",
+            row(&buf, y + 3)
+        );
+        assert!(
+            row(&buf, y + 4).contains("   ↓ Export   ≡ Log "),
+            "{}",
+            row(&buf, y + 4)
+        );
+        let (x, cy) = find(&buf, "↗ Open").unwrap();
+        assert_eq!(buf[(x, cy)].bg, crate::theme::Theme::BLACK.accent_chip_bg());
+        assert!(row(&buf, y + 5).contains("✓ b.ql"), "the next row follows");
+        // Tables are rows, in CSV.
+        p.history[0].output = "/r/t/results.csv".into();
+        p.expanded = Some(p.history[0].output.clone());
+        let buf = draw(&mut p);
+        assert!(row(&buf, y + 1).contains("├ 17 rows"));
+        assert!(row(&buf, y + 1).ends_with("CSV │"));
+        p.toggle_history(0);
+        assert!(!p.is_expanded(0));
+        assert!(
+            !p.lines()
+                .iter()
+                .any(|l| matches!(l, Line::HistoryDetail(..)))
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_chip_hits_the_chip_under_the_column() {
+        use crate::codeql_query::RunStatus;
+        let mut p = CodeqlPanel::new();
+        p.databases = vec![db("croft-core", "rust")];
+        p.current_db = Some(0);
+        p.history = vec![hist("UnsafeDeref", RunStatus::Succeeded, Some(17), 4)];
+        let _ = draw(&mut p);
+        p.toggle_history(0);
+        let buf = draw(&mut p);
+        let lines = p.lines();
+        let owner = lines.iter().position(|l| *l == Line::History(0)).unwrap();
+        let (x, y) = find(&buf, "↓ Export").unwrap();
+        assert_eq!(
+            p.hit_at(x, y),
+            Some((owner, Hit::Action(Action::ExportHistory(0)))),
+            "the chip, selecting its history row"
+        );
+        assert_eq!(
+            p.hit_at(x - 1, y).map(|(_, h)| h),
+            Some(Hit::Action(Action::ExportHistory(0))),
+            "the chip's padding"
+        );
+        assert_eq!(p.hit_at(x - 2, y), None, "left of every chip");
+        let (x, _) = find(&buf, "≡ Log").unwrap();
+        assert_eq!(
+            p.hit_at(x, y).map(|(_, h)| h),
+            Some(Hit::Action(Action::HistoryLog(0)))
+        );
+        let (x, y) = find(&buf, "↔ Compare").unwrap();
+        assert_eq!(
+            p.hit_at(x, y).map(|(_, h)| h),
+            Some(Hit::Action(Action::CompareHistory(0)))
+        );
+        let (x, y) = find(&buf, "↗ Open").unwrap();
+        assert_eq!(
+            p.hit_at(x, y).map(|(_, h)| h),
+            Some(Hit::Action(Action::OpenHistory(0)))
+        );
+        // The card's chips select its name row.
+        let card = lines
+            .iter()
+            .position(|l| *l == Line::DbCard(DbCard::Name))
+            .unwrap();
+        let (x, y) = find(&buf, "AST").unwrap();
+        assert_eq!(p.hit_at(x, y), Some((card, Hit::Action(Action::ViewAst))));
+        let (x, y) = find(&buf, "» Quick").unwrap();
+        assert_eq!(
+            p.hit_at(x, y).map(|(_, h)| h),
+            Some(Hit::Action(Action::QuickQuery))
+        );
+        let (x, y) = find(&buf, "▶ Run").unwrap();
+        assert_eq!(
+            p.hit_at(x, y).map(|(_, h)| h),
+            Some(Hit::Action(Action::RunOpenQuery))
+        );
+        assert_eq!(p.hit_at(2, y), None, "the card's edge");
+    }
+
+    #[test]
+    fn short_forms_of_durations_ages_and_sizes() {
+        assert_eq!(duration(4), "4s");
+        assert_eq!(duration(68), "1m08");
+        assert_eq!(duration(160), "2m40");
+        assert_eq!(duration(3900), "1h05");
+        assert_eq!(short_age(30), "just now");
+        assert_eq!(short_age(7230), "2h ago");
+        assert_eq!(short_age(3 * 86_400), "3d ago");
+        assert_eq!(short_size(512), "512 B");
+        assert_eq!(short_size(214 * 1024 * 1024), "214 MB");
+        assert_eq!(short_size(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+        assert_eq!(clock(0, 5 * 86_400), "5d ago");
     }
 }
