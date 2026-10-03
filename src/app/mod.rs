@@ -3617,6 +3617,10 @@ pub struct App {
     /// (#862). Removed once its own backup holds that text, so a write that
     /// fails never leaves the text in memory only.
     hot_exit_consumed: Vec<PathBuf>,
+    /// Consumed backups that could not be removed once this croft's own
+    /// backup landed (#862 review). They may still hold text, so the quit
+    /// tries them again and says which are left.
+    hot_exit_unremoved: Vec<PathBuf>,
     /// Lines for stderr once the terminal is the shell's again, about what
     /// the user must still hear after croft has gone: a hot-exit backup a
     /// quit could not remove (#862).
@@ -5796,6 +5800,7 @@ impl App {
             hot_exit_written: None,
             hot_exit_retry_at: None,
             hot_exit_consumed: Vec::new(),
+            hot_exit_unremoved: Vec::new(),
             exit_notes: Vec::new(),
             run_tasks: Vec::new(),
             last_task: None,
@@ -57981,10 +57986,21 @@ impl App {
             Ok(()) => {
                 self.hot_exit_written = stamp;
                 self.hot_exit_retry_at = None;
+                let mut left = Vec::new();
                 for consumed in std::mem::take(&mut self.hot_exit_consumed) {
-                    if consumed != path {
-                        let _ = crate::hot_exit::remove(&consumed, &root);
+                    if consumed == path {
+                        continue;
                     }
+                    if let Err(e) = crate::hot_exit::remove(&consumed, &root) {
+                        left.push(format!("{} ({e})", consumed.display()));
+                        self.hot_exit_unremoved.push(consumed);
+                    }
+                }
+                if !left.is_empty() {
+                    self.status = format!(
+                        "Could not remove the hot-exit backup {}: it may still hold unsaved text; delete it by hand",
+                        left.join(", ")
+                    );
                 }
                 true
             }
@@ -58043,7 +58059,13 @@ impl App {
         let root = self.workspace_root().to_path_buf();
         let mut left = Vec::new();
         let consumed = std::mem::take(&mut self.hot_exit_consumed);
-        for path in self.hot_exit_path().into_iter().chain(consumed) {
+        let unremoved = std::mem::take(&mut self.hot_exit_unremoved);
+        for path in self
+            .hot_exit_path()
+            .into_iter()
+            .chain(consumed)
+            .chain(unremoved)
+        {
             if let Err(e) = crate::hot_exit::remove(&path, &root) {
                 left.push(format!("{} ({e})", path.display()));
             }
@@ -58140,7 +58162,13 @@ impl App {
                 };
                 filled.push(path.clone());
                 match ed.disk_stamp() {
-                    None => gone.push(path),
+                    // Kept at the stamp its edits were made against, so a
+                    // file made at the path since is not written over
+                    // without asking.
+                    None => {
+                        ed.set_disk_stamp(buffer.disk_stamp);
+                        gone.push(path);
+                    }
                     Some(now) if buffer.disk_stamp.is_some_and(|then| then != now) => {
                         ed.set_disk_stamp(buffer.disk_stamp);
                         changed.push(path);
@@ -58200,7 +58228,11 @@ impl App {
                     if doubled.len() == 1 { "its" } else { "their" },
                 ));
             }
+            let unremoved = self.hot_exit_unremoved.len();
             if self.write_hot_exit() {
+                if self.hot_exit_unremoved.len() > unremoved {
+                    notes.push(std::mem::take(&mut self.status));
+                }
                 // A trim that fails leaves the whole backup, so its other
                 // files come back again later rather than the held copy
                 // going.

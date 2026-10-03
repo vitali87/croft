@@ -134,6 +134,8 @@ pub fn remove(path: &Path, root: &Path) -> std::io::Result<()> {
 }
 
 /// Overwrite the backup at `path` in place with an empty backup of `root`.
+/// Never through a symbolic link: one in the backup directory is not a
+/// backup, and opening it would truncate whatever it points at.
 fn clear(path: &Path, root: &Path) -> std::io::Result<()> {
     use std::io::Write;
     let empty = Backup {
@@ -141,10 +143,14 @@ fn clear(path: &Path, root: &Path) -> std::io::Result<()> {
         buffers: Vec::new(),
     };
     let json = serde_json::to_vec(&empty).map_err(std::io::Error::other)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
     file.write_all(&json)?;
     // On disk before the unlink is tried: a power cut between the two must
     // not leave the discarded text to come back on the next launch.
@@ -154,7 +160,7 @@ fn clear(path: &Path, root: &Path) -> std::io::Result<()> {
 /// Whether the backup at `path` was last written longer than
 /// [`UNREADABLE_KEPT_FOR`] ago.
 pub fn is_expired(path: &Path) -> bool {
-    std::fs::metadata(path)
+    std::fs::symlink_metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
@@ -164,7 +170,9 @@ pub fn is_expired(path: &Path) -> bool {
 /// The backups of the workspace at `root` under `dir` that no running croft
 /// owns: their croft is gone (see [`owner_runs`]), or the file carries this
 /// process's pid (a dead croft's pid, recycled, or an earlier run in this
-/// process). A running croft's file is its own, live copy.
+/// process). A running croft's file is its own, live copy. Only regular
+/// files count: a symbolic link there is not a backup, and is never read,
+/// expired or removed through.
 ///
 /// Newest written first, so where two backups hold the same file, the
 /// newer is the one restored into its tab, and the older stays in its
@@ -177,6 +185,7 @@ pub fn orphaned(dir: &Path, root: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file()))
         .filter(|p| owner_of(p).is_some_and(|(pid, start)| pid == me || !owner_runs(pid, start)))
         .collect();
     files.sort_by_cached_key(|p| {
