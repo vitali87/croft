@@ -674,6 +674,11 @@ thread_local! {
     pub static FIT_IMAGE_BAKES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The most pixels [`fit_image_auto`] decodes. The bake only ever shows a
+/// downscale, but decoding allocates the full canvas first; 128 megapixels
+/// covers any camera photo while capping a crafted header (#1160).
+pub const MAX_DECODE_PIXELS: u64 = 128_000_000;
+
 /// Same as `fit_image` but accepts any format `image` can decode (PNG,
 /// JPEG, GIF first frame, BMP, WebP). Bakes the result back to a PNG sized
 /// to the supplied canvas with `bg` as the letterbox fill.
@@ -685,15 +690,36 @@ pub fn fit_image_auto(
 ) -> Result<Vec<u8>, image::ImageError> {
     #[cfg(test)]
     FIT_IMAGE_BAKES.with(|c| c.set(c.get() + 1));
-    let img = image::load_from_memory(src)?.to_rgba8();
-    let (sw, sh) = (img.width(), img.height());
+    let reader = || image::ImageReader::new(std::io::Cursor::new(src)).with_guessed_format();
+    let (sw, sh) = reader()?.into_dimensions()?;
+    // The header is cheap and the decode is not: a few hundred KB can
+    // declare a canvas that decodes to gigabytes (#1160).
+    if sw as u64 * sh as u64 > MAX_DECODE_PIXELS {
+        let hint = reader()?
+            .format()
+            .map_or(image::error::ImageFormatHint::Unknown, Into::into);
+        return Err(image::ImageError::Decoding(
+            image::error::DecodingError::new(
+                hint,
+                format!(
+                    "{sw}x{sh} is over the {} megapixels a preview decodes",
+                    MAX_DECODE_PIXELS / 1_000_000
+                ),
+            ),
+        ));
+    }
+    let img = reader()?.decode()?;
     let scale = f64::min(
         canvas_w_px as f64 / sw as f64,
         canvas_h_px as f64 / sh as f64,
     );
     let new_w = ((sw as f64 * scale).round() as u32).max(1);
     let new_h = ((sh as f64 * scale).round() as u32).max(1);
-    let scaled = image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Lanczos3);
+    // Resize in the source's own pixel format and only then go to RGBA8: a
+    // grayscale or RGB picture never pays for a full-size RGBA copy.
+    let scaled = img
+        .resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
     let mut canvas: RgbaImage = ImageBuffer::from_pixel(canvas_w_px, canvas_h_px, bg);
     let off_x = ((canvas_w_px as i64) - (new_w as i64)) / 2;
     let off_y = ((canvas_h_px as i64) - (new_h as i64)) / 2;
@@ -1094,6 +1120,68 @@ pub fn tmux_passthrough_wrap(seq: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PNG whose header declares `w`x`h` 8-bit grayscale but whose data
+    /// holds a single row: a few hundred bytes that a decoder would size its
+    /// output buffer from (#1160's bomb, minus the 547 KB of zero rows).
+    fn declared_grayscale_png(w: u32, h: u32) -> Vec<u8> {
+        use std::io::Write as _;
+        fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut crc = flate2::Crc::new();
+            crc.update(kind);
+            crc.update(data);
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            out.extend_from_slice(&crc.sum().to_be_bytes());
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        z.write_all(&[0]).unwrap();
+        z.write_all(&vec![0x80; w as usize]).unwrap();
+        let idat = z.finish().unwrap();
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &idat);
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    #[test]
+    fn an_image_declaring_more_pixels_than_the_budget_is_refused_before_decoding() {
+        // #1160: 23000x23000 is 529 megapixels; decoding it and expanding to
+        // RGBA8 asked for 2.1 GB and aborted croft.
+        let bomb = declared_grayscale_png(23_000, 23_000);
+        assert!(bomb.len() < 1024, "the bomb is tiny: {} bytes", bomb.len());
+        let err = fit_image_auto(&bomb, 400, 300, Rgba([0, 0, 0, 255]))
+            .expect_err("must not render")
+            .to_string();
+        assert!(err.contains("23000x23000"), "{err}");
+        assert!(err.contains("megapixels"), "{err}");
+    }
+
+    #[test]
+    fn an_image_within_the_budget_still_bakes_at_the_canvas_size() {
+        // Negative: an ordinary grayscale picture (not RGBA, so the native
+        // resize path) still fits, letterboxed, with its own grey value.
+        let src = image::GrayImage::from_pixel(200, 100, image::Luma([0x80]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageLuma8(src)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let baked = fit_image_auto(&png, 400, 400, Rgba([0, 0, 0, 255])).unwrap();
+        let img = image::load_from_memory(&baked).unwrap().to_rgba8();
+        assert_eq!(img.dimensions(), (400, 400));
+        assert_eq!(
+            img.get_pixel(200, 200).0,
+            [0x80, 0x80, 0x80, 255],
+            "the picture"
+        );
+        assert_eq!(img.get_pixel(200, 10).0, [0, 0, 0, 255], "the letterbox");
+    }
 
     #[test]
     fn iterm_app_is_iterm2() {
