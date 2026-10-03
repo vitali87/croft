@@ -17494,6 +17494,12 @@ impl App {
     /// non-zero problem count rides the PROBLEMS label as a badge.
     fn paint_panel_tabs(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
         use ratatui::widgets::Block;
+        // The labels go through `set_stringn`, which indexes the buffer
+        // directly, so a strip with no row inside the frame paints nothing.
+        let strip = strip.intersection(frame.area());
+        if strip.is_empty() {
+            return;
+        }
         let strip_bg = self.theme.editor_bg();
         frame.render_widget(Block::default().style(Style::default().bg(strip_bg)), strip);
         let brand = self.theme.gradient();
@@ -18536,11 +18542,14 @@ impl App {
             // The panel group's tab strip (PROBLEMS / TERMINAL) takes the top
             // row; the active tab's view fills the rest. Mirrors VS Code's
             // bottom-panel tab bar.
+            // `min(1)`: at a one-row window the band is zero rows high just
+            // below the frame, and a one-row strip there writes outside the
+            // buffer (#1133).
             let strip = Rect {
                 x: area.x,
                 y: area.y,
                 width: area.width,
-                height: 1,
+                height: area.height.min(1),
             };
             let content = if area.height > 1 {
                 Rect {

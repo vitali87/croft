@@ -565,6 +565,47 @@ fn overlays_render_on_a_tiny_terminal_without_panicking() {
     draw(&mut app, 8, 3);
 }
 
+/// #1133: at one row the bottom panel's band is zero rows high just below
+/// the frame, and its tab strip was still painted there.
+#[test]
+fn a_one_row_terminal_renders_without_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("data.csv"), "a,b\n1,2\n").unwrap();
+    let draw = |app: &mut App, w: u16, h: u16| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    };
+    let mut welcome = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut csv = App::new(tmp.path().to_path_buf()).unwrap();
+    csv.editor.open(&tmp.path().join("data.csv")).unwrap();
+    for app in [&mut welcome, &mut csv] {
+        for w in [140, 100, 80, 40, 20] {
+            draw(app, w, 1);
+        }
+    }
+}
+
+/// Negative for #1133: two rows, and a normal size after one row, still
+/// draw the bottom panel's tab strip where it was.
+#[test]
+fn the_panel_tab_strip_still_paints_once_there_is_room() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 2)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let rows: Vec<String> = (0..30)
+        .map(|y| (0..100).map(|x| buf[(x, y)].symbol().to_string()).collect())
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("PROBLEMS") && r.contains("TERMINAL")),
+        "{rows:#?}"
+    );
+}
+
 #[test]
 fn terminal_warning_swallows_a_key_and_dismisses_for_the_session() {
     // While the unsupported-terminal nudge is up, any non-D key dismisses it
