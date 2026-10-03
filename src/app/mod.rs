@@ -54182,6 +54182,9 @@ impl App {
         // in a second buffer with a different map.
         let mut saved_paths: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> =
             Vec::new();
+        // And each saved tab's text, for a server whose didSave carries it
+        // (#854).
+        let mut saved_texts: Vec<String> = Vec::new();
         // The tabs of a file with a symbol tab mirror each other (#369), so
         // they hold one text: the first write saves them all, and writing a
         // second would read the first as an external change. Settle them
@@ -54259,6 +54262,7 @@ impl App {
                             // recorder can tell whether they are still the
                             // ones on disk when its worker reads (#349).
                             saved_paths.push((p, e.provenance_to_record(), e.bytes_for_disk()));
+                            saved_texts.push(e.lines.join("\n"));
                         }
                     }
                     // The latch also removes the tab from `due`, so this is
@@ -54329,8 +54333,8 @@ impl App {
             self.reload_config_for_path(path);
         }
         if let Some(lsp) = self.lsp.as_ref() {
-            for (path, ..) in &saved_paths {
-                lsp.save_doc(path.clone());
+            for ((path, ..), text) in saved_paths.iter().zip(saved_texts) {
+                lsp.save_doc(path.clone(), text);
             }
         }
         for (path, seats, described) in saved_paths {
@@ -56025,7 +56029,7 @@ impl App {
     /// panel never refreshes after a save (issue #37).
     fn lsp_notify_saved(&mut self) {
         if let (Some(lsp), Some(path)) = (self.lsp.as_ref(), self.editor.path.clone()) {
-            lsp.save_doc(path);
+            lsp.save_doc(path, self.editor.lines.join("\n"));
         }
     }
 
@@ -56241,10 +56245,11 @@ impl App {
             Ok(SaveOutcome::Saved) => {
                 let seats = editor.provenance_to_record();
                 let described = editor.bytes_for_disk();
+                let text = editor.lines.join("\n");
                 self.status = editor.status.clone();
                 self.record_history_snapshot_of(path, seats, described);
                 if let Some(lsp) = self.lsp.as_ref() {
-                    lsp.save_doc(path.to_path_buf());
+                    lsp.save_doc(path.to_path_buf(), text);
                 }
                 self.reload_config_for_path(path);
             }

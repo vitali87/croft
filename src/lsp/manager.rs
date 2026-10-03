@@ -740,6 +740,7 @@ enum Cmd {
     },
     SaveDoc {
         path: PathBuf,
+        text: String,
     },
     CloseDoc {
         path: PathBuf,
@@ -1171,8 +1172,12 @@ impl LspManager {
     /// Notify the servers a document was written to disk. rust-analyzer only
     /// re-runs its check-on-save (`cargo check`, the source of most Rust
     /// PROBLEMS entries) on `textDocument/didSave`.
-    pub fn save_doc(&self, path: PathBuf) {
-        let _ = self.cmd_tx.send(Cmd::SaveDoc { path });
+    ///
+    /// `text` is the buffer as saved, in the form `change_doc` sends it. Only
+    /// a server whose `save` options ask for `includeText` receives it, and
+    /// only a server that asked for saves at all is notified (#854).
+    pub fn save_doc(&self, path: PathBuf, text: String) {
+        let _ = self.cmd_tx.send(Cmd::SaveDoc { path, text });
     }
 
     pub fn close_doc(&self, path: PathBuf) {
@@ -2003,6 +2008,9 @@ struct ManagedClient {
     /// would accrue one leak per refresh for the whole session. Asking it
     /// once and then stopping bounds the damage at exactly one.
     diagnostic_pull_stalled: Arc<AtomicBool>,
+    /// Whether to send this server `textDocument/didSave`, and with the text
+    /// or without it, read from its `textDocumentSync` (#854).
+    save_notify: SaveNotify,
     /// Whether the server answers `textDocument/diagnostic` (#866), which
     /// advertising `diagnosticProvider` at all promises. croft declares the
     /// pull capability for the workspace pull (#533), and servers such as
@@ -2362,7 +2370,7 @@ async fn worker_loop(
                     .await
             }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
-            Cmd::SaveDoc { path } => state.save_doc(path).await,
+            Cmd::SaveDoc { path, text } => state.save_doc(path, text).await,
             Cmd::CloseDoc { path } => state.close_doc(path).await,
             Cmd::RequestCompletion {
                 request_id,
@@ -2856,6 +2864,7 @@ impl WorkerState {
                         let supports_document_diagnostics = caps.diagnostic_provider.is_some();
                         let diagnostic_identifier =
                             diagnostic_identifier_of(&caps.diagnostic_provider);
+                        let save_notify = save_notify_of(&caps.text_document_sync);
                         let supports_hover = hover_supported(&caps.hover_provider);
                         let supports_definition = one_of_supported(&caps.definition_provider);
                         let supports_document_symbol =
@@ -2944,6 +2953,7 @@ impl WorkerState {
                                 DiagnosticResultIds::default(),
                             )),
                             diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
+                            save_notify,
                             supports_document_diagnostics,
                             document_pull_stalled: Arc::new(AtomicBool::new(false)),
                             document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
@@ -3185,7 +3195,7 @@ impl WorkerState {
         spawn_document_pulls(pulls, self.diagnostics_tx.clone(), DOCUMENT_PULL_DEBOUNCE);
     }
 
-    async fn save_doc(&mut self, path: PathBuf) {
+    async fn save_doc(&mut self, path: PathBuf, text: String) {
         let Some(doc) = self.docs.get(&path) else {
             return;
         };
@@ -3193,16 +3203,37 @@ impl WorkerState {
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
-        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = match self.clients.get(&key) {
-            Some(cs) => cs
-                .iter()
-                .map(|c| (c.name.clone(), c.client.clone()))
-                .collect(),
-            None => return,
-        };
-        for (name, client_arc) in arcs {
+        // Only the servers that asked for saves (#854): ruff advertises no
+        // `save` and warns "no handler" on every notification it is sent.
+        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>, SaveNotify)> =
+            match self.clients.get(&key) {
+                Some(cs) => cs
+                    .iter()
+                    .filter(|c| c.save_notify != SaveNotify::Never)
+                    .map(|c| (c.name.clone(), c.client.clone(), c.save_notify))
+                    .collect(),
+                None => return,
+            };
+        // The text is cloned only for a server that asks for it while another
+        // still waits after it; the last one gets the buffer itself.
+        let mut wanting = arcs
+            .iter()
+            .filter(|(_, _, notify)| *notify == SaveNotify::WithText)
+            .count();
+        let mut text = Some(text);
+        for (name, client_arc, notify) in arcs {
+            let text = if notify == SaveNotify::WithText {
+                wanting -= 1;
+                if wanting == 0 {
+                    text.take()
+                } else {
+                    text.clone()
+                }
+            } else {
+                None
+            };
             let mut client = client_arc.lock().await;
-            if let Err(e) = client.did_save(uri.clone()) {
+            if let Err(e) = client.did_save(uri.clone(), text) {
                 log_file::log(&format!("lsp[{name}] did_save failed: {e}"));
             }
         }
@@ -5966,6 +5997,50 @@ fn signature_help_supported(cap: &Option<lsp_types::SignatureHelpOptions>) -> bo
     cap.is_some()
 }
 
+/// Whether a server asked for `textDocument/didSave`, and with the saved
+/// text or without it (#854).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveNotify {
+    /// Not asked for, so not sent: ruff advertises no `save` and warns "no
+    /// handler" on every Ctrl+S that reaches it.
+    Never,
+    /// Sent bare; the server re-reads the file (rust-analyzer's `save: {}`).
+    WithoutText,
+    /// Sent carrying the text, for `save: { includeText: true }`.
+    WithText,
+}
+
+/// Read [`SaveNotify`] off a server's `textDocumentSync` capability (#854).
+///
+/// The options form says it outright: `save` present asks for the
+/// notification, absent asks for none ("if omitted the notification should
+/// not be sent"), and `includeText` asks for the text. The bare
+/// `TextDocumentSyncKind` number predates `save`, and VS Code, Neovim and
+/// Helix all read a kind other than `None` as "saves, without the text"
+/// (LSP issue #288). croft does the same, so a server that picked the old
+/// form keeps hearing about saves as it does in every other editor.
+///
+/// Dynamic registration is not consulted because croft declares none: with
+/// `synchronization.dynamicRegistration` false rust-analyzer advertises
+/// `save: {}` here instead of registering it later, which is what keeps its
+/// check-on-save running.
+fn save_notify_of(sync: &Option<lsp_types::TextDocumentSyncCapability>) -> SaveNotify {
+    use lsp_types::{TextDocumentSyncCapability as Sync, TextDocumentSyncSaveOptions as Save};
+    match sync {
+        Some(Sync::Options(options)) => match &options.save {
+            Some(Save::SaveOptions(save)) if save.include_text == Some(true) => {
+                SaveNotify::WithText
+            }
+            Some(Save::SaveOptions(_)) | Some(Save::Supported(true)) => SaveNotify::WithoutText,
+            Some(Save::Supported(false)) | None => SaveNotify::Never,
+        },
+        Some(Sync::Kind(kind)) if *kind != lsp_types::TextDocumentSyncKind::NONE => {
+            SaveNotify::WithoutText
+        }
+        Some(Sync::Kind(_)) | None => SaveNotify::Never,
+    }
+}
+
 /// Result ids from the last `workspace/diagnostic` pull, per file (#533).
 ///
 /// The incrementality contract: send back what the server last told us, and
@@ -6875,6 +6950,16 @@ fn standard_semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
 fn build_client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
+            // croft sends didSave, and only to a server that advertised
+            // `save` (#854). No dynamic registration: croft answers no
+            // `client/registerCapability`, and rust-analyzer registers didSave
+            // dynamically when told it may, instead of advertising `save`.
+            synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
+                dynamic_registration: Some(false),
+                will_save: Some(false),
+                will_save_wait_until: Some(false),
+                did_save: Some(true),
+            }),
             completion: Some(CompletionClientCapabilities {
                 dynamic_registration: Some(false),
                 context_support: Some(true),
@@ -7622,6 +7707,7 @@ while True:
             diagnostic_identifier: None,
             diagnostic_result_ids: Arc::new(TokioMutex::new(DiagnosticResultIds::default())),
             diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
+            save_notify: SaveNotify::Never,
             supports_document_diagnostics: false,
             document_pull_stalled: Arc::new(AtomicBool::new(false)),
             document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
@@ -9838,6 +9924,10 @@ while True:
     /// Minimal LSP server that answers `initialize` and appends every
     /// incoming method name to the log file given as argv[1]. Lets a test
     /// assert exactly which notifications croft put on the wire.
+    ///
+    /// It advertises the `CAPABILITIES` a test prepends to the script (none
+    /// by default), and a `didSave` line also carries the notification's
+    /// `text` as JSON, so a test can tell a bare save from one with the text.
     const FAKE_LSP_RECORDER: &str = r#"
 import json, sys
 
@@ -9869,11 +9959,15 @@ while True:
     if msg is None:
         break
     method = msg.get("method", "")
-    log.write(method + "\n")
+    if method == "textDocument/didSave":
+        log.write(method + " " + json.dumps(msg["params"].get("text")) + "\n")
+    else:
+        log.write(method + "\n")
     log.flush()
     if "id" in msg:
         if method == "initialize":
-            send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
+            capabilities = globals().get("CAPABILITIES", {})
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": capabilities}})
         else:
             send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
     if method == "exit":
@@ -10179,36 +10273,49 @@ while True:
         handle.block_on(state.shutdown_all());
     }
 
-    /// Issue #37: rust-analyzer re-runs its check-on-save (`cargo check`, the
-    /// source of the Rust PROBLEMS entries) only when the client sends
-    /// `textDocument/didSave`. Saving a file must therefore emit didSave, or
-    /// the PROBLEMS panel goes permanently stale after the first open.
-    #[test]
-    fn save_doc_sends_did_save_notification_to_the_server() {
-        if !is_on_path("python3") {
-            eprintln!("SKIPPED: python3 not on PATH");
-            return;
-        }
+    /// Open, save and close one document against [`FAKE_LSP_RECORDER`]
+    /// advertising `capabilities` (a Python literal), and return the method
+    /// log once the close has arrived (#854).
+    ///
+    /// The close is the barrier that makes an ABSENT didSave observable: the
+    /// notifications travel one ordered stream, so a server that has seen
+    /// didClose has seen every didSave that was sent before it.
+    fn saves_seen_by(capabilities: &str) -> String {
+        saves_seen_by_each(&[capabilities]).remove(0)
+    }
+
+    /// [`saves_seen_by`] for several servers on the one document, each a
+    /// [`FAKE_LSP_RECORDER`] advertising its own `capabilities`, in order;
+    /// one method log per server.
+    fn saves_seen_by_each(capabilities: &[&str]) -> Vec<String> {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonicalize");
         let file = root.join("demo.py");
         std::fs::write(&file, "x = 1\n").expect("write demo");
-        let script = root.join("fake_lsp.py");
-        std::fs::write(&script, FAKE_LSP_RECORDER).expect("write fake server");
-        let log = root.join("methods.log");
-
         let mut registry = ServerRegistry::new();
-        registry.register(
-            Language::PYTHON,
-            ServerConfig {
-                name: "fake-recorder",
-                command: "python3".into(),
-                args: vec![script.display().to_string(), log.display().to_string()],
-                language: Language::PYTHON,
-                initialization_options: None,
-                provision: None,
-            },
-        );
+        let mut logs = Vec::new();
+        for (i, caps) in capabilities.iter().enumerate() {
+            let script = root.join(format!("fake_lsp_{i}.py"));
+            std::fs::write(
+                &script,
+                format!("CAPABILITIES = {caps}\n{FAKE_LSP_RECORDER}"),
+            )
+            .expect("write fake server");
+            let log = root.join(format!("methods_{i}.log"));
+            registry.register(
+                Language::PYTHON,
+                ServerConfig {
+                    // Named apart, so no server stands in for another.
+                    name: Box::leak(format!("fake-recorder-{i}").into_boxed_str()),
+                    command: "python3".into(),
+                    args: vec![script.display().to_string(), log.display().to_string()],
+                    language: Language::PYTHON,
+                    initialization_options: None,
+                    provision: None,
+                },
+            );
+            logs.push(log);
+        }
         let (diag_tx, _diag_rx) = std_mpsc::channel();
         let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut state = WorkerState {
@@ -10229,26 +10336,251 @@ while True:
         let runtime = LspRuntime::new().expect("runtime");
         runtime.handle().clone().block_on(async {
             state.open_doc(file.clone(), String::from("x = 1\n")).await;
-            state.save_doc(file.clone()).await;
+            state.save_doc(file.clone(), String::from("x = 2\n")).await;
+            state.close_doc(file.clone()).await;
         });
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let methods = loop {
-            let text = std::fs::read_to_string(&log).unwrap_or_default();
-            if text.contains("textDocument/didSave") || Instant::now() >= deadline {
-                break text;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        assert!(
-            methods.contains("textDocument/didOpen"),
-            "sanity: the fake server must have received didOpen; got: {methods:?}"
-        );
-        assert!(
-            methods.contains("textDocument/didSave"),
-            "saving a document must send textDocument/didSave; server received: {methods:?}"
+        // Up to three python3 servers start, initialize and see the document
+        // open, save and close: a base as wide as the other spawn waits,
+        // which costs nothing once every log shows didClose.
+        crate::test_budget::await_spawned(
+            Duration::from_secs(5),
+            "every fake server to receive didClose",
+            || {
+                logs.iter().all(|log| {
+                    std::fs::read_to_string(log)
+                        .unwrap_or_default()
+                        .contains("textDocument/didClose")
+                })
+            },
         );
         runtime.handle().clone().block_on(state.shutdown_all());
+        logs.iter()
+            .map(|log| {
+                let methods = std::fs::read_to_string(log).unwrap_or_default();
+                assert!(
+                    methods.contains("textDocument/didOpen"),
+                    "sanity: the fake server must have received didOpen; got: {methods:?}"
+                );
+                methods
+            })
+            .collect()
+    }
+
+    /// Issue #37: rust-analyzer re-runs its check-on-save (`cargo check`, the
+    /// source of the Rust PROBLEMS entries) only when the client sends
+    /// `textDocument/didSave`. Saving a file must therefore emit didSave, or
+    /// the PROBLEMS panel goes permanently stale after the first open.
+    ///
+    /// The server advertises what rust-analyzer does when the client declares
+    /// no dynamic registration (#854): `save: {}`, which asks for the
+    /// notification without the text.
+    #[test]
+    fn save_doc_sends_did_save_notification_to_the_server() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods =
+            saves_seen_by(r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {}}}"#);
+        assert!(
+            methods.lines().any(|l| l == "textDocument/didSave null"),
+            "saving a document must send textDocument/didSave, without the text \
+             the server did not ask for; server received: {methods:?}"
+        );
+    }
+
+    /// #854: a server whose `textDocumentSync` omits `save` asked not to be
+    /// told about saves ("if omitted the notification should not be sent").
+    /// This is ruff 0.15's exact capability, and it logs "Received
+    /// notification textDocument/didSave which does not have a handler" on
+    /// every Ctrl+S it is sent anyway.
+    #[test]
+    fn save_doc_skips_a_server_that_did_not_ask_for_saves() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(
+            r#"{"textDocumentSync": {"change": 2, "openClose": True, "willSave": False, "willSaveWaitUntil": False}}"#,
+        );
+        assert!(
+            !methods.contains("textDocument/didSave"),
+            "a server that advertised no `save` must not be sent didSave; \
+             server received: {methods:?}"
+        );
+    }
+
+    /// #854: `save: { includeText: true }` asks for the saved text in the
+    /// notification, and croft used to send `text: None` to everyone.
+    #[test]
+    fn save_doc_sends_the_text_to_a_server_that_asked_for_it() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+        );
+        assert!(
+            methods
+                .lines()
+                .any(|l| l == r#"textDocument/didSave "x = 2\n""#),
+            "includeText must put the saved buffer in didSave; server received: {methods:?}"
+        );
+    }
+
+    /// #854 guard: servers sharing a document are each answered by their
+    /// own capability, from the one save: the one that asked for the text
+    /// gets it, the one that asked for a bare save gets no text, and the one
+    /// that asked for nothing gets nothing.
+    #[test]
+    fn save_doc_answers_each_server_on_a_document_by_its_own_capability() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let logs = saves_seen_by_each(&[
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 2}}"#,
+        ]);
+        let saves = |log: &str| -> Vec<String> {
+            log.lines()
+                .filter(|l| l.starts_with("textDocument/didSave"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(saves(&logs[0]), vec![r#"textDocument/didSave "x = 2\n""#]);
+        assert_eq!(saves(&logs[1]), vec!["textDocument/didSave null"]);
+        assert!(saves(&logs[2]).is_empty(), "{:?}", logs[2]);
+    }
+
+    /// #854 review guard: the saved text reaches every server that asks for
+    /// it, not just the last one, which is handed the buffer itself while
+    /// the ones before it get a copy.
+    #[test]
+    fn every_server_that_asks_for_the_text_gets_it() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let logs = saves_seen_by_each(&[
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+        ]);
+        let saves = |log: &str| -> Vec<String> {
+            log.lines()
+                .filter(|l| l.starts_with("textDocument/didSave"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(saves(&logs[0]), vec![r#"textDocument/didSave "x = 2\n""#]);
+        assert_eq!(saves(&logs[1]), vec!["textDocument/didSave null"]);
+        assert_eq!(saves(&logs[2]), vec![r#"textDocument/didSave "x = 2\n""#]);
+    }
+
+    /// #854 guard: the fix does not reach a server that picked the older
+    /// `textDocumentSync: <kind>` number. That form predates `save`, and such
+    /// a server is still told about saves, without the text, as VS Code,
+    /// Neovim and Helix tell it.
+    #[test]
+    fn save_doc_still_sends_a_bare_save_to_a_server_with_the_old_sync_kind() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(r#"{"textDocumentSync": 2}"#);
+        assert!(
+            methods.lines().any(|l| l == "textDocument/didSave null"),
+            "server received: {methods:?}"
+        );
+    }
+
+    /// #854 guard: `includeText: false` asks for a bare save, never the text.
+    #[test]
+    fn save_doc_sends_no_text_when_include_text_is_false() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(
+            r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {"includeText": False}}}"#,
+        );
+        assert!(
+            methods.lines().any(|l| l == "textDocument/didSave null"),
+            "server received: {methods:?}"
+        );
+    }
+
+    /// #854: every shape `textDocumentSync` can take, read the way the spec
+    /// (and, for the pre-`save` kind number, VS Code) reads it.
+    #[test]
+    fn save_notify_reads_every_text_document_sync_shape() {
+        use lsp_types::{
+            SaveOptions, TextDocumentSyncCapability as Sync, TextDocumentSyncKind,
+            TextDocumentSyncOptions, TextDocumentSyncSaveOptions as Save,
+        };
+        let options = |save: Option<Save>| {
+            Some(Sync::Options(TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                save,
+                ..Default::default()
+            }))
+        };
+        let with = |include_text| Some(Save::SaveOptions(SaveOptions { include_text }));
+        assert_eq!(save_notify_of(&None), SaveNotify::Never);
+        assert_eq!(save_notify_of(&options(None)), SaveNotify::Never);
+        assert_eq!(
+            save_notify_of(&options(Some(Save::Supported(false)))),
+            SaveNotify::Never
+        );
+        assert_eq!(
+            save_notify_of(&options(Some(Save::Supported(true)))),
+            SaveNotify::WithoutText
+        );
+        assert_eq!(
+            save_notify_of(&options(with(None))),
+            SaveNotify::WithoutText
+        );
+        assert_eq!(
+            save_notify_of(&options(with(Some(false)))),
+            SaveNotify::WithoutText
+        );
+        assert_eq!(
+            save_notify_of(&options(with(Some(true)))),
+            SaveNotify::WithText
+        );
+        assert_eq!(
+            save_notify_of(&Some(Sync::Kind(TextDocumentSyncKind::FULL))),
+            SaveNotify::WithoutText
+        );
+        assert_eq!(
+            save_notify_of(&Some(Sync::Kind(TextDocumentSyncKind::NONE))),
+            SaveNotify::Never
+        );
+    }
+
+    /// #854: rust-analyzer advertises `save` only while the client declares
+    /// no dynamic registration for document sync; told it may register, it
+    /// drops `save` and sends `client/registerCapability`, which croft
+    /// declines, and check-on-save would stop. Pin the declaration.
+    #[test]
+    fn client_capabilities_declare_did_save_without_dynamic_registration() {
+        let caps = build_client_capabilities();
+        let sync = caps
+            .text_document
+            .and_then(|td| td.synchronization)
+            .expect("textDocument.synchronization must be declared");
+        assert_eq!(sync.did_save, Some(true));
+        assert_eq!(
+            sync.dynamic_registration,
+            Some(false),
+            "dynamic registration would move rust-analyzer's didSave to a \
+             registerCapability croft does not handle"
+        );
     }
 
     /// A fake server that advertises `inlayHintProvider` and answers

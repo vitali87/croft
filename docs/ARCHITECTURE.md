@@ -751,7 +751,7 @@ LSP lifecycle: pre-warm, spawn, `did_open`, `did_change`, `did_save`, completion
 
 **Workspace pre-warm at startup** (`prewarm_workspace`) follows VS Code's `workspaceContains` activation: every language whose root marker sits in the workspace root gets its servers spawned before any file opens, so rust-analyzer's cold indexing overlaps with tree browsing instead of starting at the first `.rs` open. The scan is non-recursive stat calls, and the command is inert under `cfg(test)` so test-built Apps never spawn real servers.
 
-**`did_save`.** `Cmd+S` makes rust-analyzer re-run check-on-save, so PROBLEMS refreshes.
+**`did_save`.** `Cmd+S` makes rust-analyzer re-run check-on-save, so PROBLEMS refreshes. The notification goes only to a server whose `textDocumentSync` asked for it: `save` present (rust-analyzer's `save: {}`), or the bare pre-`save` sync-kind number, which VS Code also reads as a request. A server that omits `save` (ruff) is not sent one, and `includeText: true` gets the saved buffer in the notification. croft declares document sync without dynamic registration, which is what makes rust-analyzer advertise `save` up front rather than register it later.
 
 **Pull diagnostics (LSP 3.17 `workspace/diagnostic`).** Servers that advertise `diagnosticProvider.workspaceDiagnostics` (taplo does; vtsls does not, which is why the `tsc --noEmit` fallback exists) are asked for the whole project's problems over the existing connection, once as they spawn and again whenever one sends `workspace/diagnostic/refresh`. Three things make it work rather than merely happen:
 
