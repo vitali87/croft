@@ -20819,20 +20819,123 @@ fn focus_flag_only_set_on_active_terminal() {
 }
 
 #[test]
-fn f9_relaunches_only_when_update_is_ready() {
+fn the_update_chord_relaunches_only_when_an_update_is_ready() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let chord = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
 
-    // Not ready: F9 must not arm the re-exec.
-    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::empty()));
+    // Not ready: the chord must not arm the re-exec, and says why.
+    let _ = app.handle_key(key(KeyCode::F(9), chord));
     assert!(!app.pending_reexec);
     assert!(!app.quit);
+    assert_eq!(app.status, "No croft update is waiting");
 
-    // Ready: F9 arms the re-exec and quits the loop so `run` can exec.
+    // Ready: the chord arms the re-exec and quits the loop so `run` can
+    // exec. Cmd+Shift+F9 is the same chord.
     app.update_status = UpdateStatus::Ready;
-    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::empty()));
+    let _ = app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ));
     assert!(app.pending_reexec);
     assert!(app.quit);
+}
+
+// #865: with croft older than its checkout, the status bar offered a
+// rebuild on F9, and F9 then started `cargo install` instead of toggling a
+// breakpoint - and was swallowed while the build ran, and re-exec'd croft
+// once it landed. Bare F9 is Toggle Breakpoint in every one of those states.
+#[test]
+fn f9_toggles_a_breakpoint_whatever_the_updater_is_doing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("app.py");
+    std::fs::write(&file, "x = 1\ny = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    let marked = |app: &App| {
+        app.editor
+            .breakpoints
+            .get(&file)
+            .is_some_and(|lines| lines.contains(&1))
+    };
+
+    // A rebuild on offer.
+    app.local_drift = Some(String::from("def456"));
+    assert!(app.update_armed());
+    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::NONE));
+    assert!(marked(&app), "F9 set a breakpoint: {}", app.status);
+    assert!(app.self_install.is_none(), "and started no rebuild");
+
+    // A rebuild running: F9 is not swallowed.
+    app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[]));
+    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::NONE));
+    assert!(!marked(&app), "F9 removed it again: {}", app.status);
+
+    // The rebuild landed: F9 still does not relaunch.
+    app.self_install = None;
+    app.update_status = UpdateStatus::Ready;
+    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::NONE));
+    assert!(marked(&app), "{}", app.status);
+    assert!(
+        !app.pending_reexec && !app.quit,
+        "F9 never relaunches croft"
+    );
+}
+
+// #865: the updater's own chord takes the drift hint's offer, and a second
+// press while that rebuild runs does not start another.
+#[test]
+fn the_update_chord_starts_the_offered_rebuild_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.local_drift = Some(String::from("def456"));
+    let chord = key(KeyCode::F(9), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    let _ = app.handle_key(chord);
+    assert!(app.self_install.is_some(), "the chord starts the rebuild");
+    assert!(
+        app.editor.breakpoints.is_empty(),
+        "and toggles no breakpoint"
+    );
+    assert!(!app.update_armed(), "a started rebuild latches the updater");
+    let _ = app.handle_key(chord);
+    assert_eq!(app.status, "croft is already updating in the background");
+}
+
+// #865 guard: only Ctrl/Cmd+Shift+F9 reaches the updater. With a rebuild on
+// offer, Shift+F9 still opens the conditional-breakpoint editor and
+// Ctrl+Shift+Alt+F9 falls to the Shift+Alt logpoint arm; neither starts the
+// rebuild or relaunches.
+#[test]
+fn only_ctrl_or_cmd_shift_f9_reaches_the_updater() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.local_drift = Some(String::from("def456"));
+    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::SHIFT));
+    assert_eq!(app.status, "Open a file to set a conditional breakpoint");
+    let _ = app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.status, "Open a file to set a logpoint");
+    assert!(app.self_install.is_none(), "no rebuild started");
+    assert!(!app.pending_reexec && !app.quit, "and no relaunch");
+}
+
+// #865 guard: a bare F9 in a focused terminal with no debug session belongs
+// to the shell (htop's F9 kill) even with an update ready, where it used to
+// relaunch croft; it toggles no breakpoint either.
+#[test]
+fn bare_f9_in_a_focused_terminal_is_the_shells_even_with_an_update_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.update_status = UpdateStatus::Ready;
+    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::NONE));
+    assert!(!app.pending_reexec && !app.quit, "croft did not relaunch");
+    assert!(
+        app.editor.breakpoints.is_empty(),
+        "nor toggled a breakpoint"
+    );
 }
 
 #[test]
@@ -20865,16 +20968,42 @@ fn bare_f10_reaches_the_shell_when_terminal_is_focused_with_no_debug_session() {
 }
 
 #[test]
-fn bare_f9_reexecs_a_ready_update_even_when_the_terminal_is_focused() {
+fn the_update_chord_reexecs_a_ready_update_even_when_the_terminal_is_focused() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Terminal);
     app.update_status = UpdateStatus::Ready;
-    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::empty()));
+    let _ = app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
     assert!(
         app.pending_reexec && app.quit,
-        "a landed update must still win F9 over PTY forwarding"
+        "a landed update's chord must win over PTY forwarding"
     );
+}
+
+// #865: the update pills in the status bar are a click target too, and say
+// which chord the updater is on.
+#[test]
+fn clicking_the_status_bar_update_pill_starts_the_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.local_drift = Some(String::from("def456"));
+    let backend = ratatui::backend::TestBackend::new(200, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let pill = app.status_update_rect;
+    assert!(pill.width > 0, "the drift pill is a click target");
+    let bar: String = (0..200)
+        .map(|x| term.backend().buffer()[(x, pill.y)].symbol().to_string())
+        .collect();
+    assert!(
+        bar.contains(&format!("{} to rebuild", super::UPDATE_CROFT_CHORD)),
+        "{bar}"
+    );
+    left_click(&mut app, pill.x + 1, pill.y);
+    assert!(app.self_install.is_some(), "a click starts the rebuild");
 }
 
 #[test]
@@ -24517,7 +24646,7 @@ fn update_events_are_charged_to_their_own_producer_body() {
     assert_eq!(
         app.update_status,
         UpdateStatus::Ready,
-        "F9 is armed for the rebuild"
+        "the updater is armed for the rebuild"
     );
     assert_eq!(
         app.staged_update_binary(),
@@ -24529,17 +24658,17 @@ fn update_events_are_charged_to_their_own_producer_body() {
         "the popup does not claim the release is ready"
     );
 
-    // And F9 stays out of the rebuild path while the staged build holds
-    // cargo's lock (#245's latch, extended).
+    // And the updater stays out of the rebuild path while the staged build
+    // holds cargo's lock (#245's latch, extended).
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.local_drift = Some(String::from("abc123"));
-    assert!(app.f9_update_armed(), "a drift hint arms F9");
+    assert!(app.update_armed(), "a drift hint arms the updater");
     app.staged_install = Some(crate::update_check::StagedInstall::preloaded(
         &[],
         staged,
         "9.9.9",
     ));
-    assert!(!app.f9_update_armed(), "not while a staged build runs");
+    assert!(!app.update_armed(), "not while a staged build runs");
 
     // A staged build that LANDED keeps its Relaunch through an unrelated
     // rebuild, whatever that rebuild does: the staged channel delivers one
@@ -24570,7 +24699,10 @@ fn update_events_are_charged_to_their_own_producer_body() {
         app.staged_update_binary().as_deref(),
         Some(landed.as_path())
     );
-    assert!(app.f9_update_armed(), "F9 still relaunches mid-rebuild");
+    assert!(
+        app.update_armed(),
+        "the updater still relaunches mid-rebuild"
+    );
     app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[
         crate::update_watch::UpdateEvent::Failed,
     ]));
@@ -24579,7 +24711,7 @@ fn update_events_are_charged_to_their_own_producer_body() {
         app.staged_update_binary().as_deref(),
         Some(landed.as_path())
     );
-    assert!(app.f9_update_armed(), "and after the rebuild fails");
+    assert!(app.update_armed(), "and after the rebuild fails");
     assert!(app.status.contains("rebuild failed"), "{}", app.status);
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -24616,9 +24748,9 @@ fn update_events_are_charged_to_their_own_producer_body() {
     assert_eq!(
         app.update_status,
         UpdateStatus::Ready,
-        "the rebuild's F9 is alive"
+        "the rebuild's relaunch is alive"
     );
-    assert!(app.f9_update_armed());
+    assert!(app.update_armed());
     assert_eq!(app.staged_update_binary(), None);
 
     // Relaunch on the popup fires only for the STAGED readiness: with a
@@ -24668,7 +24800,7 @@ fn the_update_toast_stacks_above_the_port_toast() {
 }
 
 /// #333: a staged build that lands turns the popup into a Relaunch offer,
-/// and Relaunch is the same re-exec F9 arms - never automatic.
+/// and Relaunch is the same re-exec the updater chord arms - never automatic.
 #[test]
 fn a_staged_update_offers_relaunch_and_only_relaunch_re_execs() {
     let tmp = tempfile::tempdir().unwrap();
@@ -25795,9 +25927,10 @@ fn dark_blue_theme_terminal_button_keeps_navy_chip() {
     assert_eq!(buf[(add.x + 1, add.y)].bg, navy);
 }
 
-/// A long fixed note for the welcome-card tests: the live notes are rewritten
-/// every version bump (`src/release_notes/<version>.md`), so pinning against
-/// them would let a future one-line note quietly gut these tests. The distinctive final word is the
+/// A long fixed note for the welcome-card tests: the live notes change with
+/// every release (`src/release_notes/<version>.md`, or the pending fragments in
+/// `src/release_notes/unreleased/`), so pinning against them would let a future
+/// one-line note quietly gut these tests. The distinctive final word is the
 /// clip detector.
 fn long_test_note() -> Vec<crate::release_notes::ReleaseNote> {
     vec![crate::release_notes::ReleaseNote {
@@ -36845,37 +36978,30 @@ fn install_fallback_without_a_dialog_does_not_panic() {
 
 // 2026-08-22 (#242): a Mac croft shipped a remote main @ 84a31a0 while itself
 // running an hour-old binary — locally, nothing ever compares the installed
-// croft against the repo it came from. The drift hint claims bare F9 only
-// while it is armed and no update is otherwise in flight, so the key keeps
-// its debugger meaning everywhere else.
+// croft against the repo it came from. The drift hint arms the updater
+// (Ctrl+Shift+F9 since #865) only while no update is otherwise in flight.
 #[test]
-fn drift_hint_arms_f9_only_while_idle() {
+fn drift_hint_arms_the_updater_only_while_idle() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert!(
-        !app.f9_update_armed(),
-        "no drift, no landed update: F9 stays a breakpoint key"
+        !app.update_armed(),
+        "no drift, no landed update: nothing to do"
     );
     app.local_drift = Some(String::from("def456"));
-    assert!(app.f9_update_armed(), "an armed drift hint claims F9");
+    assert!(app.update_armed(), "an armed drift hint offers a rebuild");
     app.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[]));
     assert!(
-        !app.f9_update_armed(),
-        "a spawned install must latch F9 even before its InProgress event \
-         is drained - two F9s in one input batch must not double-spawn"
+        !app.update_armed(),
+        "a spawned install must latch the updater even before its InProgress \
+         event is drained - two presses in one input batch must not double-spawn"
     );
     app.self_install = None;
     app.update_status = UpdateStatus::InProgress;
-    assert!(
-        !app.f9_update_armed(),
-        "a running rebuild must not re-trigger on F9"
-    );
+    assert!(!app.update_armed(), "a running rebuild must not re-trigger");
     app.local_drift = None;
     app.update_status = UpdateStatus::Ready;
-    assert!(
-        app.f9_update_armed(),
-        "a landed update claims F9 for the re-exec"
-    );
+    assert!(app.update_armed(), "a landed update offers the re-exec");
 }
 
 // The probe end-to-end against a real repo: a baked hash that differs from
@@ -36925,7 +37051,7 @@ fn drift_probe_verdict_arms_the_rebuild_hint() {
     assert!(app.drift_probe.is_none(), "the probe answers exactly once");
     assert_eq!(app.local_drift.as_deref(), Some(head.as_str()));
     assert!(
-        app.status.contains("F9"),
+        app.status.contains(super::UPDATE_CROFT_CHORD),
         "the status must say how to act on the drift: {:?}",
         app.status
     );
@@ -36933,8 +37059,8 @@ fn drift_probe_verdict_arms_the_rebuild_hint() {
 
 // CodeRabbit on #243: a failed rebuild used to strand the user — the drift
 // marker was cleared when the install started and nothing restored it, so
-// after a failure F9 silently reverted to its breakpoint meaning and only a
-// full relaunch re-probed. A failure must leave the hint armed for a retry.
+// after a failure the offer silently went away and only a full relaunch
+// re-probed. A failure must leave the hint armed for a retry.
 #[test]
 fn a_failed_reinstall_rearms_the_drift_hint_for_retry() {
     let tmp = tempfile::tempdir().unwrap();
@@ -36953,8 +37079,8 @@ fn a_failed_reinstall_rearms_the_drift_hint_for_retry() {
         app.status
     );
     assert!(
-        app.f9_update_armed(),
-        "the drift hint must survive a failed rebuild so F9 retries"
+        app.update_armed(),
+        "the drift hint must survive a failed rebuild so the updater retries"
     );
 }
 

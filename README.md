@@ -56,7 +56,7 @@ With [Homebrew](https://brew.sh) on macOS or Linux, no toolchain and no compile:
 brew install vitali87/croft/croft
 ```
 
-Upgrade with `brew upgrade croft`; croft's own updater (F9) leaves a Homebrew
+Upgrade with `brew upgrade croft`; croft's own updater (`Ctrl+Shift+F9`) leaves a Homebrew
 install to brew. Each release updates the formula, and it installs the same
 prebuilt archives as below.
 

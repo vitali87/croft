@@ -4241,6 +4241,9 @@ pub struct App {
     status_diag_rect: Rect,
     /// The running CodeQL query's status-bar chip; a click cancels it (#578).
     status_codeql_rect: Rect,
+    /// The croft update pills ("Update ready", the drift rebuild hint); a
+    /// click does what the updater chord does (#865).
+    status_update_rect: Rect,
     status_indent_rect: Rect,
     status_encoding_rect: Rect,
     status_eol_rect: Rect,
@@ -4267,13 +4270,13 @@ pub struct App {
     /// launcher instead. Dropped once its verdict is drained.
     drift_probe: Option<crate::update_watch::DriftProbe>,
     /// The repo's current hash label when the probe found drift ("def456",
-    /// "def456-dirty"). Arms the "F9 to rebuild" status-bar hint. Kept
-    /// through a running rebuild — the Idle guards hide the hint while it
-    /// runs, and a failure then re-arms F9 for a retry instead of
-    /// silently reverting the key to its breakpoint meaning.
+    /// "def456-dirty"). Arms the "Ctrl+Shift+F9 to rebuild" status-bar
+    /// hint. Kept through a running rebuild — the Idle guards hide the hint
+    /// while it runs, and a failure then re-arms the updater for a retry
+    /// instead of silently dropping the offer.
     local_drift: Option<String>,
     /// Background `cargo install --path <repo>` reinstalling the local
-    /// croft after the user pressed F9 on a drift hint. Reported through
+    /// croft after the user took the drift hint's offer. Reported through
     /// the same UpdateEvent lifecycle as the remote watcher.
     self_install: Option<crate::update_watch::SelfInstall>,
     /// One-shot startup check (#333): is a newer release published than
@@ -5840,6 +5843,7 @@ impl App {
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
             status_codeql_rect: Rect::default(),
+            status_update_rect: Rect::default(),
             status_indent_rect: Rect::default(),
             status_encoding_rect: Rect::default(),
             status_eol_rect: Rect::default(),
@@ -14607,10 +14611,12 @@ impl App {
 
             let row_style = Style::default().fg(self.theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9)));
 
-            // Header row: "> IN THIS RELEASE (vX.Y.Z)". The leading chevron
-            // echoes the cr<>ft wordmark's bracket. The highlights below are
-            // hand-curated data baked into this build (see
-            // `crate::release_notes`), so the heading names the exact version.
+            // Header row: "> IN THIS RELEASE (vX.Y.Z)", or "> IN THIS BUILD
+            // (vX.Y.Z+)" for a build carrying changes past that release. The
+            // leading chevron echoes the cr<>ft wordmark's bracket. The
+            // highlights below are hand-curated data baked into this build
+            // (see `crate::release_notes`), so the heading names the exact
+            // version.
             let header_y = inner_y;
             frame.buffer_mut().set_string(
                 inner_x,
@@ -14623,7 +14629,10 @@ impl App {
             frame.buffer_mut().set_string(
                 inner_x + 2,
                 header_y,
-                format!("IN THIS RELEASE (v{})", env!("CARGO_PKG_VERSION")),
+                crate::release_notes::heading(
+                    crate::release_notes::unreleased(),
+                    env!("CARGO_PKG_VERSION"),
+                ),
                 Style::default()
                     .fg(self.theme.ui(Color::White))
                     .add_modifier(Modifier::BOLD),
@@ -18921,9 +18930,12 @@ impl App {
         if let Some(span) = self.perf.status_span() {
             spans.push(span);
         }
+        // Both update pills are one click target, doing what the updater
+        // chord does (#865); recorded as (start column, width).
+        let update_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
         if self.any_update_ready() {
             spans.push(Span::styled(
-                " ⟳ Update ready - F9 to relaunch ",
+                format!(" ⟳ Update ready - {UPDATE_CROFT_CHORD} to relaunch "),
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0x1f, 0x7a, 0x33)))
                     .fg(Color::White)
@@ -18933,8 +18945,8 @@ impl App {
         if let Some(current) = self.local_drift.as_ref()
             && self.update_status == UpdateStatus::Idle
             && self.self_install.is_none()
-            // The same latch as `f9_update_armed`: while the staged release
-            // builds, F9 is not a rebuild, so the hint must not say so.
+            // The same latch as `update_armed`: while the staged release
+            // builds, the chord is not a rebuild, so the hint must not say so.
             && self.staged_status != UpdateStatus::InProgress
             && self.staged_install.is_none()
         {
@@ -18942,7 +18954,7 @@ impl App {
             // (#242). One keypress rebuilds it in the background.
             spans.push(Span::styled(
                 format!(
-                    " ⟳ croft {} < repo {current} - F9 to rebuild ",
+                    " ⟳ croft {} < repo {current} - {UPDATE_CROFT_CHORD} to rebuild ",
                     env!("CROFT_GIT_HASH")
                 ),
                 Style::default()
@@ -18951,6 +18963,9 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        let update_chip_end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let update_chip = (update_chip_end > update_chip_x)
+            .then(|| (update_chip_x, update_chip_end - update_chip_x));
         if self.any_update_in_progress() {
             // Red + a spinning circular-arrow glyph to draw the eye to the
             // in-progress background update.
@@ -19224,6 +19239,15 @@ impl App {
             },
             _ => Rect::default(),
         };
+        self.status_update_rect = match update_chip {
+            Some((x, w)) if status_h > 0 && x < status_rect.width => Rect {
+                x: status_rect.x + x,
+                y: status_rect.y,
+                width: w.min(status_rect.width - x),
+                height: 1,
+            },
+            _ => Rect::default(),
+        };
         // Diagnostics hit rect (left group), for click-to-PROBLEMS.
         self.status_diag_rect = if status_h > 0 {
             Rect {
@@ -19371,6 +19395,11 @@ impl App {
                 self.status_codeql_rect = Rect::default();
             } else if self.status_codeql_rect.right() > rx {
                 self.status_codeql_rect.width = rx - self.status_codeql_rect.x;
+            }
+            if self.status_update_rect.x >= rx {
+                self.status_update_rect = Rect::default();
+            } else if self.status_update_rect.right() > rx {
+                self.status_update_rect.width = rx - self.status_update_rect.x;
             }
             if self.status_diag_rect.x >= rx {
                 // Entirely behind the cluster: not on screen, so not a target.
@@ -21729,8 +21758,9 @@ impl App {
         // A bare F5/F9/F10/F11 pressed while the terminal pane is focused and
         // no debug session is live belongs to the app running in the shell
         // (process-compose's F10 Quit, htop's F9 kill), so it falls through to
-        // the PTY instead of dying as a debugger no-op. Modified chords and a
-        // ready update's F9 re-exec keep their croft meaning everywhere.
+        // the PTY instead of dying as a debugger no-op. Modified chords, the
+        // updater's Ctrl+Shift+F9 among them, keep their croft meaning
+        // everywhere.
         let terminal_owns_fkeys = self.focus == Pane::Terminal
             && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal)
             && self.debug_sessions.is_empty()
@@ -21767,7 +21797,12 @@ impl App {
             self.switch_debug_session();
             return Ok(());
         }
-        if matches!(key.code, KeyCode::F(9)) && !(terminal_owns_fkeys && !self.f9_update_armed()) {
+        // Checked before the F9 family below, whose Shift arm would take it.
+        if is_update_croft_key(key) {
+            self.update_croft();
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::F(9)) && !terminal_owns_fkeys {
             if key.modifiers.contains(KeyModifiers::SHIFT)
                 && key.modifiers.contains(KeyModifiers::ALT)
             {
@@ -21780,21 +21815,10 @@ impl App {
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+F9: toggle break-on-raised-exceptions.
                 self.debug_toggle_raised_exceptions();
-            } else if self.any_update_ready() {
-                // A background update has landed (a staged release, the
-                // drift rebuild, or a remote install): bare F9 re-execs
-                // into it. `run()` swaps the staged binary in first when
-                // that is the one that landed.
-                self.arm_reexec();
-            } else if self.f9_update_armed() && self.update_status == UpdateStatus::Idle {
-                // The drift hint is armed (#242): bare F9 rebuilds and
-                // reinstalls the local croft in the background.
-                self.start_local_reinstall();
-            } else if self.self_install.is_some() {
-                // A rebuild is already in flight (second F9 of an input
-                // batch, or pressed again mid-install): swallow it -
-                // toggling a breakpoint here is never what was meant.
             } else {
+                // Bare F9 is Toggle Breakpoint whatever the updater is
+                // doing (#865): it used to start a rebuild of croft when
+                // one was on offer, and was swallowed while it ran.
                 self.debug_toggle_breakpoint();
             }
             return Ok(());
@@ -33161,8 +33185,9 @@ impl App {
         // A client older than this session is told here, in croft's own
         // status line, never over its screen (#626, #652). The reference is
         // the newer of this croft and its host: a host swap moves the host
-        // past this croft until an F9 reload, and a client still on the old
-        // binary is then out of date even though it matches us. Raised only
+        // past this croft until the updater relaunches it, and a client
+        // still on the old binary is then out of date even though it
+        // matches us. Raised only
         // when the notice changes (a client resizing churns the roster), and
         // decided before the unchanged-roster return, since a swap can leave
         // the roster identical while the host's version moved.
@@ -39234,7 +39259,7 @@ impl App {
     }
 
     /// Whether any producer has an update ready to re-exec into: the
-    /// status-bar pill and bare F9 mean "any".
+    /// status-bar pill and the updater chord mean "any".
     fn any_update_ready(&self) -> bool {
         self.update_status == UpdateStatus::Ready || self.staged_status == UpdateStatus::Ready
     }
@@ -39259,7 +39284,7 @@ impl App {
             return false;
         };
         self.status = format!(
-            "This croft was built at {}, but its repo is now at {current} - press F9 to rebuild & reinstall in the background",
+            "This croft was built at {}, but its repo is now at {current} - press {UPDATE_CROFT_CHORD} to rebuild & reinstall in the background",
             env!("CROFT_GIT_HASH"),
         );
         self.local_drift = Some(current);
@@ -39268,30 +39293,59 @@ impl App {
 
     /// Kick off the background reinstall the drift hint offered. The
     /// existing update state machine takes it from here: spinner while
-    /// `cargo install` runs, then the same "F9 to relaunch" flow a remote
-    /// background update uses.
+    /// `cargo install` runs, then the same "Ctrl+Shift+F9 to relaunch" flow
+    /// a remote background update uses.
     fn start_local_reinstall(&mut self) {
-        self.self_install = Some(crate::update_watch::SelfInstall::start(
-            String::from(env!("CARGO_MANIFEST_DIR")),
-            self_install_log_path(),
-        ));
+        // Tests take the offer too, and must never `cargo install` croft
+        // over the one on PATH: they get an install that has only started.
+        #[cfg(test)]
+        {
+            self.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[]));
+        }
+        #[cfg(not(test))]
+        {
+            self.self_install = Some(crate::update_watch::SelfInstall::start(
+                String::from(env!("CARGO_MANIFEST_DIR")),
+                self_install_log_path(),
+            ));
+        }
     }
 
-    /// True when bare F9 is claimed by the update flow: either a landed
-    /// update waiting to re-exec, or an armed drift hint waiting to rebuild.
-    fn f9_update_armed(&self) -> bool {
+    /// True when the updater has something to do: either a landed update
+    /// waiting to re-exec, or an armed drift hint waiting to rebuild.
+    fn update_armed(&self) -> bool {
         self.any_update_ready()
             || (self.local_drift.is_some()
                 && self.update_status == UpdateStatus::Idle
                 && self.staged_status != UpdateStatus::InProgress
                 // `update_status` only leaves Idle when the InProgress event
                 // is drained - once per outer loop, BEFORE the input drain -
-                // so without this latch two F9s in one crossterm batch spawn
-                // two concurrent `cargo install`s racing cargo's locks
+                // so without this latch two presses in one crossterm batch
+                // spawn two concurrent `cargo install`s racing cargo's locks
                 // (#245). The staged release build holds the same cargo
-                // lock, so it latches F9 the same way.
+                // lock, so it latches the updater the same way.
                 && self.self_install.is_none()
                 && self.staged_install.is_none())
+    }
+
+    /// croft's own updater (#865), on `Ctrl+Shift+F9` and a click on an
+    /// update pill: re-exec into a landed update (`run()` swaps a staged
+    /// binary in first), else start the rebuild an armed drift hint offers,
+    /// else say why there is nothing to do. It had bare F9, which toggled
+    /// no breakpoint while an update was on offer or building.
+    fn update_croft(&mut self) {
+        if self.any_update_ready() {
+            self.arm_reexec();
+        } else if self.update_armed() {
+            self.start_local_reinstall();
+        } else if self.self_install.is_some()
+            || self.staged_install.is_some()
+            || self.any_update_in_progress()
+        {
+            self.status = String::from("croft is already updating in the background");
+        } else {
+            self.status = String::from("No croft update is waiting");
+        }
     }
 
     pub fn poll_update_watch(&mut self) -> bool {
@@ -39399,12 +39453,12 @@ impl App {
                         self.update_spinner_start = None;
                     }
                     // Do NOT yank the user mid-work: surface a persistent
-                    // "Update ready - F9 to relaunch" prompt in the status
-                    // bar and let them pick the moment. The re-exec only
-                    // fires when they press F9 (handle_key) or click
-                    // Relaunch on the popup (#333).
-                    self.status = String::from(
-                        "Update ready - press F9 to relaunch croft (terminals will reset)",
+                    // "Update ready" prompt in the status bar and let them
+                    // pick the moment. The re-exec only fires on the updater
+                    // chord (#865), a click on that pill, or Relaunch on the
+                    // popup (#333).
+                    self.status = format!(
+                        "Update ready - press {UPDATE_CROFT_CHORD} to relaunch croft (terminals will reset)"
                     );
                     if staged && let Some(install) = self.staged_install.as_ref() {
                         self.update_toast = Some(UpdateToast {
@@ -43676,8 +43730,9 @@ impl App {
     /// is `hash(launch arg)` — the same id the dtach socket uses — computed by
     /// the local launcher and the local pump and carried here in env. Keying on
     /// the launch identity (not `workspace_root`) keeps the rendezvous stable
-    /// across an in-session workspace change and the F9 self-re-exec, both of
-    /// which move `workspace_root` away from where the pump's `pwd` lands.
+    /// across an in-session workspace change and the updater's self-re-exec,
+    /// both of which move `workspace_root` away from where the pump's `pwd`
+    /// lands.
     /// `None` when no `CROFT_RELAY_KEY` is set (not a relay-capable session).
     fn relay_dir(&self) -> Option<PathBuf> {
         let id = std::env::var("CROFT_RELAY_KEY")
@@ -48674,6 +48729,7 @@ impl App {
             Cmd::RunBuildTask => self.run_build_task(),
             Cmd::RerunLastTask => self.rerun_last_task(),
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
+            Cmd::UpdateCroft => self.update_croft(),
             Cmd::OpenSettings => self.open_settings_view(),
             Cmd::OpenSettingsJson => self
                 .open_config_file_in_editor(crate::prefs::config_path(), ConfigFileSeed::Settings),
@@ -51044,6 +51100,10 @@ impl App {
             }
             if rect_contains(self.status_codeql_rect, m.column, m.row) {
                 self.cancel_codeql_run();
+                return;
+            }
+            if rect_contains(self.status_update_rect, m.column, m.row) {
+                self.update_croft();
                 return;
             }
             if rect_contains(self.status_diag_rect, m.column, m.row) {
@@ -64502,6 +64562,25 @@ fn is_run_to_cursor_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
+/// croft's own updater, `Ctrl+Shift+F9` (`Cmd+Shift+F9` too) (#865):
+/// relaunch into a landed update, or rebuild a croft older than its source
+/// checkout. It once shared bare F9 with Toggle Breakpoint, and won.
+fn is_update_croft_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(9))
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER))
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// How hints name the updater chord: with the modifier each platform's
+/// keyboard reaches for, Cmd on macOS and Ctrl elsewhere.
+const UPDATE_CROFT_CHORD: &str = if cfg!(target_os = "macos") {
+    "Cmd+Shift+F9"
+} else {
+    "Ctrl+Shift+F9"
+};
+
 /// Editor-pane Peek References: `Alt+Shift+F12` (#616). Alt is croft's
 /// "peek" modifier on the F12 family (Alt+F12 peeks the definition), so
 /// this must be checked before Go to References, which ignores Alt.
@@ -68032,7 +68111,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                         // terminal that never saw the startup DECSETs: without
                         // this re-assert the mouse (and bracketed paste, kitty
                         // keyboard flags, alt screen) stays dead until the next
-                        // F9 reload happens to re-exec croft.
+                        // updater relaunch happens to re-exec croft.
                         if std::env::var_os("CROFT_SESSION_PERSISTENT").is_some() {
                             use std::io::Write;
                             let out = terminal.backend_mut();
