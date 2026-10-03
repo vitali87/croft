@@ -565,6 +565,46 @@ fn overlays_render_on_a_tiny_terminal_without_panicking() {
     draw(&mut app, 8, 3);
 }
 
+/// #1132: editor groups that can't all sit at their minimum width ran past
+/// the frame, and the tab strip painted the first column outside it.
+#[test]
+fn splitting_the_editor_in_a_narrow_window_renders_without_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let draw = |app: &mut App, w: u16, h: u16| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    };
+    let mut app = app_with_open_file(tmp.path(), "api.py", "def f():\n    pass\n");
+    draw(&mut app, 80, 24);
+    for _ in 0..4 {
+        app.split_editor();
+        draw(&mut app, 80, 24);
+    }
+    assert_eq!(app.editor_layout.leaf_count(), 5);
+    draw(&mut app, 60, 20);
+    draw(&mut app, 22, 8);
+
+    let mut two = app_with_open_file(tmp.path(), "b.py", "x = 1\n");
+    two.split_editor();
+    draw(&mut two, 22, 8);
+    draw(&mut two, 20, 8);
+}
+
+/// #1132 (comment): the secondary side bar's OUTLINE scrollbar at 30x9.
+#[test]
+fn a_secondary_side_bar_in_a_narrow_window_renders_without_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src: String = (0..80)
+        .map(|i| format!("def f{i}():\n    pass\n"))
+        .collect();
+    let mut app = app_with_open_file(tmp.path(), "sessions.py", &src);
+    app.toggle_secondary_side_bar();
+    for (w, h) in [(120, 35), (30, 9), (30, 24), (12, 9)] {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    }
+}
+
 #[test]
 fn terminal_warning_swallows_a_key_and_dismisses_for_the_session() {
     // While the unsupported-terminal nudge is up, any non-D key dismisses it
@@ -26580,6 +26620,43 @@ fn chrome_narrow_frame_shrinks_primary_to_keep_editor_min() {
     assert_eq!(l.right.width, RIGHT_PANE_MIN, "editor keeps its minimum");
     let p = l.primary_side.expect("primary still shown, just narrower");
     assert_eq!(p.width, 100 - ACTIVITY_BAR_WIDTH - RIGHT_PANE_MIN);
+}
+
+#[test]
+fn chrome_drops_a_secondary_side_bar_the_window_cannot_fit() {
+    // #1132 (comment): at 30 columns the 30-column secondary bar was placed
+    // past the right edge of the frame, and its scrollbar wrote outside it.
+    let narrow = Rect::new(0, 0, 30, 9);
+    for pos in [SideBarPosition::Left, SideBarPosition::Right] {
+        let l = compute_chrome_layout(narrow, true, true, true, pos, 20, 30);
+        assert!(
+            l.secondary_side.is_none(),
+            "{pos:?}: {:?}",
+            l.secondary_side
+        );
+        for r in [l.activity, l.primary_side, Some(l.right)]
+            .into_iter()
+            .flatten()
+        {
+            assert!(r.right() <= narrow.right(), "{pos:?}: {r:?}");
+        }
+    }
+}
+
+#[test]
+fn chrome_keeps_the_secondary_side_bar_when_it_fits() {
+    // Negative: with room for it next to the editor's minimum, the secondary
+    // bar keeps its full width.
+    let l = compute_chrome_layout(
+        main_band(),
+        true,
+        false,
+        true,
+        SideBarPosition::Left,
+        20,
+        30,
+    );
+    assert_eq!(l.secondary_side.map(|s| s.width), Some(30));
 }
 
 #[test]

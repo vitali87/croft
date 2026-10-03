@@ -118,7 +118,7 @@ pub fn leaf_rects(node: &LayoutNode, area: Rect, min: u16) -> Vec<Rect> {
                 } else {
                     Rect::new(area.x, offset, area.width, len)
                 };
-                out.extend(leaf_rects(&child.node, sub, min));
+                out.extend(leaf_rects(&child.node, sub.intersection(area), min));
                 offset = offset.saturating_add(len);
             }
             out
@@ -128,8 +128,9 @@ pub fn leaf_rects(node: &LayoutNode, area: Rect, min: u16) -> Vec<Rect> {
 
 /// Split `total` cells among children by relative `weights` (largest-remainder
 /// rounding for an exact tiling), then raise any child below `min` to `min` by
-/// taking cells from the largest sibling. Best-effort when `total` can't seat
-/// every child at `min` (a degenerate tiny pane).
+/// taking cells from the largest sibling. When `total` can't seat every child
+/// at `min` (a degenerate tiny pane), the floor drops to an even share, so the
+/// lengths always sum to exactly `total`.
 fn apportion(total: u16, weights: &[u16], min: u16) -> Vec<u16> {
     let n = weights.len();
     if n == 0 {
@@ -158,8 +159,11 @@ fn apportion(total: u16, weights: &[u16], min: u16) -> Vec<u16> {
         leftover -= 1;
         k += 1;
     }
-    // Enforce the minimum, stealing from the largest surplus sibling.
-    let min_i = min as i64;
+    // Enforce the minimum, stealing from the largest surplus sibling. When
+    // `total` can't seat every child at `min`, lower the floor to an even
+    // share: raising a child past what the area holds made the lengths
+    // overrun it, and the last group drew outside the frame (#1132).
+    let min_i = (min as i64).min(total_i / n as i64);
     while let Some(d) = alloc.iter().position(|&a| a < min_i) {
         let need = min_i - alloc[d];
         match (0..n)
@@ -174,10 +178,7 @@ fn apportion(total: u16, weights: &[u16], min: u16) -> Vec<u16> {
                 alloc[donor] -= take;
                 alloc[d] += take;
             }
-            None => {
-                alloc[d] = min_i;
-                break;
-            }
+            None => break,
         }
     }
     alloc.into_iter().map(|a| a.max(0) as u16).collect()
@@ -788,6 +789,45 @@ mod tests {
 
     fn area(w: u16, h: u16) -> Rect {
         Rect::new(0, 0, w, h)
+    }
+
+    #[test]
+    fn apportion_never_hands_out_more_than_the_total() {
+        // #1132: below n * min the last child was forced up to `min` anyway,
+        // so the lengths overran the area and the group drew off-screen.
+        for (total, n) in [(18u16, 2usize), (47, 5), (25, 4), (3, 2), (0, 3)] {
+            let lens = apportion(total, &vec![1; n], 10);
+            assert_eq!(lens.len(), n);
+            assert_eq!(
+                lens.iter().map(|&l| l as u32).sum::<u32>(),
+                total as u32,
+                "{lens:?}"
+            );
+        }
+        let node = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            children: vec![
+                LayoutChild {
+                    node: leaf(),
+                    weight: 1,
+                },
+                LayoutChild {
+                    node: leaf(),
+                    weight: 1,
+                },
+            ],
+        };
+        let rects = leaf_rects(&node, area(18, 8), 10);
+        assert!(rects.iter().all(|r| r.right() <= 18), "{rects:?}");
+    }
+
+    #[test]
+    fn apportion_still_enforces_the_minimum_when_it_fits() {
+        // Negative: with room for every child at `min`, a lopsided weight is
+        // still raised to `min`, and the total is still tiled exactly.
+        assert_eq!(apportion(100, &[9, 1], 10), vec![90, 10]);
+        assert_eq!(apportion(100, &[98, 1, 1], 10), vec![80, 10, 10]);
+        assert_eq!(apportion(20, &[1, 1], 10), vec![10, 10]);
     }
 
     #[test]

@@ -326,7 +326,18 @@ fn compute_chrome_layout(
     } else {
         0
     };
-    let secondary_w = if secondary_visible { secondary_w } else { 0 };
+    // A secondary side bar the window can't seat beside the editor's minimum
+    // is dropped: reserving it anyway placed it past the frame's right edge,
+    // where its scrollbar wrote outside the buffer (#1132).
+    let fits = main.width
+        >= activity_w
+            .saturating_add(secondary_w)
+            .saturating_add(RIGHT_PANE_MIN);
+    let secondary_w = if secondary_visible && fits {
+        secondary_w
+    } else {
+        0
+    };
     // Reserve activity + secondary first, then fit the primary side bar in
     // what's left while keeping RIGHT_PANE_MIN for the editor column.
     let reserved = activity_w.saturating_add(secondary_w);
