@@ -341,6 +341,32 @@ mod tests {
         assert_eq!(found, want);
     }
 
+    /// #862 review (CodeRabbit, security): an entry in the backup
+    /// directory that is a symbolic link is not a backup. `orphaned`
+    /// offered it for restore and for expiry as an unreadable backup, and
+    /// removing it opened it for writing, truncating whatever it pointed at
+    /// outside the cache, before unlinking the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_entry_is_never_listed_nor_written_through() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("notes.txt");
+        std::fs::write(&victim, "keep me\n").unwrap();
+        let ws = workspace_dir(dir.path(), root.path());
+        std::fs::create_dir_all(&ws).unwrap();
+        let link = ws.join("999999998-1.json");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert_eq!(orphaned(dir.path(), root.path()), Vec::<PathBuf>::new());
+        remove(&link, root.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me\n");
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link itself goes"
+        );
+    }
+
     /// #862 review: where two gone crofts' backups hold the same file, the
     /// one restored first fills its tab and the other stays in its backup,
     /// so the newer backup comes first, whatever the names would sort to.

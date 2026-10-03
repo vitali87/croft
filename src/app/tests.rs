@@ -11543,6 +11543,98 @@ fn hot_exit_restores_deleted_and_untitled_buffers() {
     assert_eq!(scratch.lines, vec![String::from("scratch note")]);
 }
 
+/// #862 review (CodeRabbit): a tab restored for a file deleted since keeps
+/// the stamp its edits were made against. It came back with none, so once
+/// something made the file again, the first save wrote over that without
+/// asking, as it would not for a file merely changed since.
+#[test]
+fn a_restored_tab_of_a_deleted_file_does_not_overwrite_one_made_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::remove_file(&a).unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(next.status.contains("no longer on disk"), "{}", next.status);
+    assert_eq!(next.editor.path.as_deref(), Some(a.as_path()), "setup");
+    std::fs::write(&a, "made elsewhere\n").unwrap();
+    next.focus_pane(Pane::Editor);
+    next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "made elsewhere\n");
+    assert!(next.status.contains("changed on disk"), "{}", next.status);
+    assert!(next.editor.dirty, "the restored text is still there");
+}
+
+/// #862 review, the guard: a deleted file's restored tab can still be
+/// saved. The first save asks, as for any file changed since; the second
+/// writes it.
+#[test]
+fn a_restored_tab_of_a_deleted_file_is_saved_when_asked_twice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::remove_file(&a).unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    next.focus_pane(Pane::Editor);
+    for _ in 0..2 {
+        next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap().lines().next(),
+        Some("xalpha")
+    );
+    assert!(!next.editor.dirty);
+}
+
+/// #862 review (CodeRabbit): a consumed backup that cannot be removed once
+/// this croft's own backup lands is not forgotten. It was dropped without a
+/// word, so text the user later discarded could come back at a launch. It
+/// is said, and the quit tries it again and says so too.
+#[test]
+fn a_consumed_backup_that_cannot_be_removed_is_reported_and_tried_at_quit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let old = as_a_dead_crofts_backup(cache.path(), tmp.path());
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let own = block_hot_exit_path(&next);
+    next.restore_hot_exit();
+    assert!(old.exists(), "setup: kept while its own write fails");
+    // Neither emptied nor unlinked: a non-empty directory in its place.
+    std::fs::remove_file(&old).unwrap();
+    std::fs::create_dir_all(old.join("blocked")).unwrap();
+    std::fs::remove_dir_all(&own).unwrap();
+    settle_hot_exit(&mut next);
+    assert!(own.is_file(), "setup: its own backup landed");
+    let old_name = old.display().to_string();
+    assert!(
+        next.status.contains("Could not remove") && next.status.contains(&old_name),
+        "{}",
+        next.status
+    );
+    press_ctrl_q(&mut next);
+    next.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(next.quit);
+    assert!(
+        next.exit_notes.iter().any(|n| n.contains(&old_name)),
+        "{:?}",
+        next.exit_notes
+    );
+}
+
 /// #862 hot exit negative: only the launched workspace's backup comes back;
 /// another workspace's stays where it is for that workspace's next launch.
 #[test]
