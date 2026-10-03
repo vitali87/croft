@@ -57839,6 +57839,7 @@ fn codeql_pack_commands_install_dependencies_and_download_packs() {
         let mut app = codeql_query_fixture(tmp.path(), "select 1");
         app.codeql_program = fake_codeql(bin.path(), "", 0, "");
         app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
         app.run_command(Command::CodeqlInstallPackDependencies);
         assert_eq!(
             app.status,
@@ -58099,6 +58100,19 @@ fn wait_for_codeql(app: &mut App) {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// Drain until the walk for the workspace's queries lands (#840): opening
+/// the CodeQL view starts it off the UI thread.
+fn wait_for_codeql_queries(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the CodeQL query discovery to land",
+        || {
+            app.drain_codeql_queries();
+            app.codeql_queries_job.is_none()
+        },
+    );
 }
 
 #[cfg(unix)]
@@ -60346,6 +60360,7 @@ fn a_query_row_in_the_side_bar_runs_that_file_and_records_it() {
         let mut app = codeql_query_fixture(tmp.path(), "select 1");
         app.codeql_program = fake_codeql(bin.path(), r#"{"version":"2.1.0","runs":[]}"#, 0, "");
         app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
         let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["acme/rust", crate::codeql_query::NO_PACK]);
         let row = app
@@ -60408,6 +60423,7 @@ fn codeql_pack_fixture(tmp: &std::path::Path, bin: &std::path::Path) -> App {
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     app.codeql_program = program;
     app.open_codeql_view();
+    wait_for_codeql_queries(&mut app);
     app.focus = Pane::Tree;
     let row = app
         .codeql
@@ -61528,6 +61544,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         std::fs::write(pack.join("a.ql"), "select 1").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
         app.focus = Pane::Tree;
         let row = app
             .codeql
@@ -61576,6 +61593,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         let empty = tempfile::tempdir().unwrap();
         let mut app = App::new(empty.path().to_path_buf()).unwrap();
         app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
         app.focus = Pane::Tree;
         app.codeql.language = Some(6);
         app.codeql.collapsed.insert(Section::Databases);
@@ -61624,6 +61642,54 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
             Some(Command::CodeqlCreateQuery)
         );
         assert_eq!(Command::CodeqlCreateQuery.title(), "CodeQL: Create Query");
+    });
+}
+
+#[test]
+fn opening_the_codeql_view_does_not_wait_for_the_query_walk() {
+    // #840: the QL icon walked the whole workspace for queries before the
+    // view switched. It switches at once and the queries land on a later
+    // tick; a query created meanwhile is listed at once all the same.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::codeql::Line;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
+        std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        assert!(
+            app.codeql_queries_job.is_some(),
+            "the walk is off the UI thread"
+        );
+        assert!(app.codeql.queries.is_empty());
+        assert!(
+            app.codeql
+                .lines()
+                .contains(&Line::Text("Discovering queries\u{2026}"))
+        );
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/go"]);
+
+        app.open_codeql_view();
+        assert!(app.codeql_queries_job.is_some());
+        assert_eq!(app.codeql.queries[0].queries, vec![pack.join("a.ql")]);
+        app.submit_create_codeql_query(&pack, Some("go"), "later");
+        let created = pack.join("later.ql");
+        assert!(
+            app.codeql.queries[0].queries.contains(&created),
+            "{:?}",
+            app.codeql.queries
+        );
+        assert!(
+            !app.drain_codeql_queries(),
+            "the older walk is dropped, never listed over the new query"
+        );
     });
 }
 
@@ -66275,4 +66341,163 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         "{synced:?} in {:?}",
         app.settings_chain
     );
+}
+
+/// #840 regression, through base APIs only: clicking the QL icon walked the
+/// whole workspace for queries on the UI thread before the view switched,
+/// so the list was already filled when `open_codeql_view` returned. The
+/// view now switches at once and the walk's packs land on a later tick.
+#[test]
+fn opening_the_codeql_view_returns_before_the_query_walk_lands() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
+        std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            names.is_empty(),
+            "the walk ran on the UI thread before the view opened: {names:?}"
+        );
+    });
+}
+
+/// #840 negative: reopening the view while a walk is in flight keeps that
+/// walk rather than starting a second over the same tree: what it sends is
+/// what lands.
+#[test]
+fn reopening_the_codeql_view_keeps_the_walk_in_flight() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.codeql_queries_job = Some((app.workspace_root().to_path_buf(), rx));
+        app.open_codeql_view();
+        let pack = crate::codeql_query::QueryPack {
+            name: String::from("acme/in-flight"),
+            language: None,
+            dir: tmp.path().to_path_buf(),
+            queries: Vec::new(),
+        };
+        tx.send(vec![pack]).unwrap();
+        assert!(app.drain_codeql_queries());
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/in-flight"]);
+    });
+}
+
+/// #840 negative: a walk whose thread died without sending stops the
+/// "Discovering queries" line and leaves the list alone; with no walk in
+/// flight a drain changes nothing.
+#[test]
+fn a_query_walk_that_dies_stops_saying_it_is_discovering() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert!(
+            !app.drain_codeql_queries(),
+            "nothing in flight, nothing changes"
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::codeql_query::QueryPack>>();
+        drop(tx);
+        app.codeql_queries_job = Some((app.workspace_root().to_path_buf(), rx));
+        app.codeql.discovering_queries = true;
+        assert!(app.drain_codeql_queries());
+        assert!(!app.codeql.discovering_queries);
+        assert!(app.codeql_queries_job.is_none());
+        assert!(app.codeql.queries.is_empty());
+    });
+}
+
+/// A workspace folder holding one CodeQL pack named `name`.
+fn codeql_pack_workspace_840(name: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(
+        pack.join("qlpack.yml"),
+        format!("name: {name}\nextractor: go\n"),
+    )
+    .unwrap();
+    std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+    tmp
+}
+
+/// #840: the walk runs off the UI thread, so the workspace can move to
+/// another root before it lands. Its packs are the old root's: they must
+/// not be listed for the new one, and the view walks the new root.
+#[test]
+fn a_query_walk_of_a_root_the_workspace_left_never_lands() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let a = codeql_pack_workspace_840("acme/a");
+        let b = codeql_pack_workspace_840("acme/b");
+        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        assert!(
+            app.codeql_queries_job.is_some(),
+            "fixture: a's walk in flight"
+        );
+        app.change_workspace_root(b.path().to_path_buf());
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            !names.contains(&"acme/a"),
+            "a's queries landed on b: {names:?}"
+        );
+        app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/b"]);
+    });
+}
+
+/// #840: reopening the view after a workspace switch, with the old root's
+/// walk still in flight, walks the new root instead of waiting on the old.
+#[test]
+fn reopening_codeql_after_a_workspace_switch_walks_the_new_root() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let a = codeql_pack_workspace_840("acme/a");
+        let b = codeql_pack_workspace_840("acme/b");
+        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.change_workspace_root(b.path().to_path_buf());
+        // Undrained, a's walk is still in flight here, landed or not.
+        app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/b"]);
+    });
+}
+
+/// #840 negative: a walk of the root the workspace still has lands as
+/// before, and one the test holds for that root keeps its place when the
+/// view is reopened (no second walk of the same tree).
+#[test]
+fn a_query_walk_of_the_current_root_still_lands() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let a = codeql_pack_workspace_840("acme/a");
+        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/a"]);
+        assert!(!app.codeql.discovering_queries);
+    });
 }
