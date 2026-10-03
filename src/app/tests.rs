@@ -20755,6 +20755,388 @@ fn run_spec_does_not_walk_above_workspace_root() {
     );
 }
 
+/// #864: F5 on a script ran it under croft's private debug venv, where the
+/// project's packages are missing, so `import requests` stopped the run on
+/// line 1. The program runs under the interpreter Run picks: the nearest
+/// venv inside the workspace, else python3.
+#[test]
+fn a_debugged_script_runs_under_the_interpreter_run_uses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let pkg = root.join("src").join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let file = pkg.join("main.py");
+    std::fs::write(&file, b"import requests\n").unwrap();
+
+    let bare = super::project_python_for(&pkg, root);
+    assert_eq!(
+        bare.file_name().and_then(|n| n.to_str()),
+        Some("python3"),
+        "no venv: python3, got {}",
+        bare.display()
+    );
+    assert!(!bare.to_string_lossy().contains("debug-venv"));
+
+    let venv = make_venv(root, ".venv");
+    assert_eq!(super::project_python_for(&pkg, root), venv);
+    assert_eq!(
+        super::debuggee_python(&pkg, root, std::env::var_os("PATH").as_deref()),
+        Some(venv.clone()),
+        "F5's debuggee is Run's interpreter"
+    );
+    let req =
+        crate::dap::session::launch_request(&file, &super::project_python_for(&pkg, root), false);
+    assert_eq!(
+        req["arguments"]["python"][0],
+        &*venv.to_string_lossy(),
+        "the launch names the project's venv"
+    );
+    // The same interpreter Run spawns for this file.
+    let spec = App::run_spec_for(&file, root).unwrap();
+    assert_eq!(spec.program, venv.to_string_lossy());
+}
+
+/// #864 for launch.json: a Python config that names no interpreter runs
+/// under the venv nearest its program (or its cwd, for a `module`), and one
+/// that names its own keeps it.
+#[test]
+fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one() {
+    use crate::dap::configs::{SubstCtx, debugpy_request, parse_launch_json, resolve};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ctx = SubstCtx {
+        workspace_folder: root.to_path_buf(),
+        file: None,
+    };
+    let python_of = |json: &str| {
+        let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
+        let rc = resolve(&cfg, &ctx).unwrap();
+        let cwd = rc.cwd.clone().unwrap_or_else(|| root.to_path_buf());
+        let adapter = Path::new("/home/u/.croft/debug-venv/bin/python");
+        let req = debugpy_request(&rc, &super::config_project_python(&rc, &cwd, root, adapter));
+        req["arguments"]["python"].clone()
+    };
+    let program = r#"[{"name":"P","type":"python","program":"${workspaceFolder}/app/main.py"}]"#;
+
+    let fallback = python_of(program);
+    let fallback = fallback[0].as_str().unwrap();
+    assert!(
+        fallback.ends_with("python3") && !fallback.contains("debug-venv"),
+        "no venv: python3, got {fallback}"
+    );
+
+    let venv = make_venv(root, ".venv");
+    assert_eq!(python_of(program)[0], &*venv.to_string_lossy());
+
+    // A module launch has no program path: its cwd's venv is the one.
+    let svc = root.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    let svc_venv = make_venv(&svc, "venv");
+    assert_eq!(
+        python_of(r#"[{"name":"M","type":"python","module":"svc.main","cwd":"svc"}]"#)[0],
+        &*svc_venv.to_string_lossy()
+    );
+
+    assert_eq!(
+        python_of(
+            r#"[{"name":"E","type":"python","program":"app/main.py","python":"/opt/py/bin/python3.9"}]"#
+        ),
+        "/opt/py/bin/python3.9",
+        "an explicit python wins"
+    );
+}
+
+/// #864 review: a config naming both `module` and `program` launches the
+/// module (debugpy refuses a request naming both, so the program is dropped),
+/// so its interpreter comes from its `cwd`, never from beside the program
+/// the request no longer carries. A program launch still uses the venv
+/// beside its program.
+#[test]
+fn a_module_launch_that_also_names_a_program_runs_under_its_cwds_venv() {
+    use crate::dap::configs::{SubstCtx, debugpy_request, parse_launch_json, resolve};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ctx = SubstCtx {
+        workspace_folder: root.to_path_buf(),
+        file: None,
+    };
+    let request_of = |json: &str| {
+        let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
+        let rc = resolve(&cfg, &ctx).unwrap();
+        let cwd = rc.cwd.clone().unwrap_or_else(|| root.to_path_buf());
+        let adapter = Path::new("/home/u/.croft/debug-venv/bin/python");
+        debugpy_request(&rc, &super::config_project_python(&rc, &cwd, root, adapter))
+    };
+    let root_venv = make_venv(root, ".venv");
+    let tools = root.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tools_venv = make_venv(&tools, ".venv");
+
+    let both = request_of(
+        r#"[{"name":"T","type":"python","module":"pytest","program":"tools/helper.py"}]"#,
+    );
+    assert_eq!(
+        both["arguments"]["module"], "pytest",
+        "the module is launched"
+    );
+    assert!(
+        both["arguments"].get("program").is_none(),
+        "the program is dropped"
+    );
+    assert_eq!(
+        both["arguments"]["python"][0],
+        &*root_venv.to_string_lossy(),
+        "the module runs under its cwd's venv, not the dropped program's"
+    );
+
+    let program = request_of(r#"[{"name":"P","type":"python","program":"tools/helper.py"}]"#);
+    assert_eq!(
+        program["arguments"]["python"][0],
+        &*tools_venv.to_string_lossy(),
+        "a program launch keeps the venv beside its program"
+    );
+}
+
+/// #864 guard: the debuggee's interpreter is looked up no higher than the
+/// workspace root, as Run's is. A venv in the folder above the workspace
+/// belongs to some other project and is not picked up.
+#[test]
+fn a_venv_above_the_workspace_is_not_the_debuggee_interpreter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = make_venv(tmp.path(), ".venv");
+    let root = tmp.path().join("proj");
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+
+    assert_eq!(
+        super::debuggee_python(&pkg, &root, None),
+        None,
+        "a venv above the workspace is not the project's"
+    );
+    let py = super::project_python_for(&pkg, &root);
+    assert_ne!(py, outside, "nor Run's");
+    assert!(!py.starts_with(tmp.path()), "got {}", py.display());
+}
+
+/// #864 guard: a nearer venv beats the workspace root's, for the debuggee
+/// exactly as for Run, so a sub-project debugs against its own packages.
+#[test]
+fn a_nearer_venv_beats_the_workspace_roots_for_the_debuggee() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let root_venv = make_venv(root, ".venv");
+    let svc = root.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    let svc_venv = make_venv(&svc, "venv");
+
+    assert_eq!(
+        super::debuggee_python(&svc, root, None),
+        Some(svc_venv.clone())
+    );
+    assert_eq!(super::project_python_for(&svc, root), svc_venv);
+    assert_eq!(
+        super::debuggee_python(root, root, None),
+        Some(root_venv.clone())
+    );
+    assert_eq!(super::project_python_for(root, root), root_venv);
+}
+
+/// A stand-in venv interpreter ([`make_venv`]) whose `pyvenv.cfg` says it
+/// is Python `version`.
+fn make_venv_of(dir: &Path, venv_name: &str, version: &str) -> PathBuf {
+    let py = make_venv(dir, venv_name);
+    std::fs::write(
+        dir.join(venv_name).join("pyvenv.cfg"),
+        format!("home = /usr/bin\ninclude-system-site-packages = false\nversion = {version}\n"),
+    )
+    .unwrap();
+    py
+}
+
+/// #864: a debuggee interpreter older than 3.14 is named, since 3.14 is
+/// attach's floor (PEP 768) and not launch's.
+#[test]
+fn a_debuggee_older_than_3_14_is_named_with_the_attach_floor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let py = make_venv_of(tmp.path(), ".venv", "3.12.4");
+    assert_eq!(
+        super::debuggee_python_note(&py),
+        Ok(Some(String::from(
+            "under Python 3.12 (.venv); attach needs 3.14+"
+        )))
+    );
+}
+
+/// #864 guard: 3.14 and newer say nothing, and neither does an interpreter
+/// whose version cannot be read (the launch then speaks for itself).
+#[test]
+fn a_3_14_debuggee_or_an_unreadable_one_gets_no_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let py314 = make_venv_of(tmp.path(), "py314", "3.14.0");
+    assert_eq!(super::debuggee_python_note(&py314), Ok(None));
+    let py315 = make_venv_of(tmp.path(), "py315", "3.15.1");
+    assert_eq!(super::debuggee_python_note(&py315), Ok(None));
+    let unknown = make_venv(tmp.path(), "unknown");
+    assert_eq!(super::debuggee_python_note(&unknown), Ok(None));
+}
+
+/// #864: an interpreter below debugpy's own floor (3.10) cannot host the
+/// debuggee at all, so the launch refuses it by name. 3.10 itself is fine.
+#[test]
+fn a_debuggee_debugpy_cannot_run_under_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = make_venv_of(tmp.path(), ".venv", "3.9.18");
+    assert_eq!(
+        super::debuggee_python_note(&old),
+        Err(String::from(
+            "Python 3.9 (.venv) is too old to debug: debugpy needs 3.10+"
+        ))
+    );
+    let floor = make_venv_of(tmp.path(), "venv", "3.10.0");
+    assert_eq!(
+        super::debuggee_python_note(&floor),
+        Ok(Some(String::from(
+            "under Python 3.10 (venv); attach needs 3.14+"
+        )))
+    );
+}
+
+/// #864: a launch.json config's version check reads the interpreter the
+/// request actually runs: its `python` (a path or a command line) or the
+/// legacy `pythonPath`, and nothing for a request that names neither.
+#[test]
+fn a_launch_requests_own_interpreter_is_the_one_checked() {
+    use serde_json::json;
+    let python = |args: serde_json::Value| {
+        super::launch_request_python(&json!({ "arguments": args }), Path::new("/work/proj"))
+    };
+    assert_eq!(
+        python(json!({ "python": "/opt/py/bin/python3.9" })),
+        Some(PathBuf::from("/opt/py/bin/python3.9"))
+    );
+    assert_eq!(
+        python(json!({ "python": ["/p/.venv/bin/python", "-X", "dev"] })),
+        Some(PathBuf::from("/p/.venv/bin/python"))
+    );
+    assert_eq!(
+        python(json!({ "pythonPath": "/legacy/python" })),
+        Some(PathBuf::from("/legacy/python"))
+    );
+    assert_eq!(python(json!({ "program": "a.py" })), None);
+}
+
+/// #864 review: a relative interpreter in launch.json is found where
+/// debugpy starts it: the request's `cwd`, else a program's folder, else
+/// the folder the adapter runs in. The version check used to run it from
+/// croft's own folder, which can hold a different file of that name.
+#[test]
+fn a_relative_launch_python_is_checked_where_debugpy_runs_it() {
+    use serde_json::json;
+    let python = |args: serde_json::Value| {
+        super::launch_request_python(&json!({ "arguments": args }), Path::new("/work/proj"))
+    };
+    assert_eq!(
+        python(json!({ "python": ".venv/bin/python", "cwd": "/work/proj/api" })),
+        Some(PathBuf::from("/work/proj/api/.venv/bin/python")),
+        "from the request's cwd"
+    );
+    assert_eq!(
+        python(json!({
+            "python": ["venv/bin/python", "-X", "dev"],
+            "program": "/work/proj/tools/run.py"
+        })),
+        Some(PathBuf::from("/work/proj/tools/venv/bin/python")),
+        "from the program's folder when the request names no cwd"
+    );
+    assert_eq!(
+        python(json!({ "python": "./py/bin/python", "module": "pytest" })),
+        Some(PathBuf::from("/work/proj/py/bin/python")),
+        "from the adapter's folder for a module launch"
+    );
+}
+
+/// #864 review guard: only a relative path with a folder in it moves. A
+/// bare name is a PATH lookup for debugpy too, and an absolute path is
+/// already where it is.
+#[test]
+fn a_bare_or_absolute_launch_python_is_checked_as_written() {
+    use serde_json::json;
+    let python = |args: serde_json::Value| {
+        super::launch_request_python(&json!({ "arguments": args }), Path::new("/work/proj"))
+    };
+    assert_eq!(
+        python(json!({ "python": "python3", "cwd": "/work/proj/api" })),
+        Some(PathBuf::from("python3"))
+    );
+    assert_eq!(
+        python(json!({ "python": "/opt/py/bin/python3.12", "cwd": "/work/proj/api" })),
+        Some(PathBuf::from("/opt/py/bin/python3.12"))
+    );
+}
+
+/// #864, through F5: a project venv debugpy cannot run under is refused
+/// before any adapter starts, on the status line and the panel.
+#[test]
+fn f5_refuses_a_project_venv_too_old_for_debugpy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    make_venv_of(&root, ".venv", "3.9.18");
+    let file = root.join("main.py");
+    std::fs::write(&file, "print('hi')\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.debug_start_or_continue();
+    let started = !app.debug_sessions.is_empty();
+    if started {
+        app.debug_stop();
+    }
+    assert_eq!(
+        app.status, "Python 3.9 (.venv) is too old to debug: debugpy needs 3.10+",
+        "a session started: {started}"
+    );
+    assert!(!started);
+    assert!(app.run_debug.feedback_is_error);
+}
+
+/// #864 regression guard: with no venv and no `python3` on PATH, a bare
+/// `python3` cannot start, where the launch used to run under the debug
+/// venv. Nothing is found, so the launch keeps the debug venv's python; a
+/// `python3` on PATH is still preferred, as for Run.
+#[test]
+fn a_debuggee_with_no_venv_and_no_python3_is_left_to_the_debug_venv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let empty = tmp.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let no_python = std::env::join_paths([&empty]).unwrap();
+    assert_eq!(super::debuggee_python(&pkg, &root, Some(&no_python)), None);
+    assert_eq!(super::debuggee_python(&pkg, &root, None), None, "no PATH");
+
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("python3"), b"#!/bin/sh\n").unwrap();
+    let with_python = std::env::join_paths([&empty, &bin]).unwrap();
+    assert_eq!(
+        super::debuggee_python(&pkg, &root, Some(&with_python)),
+        Some(bin.join("python3"))
+    );
+}
+
+/// #864 guard: the fallback never overrides a venv the project has, even
+/// with nothing on PATH.
+#[test]
+fn a_project_venv_is_the_debuggee_whatever_path_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let venv = make_venv(root, ".venv");
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let empty = std::env::join_paths([root.join("empty-bin")]).unwrap();
+    assert_eq!(super::debuggee_python(&pkg, root, Some(&empty)), Some(venv));
+}
+
 #[test]
 fn run_active_file_with_no_open_file_records_feedback_and_does_not_spawn_terminal() {
     let tmp = tempfile::tempdir().unwrap();
@@ -51909,6 +52291,253 @@ fn a_switched_to_member_replays_its_queued_stop() {
     app.debug_stop();
 }
 
+/// #867: the Debug Console lived only in the sidebar, cut at its edge.
+/// Program output and REPL results are mirrored, whole, to OUTPUT's
+/// "Debug Console" channel, where they read at full width and can be
+/// searched and copied.
+#[test]
+fn the_debug_console_is_mirrored_to_an_output_channel() {
+    use crate::dap::session::DapEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let tag = format!("mirror-{}", std::process::id());
+    let printed = format!("{tag} {}", "wide ".repeat(40));
+    let event = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"{printed}\n"}}}}"#
+    );
+    app.debug_sessions.push("P", stub_emitting(&[&event]));
+    let mirrored = |text: &str| {
+        crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+            .unwrap_or_default()
+            .iter()
+            .any(|l| l.text == text)
+    };
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the program's output to reach the Debug Console channel",
+        || {
+            app.poll_dap();
+            mirrored(&printed)
+        },
+    );
+
+    let (_, p) = app
+        .debug_sessions
+        .iter_named_mut_indexed()
+        .find(|(i, _)| *i == 0)
+        .unwrap();
+    p.backlog.push(DapEvent::Evaluated {
+        context: String::from("repl"),
+        expression: format!("describe('{tag}')"),
+        result: format!("'{tag} described'"),
+        success: true,
+    });
+    app.poll_dap();
+    assert!(mirrored(&format!("❯ describe('{tag}')")), "the REPL echo");
+    assert!(mirrored(&format!("'{tag} described'")), "and its result");
+    app.debug_stop();
+}
+
+/// #867 guard: the mirror carries what the console shows and nothing more.
+/// debugpy's `telemetry` banner, which the console drops, stays out of the
+/// channel too, and a printed line lands there once, not once per poll.
+#[test]
+fn the_debug_console_mirror_skips_telemetry_and_copies_each_line_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let tag = format!("mirror-once-{}", std::process::id());
+    let telemetry = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"telemetry","output":"{tag} ptvsd"}}}}"#
+    );
+    let printed = format!(
+        r#"{{"seq":2,"type":"event","event":"output","body":{{"category":"stdout","output":"{tag} printed\n"}}}}"#
+    );
+    app.debug_sessions
+        .push("P", stub_emitting(&[&telemetry, &printed]));
+    let count = |text: &str| {
+        crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| l.text == text)
+            .count()
+    };
+    let line = format!("{tag} printed");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the printed line to reach the Debug Console channel",
+        || {
+            app.poll_dap();
+            count(&line) > 0
+        },
+    );
+    for _ in 0..5 {
+        app.poll_dap();
+    }
+    let channel = crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE).unwrap_or_default();
+    let in_panel = app.debug_console.iter().filter(|l| **l == line).count();
+    app.debug_stop();
+    assert_eq!(count(&line), 1, "once");
+    assert!(
+        !channel
+            .iter()
+            .any(|l| l.text.contains(&format!("{tag} ptvsd"))),
+        "telemetry is not mirrored"
+    );
+    assert_eq!(in_panel, 1, "and the panel keeps its own copy");
+}
+
+/// A stand-in debug adapter (#864) that stops on an exception as soon as it
+/// is configured, advertising `exceptionInfo`. With `answer_at_once` it
+/// answers that request as it comes; otherwise it holds the answer until
+/// `continue`, then prints `MARKER`, after which the late answer has been
+/// read.
+fn exception_stop_adapter(dir: &Path, answer_at_once: bool) -> crate::dap::session::DapSession {
+    let script = format!(
+        r#"
+import json, sys
+AT_ONCE = {at_once}
+seq = [1000]
+held = []
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length))
+def send(msg):
+    seq[0] += 1
+    msg["seq"] = seq[0]
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+def reply(req, body=None):
+    send({{"type": "response", "request_seq": req["seq"], "success": True,
+          "command": req["command"], "body": body or {{}}}})
+def answer(req):
+    reply(req, {{"exceptionId": "KeyError", "description": "'x'"}})
+while True:
+    req = read()
+    if req is None:
+        break
+    c = req["command"]
+    if c == "initialize":
+        reply(req, {{"supportsExceptionInfoRequest": True}})
+        send({{"type": "event", "event": "initialized"}})
+    elif c == "configurationDone":
+        reply(req)
+        send({{"type": "event", "event": "stopped", "body": {{"reason": "exception", "threadId": 1}}}})
+    elif c == "exceptionInfo":
+        if AT_ONCE:
+            answer(req)
+        else:
+            held.append(req)
+    elif c == "continue":
+        reply(req)
+        for h in held:
+            answer(h)
+        send({{"type": "event", "event": "output", "body": {{"category": "stdout", "output": "MARKER\n"}}}})
+    elif c == "disconnect":
+        reply(req)
+        break
+    else:
+        reply(req)
+"#,
+        at_once = if answer_at_once { "True" } else { "False" }
+    );
+    let path = dir.join("fake_dap.py");
+    std::fs::write(&path, script).unwrap();
+    crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[path.display().to_string()],
+        dir,
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("python3 spawns")
+}
+
+/// #864: an `exceptionInfo` answer that arrives after Continue describes a
+/// stop that is over. It must not put "Paused on exception" on the status
+/// line of a program that is running again.
+#[test]
+fn an_exception_answer_after_continue_does_not_say_paused() {
+    use crate::dap::session::SessionPhase;
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("P", exception_stop_adapter(tmp.path(), false));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the exception stop",
+        || {
+            app.poll_dap();
+            app.debug_sessions
+                .focused()
+                .is_some_and(|s| s.phase == SessionPhase::Stopped)
+        },
+    );
+    app.debug_start_or_continue();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the late answer and the marker after it",
+        || {
+            app.poll_dap();
+            app.debug_console.iter().any(|l| l == "MARKER")
+        },
+    );
+    let status = app.status.clone();
+    let feedback = app.run_debug.feedback.clone().unwrap_or_default();
+    app.debug_stop();
+    assert!(!status.contains("Paused"), "status: {status}");
+    assert!(!feedback.contains("KeyError"), "feedback: {feedback}");
+}
+
+/// #864 guard: an answer that arrives while the program is still stopped
+/// names the exception, on the status line and in the panel.
+#[test]
+fn an_exception_answer_while_stopped_names_the_exception() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("P", exception_stop_adapter(tmp.path(), true));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the exception to be named",
+        || {
+            app.poll_dap();
+            app.status.contains("KeyError")
+        },
+    );
+    let feedback = app.run_debug.feedback.clone();
+    let status = app.status.clone();
+    app.debug_stop();
+    assert_eq!(status, "Paused on exception: KeyError: 'x'");
+    assert_eq!(
+        feedback.as_deref(),
+        Some("Paused (exception): KeyError: 'x'")
+    );
+}
+
 /// A workspace with two source files and breakpoints set in both (#250).
 fn app_with_breakpoints() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
@@ -52227,6 +52856,101 @@ fn stop_all_false_leaves_the_siblings_running() {
     poll_until_shrinks(&mut app, 2);
     assert_eq!(app.debug_sessions.names(), vec!["B"]);
     app.debug_stop();
+}
+
+/// #867: the issue's recording shows "Debug session ended" in the panel
+/// while the status bar still read "Debugging out.p… · F10 step over ·
+/// Shift+F5 stop". A session that ends on its own says so on the status
+/// line as well.
+#[test]
+fn a_session_ending_on_its_own_says_so_on_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Debug session ended")
+    );
+    assert_eq!(app.status, "Debug session ended");
+}
+
+/// #867: the run that never reached its breakpoint says that on the
+/// status line too, as the panel does.
+#[test]
+fn a_run_that_never_hit_its_breakpoint_says_so_on_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .breakpoints
+        .entry(tmp.path().join("out.py"))
+        .or_default()
+        .insert(1);
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(app.status, "Program exited without hitting a breakpoint");
+}
+
+/// #867 guard: the end message is written once, when the session ends. A
+/// status set after that (the user's next action) survives later polls.
+#[test]
+fn a_status_set_after_the_debug_session_ended_is_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    app.status = String::from("Saved out.py");
+    for _ in 0..5 {
+        app.poll_dap();
+    }
+    assert_eq!(app.status, "Saved out.py");
+}
+
+/// #867 guard: a postDebugTask reports after the end, so its message is
+/// the one left on the status line, not the end message.
+#[test]
+fn a_post_debug_task_message_outlives_the_end_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.debug_post_tasks = vec![String::from("missing")];
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert!(
+        app.status
+            .starts_with("postDebugTask \"missing\" not found"),
+        "{}",
+        app.status
+    );
+}
+
+/// #867 guard: when the focused member of a `stopAll` compound ends, the
+/// status keeps saying why the rest stopped rather than the plain end
+/// message.
+#[test]
+fn stop_all_keeps_its_explanation_when_the_focused_member_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(0);
+    app.debug_stop_all = true;
+
+    poll_until_shrinks(&mut app, 2);
+    assert!(
+        app.debug_sessions.is_empty(),
+        "{:?}",
+        app.debug_sessions.names()
+    );
+    assert_eq!(
+        app.status,
+        "A ended — stopAll stopped the rest of the compound"
+    );
 }
 
 /// A compound that is REFUSED (here, it names a configuration no
@@ -66013,6 +66737,184 @@ fn a_launch_json_python_config_passes_args_and_env_file() {
         app.run_debug.feedback
     );
     assert_eq!(who.as_deref(), Some("'croft'"));
+}
+
+/// #864 against a real debugpy: F5 on a script importing a module only the
+/// project's `.venv` has stopped with "Paused (exception)" on line 1, since
+/// the program ran under croft's debug venv. It now reaches its breakpoint
+/// with the module's value, and the exception it raises next is named.
+/// Needs `~/.croft/debug-venv` and a `python3` with `venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn f5_debugs_a_script_against_the_project_venv_and_names_its_exception() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let made = std::process::Command::new("python3")
+        .args(["-m", "venv", "--without-pip"])
+        .arg(root.join(".venv"))
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let site = std::process::Command::new(root.join(".venv/bin/python"))
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ])
+        .output()
+        .unwrap();
+    let site = PathBuf::from(String::from_utf8(site.stdout).unwrap().trim());
+    std::fs::write(site.join("croftdep.py"), "VALUE = 42\n").unwrap();
+    let file = root.join("main.py");
+    std::fs::write(
+        &file,
+        "import croftdep\nvalue = croftdep.VALUE\nraise ValueError(f\"boom {value}\")\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.editor
+        .breakpoints
+        .entry(file.clone())
+        .or_default()
+        .insert(3);
+    app.debug_start_or_continue();
+    let value = debug_until_local(&mut app, "value", 90);
+    assert_eq!(
+        value.as_deref(),
+        Some("42"),
+        "status {:?}, feedback {:?}",
+        app.status,
+        app.run_debug.feedback
+    );
+    app.debug_start_or_continue();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline
+        && !app
+            .run_debug
+            .feedback
+            .as_deref()
+            .is_some_and(|f| f.contains("ValueError"))
+    {
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let feedback = app.run_debug.feedback.clone();
+    let status = app.status.clone();
+    app.debug_stop();
+    assert_eq!(
+        feedback.as_deref(),
+        Some("Paused (exception): ValueError: boom 42"),
+        "status {status:?}"
+    );
+    assert!(status.contains("ValueError: boom 42"), "{status}");
+}
+
+/// A real `python3 -m venv --without-pip` at `dir`, and its purelib
+/// site-packages directory.
+fn real_venv(dir: &Path) -> PathBuf {
+    let made = std::process::Command::new("python3")
+        .args(["-m", "venv", "--without-pip"])
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let site = std::process::Command::new(dir.join("bin/python"))
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ])
+        .output()
+        .unwrap();
+    PathBuf::from(String::from_utf8(site.stdout).unwrap().trim())
+}
+
+/// #864 against a real debugpy: F5 under a project venv older than 3.14
+/// names its version, on the status line and as the Debug Console's first
+/// line, and still debugs. Skipped when `python3` is already 3.14+.
+/// Needs `~/.croft/debug-venv` and a `python3` with `venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn f5_names_a_project_python_older_than_3_14() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    real_venv(&root.join(".venv"));
+    let version = std::process::Command::new(root.join(".venv/bin/python"))
+        .args(["-c", "import sys; print('%d.%d' % sys.version_info[:2])"])
+        .output()
+        .unwrap();
+    let version = String::from_utf8(version.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let (major, minor) = version.split_once('.').unwrap();
+    let minor: u32 = minor.parse().unwrap();
+    if major != "3" || !(10..14).contains(&minor) {
+        eprintln!("python3 is {version}: nothing to name");
+        return;
+    }
+    let file = root.join("main.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.debug_start_or_continue();
+    let started = !app.debug_sessions.is_empty();
+    let status = app.status.clone();
+    let console = app.debug_console.clone();
+    app.debug_stop();
+    let want = format!("Debugging main.py under Python {version} (.venv); attach needs 3.14+");
+    assert!(started, "{status}");
+    assert!(status.starts_with(&want), "{status}");
+    assert!(
+        status.contains("F10 step over"),
+        "the key hints stay: {status}"
+    );
+    assert_eq!(console.first(), Some(&want), "{console:?}");
+}
+
+/// #864 against a real debugpy: Debug Test at Cursor runs pytest under
+/// the venv nearest the test file, as F5 and Live Run pick it, not only a
+/// workspace-root `.venv`. The only venv here is `svc/venv`, holding a
+/// stand-in `pytest` module that records `sys.prefix`; the root-only lookup
+/// ran a `python3` without it.
+/// Needs `~/.croft/debug-venv` and a `python3` with `venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn debug_test_at_cursor_runs_pytest_under_the_nearest_venv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("pytest.ini"), "[pytest]\n").unwrap();
+    let svc = root.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    let site = real_venv(&svc.join("venv"));
+    let pytest = site.join("pytest");
+    std::fs::create_dir_all(&pytest).unwrap();
+    std::fs::write(pytest.join("__init__.py"), "").unwrap();
+    let main = pytest.join("__main__.py");
+    std::fs::write(&main, "import sys\nprefix = sys.prefix\nprint(prefix)\n").unwrap();
+    let test = svc.join("test_app.py");
+    std::fs::write(&test, "def test_prefix():\n    assert True\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&test).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor
+        .breakpoints
+        .entry(main.clone())
+        .or_default()
+        .insert(3);
+    app.debug_test_at_cursor();
+    let prefix = debug_until_local(&mut app, "prefix", 90);
+    let status = app.status.clone();
+    app.debug_stop();
+    let prefix = prefix.unwrap_or_else(|| panic!("no stop in pytest; status {status:?}"));
+    assert!(prefix.contains("svc/venv"), "sys.prefix {prefix}");
 }
 
 /// #250, against a real lldb-dap: a Rust binary that needs a CLI argument
