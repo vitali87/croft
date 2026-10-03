@@ -2857,6 +2857,15 @@ pub struct Editor {
     /// passes, never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
     bracket_colors: Vec<Vec<(usize, u8)>>,
+    /// Byte ranges of every string and comment in the buffer (lines joined
+    /// by `\n`), from the same highlight pass as `bracket_colors`. Quote
+    /// auto-pairing reads it to see a string or block comment an earlier
+    /// line opened, which a scan of the caret's line alone cannot (#844).
+    protected_ranges: Vec<(usize, usize)>,
+    /// Whether `protected_ranges` describes the text as it is now. Byte
+    /// ranges are not carried through edits the way spans are (#850), so an
+    /// edit leaves them stale until the next pass over the edited text lands.
+    protected_current: bool,
     /// Inline color-literal decorations (the "no colour-swatch decorations"
     /// gap in `vscode_extensions.rs`, matching `naumovs.color-highlight`):
     /// per line, the `(start char col, end char col, background, foreground)`
@@ -3217,6 +3226,8 @@ impl Editor {
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
+            protected_ranges: Vec::new(),
+            protected_current: false,
             show_color_swatches: true,
             color_swatches: Vec::new(),
             whitespace_mode: WhitespaceMode::default(),
@@ -6114,6 +6125,7 @@ impl Editor {
     /// pass (`None`: until it finishes).
     fn recompute_highlights_within(&mut self, wait: Option<std::time::Duration>) {
         self.highlight_requests = self.highlight_requests.wrapping_add(1);
+        self.protected_current = false;
         match self.lang {
             Some(kind) => {
                 carry_highlights(
@@ -6140,6 +6152,7 @@ impl Editor {
                 self.highlight_job = None;
                 self.highlight_base = Vec::new();
                 self.highlights = vec![Vec::new(); self.lines.len()];
+                self.protected_ranges.clear();
                 // No grammar means no string/comment knowledge; brackets in
                 // plain text still colorize (VS Code does the same) — unless
                 // the buffer is big enough that the per-edit scan would make
@@ -6254,6 +6267,13 @@ impl Editor {
         self.highlight_cost = pass.cost;
         self.highlights = pass.spans;
         self.bracket_colors = pass.brackets;
+        // String and comment ranges hold only for the text the pass read.
+        self.protected_current = pass.lines == self.lines;
+        self.protected_ranges = if self.protected_current {
+            pass.protected
+        } else {
+            Vec::new()
+        };
         self.highlight_base = pass.lines;
         carry_highlights(
             &mut self.highlight_base,
@@ -6949,19 +6969,34 @@ impl Editor {
             return false;
         }
         // Opener guard: never before a word character. Quote guard: also
-        // never after a word character or the same quote.
+        // never after a word character or the same quote, unless that word is
+        // a Python string prefix, which is part of the opener (`f"` pairs to
+        // `f""`, as VS Code's Python configuration lists it).
         let next_ok = next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c);
-        let prev = if self.cursor_col == 0 {
-            None
-        } else {
-            self.lines
-                .get(self.cursor_row)
-                .and_then(|l| l.chars().nth(self.cursor_col - 1))
-        };
-        let prev_ok =
-            !is_pair_quote(c) || prev.is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != c);
+        let before =
+            &self.lines[self.cursor_row][..self.byte_index(self.cursor_row, self.cursor_col)];
+        let prev_ok = !is_pair_quote(c)
+            || before
+                .chars()
+                .next_back()
+                .is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != c)
+            || (self.lang == Some(LangKind::Python)
+                && is_python_string_prefix(trailing_word(before)));
         if !next_ok || !prev_ok {
             return false;
+        }
+        // A quote typed inside a string or comment is text there, or that
+        // string's closing quote, never an opener: pairing the closing `"`
+        // of `print(f"{x}` left a stray `")` behind (#844). One opened on an
+        // earlier line (a docstring body, a block comment) comes from the
+        // highlight pass; the line scan starts where it closes.
+        if is_pair_quote(c) {
+            let Some(from) = self.earlier_construct_end(self.cursor_row, before.len()) else {
+                return false;
+            };
+            if ends_in_string_or_comment(&before[from..], self.lang) {
+                return false;
+            }
         }
         self.pin_on_edit();
         self.push_undo(EditKind::InsertChar);
@@ -6974,6 +7009,33 @@ impl Editor {
         self.recompute_highlights();
         self.auto_pair_at = Some((self.cursor_row, self.cursor_col, self.edit_seq));
         true
+    }
+
+    /// Where line `row` leaves a string or comment that an earlier line
+    /// opened, as a byte index into the line: `Some(0)` when none reaches the
+    /// line, and `None` while one still covers `caret` (a byte index too).
+    /// Read from the last highlight pass, since a scan of one line cannot
+    /// know it starts inside a docstring or a block comment (#844). While an
+    /// edit's pass is still out (#850) nothing is read: `Some(0)`, so the
+    /// caret's line alone decides, as it did before #844.
+    fn earlier_construct_end(&self, row: usize, caret: usize) -> Option<usize> {
+        if !self.protected_current {
+            return Some(0);
+        }
+        let line_start: usize = self.lines[..row].iter().map(|l| l.len() + 1).sum();
+        let first = self
+            .protected_ranges
+            .partition_point(|&(_, end)| end <= line_start);
+        match self.protected_ranges.get(first) {
+            Some(&(start, end)) if start < line_start => {
+                if end > line_start + caret {
+                    None
+                } else {
+                    Some(end - line_start)
+                }
+            }
+            _ => Some(0),
+        }
     }
 
     /// [`Self::apply_span_edits`] for text another seat wrote (#349): the line
@@ -12240,6 +12302,8 @@ struct HighlightPass {
     lines: Vec<String>,
     spans: Vec<Vec<HiSpan>>,
     brackets: BracketColors,
+    /// Byte ranges of the strings and comments the grammar found (#844).
+    protected: Vec<(usize, usize)>,
     cost: std::time::Duration,
 }
 
@@ -12262,6 +12326,7 @@ fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
         lines,
         spans,
         brackets,
+        protected,
         cost: started.elapsed(),
     }
 }
@@ -15769,6 +15834,121 @@ fn ends_in_script_string_or_comment(prefix: &str) -> bool {
         }
     }
     quote.is_some() || block_comment
+}
+
+/// Whether the end of `prefix`, the current line up to the caret, sits inside
+/// a string literal or a comment of `lang`, where a typed quote is never
+/// paired (#844). A lexical scan of the one line rather than the syntax tree:
+/// the string being typed is unterminated, which is exactly where a parser's
+/// error recovery is least trustworthy. A string or block comment opened on
+/// an earlier line goes unseen, which leaves pairing there as it always was.
+fn ends_in_string_or_comment(prefix: &str, lang: Option<LangKind>) -> bool {
+    let line_comment = line_comment_token(lang);
+    // Python's "block comment" is a triple-quoted string, scanned as one.
+    let block_comment = block_comment_tokens(lang).filter(|_| lang != Some(LangKind::Python));
+    // A shell or YAML `#` opens a comment only at the start of a word:
+    // `${#a[@]}` and `a#b` are not comments.
+    let hash_needs_space = matches!(lang, Some(LangKind::Bash | LangKind::Yaml));
+    let mut quote: Option<(char, bool)> = None; // (delimiter, triple-quoted)
+    let mut in_block = false;
+    let mut i = 0;
+    while let Some(c) = prefix[i..].chars().next() {
+        let rest = &prefix[i..];
+        let mut step = c.len_utf8();
+        if in_block {
+            if let Some((_, close)) = block_comment
+                && rest.starts_with(close)
+            {
+                in_block = false;
+                step = close.len();
+            }
+        } else if let Some((q, triple)) = quote {
+            if c == '\\' && backslash_escapes(q, lang) {
+                step += rest[step..].chars().next().map_or(0, char::len_utf8);
+            } else if c == q && (!triple || rest.chars().take(3).eq([q, q, q])) {
+                quote = None;
+                if triple {
+                    step = 3;
+                }
+            }
+        } else if let Some((open, _)) = block_comment
+            && rest.starts_with(open)
+        {
+            in_block = true;
+            step = open.len();
+        } else if line_comment.is_some_and(|t| rest.starts_with(t))
+            && (!hash_needs_space
+                || prefix[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(char::is_whitespace))
+        {
+            return true;
+        } else if is_pair_quote(c) && quote_opens_string(&prefix[..i], rest, lang) {
+            let triple =
+                lang == Some(LangKind::Python) && c != '`' && rest.chars().take(3).eq([c, c, c]);
+            quote = Some((c, triple));
+            if triple {
+                step = 3;
+            }
+        }
+        i += step;
+    }
+    quote.is_some() || in_block
+}
+
+/// Whether the quote that starts `rest` opens a string, given the line text
+/// `before` it. A `"` always does. A `'` or backtick after a word character is
+/// an apostrophe (`don't`, C++'s `1'000`) unless that word is a Python string
+/// prefix, and a Rust `'` opens a char literal, never a lifetime or a label.
+fn quote_opens_string(before: &str, rest: &str, lang: Option<LangKind>) -> bool {
+    let mut chars = rest.chars();
+    let q = chars.next();
+    if q == Some('"') {
+        return true;
+    }
+    let word = trailing_word(before);
+    let prefixed = lang == Some(LangKind::Python) && is_python_string_prefix(word);
+    if !word.is_empty() && !prefixed {
+        return false;
+    }
+    if lang == Some(LangKind::Rust) && q == Some('\'') {
+        return matches!(
+            (chars.next(), chars.next()),
+            (None, _) | (Some('\\'), _) | (Some(_), Some('\''))
+        );
+    }
+    true
+}
+
+/// Whether a backslash escapes the next character inside a `q`-quoted string
+/// of `lang`. Shell, YAML and TOML single quotes and Go's backtick raw strings
+/// take every character literally.
+fn backslash_escapes(q: char, lang: Option<LangKind>) -> bool {
+    !matches!(
+        (q, lang),
+        ('\'', Some(LangKind::Bash | LangKind::Yaml | LangKind::Toml)) | ('`', Some(LangKind::Go))
+    )
+}
+
+/// Python's string prefixes (`f"…"`, `rb'…'`, in any case): letters that
+/// belong to the string's opening quote rather than being a word before it.
+fn is_python_string_prefix(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "f" | "r" | "b" | "u" | "rb" | "br" | "fr" | "rf"
+    )
+}
+
+/// The run of word characters that ends `s`.
+fn trailing_word(s: &str) -> &str {
+    let start = s
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| is_word_char(c))
+        .last()
+        .map_or(s.len(), |(i, _)| i);
+    &s[start..]
 }
 
 /// Apply the selection background colour to columns `[start_char..end_char)`
@@ -30508,6 +30688,283 @@ mod tests {
         e.cursor_col = 3;
         e.insert_char('\'');
         assert_eq!(e.lines[0], "don'", "no auto-pair after a word character");
+    }
+
+    /// An editor in `lang` with `text` typed into it one key at a time.
+    fn typed(lang: Option<LangKind>, text: &str) -> Editor {
+        let mut e = editor_with("");
+        e.lang = lang;
+        for c in text.chars() {
+            e.insert_char(c);
+        }
+        e
+    }
+
+    #[test]
+    fn python_strings_typed_key_by_key_come_out_exactly_as_typed() {
+        // The f-string's closing `"` used to pair (it follows `}`), leaving a
+        // stray `")` behind; the prefix now opens the pair instead (#844).
+        for text in [
+            "print(f\"{category:<12} {total:>10}\")",
+            "print(f\"{x}\")",
+            "r'\\d'",
+            "x = Rb'\\x00' + fr\"{y}\"",
+        ] {
+            let e = typed(Some(LangKind::Python), text);
+            assert_eq!(e.lines, [text], "typing {text:?}");
+        }
+        let mut e = typed(Some(LangKind::Python), "print(f");
+        e.insert_char('"');
+        assert_eq!(e.lines[0], "print(f\"\")", "a string prefix opens the pair");
+        let mut e = typed(Some(LangKind::Python), "elif");
+        e.insert_char('"');
+        assert_eq!(e.lines[0], "elif\"", "a word that is not a prefix does not");
+    }
+
+    /// `text` in `lang` with the caret at its `|` (which is not kept), and
+    /// the text either side of the caret.
+    fn with_caret(lang: Option<LangKind>, text: &str) -> (Editor, &str, &str) {
+        let (head, tail) = text.split_once('|').expect("a caret marker");
+        let mut e = editor_with(&format!("{head}{tail}"));
+        e.lang = lang;
+        e.cursor_col = head.chars().count();
+        (e, head, tail)
+    }
+
+    #[test]
+    fn a_quote_typed_inside_a_string_or_comment_never_pairs() {
+        for (lang, text) in [
+            // The #844 line once `f"` had not paired but the `(` had.
+            (Some(LangKind::Python), "print(f\"{x}|)"),
+            (Some(LangKind::Python), "s = 'it is |"),
+            (Some(LangKind::Python), "doc = \"\"\"say \"hi\" |"),
+            (Some(LangKind::Python), "x = 1  # see |"),
+            (Some(LangKind::Rust), "let s = \"a \\\" b |"),
+            (Some(LangKind::Rust), "f(x); // see |"),
+            (Some(LangKind::JavaScript), "/* see |"),
+            (Some(LangKind::Bash), "echo 'a\\' \"b |"),
+            (None, "He said \"hi, |"),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('"');
+            assert_eq!(e.lines[0], format!("{head}\"{tail}"), "{lang:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_quote_outside_strings_and_comments_still_pairs() {
+        for (lang, text) in [
+            (None, "x = |"),
+            (Some(LangKind::Python), "d = {'a': 1, |}"),
+            (Some(LangKind::Python), "doc = \"\"\"a\"\"\" + |"),
+            (Some(LangKind::Rust), "fn f<'a>(s: &'a str) { g(|"),
+            (Some(LangKind::Rust), "let c = '\"'; h(|"),
+            (Some(LangKind::Cpp), "int n = 1'000; f(|"),
+            (Some(LangKind::Bash), "echo ${#a[@]} |"),
+            (Some(LangKind::JavaScript), "/* a */ f(|"),
+            (None, "don't say |"),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('"');
+            assert_eq!(
+                e.lines[0],
+                format!("{head}\"\"{tail}"),
+                "{lang:?}: {text:?}"
+            );
+        }
+    }
+
+    /// The line scan starts every line outside a string, so a quote typed in
+    /// a docstring body, a template literal or a block comment that an
+    /// earlier line opened still paired; the highlight pass knows (#844).
+    #[test]
+    fn a_quote_in_a_string_or_comment_from_an_earlier_line_pairs_only_once_it_closes() {
+        let typed_at_caret = |lang: LangKind, text: &str| {
+            let (head, tail) = text.split_once('|').expect("a caret marker");
+            let mut e = editor_with(&format!("{head}{tail}"));
+            e.lang = Some(lang);
+            e.recompute_highlights();
+            e.cursor_row = head.matches('\n').count();
+            e.cursor_col = head.rsplit('\n').next().unwrap_or("").chars().count();
+            e.insert_char('"');
+            (e.lines.join("\n"), head.to_string(), tail.to_string())
+        };
+        for (lang, text) in [
+            (
+                LangKind::Python,
+                "def f():\n    \"\"\"Doc\n    said | here\n    \"\"\"",
+            ),
+            (LangKind::JavaScript, "const s = `a\nb | c`;"),
+            (LangKind::Rust, "/* start\n   see | */"),
+        ] {
+            let (got, head, tail) = typed_at_caret(lang, text);
+            assert_eq!(got, format!("{head}\"{tail}"), "{lang:?}: {text:?}");
+        }
+        for (lang, text) in [
+            (LangKind::Python, "doc = \"\"\"a\nb\"\"\" + |"),
+            (LangKind::Rust, "/* a\n b */ f(|"),
+        ] {
+            let (got, head, tail) = typed_at_caret(lang, text);
+            assert_eq!(got, format!("{head}\"\"{tail}"), "{lang:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_string_prefix_opens_a_pair_only_in_python_and_only_as_a_prefix() {
+        // #844 guard: `f"` pairs because Python's `f` is part of the
+        // opener. In any other language, or after a word Python does not
+        // take as a prefix, a quote after a word character stays single.
+        for lang in [None, Some(LangKind::Rust), Some(LangKind::JavaScript)] {
+            let mut e = typed(lang, "f");
+            e.insert_char('"');
+            assert_eq!(e.lines[0], "f\"", "{lang:?}");
+        }
+        for word in ["ub", "fu", "bb", "rbf", "print"] {
+            let mut e = typed(Some(LangKind::Python), word);
+            e.insert_char('\'');
+            assert_eq!(e.lines[0], format!("{word}'"), "{word:?} is no prefix");
+        }
+        let mut e = typed(Some(LangKind::Python), "x = U");
+        e.insert_char('\'');
+        assert_eq!(e.lines[0], "x = U''", "a prefix in either case");
+    }
+
+    #[test]
+    fn a_closing_quote_inside_a_string_is_still_typed_over() {
+        // #844 guard: refusing to pair inside a string comes after
+        // type-over, so the quote that closes a string steps over the one
+        // already at the caret instead of adding a second.
+        for (lang, text) in [
+            (Some(LangKind::Python), "s = \"abc|\""),
+            (Some(LangKind::Rust), "let s = \"a \\\" b|\";"),
+            (None, "say \"hi|\""),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('"');
+            assert_eq!(e.lines[0], format!("{head}{tail}"), "{lang:?}: {text:?}");
+            assert_eq!(e.cursor_col, head.chars().count() + 1, "{lang:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_selection_inside_a_string_is_still_wrapped_in_quotes() {
+        // #844 guard: wrapping a selection is not auto-pairing. A quote
+        // typed over a selection inside a string still surrounds it.
+        let mut e = editor_with("s = \"a word here\"");
+        e.set_language(Some(LangKind::Python));
+        e.selection = Some(EditorSelection {
+            anchor: (0, 7),
+            head: (0, 11),
+        }); // "word"
+        e.cursor_col = 11;
+        e.insert_char('\'');
+        assert_eq!(e.lines[0], "s = \"a 'word' here\"");
+    }
+
+    #[test]
+    fn a_docstring_an_edit_removed_no_longer_holds_back_a_pair() {
+        // #844 guard: the string ranges are the highlight pass's after every
+        // edit, never stale. Inside a docstring a quote does not pair; once
+        // its opener is deleted, the same quote on the same line does.
+        let mut e = editor_with("doc = \"\"\"\nx = \n\"\"\"");
+        e.set_language(Some(LangKind::Python));
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x = \"", "inside the docstring: no pair");
+        e.backspace();
+        e.cursor_row = 0;
+        e.cursor_col = 9;
+        for _ in 0..3 {
+            e.backspace();
+        }
+        assert_eq!(e.lines[0], "doc = ");
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x = \"\"", "no docstring left: the quote pairs");
+    }
+
+    #[test]
+    fn string_ranges_are_not_read_while_the_pass_over_an_edit_is_out() {
+        // #844 x #850 guard: the string and comment ranges are byte offsets
+        // into the text one syntax pass read, and are not carried through
+        // edits. While the pass over an edit is still out (a file past the
+        // inline budget), the docstring the edit removed must not hold back
+        // a pair: the caret's line decides, as before #844.
+        let mut e = editor_with("doc = \"\"\"\nx = \n\"\"\"");
+        e.set_language(Some(LangKind::Python));
+        e.defer_highlights_for_test();
+        e.cursor_row = 0;
+        e.cursor_col = 9;
+        for _ in 0..3 {
+            e.backspace();
+        }
+        assert_eq!(e.lines[0], "doc = ");
+        assert!(e.highlight_pending(), "the edit's pass has not landed");
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x = \"\"", "the stale docstring is not read");
+    }
+
+    #[test]
+    fn a_pass_that_edits_overtook_does_not_make_its_string_ranges_count() {
+        // #844 x #850 guard: a pass that lands after more edits were made
+        // read older text. Its spans are carried over; its string ranges
+        // are not, so the docstring the later edits removed stays unread.
+        let mut e = editor_with("doc = \"\"\"\nx = \n\"\"\"");
+        e.set_language(Some(LangKind::Python));
+        e.defer_highlights_for_test();
+        let settled = e.highlight_generation();
+        e.insert_char('a'); // starts a pass over text that has the docstring
+        e.cursor_row = 0;
+        e.cursor_col = 10;
+        for _ in 0..3 {
+            e.backspace();
+        }
+        assert_eq!(e.lines[0], "adoc = ");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !e.poll_highlights() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass never landed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            e.highlight_generation(),
+            settled + 1,
+            "the first pass landed"
+        );
+        assert!(
+            e.highlight_pending(),
+            "and the edits after it started another"
+        );
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(
+            e.lines[1], "x = \"\"",
+            "the older text's docstring is not read"
+        );
+    }
+
+    #[test]
+    fn string_ranges_count_again_once_the_pass_over_the_edit_lands() {
+        // #844 x #850 guard against going too far: the fallback lasts only
+        // while the pass is out. Once it lands on the edited text, a quote
+        // inside the docstring an earlier line opened is text again.
+        let mut e = editor_with("doc = \"\"\"\nx = \n\"\"\"");
+        e.set_language(Some(LangKind::Python));
+        e.defer_highlights_for_test();
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char(' ');
+        e.await_highlight_pass(None);
+        assert!(!e.highlight_pending());
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x =  \"", "inside the docstring: no pair");
     }
 
     #[test]
