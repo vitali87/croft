@@ -10073,6 +10073,53 @@ fn sheet_grid_editing_types_commits_and_saves_with_the_delimiter() {
     );
 }
 
+/// stock.csv from #1137: the widget row's unquoted `1,200` gives it the
+/// only third field, so deleting it shrinks the sheet to two columns.
+fn sheet_app_on_stock_csv() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("stock.csv");
+    std::fs::write(&p, "item,qty\nbolt,4\nwidget,1,200\nnut,9\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    (tmp, app)
+}
+
+#[test]
+fn deleting_the_only_row_reaching_the_last_column_keeps_the_caret_in_the_sheet() {
+    let (_tmp, mut app) = sheet_app_on_stock_csv();
+    app.handle_sheet_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert_eq!((data.cur_row, data.cur_col, data.col_count()), (1, 2, 3));
+
+    // Panicked with "range end index 2 out of range for slice of length 2".
+    app.sheet_structure_op(crate::widgets::command_palette::Command::SheetDeleteRow);
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert_eq!(data.col_count(), 2);
+    assert_eq!(data.cur_col, 1, "the caret moves onto the last column left");
+    assert!(data.scroll_col <= data.cur_col);
+    assert_eq!(data.cell(1, 0), "nut");
+    // The grid still moves and renders from there.
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Left, KeyModifiers::NONE));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+}
+
+#[test]
+fn deleting_a_row_that_leaves_the_column_count_alone_keeps_the_caret_column() {
+    // Negative: bolt is not the widest row, so the sheet keeps its three
+    // columns and the caret stays where it was.
+    let (_tmp, mut app) = sheet_app_on_stock_csv();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.sheet_structure_op(crate::widgets::command_palette::Command::SheetDeleteRow);
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert_eq!(data.col_count(), 3);
+    assert_eq!((data.cur_row, data.cur_col), (0, 1));
+    assert_eq!(data.cell(0, 0), "widget");
+}
+
 #[test]
 fn hex_typing_edits_bytes_and_cmd_s_writes_them_in_place() {
     // #173 end-to-end: hex-pane nibble typing, Tab to the ASCII pane,

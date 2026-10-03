@@ -61559,6 +61559,11 @@ impl App {
             }
             _ => false,
         };
+        // Removing the only row that reached the last column shrinks the
+        // sheet's width too, so the caret column can be past the end (#1137).
+        let last_col = data.col_count().saturating_sub(1);
+        data.cur_col = data.cur_col.min(last_col);
+        data.scroll_col = data.scroll_col.min(data.cur_col);
         if changed {
             view.dirty = true;
             let visible = sheet_visible_rows(self.editor.last_inner);
@@ -65131,12 +65136,13 @@ fn sheet_follow_cursor(view: &mut crate::sheet::SheetView, idx: usize, visible: 
     if data.cur_col < data.scroll_col {
         data.scroll_col = data.cur_col;
     } else {
-        // Advance until the cursor column's right edge fits.
+        // Advance until the cursor column's right edge fits. `get`, since a
+        // caller that shrank the sheet may not have clamped the caret yet.
         while data.scroll_col < data.cur_col {
-            let used: usize = data.col_widths[data.scroll_col..=data.cur_col]
-                .iter()
-                .map(|&w| w as usize + 1)
-                .sum();
+            let Some(span) = data.col_widths.get(data.scroll_col..=data.cur_col) else {
+                break;
+            };
+            let used: usize = span.iter().map(|&w| w as usize + 1).sum();
             if used <= body_w {
                 break;
             }
