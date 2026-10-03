@@ -10852,6 +10852,57 @@ fn save_all_does_not_quit_when_a_save_is_refused() {
     assert!(app.editor.dirty, "the edits are still in the buffer");
 }
 
+/// #862 review: a file open in two editor groups is two buffers. With the
+/// same unsaved text in both, Save All writes it once and quits: before,
+/// the second write read the first as a change on disk, refused, and kept
+/// croft open over a file that already held the edits.
+#[test]
+fn save_all_writes_a_file_open_in_two_groups_with_the_same_edits_once_and_quits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let edited = app.editor.lines.clone();
+    app.split_editor();
+    app.editor.lines = edited.clone();
+    app.editor.dirty = true;
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit, "{}", app.status);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+}
+
+/// #862 review, the guard: two groups holding different unsaved text for
+/// one file are not settled by writing whichever comes first. Neither is
+/// written, both stay, and croft stays open naming the file.
+#[test]
+fn save_all_writes_neither_of_two_different_unsaved_copies_of_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.split_editor();
+    app.editor.lines = vec![String::from("yalpha"), String::new()];
+    app.editor.dirty = true;
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(
+        app.status
+            .contains("a.txt (open in 2 editor groups with different unsaved text)"),
+        "{}",
+        app.status
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    let mut texts: Vec<String> = std::iter::once(&app.editor)
+        .chain(app.editor_layout.inactive_groups())
+        .flat_map(|g| g.editors.iter())
+        .filter(|e| e.path.as_deref() == Some(a.as_path()))
+        .inspect(|e| assert!(e.dirty, "both copies stay unsaved"))
+        .map(|e| e.lines[0].clone())
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["xalpha", "yalpha"]);
+}
+
 /// #862: Cmd+W on an unsaved tab used to close it, and Reopen Closed
 /// Editor brought back only the file on disk. It asks now; Esc keeps it.
 #[test]
@@ -11693,6 +11744,173 @@ fn hot_exit_restores_a_backup_whose_pid_was_recycled() {
         .expect("restored");
     assert!(ed.dirty && ed.lines[0] == "xalpha");
     assert!(!recycled.exists(), "consumed");
+}
+
+/// The texts hot-exit backups under `cache` hold for `file`, sorted.
+fn hot_exit_texts_of(
+    cache: &std::path::Path,
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> Vec<String> {
+    let mut texts: Vec<String> = hot_exit_files(cache, root)
+        .iter()
+        .flat_map(|f| crate::hot_exit::Backup::load(f).unwrap().buffers)
+        .filter(|b| b.tab.path.as_deref() == Some(file))
+        .filter_map(|b| b.tab.unsaved_text)
+        .collect();
+    texts.sort();
+    texts
+}
+
+/// Two dead crofts' backups (`1-1.json`, `1-2.json`: pid 1 never started
+/// in 1970), each holding `a.txt` with the unsaved text `texts` gives it,
+/// the second written later, and `extra` buffers added to the first.
+fn two_dead_backups_of_a(
+    tmp: &std::path::Path,
+    cache: &std::path::Path,
+    texts: [&str; 2],
+    extra: Vec<crate::hot_exit::Buffer>,
+) {
+    let (app, _) = app_with_unsaved_file(tmp);
+    let mut app = with_hot_exit(app, cache);
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache, tmp).remove(0);
+    let mut backup = crate::hot_exit::Backup::load(&mine).unwrap();
+    std::fs::remove_file(&mine).unwrap();
+    for (i, text) in texts.iter().enumerate() {
+        backup.buffers.truncate(1);
+        backup.buffers[0].tab.unsaved_text = Some((*text).to_string());
+        if i == 0 {
+            backup.buffers.extend(extra.iter().cloned());
+        }
+        let file = mine.with_file_name(format!("1-{}.json", i + 1));
+        backup.save(&file).unwrap();
+        let written =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60 - 30 * i as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+    }
+}
+
+/// #862 review: two crofts on one workspace, both killed holding unsaved
+/// edits to one file. Restoring the second backup into the tab the first
+/// filled overwrote that text, and both backups were then deleted, so one
+/// set of edits was gone while the status line counted two tabs restored.
+/// The second copy now stays in its backup, and comes back once the first
+/// has been saved or closed.
+#[test]
+fn hot_exit_keeps_a_second_backup_of_a_file_it_already_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    two_dead_backups_of_a(
+        tmp.path(),
+        cache.path(),
+        ["first\n", "second\n"],
+        Vec::new(),
+    );
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.status.contains("restored 1 unsaved tab"),
+        "{}",
+        next.status
+    );
+    assert!(
+        next.status.contains("a.txt has a second unsaved copy"),
+        "{}",
+        next.status
+    );
+    let shown = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("restored");
+    assert_eq!(shown.lines[0], "second", "the newer copy fills the tab");
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        ["first\n", "second\n"],
+        "both texts are still on disk"
+    );
+
+    // Once this croft's copy is gone (a clean quit that discards it), the
+    // next launch brings back the other one.
+    next.clear_hot_exit();
+    drop(next);
+    let mut third = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    third.restore_hot_exit();
+    let other = third
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the second copy is restored");
+    assert!(other.dirty);
+    assert_eq!(
+        other.lines[0], "first",
+        "the copy the first launch held back"
+    );
+}
+
+/// #862 review, the guard: the backup that held the second copy keeps only
+/// that copy. Its other file is restored and not left in it to come back a
+/// second time.
+#[test]
+fn hot_exit_restores_the_rest_of_a_backup_that_also_held_a_second_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    let b_buffer = crate::hot_exit::Buffer {
+        tab: crate::session_state::OpenTabState {
+            path: Some(b.clone()),
+            dirty: true,
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll: 0,
+            scroll_col: 0,
+            unsaved_text: Some(String::from("zbravo\n")),
+        },
+        disk_stamp: None,
+    };
+    two_dead_backups_of_a(
+        tmp.path(),
+        cache.path(),
+        ["first\n", "second\n"],
+        vec![b_buffer],
+    );
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.status.contains("restored 2 unsaved tabs"),
+        "{}",
+        next.status
+    );
+    let bed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(b.as_path()))
+        .expect("b.txt restored");
+    assert!(bed.dirty && bed.lines[0] == "zbravo");
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &b),
+        ["zbravo\n"],
+        "b.txt is in this croft's backup alone"
+    );
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        ["first\n", "second\n"]
+    );
 }
 
 /// #862 hot exit negative: a backup whose pid and start time are both

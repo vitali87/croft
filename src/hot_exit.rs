@@ -342,10 +342,10 @@ mod tests {
     }
 
     /// #862 review: where two gone crofts' backups hold the same file, the
-    /// one restored last wins its tab, so the newer backup comes last,
-    /// whatever the names would sort to.
+    /// one restored first fills its tab and the other stays in its backup,
+    /// so the newer backup comes first, whatever the names would sort to.
     #[test]
-    fn the_newest_orphaned_backup_comes_last() {
+    fn the_newest_orphaned_backup_comes_first() {
         let root = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let ws = workspace_dir(dir.path(), root.path());
@@ -364,7 +364,7 @@ mod tests {
         };
         at(&older, 1_000_000);
         at(&newer, 2_000_000);
-        assert_eq!(orphaned(dir.path(), root.path()), vec![older, newer]);
+        assert_eq!(orphaned(dir.path(), root.path()), vec![newer, older]);
     }
 
     #[test]
