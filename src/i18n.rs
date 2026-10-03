@@ -154,21 +154,108 @@ pub fn active() -> bool {
     CATALOG.get().is_some()
 }
 
-/// A JSON template for translating into `lang`: every palette title plus the
-/// given extra strings, each mapped to its existing translation or `""`.
+/// Every string [`tr`] translates outside the command palette, in English:
+/// context-menu labels (`ContextMenu::localize` runs each one through `tr`)
+/// and the literals handed to `tr` directly. The one list of them:
+/// `croft locale-template` passes it as `extra`, so a new language's
+/// template offers every one, and a test reads the sources and fails on any
+/// such string that is neither here nor a palette title (#849).
+pub const TRANSLATABLE: &[&str] = &[
+    "Add Folder to Workspace",
+    "Ask Navigator",
+    "Ask Navigator About Selection",
+    "Ask Navigator About This Line",
+    "blank",
+    "Change All Occurrences",
+    "Close",
+    "Close All",
+    "Close Others",
+    "Close Saved",
+    "Close to the Right",
+    "CodeQL",
+    "Color Theme",
+    "Command Palette",
+    "Compare Selected",
+    "Copy",
+    "Copy into New Window",
+    "Copy Path",
+    "Copy Relative Path",
+    "Customize Layout",
+    "Cut",
+    "Editor",
+    "Explorer",
+    "Extensions",
+    "Fix with Navigator",
+    "Focus Left Group",
+    "Focus Right Group",
+    "Go to Declaration",
+    "Go to Definition",
+    "Go to Implementations",
+    "Go to References",
+    "Go to Symbol",
+    "Go to Type Definition",
+    "Keep Open",
+    "Line",
+    "Make root",
+    "Menu",
+    "Move Above",
+    "Move Below",
+    "Move into New Window",
+    "Move Left",
+    "Move Right",
+    "New File",
+    "New Folder",
+    "Open Symbol in Its Own Tab",
+    "Panel Alignment",
+    "Paste",
+    "Pin",
+    "Primary Side Bar Position",
+    "Quick Input Position",
+    "Remote",
+    "Remove Folder from Workspace",
+    "Rename",
+    "Rename Symbol",
+    "Reveal in Explorer View",
+    "Reveal in Finder",
+    "Run and Debug",
+    "Search",
+    "Select for Compare",
+    "Show Incoming Calls",
+    "Show Outgoing Calls",
+    "Side",
+    "Source Control",
+    "Split & Move",
+    "Split Down",
+    "Split in Group",
+    "Split Left",
+    "Split Right",
+    "Split Up",
+    "Terminal",
+    "Testing",
+    "Unpin",
+    "Untitled",
+];
+
+/// A JSON template for translating into `lang`: every palette title, every
+/// key of every built-in catalog and the given extra strings, each mapped to
+/// its existing translation or `""`.
+///
+/// The keys come from ALL the built-in catalogs, not only `lang`'s: they are
+/// the one list of the strings `tr` translates outside the palette (Close,
+/// New File, `Saved {}`, ...), so a language with no catalog of its own got
+/// none of them (#849).
 pub fn template(lang: &str, extra: &[&str]) -> String {
     let catalog = catalog_for(lang, None);
+    let built_in_keys = BUILT_IN.iter().flat_map(|(_, json)| {
+        serde_json::from_str::<HashMap<String, String>>(json)
+            .map(|map| map.into_keys().collect::<Vec<_>>())
+            .unwrap_or_default()
+    });
     let mut keys: Vec<String> = crate::widgets::command_palette::ALL_COMMANDS
         .iter()
         .map(|c| c.title().to_string())
         .chain(extra.iter().map(|s| s.to_string()))
-        .chain(catalog.exact.keys().cloned())
-        .chain(
-            catalog
-                .patterns
-                .iter()
-                .map(|(p, s, _)| format!("{p}{{}}{s}")),
-        )
+        .chain(built_in_keys)
         .collect();
     keys.sort();
     keys.dedup();
@@ -265,5 +352,111 @@ mod tests {
         let map: HashMap<String, String> = serde_json::from_str(&t).unwrap();
         assert_eq!(map.get("New File").map(String::as_str), Some("Neue Datei"));
         assert!(map.contains_key("File: Save"));
+    }
+
+    /// #849: a language with no built-in catalog got the palette titles
+    /// only, missing every other string `tr` translates (Close, New File,
+    /// `Saved {}`, ...), since those keys came from `lang`'s own catalog.
+    #[test]
+    fn a_new_languages_template_lists_every_built_in_key() {
+        let fresh: HashMap<String, String> = serde_json::from_str(&template("xx", &[])).unwrap();
+        for (lang, json) in BUILT_IN {
+            let map: HashMap<String, String> = serde_json::from_str(json).unwrap();
+            for key in map.keys() {
+                assert!(
+                    fresh.contains_key(key),
+                    "{lang}'s {key:?} is missing from a new language's template"
+                );
+            }
+        }
+        assert!(
+            fresh.values().all(String::is_empty),
+            "a language with no catalog has nothing to fill in"
+        );
+        let de: HashMap<String, String> = serde_json::from_str(&template("de", &[])).unwrap();
+        assert_eq!(
+            de.len(),
+            fresh.len(),
+            "every language's template lists the same strings"
+        );
+    }
+
+    /// #849 guard: `TRANSLATABLE` holds what the palette does not. A palette
+    /// title listed again, or an entry listed twice, is a second copy to keep
+    /// in step, so neither is allowed; nor is a blank or padded entry.
+    #[test]
+    fn translatable_repeats_no_palette_title_and_no_entry() {
+        let palette: std::collections::HashSet<&str> =
+            crate::widgets::command_palette::ALL_COMMANDS
+                .iter()
+                .map(|c| c.title())
+                .collect();
+        let mut seen = std::collections::HashSet::new();
+        for s in TRANSLATABLE {
+            assert!(seen.insert(*s), "{s:?} is listed twice");
+            assert!(
+                !palette.contains(s),
+                "{s:?} is a palette title, already in every template"
+            );
+            assert!(!s.is_empty() && s.trim() == *s, "{s:?} is blank or padded");
+        }
+    }
+
+    /// #849 guard: offering every translatable string prefills nothing it
+    /// should not. A new language's template is all blanks, and a built-in
+    /// language prefills an entry only from its own exact translation, never
+    /// from a pattern: `Opened {}` would otherwise fill in a label that
+    /// merely starts with `Opened `.
+    #[test]
+    fn translatable_strings_are_offered_blank_unless_the_catalog_has_them() {
+        let fresh: HashMap<String, String> =
+            serde_json::from_str(&template("xx", TRANSLATABLE)).unwrap();
+        for s in TRANSLATABLE {
+            assert_eq!(fresh.get(*s).map(String::as_str), Some(""), "{s:?}");
+        }
+        assert!(fresh.values().all(String::is_empty));
+        for (lang, json) in BUILT_IN {
+            let own: HashMap<String, String> = serde_json::from_str(json).unwrap();
+            let t: HashMap<String, String> =
+                serde_json::from_str(&template(lang, TRANSLATABLE)).unwrap();
+            for s in TRANSLATABLE {
+                let want = own
+                    .get(*s)
+                    .filter(|v| v.as_str() != *s)
+                    .map_or("", String::as_str);
+                assert_eq!(t.get(*s).map(String::as_str), Some(want), "{lang}: {s:?}");
+            }
+        }
+    }
+
+    /// #849 guard: the keys come from every built-in catalog, the values
+    /// only from `lang`'s own. German's template carries German, never
+    /// another catalog's translation of the same string, and a string only
+    /// another language translates is offered blank.
+    #[test]
+    fn a_template_fills_in_only_its_own_languages_translations() {
+        for (lang, json) in BUILT_IN {
+            let own: HashMap<String, String> = serde_json::from_str(json).unwrap();
+            let t: HashMap<String, String> = serde_json::from_str(&template(lang, &[])).unwrap();
+            for (key, translation) in &own {
+                // A translation spelled like the English is offered blank.
+                let want = if translation == key { "" } else { translation };
+                assert_eq!(
+                    t.get(key).map(String::as_str),
+                    Some(want),
+                    "{lang}'s own {key:?}"
+                );
+            }
+            for (other, json) in BUILT_IN.iter().filter(|(l, _)| l != lang) {
+                let theirs: HashMap<String, String> = serde_json::from_str(json).unwrap();
+                for key in theirs.keys().filter(|k| !own.contains_key(*k)) {
+                    assert_eq!(
+                        t.get(key).map(String::as_str),
+                        Some(""),
+                        "{lang}'s template must offer {other}'s {key:?} blank"
+                    );
+                }
+            }
+        }
     }
 }

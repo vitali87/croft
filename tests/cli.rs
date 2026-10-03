@@ -681,3 +681,148 @@ fn locale_template_accepts_a_full_locale() {
     assert!(filled > 0, "the built-in German entries seed it");
     assert!(stderr.contains("locales/de.json"), "{stderr}");
 }
+
+/// The text a Rust string literal's body (between its quotes) spells: one
+/// pass over its escapes (`\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`,
+/// `\xNN`, `\u{...}`), as the compiler reads them.
+fn unescape_rust_literal(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('x') => {
+                let hex: String = chars.by_ref().take(2).collect();
+                out.push(char::from(u8::from_str_radix(&hex, 16).unwrap()));
+            }
+            Some('u') => {
+                let hex: String = chars.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// #849 review: the scan reads translated strings out of Rust literals, so
+/// it has to spell every escape a literal can hold the way the compiler
+/// does, or a string with a newline or tab would be looked up by the wrong
+/// key.
+#[test]
+fn unescape_rust_literal_reads_every_rust_escape() {
+    for (body, text) in [
+        (r"plain", "plain"),
+        (r#"a \"quoted\" word"#, "a \"quoted\" word"),
+        (r"back\\slash", "back\\slash"),
+        (r"line\nbreak", "line\nbreak"),
+        (r"tab\there", "tab\there"),
+        (r"cr\r", "cr\r"),
+        (r"nul\0", "nul\0"),
+        (r"it\'s", "it's"),
+        (r"hex\x41", "hexA"),
+        (r"\u{2026}\u{1F600}", "\u{2026}\u{1F600}"),
+        (
+            r"\\n stays a backslash and an n",
+            "\\n stays a backslash and an n",
+        ),
+    ] {
+        assert_eq!(unescape_rust_literal(body), text, "{body}");
+    }
+}
+
+/// Every string literal croft hands to `tr` at runtime, read from its own
+/// sources, with the file each came from: `tr("…")` calls, and context-menu
+/// labels, which `ContextMenu::localize` runs through `tr` wholesale. Test
+/// code is skipped: its strings are never shown.
+fn strings_croft_translates() -> std::collections::BTreeMap<String, String> {
+    let lit = r#""((?:[^"\\]|\\.)*)""#;
+    let patterns: Vec<regex::Regex> = [
+        format!(r"\btr\(\s*{lit}\s*\)"),
+        format!(r"MenuEntry::(?:item|header)\(\s*{lit}"),
+        format!(r"MenuEntry::item\(\s*if [^{{]*\{{\s*{lit}\s*\}}\s*else\s*\{{\s*{lit}\s*\}}"),
+        format!(r"MenuEntry::Submenu\s*\{{\s*label:\s*(?:String::from\(\s*)?{lit}"),
+        format!(r"\(\s*String::from\(\s*{lit}\s*\)\s*,\s*MenuAction::"),
+        format!(r"\(\s*{lit}\s*\.(?:to_string|to_owned|into)\(\)\s*,\s*MenuAction::"),
+    ]
+    .iter()
+    .map(|p| regex::Regex::new(p).unwrap())
+    .collect();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut dirs = vec![root.clone()];
+    let mut found = std::collections::BTreeMap::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("app/tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let text = text
+                .find("#[cfg(test)]\nmod tests")
+                .map_or(text.as_str(), |i| &text[..i]);
+            let file = path.strip_prefix(&root).unwrap().display().to_string();
+            for re in &patterns {
+                for caps in re.captures_iter(text) {
+                    for m in caps.iter().skip(1).flatten() {
+                        found.insert(unescape_rust_literal(m.as_str()), file.clone());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// #849: `croft locale-template` must offer every string croft translates,
+/// not only the palette titles and whatever a built-in catalog happens to
+/// list. Context-menu labels (Close to the Right, Keep Open, the Customize
+/// Layout headers, ...) and `tr("CodeQL")` were missing from every
+/// language's template, so no translator could ever reach them.
+#[test]
+fn locale_template_lists_every_string_croft_translates() {
+    let found = strings_croft_translates();
+    for known in [
+        "Close to the Right",
+        "Panel Alignment",
+        "CodeQL",
+        "Pin",
+        "Unpin",
+    ] {
+        assert!(
+            found.contains_key(known),
+            "the source scan still sees {known:?}; update it with the code"
+        );
+    }
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .args(["locale-template", "xx"])
+        .assert()
+        .success();
+    let template: std::collections::HashMap<String, String> =
+        serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let missing: Vec<String> = found
+        .iter()
+        .filter(|(s, _)| !template.contains_key(*s))
+        .map(|(s, file)| format!("{s:?} ({file})"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} string(s) croft translates are missing from the template; add them to \
+         i18n::TRANSLATABLE:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+}
