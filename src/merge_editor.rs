@@ -126,6 +126,10 @@ pub struct MergeView {
     pub check_spans: Vec<(u16, std::ops::Range<u16>, usize, CheckSide)>,
     /// Per-frame rect of the source-pane area (mouse routing).
     pub last_panes_area: ratatui::layout::Rect,
+    /// The side that deleted the file in a modify/delete conflict (#1244):
+    /// its pane is empty because the file is gone there, not because it was
+    /// emptied, and taking it means removing the file.
+    pub deleted: Option<CheckSide>,
 }
 
 impl MergeView {
@@ -154,6 +158,7 @@ impl MergeView {
             synced_seq: 0,
             check_spans: Vec::new(),
             last_panes_area: ratatui::layout::Rect::default(),
+            deleted: None,
         };
         (view, result)
     }
@@ -550,6 +555,7 @@ pub fn view_from_markers(lines: &[String]) -> Option<(MergeView, Vec<String>)> {
         synced_seq: 0,
         check_spans: Vec::new(),
         last_panes_area: ratatui::layout::Rect::default(),
+        deleted: None,
     };
     Some((view, result))
 }

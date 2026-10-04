@@ -307,11 +307,7 @@ impl DiffData {
         left_raw: Option<&str>,
         right_raw: Option<&str>,
     ) -> Self {
-        let rows = build_diff_rows(&left_lines, &right_lines);
-        let bytes_differ_but_lines_equal = match (left_raw, right_raw) {
-            (Some(l), Some(r)) => l != r && rows.iter().all(|r| matches!(r, DiffRow::Equal { .. })),
-            _ => false,
-        };
+        let mut rows = build_diff_rows(&left_lines, &right_lines);
         // `str::lines()` (the display split) strips `\r` and forgets whether
         // the file ended in a newline; record both so `hunk_patch` can emit
         // byte-exact lines and the `\ No newline at end of file` marker.
@@ -329,6 +325,22 @@ impl DiffData {
         };
         let (left_crlf, left_no_final_nl) = side_meta(left_raw, left_lines.len());
         let (right_crlf, right_no_final_nl) = side_meta(right_raw, right_lines.len());
+        // A line that is the unterminated last line of ONE side only differs
+        // by its newline; git counts it as changed (`-x` / `\ No newline` /
+        // `+x`), and a patch carrying it as context never applies (#1232).
+        for row in &mut rows {
+            if let DiffRow::Equal { left, right } = *row {
+                let left_open = left_no_final_nl && left + 1 == left_lines.len();
+                let right_open = right_no_final_nl && right + 1 == right_lines.len();
+                if left_open != right_open {
+                    *row = DiffRow::Replaced { left, right };
+                }
+            }
+        }
+        let bytes_differ_but_lines_equal = match (left_raw, right_raw) {
+            (Some(l), Some(r)) => l != r && rows.iter().all(|r| matches!(r, DiffRow::Equal { .. })),
+            _ => false,
+        };
         Self {
             source: DiffSource::Static,
             seats: crate::provenance::Provenance::new(),
@@ -1339,7 +1351,6 @@ impl DiffData {
     pub fn selected_lines_patch(&self, rel_path: &str, sel: (usize, usize)) -> Option<String> {
         const CTX: usize = 3;
         let (sel_start, sel_end) = (sel.0.min(sel.1), sel.0.max(sel.1));
-        let selected = |i: usize| i >= sel_start && i <= sel_end;
         let is_change = |i: usize| !matches!(self.rows.get(i), Some(DiffRow::Equal { .. }) | None);
         if !(sel_start..=sel_end.min(self.rows.len().saturating_sub(1))).any(is_change) {
             return None;
@@ -1354,6 +1365,18 @@ impl DiffData {
         while he + 1 < self.rows.len() && is_change(he + 1) {
             he += 1;
         }
+        // A line whose only change is its final newline goes with any
+        // selection in its run: the lines added after it need that newline,
+        // and a deletion before it needs the line to lose it (#1232).
+        let newline_only = |i: usize| match self.rows.get(i) {
+            Some(DiffRow::Replaced { left, right }) => {
+                self.left_lines[*left] == self.right_lines[*right]
+                    && (*left + 1 == self.left_lines.len() || *right + 1 == self.right_lines.len())
+            }
+            _ => false,
+        };
+        let selected =
+            |i: usize| (i >= sel_start && i <= sel_end) || (i >= hs && i <= he && newline_only(i));
         let s = hs.saturating_sub(CTX);
         let e = (he + CTX).min(self.rows.len().saturating_sub(1));
         const NO_NL: &str = "\\ No newline at end of file";
@@ -1561,9 +1584,8 @@ impl DiffData {
                     old_count += 1;
                     new_count += 1;
                     body.push(left_line(' ', left));
-                    // A context marker asserts BOTH sides end unterminated;
-                    // if only one does, the last "equal" line is not equal
-                    // byte-wise and git rightly refuses the patch.
+                    // Both sides end unterminated here: the build turns a
+                    // line only one side leaves open into a change.
                     if left_last(left) && right_last(right) {
                         body.push(NO_NL.into());
                     }
@@ -1675,7 +1697,9 @@ fn parse_diff_git_new_path(text: &str) -> Option<String> {
         && (p.len() - 3) % 2 == 0
     {
         let n = (p.len() - 3) / 2;
-        if p.is_char_boundary(n) && &p[n..n + 3] == " b/" && p[..n] == p[n + 3..] {
+        // `get` rather than indexing: either end of the window can fall
+        // inside a multi-byte character of a renamed path (#1166).
+        if p.get(n..n + 3) == Some(" b/") && p[..n] == p[n + 3..] {
             return Some(p[n + 3..].to_string());
         }
     }
@@ -2376,6 +2400,161 @@ mod tests {
         }
     }
 
+    fn git_apply(root: &std::path::Path, patch: &str, args: &[&str]) -> Result<(), String> {
+        use std::io::Write;
+        let mut child = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "apply"])
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(patch.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        }
+    }
+
+    fn staged_text(root: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// #1232: stage the one hunk, then revert it from the work tree; the
+    /// index must hold `work` and the file must go back to `head`, byte
+    /// for byte.
+    fn stage_and_revert_round_trip(head: &str, work: &str) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(&root, head, work);
+        let start = (0..d.rows.len())
+            .find(|&i| !matches!(d.rows[i], DiffRow::Equal { .. }))
+            .expect("a change row");
+        let range = d.hunk_range_at(start).unwrap();
+        let patch = d.hunk_patch("f.txt", range);
+        if let Err(e) = git_apply(&root, &patch, &["--cached"]) {
+            panic!("stage failed:\n{patch}\n{e}");
+        }
+        assert_eq!(staged_text(&root), work, "the index holds the work tree");
+        if let Err(e) = git_apply(&root, &patch, &["-R"]) {
+            panic!("revert failed:\n{patch}\n{e}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            head,
+            "revert restores HEAD's bytes"
+        );
+    }
+
+    #[test]
+    fn appending_to_a_file_without_a_final_newline_stages_and_reverts() {
+        stage_and_revert_round_trip("no newline end", "no newline end\nadded");
+    }
+
+    #[test]
+    fn appending_a_terminated_line_stages_and_reverts() {
+        stage_and_revert_round_trip("a", "a\nb\n");
+    }
+
+    #[test]
+    fn deleting_the_last_unterminated_line_stages_and_reverts() {
+        stage_and_revert_round_trip("a\nb\nc", "a\nb");
+    }
+
+    #[test]
+    fn adding_only_a_final_newline_stages_and_reverts() {
+        stage_and_revert_round_trip("a\nb", "a\nb\n");
+    }
+
+    #[test]
+    fn the_unterminated_line_shows_as_changed_when_one_side_ends_it() {
+        let d = DiffData::build_with_byte_check(
+            PathBuf::new(),
+            PathBuf::new(),
+            vec!["a".into()],
+            vec!["a".into(), "b".into()],
+            Some("a"),
+            Some("a\nb"),
+        );
+        assert!(
+            matches!(d.rows[0], DiffRow::Replaced { left: 0, right: 0 }),
+            "git counts `a` as changed: {:?}",
+            d.rows
+        );
+    }
+
+    #[test]
+    fn selecting_only_the_added_line_still_carries_the_newline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (head, work) = ("a", "a\nb");
+        git_repo_with(&root, head);
+        std::fs::write(root.join("f.txt"), work).unwrap();
+        let d = head_diff(&root, head, work);
+        let patch = d.selected_lines_patch("f.txt", (1, 1)).unwrap();
+        if let Err(e) = git_apply(&root, &patch, &["--cached"]) {
+            panic!("stage failed:\n{patch}\n{e}");
+        }
+        assert_eq!(staged_text(&root), work);
+    }
+
+    #[test]
+    fn a_line_both_sides_leave_unterminated_stays_context() {
+        // Negative: an edit above the last line keeps `b` as context on
+        // both sides, as git does.
+        let d = DiffData::build_with_byte_check(
+            PathBuf::new(),
+            PathBuf::new(),
+            vec!["a".into(), "b".into()],
+            vec!["A".into(), "b".into()],
+            Some("a\nb"),
+            Some("A\nb"),
+        );
+        assert!(matches!(d.rows[1], DiffRow::Equal { .. }));
+        let patch = d.hunk_patch("f.txt", d.hunk_range_at(0).unwrap());
+        assert!(
+            patch.ends_with(" b\n\\ No newline at end of file\n"),
+            "{patch}"
+        );
+        stage_and_revert_round_trip("a\nb", "A\nb");
+    }
+
+    #[test]
+    fn terminated_last_lines_stay_context() {
+        // Negative: with a final newline on both sides nothing changes.
+        let d = DiffData::build_with_byte_check(
+            PathBuf::new(),
+            PathBuf::new(),
+            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "c".into()],
+            Some("a\nb\n"),
+            Some("a\nb\nc\n"),
+        );
+        assert!(
+            d.rows[..2]
+                .iter()
+                .all(|r| matches!(r, DiffRow::Equal { .. }))
+        );
+        assert!(
+            !d.hunk_patch("f.txt", d.hunk_range_at(2).unwrap())
+                .contains("-b")
+        );
+        stage_and_revert_round_trip("a\nb\n", "a\nb\nc\n");
+    }
+
     #[test]
     fn hunk_patches_apply_to_crlf_files() {
         // `str::lines()` also strips the `\r`, so a patch against a CRLF
@@ -2695,12 +2874,12 @@ mod tests {
     }
 
     #[test]
-    fn build_with_byte_check_flags_trailing_newline_only_difference() {
-        // Same lines on both sides but the working copy lost its trailing
-        // newline. `.lines()` collapses the difference; the byte check
-        // catches it so the renderer can surface a banner.
+    fn build_with_byte_check_flags_a_crlf_only_difference() {
+        // Same lines on both sides but the working copy switched to CRLF.
+        // `.lines()` collapses the difference; the byte check catches it so
+        // the renderer can surface a banner.
         let left_text = "alpha\nbeta\n";
-        let right_text = "alpha\nbeta";
+        let right_text = "alpha\r\nbeta\r\n";
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
         let d = DiffData::build_with_byte_check(
@@ -2713,12 +2892,30 @@ mod tests {
         );
         assert!(
             d.bytes_differ_but_lines_equal,
-            "trailing-newline difference must set bytes_differ_but_lines_equal so the diff header explains why no red/green band paints"
+            "a CRLF-only difference must set bytes_differ_but_lines_equal so the diff header explains why no red/green band paints"
         );
         assert!(
             d.rows.iter().all(|r| matches!(r, DiffRow::Equal { .. })),
             "the line-level diff is still entirely Equal rows — the flag is what tells the user the file is byte-different"
         );
+    }
+
+    #[test]
+    fn a_lost_final_newline_is_a_changed_line_not_a_banner() {
+        // #1232: git shows `-beta` / `+beta` / `\ No newline`, so the view
+        // shows the row as changed and the hunk actions can reach it.
+        let d = DiffData::build_with_byte_check(
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+            vec!["alpha".into(), "beta".into()],
+            vec!["alpha".into(), "beta".into()],
+            Some("alpha\nbeta\n"),
+            Some("alpha\nbeta"),
+        );
+        assert!(!d.bytes_differ_but_lines_equal);
+        assert!(matches!(d.rows[0], DiffRow::Equal { .. }));
+        assert!(matches!(d.rows[1], DiffRow::Replaced { left: 1, right: 1 }));
+        assert_eq!(d.hunk_range_at(1), Some((1, 1)));
     }
 
     #[test]
@@ -2912,6 +3109,30 @@ mod tests {
             parse_diff_git_new_path("diff --git a/old.rs b/new.rs").as_deref(),
             Some("new.rs")
         );
+    }
+
+    #[test]
+    fn a_rename_whose_old_path_splits_a_character_at_the_midpoint_reads_the_new_path() {
+        // #1166: the midpoint window ends inside the emoji, so slicing it
+        // panicked and took the editor down.
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/aaaaa\u{1F600} b/x").as_deref(),
+            Some("x")
+        );
+        // Accented letters, two bytes each, straddling the window's end.
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/a\u{e9}\u{e9}\u{e9}\u{e9} b/x").as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn a_header_with_no_b_side_still_yields_no_path() {
+        assert_eq!(
+            parse_diff_git_new_path("diff --git a/\u{1F600}\u{1F600}"),
+            None
+        );
+        assert_eq!(parse_diff_git_new_path("index 0000000..1111111"), None);
     }
 
     #[test]
