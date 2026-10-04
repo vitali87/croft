@@ -19224,7 +19224,7 @@ fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
 
 #[test]
 fn remote_launched_drop_queues_pull_request_via_relay_log() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // The user dragged a Finder file onto a remote-launched croft. The Mac path
     // doesn't exist on the remote box, but the session is a `croft remote` child
     // (CROFT_REMOTE_AUTOUPDATE set) whose local parent runs a drop pump, so the
@@ -19321,7 +19321,7 @@ fn cmd_c_inside_a_mouse_tracking_program_says_why_nothing_was_copied() {
 /// same road in the other direction.
 #[test]
 fn copying_on_a_relay_session_pushes_the_text_to_the_local_clipboard() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -19409,7 +19409,7 @@ fn pure_path_payload_distinguishes_finder_drag_from_text_paste() {
 
 #[test]
 fn remote_finder_drag_queues_pull_without_tree_focus() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // A drop does not move keyboard focus to the Explorer tree, so a focus-only
     // gate dropped drags whenever the user had last clicked the terminal or
     // editor. A pure-path payload must be recognised regardless of focus.
@@ -19433,7 +19433,7 @@ fn remote_finder_drag_queues_pull_without_tree_focus() {
 
 #[test]
 fn drain_remote_pulls_imports_file_when_relay_signals_ok() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut app = App::new(workspace.path().to_path_buf()).unwrap();
@@ -19470,7 +19470,7 @@ fn drain_remote_pulls_imports_file_when_relay_signals_ok() {
 
 #[test]
 fn drain_remote_pulls_surfaces_relay_error_message() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut app = App::new(workspace.path().to_path_buf()).unwrap();
@@ -43501,7 +43501,7 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
             *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
         }
     }
-    let _cache_lock = relay_test_lock().lock().unwrap();
+    let _cache_lock = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _restore = RestoreCacheDir;
     *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
 
@@ -59947,6 +59947,53 @@ fn fake_codeql(dir: &std::path::Path, body: &str, code: i32, err: &str) -> std::
     bin
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_codeql_cli_still_open_for_writing_runs_once_it_is_released() {
+    // A codeql binary just written (an update, or a test's stand-in) is
+    // "Text file busy" while a process forked meanwhile holds its write
+    // descriptor. The run waits that out instead of failing outright.
+    let bin = tempfile::tempdir().unwrap();
+    let program = fake_codeql(bin.path(), "", 0, "");
+    let writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&program)
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(writer);
+    });
+    let summary = App::codeql_command(&program, &[String::from("generate")]);
+    let stdout = App::codeql_stdout(&program, &[String::from("version")]);
+    release.join().unwrap();
+    assert_eq!(summary, Ok(()), "a busy CLI is retried, not reported");
+    assert!(stdout.is_ok(), "{stdout:?}");
+    let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+    assert_eq!(calls, "generate\nversion\n", "each command ran once");
+}
+
+#[test]
+fn a_missing_or_failing_codeql_cli_still_fails_at_once() {
+    // Only "Text file busy" is waited out: a missing CLI and one that
+    // exits non-zero report straight away.
+    let bin = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let missing = App::codeql_command(&bin.path().join("no-codeql"), &[]);
+    assert!(
+        missing
+            .as_ref()
+            .is_err_and(|e| e.starts_with("could not run codeql:")),
+        "{missing:?}"
+    );
+    let failing = fake_codeql(bin.path(), "", 2, "A fatal error occurred: no database");
+    assert!(App::codeql_command(&failing, &[]).is_err());
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(400),
+        "no retry delay for a real failure: {:?}",
+        started.elapsed()
+    );
+}
+
 /// Drain the query run until it lands, or fail after a few seconds.
 fn wait_for_codeql(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -65651,7 +65698,7 @@ fn fleet_shell_commands_quote_the_target() {
 #[test]
 fn a_forwarded_port_is_reused_and_a_pending_forward_not_repeated() {
     use crate::widgets::ports::PortOrigin;
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut app = App::new(workspace.path().to_path_buf()).unwrap();
