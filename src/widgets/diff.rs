@@ -172,6 +172,10 @@ pub struct DiffData {
     /// against. Gates stage/unstage/revert: a Timeline snapshot diff is
     /// built by the same opener and must not reach the git index.
     pub left_is_git_head: bool,
+    /// The encoding both sides were decoded with: UTF-8 unless the file's tab
+    /// was reopened with another (#1242). Hunk patches are built from the
+    /// decoded text, so stage/unstage/revert are refused for any other.
+    pub text_encoding: &'static encoding_rs::Encoding,
     /// Per-line CRLF flags and final-newline facts for byte-exact hunk
     /// patches: the display lines are `str::lines()`-cleaned, which erases
     /// both. Empty/false when raw text was not supplied (hunk actions are
@@ -351,6 +355,7 @@ impl DiffData {
             find: DiffFindState::default(),
             nav_anchor: None,
             left_is_git_head: false,
+            text_encoding: encoding_rs::UTF_8,
             left_crlf,
             right_crlf,
             left_no_final_nl,
@@ -389,6 +394,7 @@ impl DiffData {
             find: DiffFindState::default(),
             nav_anchor: None,
             left_is_git_head: false,
+            text_encoding: encoding_rs::UTF_8,
             left_crlf: Vec::new(),
             right_crlf: Vec::new(),
             left_no_final_nl: false,
@@ -446,6 +452,7 @@ impl DiffData {
                 find: DiffFindState::default(),
                 nav_anchor: None,
                 left_is_git_head: false,
+                text_encoding: encoding_rs::UTF_8,
                 left_crlf: Vec::new(),
                 right_crlf: Vec::new(),
                 left_no_final_nl: false,
@@ -548,6 +555,7 @@ impl DiffData {
             find: DiffFindState::default(),
             nav_anchor: None,
             left_is_git_head: false,
+            text_encoding: encoding_rs::UTF_8,
             left_crlf: Vec::new(),
             right_crlf: Vec::new(),
             left_no_final_nl: false,
