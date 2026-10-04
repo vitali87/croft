@@ -92,6 +92,7 @@ pub enum Command {
     UnfoldAllRegions,
     // --- File / editor management ---
     SaveFile,
+    SaveAs,
     /// File: Save All (#852): every dirty tab, in every split.
     SaveAll,
     /// File: New File… / New Folder… (#852): the Explorer's create prompt
@@ -503,6 +504,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::FoldAllRegions,
     Command::UnfoldAllRegions,
     Command::SaveFile,
+    Command::SaveAs,
     Command::SaveAll,
     Command::NewFile,
     Command::NewFolder,
@@ -869,6 +871,7 @@ impl Command {
             Command::FoldAllRegions => "Fold All Regions",
             Command::UnfoldAllRegions => "Unfold All Regions",
             Command::SaveFile => "File: Save",
+            Command::SaveAs => "File: Save As…",
             Command::SaveAll => "File: Save All",
             Command::NewFile => "File: New File…",
             Command::NewFolder => "File: New Folder…",
@@ -1236,6 +1239,7 @@ impl Command {
             Command::FoldAllRegions => "Cmd+K Cmd+8",
             Command::UnfoldAllRegions => "Cmd+K Cmd+9",
             Command::SaveFile => "Cmd+S",
+            Command::SaveAs => "",
             // VS Code's macOS chord; its Linux `Ctrl+K S` is Select for
             // Compare here, so Linux takes `Ctrl+Alt+S` instead.
             Command::SaveAll => "Cmd+Opt+S",
@@ -1588,6 +1592,7 @@ impl Command {
             Command::FoldAllRegions => "fold_all_regions",
             Command::UnfoldAllRegions => "unfold_all_regions",
             Command::SaveFile => "save_file",
+            Command::SaveAs => "save_as",
             Command::SaveAll => "save_all",
             Command::NewFile => "new_file",
             Command::NewFolder => "new_folder",

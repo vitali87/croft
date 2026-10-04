@@ -296,9 +296,21 @@ pub fn remote_hash_script() -> String {
     let names: Vec<&str> = SYNCABLE.iter().map(|s| s.name).collect();
     let names = names.join(" ");
     format!(
-        "cd ~/.config/croft 2>/dev/null || exit 0; for f in {names}; do [ -f \"$f\" ] || continue; \
+        "echo {HASHES_HEADER}; cd ~/.config/croft 2>/dev/null || exit 0; for f in {names}; do [ -f \"$f\" ] || continue; \
          if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$f\"; else shasum -a 256 \"$f\"; fi; done"
     )
+}
+
+/// The first line [`remote_hash_script`] prints, so an empty read can't
+/// pass for a remote with no config files (#1247).
+pub const HASHES_HEADER: &str = "croft-config-hashes";
+
+/// [`remote_hash_script`]'s output as file name → hash, or `None` when the
+/// header is missing: the listing was not read, so nothing is known about
+/// the remote and nothing may be pushed over it.
+pub fn parse_remote_listing(out: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut lines = out.lines().skip_while(|l| l.trim().is_empty());
+    (lines.next()?.trim() == HASHES_HEADER).then(|| parse_remote_hashes(out))
 }
 
 /// Parse [`remote_hash_script`]'s output into file name → hash. Only
@@ -455,12 +467,33 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success());
-        let got = parse_remote_hashes(&String::from_utf8_lossy(&out.stdout));
+        let got = parse_remote_listing(&String::from_utf8_lossy(&out.stdout)).unwrap();
         assert_eq!(
             got.into_iter().collect::<Vec<_>>(),
             [(String::from("keybindings.json"), content_hash(b"{}\n"))]
         );
         assert_eq!(content_hash(b"").len(), 64);
+    }
+
+    #[test]
+    fn an_empty_listing_reads_as_unknown_not_absent() {
+        // #1247: an empty read must never mean "absent there, push over it".
+        assert_eq!(parse_remote_listing(""), None);
+        let h = "a".repeat(64);
+        assert_eq!(parse_remote_listing(&format!("{h}  snippets.json\n")), None);
+        let got = parse_remote_listing(&format!("{HASHES_HEADER}\n{h}  snippets.json\n")).unwrap();
+        assert_eq!(got.get("snippets.json"), Some(&h));
+        // A remote with no config dir answers with the header alone.
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &remote_hash_script()])
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            parse_remote_listing(&String::from_utf8_lossy(&out.stdout)),
+            Some(Default::default())
+        );
     }
 
     #[test]

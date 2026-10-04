@@ -1,0 +1,1 @@
+fix: Adding a CodeQL database from GitHub, a URL or an archive no longer freezes croft for the whole download; it runs in the background, the GitHub download streams to disk instead of being held in memory, and the database appears in the side bar when it is ready.
