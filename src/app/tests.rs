@@ -68761,6 +68761,33 @@ fn a_windows_1252_file_opens_its_source_control_diff() {
     assert_eq!(changed, 1, "only the added line differs");
 }
 
+/// With no tab open, the file is decoded the way opening it would: a BOM
+/// names its encoding, so a closed UTF-16 file still opens its diff.
+#[test]
+fn a_closed_utf16_file_opens_its_source_control_diff() {
+    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let head = [&[0xff, 0xfe][..], &utf16("one\ntwo\n")].concat();
+    let (tmp, _) = encoded_repo("app.rc", &head, &utf16("three\n"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control.entries.iter().any(|e| e.path == "app.rc")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "app.rc")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    let diff = app
+        .editor
+        .diff
+        .as_ref()
+        .unwrap_or_else(|| panic!("no diff opened: {}", app.status));
+    assert_eq!(diff.left_lines, ["one", "two"]);
+    assert_eq!(diff.right_lines.last().map(String::as_str), Some("three"));
+}
+
 /// Staging a hunk writes the diff's decoded text back as a patch, which for
 /// a non-UTF-8 file would put UTF-8 bytes into a windows-1252 blob: refused,
 /// and the index is left alone.

@@ -62270,7 +62270,9 @@ impl App {
     }
 
     /// The encoding `path`'s open tab decodes it with, in any group; UTF-8
-    /// when it isn't open.
+    /// when it isn't open, which is what opening it would pick: a BOM still
+    /// wins in `decode_blob`, and bytes that are not UTF-8 get the plain
+    /// open rather than an editable diff of replacement characters.
     fn open_tab_encoding(&self, path: &Path) -> &'static encoding_rs::Encoding {
         std::iter::once(&self.editor)
             .chain(self.editor_layout.inactive_groups())
