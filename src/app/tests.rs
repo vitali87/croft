@@ -53495,10 +53495,104 @@ fn a_sticky_note_is_a_box_that_follows_its_line_and_takes_replies() {
     );
 
     app.editor.comment_focus = None;
-    app.editor.cursor_row = 0;
+    app.editor.cursor_row = 3;
     app.delete_sticky_note_here();
     term.draw(|fr| app.render(fr)).unwrap();
     assert!(!app.editor.comment_boxes.iter().any(|x| x.id == b.id));
+}
+
+/// An App on a 120-line `mod.py` with one note on line 113 (row 112), drawn
+/// once so the note has its box.
+fn app_with_a_note_far_down() -> (
+    tempfile::TempDir,
+    App,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("mod.py");
+    let src: String = (0..60)
+        .map(|i| format!("def f{i}(x):\n    return x + {i}\n"))
+        .collect();
+    std::fs::write(&f, src).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_row = 112;
+    app.add_sticky_note("TODO before release, f56 must handle negative x");
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|fr| app.render(fr)).unwrap();
+    (tmp, app, term)
+}
+
+fn live_note_bodies(app: &App) -> Vec<String> {
+    app.notes.live().map(|n| n.body.clone()).collect()
+}
+
+/// #1131: Delete Note with the caret on line 1 must not reach down to a
+/// note on line 113 the user can't see.
+#[test]
+fn delete_note_leaves_a_note_further_down_the_file_alone() {
+    let (_tmp, mut app, _term) = app_with_a_note_far_down();
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 0;
+    app.delete_sticky_note_here();
+    assert_eq!(
+        live_note_bodies(&app),
+        vec!["TODO before release, f56 must handle negative x"],
+        "the note on line 113 survives"
+    );
+    assert_eq!(app.status, "No note on this line");
+}
+
+/// The note on the caret's own line still goes, and the status names it.
+#[test]
+fn delete_note_removes_the_note_on_the_caret_line() {
+    let (_tmp, mut app, _term) = app_with_a_note_far_down();
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 112;
+    app.delete_sticky_note_here();
+    assert!(live_note_bodies(&app).is_empty());
+    assert_eq!(
+        app.status,
+        "Note deleted on line 113: TODO before release, f56 must handle"
+    );
+}
+
+/// A note whose box has focus goes wherever the caret is.
+#[test]
+fn delete_note_removes_the_focused_note_whatever_the_caret_line() {
+    let (_tmp, mut app, _term) = app_with_a_note_far_down();
+    let id = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|b| b.body.starts_with("TODO before release"))
+        .map(|b| b.id)
+        .expect("the note is drawn as a box");
+    app.editor.cursor_row = 0;
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id,
+        reply: String::new(),
+        cursor: 0,
+    });
+    app.delete_sticky_note_here();
+    assert!(live_note_bodies(&app).is_empty());
+    assert!(
+        app.status.starts_with("Note deleted on line 113"),
+        "{}",
+        app.status
+    );
+}
+
+/// A caret below every note doesn't wrap round to delete one above it.
+#[test]
+fn delete_note_below_the_last_note_deletes_nothing() {
+    let (_tmp, mut app, _term) = app_with_a_note_far_down();
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 119;
+    app.delete_sticky_note_here();
+    assert_eq!(live_note_bodies(&app).len(), 1);
+    assert_eq!(app.status, "No note on this line");
 }
 
 /// A test-built App never reads the developer's own settings layers: a

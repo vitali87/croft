@@ -33764,7 +33764,9 @@ impl App {
         true
     }
 
-    /// Notes: Delete Note: the focused note, else the next from the caret.
+    /// Notes: Delete Note: the focused note, else the one on the caret's
+    /// line. A note further down is never reached for: a tombstone can't be
+    /// undone, so the command deletes only a note the user is on (#1131).
     fn delete_sticky_note_here(&mut self) {
         let id = self
             .editor
@@ -33777,16 +33779,27 @@ impl App {
                 let lines = &self.editor.lines;
                 self.notes
                     .on_file(&file)
-                    .map(|n| (n.place(lines), Self::note_box_id(&n.id)))
-                    .filter(|(row, _)| *row >= self.editor.cursor_row)
-                    .min()
-                    .map(|(_, id)| id)
+                    .find(|n| n.place(lines) == self.editor.cursor_row)
+                    .map(|n| Self::note_box_id(&n.id))
             });
-        match id {
-            Some(id) if self.change_note_box(id, |n| n.deleted = true) => {
-                self.status = String::from("Note deleted");
-            }
-            _ => self.status = String::from("No note here"),
+        let Some(note) = id
+            .and_then(|id| self.note_box_ids.get(&id))
+            .and_then(|note_id| self.notes.get(note_id))
+        else {
+            self.status = String::from("No note on this line");
+            return;
+        };
+        let line = note.place(&self.editor.lines) + 1;
+        let first = note.body.lines().next().unwrap_or_default();
+        // The first words, cut at a space so the status doesn't end mid-word.
+        let mut gist = truncate_for_display(first, 40);
+        if gist.len() < first.len()
+            && let Some(cut) = gist.rfind(' ')
+        {
+            gist.truncate(cut);
+        }
+        if id.is_some_and(|id| self.change_note_box(id, |n| n.deleted = true)) {
+            self.status = format!("Note deleted on line {line}: {gist}");
         }
     }
 
