@@ -148,7 +148,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | Preferences: Open Keyboard Shortcuts (JSON) | `keybindings.json` | Rebind any palette command; **applies on save** |
 | Preferences: Configure User Snippets | `snippets.json` | Define snippets; **applies on save** |
 
-**Custom keybindings.** `keybindings.json` is a JSON (with `//` comments) array of `{ "key": …, "command": … }`:
+**Custom keybindings.** `keybindings.json` is a JSONC (`//` and `/* */` comments and trailing commas are fine, as in VS Code) array of `{ "key": …, "command": … }`:
 
 * `key` is a chord like `ctrl+shift+p`, `cmd+,`, `alt+up`, or `f2`. Modifiers are `ctrl`, `alt`/`opt`, `shift`, `cmd`/`super`, and `mod` (Cmd on macOS, Ctrl elsewhere).
 * `command` is a palette command id (see the ids in `Preferences: Open Settings`, e.g. `save_file`, `quick_open`, `toggle_terminal`).
@@ -158,7 +158,7 @@ These restrictions cover KEYBOARD chords only. They apply while any pane except 
 
 In iTerm2, reserved `Cmd` chords must be forwarded first (`croft setup-iterm2`); `Ctrl`/`Alt`/function-key bindings always reach croft, and Ghostty forwards everything after `croft setup-ghostty`.
 
-**User snippets.** `snippets.json` mirrors VS Code's global snippets file: an object keyed by a name, each with a `prefix`, a `body` (a string or an array of lines), and an optional `scope` (comma-separated language ids; omit for every language). Type a snippet's prefix and press `Tab` to expand it, or pick it from the completion popup, where it appears alongside language-server suggestions and is accepted with `Enter`/`Tab`.
+**User snippets.** `snippets.json` mirrors VS Code's global snippets file: an object keyed by a name, each with a `prefix`, a `body` (a string or an array of lines), and an optional `scope` (comma-separated language ids; omit for every language). Type a snippet's prefix and press `Tab` to expand it, or pick it from the completion popup, where it appears alongside language-server suggestions and is accepted with `Enter`/`Tab`. Like VS Code's, the file is JSONC: comments and trailing commas are fine. A file that still does not parse loads no snippets and says why in OUTPUT · Snippets.
 
 The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in order with `Tab`, `$0` is the final caret, and `${1:name}` seeds a stop with selected placeholder text. Continuation lines are re-indented to the caret. Language-server completions that arrive as snippets (rust-analyzer's `println!` and the like) expand the same way.
 

@@ -66276,3 +66276,13 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         app.settings_chain
     );
 }
+
+#[test]
+fn a_snippets_file_that_loads_nothing_says_where_to_look() {
+    // #1191: a broken snippets.json used to reload as "Snippets reloaded"
+    // with nothing loaded.
+    let status = super::snippets_reload_status(true);
+    assert!(status.contains("not loaded"), "{status}");
+    assert!(status.contains("OUTPUT · Snippets"), "{status}");
+    assert_eq!(super::snippets_reload_status(false), "Snippets reloaded");
+}
