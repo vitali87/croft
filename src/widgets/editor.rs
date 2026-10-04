@@ -7166,6 +7166,48 @@ impl Editor {
         self.insert_str_as(s, crate::provenance::Seat::Me);
     }
 
+    /// A paste from the clipboard (#1218). The text goes in verbatim as one
+    /// undo step; then, when `reindent` is on and it spans lines in a code
+    /// buffer, a second step moves lines 2.. under the caret line's
+    /// indentation, keeping their indentation relative to each other (Zed's
+    /// `auto_indent_on_paste`). One Ctrl+Z therefore gives back the verbatim
+    /// text. Pasting a loop into a nested Python block left its body at the
+    /// clipboard's absolute indentation, outside the block.
+    pub fn paste_str(&mut self, s: &str, reindent: bool) {
+        let text = normalize_newlines(s);
+        let (sr, sc) = match self.selection.filter(|sel| sel.has_area()) {
+            Some(sel) => sel.normalised().0,
+            None => (self.cursor_row, self.cursor_col),
+        };
+        let line = self.lines.get(sr).cloned().unwrap_or_default();
+        let before: String = line.chars().take(sc).collect();
+        self.insert_str(&text);
+        let code = !matches!(self.lang, None | Some(LangKind::Markdown));
+        if !reindent || !code || !text.contains('\n') {
+            return;
+        }
+        let at_indent = before.chars().all(char::is_whitespace);
+        let base = match at_indent {
+            true => before,
+            false => line.chars().take_while(|c| c.is_whitespace()).collect(),
+        };
+        let (tab, spaces) = self.indent_preference();
+        let edits = paste_reindent_edits(&text, sr, sc, &base, at_indent, tab, spaces);
+        if edits.is_empty() {
+            return;
+        }
+        let last = sr + text.matches('\n').count();
+        let shift: isize = edits
+            .iter()
+            .filter(|e| e.start.0 == last)
+            .map(|e| e.new_text.chars().count() as isize - (e.end.1 - e.start.1) as isize)
+            .sum();
+        self.apply_span_edits(&edits);
+        self.cursor_row = last;
+        self.cursor_col = self.cursor_col.saturating_add_signed(shift);
+        self.clamp_cursor();
+    }
+
     /// [`Self::insert_str`], attributing the inserted lines to `seat` (#349).
     ///
     /// The seat is a parameter rather than editor state because the same
@@ -13361,6 +13403,82 @@ pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The edits that re-indent a paste of `text` made at `(row, col)` (#1218):
+/// every later line moves under `base` (the caret line's indentation) by its
+/// indentation relative to the least-indented line, written in the buffer's
+/// style. The first line counts toward that least indentation when the paste
+/// starts in the caret line's leading whitespace, and then loses its own
+/// leading whitespace (the caret's column already indents it). Lines that are
+/// only whitespace are emptied; a final segment that is only whitespace is
+/// left alone, as the rest of the caret's line follows it.
+fn paste_reindent_edits(
+    text: &str,
+    row: usize,
+    col: usize,
+    base: &str,
+    at_indent: bool,
+    tab: u32,
+    spaces: bool,
+) -> Vec<TextSpanEdit> {
+    let tab = tab.max(1) as usize;
+    let segs: Vec<&str> = text.split('\n').collect();
+    let n = segs.len() - 1;
+    let ws_of = |l: &str| -> (usize, usize) {
+        let mut chars = 0;
+        let mut width = 0;
+        for c in l.chars() {
+            match c {
+                ' ' => width += 1,
+                '\t' => width += tab - width % tab,
+                _ => break,
+            }
+            chars += 1;
+        }
+        (chars, width)
+    };
+    let blank = |l: &str| l.trim().is_empty();
+    let counted = segs
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| (*i > 0 || at_indent) && !blank(l))
+        .map(|(_, l)| ws_of(l).1);
+    let Some(least) = counted.min() else {
+        return Vec::new();
+    };
+    let render = |width: usize| match spaces {
+        true => " ".repeat(width),
+        false => format!("{}{}", "\t".repeat(width / tab), " ".repeat(width % tab)),
+    };
+    let edit = |r: usize, from: usize, to: usize, new_text: String| TextSpanEdit {
+        start: (r, from),
+        end: (r, to),
+        new_text,
+        utf16: false,
+    };
+    let mut edits = Vec::new();
+    let (first_chars, _) = ws_of(segs[0]);
+    if at_indent && first_chars > 0 {
+        edits.push(edit(row, col, col + first_chars, String::new()));
+    }
+    for (i, seg) in segs.iter().enumerate().skip(1) {
+        let (chars, width) = ws_of(seg);
+        let new_ws = match blank(seg) {
+            true if i == n => continue,
+            true => String::new(),
+            false => format!("{base}{}", render(width - least)),
+        };
+        let whole = if blank(seg) {
+            seg.chars().count()
+        } else {
+            chars
+        };
+        if seg.chars().take(whole).collect::<String>() != new_ws {
+            edits.push(edit(row + i, 0, whole, new_ws));
+        }
+    }
+    edits
+}
+
 /// Fold every line-ending convention to `\n` so callers can split on it
 /// alone. Shared by the file loader and the find bar's replacement paths: a
 /// replacement carrying `\r` (VS Code's escape, or pasted CRLF text) must
@@ -18923,6 +19041,121 @@ mod tests {
         assert_eq!(e.word_string_at(0, 13).as_deref(), Some("count"));
         // over the '=' (non-word) => None
         assert_eq!(e.word_string_at(0, 10), None);
+    }
+
+    // ---- Paste keeps relative indentation (#1218) ----
+
+    const SHOP: &str = "class Shop:\n    def total(self, items):\n        if items:\n            n = 0\n            \n        return 0";
+    const LOOP: &str = "for x in items:\n    if x:\n        print(x)";
+
+    fn shop() -> Editor {
+        let mut e = editor_with(SHOP);
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 4;
+        e.cursor_col = 12;
+        e
+    }
+
+    #[test]
+    fn a_pasted_block_keeps_its_shape_under_the_caret() {
+        let mut e = shop();
+        e.paste_str(LOOP, true);
+        assert_eq!(
+            &e.lines[4..8],
+            &[
+                "            for x in items:",
+                "                if x:",
+                "                    print(x)",
+                "        return 0",
+            ]
+        );
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (6, 28),
+            "the caret ends after print(x)"
+        );
+    }
+
+    #[test]
+    fn one_undo_restores_the_verbatim_paste_and_a_second_removes_it() {
+        let mut e = shop();
+        e.paste_str(LOOP, true);
+        assert!(e.undo());
+        assert_eq!(
+            &e.lines[4..7],
+            &[
+                "            for x in items:",
+                "    if x:",
+                "        print(x)"
+            ]
+        );
+        assert!(e.undo());
+        assert_eq!(e.lines.join("\n"), SHOP);
+    }
+
+    #[test]
+    fn a_pasted_block_copied_with_its_own_indentation_lands_at_the_caret() {
+        let mut e = shop();
+        e.paste_str(
+            "    for x in items:\n        if x:\n            print(x)\n",
+            true,
+        );
+        assert_eq!(
+            &e.lines[4..8],
+            &[
+                "            for x in items:",
+                "                if x:",
+                "                    print(x)",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn tabs_in_the_paste_follow_the_buffers_spaces() {
+        let mut e = shop();
+        e.paste_str("for x in items:\n\tif x:\n\t\tprint(x)", true);
+        assert_eq!(e.lines[5], "                if x:");
+        assert_eq!(e.lines[6], "                    print(x)");
+    }
+
+    #[test]
+    fn a_paste_at_column_zero_is_unchanged() {
+        let mut e = editor_with("x = 1\n\nz");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.paste_str(LOOP, true);
+        assert_eq!(
+            &e.lines[1..4],
+            &["for x in items:", "    if x:", "        print(x)"]
+        );
+        assert!(e.undo());
+        assert_eq!(
+            e.lines[1], "",
+            "a paste needing no re-indent is one undo step"
+        );
+    }
+
+    #[test]
+    fn paste_reindent_off_or_in_plain_text_pastes_verbatim() {
+        let mut e = shop();
+        e.paste_str(LOOP, false);
+        assert_eq!(e.lines[5], "    if x:");
+        let mut e = shop();
+        e.lang = None;
+        e.paste_str(LOOP, true);
+        assert_eq!(
+            e.lines[5], "    if x:",
+            "plain text keeps the clipboard's spacing"
+        );
+    }
+
+    #[test]
+    fn a_one_line_paste_is_never_touched() {
+        let mut e = shop();
+        e.paste_str("    total = 1", true);
+        assert_eq!(e.lines[4], "                total = 1");
     }
 
     fn editor_with(text: &str) -> Editor {

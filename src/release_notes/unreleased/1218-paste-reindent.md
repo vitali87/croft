@@ -1,0 +1,1 @@
+fix: A multi-line paste into code keeps its shape under the caret: later lines move to the caret line's indentation, keeping their indentation relative to each other, so a loop pasted into a nested Python block still parses. One undo gives back the verbatim paste; disable_paste_reindent turns it off.
