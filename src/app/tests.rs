@@ -68659,3 +68659,175 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
     assert_eq!(app.status, "Tab is already kept open");
 }
+
+// --- #1255: Prettier projects format with Prettier ------------------------------
+
+/// A Prettier project whose `node_modules/.bin/prettier` is a shell stand-in:
+/// it records its arguments and turns double quotes single and drops a
+/// trailing `;`, the way `{ semi: false, singleQuote: true }` would.
+#[cfg(unix)]
+fn prettier_project(config: bool, stub_body: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    if config {
+        std::fs::write(
+            root.join(".prettierrc"),
+            "{ \"semi\": false, \"singleQuote\": true }\n",
+        )
+        .unwrap();
+    }
+    let bin = root.join("node_modules/.bin/prettier");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(&bin, format!("#!/bin/sh\n{stub_body}\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        root.join("app.ts"),
+        "import { a } from \"./a\";\nexport const b = \"b\";\n",
+    )
+    .unwrap();
+    tmp
+}
+
+#[cfg(unix)]
+const PRETTIER_STUB: &str =
+    "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/../../args.txt\"\nsed \"s/\\\"/'/g; s/;\\$//\"";
+
+#[cfg(unix)]
+fn wait_for_prettier(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if app.drain_prettier_format() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn format_document_in_a_prettier_project_runs_its_prettier() {
+    let tmp = prettier_project(true, PRETTIER_STUB);
+    let file = tmp.path().join("app.ts");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.start_format_document();
+    wait_for_prettier(&mut app);
+    assert_eq!(
+        app.editor.lines,
+        vec!["import { a } from './a'", "export const b = 'b'"],
+        "the buffer holds Prettier's output; status {:?}",
+        app.status
+    );
+    assert_eq!(app.status, "Formatted document with Prettier");
+    let args = std::fs::read_to_string(tmp.path().join("args.txt")).unwrap();
+    assert_eq!(args, format!("--stdin-filepath\n{}\n", file.display()));
+    assert!(app.editor.undo(), "the format is one undo step");
+    assert_eq!(app.editor.lines[0], "import { a } from \"./a\";");
+}
+
+#[cfg(unix)]
+#[test]
+fn format_on_save_in_a_prettier_project_writes_prettiers_output() {
+    let tmp = prettier_project(true, PRETTIER_STUB);
+    let file = tmp.path().join("app.ts");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.format_on_save = true;
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 0;
+    app.editor.insert_char('/');
+    app.editor.insert_char('/');
+    app.editor.insert_char(' ');
+    app.save();
+    wait_for_prettier(&mut app);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "import { a } from './a'\n// export const b = 'b'\n",
+        "status {:?}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn without_a_prettier_config_the_language_server_still_formats() {
+    let tmp = prettier_project(false, PRETTIER_STUB);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("app.ts")).unwrap();
+    app.start_format_document();
+    assert!(app.prettier_job.is_none());
+    assert!(!tmp.path().join("args.txt").exists(), "Prettier never ran");
+    assert_ne!(app.status, "Formatting document with Prettier");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failing_prettier_says_why_and_still_saves() {
+    let tmp = prettier_project(
+        true,
+        "cat > /dev/null\necho '[error] app.ts: SyntaxError: Unexpected token (1:5)' >&2\nexit 2",
+    );
+    let file = tmp.path().join("app.ts");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.format_on_save = true;
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_char('X');
+    app.save();
+    wait_for_prettier(&mut app);
+    assert_eq!(
+        app.status,
+        "Prettier failed: app.ts: SyntaxError: Unexpected token (1:5); saved without formatting"
+    );
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .starts_with("Ximport"),
+        "the save still happens, unformatted"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_edit_made_while_prettier_runs_is_kept() {
+    let tmp = prettier_project(true, PRETTIER_STUB);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("app.ts")).unwrap();
+    app.start_format_document();
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 0;
+    app.editor.insert_char('Z');
+    wait_for_prettier(&mut app);
+    assert_eq!(app.editor.lines[1], "Zexport const b = \"b\";");
+    assert_eq!(
+        app.status,
+        "Prettier result dropped: the file changed while it ran"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_final_newline_prettier_adds_reaches_the_disk() {
+    // Prettier always ends a file with a newline; `awk 1` does the same here.
+    let stub = format!("{PRETTIER_STUB} | awk 1");
+    let tmp = prettier_project(true, &stub);
+    let file = tmp.path().join("app.ts");
+    std::fs::write(&file, "export const b = \"b\";").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.format_on_save = true;
+    app.editor.insert_char(' ');
+    app.editor.undo();
+    app.editor.insert_char('/');
+    app.editor.insert_char('/');
+    app.save();
+    wait_for_prettier(&mut app);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "//export const b = 'b'\n",
+        "status {:?}",
+        app.status
+    );
+}

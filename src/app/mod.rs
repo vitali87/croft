@@ -2985,6 +2985,9 @@ pub struct App {
     /// Latch set while a save is waiting on a format reply. `drain_lsp_format`
     /// consumes it to write the (now formatted) buffer to disk.
     save_after_format: Option<PathBuf>,
+    /// The project's Prettier formatting the active file (#1255), whose
+    /// reply completes a deferred save like an LSP format reply does.
+    prettier_job: Option<crate::prettier::Job>,
     /// Background `git log` results for the TIMELINE, keyed by the file they
     /// describe so a stale reply for a since-closed file is ignored on drain.
     timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
@@ -5541,6 +5544,7 @@ impl App {
             auto_save_on_focus_change: loaded_prefs.auto_save_on_focus_change,
             last_focus_signature: None,
             save_after_format: None,
+            prettier_job: None,
             outline,
             open_editors,
             timeline,
@@ -13448,12 +13452,21 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
+        // A Prettier project formats with its own Prettier and config, as
+        // VS Code's Prettier extension does; tsserver's formatter knows
+        // neither (#1255).
+        if let Some(bin) = crate::prettier::for_file(&path) {
+            let sent = self.editor.text_for_formatter();
+            self.prettier_job = Some(crate::prettier::Job::spawn(bin, path, sent));
+            self.status = String::from("Formatting document with Prettier");
+            return;
+        }
         let Some(lsp) = self.lsp.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
         // Mirror the editor's indentation preference; servers that carry their
-        // own config (rustfmt, ruff, prettier) ignore these but the fields are
+        // own config (rustfmt, ruff) ignore these but the fields are
         // required by the LSP request.
         let (tab_size, insert_spaces) = self.editor.indent_preference();
         let id = lsp.request_formatting(path, tab_size, insert_spaces);
@@ -13489,6 +13502,70 @@ impl App {
         self.format_request_id = Some(id);
         self.format_request_selection = true;
         self.status = String::from("Formatting selection");
+    }
+
+    /// Apply a finished Prettier run to the tab it formatted, then let the
+    /// save it held go ahead. A buffer edited while Prettier ran keeps the
+    /// edit: the result only fits the text that was sent.
+    pub fn drain_prettier_format(&mut self) -> bool {
+        let Some(reply) = self
+            .prettier_job
+            .as_ref()
+            .and_then(|job| job.poll(std::time::Instant::now()))
+        else {
+            return false;
+        };
+        let Some(job) = self.prettier_job.take() else {
+            return false;
+        };
+        let formatted = match reply {
+            Ok(formatted) => formatted,
+            Err(e) => {
+                // Said after the save, which would otherwise cover it with
+                // "Saved".
+                let saving = self.save_after_format.is_some();
+                self.complete_pending_save();
+                self.status = match saving {
+                    true => format!("Prettier failed: {e}; saved without formatting"),
+                    false => format!("Prettier failed: {e}"),
+                };
+                return true;
+            }
+        };
+        let tab = self
+            .editor
+            .find_tab_with_path(&job.path)
+            .or_else(|| self.editor.find_any_tab_with_path(&job.path));
+        let buffer = tab.map(|i| &self.editor.editors[i]).map(|e| {
+            (
+                e.text_for_formatter(),
+                e.lines.clone(),
+                e.has_final_newline(),
+            )
+        });
+        self.status = match buffer {
+            Some((text, lines, final_newline)) if text == job.sent => {
+                if formatted == job.sent {
+                    String::from("Document already formatted")
+                } else {
+                    // The buffer keeps no line for a final newline it already
+                    // has; one Prettier adds becomes the empty last line that
+                    // writes it.
+                    let body = match final_newline {
+                        true => formatted.strip_suffix('\n').unwrap_or(&formatted),
+                        false => &formatted,
+                    };
+                    let edits = crate::prettier::edits_for(&lines, body);
+                    self.editor.apply_rename_to_open_tab(&job.path, &edits);
+                    self.editor.clamp_cursor();
+                    String::from("Formatted document with Prettier")
+                }
+            }
+            Some(_) => String::from("Prettier result dropped: the file changed while it ran"),
+            None => String::from("Format failed: document not open"),
+        };
+        self.complete_pending_save();
+        true
     }
 
     pub fn drain_lsp_format(&mut self) -> bool {
@@ -56188,8 +56265,15 @@ impl App {
             return;
         }
         // Format-on-save: defer the write until the format reply arrives, then
-        // `drain_lsp_format` calls `complete_pending_save`.
-        if self.format_on_save_eligible(self.editor_language_supports_formatting()) {
+        // `drain_lsp_format` (or `drain_prettier_format`) calls
+        // `complete_pending_save`.
+        let prettier = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(crate::prettier::for_file)
+            .is_some();
+        if self.format_on_save_eligible(prettier || self.editor_language_supports_formatting()) {
             self.arm_deferred_save();
             self.start_format_document();
             return;
@@ -68213,7 +68297,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let prepare_rename_changed = app.drain_lsp_prepare_rename();
         let occurrences_changed = app.drain_lsp_document_highlights();
         let rename_changed = app.drain_lsp_rename() | app.tick_file_moves();
-        let format_changed = app.drain_lsp_format();
+        let format_changed = app.drain_lsp_format() | app.drain_prettier_format();
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let inlay_changed = app.drain_lsp_inlay_hints();

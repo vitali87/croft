@@ -78,6 +78,7 @@ mod plot;
 mod port_detect;
 mod pr_review;
 mod prefs;
+mod prettier;
 mod problem_matchers;
 mod profiles;
 mod provenance;
