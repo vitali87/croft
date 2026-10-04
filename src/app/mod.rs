@@ -2462,6 +2462,10 @@ enum PromptKind {
     /// Rename the entry at `path`. The prompt's `target_dir` holds the
     /// entry's parent; `buffer` is pre-filled with the current basename.
     Rename(PathBuf),
+    /// File: Save As… (#1203): a path for the active tab's buffer, relative
+    /// to `target_dir` (the workspace root) unless absolute. `buffer` starts
+    /// as the tab's own path.
+    SaveAs,
     /// LSP "Rename Symbol" (F2 in the editor): rename the identifier at
     /// `(row, col)` in `path`. `buffer` is pre-filled with the symbol; on
     /// commit the new name drives a `textDocument/rename` request.
@@ -20751,6 +20755,17 @@ impl App {
                     ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
                 ]),
                 "Enter to rename, Esc to cancel",
+            ),
+            PromptKind::SaveAs => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to save, Esc to cancel (missing folders are created)",
             ),
             PromptKind::RenameSymbol { .. } => (
                 ratatui::text::Line::from(vec![
@@ -47898,6 +47913,7 @@ impl App {
             Cmd::PreviousBookmark => self.goto_bookmark(false),
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
+            Cmd::SaveAs => self.open_save_as_prompt(),
             Cmd::Undo => {
                 self.status = if self.editor.undo() {
                     String::from("Undo")
@@ -62233,6 +62249,52 @@ impl App {
         }
     }
 
+    /// File: Save As… (#1203): ask where to write the active tab's buffer.
+    fn open_save_as_prompt(&mut self) {
+        if self.editor.has_non_text_view() {
+            self.status = String::from("Save As works on text tabs; this one is a preview");
+            return;
+        }
+        let buffer = self
+            .editor
+            .path
+            .as_deref()
+            .map(|p| self.status_path(p))
+            .unwrap_or_default();
+        self.prompt = Some(Prompt {
+            label: String::from("Save As"),
+            buffer,
+            kind: PromptKind::SaveAs,
+            target_dir: self.tree.root.clone(),
+            error: None,
+        });
+    }
+
+    /// Write the active tab's buffer to `path` and move the tab there; the
+    /// error says why not, with the tab left as it was.
+    fn save_as(&mut self, path: &Path) -> Result<(), String> {
+        use crate::widgets::editor::SaveOutcome;
+        match self.editor.save_as(path) {
+            Ok(SaveOutcome::Saved) => {
+                self.status = self.editor.status.clone();
+                let seats = self.editor.provenance_to_record();
+                let described = self.editor.bytes_for_disk();
+                self.record_history_snapshot_of(path, seats, described);
+                self.sync_open_file_poll_mtime();
+                if let Some(idx) = path.parent().and_then(|d| self.tree.index_of_dir(d)) {
+                    self.tree.refresh_children(idx);
+                }
+                Ok(())
+            }
+            Ok(SaveOutcome::EncodingLoss) => Err(format!(
+                "Some characters can't be written as {}",
+                self.editor.encoding.name()
+            )),
+            Ok(SaveOutcome::DiskConflict) => unreachable!("save_as never checks for a conflict"),
+            Err(e) => Err(format!("Save failed: {e}")),
+        }
+    }
+
     fn open_rename_prompt(&mut self, path: PathBuf) {
         let parent = path
             .parent()
@@ -62371,6 +62433,25 @@ impl App {
                             p.error = Some(e.to_string());
                         }
                     }
+                }
+            }
+            PromptKind::SaveAs => {
+                let answer = prompt.buffer.trim().to_string();
+                let target = prompt.target_dir.join(&answer);
+                let error = if answer.is_empty() {
+                    Some(String::from("Enter a path to save to"))
+                } else if self.editor.path.as_deref() != Some(target.as_path()) && target.exists() {
+                    Some(format!("{answer} already exists"))
+                } else {
+                    self.save_as(&target).err()
+                };
+                match error {
+                    Some(e) => {
+                        if let Some(p) = self.prompt.as_mut() {
+                            p.error = Some(e);
+                        }
+                    }
+                    None => self.prompt = None,
                 }
             }
             PromptKind::RenameSymbol { path, row, col } => {

@@ -66276,3 +66276,151 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         app.settings_chain
     );
 }
+
+/// #1203: open `notes/plan.md`, type a line, then take its folder away the
+/// way `git checkout` of a branch without it does.
+fn app_with_plan_whose_folder_was_removed(tmp: &std::path::Path) -> App {
+    std::fs::create_dir(tmp.join("notes")).unwrap();
+    let mut app = app_with_open_file(tmp, "notes/plan.md", "# Plan\n\n- step one\n");
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = "- step one".len();
+    app.editor.insert_str("\n- step two");
+    std::fs::remove_dir_all(tmp.join("notes")).unwrap();
+    app
+}
+
+#[test]
+fn saving_a_file_whose_folder_was_removed_puts_the_folder_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    // The first press may stop to say the file changed on disk; the second
+    // is the consent to write it anyway.
+    app.save();
+    if app.editor.dirty {
+        app.save();
+    }
+    assert!(!app.editor.dirty, "still unsaved: {}", app.status);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("notes/plan.md")).unwrap(),
+        "# Plan\n\n- step one\n- step two\n"
+    );
+}
+
+#[test]
+fn a_save_whose_folder_is_now_a_file_still_fails_and_leaves_that_file_alone() {
+    // Negative: putting a missing folder back must not paper over a path
+    // that can't be a folder. A file now sits where the folder was.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    std::fs::write(tmp.path().join("notes"), "a file, not a folder\n").unwrap();
+    app.save();
+    app.save();
+    assert!(app.editor.dirty, "the edits are still only in the buffer");
+    assert!(app.status.starts_with("Save failed"), "{}", app.status);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("notes")).unwrap(),
+        "a file, not a folder\n"
+    );
+}
+
+/// Run File: Save As… the way the palette does and answer its prompt.
+fn save_as(app: &mut App, answer: &str) {
+    let cmd = crate::widgets::command_palette::Command::from_id("save_as")
+        .expect("there is a File: Save As… command");
+    app.run_command(cmd);
+    let prompt = app.prompt.as_mut().expect("Save As asks for a path");
+    prompt.buffer = answer.to_string();
+    app.commit_prompt();
+}
+
+#[test]
+fn save_as_writes_the_buffer_to_a_new_path_and_moves_the_tab_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    let cmd = crate::widgets::command_palette::Command::from_id("save_as")
+        .expect("there is a File: Save As… command");
+    app.run_command(cmd);
+    assert_eq!(
+        app.prompt.as_ref().map(|p| p.buffer.as_str()),
+        Some("notes/plan.md"),
+        "the prompt starts from the tab's own path"
+    );
+    app.prompt = None;
+    save_as(&mut app, "drafts/plan.txt");
+    let saved = tmp.path().join("drafts/plan.txt");
+    assert!(
+        app.prompt.is_none(),
+        "{:?}",
+        app.prompt.as_ref().map(|p| &p.error)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        "# Plan\n\n- step one\n- step two\n"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(saved.as_path()));
+    assert!(!app.editor.dirty);
+    assert!(
+        app.editor.language().is_none(),
+        "a .txt file has no grammar"
+    );
+    assert!(
+        !tmp.path().join("notes").exists(),
+        "the old path is not recreated"
+    );
+    // The tab now belongs to the new file: the next save goes there.
+    app.editor.insert_str("!");
+    app.save();
+    assert!(!app.editor.dirty, "{}", app.status);
+    assert!(
+        std::fs::read_to_string(&saved)
+            .unwrap()
+            .contains("- step two!")
+    );
+}
+
+#[test]
+fn save_as_does_not_overwrite_another_file() {
+    // Negative: an existing file at the answer is left as it was, and the
+    // tab keeps its own path and its unsaved edits.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    std::fs::write(tmp.path().join("README.md"), "# app\n").unwrap();
+    save_as(&mut app, "README.md");
+    let error = app.prompt.as_ref().and_then(|p| p.error.clone());
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|e| e.contains("already exists")),
+        "{error:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "# app\n"
+    );
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("notes/plan.md").as_path())
+    );
+    assert!(app.editor.dirty);
+    // Nor does a blank answer go anywhere.
+    save_as(&mut app, "  ");
+    assert!(app.prompt.as_ref().is_some_and(|p| p.error.is_some()));
+    assert!(app.editor.dirty);
+}
+
+#[test]
+fn a_save_as_that_fails_leaves_the_tab_where_it_was() {
+    // Negative: a path that can't be written keeps the tab on its own path
+    // with its edits, so nothing is lost and Save As can be tried again.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    std::fs::write(tmp.path().join("blocker"), "").unwrap();
+    save_as(&mut app, "blocker/plan.md");
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("notes/plan.md").as_path())
+    );
+    assert!(app.editor.dirty);
+    let error = app.prompt.as_ref().and_then(|p| p.error.clone());
+    assert!(error.is_some(), "the prompt stays open with the reason");
+}

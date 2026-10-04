@@ -9293,6 +9293,32 @@ impl Editor {
         self.write_buffer_to_disk()
     }
 
+    /// File: Save As… (#1203): write the buffer to `path` and make this tab
+    /// that file, with the grammar its name calls for. The tab stays on its
+    /// own path, untouched, unless the bytes land.
+    pub fn save_as(&mut self, path: &Path) -> Result<SaveOutcome> {
+        let kept = (
+            self.path.replace(path.to_path_buf()),
+            self.disk_stamp,
+            self.disk_conflict,
+        );
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        let outcome = self.write_buffer_to_disk();
+        if matches!(outcome, Ok(SaveOutcome::Saved)) {
+            let lang = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(lang_for_extension);
+            if lang != self.lang {
+                self.set_language(lang);
+            }
+        } else {
+            (self.path, self.disk_stamp, self.disk_conflict) = kept;
+        }
+        outcome
+    }
+
     /// Encode the buffer for disk in the encoding it claims, re-emitting the
     /// byte-order mark if the file had one.
     ///
@@ -9413,6 +9439,12 @@ impl Editor {
         if (had_errors || writes_replacements) && !self.lossy_save_armed {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
+        }
+        // The folder can go while the tab is open (a `git checkout` of a
+        // branch without it, #1203). Put it back, as VS Code does, rather
+        // than strand the edits; a path that can't be a folder still fails.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&path, encoded)?;
         self.decode_lossy = false;
