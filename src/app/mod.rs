@@ -3990,6 +3990,9 @@ pub struct App {
     /// True when the in-flight format request is Format Selection (#254)
     /// — the drain words its statuses accordingly.
     format_request_selection: bool,
+    /// The `edit_seq` of the tab the in-flight format request was computed
+    /// against (#1127): a reply for a buffer typed into since is dropped.
+    format_request_seq: Option<u64>,
     /// VS Code's `editor.formatOnType` (#254): typing a server trigger
     /// character runs onTypeFormatting at the spot. Off by default.
     format_on_type: bool,
@@ -6007,6 +6010,7 @@ impl App {
             pending_file_move: None,
             prepare_rename_request: None,
             format_request_id: None,
+            format_request_seq: None,
             format_request_selection: false,
             format_on_type: loaded_prefs.format_on_type,
             on_type_request: None,
@@ -13275,18 +13279,33 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        let Some(lsp) = self.lsp.as_mut() else {
+        if self.lsp.is_none() {
             self.status = String::from("No language server for this file");
             return;
-        };
+        }
         // Mirror the editor's indentation preference; servers that carry their
         // own config (rustfmt, ruff, prettier) ignore these but the fields are
         // required by the LSP request.
         let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let seq = self.format_target_seq(&path);
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
         let id = lsp.request_formatting(path, tab_size, insert_spaces);
         self.format_request_id = Some(id);
+        self.format_request_seq = seq;
         self.format_request_selection = false;
         self.status = String::from("Formatting document");
+    }
+
+    /// The `edit_seq` of the tab a format reply for `path` lands in (the
+    /// one `apply_rename_to_open_tab` picks), or `None` when no tab holds it.
+    fn format_target_seq(&self, path: &std::path::Path) -> Option<u64> {
+        let idx = self
+            .editor
+            .find_tab_with_path(path)
+            .or_else(|| self.editor.find_any_tab_with_path(path))?;
+        Some(self.editor.editors[idx].edit_seq)
     }
 
     /// "Format Selection" (#254): `textDocument/rangeFormatting` over the
@@ -13308,12 +13327,14 @@ impl App {
         let start = self.editor.pos_to_utf16(sr, sc);
         let end = self.editor.pos_to_utf16(er, ec);
         let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let seq = self.format_target_seq(&path);
         let Some(lsp) = self.lsp.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
         let id = lsp.request_range_formatting(path, start, end, tab_size, insert_spaces);
         self.format_request_id = Some(id);
+        self.format_request_seq = seq;
         self.format_request_selection = true;
         self.status = String::from("Formatting selection");
     }
@@ -13341,7 +13362,21 @@ impl App {
             return false;
         }
         self.format_request_id = None;
+        self.land_format(edits, unsupported, path);
+        true
+    }
+
+    /// Apply a formatter's reply to the request in flight, then finish a
+    /// format-on-save. Split from [`Self::drain_lsp_format`] so tests can
+    /// deliver a reply without a server.
+    fn land_format(
+        &mut self,
+        edits: Option<Vec<crate::widgets::editor::TextSpanEdit>>,
+        unsupported: bool,
+        path: Option<PathBuf>,
+    ) {
         let selection = std::mem::take(&mut self.format_request_selection);
+        let requested_at = self.format_request_seq.take();
         if unsupported {
             self.status = if selection {
                 String::from("No range formatter available for this file")
@@ -13349,9 +13384,29 @@ impl App {
                 String::from("No formatter available for this file")
             };
             self.complete_pending_save();
-            return true;
+            return;
         }
         match (edits, path) {
+            // The edits are positions in the text the server was sent; typed
+            // into since, they land on the wrong lines (#1127). Drop them, as
+            // VS Code does, and let a format-on-save write what is there.
+            (Some(edits), Some(path))
+                if !edits.is_empty() && self.format_target_seq(&path) != requested_at =>
+            {
+                let file = self.status_path(&path);
+                let saving = self.save_after_format.is_some();
+                self.complete_pending_save();
+                self.status = if saving {
+                    format!(
+                        "Saved {file} without formatting: it changed while the formatter was running"
+                    )
+                } else {
+                    format!(
+                        "Format skipped: {file} changed while the formatter was running; format again"
+                    )
+                };
+                return;
+            }
             (Some(edits), Some(path)) if !edits.is_empty() => {
                 match self.editor.apply_rename_to_open_tab(&path, &edits) {
                     Some(_) => {
@@ -13376,7 +13431,6 @@ impl App {
         // A format-on-save write is deferred until now so the disk file gets the
         // formatted text in one go.
         self.complete_pending_save();
-        true
     }
 
     /// VS Code "Quick Fix" (`Cmd+.`): ask the language server for the code

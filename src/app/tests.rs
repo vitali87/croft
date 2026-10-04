@@ -63915,6 +63915,121 @@ fn resuming_after_a_build_drops_diagnostics_no_open_tab_owns() {
     );
 }
 
+// ---- A late formatter reply never lands on text typed since (#1127) ----
+
+/// The issue's `week.notes`, with `bread` added after `milk`: the buffer a
+/// format request is sent for.
+fn app_with_week_notes(tmp: &tempfile::TempDir) -> (App, PathBuf) {
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "week.notes",
+        "# shopping list\nmilk\neggs\n# todo\ncall bob\npay rent\n",
+    );
+    let file = app.editor.path.clone().unwrap();
+    type_at_line_end(&mut app, 1, "\nbread");
+    (app, file)
+}
+
+fn type_at_line_end(app: &mut App, row: usize, text: &str) {
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = app.editor.lines[row].chars().count();
+    for c in text.chars() {
+        if c == '\n' {
+            app.editor.insert_newline();
+        } else {
+            app.editor.insert_char(c);
+        }
+    }
+}
+
+/// What the request path records when it sends `textDocument/formatting`.
+fn send_format_request(app: &mut App, file: &Path, on_save: bool) {
+    app.format_request_id = Some(41);
+    app.format_request_seq = app.format_target_seq(file);
+    if on_save {
+        app.save_after_format = Some(file.to_path_buf());
+    }
+}
+
+/// The formatter's answer for the text it was sent: upper-case the two
+/// `# ` headings, on lines 0 and 4.
+fn uppercase_headings() -> Vec<crate::widgets::editor::TextSpanEdit> {
+    [(0, "# shopping list"), (4, "# todo")]
+        .into_iter()
+        .map(|(row, line)| crate::widgets::editor::TextSpanEdit {
+            start: (row, 0),
+            end: (row, line.len()),
+            new_text: line.to_uppercase(),
+            utf16: false,
+        })
+        .collect()
+}
+
+#[test]
+fn a_format_on_save_reply_for_a_buffer_typed_into_since_saves_it_unformatted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_week_notes(&tmp);
+    send_format_request(&mut app, &file, true);
+    type_at_line_end(&mut app, 2, "\nbutter");
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    let typed = "# shopping list\nmilk\nbread\nbutter\neggs\n# todo\ncall bob\npay rent";
+    assert_eq!(app.editor.lines.join("\n"), typed, "eggs survives");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("{typed}\n"),
+        "and reaches disk"
+    );
+    assert!(app.save_after_format.is_none());
+    assert_eq!(
+        app.status,
+        "Saved week.notes without formatting: it changed while the formatter was running"
+    );
+}
+
+#[test]
+fn a_format_document_reply_for_a_buffer_typed_into_since_is_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_week_notes(&tmp);
+    send_format_request(&mut app, &file, false);
+    type_at_line_end(&mut app, 2, "\nbutter");
+    let before = app.editor.lines.clone();
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    assert_eq!(app.editor.lines, before);
+    assert_eq!(
+        app.status,
+        "Format skipped: week.notes changed while the formatter was running; format again"
+    );
+}
+
+#[test]
+fn a_format_reply_for_an_untouched_buffer_is_still_applied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_week_notes(&tmp);
+    send_format_request(&mut app, &file, false);
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 2;
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "# SHOPPING LIST\nmilk\nbread\neggs\n# TODO\ncall bob\npay rent",
+        "a caret move is not an edit"
+    );
+    assert_eq!(app.status, "Formatted document");
+}
+
+#[test]
+fn a_format_on_save_reply_for_an_untouched_buffer_saves_the_formatted_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_week_notes(&tmp);
+    send_format_request(&mut app, &file, true);
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "# SHOPPING LIST\nmilk\nbread\neggs\n# TODO\ncall bob\npay rent\n"
+    );
+    assert!(app.save_after_format.is_none());
+}
+
 /// #694 review: a format-on-save in flight when the servers stop is saved at
 /// once, unformatted, rather than left armed for an unrelated reply.
 #[test]
