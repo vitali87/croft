@@ -1,0 +1,1 @@
+fix: Pasting several lines into a terminal whose program would run each line as it lands (sh, an old Python REPL, psql) now asks first, with Paste, Paste as one line and Cancel; "terminal_multiline_paste_warning" can make it always or never ask.

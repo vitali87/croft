@@ -68659,3 +68659,129 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
     assert_eq!(app.status, "Tab is already kept open");
 }
+
+// ---- Multi-line paste into a terminal without bracketed paste (#1274) ----
+
+/// An app whose active pane runs a program that never turns on bracketed
+/// paste (`sh` reading a line), focused, with nothing written yet.
+fn plain_paste_app() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Terminal);
+    (app, tmp)
+}
+
+fn pasted(app: &App) -> String {
+    String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).into_owned()
+}
+
+const TWO_LINES: &str = "echo first-line\ntouch pasted-ran\n";
+
+#[test]
+fn a_multiline_paste_into_a_plain_shell_waits_for_confirmation() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste(TWO_LINES);
+    assert_eq!(pasted(&app), "", "nothing runs before the user agrees");
+    assert!(app.pending_terminal_paste.is_some());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), TWO_LINES);
+    assert!(app.pending_terminal_paste.is_none());
+}
+
+#[test]
+fn a_multiline_paste_can_go_in_as_one_line() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste("echo a\r\n  echo b\r\n\r\n");
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), "echo a   echo b");
+}
+
+#[test]
+fn a_cancelled_multiline_paste_writes_nothing() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste(TWO_LINES);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), "");
+    assert!(app.pending_terminal_paste.is_none());
+    // The next key is typing again, not an answer to the popup.
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), "l");
+}
+
+#[test]
+fn the_confirmation_says_how_many_lines_will_run() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste(TWO_LINES);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("PASTE 2 LINES"), "{screen}");
+}
+
+#[test]
+fn a_bracketed_paste_or_a_single_line_goes_straight_in() {
+    // Negative: a shell that brackets pastes runs nothing until Enter, and
+    // one line with no line break runs nothing either.
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste("echo one-line");
+    assert_eq!(pasted(&app), "echo one-line");
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?2004h");
+    app.handle_paste(TWO_LINES);
+    assert!(app.pending_terminal_paste.is_none());
+    assert!(
+        pasted(&app).ends_with(&format!("\x1b[200~{TWO_LINES}\x1b[201~")),
+        "{:?}",
+        pasted(&app)
+    );
+}
+
+#[test]
+fn the_multiline_paste_warning_follows_its_setting() {
+    use crate::prefs::MultilinePasteWarning;
+    let (mut app, _tmp) = plain_paste_app();
+    app.multiline_paste_warning = MultilinePasteWarning::Never;
+    app.handle_paste(TWO_LINES);
+    assert_eq!(pasted(&app), TWO_LINES, "never: straight in");
+    let (mut app, _tmp) = plain_paste_app();
+    app.multiline_paste_warning = MultilinePasteWarning::Always;
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?2004h");
+    app.handle_paste(TWO_LINES);
+    assert!(
+        app.pending_terminal_paste.is_some(),
+        "always: asks even when bracketed"
+    );
+    assert_eq!(pasted(&app), "");
+}
+
+#[test]
+fn the_multiline_paste_warning_setting_parses() {
+    use crate::prefs::{MultilinePasteWarning, Prefs};
+    let p: Prefs = serde_json::from_str(r#"{"terminal_multiline_paste_warning":"never"}"#).unwrap();
+    assert_eq!(
+        p.terminal_multiline_paste_warning,
+        MultilinePasteWarning::Never
+    );
+    let p: Prefs = serde_json::from_str("{}").unwrap();
+    assert_eq!(
+        p.terminal_multiline_paste_warning,
+        MultilinePasteWarning::Auto
+    );
+}

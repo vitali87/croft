@@ -4450,6 +4450,11 @@ pub struct App {
     /// gated: the classic footgun is typing into panes you forgot were
     /// listening).
     pub pending_broadcast_enable: bool,
+    /// A multi-line paste waiting on its confirm popup (#1274): written to
+    /// the pane only once the user picks Paste or Paste as one line.
+    pub pending_terminal_paste: Option<Vec<u8>>,
+    /// The `terminal_multiline_paste_warning` setting (#1274).
+    pub multiline_paste_warning: crate::prefs::MultilinePasteWarning,
     /// A runnable fence waiting on the confirm popup (#353): destructive-
     /// looking blocks and `{confirm}` fences ask before they type.
     pending_run_block: Option<PendingRunBlock>,
@@ -5977,6 +5982,8 @@ impl App {
             watch_published_panes: std::collections::HashSet::new(),
             broadcast_input: false,
             pending_broadcast_enable: false,
+            pending_terminal_paste: None,
+            multiline_paste_warning: loaded_prefs.terminal_multiline_paste_warning,
             pending_run_block: None,
             pending_captures: Vec::new(),
             block_outputs: std::collections::HashMap::new(),
@@ -16485,7 +16492,57 @@ impl App {
     /// aware per pane): normally just the active pane, mirrored to every
     /// non-excluded pane while broadcast is on (the focused pane always
     /// receives its own input).
+    ///
+    /// A multi-line paste a pane would run line by line asks first (#1274).
     fn paste_terminal_input(&mut self, payload: &[u8]) {
+        if self.multiline_paste_needs_confirm(payload) {
+            self.pending_terminal_paste = Some(payload.to_vec());
+            return;
+        }
+        self.paste_terminal_input_now(payload);
+    }
+
+    /// Whether `payload` waits on the confirm popup: it holds a line break,
+    /// and per `terminal_multiline_paste_warning` either always, or (`auto`)
+    /// when a pane it goes to has not turned on bracketed paste, where every
+    /// line break is an Enter (sh/dash, an old Python REPL, psql).
+    fn multiline_paste_needs_confirm(&self, payload: &[u8]) -> bool {
+        use crate::prefs::MultilinePasteWarning;
+        if !payload.iter().any(|&b| b == b'\n' || b == b'\r') {
+            return false;
+        }
+        match self.multiline_paste_warning {
+            MultilinePasteWarning::Never => false,
+            MultilinePasteWarning::Always => true,
+            MultilinePasteWarning::Auto => {
+                let active = self.active_terminal;
+                self.terminals.iter().enumerate().any(|(i, t)| {
+                    let receives = i == active || (self.broadcast_input && !t.broadcast_excluded);
+                    receives && !t.bracketed_paste()
+                })
+            }
+        }
+    }
+
+    /// The confirm popup's Paste (`one_line` false) or Paste as one line.
+    fn confirm_pending_terminal_paste(&mut self, one_line: bool) {
+        let Some(payload) = self.pending_terminal_paste.take() else {
+            return;
+        };
+        let payload = if one_line {
+            pasted_lines(&payload).join(&b' ')
+        } else {
+            payload
+        };
+        self.paste_terminal_input_now(&payload);
+    }
+
+    fn cancel_pending_terminal_paste(&mut self) {
+        self.pending_terminal_paste = None;
+        self.status = String::from("Paste cancelled");
+    }
+
+    fn paste_terminal_input_now(&mut self, payload: &[u8]) {
         if self.broadcast_input {
             let active = self.active_terminal;
             for (i, t) in self.terminals.iter_mut().enumerate() {
@@ -19676,6 +19733,7 @@ impl App {
         self.render_discard_all_confirm(frame);
         self.render_replace_all_confirm(frame);
         self.render_broadcast_confirm(frame);
+        self.render_terminal_paste_confirm(frame);
         self.render_run_block_confirm(frame);
         // Terminal-pane inline image: sync after the panes have painted so
         // last_inner and the scroll offset are this frame's (all gating —
@@ -20363,6 +20421,87 @@ impl App {
             ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: true }),
             inner,
         );
+    }
+
+    /// The confirm popup for a multi-line terminal paste (#1274): how many
+    /// lines would run, the first few of them, and the three choices.
+    fn render_terminal_paste_confirm(&self, frame: &mut ratatui::Frame) {
+        use ratatui::text::{Line, Span};
+        let Some(payload) = self.pending_terminal_paste.as_ref() else {
+            return;
+        };
+        let lines = pasted_lines(payload);
+        const PREVIEW: usize = 3;
+        let preview = lines.len().min(PREVIEW);
+        let more = lines.len() > PREVIEW;
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let height = 7 + preview as u16 + u16::from(more);
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        }
+        .intersection(area);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
+        let n = lines.len();
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
+            .title(Span::styled(
+                format!(
+                    " PASTE {n} LINE{} INTO THE TERMINAL? ",
+                    if n == 1 { "" } else { "S" }
+                ),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let white = Style::default().fg(self.theme.ui(Color::White));
+        let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x8b, 0x93, 0xa5)));
+        let mut body = vec![
+            Line::from(Span::styled(
+                "Each line break is an Enter here, so the lines run as they land:",
+                white,
+            )),
+            Line::from(""),
+        ];
+        for line in &lines[..preview] {
+            body.push(Line::from(Span::styled(
+                format!("  {}", String::from_utf8_lossy(line)),
+                dim,
+            )));
+        }
+        if more {
+            body.push(Line::from(Span::styled(
+                format!("  … and {} more", lines.len() - PREVIEW),
+                dim,
+            )));
+        }
+        let key = |k: &'static str, color: Color| {
+            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+        };
+        body.push(Line::from(""));
+        body.push(Line::from(vec![
+            key("[Y]", Color::Red),
+            Span::raw(" / Enter paste   "),
+            key("[L]", Color::Yellow),
+            Span::raw(" paste as one line   "),
+            key("[N]", Color::Green),
+            Span::raw(" / Esc cancel"),
+        ]));
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
     /// The confirm popup for a runnable fence (#353): the whole block, the
@@ -21800,6 +21939,21 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.cancel_pending_broadcast();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.pending_terminal_paste.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pending_terminal_paste(false);
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') => {
+                    self.confirm_pending_terminal_paste(true);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_terminal_paste();
                 }
                 _ => {}
             }
@@ -56341,6 +56495,7 @@ impl App {
         // config.json takes effect on the next fleet run without a restart.
         self.fleet_groups = p.fleet_groups.clone();
         self.code_scanning = p.code_scanning;
+        self.multiline_paste_warning = p.terminal_multiline_paste_warning;
         let was_excluded = std::mem::replace(
             &mut self.remote_offer_excluded,
             p.remote_offer_excluded_hosts.clone(),
@@ -67723,6 +67878,28 @@ fn install_terminal_restore_panic_hook() {
             original(info);
         }));
     });
+}
+
+/// A paste's lines (#1274), split at `\n`, `\r\n` or a lone `\r` as a shell
+/// would take them, without the empty lines a trailing break leaves.
+fn pasted_lines(payload: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut bytes = payload.iter().copied().peekable();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'\r' | b'\n' => {
+                if b == b'\r' && bytes.peek() == Some(&b'\n') {
+                    bytes.next();
+                }
+                lines.push(Vec::new());
+            }
+            b => lines.last_mut().expect("never empty").push(b),
+        }
+    }
+    while lines.len() > 1 && lines.last().is_some_and(Vec::is_empty) {
+        lines.pop();
+    }
+    lines
 }
 
 /// Append a panic record (version, thread, location, message, backtrace) to

@@ -3850,6 +3850,12 @@ impl PtyTerminal {
         self.write_input(&format_cd_command(path));
     }
 
+    /// Whether the program in the pane turned on bracketed paste, so a
+    /// pasted line break waits for Enter instead of running the line (#1274).
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Paste a payload into the embedded shell. Bracketed-paste markers
     /// are added only if the inner program asked for them; otherwise the
     /// payload is sent raw so simple shells don't see literal `\e[200~`.
