@@ -105,30 +105,63 @@ pub struct PathFilter {
     exclude: Option<GlobSet>,
 }
 
+/// The entries of a comma-separated glob list. Commas inside `{...}`
+/// belong to a brace alternate, so `*.{ts,tsx}, docs/**` is two entries
+/// (#1251).
+fn split_globs(raw: &str) -> impl Iterator<Item = &str> {
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for (i, c) in raw.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&raw[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&raw[start..]);
+    parts.into_iter().map(str::trim).filter(|p| !p.is_empty())
+}
+
+fn compile_glob(pat: &str) -> Option<Glob> {
+    // VS Code convention: a pattern without a path separator matches at
+    // any depth, so `*.rs` finds Rust files in every subdirectory.
+    let expanded = if pat.contains('/') {
+        pat.to_string()
+    } else {
+        format!("**/{pat}")
+    };
+    Glob::new(&expanded).ok()
+}
+
+/// The entries of a glob list that don't compile, for the panel to name.
+pub fn invalid_globs(raw: &str) -> Vec<&str> {
+    split_globs(raw)
+        .filter(|p| compile_glob(p).is_none())
+        .collect()
+}
+
 /// Build a `GlobSet` from a comma-separated glob list, returning `None` when
 /// the trimmed input is empty (meaning "no filter"). Invalid individual globs
-/// are skipped silently so one typo doesn't disable the whole filter.
-fn build_glob_set(raw: &str) -> Option<GlobSet> {
+/// are skipped so one typo doesn't disable the rest. When none compiles, an
+/// include list (`fail_closed`) yields an empty set that matches nothing, so
+/// a broken filter never widens a search or Replace All to every file.
+fn build_glob_set(raw: &str, fail_closed: bool) -> Option<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     let mut any = false;
-    for part in raw.split(',') {
-        let pat = part.trim();
-        if pat.is_empty() {
-            continue;
-        }
-        // VS Code convention: a pattern without a path separator matches at
-        // any depth, so `*.rs` finds Rust files in every subdirectory.
-        let expanded = if pat.contains('/') {
-            pat.to_string()
-        } else {
-            format!("**/{pat}")
-        };
-        if let Ok(g) = Glob::new(&expanded) {
+    let mut typed = false;
+    for pat in split_globs(raw) {
+        typed = true;
+        if let Some(g) = compile_glob(pat) {
             builder.add(g);
             any = true;
         }
     }
-    if !any {
+    if !any && !(typed && fail_closed) {
         return None;
     }
     builder.build().ok()
@@ -139,8 +172,8 @@ impl PathFilter {
     /// (or all-whitespace) string disables that side of the filter.
     pub fn new(include: &str, exclude: &str) -> Self {
         Self {
-            include: build_glob_set(include),
-            exclude: build_glob_set(exclude),
+            include: build_glob_set(include, true),
+            exclude: build_glob_set(exclude, false),
         }
     }
 
@@ -1723,6 +1756,31 @@ struct FieldArgs<'a> {
     reserve_right: u16,
 }
 
+/// A glob box's caption. An entry that doesn't compile replaces the label
+/// with its name in red, right above the box, so a typo can't silently
+/// change what the search covers (#1251).
+fn draw_glob_caption(
+    buf: &mut Buffer,
+    (x, y, right): (u16, u16, u16),
+    label: &str,
+    raw: &str,
+    style: Style,
+    theme: crate::theme::Theme,
+) {
+    let bad = invalid_globs(raw);
+    if bad.is_empty() {
+        buf.set_string(x, y, label, style);
+        return;
+    }
+    buf.set_stringn(
+        x,
+        y,
+        format!("invalid glob: {}", bad.join(", ")),
+        right.saturating_sub(x) as usize + 1,
+        Style::default().fg(theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))),
+    );
+}
+
 /// Render a single filled input row (VS Code's `input.background` model) and
 /// return the click-to-focus hit `Rect` covering the bar + editable span (but
 /// not any reserved control cells on the right). Shared by all four Search
@@ -2114,7 +2172,14 @@ impl Widget for &mut SearchPanel {
                 // separation so every input reads as its own row.
                 draw_field_divider(buf, bar_x, detail_fill_right, next_y, self.theme);
                 next_y += 1;
-                buf.set_string(bar_x, next_y, "files to include", caption_style);
+                draw_glob_caption(
+                    buf,
+                    (bar_x, next_y, detail_fill_right),
+                    "files to include",
+                    &self.include,
+                    caption_style,
+                    self.theme,
+                );
                 next_y += 1;
                 let inc_focused = self.focused && self.field == SearchField::Include;
                 self.include_input_rect = render_field(
@@ -2145,7 +2210,14 @@ impl Widget for &mut SearchPanel {
                 // Hairline before the exclude group, same as above.
                 draw_field_divider(buf, bar_x, detail_fill_right, next_y, self.theme);
                 next_y += 1;
-                buf.set_string(bar_x, next_y, "files to exclude", caption_style);
+                draw_glob_caption(
+                    buf,
+                    (bar_x, next_y, detail_fill_right),
+                    "files to exclude",
+                    &self.exclude,
+                    caption_style,
+                    self.theme,
+                );
                 next_y += 1;
                 let exc_focused = self.focused && self.field == SearchField::Exclude;
                 self.exclude_input_rect = render_field(
@@ -3571,6 +3643,83 @@ mod tests {
         assert!(f.allows(root, Path::new("/proj/main.rs")));
         assert!(f.allows(root, Path::new("/proj/Cargo.toml")));
         assert!(!f.allows(root, Path::new("/proj/notes.md")));
+    }
+
+    #[test]
+    fn path_filter_include_keeps_commas_inside_braces() {
+        // #1251: `*.{ts,tsx}` is one glob, not `*.{ts` and `tsx}`.
+        let f = PathFilter::new("*.{ts,tsx}", "");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/src/a.ts")));
+        assert!(f.allows(root, Path::new("/proj/src/b.tsx")));
+        assert!(!f.allows(root, Path::new("/proj/other/d.js")));
+        assert!(!f.allows(root, Path::new("/proj/README.md")));
+    }
+
+    #[test]
+    fn path_filter_include_brace_glob_mixes_with_plain_ones() {
+        let f = PathFilter::new("*.md, src/**/*.{js,jsx}", "");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/README.md")));
+        assert!(f.allows(root, Path::new("/proj/src/ui/app.jsx")));
+        assert!(!f.allows(root, Path::new("/proj/lib/app.jsx")));
+        assert!(!f.allows(root, Path::new("/proj/src/app.ts")));
+    }
+
+    #[test]
+    fn path_filter_include_with_no_valid_glob_allows_nothing() {
+        // A typed include that compiles to nothing must not widen the search
+        // (and Replace All) to every file.
+        let f = PathFilter::new("*.{ts", "");
+        let root = Path::new("/proj");
+        assert!(!f.allows(root, Path::new("/proj/src/a.ts")));
+        assert!(!f.allows(root, Path::new("/proj/README.md")));
+    }
+
+    #[test]
+    fn path_filter_exclude_keeps_commas_inside_braces() {
+        let f = PathFilter::new("", "*.{md,js}, target/**");
+        let root = Path::new("/proj");
+        assert!(!f.allows(root, Path::new("/proj/README.md")));
+        assert!(!f.allows(root, Path::new("/proj/other/d.js")));
+        assert!(!f.allows(root, Path::new("/proj/target/x.rs")));
+        assert!(f.allows(root, Path::new("/proj/src/a.ts")));
+    }
+
+    #[test]
+    fn path_filter_invalid_exclude_hides_nothing() {
+        // Negative: a broken exclude entry drops only itself.
+        let f = PathFilter::new("", "*.{md");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/README.md")));
+        assert!(f.allows(root, Path::new("/proj/src/a.ts")));
+    }
+
+    #[test]
+    fn an_invalid_include_glob_is_named_above_the_box() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.details_open = true;
+        panel.include = String::from("*.md, *.{ts");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 16,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("invalid glob: *.{ts"), "{text}");
+        assert!(text.contains("files to exclude\u{20}"), "{text}");
     }
 
     #[test]

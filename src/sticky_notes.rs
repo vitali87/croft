@@ -168,7 +168,7 @@ impl Notes {
         &self.notes
     }
 
-    #[cfg(test)]
+    /// The live note with `id`.
     pub fn get(&self, id: &str) -> Option<&Note> {
         self.notes.iter().find(|n| n.id == id && !n.deleted)
     }
