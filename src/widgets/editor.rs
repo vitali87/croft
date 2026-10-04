@@ -16430,6 +16430,34 @@ impl EditorTabs {
         Some(self.editors[idx].apply_span_edits(edits))
     }
 
+    /// Every open tab's file and `edit_seq`: the buffers as they stand when
+    /// a language server is asked for a workspace edit (#1151).
+    pub fn edit_seqs(&self) -> Vec<(PathBuf, u64)> {
+        self.editors
+            .iter()
+            .filter_map(|e| Some((e.path.clone()?, e.edit_seq)))
+            .collect()
+    }
+
+    /// True when the tab a workspace edit to `path` would land in (as
+    /// [`Self::apply_rename_to_open_tab`] picks it) was edited after `seqs`
+    /// was taken: the edit's positions describe text no longer there. A
+    /// file no tab held when `seqs` was taken is never called edited.
+    pub fn edited_since(&self, seqs: &[(PathBuf, u64)], path: &Path) -> bool {
+        let Some(idx) = self
+            .find_tab_with_path(path)
+            .or_else(|| self.find_any_tab_with_path(path))
+        else {
+            return false;
+        };
+        let e = &self.editors[idx];
+        let Some(p) = e.path.as_ref() else {
+            return false;
+        };
+        let mut then = seqs.iter().filter(|(q, _)| q == p).peekable();
+        then.peek().is_some() && !then.any(|(_, seq)| *seq == e.edit_seq)
+    }
+
     fn find_tab_matching(&self, target: &Path, extra: impl Fn(&Editor) -> bool) -> Option<usize> {
         let canon_target = target.canonicalize().ok();
         self.editors.iter().position(|e| {

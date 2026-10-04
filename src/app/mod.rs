@@ -1805,6 +1805,8 @@ struct PendingFileMove {
     op: FileMove,
     renames: Vec<crate::lsp::manager::FileRenameOp>,
     deadline: std::time::Instant,
+    /// The open buffers' `edit_seq`s when the request went out (#1151).
+    baseline: Vec<(PathBuf, u64)>,
 }
 
 /// A Search Editor tab's label (#615): not a file on disk, so it names the
@@ -3980,6 +3982,9 @@ pub struct App {
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
+    /// The open buffers' `edit_seq`s when the in-flight rename went out
+    /// (#1151): a reply for a buffer edited since is refused.
+    rename_baseline: Vec<(PathBuf, u64)>,
     /// An Explorer rename or move waiting on the servers' `willRenameFiles`
     /// edit (#610); it runs when the answer lands or its deadline passes.
     pending_file_move: Option<PendingFileMove>,
@@ -4003,6 +4008,9 @@ pub struct App {
     /// (the reply is one resolved action to apply directly) rather than the
     /// initial `textDocument/codeAction` (whose reply opens the picker).
     code_action_pending_resolve: bool,
+    /// The open buffers' `edit_seq`s when the code-action (or resolve)
+    /// request whose edits are pending went out (#1151).
+    code_action_baseline: Vec<(PathBuf, u64)>,
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
@@ -6004,6 +6012,7 @@ impl App {
             signature_help_request_id: None,
             signature_help_anchor: None,
             rename_request_id: None,
+            rename_baseline: Vec::new(),
             pending_file_move: None,
             prepare_rename_request: None,
             format_request_id: None,
@@ -6012,6 +6021,7 @@ impl App {
             on_type_request: None,
             code_action_request_id: None,
             code_action_pending_resolve: false,
+            code_action_baseline: Vec::new(),
             pending_code_actions: Vec::new(),
             review_boxes: None,
             review_pending: Vec::new(),
@@ -13219,17 +13229,50 @@ impl App {
             return false;
         }
         self.rename_request_id = None;
+        self.land_rename(edits);
+        true
+    }
+
+    /// Apply a rename reply, unless a buffer it edits was typed into after
+    /// the request went out (#1151): its positions were computed against
+    /// the text as it was then, and would land on whatever sits there now.
+    fn land_rename(
+        &mut self,
+        edits: Option<Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)>>,
+    ) {
+        let baseline = std::mem::take(&mut self.rename_baseline);
         match edits {
-            Some(files) => match self.apply_rename_edits(&files) {
-                Ok((file_count, occ)) => {
-                    self.status =
-                        format!("Renamed {occ} occurrence(s) across {file_count} file(s)");
+            Some(files) => {
+                if let Some(file) = self.stale_edit_target(&baseline, &files) {
+                    self.status = format!(
+                        "Rename cancelled: {file} changed while the server was working; press F2 again"
+                    );
+                    return;
                 }
-                Err(e) => self.status = format!("Rename failed: {e}"),
-            },
+                match self.apply_rename_edits(&files) {
+                    Ok((file_count, occ)) => {
+                        self.status =
+                            format!("Renamed {occ} occurrence(s) across {file_count} file(s)");
+                    }
+                    Err(e) => self.status = format!("Rename failed: {e}"),
+                }
+            }
             None => self.status = String::from("Rename produced no changes"),
         }
-        true
+    }
+
+    /// The first file of a workspace edit whose open buffer changed after
+    /// `baseline` was taken, named for the status bar (#1151).
+    fn stale_edit_target(
+        &self,
+        baseline: &[(PathBuf, u64)],
+        files: &[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)],
+    ) -> Option<String> {
+        files
+            .iter()
+            .filter(|(_, edits)| !edits.is_empty())
+            .find(|(path, _)| self.editor.edited_since(baseline, path))
+            .map(|(path, _)| self.status_path(path))
     }
 
     /// Apply an LSP rename `WorkspaceEdit` (already normalised to per-file
@@ -13809,6 +13852,7 @@ impl App {
         let id = lsp.request_code_action(path, row, col, row, col, diagnostics);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = false;
+        self.code_action_baseline = self.editor.edit_seqs();
         self.status = String::from("Finding quick fixes");
     }
 
@@ -13918,6 +13962,12 @@ impl App {
     /// that returns a still-edit-less action after resolve can't loop.
     fn apply_resolved_code_action(&mut self, item: crate::lsp::manager::CodeActionItem) {
         let mut applied = false;
+        if let Some(file) = self.stale_edit_target(&self.code_action_baseline, &item.edits) {
+            self.status = format!(
+                "Quick fix cancelled: {file} changed while the server was working; try it again"
+            );
+            return;
+        }
         if !item.edits.is_empty() {
             match self.apply_rename_edits(&item.edits) {
                 Ok((files, occ)) => {
@@ -13961,6 +14011,7 @@ impl App {
         let id = lsp.request_code_action_resolve(path, item.server, action);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = true;
+        self.code_action_baseline = self.editor.edit_seqs();
         self.status = String::from("Resolving quick fix");
     }
 
@@ -62030,6 +62081,7 @@ impl App {
             op,
             renames,
             deadline: std::time::Instant::now() + FILE_MOVE_DEADLINE,
+            baseline: self.editor.edit_seqs(),
         });
     }
 
@@ -62075,11 +62127,27 @@ impl App {
                 .into_iter()
                 .map(|(path, e)| (moved_path(&path, &pending.renames), e))
                 .collect();
-            match self.apply_rename_edits(&edits) {
-                Ok((files, _)) => {
-                    self.status = format!("{moved_status}, references updated in {files} file(s)");
+            // The move carried open tabs to their new paths; so too their
+            // request-time seqs, for the check below to find them.
+            let baseline: Vec<_> = pending
+                .baseline
+                .iter()
+                .map(|(path, seq)| (moved_path(path, &pending.renames), *seq))
+                .collect();
+            if let Some(file) = self.stale_edit_target(&baseline, &edits) {
+                self.status = format!(
+                    "{moved_status}; references not updated: {file} changed while the server was working"
+                );
+            } else {
+                match self.apply_rename_edits(&edits) {
+                    Ok((files, _)) => {
+                        self.status =
+                            format!("{moved_status}, references updated in {files} file(s)");
+                    }
+                    Err(e) => {
+                        self.status = format!("{moved_status}; could not update references: {e}")
+                    }
                 }
-                Err(e) => self.status = format!("{moved_status}; could not update references: {e}"),
             }
         }
         if let Some(lsp) = self.lsp.as_mut() {
@@ -62392,6 +62460,7 @@ impl App {
                 };
                 let id = lsp.request_rename(path, line, character, new_name);
                 self.rename_request_id = Some(id);
+                self.rename_baseline = self.editor.edit_seqs();
                 self.prompt = None;
                 self.status = String::from("Renaming symbol");
             }

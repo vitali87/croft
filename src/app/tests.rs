@@ -43856,6 +43856,209 @@ fn a_rename_landing_before_a_keystroke_in_a_symbol_tab_is_kept() {
     );
 }
 
+// ---- A late workspace edit never lands on text typed since (#1151) ----
+
+/// `calc.srn` open in the editor, caret at its start, as in the issue.
+fn app_with_calc_open(tmp: &tempfile::TempDir) -> (App, PathBuf) {
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("calc.srn");
+    std::fs::write(&file, "total = 1\nprint(total)\ntotal += 2\n").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.focus = Pane::Editor;
+    (app, file)
+}
+
+/// The server's rename of `total` to `sum` in calc.srn, computed against
+/// the text the file held when the request went out.
+fn rename_total_to_sum(file: &Path) -> Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)> {
+    let span = |row, col| crate::widgets::editor::TextSpanEdit {
+        start: (row, col),
+        end: (row, col + 5),
+        new_text: String::from("sum"),
+        utf16: false,
+    };
+    vec![(file.to_path_buf(), vec![span(0, 0), span(1, 6), span(2, 0)])]
+}
+
+/// The issue's keystrokes while the server works: a `# header` line above.
+fn type_a_header_line(app: &mut App) {
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    for c in "# header".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_rename_reply_for_a_buffer_typed_into_since_the_request_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.rename_baseline = app.editor.edit_seqs();
+    type_a_header_line(&mut app);
+    app.land_rename(Some(rename_total_to_sum(&file)));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "# header\ntotal = 1\nprint(total)\ntotal += 2",
+        "no edit lands at the stale positions"
+    );
+    assert_eq!(
+        app.status,
+        "Rename cancelled: calc.srn changed while the server was working; press F2 again"
+    );
+}
+
+#[test]
+fn a_rename_reply_for_an_untouched_buffer_still_renames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.rename_baseline = app.editor.edit_seqs();
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.land_rename(Some(rename_total_to_sum(&file)));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "sum = 1\nprint(sum)\nsum += 2",
+        "a caret move is not an edit"
+    );
+    assert_eq!(app.status, "Renamed 3 occurrence(s) across 1 file(s)");
+}
+
+#[test]
+fn a_rename_still_rewrites_a_closed_file_when_another_buffer_was_typed_into() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_calc_open(&tmp);
+    let closed = app.tree.root.join("other.srn");
+    std::fs::write(&closed, "total = 1\nprint(total)\ntotal += 2\n").unwrap();
+    app.rename_baseline = app.editor.edit_seqs();
+    type_a_header_line(&mut app);
+    app.land_rename(Some(rename_total_to_sum(&closed)));
+    assert_eq!(
+        std::fs::read_to_string(&closed).unwrap(),
+        "sum = 1\nprint(sum)\nsum += 2\n",
+        "the typing was in a file the rename leaves alone"
+    );
+    assert_eq!(app.status, "Renamed 3 occurrence(s) across 1 file(s)");
+}
+
+#[test]
+fn a_rename_reply_with_no_baseline_is_applied_as_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.land_rename(Some(rename_total_to_sum(&file)));
+    assert_eq!(app.editor.lines[0], "sum = 1");
+    assert!(app.rename_baseline.is_empty());
+}
+
+fn quick_fix_renaming_total(file: &Path) -> crate::lsp::manager::CodeActionItem {
+    crate::lsp::manager::CodeActionItem {
+        title: String::from("Rename to sum"),
+        server: String::from("slowrename"),
+        edits: rename_total_to_sum(file),
+        command: None,
+        needs_resolve: false,
+        resolve_action: None,
+        is_preferred: false,
+    }
+}
+
+#[test]
+fn a_quick_fix_for_a_buffer_typed_into_since_the_request_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.code_action_baseline = app.editor.edit_seqs();
+    type_a_header_line(&mut app);
+    app.apply_code_action(quick_fix_renaming_total(&file));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "# header\ntotal = 1\nprint(total)\ntotal += 2"
+    );
+    assert_eq!(
+        app.status,
+        "Quick fix cancelled: calc.srn changed while the server was working; try it again"
+    );
+}
+
+#[test]
+fn a_quick_fix_for_an_untouched_buffer_still_applies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.code_action_baseline = app.editor.edit_seqs();
+    app.apply_code_action(quick_fix_renaming_total(&file));
+    assert_eq!(app.editor.lines.join("\n"), "sum = 1\nprint(sum)\nsum += 2");
+    assert_eq!(
+        app.status,
+        "Rename to sum: changed 3 edit(s) across 1 file(s)"
+    );
+}
+
+/// An Explorer rename of `calc.srn` to `sums.srn` whose server answer also
+/// renames `total` inside the moved file, which is open in a tab.
+fn move_calc_to_sums(app: &App, file: &Path) -> PendingFileMove {
+    let root = app.tree.root.clone();
+    PendingFileMove {
+        request_id: 9,
+        op: FileMove::Rename {
+            parent: root.clone(),
+            old: file.to_path_buf(),
+            new_name: String::from("sums.srn"),
+        },
+        renames: vec![crate::lsp::manager::FileRenameOp {
+            old: file.to_path_buf(),
+            new: root.join("sums.srn"),
+            is_dir: false,
+        }],
+        deadline: std::time::Instant::now(),
+        baseline: app.editor.edit_seqs(),
+    }
+}
+
+#[test]
+fn a_file_move_moves_but_leaves_a_buffer_typed_into_since_the_request_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    let pending = move_calc_to_sums(&app, &file);
+    type_a_header_line(&mut app);
+    app.finish_file_move(pending, rename_total_to_sum(&file));
+    assert!(
+        app.tree.root.join("sums.srn").exists(),
+        "the move still ran"
+    );
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "# header\ntotal = 1\nprint(total)\ntotal += 2"
+    );
+    assert!(
+        app.status
+            .ends_with("; references not updated: sums.srn changed while the server was working"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn a_file_move_still_updates_an_untouched_buffer_it_moved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    let pending = move_calc_to_sums(&app, &file);
+    app.finish_file_move(pending, rename_total_to_sum(&file));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(app.tree.root.join("sums.srn").as_path())
+    );
+    assert_eq!(app.editor.lines.join("\n"), "sum = 1\nprint(sum)\nsum += 2");
+    assert!(
+        app.status.contains("references updated in 1 file"),
+        "{}",
+        app.status
+    );
+}
+
 #[test]
 fn peek_references_with_nothing_to_ask_does_not_arm_on_a_stale_request() {
     let tmp = tempfile::tempdir().unwrap();
@@ -52397,6 +52600,7 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
             is_dir: false,
         }],
         deadline: std::time::Instant::now(),
+        baseline: Vec::new(),
     };
     let edits = vec![(
         root.join("main.py"),
@@ -52513,6 +52717,7 @@ fn a_failed_move_leaves_the_importers_alone_and_edits_follow_a_moved_file() {
             is_dir: true,
         }],
         deadline: std::time::Instant::now(),
+        baseline: Vec::new(),
     };
     app.finish_file_move(pending, edit(root.join("main.rs")));
     assert_eq!(
@@ -52536,6 +52741,7 @@ fn a_failed_move_leaves_the_importers_alone_and_edits_follow_a_moved_file() {
             is_dir: true,
         }],
         deadline: std::time::Instant::now(),
+        baseline: Vec::new(),
     };
     app.finish_file_move(pending, edit(root.join("pkg/lib.rs")));
     assert_eq!(
@@ -52559,6 +52765,7 @@ fn a_pending_move_goes_ahead_at_its_deadline_without_an_answer() {
         },
         renames: Vec::new(),
         deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+        baseline: Vec::new(),
     });
     assert!(app.tick_file_moves());
     assert!(app.pending_file_move.is_none());
