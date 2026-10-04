@@ -7505,7 +7505,7 @@ impl App {
                 title,
                 "type reload to discard your unsaved edits",
             )
-            .with_hint("reload + Enter: discard your edits · Esc or any other answer: keep them"),
+            .with_hint("reload + Enter discards your edits · anything else keeps them"),
         );
     }
 
