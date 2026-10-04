@@ -68659,3 +68659,126 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
     assert_eq!(app.status, "Tab is already kept open");
 }
+
+// --- #1252: Quick Fix sends the selection --------------------------------------
+
+fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
+    crate::lsp::manager::Diagnostic {
+        start_line: line,
+        start_char: 0,
+        end_line: line,
+        end_char: 1,
+        severity: crate::lsp::manager::DiagnosticSeverity::Warning,
+        message: String::from(message),
+    }
+}
+
+const QUICK_FIX_BODY: &str = "def f():\n    a = 1\n    b = 2\n    c = 3\n    return a\n";
+
+#[test]
+fn quick_fix_with_a_selection_asks_about_the_whole_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    // Select lines 2-3 top to bottom: the caret ends at the start of line 4.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (1, 0),
+        head: (3, 0),
+    });
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 0;
+    let (start, end, _) = app.code_action_request();
+    assert_eq!(
+        (start, end),
+        ((1, 0), (3, 0)),
+        "the code action range must be the selection, not the caret point"
+    );
+}
+
+#[test]
+fn quick_fix_with_a_backwards_selection_sends_it_start_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (2, 9),
+        head: (1, 4),
+    });
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+    let (start, end, _) = app.code_action_request();
+    assert_eq!((start, end), ((1, 4), (2, 9)));
+}
+
+#[test]
+fn quick_fix_with_a_selection_sends_the_diagnostics_of_every_selected_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    let path = app.editor.path.clone().unwrap();
+    app.editor.apply_diagnostics(
+        path,
+        vec![
+            diag_on_line(1, "a unused"),
+            diag_on_line(2, "b unused"),
+            diag_on_line(4, "outside"),
+        ],
+    );
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (1, 0),
+        head: (2, 9),
+    });
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 9;
+    let (_, _, diagnostics) = app.code_action_request();
+    let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(messages, vec!["a unused", "b unused"]);
+}
+
+#[test]
+fn quick_fix_without_a_selection_still_asks_about_the_caret_point() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    let path = app.editor.path.clone().unwrap();
+    app.editor.apply_diagnostics(
+        path,
+        vec![diag_on_line(1, "a unused"), diag_on_line(2, "b unused")],
+    );
+    app.editor.selection = None;
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 6;
+    let (start, end, diagnostics) = app.code_action_request();
+    assert_eq!((start, end), ((2, 6), (2, 6)));
+    let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        vec!["b unused"],
+        "only the caret line's diagnostics"
+    );
+}
+
+#[test]
+fn quick_fix_with_an_empty_selection_falls_back_to_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 4),
+        head: (3, 4),
+    });
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 4;
+    let (start, end, _) = app.code_action_request();
+    assert_eq!((start, end), ((3, 4), (3, 4)));
+}
+
+#[test]
+fn quick_fix_selection_columns_are_utf16() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", "s = \"🙂🙂\"\n");
+    // Select the two emoji: chars 5..7, UTF-16 units 5..9.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 5),
+        head: (0, 7),
+    });
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    let (start, end, _) = app.code_action_request();
+    assert_eq!((start, end), ((0, 5), (0, 9)));
+}

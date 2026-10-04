@@ -13952,6 +13952,28 @@ impl App {
         self.status = format!("Conflict {} of {total}", idx + 1);
     }
 
+    /// The range a Quick Fix asks the server about, as UTF-16 `(line, col)`
+    /// start and end, with the diagnostics on its lines as context: the
+    /// selection when there is one (VS Code sends it, so selection-scoped
+    /// refactors like Extract Function are offered), else the caret point.
+    #[allow(clippy::type_complexity)]
+    fn code_action_request(
+        &self,
+    ) -> ((u32, u32), (u32, u32), Vec<crate::lsp::manager::Diagnostic>) {
+        let ((sr, sc), (er, ec)) = match self.editor.selection.filter(|s| s.has_area()) {
+            Some(sel) => sel.normalised(),
+            None => {
+                let caret = (self.editor.cursor_row, self.editor.cursor_col);
+                (caret, caret)
+            }
+        };
+        let start = self.editor.pos_to_utf16(sr, sc);
+        let end = self.editor.pos_to_utf16(er, ec);
+        // Rows are plain line numbers, unaffected by the UTF-16 columns.
+        let diagnostics = self.editor.diagnostics_in_line_range(start.0, end.0);
+        (start, end, diagnostics)
+    }
+
     fn start_code_action(&mut self) {
         if self.editor.has_non_text_view() {
             return;
@@ -13969,17 +13991,12 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        // `row`/`col` go to the server, so the column must be UTF-16;
-        // `diagnostics_in_line_range` takes a plain row and is unaffected.
-        let (row, col) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let diagnostics = self.editor.diagnostics_in_line_range(row, row);
+        let ((sr, sc), (er, ec), diagnostics) = self.code_action_request();
         let Some(lsp) = self.lsp.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
-        let id = lsp.request_code_action(path, row, col, row, col, diagnostics);
+        let id = lsp.request_code_action(path, sr, sc, er, ec, diagnostics);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = false;
         self.status = String::from("Finding quick fixes");
