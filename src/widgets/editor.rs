@@ -1197,6 +1197,11 @@ fn render_diff(
     } else {
         header
     };
+    let header = if diff.coarse {
+        format!("{header}\u{2022} large change: diff stopped early ")
+    } else {
+        header
+    };
     let head_bg = if diff.bytes_differ_but_lines_equal {
         theme.ui(Color::Rgb(0x8a, 0x4a, 0x10))
     } else {
