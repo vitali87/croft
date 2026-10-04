@@ -13,6 +13,7 @@ Per platform:
 | Keys | Action |
 |------|--------|
 | `Ctrl+s` / `Cmd+s` | Save the open file |
+| A file you have unsaved edits in changes on disk | A prompt asks what to do. Typing `reload` + Enter replaces the buffer with the disk version, after recording your unsaved version in Local History (TIMELINE). Esc, or Enter on any other answer (keys typed before you noticed the prompt), keeps your edits |
 | Typing `(` `[` `{` or a quote | Auto-closing pairs: the pair inserts with the caret between (openers never before a word, quotes never after one); typing the closer steps over; a selection is surrounded; backspace inside an empty pair deletes both. Settings gear → "Auto Closing Pairs" toggles |
 | `Ctrl+q` | Quit |
 | `F1` | Open the shortcuts modal |

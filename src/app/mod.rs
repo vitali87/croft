@@ -7482,20 +7482,17 @@ impl App {
     /// already owns the modal slot, so we never stomp an in-progress input.
     fn prompt_disk_conflict(&mut self, paths: Vec<PathBuf>) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-        let (title, placeholder) = match paths.as_slice() {
-            [one] => (
-                format!(
-                    "{} changed on disk and you have unsaved edits.",
-                    one.display()
-                ),
-                "Enter to reload (discard your edits) · Esc to keep editing",
+        // It opens mid-typing and takes the keys, so nothing a stray Enter
+        // or a typed line can confirm discards the edits: only the word
+        // `reload` does, and the box says so (#910).
+        let title = match paths.as_slice() {
+            [one] => format!(
+                "{} changed on disk and you have unsaved edits.",
+                self.status_path(one)
             ),
-            many => (
-                format!(
-                    "{} open files changed on disk with unsaved edits.",
-                    many.len()
-                ),
-                "Enter to reload all (discard your edits) · Esc to keep editing",
+            many => format!(
+                "{} open files changed on disk with unsaved edits.",
+                many.len()
             ),
         };
         if self.input_prompt.is_some() {
@@ -7503,8 +7500,12 @@ impl App {
             return;
         }
         self.open_input_prompt(
-            InputPrompt::new(InputPurpose::ReloadConflict { paths }, title, placeholder)
-                .with_value("reload"),
+            InputPrompt::new(
+                InputPurpose::ReloadConflict { paths },
+                title,
+                "type reload to discard your unsaved edits",
+            )
+            .with_hint("reload + Enter: discard your edits · Esc or any other answer: keep them"),
         );
     }
 
@@ -32901,6 +32902,15 @@ impl App {
             }
             InputPurpose::ReloadConflict { paths } => {
                 self.close_input_prompt();
+                if !value.eq_ignore_ascii_case("reload") {
+                    self.status = String::from(
+                        "Kept your unsaved edits; saving asks before overwriting the disk version",
+                    );
+                    return;
+                }
+                // Recoverable from TIMELINE: no answer, however deliberate,
+                // makes typed work unrecoverable (#910).
+                let kept = self.keep_unsaved_buffers_in_history(&paths);
                 // Every group: the prompt lists conflicts from the other
                 // splits too, and reverting only the focused one left theirs
                 // unreloaded with the prompt never coming back.
@@ -32922,6 +32932,10 @@ impl App {
                     (n, 0) => format!("Reloaded {n} files from disk"),
                     (n, f) => format!("Reloaded {n} files; {f} failed and kept their edits"),
                 };
+                if kept > 0 && !reverted.is_empty() {
+                    self.status
+                        .push_str("; the discarded edits are in Local History (TIMELINE)");
+                }
             }
             InputPurpose::AskNavigator {
                 file,
@@ -56175,6 +56189,32 @@ impl App {
         for session in self.debug_sessions.iter_mut() {
             session.update_breakpoints(path, &specs);
         }
+    }
+
+    /// Record each dirty tab of `paths` (any group) in Local History as a
+    /// kept snapshot, before a reload throws its edits away (#910). The
+    /// number recorded.
+    fn keep_unsaved_buffers_in_history(&mut self, paths: &[PathBuf]) -> usize {
+        let millis = now_millis();
+        let mut buffers: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        for tab in groups.flat_map(|g| g.iter_tabs()) {
+            let Some(path) = tab.path.as_ref().filter(|p| paths.contains(p)) else {
+                continue;
+            };
+            if tab.dirty
+                && !buffers.iter().any(|(p, _)| p == path)
+                && let Some(bytes) = tab.bytes_for_disk()
+            {
+                buffers.push((path.clone(), bytes));
+            }
+        }
+        buffers
+            .iter()
+            .filter(|(path, bytes)| {
+                crate::history::record_kept_in(&self.history_root, path, bytes, millis).is_ok()
+            })
+            .count()
     }
 
     /// [`Self::record_history_snapshot_of`] as a kept snapshot (a restore).
