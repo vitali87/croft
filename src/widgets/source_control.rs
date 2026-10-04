@@ -131,6 +131,12 @@ pub struct RepoRow {
     pub workspace_root: std::path::PathBuf,
 }
 
+/// Most message rows the box shows before it scrolls.
+pub const MESSAGE_MAX_ROWS: usize = 6;
+
+/// Change-list rows a growing commit message never takes over.
+const MESSAGE_LIST_MIN_ROWS: u16 = 2;
+
 pub struct SourceControlPanel {
     pub focused: bool,
     /// True under the Black theme: overpaint the focused outer border with the
@@ -147,6 +153,10 @@ pub struct SourceControlPanel {
     /// wider than the box. Recomputed every render from the cursor and the
     /// box width.
     pub message_scroll: usize,
+    /// Message lines scrolled out of view above the commit-message input
+    /// once the message has more lines than the box shows. Recomputed every
+    /// render, like `message_scroll`, to keep the caret's line visible.
+    pub message_line_scroll: usize,
     pub status: GitStatus,
     pub entries: Vec<ChangeEntry>,
     /// The multi-root repositories overview (#161), pushed by the App per
@@ -176,6 +186,13 @@ pub struct SourceControlPanel {
     /// Empty when the panel is in a git repo or when the panel is too
     /// small to draw the empty-state card.
     pub last_init_repo_button_area: Rect,
+    /// Repositories in the workspace's immediate subfolders, as (label,
+    /// absolute path), set by `App` while the workspace itself is in no
+    /// repo (#1227). Non-empty, the empty-state card lists them with an
+    /// Open button each in place of Initialize.
+    pub nested_repos: Vec<(String, std::path::PathBuf)>,
+    /// Hit-test rects for those Open buttons; empty whenever none paint.
+    pub nested_repo_button_areas: Vec<(Rect, std::path::PathBuf)>,
     /// Cell rect reserved for the no-repo empty-state hero illustration.
     /// `App` paints an OSC-1337 inline PNG here on iTerm2-class terminals;
     /// the widget paints an ASCII Y-fork as fallback so the same rect
@@ -234,6 +251,7 @@ impl SourceControlPanel {
             message: String::new(),
             message_cursor: 0,
             message_scroll: 0,
+            message_line_scroll: 0,
             status: GitStatus::default(),
             entries: Vec::new(),
             repositories: Vec::new(),
@@ -247,6 +265,8 @@ impl SourceControlPanel {
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_init_repo_button_area: Rect::default(),
+            nested_repos: Vec::new(),
+            nested_repo_button_areas: Vec::new(),
             last_hero_area: Rect::default(),
             inline_hero_image_active: false,
             scroll: 0,
@@ -344,22 +364,72 @@ impl SourceControlPanel {
         self.entries.len()
     }
 
+    /// Insert at the caret. A newline starts a new message line (the
+    /// commit body); a carriage return counts as one.
     pub fn insert_char(&mut self, c: char) {
-        if c == '\n' || c == '\r' {
-            return;
-        }
+        let c = if c == '\r' { '\n' } else { c };
         let idx = self.byte_index_at_cursor();
         self.message.insert(idx, c);
         self.message_cursor += 1;
     }
 
+    /// Insert pasted text at the caret, keeping its line breaks: CRLF and
+    /// a lone CR both become one newline, so words on adjacent lines never
+    /// run together.
     pub fn insert_str(&mut self, s: &str) {
-        for c in s.chars() {
-            if c == '\n' || c == '\r' {
-                continue;
-            }
+        for c in s.replace("\r\n", "\n").chars() {
             self.insert_char(c);
         }
+    }
+
+    /// The caret's (line, column) within the message, in chars.
+    fn caret_line_col(&self) -> (usize, usize) {
+        let before = self.message.chars().take(self.message_cursor);
+        let (mut line, mut col) = (0, 0);
+        for c in before {
+            if c == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    /// Move the caret to `col` (clamped to the line's end) on message line
+    /// `line`.
+    fn set_caret_line_col(&mut self, line: usize, col: usize) {
+        let mut offset = 0;
+        for (n, text) in self.message.split('\n').enumerate() {
+            let len = text.chars().count();
+            if n == line {
+                self.message_cursor = offset + col.min(len);
+                return;
+            }
+            offset += len + 1;
+        }
+    }
+
+    /// Caret to the same column on the line above. False on the first
+    /// line, where there is nowhere to go.
+    pub fn move_cursor_up(&mut self) -> bool {
+        let (line, col) = self.caret_line_col();
+        if line == 0 {
+            return false;
+        }
+        self.set_caret_line_col(line - 1, col);
+        true
+    }
+
+    /// Caret to the same column on the line below. False on the last line.
+    pub fn move_cursor_down(&mut self) -> bool {
+        let (line, col) = self.caret_line_col();
+        if line + 1 >= self.message.split('\n').count() {
+            return false;
+        }
+        self.set_caret_line_col(line + 1, col);
+        true
     }
 
     pub fn backspace(&mut self) {
@@ -420,6 +490,7 @@ impl SourceControlPanel {
         self.message.clear();
         self.message_cursor = 0;
         self.message_scroll = 0;
+        self.message_line_scroll = 0;
     }
 
     pub fn entry_at_y(&self, y: u16) -> Option<usize> {
@@ -466,6 +537,14 @@ impl SourceControlPanel {
         rect_hit(self.last_init_repo_button_area, x, y)
     }
 
+    /// The subfolder repo whose Open button (x, y) lands on (#1227).
+    pub fn click_nested_repo(&self, x: u16, y: u16) -> Option<std::path::PathBuf> {
+        self.nested_repo_button_areas
+            .iter()
+            .find(|(r, _)| rect_hit(*r, x, y))
+            .map(|(_, path)| path.clone())
+    }
+
     pub fn scroll_up(&mut self, rows: usize) {
         self.scroll = self.scroll.saturating_sub(rows);
     }
@@ -503,10 +582,11 @@ impl SourceControlPanel {
     /// to drive the host terminal's hardware caret. Returns `None` when
     /// the panel isn't focused, isn't in a repo (no input box painted),
     /// hasn't been laid out yet, or the cursor would land outside the
-    /// visible inner width of the input box. The render path paints the
-    /// message at `input_inner.x + 1` on `input_inner.y`, so the caret
-    /// sits at column `input_box.x + 2 + message_cursor`, row
-    /// `input_box.y + 1` (rounded border occupies one cell on each side).
+    /// visible inner width of the input box. The render path paints
+    /// message line `n` at `input_inner.x + 1` on `input_inner.y + n`
+    /// (less the scrolled-off lines and columns), so the caret sits at
+    /// column `input_box.x + 2 + col`, row `input_box.y + 1 + line`
+    /// (rounded border occupies one cell on each side).
     pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
         if !self.focused {
             return None;
@@ -515,12 +595,17 @@ impl SourceControlPanel {
         if r.width < 3 || r.height < 3 {
             return None;
         }
-        let cursor_col = self.message_cursor.saturating_sub(self.message_scroll) as u16;
+        let (line, col) = self.caret_line_col();
+        let cursor_col = col.saturating_sub(self.message_scroll) as u16;
         let max_col = r.width.saturating_sub(3);
         if cursor_col > max_col {
             return None;
         }
-        Some((r.x + 2 + cursor_col, r.y + 1))
+        let row = line.checked_sub(self.message_line_scroll)? as u16;
+        if row + 2 >= r.height {
+            return None;
+        }
+        Some((r.x + 2 + cursor_col, r.y + 1 + row))
     }
 
     /// Compute the visual layout of the change list as a flat sequence of
@@ -728,7 +813,12 @@ impl SourceControlPanel {
         // word wrapping so a resized panel reflows the text instead of
         // truncating mid-word - that's the "text inside is not even
         // adjusted" bug from the user's screenshot.
-        let title_text = "No repository detected";
+        let nested = !self.nested_repos.is_empty();
+        let title_text = if nested {
+            "Repositories found in subfolders"
+        } else {
+            "No repository detected"
+        };
         let title_h = paragraph_line_count(title_text, card_inner.width).min(3) as u16;
         if y + title_h <= bottom && title_h > 0 {
             let title_rect = Rect {
@@ -745,8 +835,11 @@ impl SourceControlPanel {
             y += title_h + 1;
         }
 
-        let desc_text =
-            "Open a folder under Git or create a new repository to start tracking changes.";
+        let desc_text = if nested {
+            "This folder is not a Git repository, but these subfolders are. Open one to use Source Control."
+        } else {
+            "Open a folder under Git or create a new repository to start tracking changes."
+        };
         let desc_h = paragraph_line_count(desc_text, card_inner.width).min(6) as u16;
         if y + desc_h <= bottom && desc_h > 0 {
             let desc_rect = Rect {
@@ -768,6 +861,26 @@ impl SourceControlPanel {
         let max_btn_w: u16 = 40;
         let btn_w = card_inner.width.saturating_sub(2).min(max_btn_w);
         let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_w)) / 2;
+        if nested {
+            // One Open button per repo while they fit; Initialize would
+            // `git init` this folder around them, so it is not offered.
+            for (label, path) in &self.nested_repos {
+                if y + 3 > bottom || btn_w < 6 {
+                    break;
+                }
+                let area = Rect {
+                    x: btn_x,
+                    y,
+                    width: btn_w,
+                    height: 3,
+                };
+                let text = format!("Open {label}");
+                render_rounded_button(buf, area, &text, blue_bg, text_white);
+                self.nested_repo_button_areas.push((area, path.clone()));
+                y += 4;
+            }
+            return;
+        }
         let init_label: &str = if btn_w >= 23 {
             "Initialize Repository"
         } else if btn_w >= 12 {
@@ -1101,6 +1214,7 @@ impl Widget for &mut SourceControlPanel {
         // design the user supplied.
         if !self.status.in_repo {
             self.last_init_repo_button_area = Rect::default();
+            self.nested_repo_button_areas.clear();
             self.last_hero_area = Rect::default();
             self.render_no_repo_empty_state(inner, buf);
             // With several folders open, the OTHER folders' repositories
@@ -1111,6 +1225,7 @@ impl Widget for &mut SourceControlPanel {
         }
         // Repo path: hero is only for the empty state.
         self.last_hero_area = Rect::default();
+        self.nested_repo_button_areas.clear();
 
         // Row 2: branch row — a green branch glyph plus the branch name.
         let mut y = inner.y + 2;
@@ -1164,15 +1279,26 @@ impl Widget for &mut SourceControlPanel {
         buf.set_line(inner.x, y, &Line::from(spans), inner.width);
         y += 2; // blank gap below branch row
 
-        // Rows y..y+3: commit-message input (3-row rounded box).
+        // Rows y..y+3: commit-message input, a rounded box one row per
+        // message line (up to MESSAGE_MAX_ROWS, then it scrolls).
         if y + 3 > inner.y + inner.height {
             return;
         }
+        let line_count = self.message.split('\n').count();
+        // Below the box: gap, Commit button, gap, the feedback line when
+        // there is one, the separator and a couple of change-list rows. A
+        // long message gives up rows (and scrolls) before any of those do;
+        // a short panel still gets a one-line box.
+        let feedback_rows = if self.commit_feedback.is_some() { 2 } else { 0 };
+        let below = 1 + 3 + 1 + feedback_rows + 1 + MESSAGE_LIST_MIN_ROWS;
+        let left = inner.y + inner.height - y;
         let input_box = Rect {
             x: inner.x,
             y,
             width: inner.width,
-            height: 3,
+            height: (line_count.clamp(1, MESSAGE_MAX_ROWS) as u16 + 2)
+                .min(left.saturating_sub(below).max(3))
+                .min(left),
         };
         self.last_input_area = input_box;
         let input_border_style = if self.focused {
@@ -1199,10 +1325,11 @@ impl Widget for &mut SourceControlPanel {
             let text_max = (input_inner.width as usize).saturating_sub(2);
             if self.message.is_empty() {
                 self.message_scroll = 0;
+                self.message_line_scroll = 0;
                 buf.set_stringn(
                     text_x,
                     content_y,
-                    "Message (Enter = commit, \u{2303}Enter = push)",
+                    "Message (Enter = commit, \u{21e7}Enter = new line, \u{2303}Enter = push)",
                     text_max,
                     Style::default()
                         .fg(Color::Rgb(
@@ -1217,30 +1344,43 @@ impl Widget for &mut SourceControlPanel {
                 // message wider than the input (e.g. a pasted path) stays
                 // editable. Without this the box always shows byte 0, the
                 // caret falls off the right edge, and edits at the tail are
-                // invisible — the field reads as frozen.
-                let len = self.message.chars().count();
-                let cursor = self.message_cursor.min(len);
+                // invisible — the field reads as frozen. Vertical scroll
+                // does the same for the caret's line in a long message.
+                let (line, cursor) = self.caret_line_col();
                 if cursor < self.message_scroll {
                     self.message_scroll = cursor;
                 } else if text_max > 0 && cursor > self.message_scroll + text_max {
                     self.message_scroll = cursor - text_max;
                 }
-                let visible: String = self
+                let rows = input_inner.height as usize;
+                if line < self.message_line_scroll {
+                    self.message_line_scroll = line;
+                } else if line >= self.message_line_scroll + rows {
+                    self.message_line_scroll = line + 1 - rows;
+                }
+                for (row, text) in self
                     .message
-                    .chars()
-                    .skip(self.message_scroll)
-                    .take(text_max)
-                    .collect();
-                buf.set_stringn(
-                    text_x,
-                    content_y,
-                    &visible,
-                    text_max,
-                    Style::default().fg(self.theme.ui(Color::White)),
-                );
+                    .split('\n')
+                    .skip(self.message_line_scroll)
+                    .take(rows)
+                    .enumerate()
+                {
+                    let visible: String = text
+                        .chars()
+                        .skip(self.message_scroll)
+                        .take(text_max)
+                        .collect();
+                    buf.set_stringn(
+                        text_x,
+                        content_y + row as u16,
+                        &visible,
+                        text_max,
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    );
+                }
             }
         }
-        y += 3 + 1; // input box + 1-row gap
+        y += input_box.height + 1; // input box + 1-row gap
 
         // Rows y..y+3: chunky split-button — wide "Commit" main + narrow
         // chevron caret. The caret reveals a "Commit & Push" dropdown so
@@ -2351,6 +2491,130 @@ mod tests {
         );
     }
 
+    /// #1227: the workspace sits one folder above its repo. Initialize
+    /// would `git init` the parent around the existing repo, so the card
+    /// names the subfolder repos and offers to open them instead.
+    #[test]
+    fn empty_state_offers_subfolder_repos_instead_of_initialize() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        p.nested_repos = vec![(String::from("sub/"), std::path::PathBuf::from("/w/sub"))];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("Repositories found in subfolders"),
+            "title must name the subfolder repos:\n{dump}"
+        );
+        assert!(dump.contains("Open sub/"), "open button missing:\n{dump}");
+        assert!(
+            !dump.contains("Initialize") && !dump.contains("No repository detected"),
+            "Initialize must not be offered above a repo:\n{dump}"
+        );
+        assert_eq!(p.last_init_repo_button_area, Rect::default());
+        assert_eq!(p.nested_repo_button_areas.len(), 1);
+        let (btn, _) = p.nested_repo_button_areas[0].clone();
+        assert_eq!(
+            p.click_nested_repo(btn.x + 1, btn.y + 1),
+            Some(std::path::PathBuf::from("/w/sub"))
+        );
+        assert_eq!(p.click_nested_repo(btn.x + 1, btn.y + btn.height), None);
+    }
+
+    #[test]
+    fn empty_state_lists_one_open_button_per_subfolder_repo() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        p.nested_repos = vec![
+            (String::from("api/"), std::path::PathBuf::from("/w/api")),
+            (String::from("web/"), std::path::PathBuf::from("/w/web")),
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 40,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("Open api/") && dump.contains("Open web/"),
+            "{dump}"
+        );
+        let paths: Vec<_> = p
+            .nested_repo_button_areas
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                std::path::PathBuf::from("/w/api"),
+                std::path::PathBuf::from("/w/web")
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_state_without_subfolder_repos_still_offers_initialize() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        p.nested_repo_button_areas = vec![(
+            Rect {
+                x: 1,
+                y: 1,
+                width: 5,
+                height: 3,
+            },
+            std::path::PathBuf::from("/stale"),
+        )];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(p.last_init_repo_button_area.width > 0);
+        assert!(
+            p.nested_repo_button_areas.is_empty(),
+            "stale open buttons must not stay clickable"
+        );
+        assert_eq!(p.click_nested_repo(2, 2), None);
+    }
+
+    #[test]
+    fn a_repo_workspace_never_shows_subfolder_open_buttons() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus {
+            in_repo: true,
+            ..GitStatus::default()
+        };
+        p.nested_repos = vec![(String::from("sub/"), std::path::PathBuf::from("/w/sub"))];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(p.nested_repo_button_areas.is_empty());
+        assert!(!buffer_to_string(&buf).contains("Open sub/"));
+    }
+
     #[test]
     fn empty_state_records_button_rect_for_hit_testing() {
         use crate::git::GitStatus;
@@ -3317,5 +3581,143 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(p.changes_count(), 2);
+    }
+
+    fn render_rows(p: &mut SourceControlPanel) -> Vec<String> {
+        render_rows_in(p, 30)
+    }
+
+    fn render_rows_in(p: &mut SourceControlPanel, height: u16) -> Vec<String> {
+        use ratatui::buffer::Buffer;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(p, area, &mut buf);
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// Pasted line breaks are kept (CRLF and lone CR become LF), so a
+    /// message can have a body (#1241).
+    #[test]
+    fn pasted_line_breaks_are_kept_as_newlines() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("a\r\n\r\nb\rc\nd");
+        assert_eq!(p.message, "a\n\nb\nc\nd");
+        assert_eq!(p.message_cursor, p.message.chars().count());
+    }
+
+    /// The box grows a row per message line, so subject and body each show
+    /// on their own row, and the caret sits on its line.
+    #[test]
+    fn the_message_box_shows_each_line_on_its_own_row() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.focused = true;
+        p.insert_str("subject\n\nbody");
+        let rows = render_rows(&mut p);
+        let input = p.last_input_area;
+        assert_eq!(input.height, 5, "three lines plus the border");
+        let row = |n: u16| rows[(input.y + 1 + n) as usize].clone();
+        assert!(row(0).contains("subject"), "{rows:#?}");
+        assert!(!row(1).contains("body") && !row(1).contains("subject"));
+        assert!(row(2).contains("body"), "{rows:#?}");
+        assert_eq!(p.cursor_screen_pos(), Some((input.x + 2 + 4, input.y + 3)));
+    }
+
+    /// Past the row cap the box scrolls to keep the caret's line in view.
+    #[test]
+    fn a_long_message_scrolls_to_the_caret_line() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.focused = true;
+        let text: Vec<String> = (1..=12).map(|n| format!("line{n}")).collect();
+        p.insert_str(&text.join("\n"));
+        let rows = render_rows(&mut p);
+        let input = p.last_input_area;
+        assert_eq!(input.height, 2 + MESSAGE_MAX_ROWS as u16);
+        let last = rows[(input.y + input.height - 2) as usize].clone();
+        assert!(last.contains("line12"), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.contains("line1 ")), "{rows:#?}");
+        let (_, caret_y) = p.cursor_screen_pos().unwrap();
+        assert_eq!(caret_y, input.y + input.height - 2);
+    }
+
+    fn long_message_panel(lines: usize) -> SourceControlPanel {
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.focused = true;
+        let text: Vec<String> = (1..=lines).map(|n| format!("line{n}")).collect();
+        p.insert_str(&text.join("\n"));
+        p
+    }
+
+    /// A tall message in a short panel shrinks its box instead of pushing
+    /// the Commit button off the bottom.
+    #[test]
+    fn a_long_message_leaves_room_for_the_commit_button() {
+        let mut p = long_message_panel(5);
+        let rows = render_rows_in(&mut p, 16);
+        let button = p.last_button_area;
+        assert_eq!(button.height, 3, "{rows:#?}");
+        assert!(button.y + button.height <= 16, "{button:?}");
+        assert!(
+            rows[(button.y + 1) as usize].contains("Commit"),
+            "{rows:#?}"
+        );
+        let input = p.last_input_area;
+        assert!(input.y + input.height < button.y, "{input:?} {button:?}");
+        let (_, caret_y) = p.cursor_screen_pos().unwrap();
+        assert!(rows[caret_y as usize].contains("line5"), "{rows:#?}");
+    }
+
+    /// ...and leaves rows for the change list, so files can still be staged.
+    #[test]
+    fn a_long_message_leaves_room_for_the_change_list() {
+        let mut p = long_message_panel(6);
+        let rows = render_rows_in(&mut p, 20);
+        assert!(
+            p.last_list_area.height >= 2,
+            "{:?} {rows:#?}",
+            p.last_list_area
+        );
+        assert!(p.last_list_area.y + p.last_list_area.height <= 20);
+    }
+
+    /// Up and Down move the caret between message lines, keeping its
+    /// column where the line allows; at the first or last line they report
+    /// that nothing moved, so the panel can scroll its list as before.
+    #[test]
+    fn up_and_down_move_between_message_lines() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("abcdef\nxy\nlonger");
+        assert!(p.move_cursor_up(), "from the last line up");
+        assert_eq!(
+            p.message_cursor,
+            7 + 2,
+            "column 6 clamps to the end of 'xy'"
+        );
+        assert!(p.move_cursor_up());
+        assert_eq!(p.message_cursor, 2);
+        assert!(!p.move_cursor_up(), "the first line has nothing above");
+        assert!(p.move_cursor_down());
+        assert!(p.move_cursor_down());
+        assert_eq!(p.message_cursor, 10 + 2);
+        assert!(!p.move_cursor_down(), "the last line has nothing below");
+    }
+
+    /// A one-line message keeps the three-row box.
+    #[test]
+    fn a_one_line_message_keeps_the_three_row_box() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.insert_str("just a subject");
+        render_rows(&mut p);
+        assert_eq!(p.last_input_area.height, 3);
     }
 }

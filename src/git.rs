@@ -205,6 +205,24 @@ fn git_raw(root: &Path, args: &[&str], stdin_data: Option<&[u8]>) -> Option<Vec<
     Some(out?.stdout)
 }
 
+/// The immediate subfolders of `dir` that hold a repository (a `.git`
+/// entry: a folder, or a file for worktrees and submodules), sorted by
+/// name. Hidden folders are skipped, like VS Code's depth-1 scan (#1227).
+pub fn child_repos(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut repos: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .filter(|p| p.join(".git").exists())
+        .collect();
+    repos.sort();
+    repos
+}
+
 /// The toplevel of the repository containing `dir`, or `None` outside a
 /// repo. This is the ONLY correct base for porcelain/numstat paths and
 /// for rev pathspecs (`HEAD:<rel>`), which git resolves against the
@@ -794,6 +812,79 @@ fn retarget_hunk_starts(patch: &str, side: HunkSide) -> String {
         .join("\n")
 }
 
+/// The path a single-file patch writes, from its `+++ b/<path>` header.
+fn patch_path(patch: &str) -> Option<&str> {
+    patch
+        .split('\n')
+        .find_map(|l| l.strip_prefix("+++ b/"))
+        .map(|p| p.trim_end_matches('\r'))
+}
+
+/// Whether `git add` turns this path's CRLF line endings into LF in the
+/// index, whatever decides it (`.gitattributes` `eol`/`text`,
+/// `core.autocrlf`, `core.eol`): git cleans a probe line for the path and
+/// the result is compared with the plain LF line.
+fn strips_cr_on_add(root: &Path, rel: &str) -> bool {
+    let hash = |input: &[u8], args: &[&str]| -> Option<String> {
+        use std::io::Write as _;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["hash-object", "--stdin"])
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(input).ok()?;
+        let out = child.wait_with_output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let path_arg = format!("--path={rel}");
+    match (
+        hash(b"croft\r\n", &[&path_arg]),
+        hash(b"croft\n", &["--no-filters"]),
+    ) {
+        (Some(cleaned), Some(lf)) => cleaned == lf,
+        _ => false,
+    }
+}
+
+/// `patch` with the `\r` dropped from the end of every added line.
+fn strip_added_crs(patch: &str) -> String {
+    patch
+        .split('\n')
+        .map(|l| {
+            if l.starts_with('+') && !l.starts_with("+++ ") {
+                l.strip_suffix('\r').unwrap_or(l)
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `patch` with a `\r` put back on every context and removed line (the
+/// ones taken from HEAD), to match a CRLF working tree.
+fn add_crs_to_head_lines(patch: &str) -> String {
+    patch
+        .split('\n')
+        .map(|l| {
+            let from_head = (l.starts_with(' ') || l.starts_with('-')) && !l.starts_with("--- ");
+            if from_head && !l.ends_with('\r') {
+                format!("{l}\r")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Apply a unified-diff patch fed on stdin via `git apply`. `cached`
 /// targets the index (stage), `reverse` un-applies (`cached + reverse` =
 /// unstage, `reverse` alone = revert the working tree). Logged to the
@@ -827,6 +918,28 @@ pub fn apply_patch(
         (true, false) => retarget_hunk_starts(patch, HunkSide::Old),
         (false, true) => retarget_hunk_starts(patch, HunkSide::New),
         _ => patch.to_string(),
+    };
+    // A path git stores LF but checks out CRLF (`eol=crlf`,
+    // `core.autocrlf`) has two spellings, and the patch mixes them: its
+    // added lines come from the working tree (CRLF), its context and
+    // removed lines from HEAD (LF). `git apply` uses no conversion, so each
+    // target needs the patch in its own spelling (#1236): the index gets
+    // the added lines cleaned, as `git add` would (verbatim, a CRLF
+    // checkout's `\r` made the blob mixed), and the working tree gets the
+    // HEAD lines with its `\r` (without, a revert did not apply at all).
+    let retargeted = match patch_path(&retargeted) {
+        Some(rel) if strips_cr_on_add(root, rel) => {
+            if cached {
+                strip_added_crs(&retargeted)
+            } else if std::fs::read(root.join(rel))
+                .is_ok_and(|b| b.windows(2).any(|w| w == b"\r\n"))
+            {
+                add_crs_to_head_lines(&retargeted)
+            } else {
+                retargeted
+            }
+        }
+        _ => retargeted,
     };
     let patch = retargeted.as_str();
     crate::output::push(
@@ -990,12 +1103,26 @@ pub struct FileHistoryEntry {
     pub age_secs: i64,
 }
 
+/// The folder to run a per-file query from, and the pathspec to pass it:
+/// the file's own folder and name, so git finds the repo that holds the
+/// file even when `root` (the workspace) sits above it (#1227). A
+/// cwd-relative pathspec is exact with `-C`. Falls back to `root` and
+/// `rel_path` when that folder is gone (a deleted file's history).
+fn file_cwd(root: &Path, rel_path: &str) -> (PathBuf, String) {
+    let abs = root.join(rel_path);
+    match (abs.parent(), abs.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(name)) if dir.is_dir() => (dir.to_path_buf(), name.to_string()),
+        _ => (root.to_path_buf(), rel_path.to_string()),
+    }
+}
+
 /// Recent commits touching `rel_path`, newest first, via `git log --follow`
 /// (so the history survives renames, like VS Code's Timeline). Returns an
 /// empty vec when the path is untracked, the repo has no history, or git is
 /// unavailable — the panel renders that as an empty state, never an error.
 pub fn file_history(root: &Path, rel_path: &str, limit: usize) -> Vec<FileHistoryEntry> {
-    let Some(path_str) = root.to_str() else {
+    let (dir, name) = file_cwd(root, rel_path);
+    let Some(path_str) = dir.to_str() else {
         return Vec::new();
     };
     let output = Command::new("git")
@@ -1007,7 +1134,7 @@ pub fn file_history(root: &Path, rel_path: &str, limit: usize) -> Vec<FileHistor
             &format!("-n{limit}"),
             "--format=%h\x1f%s\x1f%an\x1f%ct",
             "--",
-            rel_path,
+            &name,
         ])
         .output();
     let Ok(output) = output else {
@@ -1692,12 +1819,13 @@ pub struct BlameLine {
 /// its author, author-time, and summary. Returns empty on any failure so the
 /// caller renders no annotation rather than an error.
 pub fn blame(root: &Path, rel_path: &str) -> Vec<BlameLine> {
-    let Some(path_str) = root.to_str() else {
+    let (dir, name) = file_cwd(root, rel_path);
+    let Some(path_str) = dir.to_str() else {
         return Vec::new();
     };
     let output = Command::new("git")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-C", path_str, "blame", "--line-porcelain", "--", rel_path])
+        .args(["-C", path_str, "blame", "--line-porcelain", "--", &name])
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -1811,6 +1939,32 @@ pub fn default_branch(root: &Path) -> Result<String, String> {
 /// status worker can't race us between adds).
 pub fn stage_path(root: &Path, rel_path: &str) -> Result<(), String> {
     stage_paths(root, std::slice::from_ref(&rel_path.to_string()))
+}
+
+/// `git rm` one path: out of the index and off the disk. Resolves a
+/// modify/delete conflict in favour of the deletion (#1244).
+pub fn remove_path(root: &Path, rel_path: &str) -> Result<(), String> {
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let out = Command::new("git")
+        .args([
+            "-C",
+            path_str,
+            "--literal-pathspecs",
+            "rm",
+            "-q",
+            "-f",
+            "--",
+        ])
+        .arg(rel_path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 /// Stage all listed paths in a single `git add -- p1 p2 ...` invocation.
@@ -2182,11 +2336,59 @@ pub fn push_to_remote(root: &Path, remote: &str) -> Result<String, String> {
     run_mutation(root, &["push", remote])
 }
 
-/// Publish the current branch: push it to `origin` and set upstream
-/// tracking (`git push -u origin <branch>`). Used when a local branch has
-/// no upstream yet.
+/// Publish the current branch: push it and set upstream tracking
+/// (`git push -u <remote> <branch>`, the remote chosen by
+/// [`publish_remote`]). Used when a local branch has no upstream yet.
 pub fn publish_branch(root: &Path, branch: &str) -> Result<String, String> {
-    run_mutation(root, &["push", "-u", "origin", branch])
+    let remote = publish_remote(root)?;
+    run_mutation(root, &["push", "-u", &remote, branch])?;
+    Ok(format!("{branch} to {remote}"))
+}
+
+/// The current branch when it has no upstream to push to or pull from
+/// (`@{u}` does not resolve), the case `git push` refuses with "has no
+/// upstream branch". None on a tracked branch and on a detached HEAD.
+pub fn unpublished_branch(root: &Path) -> Option<String> {
+    let branch = run_git(root, &["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .and_then(parse_branch)?;
+    let tracked = run_git(
+        root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .is_ok();
+    (!tracked).then_some(branch)
+}
+
+/// The remote an unpublished branch goes to: `remote.pushDefault` when
+/// set, else `origin`, else the only remote. With several remotes and
+/// none of those, picking one would be a guess, so it is an error.
+fn publish_remote(root: &Path) -> Result<String, String> {
+    if let Ok(remote) = run_git(root, &["config", "--get", "remote.pushDefault"])
+        && !remote.is_empty()
+    {
+        return Ok(remote);
+    }
+    let listed = run_git(root, &["remote"]).map_err(|e| e.to_string())?;
+    let remotes: Vec<&str> = listed.lines().filter(|l| !l.is_empty()).collect();
+    match remotes.as_slice() {
+        [] => Err(String::from("no remote to publish this branch to")),
+        [only] => Ok((*only).to_string()),
+        several if several.contains(&"origin") => Ok(String::from("origin")),
+        _ => Err(String::from(
+            "branch has no upstream and several remotes, none of them origin: set remote.pushDefault to pick one",
+        )),
+    }
+}
+
+/// Push the current branch, publishing it first if it has no upstream
+/// (`git push -u <remote> <branch>`), as VS Code's Push and Sync do. A
+/// plain `git push` would refuse with "has no upstream branch".
+pub fn push_or_publish(root: &Path) -> Result<String, String> {
+    let Some(branch) = unpublished_branch(root) else {
+        return push_current_branch(root);
+    };
+    publish_branch(root, &branch).map(|summary| format!("published {summary}"))
 }
 
 // --- Branch management ---------------------------------------------------
@@ -2683,6 +2885,101 @@ mod tests {
         assert!(
             staged.trim().is_empty(),
             "reverse cached apply must empty the index diff: {staged}"
+        );
+    }
+
+    /// #1236: `run.bat` stored LF in the index and CRLF in the working tree,
+    /// with `echo two` changed to `echo TWO`; `config` is extra setup.
+    fn crlf_checkout_with_one_edit(root: &Path, attrs: &str, config: &[(&str, &str)]) -> String {
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        for (k, v) in config {
+            git(&["config", k, v]);
+        }
+        std::fs::write(root.join(".gitattributes"), attrs).unwrap();
+        let head = "echo one\r\necho two\r\necho three\r\necho four\r\n";
+        std::fs::write(root.join("run.bat"), head).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        let work = head.replace("two", "TWO");
+        std::fs::write(root.join("run.bat"), &work).unwrap();
+        let head = read_file_at_head(root, "run.bat").unwrap();
+        let diff = crate::widgets::diff::DiffData::build_with_byte_check(
+            std::path::PathBuf::new(),
+            root.join("run.bat"),
+            head.lines().map(str::to_string).collect(),
+            work.lines().map(str::to_string).collect(),
+            Some(&head),
+            Some(&work),
+        );
+        diff.hunk_patch("run.bat", diff.hunk_range_at(0).unwrap())
+    }
+
+    #[test]
+    fn staging_a_hunk_of_an_eol_crlf_file_stores_lf_like_git_add() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let patch = crlf_checkout_with_one_edit(root, "*.bat text eol=crlf\n", &[]);
+        apply_patch(root, &patch, true, false).unwrap();
+        let eol = git_stdout(root, &["ls-files", "--eol", "run.bat"]);
+        assert!(eol.starts_with("i/lf "), "the index blob: {eol}");
+        let status = git_stdout(root, &["status", "--porcelain", "run.bat"]);
+        assert_eq!(status, "M  run.bat\n", "nothing is left unstaged");
+        // And back out again: the unstage patch must match the LF index.
+        apply_patch(root, &patch, true, true).unwrap();
+        assert_eq!(git_stdout(root, &["diff", "--cached"]), "");
+    }
+
+    #[test]
+    fn staging_a_hunk_under_core_autocrlf_stores_lf_like_git_add() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let patch = crlf_checkout_with_one_edit(root, "", &[("core.autocrlf", "true")]);
+        apply_patch(root, &patch, true, false).unwrap();
+        let eol = git_stdout(root, &["ls-files", "--eol", "run.bat"]);
+        assert!(eol.starts_with("i/lf "), "the index blob: {eol}");
+    }
+
+    #[test]
+    fn staging_a_hunk_of_a_file_kept_as_crlf_keeps_its_crs() {
+        // Negative: with no conversion configured, the index holds CRLF and
+        // `git add` keeps it, so the staged line keeps its `\r` too.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let patch = crlf_checkout_with_one_edit(root, "", &[("core.autocrlf", "false")]);
+        apply_patch(root, &patch, true, false).unwrap();
+        let eol = git_stdout(root, &["ls-files", "--eol", "run.bat"]);
+        assert!(eol.starts_with("i/crlf "), "the index blob: {eol}");
+        assert_eq!(
+            git_stdout(root, &["status", "--porcelain", "run.bat"]),
+            "M  run.bat\n"
+        );
+    }
+
+    #[test]
+    fn reverting_a_hunk_of_an_eol_crlf_file_writes_crlf_to_the_work_tree() {
+        // Negative: a revert writes the working tree, which keeps CRLF.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let patch = crlf_checkout_with_one_edit(root, "*.bat text eol=crlf\n", &[]);
+        apply_patch(root, &patch, false, true).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("run.bat")).unwrap(),
+            b"echo one\r\necho two\r\necho three\r\necho four\r\n"
         );
     }
 
@@ -4195,6 +4492,100 @@ filename seed.txt
         );
         assert!(!b[0].uncommitted);
         assert!(!b[0].short_hash.is_empty());
+    }
+
+    /// A workspace opened one folder ABOVE its repo (#1227): `tl/` holding
+    /// the repo `tl/sub/`. Running git from the workspace root fails there,
+    /// so history and blame must resolve from the file's own folder.
+    #[test]
+    fn file_history_finds_the_repo_below_the_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        init_repo_with_commit(&sub);
+        let hist = file_history(tmp.path(), "sub/seed.txt", 10);
+        assert_eq!(hist.len(), 1, "the commit in sub/ must be listed");
+    }
+
+    #[test]
+    fn blame_finds_the_repo_below_the_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        init_repo_with_commit(&sub);
+        let b = blame(tmp.path(), "sub/seed.txt");
+        assert_eq!(b.len(), 2, "blame of sub/seed.txt from the parent");
+        assert!(!b[0].uncommitted);
+    }
+
+    #[test]
+    fn file_history_of_a_file_in_a_repo_subfolder_still_resolves() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::create_dir(p.join("dir")).unwrap();
+        std::fs::write(p.join("dir/x.txt"), "x\n").unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["add", "."])
+            .status();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["commit", "-qm", "x"])
+            .status();
+        assert_eq!(file_history(p, "dir/x.txt", 10).len(), 1);
+        assert_eq!(blame(p, "dir/x.txt").len(), 1);
+    }
+
+    #[test]
+    fn history_and_blame_stay_empty_outside_any_repo() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("plain.txt"), "one\n").unwrap();
+        assert!(file_history(tmp.path(), "sub/plain.txt", 10).is_empty());
+        assert!(blame(tmp.path(), "sub/plain.txt").is_empty());
+    }
+
+    #[test]
+    fn history_of_a_file_untracked_in_a_nested_repo_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        init_repo_with_commit(&sub);
+        std::fs::write(sub.join("new.txt"), "new\n").unwrap();
+        assert!(file_history(tmp.path(), "sub/new.txt", 10).is_empty());
+    }
+
+    #[test]
+    fn child_repos_finds_repos_one_level_down_only() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        for d in ["web", "api", "plain", ".hidden", "deep/inner"] {
+            std::fs::create_dir_all(p.join(d)).unwrap();
+        }
+        init_repo_with_commit(&p.join("web"));
+        init_repo_with_commit(&p.join("api"));
+        init_repo_with_commit(&p.join(".hidden"));
+        init_repo_with_commit(&p.join("deep/inner"));
+        std::fs::write(p.join("worktree_file_dir_marker"), "").unwrap();
+        std::fs::create_dir(p.join("wt")).unwrap();
+        std::fs::write(p.join("wt/.git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(
+            child_repos(p),
+            vec![p.join("api"), p.join("web"), p.join("wt")],
+            "sorted, depth 1, hidden skipped, a .git file counts"
+        );
+    }
+
+    #[test]
+    fn child_repos_is_empty_for_a_missing_or_repo_free_folder() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("plain")).unwrap();
+        assert!(child_repos(tmp.path()).is_empty());
+        assert!(child_repos(&tmp.path().join("gone")).is_empty());
     }
 
     /// Stage a path so we can exercise `unstage_*` against a real index.
