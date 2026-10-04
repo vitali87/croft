@@ -882,8 +882,12 @@ pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> 
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let output = Command::new("git")
-        .args(["-C", path_str, "commit", "-am", message])
+    // A hook or signing helper that wants a terminal fails fast with its
+    // own message instead of fighting croft for the screen (#1153).
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", path_str, "commit", "-am", message]);
+    never_prompt(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -3072,6 +3076,55 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         assert!(commit_all_tracked(tmp.path(), "").is_err());
         assert!(commit_all_tracked(tmp.path(), "   \n").is_err());
+    }
+
+    /// GIT_TERMINAL_PROMPT and a null stdin are checked too, but the session
+    /// is what tells: a test runner has no terminal to hand on and may set
+    /// GIT_TERMINAL_PROMPT=0 itself, while a hook still in croft's session
+    /// can open croft's `/dev/tty`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commit_all_tracked_never_offers_its_hooks_the_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(p.join("f.txt"), "one\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-qm", "init"]);
+        let hook = p.join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho \"prompt=$GIT_TERMINAL_PROMPT\" > seen\n\
+             if [ -t 0 ]; then echo stdin=tty >> seen; else echo stdin=none >> seen; fi\n\
+             if [ \"$(cut -d' ' -f6 /proc/$$/stat)\" = \"$(cat croft_sid)\" ]; \
+             then echo session=croft >> seen; else echo session=own >> seen; fi\n",
+        )
+        .unwrap();
+        // SAFETY: getsid(0) only reads the calling process's session id.
+        let sid = unsafe { libc::getsid(0) };
+        std::fs::write(p.join("croft_sid"), sid.to_string()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(p.join("f.txt"), "two\n").unwrap();
+        commit_all_tracked(p, "two").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("seen")).unwrap(),
+            "prompt=0\nstdin=none\nsession=own\n"
+        );
     }
 
     #[test]

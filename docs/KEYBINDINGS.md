@@ -212,7 +212,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | Keys | Action |
 |------|--------|
 | Type in the message box | Edit the commit message (the box scrolls horizontally when the message outgrows it) |
-| `Enter` | Commit all tracked changes with the message |
+| `Enter` | Commit all tracked changes with the message. The commit runs in the background, so croft keeps responding while the repository's hooks run; the message stays in the box until the commit lands, and a hook's rejection shows below it |
 | Click ✓ Commit | Same as `Enter` |
 | Click a change row | Open that file's diff against HEAD in a read-only editor tab |
 | `S` in a diff tab | Stage only the change hunk under the cursor (click a row or `F7` to pick the hunk). With a selection dragged across rows, stages only the SELECTED lines instead (VS Code's Stage Selected Ranges): unselected additions stay out of the index and unselected deletions stay in it |

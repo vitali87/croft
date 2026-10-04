@@ -32271,41 +32271,48 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        let r = crate::git::commit_staged(&self.scm_root(), &message);
-        if r.is_ok() {
-            self.source_control.clear_message();
-        }
-        self.run_scm_op("commit -m", r, "Committed staged");
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit_staged(&root, &committed),
+            |app, r| app.run_scm_op("commit -m", r, "Committed staged"),
+        );
     }
 
     fn commit_all_source_control(&mut self) {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        if let Err(err) = crate::git::stage_all(&self.scm_root()) {
-            self.run_scm_op("add -A", Err(err), "Stage all");
-            return;
-        }
-        let r = crate::git::commit_staged(&self.scm_root(), &message);
-        if r.is_ok() {
-            self.source_control.clear_message();
-        }
-        self.run_scm_op("commit (all)", r, "Committed all");
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || {
+                crate::git::stage_all(&root).map_err(|err| format!("stage all failed: {err}"))?;
+                crate::git::commit_staged(&root, &committed)
+            },
+            |app, r| app.run_scm_op("commit (all)", r, "Committed all"),
+        );
     }
 
     fn commit_amend_source_control(&mut self) {
         // Amend keeps the prior message when the box is empty, otherwise
         // rewrites it — matching VS Code's amend.
         let message = self.source_control.message.trim().to_string();
-        let r = if message.is_empty() {
-            crate::git::commit_amend_no_edit(&self.scm_root())
-        } else {
-            crate::git::commit_amend(&self.scm_root(), &message)
-        };
-        if r.is_ok() {
-            self.source_control.clear_message();
-        }
-        self.run_scm_op("commit --amend", r, "Amended commit");
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || {
+                if committed.is_empty() {
+                    crate::git::commit_amend_no_edit(&root)
+                } else {
+                    crate::git::commit_amend(&root, &committed)
+                }
+            },
+            |app, r| app.run_scm_op("commit --amend", r, "Amended commit"),
+        );
     }
 
     fn commit_and_sync_source_control(&mut self) {
@@ -32315,16 +32322,22 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        let commit = crate::git::commit_all_tracked(&self.scm_root(), &message);
-        self.log_git("commit -am", &commit);
-        if let Err(err) = commit {
-            self.source_control.commit_feedback = Some(err.clone());
-            self.source_control.commit_feedback_is_error = true;
-            self.status = format!("Commit failed: {err}");
-            return;
-        }
-        self.source_control.clear_message();
-        self.sync_source_control();
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit_all_tracked(&root, &committed),
+            |app, commit| {
+                app.log_git("commit -am", &commit);
+                if let Err(err) = commit {
+                    app.source_control.commit_feedback = Some(err.clone());
+                    app.source_control.commit_feedback_is_error = true;
+                    app.status = format!("Commit failed: {err}");
+                    return;
+                }
+                app.sync_source_control();
+            },
+        );
     }
 
     fn publish_branch_source_control(&mut self) {
@@ -35880,25 +35893,31 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        let commit_summary = match crate::git::commit_all_tracked(&self.scm_root(), &message) {
-            Ok(s) => s,
-            Err(err) => {
-                self.source_control.commit_feedback = Some(err.clone());
-                self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Commit failed: {err}");
-                return;
-            }
-        };
-        self.source_control.clear_message();
-        self.status = format!("Committed: {commit_summary}");
         let root = self.scm_root();
-        self.spawn_git_net("push", move || {
-            let r = crate::git::push_current_branch(&root);
-            Box::new(move |app: &mut App| app.finish_commit_and_push(commit_summary, r))
-        });
-        self.active_git_bypass_debounce();
-        self.refresh_git_status_debounced();
-        self.refresh_source_control();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit_all_tracked(&root, &committed),
+            |app, r| {
+                let commit_summary = match r {
+                    Ok(s) => s,
+                    Err(err) => {
+                        app.source_control.commit_feedback = Some(err.clone());
+                        app.source_control.commit_feedback_is_error = true;
+                        app.status = format!("Commit failed: {err}");
+                        return;
+                    }
+                };
+                let root = app.scm_root();
+                app.spawn_git_net("push", move || {
+                    let r = crate::git::push_current_branch(&root);
+                    Box::new(move |app: &mut App| app.finish_commit_and_push(commit_summary, r))
+                });
+                app.active_git_bypass_debounce();
+                app.refresh_git_status_debounced();
+                app.refresh_source_control();
+            },
+        );
     }
 
     fn finish_commit_and_push(&mut self, commit_summary: String, push: Result<String, String>) {
@@ -36414,22 +36433,57 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        match crate::git::commit_all_tracked(&self.scm_root(), &message) {
-            Ok(summary) => {
-                self.source_control.clear_message();
-                self.source_control.commit_feedback = Some(summary.clone());
-                self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Committed: {summary}");
-                self.active_git_bypass_debounce();
-                self.refresh_git_status_debounced();
-                self.refresh_source_control();
-            }
-            Err(err) => {
-                self.source_control.commit_feedback = Some(err.clone());
-                self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Commit failed: {err}");
-            }
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit_all_tracked(&root, &committed),
+            |app, r| match r {
+                Ok(summary) => {
+                    app.source_control.commit_feedback = Some(summary.clone());
+                    app.source_control.commit_feedback_is_error = false;
+                    app.status = format!("Committed: {summary}");
+                    app.active_git_bypass_debounce();
+                    app.refresh_git_status_debounced();
+                    app.refresh_source_control();
+                }
+                Err(err) => {
+                    app.source_control.commit_feedback = Some(err.clone());
+                    app.source_control.commit_feedback_is_error = true;
+                    app.status = format!("Commit failed: {err}");
+                }
+            },
+        );
+    }
+
+    /// Run a commit on the git worker (#1153). The repository's hooks
+    /// (pre-commit, commit-msg) can run for minutes; inline, the whole UI
+    /// froze until they ended and every key pressed meanwhile fired at once.
+    /// The message stays in the box until the commit lands, and is cleared
+    /// then only if it is still the one committed. `done` applies the
+    /// result on the UI thread.
+    fn spawn_commit(
+        &mut self,
+        message: String,
+        commit: impl FnOnce() -> Result<String, String> + Send + 'static,
+        done: impl FnOnce(&mut App, Result<String, String>) + Send + 'static,
+    ) {
+        if self.git_net_busy() {
+            return;
         }
+        self.spawn_git_net("commit", move || {
+            let r = commit();
+            Box::new(move |app: &mut App| {
+                if r.is_ok() && app.source_control.message.trim() == message.trim() {
+                    app.source_control.clear_message();
+                }
+                done(app, r)
+            })
+        });
+        let running = String::from("Committing\u{2026} (running hooks)");
+        self.source_control.commit_feedback = Some(running.clone());
+        self.source_control.commit_feedback_is_error = false;
+        self.status = running;
     }
 
     /// Housekeeping for the ssh-pane offer (#364), from the top of `render`

@@ -12463,6 +12463,136 @@ fn wait_for_git_net(app: &mut App) {
     );
 }
 
+// ---- A commit's hooks run off the UI thread (#1153) ----
+
+/// A committed repo with `seed.txt` changed and a `pre-commit` hook that
+/// runs `body`.
+fn repo_with_pre_commit_hook(body: &str) -> tempfile::TempDir {
+    let tmp = make_committed_repo();
+    let hook = tmp.path().join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    tmp
+}
+
+/// A hook that runs until the test drops a `go` file next to the repo, or
+/// for five seconds, whichever comes first: long enough to tell a commit
+/// that waited for it from one that did not.
+const HOOK_UNTIL_GO: &str =
+    "i=0; while [ ! -f go ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done";
+
+fn last_commit_subject(root: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "-1", "--format=%s"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn app_with_commit_message(root: &Path, message: &str) -> App {
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message = message.to_string();
+    app.source_control.message_cursor = message.chars().count();
+    app
+}
+
+#[test]
+fn a_commit_returns_at_once_while_its_hook_runs_and_lands_later() {
+    let tmp = repo_with_pre_commit_hook(HOOK_UNTIL_GO);
+    let mut app = app_with_commit_message(tmp.path(), "fix: hooked");
+    let started = std::time::Instant::now();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "Enter blocked for {:?} on the hook",
+        started.elapsed()
+    );
+    assert!(app.git_net_job.is_some(), "the commit is in flight");
+    assert_eq!(app.status, "Committing\u{2026} (running hooks)");
+    assert_eq!(
+        app.source_control.message, "fix: hooked",
+        "kept until it lands"
+    );
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.status.contains("commit is still running"),
+        "{}",
+        app.status
+    );
+    std::fs::write(tmp.path().join("go"), b"").unwrap();
+    wait_for_git_net(&mut app);
+    assert_eq!(last_commit_subject(tmp.path()), "fix: hooked");
+    assert!(app.source_control.message.is_empty());
+    assert!(app.status.starts_with("Committed: "), "{}", app.status);
+}
+
+#[test]
+fn commit_and_push_runs_its_commit_off_the_ui_thread_too() {
+    let tmp = repo_with_pre_commit_hook(HOOK_UNTIL_GO);
+    let mut app = app_with_commit_message(tmp.path(), "feat: pushed");
+    let started = std::time::Instant::now();
+    app.commit_and_push_source_control();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "blocked for {:?} on the hook",
+        started.elapsed()
+    );
+    std::fs::write(tmp.path().join("go"), b"").unwrap();
+    wait_for_git_net(&mut app);
+    assert_eq!(last_commit_subject(tmp.path()), "feat: pushed");
+    wait_for_git_net(&mut app);
+    assert!(
+        app.status.starts_with("Commit ok; push failed"),
+        "with no remote the push that follows fails, after the commit: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_commit_rejected_by_its_hook_keeps_the_message_and_says_why() {
+    let tmp = repo_with_pre_commit_hook("echo 'lint: 3 problems' >&2; exit 1");
+    let mut app = app_with_commit_message(tmp.path(), "wip: broken");
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    assert_eq!(last_commit_subject(tmp.path()), "init");
+    assert_eq!(app.source_control.message, "wip: broken");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert!(app.status.contains("lint: 3 problems"), "{}", app.status);
+}
+
+#[test]
+fn a_message_typed_while_the_commit_runs_is_not_cleared_when_it_lands() {
+    let tmp = repo_with_pre_commit_hook(HOOK_UNTIL_GO);
+    let mut app = app_with_commit_message(tmp.path(), "fix: first");
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.source_control.message = String::from("fix: the next one");
+    std::fs::write(tmp.path().join("go"), b"").unwrap();
+    wait_for_git_net(&mut app);
+    assert_eq!(last_commit_subject(tmp.path()), "fix: first");
+    assert_eq!(app.source_control.message, "fix: the next one");
+}
+
+#[test]
+fn an_empty_commit_message_is_still_refused_on_the_spot() {
+    let tmp = repo_with_pre_commit_hook(HOOK_UNTIL_GO);
+    let mut app = app_with_commit_message(tmp.path(), "   ");
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.git_net_job.is_none(), "nothing to run");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Empty commit message")
+    );
+}
+
 /// A push runs on a worker: the call returns with the operation in flight,
 /// a second one is refused while it runs, and the result lands on a drain.
 #[test]
@@ -13174,6 +13304,7 @@ fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
     app.source_control.message = "fix: plain cmd-enter".to_string();
     app.source_control.message_cursor = app.source_control.message.chars().count();
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::SUPER));
+    wait_for_git_net(&mut app);
     let log = std::process::Command::new("git")
         .args(["-C"])
         .arg(tmp.path())
@@ -29654,6 +29785,7 @@ fn focusing_a_secondary_roots_file_flips_source_control_to_its_repo() {
     app.stage_all_source_control();
     app.source_control.message = String::from("from the panel");
     app.commit_staged_source_control();
+    wait_for_git_net(&mut app);
     let log = std::process::Command::new("git")
         .args(["-C"])
         .arg(&repo)
