@@ -30,6 +30,10 @@ pub const NEW_FILE_GLYPH: char = '\u{ea7f}';
 /// Codicon `cod-new_folder` — the folder-with-plus glyph for "New Folder".
 /// Nerd Fonts `cod-new_folder` = U+EA80.
 pub const NEW_FOLDER_GLYPH: char = '\u{ea80}';
+/// Codicon `cod-save_all` — the stacked-disks glyph VS Code paints on the
+/// OPEN EDITORS header's "Save All" action (#852). Nerd Fonts `cod-save_all`
+/// = U+EB49 (verified against `glyphnames.json`; `cod-save` is U+EB4B).
+pub const SAVE_ALL_GLYPH: char = '\u{eb49}';
 /// Codicon `cod-collapse_all` — the stacked-rows-with-minus glyph for
 /// "Collapse Folders in Explorer". Nerd Fonts `cod-collapse_all` = U+EAC5.
 pub const COLLAPSE_ALL_GLYPH: char = '\u{eac5}';

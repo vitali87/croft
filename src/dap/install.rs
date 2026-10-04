@@ -4,14 +4,18 @@
 //! installing debugpy into the user's interpreter: PEP 668 marks the uv-managed
 //! CPython externally-managed (pip refuses), and polluting the user's Python
 //! would be wrong regardless. Mirrors the `~/.croft/servers` LSP store. The venv
-//! is built from CPython 3.14+ (`uv venv -p 3.14`) — the only line croft's
-//! debugger supports (PEP 768), with no fallback to older interpreters.
+//! is built from CPython 3.14+ (`uv venv -p 3.14`), with no fallback to older
+//! interpreters; it hosts the debugpy adapter, while a launched program runs
+//! under the project's own interpreter (#864). The 3.14 floor on the program
+//! itself is attach's (PEP 768), not launch's.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+
+use crate::dap::remote_attach::PyVersion;
 
 /// Minimum CPython line croft debugs. `uv` resolves the newest matching.
 const PYTHON_VERSION: &str = "3.14";
@@ -32,10 +36,52 @@ pub fn debug_venv_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".croft").join("debug-venv"))
 }
 
-/// The venv's interpreter, used both to run `-m debugpy.adapter` and as the
-/// debuggee interpreter.
+/// The venv's interpreter, which runs `-m debugpy.adapter` only. The program
+/// being debugged runs under the project's own interpreter (#864): debugpy
+/// injects itself there, so neither debugpy nor 3.14 is required of it.
 pub fn debug_venv_python() -> Option<PathBuf> {
     Some(debug_venv_dir()?.join("bin").join("python"))
+}
+
+/// Oldest CPython a launched program may run under: debugpy 1.8 declares
+/// `Requires-Python >=3.10`, and the code it injects into the program's
+/// interpreter does not load on an older one (#864). Attach's own floor is
+/// [`crate::dap::remote_attach::MIN_ATTACH_VERSION`].
+pub const DEBUGPY_MIN_PYTHON: PyVersion = PyVersion {
+    major: 3,
+    minor: 10,
+    patch: 0,
+};
+
+/// The `pyvenv.cfg` of the venv `python` belongs to (`<venv>/bin/python`),
+/// when there is one.
+pub fn pyvenv_cfg(python: &Path) -> Option<PathBuf> {
+    let cfg = python.parent()?.parent()?.join("pyvenv.cfg");
+    cfg.is_file().then_some(cfg)
+}
+
+/// The version of the interpreter at `python` (#864): from its venv's
+/// `pyvenv.cfg` when it has one (`version =` from `python -m venv`,
+/// `version_info =` from uv and virtualenv), else by running it once. None
+/// when neither says.
+pub fn python_version(python: &Path) -> Option<PyVersion> {
+    let from_cfg = pyvenv_cfg(python)
+        .and_then(|cfg| std::fs::read_to_string(cfg).ok())
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                matches!(key.trim(), "version" | "version_info").then(|| PyVersion::parse(value))?
+            })
+        });
+    if from_cfg.is_some() {
+        return from_cfg;
+    }
+    let out = run_bounded(
+        &python.to_string_lossy(),
+        &["-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+        Duration::from_secs(5),
+    )?;
+    PyVersion::parse(&out)
 }
 
 /// Ensure the debug venv exists with debugpy, creating it via `uv` on first use.
@@ -421,5 +467,83 @@ mod tests {
             Some(croft.join("dlv"))
         );
         assert_eq!(find_dlv(None, None, None, None), None, "nowhere to look");
+    }
+
+    /// A stand-in interpreter at `<dir>/<venv>/bin/python`: a shell script
+    /// running `body`, with a `pyvenv.cfg` holding `cfg` beside `bin` when
+    /// one is given.
+    #[cfg(unix)]
+    fn stub_python(dir: &Path, venv: &str, body: &str, cfg: Option<&str>) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join(venv).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let py = bin.join("python");
+        std::fs::write(&py, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if let Some(cfg) = cfg {
+            std::fs::write(dir.join(venv).join("pyvenv.cfg"), cfg).unwrap();
+        }
+        py
+    }
+
+    /// #864: a venv's version is read from its `pyvenv.cfg`, in both
+    /// spellings (`version =` from `python -m venv`, `version_info =` from
+    /// uv and virtualenv), without running an interpreter that would fail.
+    #[cfg(unix)]
+    #[test]
+    fn python_version_reads_a_venvs_pyvenv_cfg_without_running_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let venv = stub_python(
+            tmp.path(),
+            ".venv",
+            "exit 1",
+            Some("home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.12.4\n"),
+        );
+        assert_eq!(
+            python_version(&venv).map(|v| (v.major, v.minor)),
+            Some((3, 12))
+        );
+        let uv = stub_python(
+            tmp.path(),
+            "uv-venv",
+            "exit 1",
+            Some("home = /opt/py/bin\nimplementation = CPython\nversion_info = 3.14.0rc2\n"),
+        );
+        assert_eq!(
+            python_version(&uv).map(|v| (v.major, v.minor)),
+            Some((3, 14))
+        );
+    }
+
+    /// #864: an interpreter outside a venv (a system `python3`) is asked
+    /// once for its version.
+    #[cfg(unix)]
+    #[test]
+    fn python_version_asks_an_interpreter_with_no_pyvenv_cfg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let py = stub_python(tmp.path(), "usr", "echo 3.11", None);
+        assert_eq!(
+            python_version(&py).map(|v| (v.major, v.minor)),
+            Some((3, 11))
+        );
+    }
+
+    /// #864 guard: no version is made up. A missing interpreter, one that
+    /// prints something else, and a `pyvenv.cfg` without a version (with an
+    /// interpreter that says nothing) all read as unknown.
+    #[cfg(unix)]
+    #[test]
+    fn python_version_is_none_when_nothing_says() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(python_version(&tmp.path().join("nope/bin/python")), None);
+        let chatty = stub_python(tmp.path(), "chatty", "echo Python", None);
+        assert_eq!(python_version(&chatty), None);
+        let bare_cfg = stub_python(
+            tmp.path(),
+            ".venv",
+            "exit 0",
+            Some("home = /usr/bin\ninclude-system-site-packages = false\n"),
+        );
+        assert_eq!(python_version(&bare_cfg), None);
     }
 }
