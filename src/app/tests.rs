@@ -23024,6 +23024,136 @@ fn sync_outline_populates_from_tree_sitter_without_a_language_server() {
     );
 }
 
+// ---- A large file's outline is parsed off the UI thread (#1150) ----
+
+/// A Python module of `defs` functions: past the inline-parse limit when
+/// `defs` is large.
+fn python_module(defs: usize) -> String {
+    (0..defs)
+        .map(|i| format!("def f{i}(x):\n    return x + {i}\n"))
+        .collect()
+}
+
+/// What `sync_lsp` records after an edit, without starting a server: the
+/// outline keys on it.
+fn note_edit_for_outline(app: &mut App) {
+    let path = app.editor.path.clone().unwrap();
+    app.lsp_last_seen.insert(path, app.editor.edit_seq);
+}
+
+/// Tick `sync_outline` until the outline holds a symbol named `name`.
+fn sync_outline_until_symbol(app: &mut App, name: &str) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the off-thread outline parse",
+        || {
+            app.sync_outline();
+            app.outline.symbols().iter().any(|s| s.name == name)
+        },
+    );
+}
+
+#[test]
+fn typing_in_a_large_file_does_not_reparse_its_outline_on_the_ui_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(60_000));
+    note_edit_for_outline(&mut app);
+    sync_outline_until_symbol(&mut app, "f59999");
+    app.editor.cursor_row = app.editor.lines.len() - 1;
+    app.editor.cursor_col = 0;
+    for c in "def added(): pass".chars() {
+        app.editor.insert_char(c);
+    }
+    note_edit_for_outline(&mut app);
+    let started = std::time::Instant::now();
+    app.sync_outline();
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(250),
+        "a keystroke's outline sync took {took:?}"
+    );
+    assert!(
+        app.outline.symbols().iter().any(|s| s.name == "f59999"),
+        "the previous outline stays until the new one lands"
+    );
+    sync_outline_until_symbol(&mut app, "added");
+}
+
+#[test]
+fn a_burst_of_typing_in_a_large_file_ends_on_the_outline_of_its_last_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(20_000));
+    note_edit_for_outline(&mut app);
+    sync_outline_until_symbol(&mut app, "f19999");
+    app.editor.cursor_row = app.editor.lines.len() - 1;
+    for c in "def burst(): pass".chars() {
+        app.editor.insert_char(c);
+        note_edit_for_outline(&mut app);
+        app.sync_outline();
+    }
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the parse of the last keystroke",
+        || {
+            app.sync_outline();
+            app.outline_parse.is_none() && app.outline_parsed_for == app.outline_synced
+        },
+    );
+    assert!(app.outline.symbols().iter().any(|s| s.name == "burst"));
+    app.sync_outline();
+    assert!(
+        app.outline_parse.is_none(),
+        "with no new edit, no new parse"
+    );
+}
+
+#[test]
+fn a_small_file_outline_still_lands_in_the_same_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "small.py", &python_module(50));
+    note_edit_for_outline(&mut app);
+    app.sync_outline();
+    assert_eq!(app.outline.symbols().len(), 50);
+    assert!(app.outline_parse.is_none(), "no worker for a small file");
+}
+
+#[test]
+fn a_syntax_parse_landing_after_the_language_servers_outline_does_not_replace_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(20_000));
+    let path = app.editor.path.clone().unwrap();
+    note_edit_for_outline(&mut app);
+    app.sync_outline();
+    assert!(app.outline_parse.is_some(), "the parse is running");
+    let mut from_server = app_outline_symbol_named("FromServer");
+    from_server.range_end_line = 40_000;
+    assert!(app.apply_outline_symbols(path, app.editor.edit_seq, vec![from_server]));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the off-thread outline parse",
+        || {
+            app.sync_outline();
+            app.outline_parse.is_none()
+        },
+    );
+    let names: Vec<_> = app
+        .outline
+        .symbols()
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["FromServer"]);
+}
+
+fn app_outline_symbol_named(name: &str) -> crate::lsp::manager::OutlineSymbol {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut probe = app_with_open_file(tmp.path(), "one.py", "def one(x):\n    return x\n");
+    probe.sync_outline();
+    let mut symbol = probe.outline.symbols()[0].clone();
+    symbol.name = name.to_string();
+    symbol
+}
+
 #[test]
 fn empty_lsp_reply_keeps_the_tree_sitter_outline() {
     // A server that lacks documentSymbol (or replies before indexing) sends an

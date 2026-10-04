@@ -1664,6 +1664,12 @@ enum PrGhJob {
 /// of the operation, applied to the app when it arrives.
 type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
 
+/// The file the OUTLINE shows and the edit seq it was synced at.
+type OutlineKey = (PathBuf, Option<u64>);
+
+/// Where an off-thread outline parse delivers its symbols (#1150).
+type OutlineParse = std::sync::mpsc::Receiver<Vec<crate::lsp::manager::OutlineSymbol>>;
+
 /// The BREAKPOINTS section of the debug tree (#250): a header and one row per
 /// breakpoint, or nothing when there are none.
 fn breakpoint_section_rows(count: usize) -> Vec<crate::widgets::run_debug::DebugRow> {
@@ -3954,6 +3960,17 @@ pub struct App {
     /// to, so `sync_outline` re-requests symbols exactly once per tab switch or
     /// edit batch. `None` seq means the file has no language server.
     outline_synced: Option<(PathBuf, Option<u64>)>,
+    /// A large buffer's syntax outline being parsed off the UI thread
+    /// (#1150): the `outline_synced` key its snapshot was taken at, and
+    /// where the symbols land. One at a time; typing meanwhile coalesces
+    /// into one fresh parse when it lands.
+    outline_parse: Option<(OutlineKey, OutlineParse)>,
+    /// The `outline_synced` key the last off-thread parse was started for.
+    outline_parsed_for: Option<(PathBuf, Option<u64>)>,
+    /// The file and edit seq whose language-server outline last landed: a
+    /// syntax parse of that same buffer finishing later must not replace
+    /// the richer symbols.
+    outline_lsp_landed: Option<(PathBuf, u64)>,
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
     call_hierarchy_request_id: Option<u64>,
@@ -6102,6 +6119,9 @@ impl App {
             peek_refs: None,
             references_want_peek: false,
             outline_synced: None,
+            outline_parse: None,
+            outline_parsed_for: None,
+            outline_lsp_landed: None,
             declaration_request_id: None,
             type_definition_request_id: None,
             implementation_request_id: None,
@@ -10640,17 +10660,79 @@ impl App {
             // Tree-sitter paints the outline instantly from the buffer's own
             // syntax tree, before any language server replies. The LSP request
             // below refines it with richer kinds/detail when (and if) it lands.
-            let syntax = self.compute_syntax_outline(&path);
             let lsp_pending = seq.is_some();
-            self.outline
-                .set_syntax_symbols(path.clone(), syntax, lsp_pending);
+            if outline_parses_inline(&self.editor.lines) {
+                let syntax = self.compute_syntax_outline(&path);
+                self.outline
+                    .set_syntax_symbols(path.clone(), syntax, lsp_pending);
+            } else if self.outline.path.as_ref() != Some(&path) {
+                // A large buffer is parsed off the UI thread (#1150); until
+                // that lands, another file's outline must never stand in.
+                self.outline
+                    .set_syntax_symbols(path.clone(), Vec::new(), true);
+            }
             if lsp_pending && let (Some(lsp), Some(seq)) = (self.lsp.as_ref(), seq) {
                 lsp.request_document_symbols(path, seq);
             }
         }
+        let landed = self.drain_outline_parse();
+        self.start_outline_parse();
         // Follow-cursor every tick; cheap (O(symbols)) and only repaints when
         // the enclosing symbol actually changes.
-        self.outline.follow_caret(self.editor.cursor_row as u32)
+        self.outline.follow_caret(self.editor.cursor_row as u32) | landed
+    }
+
+    /// Parse a large buffer's syntax outline on a worker (#1150): inline, a
+    /// multi-megabyte file re-parsed from scratch on every keystroke and each
+    /// character took seconds to appear. Starts only when no parse is
+    /// running and the buffer moved past the last one started, so a burst of
+    /// typing costs one parse when it ends, not one per key.
+    fn start_outline_parse(&mut self) {
+        if self.outline_parse.is_some() || self.outline_parsed_for == self.outline_synced {
+            return;
+        }
+        let Some(key) = self.outline_synced.clone() else {
+            return;
+        };
+        if self.editor.path.as_ref() != Some(&key.0) || outline_parses_inline(&self.editor.lines) {
+            return;
+        }
+        let (path, lines) = (key.0.clone(), self.editor.lines.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(syntax_outline_for(&path, &lines));
+        });
+        self.outline_parsed_for = Some(key.clone());
+        self.outline_parse = Some((key, rx));
+    }
+
+    /// Apply a finished off-thread outline parse, if the buffer is still the
+    /// one it parsed and the language server's outline of that same buffer
+    /// has not landed first. True when the outline changed.
+    fn drain_outline_parse(&mut self) -> bool {
+        let Some((key, rx)) = &self.outline_parse else {
+            return false;
+        };
+        let symbols = match rx.try_recv() {
+            Ok(symbols) => symbols,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.outline_parse = None;
+                return false;
+            }
+        };
+        let key = key.clone();
+        self.outline_parse = None;
+        if self.outline_synced.as_ref() != Some(&key) {
+            return false;
+        }
+        let (path, seq) = key;
+        if seq.is_some_and(|seq| self.outline_lsp_landed == Some((path.clone(), seq))) {
+            return false;
+        }
+        self.outline
+            .set_syntax_symbols(path, symbols, seq.is_some());
+        true
     }
 
     /// Keep the Explorer's non-OUTLINE stacked sub-views current: re-project the
@@ -11007,6 +11089,9 @@ impl App {
         // filled. Keep the syntactic symbols rather than flashing "No symbols".
         if symbols.is_empty() && !self.outline.is_empty() {
             return false;
+        }
+        if !symbols.is_empty() {
+            self.outline_lsp_landed = Some((path.clone(), seq));
         }
         self.outline.set_symbols(path, symbols);
         self.outline.follow_caret(self.editor.cursor_row as u32);
@@ -63763,6 +63848,23 @@ fn syntax_outline_for(
     lines: &[String],
 ) -> Vec<crate::lsp::manager::OutlineSymbol> {
     crate::outline_syntax::symbols_for_lines(path, lines)
+}
+
+/// The largest buffer whose syntax outline is parsed on the UI thread
+/// (#1150). A from-scratch parse costs about a quarter of a millisecond per
+/// kilobyte, so this keeps it within a frame; larger buffers go to
+/// [`App::start_outline_parse`].
+const OUTLINE_INLINE_MAX_BYTES: usize = 64 * 1024;
+
+/// Whether `lines` is small enough to parse for the outline inline.
+fn outline_parses_inline(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .try_fold(0usize, |bytes, l| {
+            let bytes = bytes + l.len() + 1;
+            (bytes <= OUTLINE_INLINE_MAX_BYTES).then_some(bytes)
+        })
+        .is_some()
 }
 
 /// The breadcrumb scope chain for `line`: the indices of every outline symbol
