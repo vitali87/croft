@@ -63829,13 +63829,6 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     has_shift && has_ctrl_or_super
 }
 
-/// The status line shown after a keybindings reload.
-///
-/// Split out of `reload_config_for_path` so it can be tested against a keymap
-/// built in memory. The alternative — a test that writes the real
-/// `~/.config/croft/keybindings.json` — would leak into every one of the
-/// thousands of concurrent tests that construct an `App`, since `App::new`
-/// loads that path unconditionally.
 /// The status after snippets.json is saved: a file that loaded nothing
 /// says so, with the detail in OUTPUT (#1191), as keybindings.json does.
 fn snippets_reload_status(broken: bool) -> String {
@@ -63846,6 +63839,13 @@ fn snippets_reload_status(broken: bool) -> String {
     }
 }
 
+/// The status line shown after a keybindings reload.
+///
+/// Split out of `reload_config_for_path` so it can be tested against a keymap
+/// built in memory. The alternative — a test that writes the real
+/// `~/.config/croft/keybindings.json` — would leak into every one of the
+/// thousands of concurrent tests that construct an `App`, since `App::new`
+/// loads that path unconditionally.
 fn keybindings_reload_status(warns: &[String]) -> String {
     if warns.is_empty() {
         String::from(
