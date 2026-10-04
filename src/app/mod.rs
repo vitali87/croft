@@ -16495,6 +16495,12 @@ impl App {
     ///
     /// A multi-line paste a pane would run line by line asks first (#1274).
     fn paste_terminal_input(&mut self, payload: &[u8]) {
+        // A paste while the popup asks about another would replace the
+        // held bytes, or (one line) slip into the shell behind the popup.
+        if self.pending_terminal_paste.is_some() {
+            self.status = String::from("Resolve the pending paste before pasting again");
+            return;
+        }
         if self.multiline_paste_needs_confirm(payload) {
             self.pending_terminal_paste = Some(payload.to_vec());
             return;
@@ -51401,6 +51407,12 @@ impl App {
             .is_some_and(|k| rect_contains(k.last_area, m.column, m.row))
         {
             self.handle_osk_mouse(m);
+            return;
+        }
+        // The pending paste was checked against the active pane and the
+        // broadcast set; a click that switched panes would send it to one
+        // that was never checked. Only the popup's keys answer it.
+        if self.pending_terminal_paste.is_some() {
             return;
         }
         // A click on the port-detection toast's action buttons is consumed

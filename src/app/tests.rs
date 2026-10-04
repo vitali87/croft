@@ -68772,6 +68772,66 @@ fn the_multiline_paste_warning_follows_its_setting() {
 }
 
 #[test]
+fn a_second_paste_while_asking_is_refused_and_the_first_still_waits() {
+    // The popup holds the first paste; a later one, multi-line or not,
+    // neither replaces it nor slips into the shell behind the popup.
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste(TWO_LINES);
+    app.handle_paste("rm -rf build\nls\n");
+    app.handle_paste("echo sneaked");
+    assert_eq!(pasted(&app), "", "nothing reaches the shell");
+    assert_eq!(app.status, "Resolve the pending paste before pasting again");
+    assert_eq!(
+        app.pending_terminal_paste.as_deref(),
+        Some(TWO_LINES.as_bytes()),
+        "the first paste is the one still asked about"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), TWO_LINES);
+}
+
+/// Two panes, the first active and maximized so each has a rail row,
+/// drawn once so the rows are laid out.
+fn two_pane_paste_app() -> (App, tempfile::TempDir) {
+    let (mut app, tmp) = plain_paste_app();
+    app.split_terminal().unwrap();
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Terminal);
+    app.terminal_pane_maximized = true;
+    draw(&mut app, 180, 40);
+    (app, tmp)
+}
+
+#[test]
+fn a_click_while_asking_cannot_move_the_paste_to_another_pane() {
+    // The paste was checked against the active pane; a click on another
+    // pane's rail row must not send it there instead.
+    let (mut app, _tmp) = two_pane_paste_app();
+    app.handle_paste(TWO_LINES);
+    let other = app.terminal_rail_rects[1];
+    left_click(&mut app, other.x + 1, other.y);
+    assert_eq!(app.active_terminal, 0, "the click is ignored while asking");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), TWO_LINES, "the checked pane gets the paste");
+}
+
+#[test]
+fn once_the_paste_is_answered_clicks_and_pastes_work_again() {
+    // Negative: the guards last only while the popup is up.
+    let (mut app, _tmp) = two_pane_paste_app();
+    app.handle_paste(TWO_LINES);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_paste("echo again");
+    assert_eq!(pasted(&app), "echo again");
+    let other = app.terminal_rail_rects[1];
+    left_click(&mut app, other.x + 1, other.y);
+    assert_eq!(app.active_terminal, 1, "the rail row switches panes again");
+}
+
+#[test]
 fn the_multiline_paste_warning_setting_parses() {
     use crate::prefs::{MultilinePasteWarning, Prefs};
     let p: Prefs = serde_json::from_str(r#"{"terminal_multiline_paste_warning":"never"}"#).unwrap();
