@@ -60,6 +60,31 @@ pub struct SheetView {
     pub sqlite_pages: Vec<(String, usize)>,
 }
 
+impl SheetView {
+    /// Commit the cell being typed into at the current sheet's caret: the
+    /// value goes in the cell, the cell joins `cell_edits` and the view turns
+    /// dirty. Every commit (Enter, Tab, a click elsewhere, a save) goes
+    /// through here, so none can skip the record the xlsx save writes from
+    /// (#1140, #1141). Returns the committed cell, or None with no edit open.
+    pub fn commit_edit(&mut self) -> Option<(usize, usize)> {
+        let current = self.current_sheet;
+        let data = self.sheets.get_mut(current)?;
+        let edit = self.editing.take()?;
+        let (r, c) = (data.cur_row, data.cur_col);
+        data.set_cell(r, c, edit.value);
+        if !self.cell_edits.contains(&(current, r, c)) {
+            self.cell_edits.push((current, r, c));
+        }
+        self.dirty = true;
+        Some((r, c))
+    }
+
+    /// Whether the grid takes edits: CSV, TSV and xlsx.
+    pub fn editable(&self) -> bool {
+        matches!(self.kind, SheetKind::Csv | SheetKind::Tsv | SheetKind::Xlsx)
+    }
+}
+
 /// In-grid cell input state (#177): plain value + char cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellEdit {

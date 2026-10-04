@@ -10073,6 +10073,165 @@ fn sheet_grid_editing_types_commits_and_saves_with_the_delimiter() {
     );
 }
 
+/// `stock.csv` open in the grid, as #1140 repros it.
+fn stock_sheet_app() -> (tempfile::TempDir, std::path::PathBuf, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("stock.csv");
+    std::fs::write(&p, "item,qty\nbolt,4\nnut,9\nwasher,25\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.sheet.is_some());
+    (tmp, p, app)
+}
+
+fn type_into_sheet(app: &mut App, text: &str) {
+    for ch in text.chars() {
+        app.handle_sheet_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+}
+
+/// #1140: Cmd+S with a cell still being typed into saves that cell along
+/// with the ones already committed.
+#[test]
+fn saving_a_sheet_saves_the_cell_still_being_typed_into() {
+    let (_tmp, p, mut app) = stock_sheet_app();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "40");
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "90");
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "item,qty\nbolt,40\nnut,90\nwasher,25\n"
+    );
+    assert!(!app.editor.dirty, "{}", app.status);
+    assert!(app.editor.sheet.as_ref().unwrap().editing.is_none());
+}
+
+/// #1140: with the typed cell the only change, Cmd+S saves it instead of
+/// calling the editable grid a read-only preview.
+#[test]
+fn saving_a_sheet_whose_only_change_is_being_typed_saves_it() {
+    let (_tmp, p, mut app) = stock_sheet_app();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "40");
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "item,qty\nbolt,40\nnut,9\nwasher,25\n",
+        "{}",
+        app.status
+    );
+    assert!(app.status.starts_with("Saved"), "{}", app.status);
+}
+
+/// An unedited sheet writes nothing, and says there's nothing to save
+/// rather than that the grid is read-only.
+#[test]
+fn saving_an_unedited_sheet_writes_nothing_and_says_so() {
+    let (_tmp, p, mut app) = stock_sheet_app();
+    let before = std::fs::metadata(&p).unwrap().modified().unwrap();
+    app.save();
+    assert_eq!(app.status, "No changes to save");
+    assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), before);
+}
+
+/// Esc still throws a typed value away: the save that follows has nothing
+/// to write.
+#[test]
+fn a_cell_edit_cancelled_with_esc_is_not_saved() {
+    let (_tmp, p, mut app) = stock_sheet_app();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "40");
+    app.handle_sheet_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "item,qty\nbolt,4\nnut,9\nwasher,25\n"
+    );
+}
+
+/// `prices.xlsx` from #1141 open in the grid, drawn once so clicks land.
+fn prices_xlsx_app() -> (tempfile::TempDir, std::path::PathBuf, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("prices.xlsx");
+    let mut book = umya_spreadsheet::new_file();
+    let ws = book.sheet_mut(0).unwrap();
+    ws.cell_mut((1u32, 1u32)).set_value("item");
+    ws.cell_mut((2u32, 1u32)).set_value("price");
+    for (row, (item, price)) in [("bolt", 4), ("nut", 9), ("washer", 25)].iter().enumerate() {
+        ws.cell_mut((1u32, row as u32 + 2)).set_value(*item);
+        ws.cell_mut((2u32, row as u32 + 2)).set_value_number(*price);
+    }
+    umya_spreadsheet::writer::xlsx::write(&book, &p).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.sheet.is_some());
+    draw(&mut app, 120, 40);
+    (tmp, p, app)
+}
+
+/// Screen coordinates of grid cell `(row, col)` in the last drawn frame.
+fn sheet_cell_on_screen(app: &App, row: usize, col: usize) -> (u16, u16) {
+    let view = app.editor.sheet.as_ref().unwrap();
+    (0..40)
+        .flat_map(|y| (0..120).map(move |x| (x, y)))
+        .find(|&(x, y)| sheet_cell_at(view, x, y) == Some((row, col)))
+        .expect("the cell is on screen")
+}
+
+fn xlsx_value(p: &std::path::Path, col: u32, row: u32) -> String {
+    let book = umya_spreadsheet::reader::xlsx::read(p).unwrap();
+    book.sheet(0)
+        .unwrap()
+        .cell((col, row))
+        .unwrap()
+        .value()
+        .to_string()
+}
+
+/// #1141: an xlsx cell committed by clicking another cell is saved.
+#[test]
+fn an_xlsx_cell_committed_by_a_click_is_saved() {
+    let (_tmp, p, mut app) = prices_xlsx_app();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "5");
+    let (x, y) = sheet_cell_on_screen(&app, 2, 0);
+    left_click(&mut app, x, y);
+    assert!(app.editor.dirty, "the click commits the edit");
+    app.save();
+    assert_eq!(xlsx_value(&p, 2, 2), "5", "{}", app.status);
+    assert!(app.status.ends_with("(1 cell)"), "{}", app.status);
+    assert!(!app.editor.dirty);
+}
+
+/// A click on the cell being edited keeps the edit open: nothing commits.
+#[test]
+fn a_click_on_the_cell_being_edited_keeps_editing() {
+    let (_tmp, _p, mut app) = prices_xlsx_app();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "5");
+    let (x, y) = sheet_cell_on_screen(&app, 0, 1);
+    left_click(&mut app, x, y);
+    let view = app.editor.sheet.as_ref().unwrap();
+    assert!(view.editing.is_some());
+    assert!(view.cell_edits.is_empty() && !app.editor.dirty);
+}
+
+/// #1140 (hex comment): half a byte typed is not a read-only preview.
+#[test]
+fn a_hex_tab_with_half_a_byte_typed_is_not_called_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("blob.bin");
+    std::fs::write(&p, vec![0u8; 16]).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_hex_key(key(KeyCode::Char('f'), KeyModifiers::NONE));
+    app.save();
+    assert!(!app.status.contains("read-only"), "{}", app.status);
+    assert_eq!(std::fs::read(&p).unwrap(), vec![0u8; 16]);
+}
+
 #[test]
 fn hex_typing_edits_bytes_and_cmd_s_writes_them_in_place() {
     // #173 end-to-end: hex-pane nibble typing, Tab to the ASCII pane,

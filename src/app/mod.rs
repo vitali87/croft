@@ -53125,9 +53125,7 @@ impl App {
                                 (d.cur_row, d.cur_col)
                             };
                             let was_here = pr == r && pc == c;
-                            if !was_here && let Some(edit) = view.editing.take() {
-                                view.sheets[current].set_cell(pr, pc, edit.value);
-                                view.dirty = true;
+                            if !was_here && view.commit_edit().is_some() {
                                 self.editor.dirty = true;
                             }
                             let view = self.editor.sheet.as_mut().expect("checked");
@@ -55674,6 +55672,14 @@ impl App {
             }
             return;
         }
+        // A cell still being typed into is part of the save (#1140): commit
+        // it the way Enter does, so it reaches the file.
+        if let Some(view) = self.editor.sheet.as_mut()
+            && view.editable()
+            && view.commit_edit().is_some()
+        {
+            self.editor.dirty = true;
+        }
         // A CSV/TSV sheet with grid edits saves through its own
         // serialisation path (#177), same shape as the hex branch above.
         if self.editor.sheet.as_ref().is_some_and(|v| v.dirty) {
@@ -55720,7 +55726,22 @@ impl App {
         // choke-point guard in `write_buffer_to_disk` backstops every
         // other path.
         if self.editor.has_non_text_view() {
-            self.status = String::from("Nothing to save: this tab is a read-only preview");
+            // An editable grid or hex view with nothing to write isn't a
+            // preview (#1140).
+            let editable = self.editor.sheet.as_ref().is_some_and(|v| v.editable())
+                || self.editor.hex.is_some();
+            self.status = if self
+                .editor
+                .hex
+                .as_ref()
+                .is_some_and(|v| v.pending_nibble.is_some())
+            {
+                String::from("Type the byte's second hex digit, then save")
+            } else if editable {
+                String::from("No changes to save")
+            } else {
+                String::from("Nothing to save: this tab is a read-only preview")
+            };
             return;
         }
         // Guests in a collab session never write shared files: the owner is
@@ -59041,16 +59062,7 @@ impl App {
                     self.status = String::from("This view is read-only");
                     return;
                 }
-                let edit = sheet.editing.take().expect("checked");
-                let (r, c) = {
-                    let data = &mut sheet.sheets[current];
-                    data.set_cell(data.cur_row, data.cur_col, edit.value);
-                    (data.cur_row, data.cur_col)
-                };
-                if !sheet.cell_edits.contains(&(current, r, c)) {
-                    sheet.cell_edits.push((current, r, c));
-                }
-                sheet.dirty = true;
+                let (r, c) = sheet.commit_edit().expect("checked");
                 self.editor.dirty = true;
                 let data = &mut self.editor.sheet.as_mut().expect("checked").sheets[current];
                 data.cur_row = r
