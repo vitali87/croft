@@ -12424,6 +12424,10 @@ fn carry_changed_lines(
         })
         .collect();
     let line_of = |at: usize| new_starts.partition_point(|&s| s <= at) - 1;
+    // Brackets land in ascending order, so each new column is counted on
+    // from the previous bracket's (line, byte, column) rather than from the
+    // start of its line, which made a minified line quadratic (#1214).
+    let mut cursor = (usize::MAX, 0usize, 0usize);
     let mut old_start = 0usize;
     for (i, line) in old.iter().enumerate() {
         for span in &spans[i] {
@@ -12464,8 +12468,12 @@ fn carry_changed_lines(
             let moved = if at < head { at } else { shift(at) };
             let li = line_of(moved);
             let in_line = moved - new_starts[li];
-            let col = new[li][..in_line].chars().count();
-            out_brackets[li].push((col, depth));
+            if cursor.0 != li || cursor.1 > in_line {
+                cursor = (li, 0, 0);
+            }
+            cursor.2 += new[li][cursor.1..in_line].chars().count();
+            cursor.1 = in_line;
+            out_brackets[li].push((cursor.2, depth));
         }
         old_start += line.len() + 1;
     }
@@ -28594,6 +28602,110 @@ mod tests {
             vec![(2, 0), (4, 0)],
             "columns count chars, not bytes"
         );
+    }
+
+    /// One minified line, as a bundler writes it: a bracket every few chars.
+    fn minified_line(functions: usize) -> String {
+        (0..functions)
+            .map(|i| format!("function f{i}(a,b){{return a*{i}+b}}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// Each bracket of `line` at its char column, the way a pass colors them.
+    fn bracket_columns(line: &str) -> Vec<(usize, u8)> {
+        line.chars()
+            .enumerate()
+            .filter(|(_, c)| "(){}[]".contains(*c))
+            .map(|(col, _)| (col, (col % 3) as u8))
+            .collect()
+    }
+
+    #[test]
+    fn carry_moves_the_brackets_of_a_long_minified_line_in_one_pass() {
+        // #1214: each bracket's new column was counted from the start of
+        // its line, so a keystroke on a 914 KB line (96,000 brackets) cost
+        // about 3 s before the key was drawn.
+        let before = minified_line(24_000);
+        let brackets = bracket_columns(&before);
+        assert!(brackets.len() > 90_000, "{}", brackets.len());
+        let after = format!("x{before}");
+        // A token every few bytes, each with its color, as a pass leaves them.
+        let style = Style::default().fg(Color::Blue);
+        let tokens: Vec<HiSpan> = (0..before.len() / 4)
+            .map(|k| HiSpan {
+                start: 4 * k,
+                end: 4 * k + 3,
+                style,
+            })
+            .collect();
+        let mut base = vec![before];
+        let mut spans = vec![tokens.clone()];
+        let mut carried = vec![brackets.clone()];
+        let started = std::time::Instant::now();
+        carry_highlights(&mut base, &mut spans, &mut carried, &[after]);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "one keystroke's carry took {took:?}"
+        );
+        let shifted: Vec<(usize, u8)> = brackets.iter().map(|&(c, d)| (c + 1, d)).collect();
+        assert_eq!(carried[0], shifted, "every bracket moved one column right");
+        assert_eq!(spans[0].len(), tokens.len());
+        assert_eq!(
+            (spans[0][1].start, spans[0][1].end),
+            (5, 8),
+            "the spans moved too"
+        );
+    }
+
+    #[test]
+    fn carry_places_brackets_as_counting_from_the_line_start_would() {
+        // The single pass must land every bracket where counting its
+        // column from scratch does: across new line breaks, deletions
+        // that take brackets with them, and multi-byte text on either side.
+        fn counted(old: &str, brackets: &[(usize, u8)], new: &str) -> Vec<Vec<(usize, u8)>> {
+            let (head, tail) = common_affixes(old, new);
+            let (old_end, new_end) = (old.len() - tail, new.len() - tail);
+            let new_lines: Vec<&str> = new.split('\n').collect();
+            let mut out = vec![Vec::new(); new_lines.len()];
+            for &(col, depth) in brackets {
+                let at = old.char_indices().nth(col).unwrap().0;
+                if at >= head && at < old_end {
+                    continue;
+                }
+                let moved = if at < head {
+                    at
+                } else {
+                    at - old_end + new_end
+                };
+                let li = new[..moved].matches('\n').count();
+                let start = new[..moved].rfind('\n').map_or(0, |n| n + 1);
+                out[li].push((new[start..moved].chars().count(), depth));
+            }
+            out
+        }
+        let old = "é(a, [b]) → {c}";
+        let brackets = bracket_columns(old);
+        for new in [
+            "é(a, [b]) → {c}",
+            "Xé(a, [b]) → {c}",
+            "é(a,\n [b]) → {c}",
+            "é(a, [b])\n→\n{c}",
+            "é(a, b]) → {c}",
+            "é() → {c}",
+            "é(a, [b]) → {ç}",
+            "日本(a, [b]) → {c}",
+            "é(a, [b]) → {c}✓",
+            "",
+        ] {
+            let mut base = vec![String::from(old)];
+            let mut spans = vec![Vec::new()];
+            let mut carried = vec![brackets.clone()];
+            let lines: Vec<String> = new.split('\n').map(String::from).collect();
+            carry_highlights(&mut base, &mut spans, &mut carried, &lines);
+            assert_eq!(carried, counted(old, &brackets, new), "edit: {new:?}");
+        }
     }
 
     #[test]
