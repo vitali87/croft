@@ -32282,7 +32282,11 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        if let Err(err) = crate::git::stage_all(&self.scm_root()) {
+        // Before `add -A`, which would mark a conflict resolved with its
+        // markers still in it (#989).
+        let staged = crate::git::refuse_unmerged(&self.scm_root())
+            .and_then(|()| crate::git::stage_all(&self.scm_root()));
+        if let Err(err) = staged {
             self.run_scm_op("add -A", Err(err), "Stage all");
             return;
         }
