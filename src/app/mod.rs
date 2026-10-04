@@ -16529,11 +16529,13 @@ impl App {
         let Some(payload) = self.pending_terminal_paste.take() else {
             return;
         };
-        let payload = if one_line {
-            pasted_lines(&payload).join(&b' ')
+        let lines = pasted_lines(&payload);
+        self.status = if one_line {
+            format!("Pasted {} lines as one", lines.len())
         } else {
-            payload
+            format!("Pasted {} lines", lines.len())
         };
+        let payload = if one_line { lines.join(&b' ') } else { payload };
         self.paste_terminal_input_now(&payload);
     }
 
