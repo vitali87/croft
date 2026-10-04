@@ -9206,6 +9206,15 @@ impl App {
     }
 
     fn on_mouse_moved(&mut self, col: u16, row: u16, in_editor: bool) {
+        // Crossing onto the hover keeps it, so the wheel can reach it.
+        if self
+            .hover_popup
+            .as_ref()
+            .is_some_and(|p| rect_contains(p.last_area, col, row))
+        {
+            self.hover.clear();
+            return;
+        }
         // Activity-bar hover: brighten the icon under the pointer. Re-emit the
         // swapped pre-baked image only when the hovered icon actually changes,
         // so a pointer drifting within one icon (or anywhere else) costs
@@ -19660,6 +19669,7 @@ impl App {
         if let Some(popup) = self.hover_popup.as_mut() {
             popup.theme = self.theme;
             let area = popup.area_for(frame.area());
+            popup.last_area = area;
             if area.width > 0 && area.height > 0 {
                 frame.render_widget(&*popup, area);
             }
@@ -51845,6 +51855,23 @@ impl App {
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
         let in_editor_hscrollbar = rect_contains(self.editor.last_hscrollbar, m.column, m.row);
 
+        // The wheel over a hover scrolls its text rather than dismissing it
+        // (#1254): a long docstring's Returns/Raises sit below the box.
+        if let Some(popup) = self.hover_popup.as_mut()
+            && rect_contains(popup.last_area, m.column, m.row)
+        {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    popup.scroll_by(3);
+                    return;
+                }
+                MouseEventKind::ScrollUp => {
+                    popup.scroll_by(-3);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if matches!(m.kind, MouseEventKind::Moved) {
             self.pointer_cell = Some((m.column, m.row));
             self.on_mouse_moved(m.column, m.row, in_editor);
