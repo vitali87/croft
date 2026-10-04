@@ -908,47 +908,7 @@ pub fn replace_in_file(
     }
     // Written aside and renamed in, keeping the file's mode: written in
     // place, a failed write (a full disk) left the file truncated.
-    // A rename would change more than the contents where the file is a hard
-    // link (the other names keep the old text) or belongs to someone else
-    // (the new file would be ours): those are written in place, as is a
-    // file whose directory refuses the temp file.
-    #[cfg(unix)]
-    let in_place = std::fs::metadata(path).is_ok_and(|m| {
-        use std::os::unix::fs::MetadataExt;
-        m.nlink() > 1 || m.uid() != unsafe { libc::geteuid() }
-    });
-    #[cfg(not(unix))]
-    let in_place = false;
-    if !in_place {
-        let name = path.file_name()?.to_string_lossy();
-        let tmp = path.with_file_name(format!(".{name}.croft-replace-{}", std::process::id()));
-        match crate::prefs::write_keeping_mode(&tmp, path, new_content.as_bytes()) {
-            Ok(()) => {
-                if std::fs::rename(&tmp, path).is_ok() {
-                    return Some(count);
-                }
-                // The directory took the temp file, so nothing is gained by
-                // writing in place, and a failure there truncates the file.
-                let _ = std::fs::remove_file(&tmp);
-                return None;
-            }
-            // Only a temp file that cannot be created (a directory that
-            // refuses it, or a name already taken, which is never followed)
-            // falls through to an in-place write. A full disk would fail that
-            // write too, after it had already truncated the file.
-            Err(e) => {
-                use std::io::ErrorKind;
-                if !matches!(
-                    e.kind(),
-                    ErrorKind::PermissionDenied | ErrorKind::AlreadyExists
-                ) {
-                    let _ = std::fs::remove_file(&tmp);
-                    return None;
-                }
-            }
-        }
-    }
-    std::fs::write(path, new_content).ok()?;
+    crate::prefs::replace_file_contents(path, new_content.as_bytes()).ok()?;
     Some(count)
 }
 

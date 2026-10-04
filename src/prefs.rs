@@ -617,6 +617,64 @@ pub(crate) fn write_keeping_mode(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::
     file.write_all(bytes)
 }
 
+/// Replace the contents of the user's file at `path` with `bytes` so that
+/// a write that fails partway (a full disk) leaves the old contents whole:
+/// the bytes go to a temp file beside it, created with its mode, which is
+/// then renamed over it. Written in place, the file was truncated first and
+/// a failed write lost its end (#1124).
+///
+/// A symlink is followed, so the link survives and its target is replaced.
+/// A file that doesn't exist yet has nothing to lose and is written
+/// directly, with the usual umask mode. A rename would change more than the
+/// contents where the file is a hard link (the other names keep the old
+/// text) or belongs to someone else (the new file would be ours): those are
+/// written in place, as is a file whose directory refuses the temp file.
+pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Ok(meta) = std::fs::metadata(&target) else {
+        return std::fs::write(&target, bytes);
+    };
+    #[cfg(unix)]
+    let in_place = {
+        use std::os::unix::fs::MetadataExt;
+        meta.nlink() > 1 || meta.uid() != unsafe { libc::geteuid() }
+    };
+    #[cfg(not(unix))]
+    let in_place = {
+        let _ = &meta;
+        false
+    };
+    if !in_place {
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp = target.with_file_name(format!(".{name}.croft-save-{}", std::process::id()));
+        match write_keeping_mode(&tmp, &target, bytes) {
+            Ok(()) => {
+                return std::fs::rename(&tmp, &target).inspect_err(|_| {
+                    let _ = std::fs::remove_file(&tmp);
+                });
+            }
+            // Only a temp file that cannot be created (a directory that
+            // refuses it, or a name already taken, which is never followed)
+            // falls through to an in-place write. A full disk would fail that
+            // write too, after it had already truncated the file.
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                use std::io::ErrorKind;
+                if !matches!(
+                    e.kind(),
+                    ErrorKind::PermissionDenied | ErrorKind::AlreadyExists
+                ) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    std::fs::write(&target, bytes)
+}
+
 /// The settings file under `config_dir`. The real config dir means the
 /// active profile's file (#618), which is what startup reads; saving
 /// consent or disabled extensions to the base file instead let a revoked
