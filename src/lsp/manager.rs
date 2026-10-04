@@ -942,6 +942,15 @@ pub struct LspManager {
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
+    /// Test hooks: senders into the three jump channels, so app tests can
+    /// answer a definition, declaration or type definition request
+    /// without a server.
+    #[cfg(test)]
+    jump_test_tx: (
+        std_mpsc::Sender<DefinitionResult>,
+        std_mpsc::Sender<DeclarationResult>,
+        std_mpsc::Sender<TypeDefinitionResult>,
+    ),
     doc_symbols_rx: std_mpsc::Receiver<DocumentSymbolsResult>,
     decl_rx: std_mpsc::Receiver<DeclarationResult>,
     type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
@@ -1006,6 +1015,8 @@ impl LspManager {
         let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
         let (decl_tx, decl_rx) = std_mpsc::channel();
         let (type_def_tx, type_def_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let jump_test_tx = (def_tx.clone(), decl_tx.clone(), type_def_tx.clone());
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
@@ -1099,6 +1110,8 @@ impl LspManager {
             signature_help_rx,
             hover_rx,
             def_rx,
+            #[cfg(test)]
+            jump_test_tx,
             doc_symbols_rx,
             decl_rx,
             type_def_rx,
@@ -1429,6 +1442,25 @@ impl LspManager {
 
     pub fn drain_definition(&self) -> Option<DefinitionResult> {
         self.def_rx.try_recv().ok()
+    }
+
+    /// Test hook: deliver a definition reply as if a server had answered.
+    #[cfg(test)]
+    pub fn push_definition_for_test(&self, result: DefinitionResult) {
+        let _ = self.jump_test_tx.0.send(result);
+    }
+
+    /// Test hook: deliver a declaration reply as if a server had answered.
+    #[cfg(test)]
+    pub fn push_declaration_for_test(&self, result: DeclarationResult) {
+        let _ = self.jump_test_tx.1.send(result);
+    }
+
+    /// Test hook: deliver a type definition reply as if a server had
+    /// answered.
+    #[cfg(test)]
+    pub fn push_type_definition_for_test(&self, result: TypeDefinitionResult) {
+        let _ = self.jump_test_tx.2.send(result);
     }
 
     /// Ask the server for the document's symbol tree (the Outline). Fire on
