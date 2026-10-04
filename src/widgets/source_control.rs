@@ -176,6 +176,13 @@ pub struct SourceControlPanel {
     /// Empty when the panel is in a git repo or when the panel is too
     /// small to draw the empty-state card.
     pub last_init_repo_button_area: Rect,
+    /// Repositories in the workspace's immediate subfolders, as (label,
+    /// absolute path), set by `App` while the workspace itself is in no
+    /// repo (#1227). Non-empty, the empty-state card lists them with an
+    /// Open button each in place of Initialize.
+    pub nested_repos: Vec<(String, std::path::PathBuf)>,
+    /// Hit-test rects for those Open buttons; empty whenever none paint.
+    pub nested_repo_button_areas: Vec<(Rect, std::path::PathBuf)>,
     /// Cell rect reserved for the no-repo empty-state hero illustration.
     /// `App` paints an OSC-1337 inline PNG here on iTerm2-class terminals;
     /// the widget paints an ASCII Y-fork as fallback so the same rect
@@ -247,6 +254,8 @@ impl SourceControlPanel {
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_init_repo_button_area: Rect::default(),
+            nested_repos: Vec::new(),
+            nested_repo_button_areas: Vec::new(),
             last_hero_area: Rect::default(),
             inline_hero_image_active: false,
             scroll: 0,
@@ -464,6 +473,14 @@ impl SourceControlPanel {
 
     pub fn click_init_repo_button(&self, x: u16, y: u16) -> bool {
         rect_hit(self.last_init_repo_button_area, x, y)
+    }
+
+    /// The subfolder repo whose Open button (x, y) lands on (#1227).
+    pub fn click_nested_repo(&self, x: u16, y: u16) -> Option<std::path::PathBuf> {
+        self.nested_repo_button_areas
+            .iter()
+            .find(|(r, _)| rect_hit(*r, x, y))
+            .map(|(_, path)| path.clone())
     }
 
     pub fn scroll_up(&mut self, rows: usize) {
@@ -728,7 +745,12 @@ impl SourceControlPanel {
         // word wrapping so a resized panel reflows the text instead of
         // truncating mid-word - that's the "text inside is not even
         // adjusted" bug from the user's screenshot.
-        let title_text = "No repository detected";
+        let nested = !self.nested_repos.is_empty();
+        let title_text = if nested {
+            "Repositories found in subfolders"
+        } else {
+            "No repository detected"
+        };
         let title_h = paragraph_line_count(title_text, card_inner.width).min(3) as u16;
         if y + title_h <= bottom && title_h > 0 {
             let title_rect = Rect {
@@ -745,8 +767,11 @@ impl SourceControlPanel {
             y += title_h + 1;
         }
 
-        let desc_text =
-            "Open a folder under Git or create a new repository to start tracking changes.";
+        let desc_text = if nested {
+            "This folder is not a Git repository, but these subfolders are. Open one to use Source Control."
+        } else {
+            "Open a folder under Git or create a new repository to start tracking changes."
+        };
         let desc_h = paragraph_line_count(desc_text, card_inner.width).min(6) as u16;
         if y + desc_h <= bottom && desc_h > 0 {
             let desc_rect = Rect {
@@ -768,6 +793,26 @@ impl SourceControlPanel {
         let max_btn_w: u16 = 40;
         let btn_w = card_inner.width.saturating_sub(2).min(max_btn_w);
         let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_w)) / 2;
+        if nested {
+            // One Open button per repo while they fit; Initialize would
+            // `git init` this folder around them, so it is not offered.
+            for (label, path) in &self.nested_repos {
+                if y + 3 > bottom || btn_w < 6 {
+                    break;
+                }
+                let area = Rect {
+                    x: btn_x,
+                    y,
+                    width: btn_w,
+                    height: 3,
+                };
+                let text = format!("Open {label}");
+                render_rounded_button(buf, area, &text, blue_bg, text_white);
+                self.nested_repo_button_areas.push((area, path.clone()));
+                y += 4;
+            }
+            return;
+        }
         let init_label: &str = if btn_w >= 23 {
             "Initialize Repository"
         } else if btn_w >= 12 {
@@ -1101,6 +1146,7 @@ impl Widget for &mut SourceControlPanel {
         // design the user supplied.
         if !self.status.in_repo {
             self.last_init_repo_button_area = Rect::default();
+            self.nested_repo_button_areas.clear();
             self.last_hero_area = Rect::default();
             self.render_no_repo_empty_state(inner, buf);
             // With several folders open, the OTHER folders' repositories
@@ -1111,6 +1157,7 @@ impl Widget for &mut SourceControlPanel {
         }
         // Repo path: hero is only for the empty state.
         self.last_hero_area = Rect::default();
+        self.nested_repo_button_areas.clear();
 
         // Row 2: branch row — a green branch glyph plus the branch name.
         let mut y = inner.y + 2;
@@ -2221,6 +2268,130 @@ mod tests {
             !dump.contains("Learn more about Git"),
             "Learn more link must be gone:\n{dump}"
         );
+    }
+
+    /// #1227: the workspace sits one folder above its repo. Initialize
+    /// would `git init` the parent around the existing repo, so the card
+    /// names the subfolder repos and offers to open them instead.
+    #[test]
+    fn empty_state_offers_subfolder_repos_instead_of_initialize() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        p.nested_repos = vec![(String::from("sub/"), std::path::PathBuf::from("/w/sub"))];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("Repositories found in subfolders"),
+            "title must name the subfolder repos:\n{dump}"
+        );
+        assert!(dump.contains("Open sub/"), "open button missing:\n{dump}");
+        assert!(
+            !dump.contains("Initialize") && !dump.contains("No repository detected"),
+            "Initialize must not be offered above a repo:\n{dump}"
+        );
+        assert_eq!(p.last_init_repo_button_area, Rect::default());
+        assert_eq!(p.nested_repo_button_areas.len(), 1);
+        let (btn, _) = p.nested_repo_button_areas[0].clone();
+        assert_eq!(
+            p.click_nested_repo(btn.x + 1, btn.y + 1),
+            Some(std::path::PathBuf::from("/w/sub"))
+        );
+        assert_eq!(p.click_nested_repo(btn.x + 1, btn.y + btn.height), None);
+    }
+
+    #[test]
+    fn empty_state_lists_one_open_button_per_subfolder_repo() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        p.nested_repos = vec![
+            (String::from("api/"), std::path::PathBuf::from("/w/api")),
+            (String::from("web/"), std::path::PathBuf::from("/w/web")),
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 40,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("Open api/") && dump.contains("Open web/"),
+            "{dump}"
+        );
+        let paths: Vec<_> = p
+            .nested_repo_button_areas
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                std::path::PathBuf::from("/w/api"),
+                std::path::PathBuf::from("/w/web")
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_state_without_subfolder_repos_still_offers_initialize() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus::default();
+        p.nested_repo_button_areas = vec![(
+            Rect {
+                x: 1,
+                y: 1,
+                width: 5,
+                height: 3,
+            },
+            std::path::PathBuf::from("/stale"),
+        )];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(p.last_init_repo_button_area.width > 0);
+        assert!(
+            p.nested_repo_button_areas.is_empty(),
+            "stale open buttons must not stay clickable"
+        );
+        assert_eq!(p.click_nested_repo(2, 2), None);
+    }
+
+    #[test]
+    fn a_repo_workspace_never_shows_subfolder_open_buttons() {
+        use crate::git::GitStatus;
+        let mut p = SourceControlPanel::new();
+        p.status = GitStatus {
+            in_repo: true,
+            ..GitStatus::default()
+        };
+        p.nested_repos = vec![(String::from("sub/"), std::path::PathBuf::from("/w/sub"))];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(p.nested_repo_button_areas.is_empty());
+        assert!(!buffer_to_string(&buf).contains("Open sub/"));
     }
 
     #[test]

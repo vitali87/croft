@@ -234,10 +234,14 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
 }
 
 pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<SheetData, csv::Error> {
+    // TSV has no quoting (#1136): `psql`, `mysql -B` and `cut` write a `"`
+    // as a plain character, and reading one as a quote swallowed every row
+    // after a cell that started with it.
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
         .delimiter(delim)
+        .quoting(delim != b'\t')
         .from_reader(bytes);
     let mut rows: Vec<Vec<String>> = Vec::new();
     // The reader skips blank lines, so a single-column file lost every
@@ -417,10 +421,17 @@ pub fn serialize_delimited(data: &SheetData, delim: u8, crlf: bool) -> Vec<u8> {
             out.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
             return;
         }
+        // Never quoted for TSV, as it was read (#1136).
+        let quote_style = if delim == b'\t' {
+            csv::QuoteStyle::Never
+        } else {
+            csv::QuoteStyle::Necessary
+        };
         let mut w = csv::WriterBuilder::new()
             .delimiter(delim)
             .flexible(true)
             .terminator(terminator)
+            .quote_style(quote_style)
             .from_writer(&mut out);
         let _ = w.write_record(record);
         let _ = w.flush();
@@ -737,6 +748,53 @@ mod tests {
             "a,b,c\n1,2,\"x,y\"\n",
             "delimiter-bearing cells are quoted, header row survives"
         );
+    }
+
+    /// The #1136 repro: TSV as `psql`, `mysql -B` and `cut` write it, with
+    /// `"` as a plain character.
+    const PRODUCTS_TSV: &[u8] = b"sku\tname\tsize\tqty\nA1\tDeluxe widget\t5\"\t10\nA2\t\"Pro\" ruler\t12in\t4\nA3\t\"12 inch ruler\t12in\t7\nA4\tnut\tM6\t100\nA5\tbolt\tM6\t50\n";
+
+    /// #1136: a TSV cell starting with `"` doesn't swallow the rows after it.
+    #[test]
+    fn a_tsv_quote_is_a_plain_character() {
+        let d = super::parse_delimited(PRODUCTS_TSV, b'\t', "S").unwrap();
+        let skus: Vec<&str> = d.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(skus, vec!["A1", "A2", "A3", "A4", "A5"]);
+        assert_eq!(d.cell(1, 1), "\"Pro\" ruler");
+        assert_eq!(d.cell(2, 1), "\"12 inch ruler");
+    }
+
+    /// #1136: a one-cell edit to a TSV leaves every other line as it was.
+    #[test]
+    fn a_tsv_cell_edit_rewrites_only_that_cell() {
+        let mut d = super::parse_delimited(PRODUCTS_TSV, b'\t', "S").unwrap();
+        d.set_cell(0, 3, String::from("12"));
+        let out = super::serialize_delimited(&d, b'\t', false);
+        let want = String::from_utf8(PRODUCTS_TSV.to_vec())
+            .unwrap()
+            .replacen("5\"\t10", "5\"\t12", 1);
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+    }
+
+    /// CSV keeps its quoting: a quoted field holds a comma or a line break,
+    /// and a cell that needs quotes gets them on save.
+    #[test]
+    fn csv_quoting_is_unchanged() {
+        let d = super::parse_delimited(b"a,b\n\"x,y\",\"two\nlines\"\n", b',', "S").unwrap();
+        assert_eq!(
+            d.rows,
+            vec![vec!["x,y".to_string(), "two\nlines".to_string()]]
+        );
+        let out = super::serialize_delimited(&d, b',', false);
+        assert_eq!(out, b"a,b\n\"x,y\",\"two\nlines\"\n".to_vec());
+    }
+
+    /// A TSV with no quotes in it still round-trips byte for byte.
+    #[test]
+    fn a_plain_tsv_round_trips() {
+        let src = b"h1\th2\n1\t2\n\n3\t\n";
+        let d = super::parse_delimited(src, b'\t', "S").unwrap();
+        assert_eq!(super::serialize_delimited(&d, b'\t', false), src.to_vec());
     }
 
     #[test]

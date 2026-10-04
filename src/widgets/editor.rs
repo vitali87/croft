@@ -977,7 +977,11 @@ fn render_merge_panes(
     };
     let mut panes: Vec<Pane> = Vec::new();
     panes.push(Pane {
-        title: "CURRENT (yours)",
+        title: if mv.deleted == Some(CheckSide::Current) {
+            "CURRENT (yours): deleted"
+        } else {
+            "CURRENT (yours)"
+        },
         lines: &mv.ours,
         scroll: mv.ours_scroll,
         side: Some(CheckSide::Current),
@@ -1007,7 +1011,11 @@ fn render_merge_panes(
         });
     }
     panes.push(Pane {
-        title: "INCOMING (theirs)",
+        title: if mv.deleted == Some(CheckSide::Incoming) {
+            "INCOMING (theirs): deleted"
+        } else {
+            "INCOMING (theirs)"
+        },
         lines: &mv.theirs,
         scroll: mv.theirs_scroll,
         side: Some(CheckSide::Incoming),
@@ -1131,6 +1139,25 @@ fn render_merge_panes(
         width: inner.width,
         height: inner.height - top_h - 1,
     }
+}
+
+/// `text` from char `skip` on, cut and space-padded to exactly `width`
+/// screen cells for one side of the side-by-side diff. A double-width (CJK,
+/// emoji) char takes two cells, and one that would straddle the edge is left
+/// out, so the text never runs over the seam into the other column.
+fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars().skip(skip) {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.extend(std::iter::repeat_n(' ', width - used));
+    out
 }
 
 /// Returns the hit-test rects of the prev / next change arrows painted
@@ -1341,16 +1368,7 @@ fn render_diff(
                 .bg(l_cell_bg)
                 .add_modifier(Modifier::BOLD),
         );
-        let l_clipped: String = l_text
-            .chars()
-            .skip(diff.scroll_x)
-            .take(l_text_w as usize)
-            .collect();
-        let mut l_padded = l_clipped.clone();
-        let l_pad = (l_text_w as usize).saturating_sub(l_padded.chars().count());
-        for _ in 0..l_pad {
-            l_padded.push(' ');
-        }
+        let l_padded = clip_pad_cells(&l_text, diff.scroll_x, l_text_w as usize);
         buf.set_string(
             l_text_x,
             y,
@@ -1417,16 +1435,7 @@ fn render_diff(
                 .bg(r_cell_bg)
                 .add_modifier(Modifier::BOLD),
         );
-        let r_clipped: String = r_text
-            .chars()
-            .skip(diff.scroll_x)
-            .take(r_text_w as usize)
-            .collect();
-        let mut r_padded = r_clipped.clone();
-        let r_pad = (r_text_w as usize).saturating_sub(r_padded.chars().count());
-        for _ in 0..r_pad {
-            r_padded.push(' ');
-        }
+        let r_padded = clip_pad_cells(&r_text, diff.scroll_x, r_text_w as usize);
         buf.set_string(
             r_text_x,
             y,
@@ -1810,16 +1819,7 @@ fn render_unified_deletion(
         let text = left_idx
             .and_then(|i| diff.left_lines.get(i).cloned())
             .unwrap_or_default();
-        let clipped: String = text
-            .chars()
-            .skip(diff.scroll_x)
-            .take(text_w as usize)
-            .collect();
-        let mut padded = clipped;
-        let pad = (text_w as usize).saturating_sub(padded.chars().count());
-        for _ in 0..pad {
-            padded.push(' ');
-        }
+        let padded = clip_pad_cells(&text, diff.scroll_x, text_w as usize);
         buf.set_string(
             text_x,
             y,
@@ -6948,9 +6948,15 @@ impl Editor {
         if is_pair_closer(c) {
             return false;
         }
-        // Opener guard: never before a word character. Quote guard: also
-        // never after a word character or the same quote.
-        let next_ok = next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c);
+        // Opener guard: VS Code's `autoCloseBefore`, so only before
+        // whitespace, a closer or punctuation. Anything else, a string's
+        // closing quote above all, means the opener is text: `"("` typed
+        // inside a string left a stray `)` (#1183). Quote guard: never
+        // before or after a word character or the same quote.
+        let next_ok = match is_pair_quote(c) {
+            true => next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c),
+            false => next.is_none_or(|n| AUTO_CLOSE_BEFORE.contains(n)),
+        };
         let prev = if self.cursor_col == 0 {
             None
         } else {
@@ -9293,6 +9299,32 @@ impl Editor {
         self.write_buffer_to_disk()
     }
 
+    /// File: Save As… (#1203): write the buffer to `path` and make this tab
+    /// that file, with the grammar its name calls for. The tab stays on its
+    /// own path, untouched, unless the bytes land.
+    pub fn save_as(&mut self, path: &Path) -> Result<SaveOutcome> {
+        let kept = (
+            self.path.replace(path.to_path_buf()),
+            self.disk_stamp,
+            self.disk_conflict,
+        );
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_conflict = false;
+        let outcome = self.write_buffer_to_disk();
+        if matches!(outcome, Ok(SaveOutcome::Saved)) {
+            let lang = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(lang_for_extension);
+            if lang != self.lang {
+                self.set_language(lang);
+            }
+        } else {
+            (self.path, self.disk_stamp, self.disk_conflict) = kept;
+        }
+        outcome
+    }
+
     /// Encode the buffer for disk in the encoding it claims, re-emitting the
     /// byte-order mark if the file had one.
     ///
@@ -9413,6 +9445,12 @@ impl Editor {
         if (had_errors || writes_replacements) && !self.lossy_save_armed {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
+        }
+        // The folder can go while the tab is open (a `git checkout` of a
+        // branch without it, #1203). Put it back, as VS Code does, rather
+        // than strand the edits; a path that can't be a folder still fails.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&path, encoded)?;
         self.decode_lossy = false;
@@ -12424,6 +12462,10 @@ fn carry_changed_lines(
         })
         .collect();
     let line_of = |at: usize| new_starts.partition_point(|&s| s <= at) - 1;
+    // Brackets land in ascending order, so each new column is counted on
+    // from the previous bracket's (line, byte, column) rather than from the
+    // start of its line, which made a minified line quadratic (#1214).
+    let mut cursor = (usize::MAX, 0usize, 0usize);
     let mut old_start = 0usize;
     for (i, line) in old.iter().enumerate() {
         for span in &spans[i] {
@@ -12464,8 +12506,12 @@ fn carry_changed_lines(
             let moved = if at < head { at } else { shift(at) };
             let li = line_of(moved);
             let in_line = moved - new_starts[li];
-            let col = new[li][..in_line].chars().count();
-            out_brackets[li].push((col, depth));
+            if cursor.0 != li || cursor.1 > in_line {
+                cursor = (li, 0, 0);
+            }
+            cursor.2 += new[li][cursor.1..in_line].chars().count();
+            cursor.1 = in_line;
+            out_brackets[li].push((cursor.2, depth));
         }
         old_start += line.len() + 1;
     }
@@ -15795,6 +15841,10 @@ fn auto_close_partner(c: char) -> Option<char> {
     }
 }
 
+/// The characters an opener may auto-close in front of: VS Code's default
+/// `autoCloseBefore` (#1183).
+const AUTO_CLOSE_BEFORE: &str = ";:.,=}])> \t";
+
 fn is_pair_closer(c: char) -> bool {
     matches!(c, ')' | ']' | '}')
 }
@@ -16428,6 +16478,34 @@ impl EditorTabs {
             .find_tab_with_path(path)
             .or_else(|| self.find_any_tab_with_path(path))?;
         Some(self.editors[idx].apply_span_edits(edits))
+    }
+
+    /// Every open tab's file and `edit_seq`: the buffers as they stand when
+    /// a language server is asked for a workspace edit (#1151).
+    pub fn edit_seqs(&self) -> Vec<(PathBuf, u64)> {
+        self.editors
+            .iter()
+            .filter_map(|e| Some((e.path.clone()?, e.edit_seq)))
+            .collect()
+    }
+
+    /// True when the tab a workspace edit to `path` would land in (as
+    /// [`Self::apply_rename_to_open_tab`] picks it) was edited after `seqs`
+    /// was taken: the edit's positions describe text no longer there. A
+    /// file no tab held when `seqs` was taken is never called edited.
+    pub fn edited_since(&self, seqs: &[(PathBuf, u64)], path: &Path) -> bool {
+        let Some(idx) = self
+            .find_tab_with_path(path)
+            .or_else(|| self.find_any_tab_with_path(path))
+        else {
+            return false;
+        };
+        let e = &self.editors[idx];
+        let Some(p) = e.path.as_ref() else {
+            return false;
+        };
+        let mut then = seqs.iter().filter(|(q, _)| q == p).peekable();
+        then.peek().is_some() && !then.any(|(_, seq)| *seq == e.edit_seq)
     }
 
     fn find_tab_matching(&self, target: &Path, extra: impl Fn(&Editor) -> bool) -> Option<usize> {
@@ -25243,6 +25321,93 @@ mod tests {
         );
     }
 
+    /// Render a side-by-side diff of `left` vs `right` into an 80x10 buffer.
+    fn render_wide_diff(left: &str, right: &str) -> (ratatui::buffer::Buffer, Rect, u16) {
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), left).unwrap();
+        std::fs::write(f2.path(), right).unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let idx = t.active_index();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[idx], area, &mut buf);
+        let inner = t.editors[idx].last_inner;
+        let r_gutter = (t.editors[idx].diff.as_ref().unwrap().right_lines.len() + 1)
+            .to_string()
+            .len() as u16
+            + 1;
+        let r_text_x = inner.x + inner.width / 2 + 1 + r_gutter + 2;
+        (buf, inner, r_text_x)
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, from: u16, to: u16) -> String {
+        (from..to).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// Wide (CJK) characters take two cells: each side is clipped to its
+    /// half by display width, so the seam survives on every row and the
+    /// right side starts where it should (#1248).
+    #[test]
+    fn a_diff_of_wide_characters_keeps_each_side_in_its_half() {
+        let left = "# 项目\n这是一个轻量级的终端编辑器，支持多种编程语言和版本控制功能。\nend\n";
+        let right = "# 项目\n这是一个高性能的终端编辑器，支持多种编程语言和版本控制功能。\nend\n";
+        let (buf, inner, r_text_x) = render_wide_diff(left, right);
+        let seam_x = inner.x + inner.width / 2;
+        for y in inner.y + 1..inner.y + 4 {
+            assert_eq!(
+                buf[(seam_x, y)].symbol(),
+                "\u{2502}",
+                "row {y}: {:?}",
+                row_text(&buf, y, inner.x, inner.right())
+            );
+        }
+        let changed = (inner.y..inner.bottom())
+            .find(|&y| row_text(&buf, y, r_text_x, inner.right()).contains('高'))
+            .expect("the changed right line is drawn");
+        assert_eq!(
+            buf[(r_text_x, changed)].symbol(),
+            "这",
+            "starts at its column"
+        );
+        assert!(
+            !row_text(&buf, changed, inner.x, seam_x).contains('高'),
+            "no right text left of the seam"
+        );
+    }
+
+    /// A wide character that would straddle a column's edge is left out and
+    /// its cell padded, rather than drawn across the seam.
+    #[test]
+    fn clip_pad_cells_never_splits_a_wide_character() {
+        assert_eq!(clip_pad_cells("日本語", 0, 5), "日本 ");
+        assert_eq!(clip_pad_cells("日本語", 1, 6), "本語  ");
+        assert_eq!(clip_pad_cells("ab日", 0, 3), "ab ");
+    }
+
+    /// Narrow text clips and pads exactly as before: by character, to the
+    /// column's width.
+    #[test]
+    fn clip_pad_cells_matches_char_clipping_for_narrow_text() {
+        assert_eq!(clip_pad_cells("abcdef", 2, 3), "cde");
+        assert_eq!(clip_pad_cells("ab", 0, 4), "ab  ");
+        assert_eq!(clip_pad_cells("abc", 5, 2), "  ");
+        let (buf, inner, r_text_x) = render_wide_diff("x\nold line\n", "x\nnew line\n");
+        let changed = (inner.y..inner.bottom())
+            .find(|&y| row_text(&buf, y, r_text_x, inner.right()).starts_with("new line"))
+            .expect("ascii right line drawn at its column");
+        assert_eq!(
+            buf[(inner.x + inner.width / 2, changed)].symbol(),
+            "\u{2502}"
+        );
+    }
+
     #[test]
     fn render_diff_paints_selection_band_over_selected_cells() {
         use crate::widgets::diff::DiffSide;
@@ -28596,6 +28761,110 @@ mod tests {
         );
     }
 
+    /// One minified line, as a bundler writes it: a bracket every few chars.
+    fn minified_line(functions: usize) -> String {
+        (0..functions)
+            .map(|i| format!("function f{i}(a,b){{return a*{i}+b}}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// Each bracket of `line` at its char column, the way a pass colors them.
+    fn bracket_columns(line: &str) -> Vec<(usize, u8)> {
+        line.chars()
+            .enumerate()
+            .filter(|(_, c)| "(){}[]".contains(*c))
+            .map(|(col, _)| (col, (col % 3) as u8))
+            .collect()
+    }
+
+    #[test]
+    fn carry_moves_the_brackets_of_a_long_minified_line_in_one_pass() {
+        // #1214: each bracket's new column was counted from the start of
+        // its line, so a keystroke on a 914 KB line (96,000 brackets) cost
+        // about 3 s before the key was drawn.
+        let before = minified_line(24_000);
+        let brackets = bracket_columns(&before);
+        assert!(brackets.len() > 90_000, "{}", brackets.len());
+        let after = format!("x{before}");
+        // A token every few bytes, each with its color, as a pass leaves them.
+        let style = Style::default().fg(Color::Blue);
+        let tokens: Vec<HiSpan> = (0..before.len() / 4)
+            .map(|k| HiSpan {
+                start: 4 * k,
+                end: 4 * k + 3,
+                style,
+            })
+            .collect();
+        let mut base = vec![before];
+        let mut spans = vec![tokens.clone()];
+        let mut carried = vec![brackets.clone()];
+        let started = std::time::Instant::now();
+        carry_highlights(&mut base, &mut spans, &mut carried, &[after]);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "one keystroke's carry took {took:?}"
+        );
+        let shifted: Vec<(usize, u8)> = brackets.iter().map(|&(c, d)| (c + 1, d)).collect();
+        assert_eq!(carried[0], shifted, "every bracket moved one column right");
+        assert_eq!(spans[0].len(), tokens.len());
+        assert_eq!(
+            (spans[0][1].start, spans[0][1].end),
+            (5, 8),
+            "the spans moved too"
+        );
+    }
+
+    #[test]
+    fn carry_places_brackets_as_counting_from_the_line_start_would() {
+        // The single pass must land every bracket where counting its
+        // column from scratch does: across new line breaks, deletions
+        // that take brackets with them, and multi-byte text on either side.
+        fn counted(old: &str, brackets: &[(usize, u8)], new: &str) -> Vec<Vec<(usize, u8)>> {
+            let (head, tail) = common_affixes(old, new);
+            let (old_end, new_end) = (old.len() - tail, new.len() - tail);
+            let new_lines: Vec<&str> = new.split('\n').collect();
+            let mut out = vec![Vec::new(); new_lines.len()];
+            for &(col, depth) in brackets {
+                let at = old.char_indices().nth(col).unwrap().0;
+                if at >= head && at < old_end {
+                    continue;
+                }
+                let moved = if at < head {
+                    at
+                } else {
+                    at - old_end + new_end
+                };
+                let li = new[..moved].matches('\n').count();
+                let start = new[..moved].rfind('\n').map_or(0, |n| n + 1);
+                out[li].push((new[start..moved].chars().count(), depth));
+            }
+            out
+        }
+        let old = "é(a, [b]) → {c}";
+        let brackets = bracket_columns(old);
+        for new in [
+            "é(a, [b]) → {c}",
+            "Xé(a, [b]) → {c}",
+            "é(a,\n [b]) → {c}",
+            "é(a, [b])\n→\n{c}",
+            "é(a, b]) → {c}",
+            "é() → {c}",
+            "é(a, [b]) → {ç}",
+            "日本(a, [b]) → {c}",
+            "é(a, [b]) → {c}✓",
+            "",
+        ] {
+            let mut base = vec![String::from(old)];
+            let mut spans = vec![Vec::new()];
+            let mut carried = vec![brackets.clone()];
+            let lines: Vec<String> = new.split('\n').map(String::from).collect();
+            carry_highlights(&mut base, &mut spans, &mut carried, &lines);
+            assert_eq!(carried, counted(old, &brackets, new), "edit: {new:?}");
+        }
+    }
+
     #[test]
     fn carry_starts_clean_when_the_spans_do_not_describe_the_base() {
         // A non-text view resets `highlights` to one empty line without
@@ -30489,6 +30758,49 @@ mod tests {
             e.lines[0], "(foo",
             "no closer may be jammed into the following word"
         );
+    }
+
+    fn typed(text: &str) -> String {
+        let mut e = editor_with("");
+        for c in text.chars() {
+            e.insert_char(c);
+        }
+        e.lines[0].clone()
+    }
+
+    #[test]
+    fn a_bracket_typed_alone_inside_a_string_does_not_auto_close() {
+        // #1183: each row typed char by char comes out as VS Code has it.
+        for text in [
+            "print(\"(\")",
+            "x = \"[a\"",
+            "parts = line.split(\"[\")",
+            "smiley = ':-('",
+        ] {
+            assert_eq!(typed(text), text);
+        }
+    }
+
+    #[test]
+    fn openers_still_auto_close_before_spaces_closers_and_punctuation() {
+        for next in [")", "]", "}", ";", ",", ".", ":", "=", ">", " ", "\t"] {
+            let mut e = editor_with(next);
+            e.cursor_row = 0;
+            e.cursor_col = 0;
+            e.insert_char('(');
+            assert_eq!(e.lines[0], format!("(){next}"), "before {next:?}");
+        }
+    }
+
+    #[test]
+    fn openers_do_not_auto_close_before_a_quote_or_other_symbols() {
+        for next in ["\"", "'", "`", "-", "+", "$", "#"] {
+            let mut e = editor_with(next);
+            e.cursor_row = 0;
+            e.cursor_col = 0;
+            e.insert_char('[');
+            assert_eq!(e.lines[0], format!("[{next}"), "before {next:?}");
+        }
     }
 
     #[test]
