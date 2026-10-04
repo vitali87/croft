@@ -894,10 +894,12 @@ fn request_value(command: &str, arguments: Map<String, Value>) -> Value {
     })
 }
 
-/// Build the debugpy `launch`/`attach` request. `debug_venv_python` is the
-/// interpreter of croft's debug venv, used as the debuggee interpreter when
-/// the config doesn't name its own `python`.
-pub fn debugpy_request(rc: &ResolvedConfig, debug_venv_python: &Path) -> Value {
+/// Build the debugpy `launch`/`attach` request. `project_python` is the
+/// project's own interpreter (its venv's, as Run uses), which the program
+/// runs under when the config names no `python` (or legacy `pythonPath`):
+/// croft's debug venv only hosts the adapter, and debugpy injects itself
+/// into the debuggee, so the project needs no debugpy of its own (#864).
+pub fn debugpy_request(rc: &ResolvedConfig, project_python: &Path) -> Value {
     let mut args = base_arguments(rc);
     match rc.request {
         RequestKind::Launch => {
@@ -910,11 +912,9 @@ pub fn debugpy_request(rc: &ResolvedConfig, debug_venv_python: &Path) -> Value {
             if !rc.env.is_empty() {
                 args.insert("env".into(), json!(rc.env));
             }
-            if !args.contains_key("python") {
-                args.insert(
-                    "python".into(),
-                    json!([debug_venv_python.to_string_lossy()]),
-                );
+            // debugpy refuses a launch that names both spellings.
+            if !args.contains_key("python") && !args.contains_key("pythonPath") {
+                args.insert("python".into(), json!([project_python.to_string_lossy()]));
             }
             args.insert("console".into(), json!("internalConsole"));
             if !args.contains_key("justMyCode") {
@@ -1716,6 +1716,27 @@ mod tests {
         assert_eq!(req["command"], "attach");
         assert_eq!(req["arguments"]["connect"]["port"], 5678);
         assert_eq!(req["arguments"]["connect"]["host"], "127.0.0.1");
+    }
+
+    /// #864: the project interpreter is only the default. A config naming
+    /// its own `python` keeps it, and one using the legacy `pythonPath`
+    /// gets no `python` beside it, which debugpy would refuse.
+    #[test]
+    fn a_configs_own_python_wins_over_the_project_interpreter() {
+        let cfg = config(
+            r#"[{ "name": "P", "type": "python", "program": "a.py", "python": "/opt/py/bin/python" }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        let req = debugpy_request(&rc, Path::new("/proj/.venv/bin/python"));
+        assert_eq!(req["arguments"]["python"], "/opt/py/bin/python");
+
+        let cfg = config(
+            r#"[{ "name": "L", "type": "python", "program": "a.py", "pythonPath": "/opt/py/bin/python" }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        let req = debugpy_request(&rc, Path::new("/proj/.venv/bin/python"));
+        assert!(req["arguments"].get("python").is_none());
+        assert_eq!(req["arguments"]["pythonPath"], "/opt/py/bin/python");
     }
 
     #[test]

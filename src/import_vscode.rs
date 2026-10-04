@@ -198,6 +198,10 @@ const SETTINGS: &[SettingMap] = &[
 /// opens a different thing entirely.
 const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.save", "save_file"),
+    ("workbench.action.files.saveAll", "save_all"),
+    ("explorer.newFile", "new_file"),
+    ("explorer.newFolder", "new_folder"),
+    ("editor.action.selectAll", "select_all"),
     ("workbench.action.quickOpen", "quick_open"),
     ("workbench.action.gotoSymbol", "go_to_symbol"),
     ("workbench.action.showAllSymbols", "go_to_workspace_symbol"),
@@ -206,6 +210,19 @@ const COMMANDS: &[(&str, &str)] = &[
         "workbench.action.reopenClosedEditor",
         "reopen_closed_editor",
     ),
+    ("workbench.action.closeOtherEditors", "close_other_editors"),
+    (
+        "workbench.action.closeEditorsToTheRight",
+        "close_editors_to_the_right",
+    ),
+    (
+        "workbench.action.closeUnmodifiedEditors",
+        "close_saved_editors",
+    ),
+    ("workbench.action.closeAllEditors", "close_all_editors"),
+    ("workbench.action.pinEditor", "pin_editor"),
+    ("workbench.action.unpinEditor", "unpin_editor"),
+    ("workbench.action.keepEditor", "keep_editor"),
     ("workbench.action.splitEditor", "split_editor"),
     (
         "workbench.action.toggleSidebarVisibility",
@@ -220,7 +237,22 @@ const COMMANDS: &[(&str, &str)] = &[
         "toggle_terminal",
     ),
     ("workbench.action.terminal.new", "new_terminal"),
+    ("workbench.action.terminal.focus", "focus_terminal"),
+    ("workbench.actions.view.problems", "show_problems"),
     ("workbench.action.toggleZenMode", "toggle_zen_mode"),
+    (
+        "workbench.action.toggleActivityBarVisibility",
+        "toggle_activity_bar",
+    ),
+    (
+        "workbench.action.toggleStatusbarVisibility",
+        "toggle_status_bar",
+    ),
+    (
+        "workbench.action.toggleSidebarPosition",
+        "toggle_side_bar_position",
+    ),
+    ("workbench.action.customizeLayout", "customize_layout"),
     ("workbench.view.explorer", "show_explorer"),
     ("workbench.view.search", "show_search"),
     ("workbench.view.scm", "show_source_control"),
@@ -1162,6 +1194,63 @@ mod tests {
             "a chord croft cannot honour must be NAMED, not bound to something \
              that merely sounds similar"
         );
+    }
+
+    /// #852 (comment 3): VS Code's editor-tab commands import onto croft's
+    /// palette commands of the same name, and croft loads every row.
+    #[test]
+    fn the_editor_tab_commands_import_under_their_vscode_ids() {
+        let pairs = [
+            (
+                "ctrl+alt+1",
+                "workbench.action.closeOtherEditors",
+                "close_other_editors",
+            ),
+            (
+                "ctrl+alt+2",
+                "workbench.action.closeEditorsToTheRight",
+                "close_editors_to_the_right",
+            ),
+            (
+                "ctrl+alt+3",
+                "workbench.action.closeUnmodifiedEditors",
+                "close_saved_editors",
+            ),
+            (
+                "ctrl+alt+4",
+                "workbench.action.closeAllEditors",
+                "close_all_editors",
+            ),
+            ("ctrl+alt+5", "workbench.action.pinEditor", "pin_editor"),
+            ("ctrl+alt+6", "workbench.action.unpinEditor", "unpin_editor"),
+            ("ctrl+alt+7", "workbench.action.keepEditor", "keep_editor"),
+        ];
+        let doc = Value::Array(
+            pairs
+                .iter()
+                .map(|(key, vscode, _)| json!({ "key": key, "command": vscode }))
+                .collect(),
+        );
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert!(
+            report.dropped_keybindings.is_empty(),
+            "{:?}",
+            report.dropped_keybindings
+        );
+        let expected: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(key, _, croft)| (key.to_string(), croft.to_string()))
+            .collect();
+        assert_eq!(report.keybindings, expected);
+        let rows: Vec<Value> = report
+            .keybindings
+            .iter()
+            .map(|(key, command)| json!({ "key": key, "command": command }))
+            .collect();
+        let json = serde_json::to_string(&Value::Array(rows)).unwrap();
+        let (_keymap, warnings) = crate::keymap::Keymap::resolve(&json);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// Every croft command id in the table must actually exist. A typo here
