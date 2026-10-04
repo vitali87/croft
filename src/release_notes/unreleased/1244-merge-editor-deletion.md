@@ -1,0 +1,1 @@
+fix: In a modify/delete merge conflict, the merge editor labels the side that deleted the file (`INCOMING (theirs): deleted`), and Complete Merge after taking that side removes the file from the index and the disk instead of staging an empty one (#1244).

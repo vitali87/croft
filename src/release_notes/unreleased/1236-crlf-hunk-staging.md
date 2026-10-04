@@ -1,0 +1,1 @@
+fix: Staging a hunk of a file git stores with LF but checks out with CRLF (eol=crlf, core.autocrlf) stages LF as git add would, instead of a mixed-ending blob, and reverting such a hunk applies instead of failing.
