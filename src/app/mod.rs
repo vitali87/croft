@@ -3245,6 +3245,9 @@ pub struct App {
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
+    /// A database being downloaded or extracted (#1155): what is being
+    /// added, for the status line, and where its folder arrives.
+    codeql_db_job: Option<(String, std::sync::mpsc::Receiver<Result<PathBuf, String>>)>,
     /// A CodeQL document being made (#578: View CFG, the alert and result
     /// views): the file it writes or why not, and the status lines for
     /// each.
@@ -5627,6 +5630,7 @@ impl App {
             codeql_perf_compare: None,
             codeql_query_help: None,
             codeql_pack_job: None,
+            codeql_db_job: None,
             codeql_ast_job: None,
             codeql_doc_job: None,
             codeql_results_walk: None,
@@ -28547,37 +28551,90 @@ impl App {
         value: &str,
     ) {
         use crate::widgets::input_prompt::CodeqlDbSource;
-        let found: Result<PathBuf, String> = match source {
-            CodeqlDbSource::Folder => {
-                let dir = self.typed_path(value);
-                crate::codeql_db::find_database_in(&dir).ok_or_else(|| {
-                    format!(
+        if source == CodeqlDbSource::Folder {
+            let dir = self.typed_path(value);
+            match crate::codeql_db::find_database_in(&dir) {
+                Some(found) => self.register_codeql_database(&found),
+                None => {
+                    self.status = format!(
                         "{} is not a CodeQL database (no codeql-database.yml)",
                         dir.display()
+                    );
+                }
+            }
+            return;
+        }
+        // Downloads and extraction run on a worker (#1155): a database is
+        // commonly hundreds of megabytes, and inline the whole UI froze until
+        // it was on disk.
+        if let Some((what, _)) = &self.codeql_db_job {
+            self.status = format!("Still adding the CodeQL database {what}");
+            return;
+        }
+        let cache = Self::codeql_db_cache_dir();
+        let (what, job): (String, Box<dyn FnOnce() -> Result<PathBuf, String> + Send>) =
+            match source {
+                CodeqlDbSource::Archive => {
+                    let zip = self.typed_path(value);
+                    let stem = zip
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| String::from("database"));
+                    (
+                        zip.display().to_string(),
+                        Box::new(move || Self::extract_codeql_zip(&cache, &zip, &stem)),
                     )
-                })
-            }
-            CodeqlDbSource::Archive => {
-                let zip = self.typed_path(value);
-                let stem = zip
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| String::from("database"));
-                self.extract_codeql_zip(&zip, &stem)
-            }
-            CodeqlDbSource::Url => self.download_codeql_zip_from_url(value.trim()),
-            CodeqlDbSource::Github => self.download_codeql_db_from_github(value.trim()),
+                }
+                CodeqlDbSource::Url => {
+                    let url = value.trim().to_string();
+                    (
+                        url.clone(),
+                        Box::new(move || Self::download_codeql_zip_from_url(&cache, &url)),
+                    )
+                }
+                CodeqlDbSource::Github => {
+                    let repo = value.trim().to_string();
+                    let gh = self.gh_program.clone();
+                    (
+                        repo.clone(),
+                        Box::new(move || Self::download_codeql_db_from_github(&gh, &cache, &repo)),
+                    )
+                }
+                CodeqlDbSource::Folder => unreachable!("added above"),
+            };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.status = format!("Adding the CodeQL database {what}\u{2026}");
+        self.codeql_db_job = Some((what, rx));
+    }
+
+    /// Register a database that finished downloading or extracting (#1155).
+    pub fn drain_codeql_db_job(&mut self) -> bool {
+        let Some((what, rx)) = self.codeql_db_job.as_ref() else {
+            return false;
         };
-        let dir = match found {
-            Ok(d) => d,
-            Err(why) => {
-                self.status = why;
-                return;
-            }
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(format!(
+                "Adding the CodeQL database {what} stopped unexpectedly"
+            )),
         };
+        self.codeql_db_job = None;
+        match outcome {
+            Ok(dir) => self.register_codeql_database(&dir),
+            Err(why) => self.status = why,
+        }
+        true
+    }
+
+    /// Add a database folder to the saved list and make it current.
+    fn register_codeql_database(&mut self, dir: &std::path::Path) {
         let path = Self::codeql_db_store_path();
         let mut store = crate::codeql_db::DatabaseStore::load(&path);
-        match store.add(&dir) {
+        match store.add(dir) {
             Ok(i) => {
                 if let Err(e) = store.save(&path) {
                     self.status = format!("Could not save the database list: {e}");
@@ -28598,14 +28655,19 @@ impl App {
         }
     }
 
-    fn extract_codeql_zip(&self, zip: &std::path::Path, name: &str) -> Result<PathBuf, String> {
-        let dest = Self::codeql_db_cache_dir().join(name);
+    /// Unpack `zip` into `cache/<name>`. Runs on the add-database worker.
+    fn extract_codeql_zip(
+        cache: &std::path::Path,
+        zip: &std::path::Path,
+        name: &str,
+    ) -> Result<PathBuf, String> {
+        let dest = cache.join(name);
         crate::codeql_db::extract_zip(zip, &dest, None)?;
         crate::codeql_db::find_database_in(&dest)
             .ok_or_else(|| format!("{} holds no CodeQL database", zip.display()))
     }
 
-    fn download_codeql_zip_from_url(&self, url: &str) -> Result<PathBuf, String> {
+    fn download_codeql_zip_from_url(cache: &std::path::Path, url: &str) -> Result<PathBuf, String> {
         if !url.starts_with("https://") {
             return Err(String::from("A database URL must be https://"));
         }
@@ -28619,20 +28681,22 @@ impl App {
             .unwrap_or("database")
             .trim_end_matches(".zip")
             .to_string();
-        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
-        if let Some(dir) = tmp.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
+        let tmp = cache.join(format!("{name}.download.zip"));
+        std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
         let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         std::io::copy(&mut resp.into_reader(), &mut f).map_err(|e| e.to_string())?;
-        let out = self.extract_codeql_zip(&tmp, &name);
+        let out = Self::extract_codeql_zip(cache, &tmp, &name);
         let _ = std::fs::remove_file(&tmp);
         out
     }
 
     /// `owner/repo` or `owner/repo language`. With no language, the one
     /// database GitHub has is used; several need the language named.
-    fn download_codeql_db_from_github(&self, value: &str) -> Result<PathBuf, String> {
+    fn download_codeql_db_from_github(
+        gh: &std::path::Path,
+        cache: &std::path::Path,
+        value: &str,
+    ) -> Result<PathBuf, String> {
         let mut parts = value.split_whitespace();
         let repo = parts
             .next()
@@ -28648,7 +28712,7 @@ impl App {
         let language = match parts.next() {
             Some(l) => l.to_string(),
             None => {
-                let out = std::process::Command::new("gh")
+                let out = std::process::Command::new(gh)
                     .args([
                         "api",
                         &format!("/repos/{repo}/code-scanning/codeql/databases"),
@@ -28679,23 +28743,26 @@ impl App {
                 }
             }
         };
-        let out = std::process::Command::new("gh")
+        // Streamed straight to disk: a database can be larger than the
+        // memory croft should hold at once.
+        let name = format!("{}-{language}", repo.replace('/', "-"));
+        let tmp = cache.join(format!("{name}.download.zip"));
+        std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
+        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let out = std::process::Command::new(gh)
             .args(crate::codeql_db::github_database_args(&repo, &language))
+            .stdin(std::process::Stdio::null())
+            .stdout(file)
             .output()
             .map_err(|e| format!("could not run gh: {e}"))?;
         if !out.status.success() {
+            let _ = std::fs::remove_file(&tmp);
             return Err(format!(
                 "Download failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        let name = format!("{}-{language}", repo.replace('/', "-"));
-        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
-        if let Some(dir) = tmp.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&tmp, &out.stdout).map_err(|e| e.to_string())?;
-        let result = self.extract_codeql_zip(&tmp, &name);
+        let result = Self::extract_codeql_zip(cache, &tmp, &name);
         let _ = std::fs::remove_file(&tmp);
         result
     }
@@ -67532,6 +67599,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_perf_compare()
             | app.drain_codeql_query_help()
             | app.drain_codeql_pack_job()
+            | app.drain_codeql_db_job()
             | app.drain_codeql_cli_download()
             | app.drain_codeql_cli_check()
             | app.drain_codeql_code_search()

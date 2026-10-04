@@ -56750,6 +56750,137 @@ fn adding_a_codeql_database_from_a_folder_lists_and_persists_it() {
     });
 }
 
+/// Drain the database download or extraction in flight until it lands.
+fn wait_for_codeql_db_job(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(20),
+        "the CodeQL database job",
+        || {
+            app.drain_codeql_db_job();
+            app.codeql_db_job.is_none()
+        },
+    );
+}
+
+/// A one-database CodeQL zip (Java) at `dir/<name>.zip`.
+fn codeql_db_zip(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use std::io::Write as _;
+    let zp = dir.join(format!("{name}.zip"));
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&zp).unwrap());
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    z.start_file("python/codeql-database.yml", opts).unwrap();
+    z.write_all(b"primaryLanguage: \"python\"\n").unwrap();
+    z.finish().unwrap();
+    zp
+}
+
+/// A stand-in `gh`: lists one `python` database, and downloads `zip` once
+/// a `go` file appears in `dir` (or after five seconds), as a large
+/// database takes its time.
+fn slow_fake_gh(dir: &std::path::Path, zip: &std::path::Path) -> std::path::PathBuf {
+    let gh = dir.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *--jq*) echo python; exit 0;; esac\n\
+             i=0; while [ ! -f '{go}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done\n\
+             cat '{zip}'\n",
+            go = dir.join("go").display(),
+            zip = zip.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    gh
+}
+
+#[test]
+fn adding_a_codeql_database_from_github_returns_at_once_and_lands_later() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = codeql_db_zip(tmp.path(), "requests-db");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = slow_fake_gh(tmp.path(), &zip);
+        let started = std::time::Instant::now();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Github,
+            "psf/requests",
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the download held the UI for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            app.status,
+            "Adding the CodeQL database psf/requests\u{2026}"
+        );
+        assert!(app.codeql.databases.is_empty(), "not there yet");
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Github,
+            "pallets/flask",
+        );
+        assert_eq!(
+            app.status, "Still adding the CodeQL database psf/requests",
+            "one download at a time"
+        );
+        std::fs::write(tmp.path().join("go"), b"").unwrap();
+        wait_for_codeql_db_job(&mut app);
+        assert_eq!(app.status, "Added CodeQL database python (python)");
+        assert_eq!(app.codeql.databases.len(), 1);
+        let entry = &app.codeql.databases[0];
+        assert!(
+            entry.path.starts_with(home.path()),
+            "extracted under croft's cache: {}",
+            entry.path.display()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(App::codeql_db_cache_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".download.zip"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the download is removed once unpacked"
+        );
+    });
+}
+
+#[test]
+fn a_failed_github_download_says_why_and_adds_nothing() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = tmp.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho 'HTTP 404: Not Found' >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh;
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Github,
+            "psf/requests python",
+        );
+        wait_for_codeql_db_job(&mut app);
+        assert_eq!(app.status, "Download failed: HTTP 404: Not Found");
+        assert!(app.codeql.databases.is_empty());
+        let cache = App::codeql_db_cache_dir();
+        let left = std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "no partial download left in {}", cache.display());
+    });
+}
+
 #[test]
 fn adding_a_codeql_database_from_an_archive_extracts_it_first() {
     // The cache-dir override is process-global; serialize with the
@@ -56771,6 +56902,7 @@ fn adding_a_codeql_database_from_an_archive_extracts_it_first() {
             crate::widgets::input_prompt::CodeqlDbSource::Archive,
             &zp.display().to_string(),
         );
+        wait_for_codeql_db_job(&mut app);
         assert_eq!(app.codeql.databases.len(), 1, "{}", app.status);
         let entry = &app.codeql.databases[0];
         assert_eq!(entry.language.as_deref(), Some("java"));
