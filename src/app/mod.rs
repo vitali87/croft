@@ -49650,6 +49650,7 @@ impl App {
             return;
         }
         if self.editor_find.is_some() {
+            self.reselect_editor_find();
             return;
         }
         let opts = self.search.opts;
@@ -49672,14 +49673,10 @@ impl App {
                 String::from("Find: type to search, Enter next, Shift+Enter prev, Esc close");
             return;
         }
-        let initial = if !self.editor.selection_text().is_empty()
-            && !self.editor.selection_text().contains('\n')
-        {
-            self.editor.selection_text()
-        } else {
-            self.editor.word_before_cursor()
-        };
+        let initial = self.editor_find_seed();
         let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
+        // Selected, so what the user types next replaces the seed (#1278).
+        state.query_selected = !initial.is_empty();
         if !initial.is_empty() {
             state.set_match_count(
                 crate::widgets::editor_find::count_matches(&self.editor.lines, &initial, opts),
@@ -50817,9 +50814,112 @@ impl App {
         self.editor_find_set_query(new_q);
     }
 
+    /// What Ctrl+F puts in the find bar: a one-line selection, else the
+    /// whole word under the caret or just left of it (#1278; the half of
+    /// the word before the caret made typing build `loadOrsave`).
+    fn editor_find_seed(&self) -> String {
+        let selection = self.editor.selection_text();
+        if !selection.is_empty() && !selection.contains('\n') {
+            return selection;
+        }
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        self.editor
+            .word_string_at(row, col)
+            .or_else(|| {
+                col.checked_sub(1)
+                    .and_then(|c| self.editor.word_string_at(row, c))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Ctrl+F on an open find bar, as in VS Code: take a one-line selection
+    /// if there is one, focus the query and select it, so typing replaces it.
+    fn reselect_editor_find(&mut self) {
+        let selection = self.editor.selection_text();
+        if self.editor.diff.is_none() && !selection.is_empty() && !selection.contains('\n') {
+            self.editor_find_set_query(selection);
+        }
+        if let Some(s) = self.editor_find.as_mut() {
+            s.focus = crate::widgets::editor_find::FindField::Query;
+            s.query_selected = !s.query.is_empty();
+        }
+    }
+
     fn handle_editor_find_key(&mut self, key: KeyEvent) {
         if is_editor_replace_key(key) {
             self.open_editor_replace();
+            return;
+        }
+        if is_editor_find_key(key) {
+            self.reselect_editor_find();
+            return;
+        }
+        // A selected query (#1278) is replaced by what is typed or pasted
+        // and cleared by Backspace / Delete; any other editing or caret key
+        // drops the selection and then acts as usual.
+        let selected = !self.editor_find_replace_focused()
+            && self.editor_find.as_ref().is_some_and(|s| s.query_selected);
+        if selected {
+            let plain_char = matches!(key.code, KeyCode::Char(_))
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+            let paste = matches!(key.code, KeyCode::Char('v'))
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+            let keeps = matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::F(3) | KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc
+            ) || (matches!(key.code, KeyCode::Char('a'))
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER));
+            if let Some(s) = self.editor_find.as_mut()
+                && !keeps
+            {
+                s.query_selected = false;
+            }
+            if plain_char || paste || matches!(key.code, KeyCode::Backspace | KeyCode::Delete) {
+                self.editor_find_set_query(String::new());
+                if matches!(key.code, KeyCode::Backspace | KeyCode::Delete) {
+                    return;
+                }
+            }
+        }
+        let word_delete = key.code == KeyCode::Backspace
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if word_delete {
+            // The word before the end, with any spaces after it, as in a
+            // text field; a lone punctuation mark goes on its own.
+            self.editor_find_edit_focused(|s| {
+                let kept = s.trim_end().len();
+                let word_start = s[..kept]
+                    .char_indices()
+                    .rev()
+                    .find(|&(_, c)| !crate::widgets::editor::is_word_char(c))
+                    .map_or(0, |(i, c)| i + c.len_utf8());
+                let cut = if word_start == kept {
+                    s[..kept].char_indices().next_back().map_or(0, |(i, _)| i)
+                } else {
+                    word_start
+                };
+                s.truncate(cut);
+            });
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('a'))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
+            if let Some(s) = self.editor_find.as_mut()
+                && s.focus == crate::widgets::editor_find::FindField::Query
+            {
+                s.query_selected = !s.query.is_empty();
+            }
             return;
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);

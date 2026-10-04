@@ -11947,7 +11947,7 @@ fn char_byte(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 

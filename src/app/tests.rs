@@ -17349,8 +17349,12 @@ fn editor_find_pre_fills_the_query_from_word_under_cursor_on_open() {
         .unwrap();
     assert_eq!(
         app.editor_find.as_ref().unwrap().query,
-        "alpha",
-        "opening Cmd+F with the cursor mid-word must pre-fill the query with the identifier chars to the left of the cursor, matching VS Code"
+        "alphabet",
+        "opening Cmd+F with the cursor mid-word pre-fills the whole word under it, as VS Code does (#1278)"
+    );
+    assert!(
+        app.editor_find.as_ref().unwrap().query_selected,
+        "and selects it, so typing replaces it"
     );
 }
 
@@ -28442,7 +28446,9 @@ fn replace_chord_toggles_the_replace_row_on_an_open_find_bar() {
 fn tab_switches_focus_between_the_find_and_replace_fields() {
     use crate::widgets::editor_find::FindField;
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta");
+    // The caret opens off any word, so nothing is seeded and focus starts
+    // in the query row (a seeded query would start in the replace row).
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta");
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -28479,7 +28485,9 @@ fn tab_switches_focus_between_the_find_and_replace_fields() {
 #[test]
 fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta\ngamma alpha");
+    // The caret opens off any word, so nothing is seeded (#1278) and the
+    // query is typed.
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -28492,7 +28500,7 @@ fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        app.editor.lines[0], "x beta",
+        app.editor.lines[0], "- x beta",
         "the current match is replaced"
     );
     assert_eq!(
@@ -28505,13 +28513,15 @@ fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     );
     assert!(app.editor.dirty, "a replace dirties the buffer");
     assert!(app.editor.undo(), "the replace is undoable");
-    assert_eq!(app.editor.lines[0], "alpha beta");
+    assert_eq!(app.editor.lines[0], "- alpha beta");
 }
 
 #[test]
 fn replace_all_chord_replaces_every_match_in_one_undo_step() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta\ngamma alpha");
+    // The caret opens off any word, so nothing is seeded (#1278) and the
+    // query is typed.
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -28523,11 +28533,11 @@ fn replace_all_chord_replaces_every_match_in_one_undo_step() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SUPER))
         .unwrap();
-    assert_eq!(app.editor.lines[0], "x beta");
+    assert_eq!(app.editor.lines[0], "- x beta");
     assert_eq!(app.editor.lines[1], "gamma x");
     assert!(app.editor.dirty, "replace all dirties the buffer");
     assert!(app.editor.undo(), "replace all is one undo step");
-    assert_eq!(app.editor.lines[0], "alpha beta");
+    assert_eq!(app.editor.lines[0], "- alpha beta");
     assert_eq!(app.editor.lines[1], "gamma alpha");
 }
 
@@ -68658,4 +68668,101 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     );
     assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
     assert_eq!(app.status, "Tab is already kept open");
+}
+
+// ---- Find bar seeding selects the word under the caret (#1278) ----
+
+/// orders.py from the issue, open and focused, caret at `(row, col)`.
+fn find_seed_app(row: usize, col: usize) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("orders.py");
+    std::fs::write(
+        &f,
+        "def loadOrders(path):\n    return readRows(path)\n\n\ndef saveOrders(path, rows):\n    writeRows(path, rows)\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = col;
+    (app, tmp)
+}
+
+fn ctrl(c: char) -> KeyEvent {
+    key(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+fn type_str(app: &mut App, s: &str) {
+    for c in s.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+fn find_query(app: &App) -> String {
+    app.editor_find.as_ref().map(|s| s.query.clone()).unwrap()
+}
+
+#[test]
+fn find_seeds_the_whole_word_and_typing_replaces_it() {
+    // Caret after `def loadOr`, mid-word.
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "loadOrders");
+    type_str(&mut app, "save");
+    assert_eq!(find_query(&app), "save");
+    assert!(app.editor_find.as_ref().unwrap().match_count >= 1);
+}
+
+#[test]
+fn find_seeds_the_word_the_caret_just_left() {
+    // Caret right after `loadOrders`, where it sits after typing a word.
+    let (mut app, _tmp) = find_seed_app(0, 14);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "loadOrders");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(find_query(&app), "", "Backspace clears a selected seed");
+}
+
+#[test]
+fn ctrl_a_selects_the_query_and_ctrl_backspace_deletes_a_word() {
+    let (mut app, _tmp) = find_seed_app(2, 0);
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "write rows");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(find_query(&app), "write ");
+    app.handle_key(ctrl('a')).unwrap();
+    type_str(&mut app, "read");
+    assert_eq!(find_query(&app), "read");
+}
+
+#[test]
+fn ctrl_f_on_an_open_bar_selects_its_query_again() {
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "save");
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "write");
+    assert_eq!(find_query(&app), "write");
+}
+
+#[test]
+fn an_unseeded_or_deselected_query_still_appends() {
+    // Negative: with nothing to seed, typing appends as before; after a
+    // caret key the seed is no longer selected and typing extends it.
+    let (mut app, _tmp) = find_seed_app(2, 0);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "");
+    type_str(&mut app, "sa");
+    type_str(&mut app, "ve");
+    assert_eq!(find_query(&app), "save");
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    type_str(&mut app, "X");
+    assert_eq!(find_query(&app), "loadOrdersX");
 }
