@@ -12,7 +12,8 @@
 //! `LC_MESSAGES` or `LANG` (`de_DE.UTF-8` reads as `de`). Built-in
 //! catalogs ship in `assets/i18n/`; a file at `<config>/locales/<lang>.json`
 //! adds to or overrides one, which is also how a new language starts.
-//! `croft locale-template <lang>` prints every translatable string.
+//! `croft locale-template <lang>` prints every translatable string, and
+//! `--write` brings `locales/<lang>.json` up to date in place.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -155,9 +156,13 @@ pub fn active() -> bool {
 }
 
 /// A JSON template for translating into `lang`: every palette title plus the
-/// given extra strings, each mapped to its existing translation or `""`.
-pub fn template(lang: &str, extra: &[&str]) -> String {
+/// given extra strings and every key of the user's own file, each mapped to
+/// the user's translation, else the built-in one, else `""`.
+pub fn template(lang: &str, user_file: Option<&str>, extra: &[&str]) -> String {
     let catalog = catalog_for(lang, None);
+    let user: serde_json::Map<String, serde_json::Value> = user_file
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
     let mut keys: Vec<String> = crate::widgets::command_palette::ALL_COMMANDS
         .iter()
         .map(|c| c.title().to_string())
@@ -169,22 +174,74 @@ pub fn template(lang: &str, extra: &[&str]) -> String {
                 .iter()
                 .map(|(p, s, _)| format!("{p}{{}}{s}")),
         )
+        .chain(user.keys().cloned())
         .collect();
     keys.sort();
     keys.dedup();
     let map: serde_json::Map<String, serde_json::Value> = keys
         .into_iter()
         .map(|k| {
-            let v = catalog.lookup(&k);
-            let v = if v == k {
-                String::new()
-            } else {
-                v.into_owned()
+            let own = user
+                .get(&k)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty());
+            let v = match own {
+                Some(v) => v.to_string(),
+                None => {
+                    let v = catalog.lookup(&k);
+                    if v == k {
+                        String::new()
+                    } else {
+                        v.into_owned()
+                    }
+                }
             };
             (k, serde_json::Value::String(v))
         })
         .collect();
     serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default()
+}
+
+/// `croft locale-template <lang> --write` (#1148): bring the translation at
+/// `path` up to date in place, keeping every value already in it and adding
+/// the strings it lacks as `""`. A file that isn't a JSON object of strings
+/// is refused, never replaced. The new file goes to a sibling and is renamed
+/// over the old one, so a failed write leaves the old file whole. Returns
+/// how many strings the file holds and how many are still untranslated.
+pub fn write_template(path: &std::path::Path, lang: &str) -> std::io::Result<(usize, usize)> {
+    use std::io::{Error, ErrorKind};
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let existing = existing.filter(|t| !t.trim().is_empty());
+    if let Some(text) = &existing
+        && serde_json::from_str::<HashMap<String, String>>(text).is_err()
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "{} isn't a JSON object of strings; fix it or move it aside, then run this again",
+                path.display()
+            ),
+        ));
+    }
+    let text = template(lang, existing.as_deref(), &[]);
+    let map: HashMap<String, String> = serde_json::from_str(&text).unwrap_or_default();
+    let todo = map.values().filter(|v| v.is_empty()).count();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".croft-tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let written =
+        std::fs::write(&tmp, format!("{text}\n")).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.map(|()| (map.len(), todo))
 }
 
 #[cfg(test)]
@@ -261,7 +318,7 @@ mod tests {
 
     #[test]
     fn the_template_lists_palette_titles_with_known_translations_filled() {
-        let t = template("de", &["New File"]);
+        let t = template("de", None, &["New File"]);
         let map: HashMap<String, String> = serde_json::from_str(&t).unwrap();
         assert_eq!(map.get("New File").map(String::as_str), Some("Neue Datei"));
         assert!(map.contains_key("File: Save"));
