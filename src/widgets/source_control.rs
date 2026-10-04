@@ -1302,8 +1302,17 @@ impl Widget for &mut SourceControlPanel {
             } else {
                 Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
             };
-            buf.set_string(inner.x, y, msg.as_str(), style);
-            y += 2;
+            // Wrapped to the panel: a refusal ran on past its edge into the
+            // editor, which painted over it (#989).
+            let rows = wrap_feedback(msg, inner.width as usize, FEEDBACK_MAX_ROWS);
+            for row in &rows {
+                if y >= inner.y + inner.height {
+                    break;
+                }
+                buf.set_stringn(inner.x, y, row, inner.width as usize, style);
+                y += 1;
+            }
+            y += 1;
         }
 
         // Thin separator line.
@@ -1581,6 +1590,52 @@ impl Widget for &mut SourceControlPanel {
     }
 }
 
+/// Most rows a commit feedback message takes before it is cut with `…`.
+const FEEDBACK_MAX_ROWS: usize = 4;
+
+/// `msg` broken into rows of at most `width` columns, at spaces where it can
+/// be and mid-word where a word is wider than a row; at most `max_rows`,
+/// the last ending in `…` when the message runs longer.
+fn wrap_feedback(msg: &str, width: usize, max_rows: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr as _;
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in msg.split_whitespace() {
+        let gap = usize::from(!row.is_empty());
+        if row.width() + gap + word.width() <= width {
+            if gap == 1 {
+                row.push(' ');
+            }
+            row.push_str(word);
+            continue;
+        }
+        if !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+        }
+        for c in word.chars() {
+            if row.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > width {
+                rows.push(std::mem::take(&mut row));
+            }
+            row.push(c);
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
+        let last = &mut rows[max_rows - 1];
+        while last.width() + 1 > width {
+            last.pop();
+        }
+        last.push('…');
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1677,6 +1732,79 @@ mod tests {
         // Hit-test: a click on the pill registers, one column left of it does not.
         assert!(p.click_header_refresh(btn.x, btn.y));
         assert!(!p.click_header_refresh(btn.x.saturating_sub(2), btn.y));
+    }
+
+    #[test]
+    fn long_commit_feedback_wraps_inside_the_panel() {
+        // A refusal is only useful if it can be read: it ran on past the
+        // panel's edge into the editor, where the editor painted over it.
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.status.in_repo = true;
+        let msg = "Resolve 1 merge conflict (README.md) and stage it before committing";
+        p.commit_feedback = Some(String::from(msg));
+        p.commit_feedback_is_error = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(Rect { width: 80, ..area });
+        (&mut p).render(area, &mut buf);
+        let row = |y: u16, xs: std::ops::Range<u16>| -> String {
+            xs.map(|x| buf[(x, y)].symbol().to_string()).collect()
+        };
+        for y in 0..area.height {
+            assert_eq!(row(y, 32..80).trim(), "", "row {y} spills past the panel");
+        }
+        let words: Vec<String> = (0..area.height)
+            .flat_map(|y| {
+                row(y, 1..31)
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let text = words.join(" ");
+        assert!(text.contains(msg), "the whole message is on screen: {text}");
+    }
+
+    #[test]
+    fn feedback_wrapping_splits_long_words_and_caps_the_rows() {
+        assert_eq!(
+            wrap_feedback("abcdefghij kl", 4, 4),
+            vec!["abcd", "efgh", "ij", "kl"]
+        );
+        let rows = wrap_feedback(&"word ".repeat(40), 10, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[1].ends_with('…') && rows[1].chars().count() <= 10,
+            "{rows:?}"
+        );
+        assert!(wrap_feedback("anything", 0, 3).is_empty());
+    }
+
+    #[test]
+    fn short_commit_feedback_stays_on_one_line() {
+        // Negative: the usual one-line summary keeps its single row, so the
+        // change list below does not move down.
+        use ratatui::buffer::Buffer;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let list_top = |feedback: Option<&str>| {
+            let mut p = SourceControlPanel::new();
+            p.status.in_repo = true;
+            p.commit_feedback = feedback.map(String::from);
+            let mut buf = Buffer::empty(area);
+            (&mut p).render(area, &mut buf);
+            p.last_list_area.y
+        };
+        assert_eq!(list_top(Some("[main 548c72d] Merge")), list_top(Some("x")));
     }
 
     #[test]
