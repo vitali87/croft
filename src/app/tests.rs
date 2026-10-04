@@ -31835,6 +31835,144 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     );
 }
 
+/// A relay on a temp socket with `plan.txt` from #1147 beside it, plus an
+/// owner and a `--solo` guest that have both opened it and bootstrapped.
+fn collab_owner_and_guest_on_plan() -> (tempfile::TempDir, std::path::PathBuf, App, App) {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("plan.txt");
+    std::fs::write(&file, "Owner: alice\nDue: Friday").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket, crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    pump_apps_until(&mut [&mut owner, &mut guest], "bootstrap", |apps| {
+        apps[1]
+            .collab
+            .as_ref()
+            .is_some_and(|s| s.is_live("plan.txt"))
+    });
+    (tmp, file, owner, guest)
+}
+
+/// Poll every app's collab session until `done` holds (5s bound).
+fn pump_apps_until(apps: &mut [&mut App], what: &str, done: impl Fn(&[&mut App]) -> bool) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done(apps) {
+        assert!(Instant::now() < deadline, "never settled: {what}");
+        for app in apps.iter_mut() {
+            app.poll_collab();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The guest's edit to line 2 of `plan.txt`, typed and synced to the owner.
+fn guest_moves_the_due_date(owner: &mut App, guest: &mut App) {
+    guest.editor.cursor_row = 1;
+    guest.editor.cursor_col = "Due: Friday".len();
+    guest.editor.insert_str(" -> moved to Monday");
+    pump_apps_until(&mut [owner, guest], "the edit reaches the owner", |apps| {
+        apps[0]
+            .editor
+            .lines
+            .get(1)
+            .is_some_and(|l| l.ends_with("Monday"))
+    });
+}
+
+/// #1147: once the owner quits, the guest's Cmd+S writes the file instead
+/// of deferring to an owner that is gone.
+#[test]
+fn a_guest_saves_to_disk_once_the_owner_quits() {
+    use std::time::{Duration, Instant};
+    let (_tmp, file, mut owner, mut guest) = collab_owner_and_guest_on_plan();
+    guest_moves_the_due_date(&mut owner, &mut guest);
+    drop(owner);
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !guest.status.contains("owner left") {
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    guest.save();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "Owner: alice\nDue: Friday -> moved to Monday",
+        "{}",
+        guest.status
+    );
+}
+
+/// #1147: a new owner on the same relay gets the edits the stranded guest
+/// made after the first owner left, instead of the two forking.
+#[test]
+fn a_new_owner_receives_the_stranded_guests_edits() {
+    use std::time::{Duration, Instant};
+    let (tmp, file, mut owner, mut guest) = collab_owner_and_guest_on_plan();
+    guest_moves_the_due_date(&mut owner, &mut guest);
+    let socket = owner.collab_config.clone().unwrap().0;
+    drop(owner);
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !guest.status.contains("owner left") {
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    guest.editor.cursor_row = 0;
+    guest.editor.cursor_col = "Owner: alice".len();
+    guest.editor.insert_str(" and bob");
+    let mut owner2 = App::new(tmp.path().to_path_buf()).unwrap();
+    owner2.collab_config = Some((socket, crate::collab::CollabRole::Owner));
+    owner2.open_file_at_launch(&file);
+    pump_apps_until(
+        &mut [&mut owner2, &mut guest],
+        "the new owner converges",
+        |apps| {
+            apps[0].editor.lines == apps[1].editor.lines
+                && apps[0].editor.lines[0].ends_with("and bob")
+        },
+    );
+    assert_eq!(
+        guest.editor.lines,
+        vec!["Owner: alice and bob", "Due: Friday -> moved to Monday"]
+    );
+}
+
+/// While the owner is still there, a guest's save stays with the owner,
+/// however long the session runs between saves.
+#[test]
+fn a_guest_save_still_defers_to_an_owner_that_is_present() {
+    use std::time::{Duration, Instant};
+    let (_tmp, file, mut owner, mut guest) = collab_owner_and_guest_on_plan();
+    guest_moves_the_due_date(&mut owner, &mut guest);
+    let until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < until {
+        owner.poll_collab();
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    guest.save();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "Owner: alice\nDue: Friday"
+    );
+    assert!(guest.status.contains("owner saves"), "{}", guest.status);
+}
+
 /// Splitting (or reopening) a live shared file loads the DISK copy, which
 /// is stale by construction: a guest never writes shared files, so an
 /// unsaved session's work exists only in buffers and replicas. The stale

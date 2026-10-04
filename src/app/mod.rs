@@ -34561,6 +34561,29 @@ impl App {
                 CollabEvent::BootstrapTimedOut { file } => {
                     self.status = format!("{file}: no session owner answered; editing locally");
                 }
+                CollabEvent::OwnerLeft => {
+                    self.status = String::from("The session owner left; saves now write to disk");
+                }
+                CollabEvent::OwnerReturned { files } => {
+                    // The new owner starts from the file on disk, so that is
+                    // the merge base for this guest's work since the owner
+                    // left (#1147): only this side's changes replay, and any
+                    // the new owner already made survive.
+                    for file in files {
+                        match crate::collab::contained_path(&root, &file)
+                            .and_then(|p| std::fs::read_to_string(p).ok())
+                        {
+                            Some(disk) => {
+                                self.collab_offline_base
+                                    .insert(file, disk.replace("\r\n", "\n"));
+                            }
+                            None => {
+                                self.collab_offline_base.remove(&file);
+                            }
+                        }
+                    }
+                    self.status = String::from("The session owner is back; rejoining shared files");
+                }
                 CollabEvent::Caret {
                     file,
                     site,
@@ -55730,7 +55753,8 @@ impl App {
         // guest is its only author, and refusing meant the work could never
         // persist anywhere. Same when there is NO session at all (relay
         // link down, reconnect pending): with nobody to defer to, blocking
-        // strands the offline work in RAM for the whole outage.
+        // strands the offline work in RAM for the whole outage. And when
+        // the owner left (#1147): there is nobody to save for this guest.
         if self.is_collab_guest()
             && self
                 .editor
@@ -55740,7 +55764,7 @@ impl App {
                 .is_some_and(|file| {
                     self.collab
                         .as_ref()
-                        .is_some_and(|s| !s.is_local_only(&file))
+                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
                 })
         {
             self.status =
@@ -66990,6 +67014,9 @@ pub fn run(
     let mut terminal: CroftTerminal = Terminal::new(backend).context("create terminal")?;
 
     let result = main_loop(&mut app, &mut terminal);
+    // An owner's goodbye goes out now (#1147): the drop-to-local and
+    // self-update exits below never drop the App.
+    drop(app.collab.take());
 
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
