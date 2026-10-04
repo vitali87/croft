@@ -7973,7 +7973,7 @@ impl App {
             self.search.query.clone(),
             self.search.opts,
         ));
-        let term = if self.search.query.trim().is_empty() {
+        let term = if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             None
         } else {
             Some(self.search.query.clone())
@@ -22229,7 +22229,7 @@ impl App {
             self.status = String::from("Replace All is owner-only in a shared session");
             return;
         }
-        if self.search.query.trim().is_empty() {
+        if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             self.status = String::from("Replace All: enter a search term first");
             return;
         }
@@ -39808,7 +39808,7 @@ impl App {
                 // horizontally and the user lands on the match instead of the
                 // line's leftmost cell - which on a 200k-char line means
                 // never seeing the match without manual scrolling.
-                let needle = self.search.query.trim();
+                let needle = crate::widgets::search::as_typed(&self.search.query);
                 let opts = self.search.opts;
                 let line = self.editor.lines.get(row).cloned().unwrap_or_default();
                 // Locate the first match on the line: its start column and
