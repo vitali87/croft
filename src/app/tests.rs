@@ -68666,8 +68666,8 @@ fn app_in_a_conflicted_merge() -> (App, tempfile::TempDir) {
     let script = r#"set -e
 git init -q -b main && git config user.email a@b && git config user.name a
 printf '# Orders\n\nRun `python pricing.py`.\n' > README.md && git add . && git commit -qm init
-git checkout -qb hotfix && sed -i 's/python pricing.py/python -m pricing/' README.md && git commit -qam fix
-git checkout -q main && sed -i 's/python pricing.py/uv run pricing.py/' README.md && git commit -qam uv
+git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' README.md > README.tmp && mv README.tmp README.md && git commit -qam fix
+git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md > README.tmp && mv README.tmp README.md && git commit -qam uv
 ! git merge -q hotfix >/dev/null 2>&1"#;
     let out = std::process::Command::new("sh")
         .args(["-c", script])
