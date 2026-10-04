@@ -99,6 +99,10 @@ runs (Tasks: Run Task / Run Build Task):
   2`, `"column": 3`, plus `severity`/`message`/`code`/`loop`), an
   optional `base`, and `background.beginsPattern`/`endsPattern` (string
   or `{ "regexp": … }`).
+- A list (`["$tsc", "$eslint-stylish"]`) runs every matcher in it and
+  reports all their rows, so a compile-and-lint task shows both tools'
+  errors. A background matcher anywhere in the list makes it a watch
+  task. Entries that don't translate are skipped.
 - An unknown `$name` degrades to the built-in first-match-wins scan
   rather than erroring.
 

@@ -57,7 +57,8 @@ pub struct SearchHit {
     pub path: PathBuf,
     /// 1-indexed line number, the way humans / editors talk about lines.
     pub line_no: usize,
-    /// The matched line, with surrounding whitespace trimmed and length capped.
+    /// The matched line without its line break, length capped, and with
+    /// any indent before the first match trimmed.
     pub line_text: String,
 }
 
@@ -105,30 +106,63 @@ pub struct PathFilter {
     exclude: Option<GlobSet>,
 }
 
+/// The entries of a comma-separated glob list. Commas inside `{...}`
+/// belong to a brace alternate, so `*.{ts,tsx}, docs/**` is two entries
+/// (#1251).
+fn split_globs(raw: &str) -> impl Iterator<Item = &str> {
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for (i, c) in raw.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&raw[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&raw[start..]);
+    parts.into_iter().map(str::trim).filter(|p| !p.is_empty())
+}
+
+fn compile_glob(pat: &str) -> Option<Glob> {
+    // VS Code convention: a pattern without a path separator matches at
+    // any depth, so `*.rs` finds Rust files in every subdirectory.
+    let expanded = if pat.contains('/') {
+        pat.to_string()
+    } else {
+        format!("**/{pat}")
+    };
+    Glob::new(&expanded).ok()
+}
+
+/// The entries of a glob list that don't compile, for the panel to name.
+pub fn invalid_globs(raw: &str) -> Vec<&str> {
+    split_globs(raw)
+        .filter(|p| compile_glob(p).is_none())
+        .collect()
+}
+
 /// Build a `GlobSet` from a comma-separated glob list, returning `None` when
 /// the trimmed input is empty (meaning "no filter"). Invalid individual globs
-/// are skipped silently so one typo doesn't disable the whole filter.
-fn build_glob_set(raw: &str) -> Option<GlobSet> {
+/// are skipped so one typo doesn't disable the rest. When none compiles, an
+/// include list (`fail_closed`) yields an empty set that matches nothing, so
+/// a broken filter never widens a search or Replace All to every file.
+fn build_glob_set(raw: &str, fail_closed: bool) -> Option<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     let mut any = false;
-    for part in raw.split(',') {
-        let pat = part.trim();
-        if pat.is_empty() {
-            continue;
-        }
-        // VS Code convention: a pattern without a path separator matches at
-        // any depth, so `*.rs` finds Rust files in every subdirectory.
-        let expanded = if pat.contains('/') {
-            pat.to_string()
-        } else {
-            format!("**/{pat}")
-        };
-        if let Ok(g) = Glob::new(&expanded) {
+    let mut typed = false;
+    for pat in split_globs(raw) {
+        typed = true;
+        if let Some(g) = compile_glob(pat) {
             builder.add(g);
             any = true;
         }
     }
-    if !any {
+    if !any && !(typed && fail_closed) {
         return None;
     }
     builder.build().ok()
@@ -139,8 +173,8 @@ impl PathFilter {
     /// (or all-whitespace) string disables that side of the filter.
     pub fn new(include: &str, exclude: &str) -> Self {
         Self {
-            include: build_glob_set(include),
-            exclude: build_glob_set(exclude),
+            include: build_glob_set(include, true),
+            exclude: build_glob_set(exclude, false),
         }
     }
 
@@ -172,6 +206,7 @@ impl PathFilter {
 
 struct HitSink<'a> {
     path: PathBuf,
+    matcher: &'a RegexMatcher,
     batch: &'a mut Vec<SearchHit>,
     cancel: Option<Arc<AtomicBool>>,
 }
@@ -191,7 +226,15 @@ impl<'a> Sink for HitSink<'a> {
         let line_no = mat.line_number().unwrap_or(0) as usize;
         let line_str = std::str::from_utf8(mat.bytes()).unwrap_or("");
         let stripped = line_str.trim_end_matches(['\r', '\n']);
-        let trimmed = stripped.trim_start();
+        // The indent is trimmed only up to where the first match starts: a
+        // match that begins in it (a query starting with whitespace) would
+        // otherwise lose its highlight in the preview.
+        let indent = stripped.len() - stripped.trim_start().len();
+        let start = grep_matcher::Matcher::find(self.matcher, stripped.as_bytes())
+            .ok()
+            .flatten()
+            .map_or(indent, |m| m.start().min(indent));
+        let trimmed = stripped.get(start..).unwrap_or(stripped.trim_start());
         let cut = if trimmed.chars().count() > MAX_LINE_LEN {
             // Cut plainly, no trailing ellipsis marker (no ellipsis anywhere).
             trimmed.chars().take(MAX_LINE_LEN).collect()
@@ -205,6 +248,13 @@ impl<'a> Sink for HitSink<'a> {
         });
         Ok(true)
     }
+}
+
+/// The query as the user typed it (#1175): spaces and tabs are part of
+/// what's searched, so `return ` skips `returned`. Only a line break at
+/// either end, the usual leftover of a paste, is dropped.
+pub(crate) fn as_typed(query: &str) -> &str {
+    query.trim_matches(|c| c == '\r' || c == '\n')
 }
 
 /// Stream every match for `query` under `root` into `on_batch`, one batch
@@ -263,7 +313,7 @@ pub fn search_workspace_streaming_filtered<F>(
 ) where
     F: FnMut(Vec<SearchHit>) + Send + Clone,
 {
-    let q = query.trim();
+    let q = as_typed(query);
     if q.is_empty() {
         return;
     }
@@ -308,6 +358,7 @@ pub fn search_workspace_streaming_filtered<F>(
             {
                 let mut sink = HitSink {
                     path: path.to_path_buf(),
+                    matcher: &matcher,
                     batch: &mut batch,
                     cancel: Some(cancel.clone()),
                 };
@@ -596,7 +647,7 @@ pub fn search_worker_loop(
         let SearchRequest::Query(query, opts) = latest else {
             continue;
         };
-        if query.trim().is_empty() {
+        if as_typed(&query).is_empty() {
             if tx.send(SearchEvent::Done(query, opts)).is_err() {
                 return;
             }
@@ -681,7 +732,7 @@ pub fn collect_matches_in_text(
     opts: SearchOpts,
     out: &mut Vec<SearchHit>,
 ) {
-    let q = query.trim();
+    let q = as_typed(query);
     if q.is_empty() {
         return;
     }
@@ -690,6 +741,7 @@ pub fn collect_matches_in_text(
     };
     let mut sink = HitSink {
         path: path.to_path_buf(),
+        matcher: &matcher,
         batch: out,
         cancel: None,
     };
@@ -706,7 +758,7 @@ pub fn collect_matches_in_text(
 /// query is escaped so metacharacters are matched verbatim. Returns `None` for
 /// an empty query or an uncompilable pattern.
 fn build_replace_regex(query: &str, opts: SearchOpts) -> Option<regex::Regex> {
-    let q = query.trim();
+    let q = as_typed(query);
     if q.is_empty() {
         return None;
     }
@@ -843,7 +895,7 @@ pub fn replace_in_text(
     replacement: &str,
     opts: SearchOpts,
 ) -> Option<(String, usize)> {
-    let q = query.trim();
+    let q = as_typed(query);
     let matcher = build_matcher(q, opts)?;
     // The pattern itself, for `$1` expansion only. Not wrapped in anything:
     // a `(?x)` query's trailing `# comment` swallowed a closing `)$`.
@@ -1478,7 +1530,7 @@ impl SearchPanel {
     /// number of matches replaced across all files. The caller is responsible
     /// for re-running the query afterwards so the (now stale) hit list updates.
     pub fn replace_all_on_disk(&self) -> usize {
-        let needle = self.query.trim();
+        let needle = as_typed(&self.query);
         if needle.is_empty() {
             return 0;
         }
@@ -1498,7 +1550,7 @@ impl SearchPanel {
     /// Count what Replace All WOULD do — `(occurrences, files)` — without
     /// writing anything. Feeds the confirmation modal (#123).
     pub fn count_replacements(&self, skip: &HashSet<PathBuf>) -> (usize, usize) {
-        let needle = self.query.trim();
+        let needle = as_typed(&self.query);
         if needle.is_empty() {
             return (0, 0);
         }
@@ -1537,7 +1589,7 @@ impl SearchPanel {
         &self,
         skip: &HashSet<PathBuf>,
     ) -> (usize, Vec<PathBuf>, Vec<PathBuf>) {
-        let needle = self.query.trim();
+        let needle = as_typed(&self.query);
         if needle.is_empty() {
             return (0, Vec::new(), Vec::new());
         }
@@ -1721,6 +1773,31 @@ struct FieldArgs<'a> {
     /// row's toggles). The returned hit rect also stops short of them so a
     /// toggle click is not swallowed as a click-to-focus.
     reserve_right: u16,
+}
+
+/// A glob box's caption. An entry that doesn't compile replaces the label
+/// with its name in red, right above the box, so a typo can't silently
+/// change what the search covers (#1251).
+fn draw_glob_caption(
+    buf: &mut Buffer,
+    (x, y, right): (u16, u16, u16),
+    label: &str,
+    raw: &str,
+    style: Style,
+    theme: crate::theme::Theme,
+) {
+    let bad = invalid_globs(raw);
+    if bad.is_empty() {
+        buf.set_string(x, y, label, style);
+        return;
+    }
+    buf.set_stringn(
+        x,
+        y,
+        format!("invalid glob: {}", bad.join(", ")),
+        right.saturating_sub(x) as usize + 1,
+        Style::default().fg(theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))),
+    );
 }
 
 /// Render a single filled input row (VS Code's `input.background` model) and
@@ -2114,7 +2191,14 @@ impl Widget for &mut SearchPanel {
                 // separation so every input reads as its own row.
                 draw_field_divider(buf, bar_x, detail_fill_right, next_y, self.theme);
                 next_y += 1;
-                buf.set_string(bar_x, next_y, "files to include", caption_style);
+                draw_glob_caption(
+                    buf,
+                    (bar_x, next_y, detail_fill_right),
+                    "files to include",
+                    &self.include,
+                    caption_style,
+                    self.theme,
+                );
                 next_y += 1;
                 let inc_focused = self.focused && self.field == SearchField::Include;
                 self.include_input_rect = render_field(
@@ -2145,7 +2229,14 @@ impl Widget for &mut SearchPanel {
                 // Hairline before the exclude group, same as above.
                 draw_field_divider(buf, bar_x, detail_fill_right, next_y, self.theme);
                 next_y += 1;
-                buf.set_string(bar_x, next_y, "files to exclude", caption_style);
+                draw_glob_caption(
+                    buf,
+                    (bar_x, next_y, detail_fill_right),
+                    "files to exclude",
+                    &self.exclude,
+                    caption_style,
+                    self.theme,
+                );
                 next_y += 1;
                 let exc_focused = self.focused && self.field == SearchField::Exclude;
                 self.exclude_input_rect = render_field(
@@ -2190,7 +2281,7 @@ impl Widget for &mut SearchPanel {
         let results_start_y = caption_y + 1;
         // Record where results begin so scrolling / click mapping stay aligned.
         self.results_start_offset = results_start_y.saturating_sub(inner.y);
-        if caption_y < inner.y + inner.height && !self.query.trim().is_empty() {
+        if caption_y < inner.y + inner.height && !as_typed(&self.query).is_empty() {
             let count = self.hits.len();
             let header = format!("{count} match{}", if count == 1 { "" } else { "es" });
             let caption = Line::from(Span::styled(
@@ -2318,7 +2409,7 @@ impl Widget for &mut SearchPanel {
             } else {
                 Style::default().fg(self.theme.ui(Color::White))
             };
-            let needle = self.query.trim();
+            let needle = as_typed(&self.query);
             // High-contrast yellow background like ripgrep / VS Code's
             // editor.findMatchHighlightBackground. Different treatment when
             // the row is selected so the highlight stays readable against
@@ -2421,6 +2512,82 @@ mod tests {
         assert_eq!(out[0].line_text, "Hello World");
         assert_eq!(out[1].line_no, 3);
         assert_eq!(out[1].line_text, "HELLO again");
+    }
+
+    fn highlighted(hit: &SearchHit, query: &str, opts: SearchOpts) -> Vec<String> {
+        split_for_highlight(&hit.line_text, as_typed(query), opts)
+            .into_iter()
+            .filter(|(_, m)| *m)
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    #[test]
+    fn a_match_starting_in_the_indent_keeps_its_highlight() {
+        // The preview trimmed the indent a whitespace query matched in, so
+        // the result row showed no highlight at all.
+        for (content, query) in [
+            ("\tleading word\n", "\tleading"),
+            ("    spaced out\n", "  spaced"),
+            ("x\n      \n", "   "),
+        ] {
+            let mut out = Vec::new();
+            collect_matches_in_text(
+                Path::new("a.txt"),
+                content,
+                query,
+                SearchOpts::default(),
+                &mut out,
+            );
+            assert_eq!(out.len(), 1, "{query:?}");
+            assert_eq!(
+                highlighted(&out[0], query, SearchOpts::default()).first(),
+                Some(&as_typed(query).to_string()),
+                "{query:?} in {:?}",
+                out[0].line_text
+            );
+        }
+    }
+
+    #[test]
+    fn a_regex_match_starting_in_the_indent_keeps_its_highlight() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let mut out = Vec::new();
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "    foo()\n",
+            r"^\s+foo",
+            opts,
+            &mut out,
+        );
+        assert_eq!(highlighted(&out[0], r"^\s+foo", opts), ["    foo"]);
+    }
+
+    #[test]
+    fn the_indent_is_still_trimmed_when_the_match_starts_after_it() {
+        // Negative: a match past the indent keeps the compact preview.
+        let mut out = Vec::new();
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "        let x = 1;\n\t\tx  y\n",
+            "x",
+            SearchOpts::default(),
+            &mut out,
+        );
+        assert_eq!(out[0].line_text, "let x = 1;");
+        assert_eq!(out[1].line_text, "x  y");
+        let mut out = Vec::new();
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "\tif a  b {\n",
+            "  b",
+            SearchOpts::default(),
+            &mut out,
+        );
+        assert_eq!(out[0].line_text, "if a  b {");
     }
 
     #[test]
@@ -3574,6 +3741,83 @@ mod tests {
     }
 
     #[test]
+    fn path_filter_include_keeps_commas_inside_braces() {
+        // #1251: `*.{ts,tsx}` is one glob, not `*.{ts` and `tsx}`.
+        let f = PathFilter::new("*.{ts,tsx}", "");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/src/a.ts")));
+        assert!(f.allows(root, Path::new("/proj/src/b.tsx")));
+        assert!(!f.allows(root, Path::new("/proj/other/d.js")));
+        assert!(!f.allows(root, Path::new("/proj/README.md")));
+    }
+
+    #[test]
+    fn path_filter_include_brace_glob_mixes_with_plain_ones() {
+        let f = PathFilter::new("*.md, src/**/*.{js,jsx}", "");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/README.md")));
+        assert!(f.allows(root, Path::new("/proj/src/ui/app.jsx")));
+        assert!(!f.allows(root, Path::new("/proj/lib/app.jsx")));
+        assert!(!f.allows(root, Path::new("/proj/src/app.ts")));
+    }
+
+    #[test]
+    fn path_filter_include_with_no_valid_glob_allows_nothing() {
+        // A typed include that compiles to nothing must not widen the search
+        // (and Replace All) to every file.
+        let f = PathFilter::new("*.{ts", "");
+        let root = Path::new("/proj");
+        assert!(!f.allows(root, Path::new("/proj/src/a.ts")));
+        assert!(!f.allows(root, Path::new("/proj/README.md")));
+    }
+
+    #[test]
+    fn path_filter_exclude_keeps_commas_inside_braces() {
+        let f = PathFilter::new("", "*.{md,js}, target/**");
+        let root = Path::new("/proj");
+        assert!(!f.allows(root, Path::new("/proj/README.md")));
+        assert!(!f.allows(root, Path::new("/proj/other/d.js")));
+        assert!(!f.allows(root, Path::new("/proj/target/x.rs")));
+        assert!(f.allows(root, Path::new("/proj/src/a.ts")));
+    }
+
+    #[test]
+    fn path_filter_invalid_exclude_hides_nothing() {
+        // Negative: a broken exclude entry drops only itself.
+        let f = PathFilter::new("", "*.{md");
+        let root = Path::new("/proj");
+        assert!(f.allows(root, Path::new("/proj/README.md")));
+        assert!(f.allows(root, Path::new("/proj/src/a.ts")));
+    }
+
+    #[test]
+    fn an_invalid_include_glob_is_named_above_the_box() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.details_open = true;
+        panel.include = String::from("*.md, *.{ts");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 16,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("invalid glob: *.{ts"), "{text}");
+        assert!(text.contains("files to exclude\u{20}"), "{text}");
+    }
+
+    #[test]
     fn path_filter_exclude_drops_matching_files() {
         let f = PathFilter::new("", "*.lock");
         let root = Path::new("/proj");
@@ -3889,6 +4133,79 @@ mod tests {
         let n = replace_in_file(&p, "old", "new", SearchOpts::default()).unwrap();
         assert_eq!(n, 2);
         assert_eq!(fs::read_to_string(&p).unwrap(), "new value new\n");
+    }
+
+    /// #1175: the `srch` repro, a query with a trailing space.
+    fn srch_workspace() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("app.py"),
+            "def run(value):\n    returned = value\n    return value\n",
+        );
+        write(&tmp.path().join("calc.py"), "total = price  * qty\n");
+        tmp
+    }
+
+    /// #1175: a trailing space in the query is part of what's searched, so
+    /// `return ` doesn't match `returned`.
+    #[test]
+    fn a_trailing_space_in_the_query_is_searched_for() {
+        let tmp = srch_workspace();
+        let hits = search_workspace(tmp.path(), "return ", SearchOpts::default());
+        let lines: Vec<usize> = hits.iter().map(|h| h.line_no).collect();
+        assert_eq!(lines, vec![3]);
+    }
+
+    /// #1175: Replace All rewrites only what the query matched as typed.
+    #[test]
+    fn replace_all_keeps_the_spaces_typed_in_the_query() {
+        let tmp = srch_workspace();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = "return ".into();
+        panel.replace = "yield ".into();
+        panel.run_query();
+        assert_eq!(panel.count_replacements(&HashSet::new()), (1, 1));
+        assert_eq!(panel.replace_all_on_disk(), 1);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("app.py")).unwrap(),
+            "def run(value):\n    returned = value\n    yield value\n"
+        );
+        assert_eq!(
+            replace_in_text(
+                "returned\nreturn x\n",
+                "return ",
+                "yield ",
+                SearchOpts::default()
+            ),
+            Some((String::from("returned\nyield x\n"), 1))
+        );
+    }
+
+    /// #1175: a query of only spaces searches for those spaces.
+    #[test]
+    fn a_query_of_spaces_finds_runs_of_spaces() {
+        let tmp = srch_workspace();
+        let hits = search_workspace(tmp.path(), "  ", SearchOpts::default());
+        let mut files: Vec<String> = hits
+            .iter()
+            .map(|h| h.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        files.dedup();
+        assert_eq!(files, vec!["app.py", "calc.py"]);
+    }
+
+    /// An empty query still searches for nothing, and a query pasted with a
+    /// stray line break at the end still finds its text.
+    #[test]
+    fn an_empty_query_finds_nothing_and_a_pasted_newline_is_dropped() {
+        let tmp = srch_workspace();
+        assert!(search_workspace(tmp.path(), "", SearchOpts::default()).is_empty());
+        let hits = search_workspace(tmp.path(), "returned\n", SearchOpts::default());
+        assert_eq!(hits.len(), 1);
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.replace = "x".into();
+        assert_eq!(panel.replace_all_on_disk(), 0);
     }
 
     #[test]

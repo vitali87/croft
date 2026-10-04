@@ -1,0 +1,1 @@
+fix: A tasks.json `problemMatcher` list such as `["$gcc", "$eslint-stylish"]` runs every matcher in it, so a compile-and-lint task shows both tools' errors in PROBLEMS instead of only the first matcher's.

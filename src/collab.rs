@@ -534,6 +534,13 @@ pub enum CollabMsg {
     },
     /// A joiner asks the owner for every note in the workspace.
     NotesRequest {},
+    /// The owner's heartbeat (#1147), every [`OWNER_HEARTBEAT`]: guests that
+    /// stop hearing it for [`OWNER_GONE_AFTER`] treat the owner as gone.
+    /// Older peers drop the variant in `drain`, and a guest that never
+    /// heard one never decides an owner left.
+    OwnerHere {},
+    /// The owner is quitting (#1147): guests stop deferring saves to it.
+    OwnerLeft {},
 }
 
 impl CollabMsg {
@@ -824,6 +831,14 @@ const SNAPSHOT_RESEND: std::time::Duration = std::time::Duration::from_millis(50
 /// duplicate-snapshot spam.
 const SNAPSHOT_RESEND_CAP: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How often the owner announces it is still there ([`CollabMsg::OwnerHere`]).
+const OWNER_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a guest goes without the owner's heartbeat before treating the
+/// owner as gone (a crash; a clean quit says [`CollabMsg::OwnerLeft`]).
+/// Generous, so an owner busy for a few seconds isn't taken for gone.
+const OWNER_GONE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Per-file replication state on one participant.
 enum DocState {
     /// Guest waiting for the owner's [`CollabMsg::SnapshotReply`]. Ops for
@@ -888,6 +903,14 @@ pub enum CollabEvent {
     Note(crate::sticky_notes::Note),
     /// A joiner wants every note; the owner answers with [`Self::Note`]s.
     NotesRequested,
+    /// Guest: the owner quit or went silent (#1147). Every file that was
+    /// live is local-only now, so this guest saves it itself.
+    OwnerLeft,
+    /// Guest: an owner is back after [`Self::OwnerLeft`]. `files`, the ones
+    /// that went local-only then, are forgotten, so the app re-requests them
+    /// and they bootstrap from the new owner, merging the work done
+    /// meanwhile.
+    OwnerReturned { files: Vec<String> },
 }
 
 /// One participant's collab state machine: per-file replicated documents
@@ -911,6 +934,16 @@ pub struct CollabSession {
     /// peers can tag the ghost caret (site ids are per-file and carry no
     /// identity across files).
     name: String,
+    /// Owner: when the next [`CollabMsg::OwnerHere`] is due.
+    heartbeat_at: std::time::Instant,
+    /// Guest: when the owner's heartbeat was last heard; None until the
+    /// first one (an owner too old to send them is never taken for gone).
+    owner_seen: Option<std::time::Instant>,
+    /// Guest: the owner left and hasn't come back.
+    owner_gone: bool,
+    /// Guest: files that went local-only because the owner left, rejoined
+    /// when an owner comes back.
+    orphaned: std::collections::HashSet<String>,
 }
 
 impl CollabSession {
@@ -926,6 +959,24 @@ impl CollabSession {
             next_site: ((std::process::id() as u64) << 32) | (OWNER_SITE + 1),
             next_nonce: (std::process::id() as u64) << 32,
             name,
+            heartbeat_at: std::time::Instant::now(),
+            owner_seen: None,
+            owner_gone: false,
+            orphaned: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Guest: true while the owner is gone (quit, or silent for
+    /// [`OWNER_GONE_AFTER`]) and no owner has come back.
+    pub fn owner_gone(&self) -> bool {
+        self.owner_gone
+    }
+
+    /// Owner: tell the guests this owner is quitting, so they stop
+    /// deferring saves to it (#1147). A no-op for a guest.
+    pub fn leave(&mut self) {
+        if self.role == CollabRole::Owner && !self.channel.is_dead() {
+            self.channel.send(&CollabMsg::OwnerLeft {});
         }
     }
 
@@ -1245,10 +1296,38 @@ impl CollabSession {
                         events.push(CollabEvent::NotesRequested);
                     }
                 }
+                CollabMsg::OwnerHere {} if self.role == CollabRole::Guest => {
+                    self.owner_seen = Some(std::time::Instant::now());
+                    if std::mem::take(&mut self.owner_gone) {
+                        let files: Vec<String> = self
+                            .orphaned
+                            .drain()
+                            .filter(|f| matches!(self.docs.get(f), Some(DocState::LocalOnly)))
+                            .collect();
+                        for file in &files {
+                            self.docs.remove(file);
+                        }
+                        events.push(CollabEvent::OwnerReturned { files });
+                    }
+                }
+                CollabMsg::OwnerLeft {} if self.role == CollabRole::Guest => {
+                    self.orphan_live_files(&mut events);
+                }
+                CollabMsg::OwnerHere {} | CollabMsg::OwnerLeft {} => {}
             }
         }
-        // Give up on bootstraps nobody answered (no owner running).
         let now = std::time::Instant::now();
+        if self.role == CollabRole::Owner && now >= self.heartbeat_at {
+            self.heartbeat_at = now + OWNER_HEARTBEAT;
+            self.channel.send(&CollabMsg::OwnerHere {});
+        }
+        if self
+            .owner_seen
+            .is_some_and(|seen| now.duration_since(seen) > OWNER_GONE_AFTER)
+        {
+            self.orphan_live_files(&mut events);
+        }
+        // Give up on bootstraps nobody answered (no owner running).
         let timed_out: Vec<String> = self
             .docs
             .iter()
@@ -1287,6 +1366,29 @@ impl CollabSession {
                 .send(&CollabMsg::SnapshotRequest { file, nonce });
         }
         events
+    }
+
+    /// Guest: the owner is gone (#1147). Every live file goes local-only,
+    /// so the app's save gate stands down and this guest writes it.
+    fn orphan_live_files(&mut self, events: &mut Vec<CollabEvent>) {
+        self.owner_seen = None;
+        if self.owner_gone {
+            return;
+        }
+        self.owner_gone = true;
+        for (file, _) in self.live_texts() {
+            self.docs.insert(file.clone(), DocState::LocalOnly);
+            self.orphaned.insert(file);
+        }
+        events.push(CollabEvent::OwnerLeft);
+    }
+}
+
+impl Drop for CollabSession {
+    /// An owner says goodbye however it goes away (#1147), so its guests
+    /// stop deferring saves to it at once.
+    fn drop(&mut self) {
+        self.leave();
     }
 }
 
@@ -1967,6 +2069,61 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         (oe, ge)
+    }
+
+    /// #1147: an owner that stops heartbeating (a crash, no goodbye) is
+    /// taken for gone once [`OWNER_GONE_AFTER`] lapses, and the guest's live
+    /// files go local-only so it can save them.
+    #[test]
+    fn a_silent_owner_is_taken_for_gone_after_the_heartbeat_lapses() {
+        let (_dir, mut owner, mut guest) = session_pair();
+        guest.request_file("plan.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(guest.is_live("plan.txt") && guest.owner_seen.is_some()) {
+            assert!(std::time::Instant::now() < deadline, "never bootstrapped");
+            owner.poll(|_| Some("Due: Friday".to_string()));
+            guest.poll(|_| None);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        guest.owner_seen = Some(std::time::Instant::now() - OWNER_GONE_AFTER * 2);
+        let events = guest.poll(|_| None);
+        assert!(events.iter().any(|e| matches!(e, CollabEvent::OwnerLeft)));
+        assert!(guest.owner_gone() && guest.is_local_only("plan.txt"));
+        // Its heartbeat coming back rejoins the file.
+        let (_, ge) = pump(&mut owner, &mut guest, "Due: Friday", |_, ge| {
+            ge.iter()
+                .any(|e| matches!(e, CollabEvent::OwnerReturned { .. }))
+        });
+        assert!(ge.iter().any(|e| matches!(
+            e,
+            CollabEvent::OwnerReturned { files } if files == &vec!["plan.txt".to_string()]
+        )));
+        assert!(!guest.owner_gone() && !guest.is_local_only("plan.txt"));
+    }
+
+    /// A guest that never heard a heartbeat (an owner too old to send one)
+    /// never decides the owner left, and an owner's own session never does.
+    #[test]
+    fn no_heartbeat_heard_means_no_owner_left() {
+        let (_dir, mut owner, mut guest) = session_pair();
+        guest.request_file("plan.txt");
+        // Bootstrap with the owner answering but its heartbeat dropped.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !guest.is_live("plan.txt") {
+            assert!(std::time::Instant::now() < deadline);
+            owner.heartbeat_at = std::time::Instant::now() + OWNER_GONE_AFTER * 4;
+            owner.poll(|_| Some("Due: Friday".to_string()));
+            guest.poll(|_| None);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(guest.owner_seen.is_none());
+        for _ in 0..20 {
+            let ev = guest.poll(|_| None);
+            assert!(!ev.iter().any(|e| matches!(e, CollabEvent::OwnerLeft)));
+            let ev = owner.poll(|_| None);
+            assert!(!ev.iter().any(|e| matches!(e, CollabEvent::OwnerLeft)));
+        }
+        assert!(!guest.owner_gone() && guest.is_live("plan.txt"));
     }
 
     /// The full slice-4 handshake headlessly: a guest bootstraps a file from
