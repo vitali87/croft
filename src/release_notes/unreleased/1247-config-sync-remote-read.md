@@ -1,0 +1,1 @@
+fix: Config sync reads the remote's copies again, so `croft sync-config`, the connect-time push and the mid-session re-push leave a file edited on the remote alone instead of overwriting it, and `--diff` shows the remote's real contents; a read that comes back empty now counts as unknown, never as "absent there" (#1247).

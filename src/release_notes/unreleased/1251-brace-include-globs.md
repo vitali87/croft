@@ -1,0 +1,1 @@
+fix: Search's files to include and files to exclude accept brace globs such as `*.{ts,tsx}`, an include box whose globs all fail to compile matches nothing instead of every file, and any glob that doesn't compile is named in red above its box ("invalid glob: …"), so Replace All can't reach files the filter was meant to leave out (#1251).
