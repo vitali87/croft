@@ -2022,6 +2022,51 @@ pub fn unstage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
     run_mutation(root, &args).map(|_| ())
 }
 
+/// Whether `rel_path` is a submodule: a gitlink (mode `160000`) in the
+/// index or in HEAD (#1235). Porcelain status lists one as a plain path, so
+/// a Changes row cannot tell on its own, and a gitlink has no blob for
+/// `git show HEAD:<path>` and nothing for `git checkout -- <path>` to do.
+pub fn is_submodule(root: &Path, rel_path: &str) -> bool {
+    let gitlink = |args: &[&str]| {
+        run_git(root, args).is_ok_and(|out| out.lines().any(|l| l.starts_with("160000 ")))
+    };
+    gitlink(&["--literal-pathspecs", "ls-files", "--stage", "--", rel_path])
+        || gitlink(&["--literal-pathspecs", "ls-tree", "HEAD", "--", rel_path])
+}
+
+/// What changed in submodule `rel_path` since HEAD, as `git diff` reports a
+/// submodule: the commits it moved across (`--submodule=log`), then its
+/// own changes, staged or not (`--submodule=diff`), with paths inside it.
+pub fn submodule_diff(root: &Path, rel_path: &str) -> Result<String, String> {
+    let diff = |mode: &str| {
+        run_git(
+            root,
+            &[
+                "-c",
+                "color.ui=never",
+                "--literal-pathspecs",
+                "diff",
+                mode,
+                "HEAD",
+                "--",
+                rel_path,
+            ],
+        )
+        .map_err(|e| e.to_string())
+    };
+    let log = diff("--submodule=log")?;
+    let content: String = diff("--submodule=diff")?
+        .lines()
+        .filter(|l| !l.starts_with("Submodule "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    Ok(if content.is_empty() {
+        log
+    } else {
+        format!("{log}\n{content}")
+    })
+}
+
 /// Discard a single path. A Changes row restores the working tree from the
 /// INDEX (`git checkout -- <path>`), so a staged part of the same file is
 /// kept, as VS Code does; restoring from HEAD threw the staged work away
@@ -2052,6 +2097,14 @@ pub fn discard_path(
                 .map_err(|e| format!("failed to remove {}: {e}", abs.display()))
         }
     } else {
+        // `git checkout -- <submodule>` exits 0 and changes nothing, which
+        // reported "Discarded" over a submodule still on its new commit
+        // with its edits intact (#1235). Say so instead.
+        if is_submodule(root, rel_path) {
+            return Err(format!(
+                "{rel_path} is a submodule; open it to discard its changes"
+            ));
+        }
         let path_str = root
             .to_str()
             .ok_or_else(|| "non-utf8 workspace path".to_string())?;

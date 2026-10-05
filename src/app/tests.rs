@@ -70420,3 +70420,124 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
+
+/// `app/` with a submodule `lib` whose checked-out commit moved past the
+/// recorded one and whose working tree is dirty, plus a tracked `a.txt`.
+fn repo_with_moved_dirty_submodule() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let lib = tmp.path().join("libsrc");
+    let app = tmp.path().join("app");
+    for dir in [&lib, &app] {
+        std::fs::create_dir_all(dir).unwrap();
+        git_ok(dir, &["init", "-q", "-b", "main"]);
+        git_ok(dir, &["config", "user.email", "a@b"]);
+        git_ok(dir, &["config", "user.name", "a"]);
+    }
+    std::fs::write(lib.join("lib.txt"), "v1\n").unwrap();
+    git_ok(&lib, &["add", "."]);
+    git_ok(&lib, &["commit", "-qm", "l1"]);
+    std::fs::write(app.join("a.txt"), "one\n").unwrap();
+    git_ok(
+        &app,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            "../libsrc",
+            "lib",
+        ],
+    );
+    git_ok(&app, &["add", "."]);
+    git_ok(&app, &["commit", "-qm", "app1"]);
+    let inner = app.join("lib");
+    git_ok(&inner, &["config", "user.email", "a@b"]);
+    git_ok(&inner, &["config", "user.name", "a"]);
+    std::fs::write(inner.join("lib.txt"), "v2\n").unwrap();
+    git_ok(&inner, &["commit", "-qam", "l2"]);
+    std::fs::write(inner.join("lib.txt"), "v2\ndirty\n").unwrap();
+    (tmp, app)
+}
+
+/// Clicking a changed submodule shows what moved in it, the commit range
+/// and its own changes, instead of "git show HEAD failed: bad object"
+/// (#1235).
+#[test]
+fn clicking_a_changed_submodule_shows_its_diff() {
+    let (_tmp, root) = repo_with_moved_dirty_submodule();
+    let mut app = App::new(root.clone()).unwrap();
+    app.source_control.entries = vec![crate::git::ChangeEntry {
+        path: "lib".into(),
+        kind: crate::git::ChangeKind::Modified,
+        ..Default::default()
+    }];
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.open_source_control_entry(0);
+    assert!(!app.status.contains("failed"), "status: {}", app.status);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(std::path::Path::new("lib (submodule)"))
+    );
+    let text = app.editor.lines.join("\n");
+    assert!(text.starts_with("Submodule lib "), "{text}");
+    assert!(text.contains("> l2"), "the commit it moved to: {text}");
+    assert!(
+        text.contains("+dirty"),
+        "and its uncommitted change: {text}"
+    );
+}
+
+/// Discard on a submodule changes nothing, so it must not report
+/// "Discarded": it refuses and says why, leaving the submodule as it was.
+#[test]
+fn discarding_a_submodule_refuses_instead_of_claiming_success() {
+    let (_tmp, root) = repo_with_moved_dirty_submodule();
+    let inner_head = git_out(&root.join("lib"), &["rev-parse", "HEAD"]);
+    let mut app = App::new(root.clone()).unwrap();
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: "lib".into(),
+        untracked: false,
+        staged: false,
+    });
+    app.confirm_pending_discard();
+    assert!(
+        !app.status.starts_with("Discarded"),
+        "status: {}",
+        app.status
+    );
+    assert!(app.status.contains("submodule"), "status: {}", app.status);
+    assert_eq!(
+        git_out(&root.join("lib"), &["rev-parse", "HEAD"]),
+        inner_head
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("lib/lib.txt")).unwrap(),
+        "v2\ndirty\n"
+    );
+}
+
+/// Negative: in the same repository a plain file still discards, and a
+/// staged submodule (`git add lib`, which records the new commit) is a
+/// submodule all the same.
+#[test]
+fn a_plain_file_beside_a_submodule_still_discards() {
+    let (_tmp, root) = repo_with_moved_dirty_submodule();
+    std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: "a.txt".into(),
+        untracked: false,
+        staged: false,
+    });
+    app.confirm_pending_discard();
+    assert_eq!(app.status, "Discarded a.txt");
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "one\n"
+    );
+
+    git_ok(&root, &["add", "lib"]);
+    let err = crate::git::discard_path(&root, "lib", false, true).unwrap_err();
+    assert!(err.contains("submodule"), "{err}");
+}
