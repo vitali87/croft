@@ -10140,17 +10140,57 @@ impl App {
     /// terminal-control tool, and runs THAT against the user's source. The
     /// `--no-install` flag turns a missing compiler into an error, which is
     /// the honest outcome.
-    fn project_check_command(root: &Path) -> Option<(std::ffi::OsString, Vec<&'static str>)> {
-        if !root.join("tsconfig.json").is_file() {
-            return None;
-        }
+    ///
+    /// A solution-style root tsconfig (`"files": []` plus `references`, the
+    /// layout Vite's TypeScript templates and most monorepos use) compiles
+    /// nothing on its own: plain `tsc --noEmit` exits 0 having checked no
+    /// file, which read as a clean project (#1291). Each referenced project
+    /// is checked instead, `tsc -p <ref> --noEmit`, which writes nothing (no
+    /// `.tsbuildinfo`, unlike `tsc -b`). A root that names no files and no
+    /// references is `ProjectCheck::Empty`, never run and never "clean".
+    fn project_check_command(root: &Path) -> Option<ProjectCheck> {
+        let text = std::fs::read_to_string(root.join("tsconfig.json")).ok()?;
+        let config: serde_json::Value =
+            serde_json::from_str(&crate::tasks::strip_jsonc(&text)).unwrap_or_default();
+        let references: Vec<String> = config
+            .get("references")
+            .and_then(|r| r.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.get("path")?.as_str().map(String::from))
+            .collect();
+        let names_no_files = config
+            .get("files")
+            .and_then(|f| f.as_array())
+            .is_some_and(|f| f.is_empty())
+            && config.get("include").is_none()
+            // An `extends` base may supply the files.
+            && config.get("extends").is_none();
+        let runs: Vec<Vec<String>> = if references.is_empty() {
+            if names_no_files {
+                return Some(ProjectCheck::Empty);
+            }
+            vec![vec![String::from("--noEmit")]]
+        } else {
+            references
+                .into_iter()
+                .map(|r| vec![String::from("-p"), r, String::from("--noEmit")])
+                .collect()
+        };
         let local = root.join("node_modules").join(".bin").join("tsc");
-        if local.is_file() {
-            return Some((local.into_os_string(), vec!["--noEmit"]));
-        }
-        Some((
-            std::ffi::OsString::from("npx"),
-            vec!["--no-install", "tsc", "--noEmit"],
+        let (program, prefix): (std::ffi::OsString, &[&str]) = if local.is_file() {
+            (local.into_os_string(), &[])
+        } else {
+            (std::ffi::OsString::from("npx"), &["--no-install", "tsc"])
+        };
+        Some(ProjectCheck::Run(
+            runs.into_iter()
+                .map(|args| {
+                    let mut all: Vec<String> = prefix.iter().map(|a| a.to_string()).collect();
+                    all.extend(args);
+                    (program.clone(), all)
+                })
+                .collect(),
         ))
     }
 
@@ -49157,10 +49197,14 @@ impl App {
                             "No whole-project checker for this workspace (expected tsconfig.json)",
                         );
                     }
+                    Some(ProjectCheck::Empty) => {
+                        self.status =
+                            String::from("Whole-project check: tsconfig.json includes no files");
+                    }
                     Some(_) if self.project_check_running => {
                         self.status = String::from("A whole-project check is already running");
                     }
-                    Some((program, args)) => {
+                    Some(ProjectCheck::Run(runs)) => {
                         // Off the main loop: tsc on a large project takes tens
                         // of seconds, and running it inline froze input and
                         // redraw for the duration - the "Checking..." status
@@ -49198,12 +49242,35 @@ impl App {
                             }
                             // .output(), never .status(): the checker must not
                             // inherit croft's TTY, or its diagnostics spray
-                            // over the UI.
-                            let done = std::process::Command::new(&program)
-                                .args(&args)
-                                .current_dir(&root_for_thread)
-                                .output();
-                            let _ = tx.send((root_for_thread, done));
+                            // over the UI. One run per referenced project,
+                            // merged: both streams concatenated, and the
+                            // last failing status kept, so one failing
+                            // project fails the sweep.
+                            let mut done: Option<std::io::Result<std::process::Output>> = None;
+                            for (program, args) in runs {
+                                let out = std::process::Command::new(&program)
+                                    .args(&args)
+                                    .current_dir(&root_for_thread)
+                                    .output();
+                                done = Some(match (done, out) {
+                                    (Some(Ok(mut acc)), Ok(o)) => {
+                                        acc.stdout.extend(o.stdout);
+                                        acc.stderr.extend(o.stderr);
+                                        if !o.status.success() {
+                                            acc.status = o.status;
+                                        }
+                                        Ok(acc)
+                                    }
+                                    (Some(Err(e)), _) | (_, Err(e)) => Err(e),
+                                    (None, Ok(o)) => Ok(o),
+                                });
+                                if matches!(done, Some(Err(_))) {
+                                    break;
+                                }
+                            }
+                            if let Some(done) = done {
+                                let _ = tx.send((root_for_thread, done));
+                            }
                         });
                         self.project_check_running = true;
                         self.status = String::from("Checking the whole project...");
@@ -64034,6 +64101,15 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
     // never swallowed); on Termux Ctrl is the command key, and this predicate
     // only runs while the Explorer is focused, so there is no suspend to clash.
     has_cmd(key.modifiers)
+}
+
+/// What Problems: Check Whole Project runs (#256, #1291).
+enum ProjectCheck {
+    /// Each `(program, args)` in turn, with their output merged.
+    Run(Vec<(std::ffi::OsString, Vec<String>)>),
+    /// The root tsconfig names no files and no references: tsc would
+    /// compile nothing and exit clean.
+    Empty,
 }
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".

@@ -1,0 +1,1 @@
+fix: Problems: Check Whole Project checks every project a solution-style tsconfig.json references (`"files": []` plus `references`, as Vite's TypeScript templates write), instead of compiling nothing and reporting "no problems"; a tsconfig that names no files says so.
