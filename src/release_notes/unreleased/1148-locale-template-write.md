@@ -1,0 +1,1 @@
+fix: `croft locale-template <lang> --write` updates `locales/<lang>.json` in place, keeping every translation already in it and adding the new strings, and refuses a file it cannot read rather than replacing it. The printed template carries your own translations too, and the docs no longer tell you to redirect it onto the file, which emptied a translation in progress.
