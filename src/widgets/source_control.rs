@@ -158,6 +158,9 @@ pub struct SourceControlPanel {
     /// render, like `message_scroll`, to keep the caret's line visible.
     pub message_line_scroll: usize,
     pub status: GitStatus,
+    /// The prepared merge message last put in the box (#1282), to tell an
+    /// untouched seed from the user's own text.
+    seeded_message: Option<String>,
     pub entries: Vec<ChangeEntry>,
     /// The multi-root repositories overview (#161), pushed by the App per
     /// frame from its per-folder git workers. Length below two hides the
@@ -253,6 +256,7 @@ impl SourceControlPanel {
             message_scroll: 0,
             message_line_scroll: 0,
             status: GitStatus::default(),
+            seeded_message: None,
             entries: Vec::new(),
             repositories: Vec::new(),
             repo_row_areas: Vec::new(),
@@ -326,6 +330,7 @@ impl SourceControlPanel {
 
     pub fn set_status(&mut self, status: GitStatus, entries: Vec<ChangeEntry>) {
         self.status = status;
+        self.seed_prepared_message();
         self.entries = entries;
         // A change set refresh can re-order entries; clear stale selection
         // state rather than risk pointing it at the wrong file.
@@ -484,6 +489,37 @@ impl SourceControlPanel {
 
     pub fn end(&mut self) {
         self.message_cursor = self.message.chars().count();
+    }
+
+    /// Fill an empty box with the subject of git's prepared message
+    /// (#1282), so finishing a merge commits `Merge branch 'other'` rather
+    /// than "Empty commit message". Text the user typed, or edited from the
+    /// seed, is never replaced; a seed the user cleared is not put back;
+    /// and an untouched seed goes once the merge is committed or aborted.
+    pub fn seed_prepared_message(&mut self) {
+        let subject = self
+            .status
+            .prepared_message
+            .as_deref()
+            .map(|m| m.lines().next().unwrap_or("").trim().to_string());
+        match subject {
+            Some(subject) => {
+                if self.message.is_empty()
+                    && !subject.is_empty()
+                    && self.seeded_message.as_deref() != Some(subject.as_str())
+                {
+                    self.insert_str(&subject);
+                    self.seeded_message = Some(subject);
+                }
+            }
+            None => {
+                if let Some(seed) = self.seeded_message.take()
+                    && self.message == seed
+                {
+                    self.clear_message();
+                }
+            }
+        }
     }
 
     pub fn clear_message(&mut self) {
@@ -1899,6 +1935,7 @@ mod tests {
             dirty: false,
             repo_root: None,
             changed_count: 0,
+            prepared_message: None,
         }
     }
 
@@ -2787,6 +2824,69 @@ mod tests {
             "a click inside the second row maps to its folder"
         );
         assert_eq!(p.click_repository(rect.x + 2, rect.y + 10), None);
+    }
+
+    fn merging(message: Option<&str>) -> GitStatus {
+        GitStatus {
+            prepared_message: message.map(String::from),
+            ..dummy_status_with_branch("main")
+        }
+    }
+
+    /// A merge in progress fills the empty box with git's message (#1282),
+    /// caret at its end, and the box empties again once the merge is over.
+    #[test]
+    fn a_merge_in_progress_fills_an_empty_message_box() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(merging(Some("Merge branch 'other'")), Vec::new());
+        assert_eq!(p.message, "Merge branch 'other'");
+        assert_eq!(p.message_cursor, p.message.chars().count());
+        p.set_status(merging(None), Vec::new());
+        assert_eq!(p.message, "", "the merge was committed or aborted");
+    }
+
+    /// Only the subject line goes in while the box is one line.
+    #[test]
+    fn a_prepared_message_with_a_body_fills_its_subject() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            merging(Some("Revert \"x\"\n\nThis reverts commit abc.")),
+            Vec::new(),
+        );
+        assert_eq!(p.message, "Revert \"x\"");
+    }
+
+    #[test]
+    fn a_prepared_message_never_replaces_typed_text() {
+        // Negative: what the user typed stays, during and after the merge.
+        let mut p = SourceControlPanel::new();
+        p.insert_str("my own words");
+        p.set_status(merging(Some("Merge branch 'other'")), Vec::new());
+        assert_eq!(p.message, "my own words");
+        p.set_status(merging(None), Vec::new());
+        assert_eq!(p.message, "my own words");
+        // An edited seed is the user's text too.
+        let mut p = SourceControlPanel::new();
+        p.set_status(merging(Some("Merge branch 'other'")), Vec::new());
+        p.insert_str(" into main");
+        p.set_status(merging(None), Vec::new());
+        assert_eq!(p.message, "Merge branch 'other' into main");
+    }
+
+    #[test]
+    fn a_cleared_seed_is_not_refilled_on_the_next_refresh() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(merging(Some("Merge branch 'other'")), Vec::new());
+        p.clear_message();
+        p.set_status(merging(Some("Merge branch 'other'")), Vec::new());
+        assert_eq!(p.message, "", "the user emptied it on purpose");
+    }
+
+    #[test]
+    fn no_merge_leaves_an_empty_box_empty() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(merging(None), Vec::new());
+        assert_eq!(p.message, "");
     }
 
     #[test]
