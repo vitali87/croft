@@ -38,6 +38,11 @@ pub struct GitStatus {
     /// entry list which only the active repo fetches (#161: the
     /// repositories overview and the cross-repo badge read this).
     pub changed_count: usize,
+    /// The message git prepared for the commit in progress (#1282): a
+    /// conflicted merge, cherry-pick or revert writes `MERGE_MSG`, a
+    /// `merge --squash` writes `SQUASH_MSG`. Comment lines are dropped, as
+    /// `commit.cleanup=strip` would. `None` when neither file is there.
+    pub prepared_message: Option<String>,
 }
 
 pub fn query(root: &Path) -> GitStatus {
@@ -82,7 +87,37 @@ pub fn query(root: &Path) -> GitStatus {
         ignored: Arc::new(query_ignored(root)),
         repo_root: Some(repo_root),
         changed_count,
+        prepared_message: prepared_message(root),
     }
+}
+
+/// git's prepared message for the commit in progress (#1282): `MERGE_MSG`
+/// (a conflicted merge, cherry-pick or revert), else `SQUASH_MSG`, found
+/// through `--git-path` so a worktree or submodule reads its own. Comment
+/// lines are dropped as `commit.cleanup=strip` drops them; nothing left
+/// is no message.
+fn prepared_message(root: &Path) -> Option<String> {
+    let paths = run_git(
+        root,
+        &[
+            "rev-parse",
+            "--git-path",
+            "MERGE_MSG",
+            "--git-path",
+            "SQUASH_MSG",
+        ],
+    )
+    .ok()?;
+    paths.lines().find_map(|p| {
+        let text = std::fs::read_to_string(root.join(p.trim())).ok()?;
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(str::trim_end)
+            .collect();
+        let message = kept.join("\n").trim().to_string();
+        (!message.is_empty()).then_some(message)
+    })
 }
 
 /// The git-ignored paths under `root`, absolute.
@@ -698,6 +733,41 @@ fn count_lines_in_file(root: &Path, rel_path: &str) -> usize {
     lines
 }
 
+/// The clean/smudge filter `rel_path` goes through (`lfs` for a Git LFS
+/// file), from `git check-attr filter`. `None` when no filter applies.
+pub fn path_filter(root: &Path, rel_path: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-attr", "filter", "--", rel_path])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let value = text.trim_end().rsplit(": ").next()?;
+    match value {
+        "" => None,
+        // check-attr prints these states and the same-named values alike
+        // (`filter` and `filter=set` both read `set`): only a configured
+        // driver makes one a filter.
+        "unspecified" | "unset" | "set" if !filter_driver_configured(root, value) => None,
+        name => Some(name.to_string()),
+    }
+}
+
+/// Whether git config defines a `filter.<name>` driver.
+fn filter_driver_configured(root: &Path, name: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get-regexp"])
+        .arg(format!(
+            r"^filter\.{}\.(clean|smudge|process)$",
+            regex::escape(name)
+        ))
+        .output()
+        .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
+}
+
 /// Result of an attempted commit. `Ok(summary)` carries git's stdout/stderr
 /// summary (e.g. "[main 4a5b6c7] message"); `Err` carries git's error
 /// Read the HEAD-committed contents of `rel_path` (workspace-relative)
@@ -711,8 +781,17 @@ pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> 
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let spec = format!("HEAD:{rel_path}");
+    // A filtered file (Git LFS) is stored in its clean form, a pointer, while
+    // the working tree holds the smudged content: read HEAD through the
+    // filter so the diff compares like with like (#1238).
+    let read = match path_filter(root, rel_path) {
+        Some(_) => ["cat-file", "--filters"],
+        None => ["show", ""],
+    };
     let output = Command::new("git")
-        .args(["-C", path_str, "show", &spec])
+        .args(["-C", path_str])
+        .args(read.iter().filter(|a| !a.is_empty()))
+        .arg(&spec)
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     if !output.status.success() {
@@ -914,6 +993,27 @@ pub fn apply_patch(
     // one target only: staging writes the index (HEAD's numbering), a revert
     // writes the working tree (its own). With the other number, a file with
     // repeated context took the patch at the wrong place.
+    // `git apply` patches a file in git's clean form: `--cached` writes the
+    // result into the index as it is, skipping the clean filter `git add`
+    // runs, so a hunk of an LFS file put the raw content into git where a
+    // pointer belongs; on the working tree the patch is matched against the
+    // cleaned text (the pointer) and never applies (#1238).
+    let paths = patch.lines().filter_map(|l| {
+        l.strip_prefix("+++ b/")
+            .or_else(|| l.strip_prefix("--- a/"))
+    });
+    for rel in paths {
+        if let Some(filter) = path_filter(root, rel) {
+            let whole = match (cached, reverse) {
+                (true, false) => "stage",
+                (true, true) => "unstage",
+                _ => "discard",
+            };
+            return Err(format!(
+                "{rel} uses the {filter} filter: {whole} the whole file, not a part"
+            ));
+        }
+    }
     let retargeted = match (cached, reverse) {
         (true, false) => retarget_hunk_starts(patch, HunkSide::Old),
         (false, true) => retarget_hunk_starts(patch, HunkSide::New),
@@ -3826,6 +3926,44 @@ mod tests {
         );
     }
 
+    /// git's prepared message for a conflicted merge (#1282), comments
+    /// dropped, and a squash's when there is no merge message.
+    #[test]
+    fn a_merge_in_progress_carries_gits_prepared_message() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        assert_eq!(query(p).prepared_message, None, "no merge, no message");
+        std::fs::write(
+            p.join(".git/SQUASH_MSG"),
+            "Squashed commit of the following:\n\ncommit abc\n",
+        )
+        .unwrap();
+        assert_eq!(
+            query(p).prepared_message.as_deref(),
+            Some("Squashed commit of the following:\n\ncommit abc")
+        );
+        std::fs::write(
+            p.join(".git/MERGE_MSG"),
+            "Merge branch 'other'\n\n# Conflicts:\n#\tf.txt\n",
+        )
+        .unwrap();
+        assert_eq!(
+            query(p).prepared_message.as_deref(),
+            Some("Merge branch 'other'")
+        );
+    }
+
+    #[test]
+    fn a_prepared_message_of_only_comments_is_none() {
+        // Negative: nothing left after stripping is no message.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join(".git/MERGE_MSG"), "# Conflicts:\n#\tf.txt\n\n").unwrap();
+        assert_eq!(query(p).prepared_message, None);
+    }
+
     #[test]
     fn query_from_a_subdir_carries_the_repo_root_and_counts_untracked_lines() {
         let tmp = TempDir::new().unwrap();
@@ -4806,5 +4944,176 @@ filename seed.txt
             summary.to_lowercase().contains("up to date") || summary.is_empty(),
             "an up-to-date pull reports no new work (got: {summary:?})"
         );
+    }
+
+    /// A repo whose `*.txt` files go through a rot13 clean/smudge filter: the
+    /// index and HEAD hold rot13 text, the working tree plain text, the way
+    /// Git LFS keeps a pointer in git and the real file on disk (#1238).
+    fn filtered_repo(root: &Path) {
+        filtered_repo_with(root, "rot13");
+    }
+
+    /// [`filtered_repo`] with the driver configured under `name`.
+    fn filtered_repo_with(root: &Path, name: &str) {
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            )
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        let rot13 = "tr A-Za-z N-ZA-Mn-za-m";
+        run(&["config", &format!("filter.{name}.clean"), rot13]);
+        run(&["config", &format!("filter.{name}.smudge"), rot13]);
+        std::fs::write(
+            root.join(".gitattributes"),
+            format!("*.txt filter={name}\n"),
+        )
+        .unwrap();
+        let body: String = (1..=12).map(|i| format!("row {i}\n")).collect();
+        std::fs::write(root.join("data.txt"), &body).unwrap();
+        std::fs::write(root.join("notes.md"), &body).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        let edit = |name: &str| {
+            let text = std::fs::read_to_string(root.join(name)).unwrap();
+            std::fs::write(root.join(name), text.replace("row 5\n", "row FIVE\n")).unwrap();
+        };
+        edit("data.txt");
+        edit("notes.md");
+    }
+
+    fn head_vs_work_patch(root: &Path, rel: &str) -> String {
+        let head = read_file_at_head(root, rel).unwrap();
+        let work = std::fs::read_to_string(root.join(rel)).unwrap();
+        let diff = crate::widgets::diff::DiffData::build(
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+            head.lines().map(str::to_string).collect(),
+            work.lines().map(str::to_string).collect(),
+        );
+        diff.hunk_patch(rel, diff.hunk_range_at(0).unwrap())
+    }
+
+    #[test]
+    fn a_filtered_files_head_side_is_what_the_filter_checks_out() {
+        let tmp = TempDir::new().unwrap();
+        filtered_repo(tmp.path());
+        assert_eq!(
+            sh_git(tmp.path(), &["show", "HEAD:data.txt"])
+                .lines()
+                .next(),
+            Some("ebj 1"),
+            "sanity: git stores the cleaned form"
+        );
+        let head = read_file_at_head(tmp.path(), "data.txt").unwrap();
+        assert_eq!(
+            head.lines().next(),
+            Some("row 1"),
+            "the diff compares like with like"
+        );
+        let patch = head_vs_work_patch(tmp.path(), "data.txt");
+        assert_eq!(
+            patch
+                .lines()
+                .filter(|l| l.starts_with(['-', '+'])
+                    && !l.starts_with("---")
+                    && !l.starts_with("+++"))
+                .collect::<Vec<_>>(),
+            vec!["-row 5", "+row FIVE"],
+            "a one-line edit is a one-line change: {patch}"
+        );
+    }
+
+    #[test]
+    fn staging_a_hunk_of_a_filtered_file_is_refused_and_leaves_the_index() {
+        let tmp = TempDir::new().unwrap();
+        filtered_repo(tmp.path());
+        let before = sh_git(tmp.path(), &["show", ":data.txt"]);
+        let patch = head_vs_work_patch(tmp.path(), "data.txt");
+        let err = apply_patch(tmp.path(), &patch, true, false).unwrap_err();
+        assert_eq!(
+            err,
+            "data.txt uses the rot13 filter: stage the whole file, not a part"
+        );
+        assert_eq!(
+            sh_git(tmp.path(), &["show", ":data.txt"]),
+            before,
+            "index untouched"
+        );
+        let err = apply_patch(tmp.path(), &patch, true, true).unwrap_err();
+        assert!(
+            err.contains("unstage the whole file"),
+            "unstaging is refused too: {err}"
+        );
+    }
+
+    #[test]
+    fn reverting_a_hunk_of_a_filtered_file_says_why_it_cannot() {
+        let tmp = TempDir::new().unwrap();
+        filtered_repo(tmp.path());
+        let patch = head_vs_work_patch(tmp.path(), "data.txt");
+        let err = apply_patch(tmp.path(), &patch, false, true).unwrap_err();
+        assert_eq!(
+            err,
+            "data.txt uses the rot13 filter: discard the whole file, not a part"
+        );
+        let work = std::fs::read_to_string(tmp.path().join("data.txt")).unwrap();
+        assert!(
+            work.contains("row FIVE\n"),
+            "the working file is untouched: {work}"
+        );
+    }
+
+    #[test]
+    fn a_driver_named_like_a_check_attr_state_is_still_a_filter() {
+        // `git check-attr` prints `filter: set` both for a bare `filter` and
+        // for `filter=set`; the configured driver tells them apart.
+        for name in ["set", "unset", "unspecified"] {
+            let tmp = TempDir::new().unwrap();
+            filtered_repo_with(tmp.path(), name);
+            assert_eq!(path_filter(tmp.path(), "data.txt").as_deref(), Some(name));
+            let head = read_file_at_head(tmp.path(), "data.txt").unwrap();
+            assert_eq!(head.lines().next(), Some("row 1"), "{name}");
+            let patch = head_vs_work_patch(tmp.path(), "data.txt");
+            let err = apply_patch(tmp.path(), &patch, true, false).unwrap_err();
+            assert!(err.contains(&format!("the {name} filter")), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_bare_or_unset_filter_attribute_names_no_filter() {
+        // Negative: with no driver behind them these are not filters.
+        let tmp = TempDir::new().unwrap();
+        filtered_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".gitattributes"),
+            "*.txt filter=rot13\nbare.md filter\noff.md -filter\n",
+        )
+        .unwrap();
+        assert_eq!(path_filter(tmp.path(), "bare.md"), None);
+        assert_eq!(path_filter(tmp.path(), "off.md"), None);
+        assert_eq!(path_filter(tmp.path(), "notes.md"), None);
+        assert_eq!(
+            path_filter(tmp.path(), "data.txt").as_deref(),
+            Some("rot13")
+        );
+    }
+
+    #[test]
+    fn an_unfiltered_file_beside_a_filtered_one_still_stages_a_hunk() {
+        let tmp = TempDir::new().unwrap();
+        filtered_repo(tmp.path());
+        let patch = head_vs_work_patch(tmp.path(), "notes.md");
+        apply_patch(tmp.path(), &patch, true, false).unwrap();
+        assert!(sh_git(tmp.path(), &["diff", "--cached"]).contains("+row FIVE"));
     }
 }

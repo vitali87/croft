@@ -22511,15 +22511,20 @@ impl App {
         // everywhere, which is what keeps the sidebar reachable from the
         // terminal; only the Ctrl form is released, matching iTerm2 and
         // Ghostty, which reserve Cmd and pass Ctrl through.
-        let terminal_owns_ctrl_b = self.focus == Pane::Terminal
+        //
+        // Ctrl+Q follows the same rule (#1290): it is vim's visual block,
+        // nano's search backwards and the shell's XON, and quitting from
+        // inside one of them killed the app, the shell and every unsaved
+        // tab. Quit keeps Ctrl+Q from every other pane.
+        let terminal_owns_ctrl = self.focus == Pane::Terminal
             && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal)
             && key.modifiers == KeyModifiers::CONTROL;
-        if is_sidebar_toggle_key(key) && !terminal_owns_ctrl_b {
+        if is_sidebar_toggle_key(key) && !terminal_owns_ctrl {
             self.toggle_side_bar();
             return Ok(());
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) if !terminal_owns_ctrl => {
                 self.quit = true;
                 return Ok(());
             }
@@ -43102,11 +43107,12 @@ impl App {
             self.copy_terminal_selection();
             return;
         }
-        // Cmd+V / Ctrl+V / Ctrl+Shift+V: paste local clipboard into the
-        // embedded shell. Without this, raw Ctrl+V bytes (\x16) just go
-        // through to the shell unchanged, and Cmd+V — when not eaten by
-        // the host terminal's menu shortcut — would do nothing useful.
-        if is_clipboard_paste_key(key) {
+        // Cmd+V / Ctrl+Shift+V: paste local clipboard into the embedded
+        // shell; Cmd+V, when not eaten by the host terminal's menu
+        // shortcut, would otherwise do nothing useful. Plain Ctrl+V is the
+        // app's (#1290): vim's visual block and nano's page down need the
+        // 0x16 byte, as in VS Code's terminal on Linux.
+        if is_clipboard_paste_key(key) && !is_plain_ctrl_v(key) {
             self.paste_clipboard_into_terminal();
             return;
         }
@@ -43242,7 +43248,7 @@ impl App {
     }
 
     /// Paste the host clipboard into the terminal: the chord (Cmd+V /
-    /// Ctrl+V / Ctrl+Shift+V) and the pane menu's "Paste" both land here, so
+    /// Ctrl+Shift+V) and the pane menu's "Paste" both land here, so
     /// bracketed paste, broadcast fan-out and the remote-clipboard fallback
     /// behave identically whichever one the user reached for.
     ///
@@ -65363,6 +65369,16 @@ fn is_clipboard_paste_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Ctrl+V with no other modifier (or its raw 0x16 form), which the
+/// terminal hands to the app rather than pasting (#1290).
+fn is_plain_ctrl_v(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('\u{16}') => true,
+        KeyCode::Char(c) => c.eq_ignore_ascii_case(&'v') && key.modifiers == KeyModifiers::CONTROL,
+        _ => false,
+    }
 }
 
 fn is_search_editing_shortcut(key: KeyEvent) -> bool {
