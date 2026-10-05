@@ -432,7 +432,12 @@ fn versioned_on_path(bin: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
             else {
                 continue;
             };
-            let full = entry.path();
+            // A relative PATH entry resolves against croft's cwd now; the
+            // server is spawned from the workspace root, so hand it an
+            // absolute path.
+            let Ok(full) = std::path::absolute(entry.path()) else {
+                continue;
+            };
             if crate::lsp::manager::is_executable_file(&full)
                 && best.as_ref().is_none_or(|(k, _)| key > *k)
             {
@@ -2099,6 +2104,24 @@ mod tests {
             versioned_on_path("clangd", &path),
             Some(b.path().join("clangd-18.1"))
         );
+    }
+
+    /// A relative PATH entry still yields an absolute path, so the server
+    /// launches from the workspace root, not croft's cwd.
+    #[test]
+    fn a_versioned_binary_on_a_relative_path_entry_is_returned_absolute() {
+        let a = tempfile::tempdir().unwrap();
+        put_exe(a.path(), "clangd-18", true);
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.push(a.path().strip_prefix("/").unwrap());
+        assert!(rel.is_relative());
+        let found = versioned_on_path("clangd", rel.as_os_str()).unwrap();
+        assert!(found.is_absolute(), "{found:?}");
+        assert!(found.ends_with("clangd-18"), "{found:?}");
     }
 
     /// Negative: a different tool that shares the prefix (`clangd-tidy`,
