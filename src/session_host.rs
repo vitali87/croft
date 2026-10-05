@@ -432,6 +432,13 @@ struct HandoffFds {
     child_pid: u32,
 }
 
+/// This process's SIGPIPE action, read without changing it.
+fn sigpipe_action() -> Option<libc::sigaction> {
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a null `act` only reads the current action into `old`.
+    (unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut old) } == 0).then_some(old)
+}
+
 fn set_cloexec(fd: std::os::fd::RawFd, on: bool) -> Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     anyhow::ensure!(flags != -1, "F_GETFD({fd}) failed");
@@ -506,9 +513,17 @@ fn swap_to_new_image(host: &Host, exe: &Path, handoff: &HandoffFds) -> anyhow::E
         .env(RESUME_CHILD_ENV, handoff.child_pid.to_string())
         .env(RESUME_TOKEN_ENV, &host.token);
     use std::os::unix::process::CommandExt;
+    // `exec` puts SIGPIPE back to its default for the new image before it
+    // calls execve, and a failed exec leaves it there: this host would then
+    // die of its next write to a client that hung up.
+    let sigpipe = sigpipe_action();
     // exec never returns on success; on failure re-arm CLOEXEC so a later
     // unrelated spawn cannot leak the session fds.
     let err = anyhow::Error::from(cmd.exec()).context("exec of updated binary");
+    if let Some(action) = sigpipe {
+        // SAFETY: reinstates the action read above, before the exec.
+        unsafe { libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut()) };
+    }
     let _ = set_cloexec(handoff.listener, true);
     let _ = set_cloexec(handoff.master, true);
     // No successor is coming: this host serves on (stale, and marked so by
@@ -4782,6 +4797,33 @@ mod tests {
         assert!(
             !host.swapping.load(Ordering::SeqCst),
             "a host that could not swap must seat clients again"
+        );
+        // `Command::exec` resets SIGPIPE to its default for the new image,
+        // and a failed exec left it there: the host (and the test binary in
+        // CI) then died of its next write to a peer that had gone.
+        assert_eq!(
+            sigpipe_action().map(|a| a.sa_sigaction),
+            Some(libc::SIG_IGN),
+            "a host that could not swap must still ignore SIGPIPE"
+        );
+        // Negative: the host's own action comes back, not a fixed one. A
+        // no-op handler stands in for it (as safe as ignoring, for the
+        // other tests in this process).
+        extern "C" fn noop(_: libc::c_int) {}
+        let mut custom: libc::sigaction = unsafe { std::mem::zeroed() };
+        custom.sa_sigaction = noop as *const () as libc::sighandler_t;
+        // SAFETY: installs a handler that does nothing.
+        unsafe { libc::sigaction(libc::SIGPIPE, &custom, std::ptr::null_mut()) };
+        let _ = swap_to_new_image(&host, Path::new("/nonexistent/croft-successor"), &handoff);
+        let after = sigpipe_action().map(|a| a.sa_sigaction);
+        let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
+        ignore.sa_sigaction = libc::SIG_IGN;
+        // SAFETY: puts back the Rust runtime's SIGPIPE action.
+        unsafe { libc::sigaction(libc::SIGPIPE, &ignore, std::ptr::null_mut()) };
+        assert_eq!(
+            after,
+            Some(noop as *const () as libc::sighandler_t),
+            "the host's own SIGPIPE handler survives a failed swap"
         );
     }
 
