@@ -1,0 +1,1 @@
+fix: C and C++ files use a versioned clangd on PATH, such as the `clangd-18` that Ubuntu `apt install clangd-18` and apt.llvm.org install with no unversioned name, instead of trying to download one; offline and on Linux arm64 they now get a language server. lsp.log also names what was looked for before a download starts.
