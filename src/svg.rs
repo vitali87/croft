@@ -16,6 +16,117 @@ pub const RASTER_LONG_EDGE: u32 = 1600;
 /// documents belong in the text editor, not the parser.
 pub const MAX_SVG_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Deepest element nesting the preview will parse. usvg's XML parser
+/// recurses per level with no limit of its own, and running out of stack
+/// aborts the whole process (#1135); real SVGs nest a few dozen levels.
+pub const MAX_SVG_DEPTH: usize = 256;
+
+/// Entity references the XML parser expands inside one another before
+/// it gives up (roxmltree's loop guard): the most times one entity
+/// value's markup can stack on a single path.
+const ENTITY_EXPANSION_DEPTH: usize = 10;
+
+/// The deepest element nesting the parser can reach in `svg`, from a
+/// linear scan that never recurses per level. Comments, CDATA,
+/// processing instructions and declarations open no element; attribute
+/// values are skipped whole, so a `>` or `/>` quoted inside one ends
+/// nothing. Markup quoted in a declaration (an entity value) is counted
+/// as if every expansion stacked it, since the parser expands `&name;`
+/// in place. Stops early once the depth passes `limit`, so a refused
+/// file costs no more than its first `limit` levels.
+pub fn nesting_depth(svg: &[u8], limit: usize) -> usize {
+    let (mut depth, mut max, mut i) = (0usize, 0usize, 0usize);
+    let mut quoted = 0usize;
+    let worst = |max: usize, quoted: usize| {
+        max.saturating_add(quoted.saturating_mul(ENTITY_EXPANSION_DEPTH))
+    };
+    while i < svg.len() && worst(max, quoted) <= limit {
+        if svg[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &svg[i..];
+        if rest.starts_with(b"<!--") {
+            i = find(svg, i + 4, b"-->");
+        } else if rest.starts_with(b"<![CDATA[") {
+            i = find(svg, i + 9, b"]]>");
+        } else if rest.starts_with(b"<?") {
+            i = find(svg, i + 2, b"?>");
+        } else if rest.starts_with(b"<!") {
+            let (end, deepest) = skip_declaration(svg, i + 2, limit);
+            quoted = quoted.max(deepest);
+            i = end;
+        } else if rest.starts_with(b"</") {
+            depth = depth.saturating_sub(1);
+            i = find(svg, i + 2, b">");
+        } else {
+            let mut j = i + 1;
+            let mut quote = None;
+            while j < svg.len() {
+                match (quote, svg[j]) {
+                    (Some(q), c) if c == q => quote = None,
+                    (None, b'"' | b'\'') => quote = Some(svg[j]),
+                    (None, b'>') => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if svg.get(j.wrapping_sub(1)) != Some(&b'/') || quote.is_some() {
+                depth += 1;
+                max = max.max(depth);
+            }
+            i = j + 1;
+        }
+    }
+    worst(max, quoted)
+}
+
+/// The index just past the first `pat` at or after `from`, or the end.
+fn find(svg: &[u8], from: usize, pat: &[u8]) -> usize {
+    svg.get(from..)
+        .and_then(|rest| rest.windows(pat.len()).position(|w| w == pat))
+        .map_or(svg.len(), |i| from + i + pat.len())
+}
+
+/// Skips a `<!...>` declaration whose body starts at `from`. Quoted
+/// literals are skipped whole, and only an unquoted `[` opens a DOCTYPE's
+/// internal subset, which ends at its unquoted `]` (comments and
+/// processing instructions inside it skipped). A subset that never ends
+/// resumes the scan right after its `[`, so nothing after it goes
+/// uncounted. Returns where the scan resumes and the deepest nesting
+/// written inside any literal.
+fn skip_declaration(svg: &[u8], from: usize, limit: usize) -> (usize, usize) {
+    let (mut j, mut deepest, mut subset) = (from, 0usize, None);
+    while j < svg.len() {
+        let rest = &svg[j..];
+        match svg[j] {
+            q @ (b'"' | b'\'') => {
+                let close = rest[1..].iter().position(|&c| c == q);
+                let end = close.map_or(svg.len(), |k| j + 1 + k);
+                deepest = deepest.max(nesting_depth(&svg[j + 1..end], limit));
+                j = end + 1;
+                continue;
+            }
+            b'<' if subset.is_some() && rest.starts_with(b"<!--") => {
+                j = find(svg, j + 4, b"-->");
+                continue;
+            }
+            b'<' if subset.is_some() && rest.starts_with(b"<?") => {
+                j = find(svg, j + 2, b"?>");
+                continue;
+            }
+            b'[' if subset.is_none() => subset = Some(j + 1),
+            b']' if subset.is_some() => {
+                return (find(svg, j + 1, b">"), deepest);
+            }
+            b'>' if subset.is_none() => return (j + 1, deepest),
+            _ => {}
+        }
+        j += 1;
+    }
+    (subset.unwrap_or(svg.len()), deepest)
+}
+
 fn fontdb() -> &'static resvg::usvg::fontdb::Database {
     static DB: OnceLock<resvg::usvg::fontdb::Database> = OnceLock::new();
     DB.get_or_init(|| {
@@ -62,6 +173,11 @@ pub fn has_fonts() -> bool {
 /// image instead of a 1600px blur). Returns the PNG plus its pixel
 /// dimensions.
 pub fn rasterize(svg: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    if nesting_depth(svg, MAX_SVG_DEPTH) > MAX_SVG_DEPTH {
+        return Err(format!(
+            "SVG nested too deeply to render (over {MAX_SVG_DEPTH} levels)"
+        ));
+    }
     let opts = resvg::usvg::Options {
         fontdb: std::sync::Arc::new(fontdb().clone()),
         // The fallback for text WITHOUT a font-family: usvg's default is
@@ -147,6 +263,156 @@ mod tests {
             "text must rasterise to visible pixels, got {inked} inked of {}",
             w * h
         );
+    }
+
+    fn nested(levels: usize) -> Vec<u8> {
+        let mut s =
+            String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">"#);
+        s.push_str(&"<g>".repeat(levels));
+        s.push_str(r##"<rect width="5" height="5" fill="#0000ff"/>"##);
+        s.push_str(&"</g>".repeat(levels));
+        s.push_str("</svg>");
+        s.into_bytes()
+    }
+
+    #[test]
+    fn a_deeply_nested_svg_is_refused_instead_of_overflowing_the_stack() {
+        // #1135: the XML parser recurses per level with no limit, and the
+        // overflow aborts the process (no panic hook, no hot exit).
+        let err = rasterize(&nested(50_000)).unwrap_err();
+        assert!(err.contains("nested too deeply"), "{err}");
+    }
+
+    #[test]
+    fn ordinary_nesting_still_renders() {
+        // Negative: real SVGs nest a few dozen levels at most.
+        let (png, _, _) = rasterize(&nested(100)).unwrap();
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert!(
+            img.pixels().any(|p| p[2] == 255 && p[3] == 255),
+            "the rect draws"
+        );
+    }
+
+    #[test]
+    fn nesting_depth_skips_markup_that_opens_no_element() {
+        assert_eq!(
+            nesting_depth(b"<svg><g><g/></g><g></g></svg>", usize::MAX),
+            2
+        );
+        assert_eq!(
+            nesting_depth(
+                br#"<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY a "x>y">]><svg></svg>"#,
+                usize::MAX
+            ),
+            1
+        );
+        assert_eq!(
+            nesting_depth(
+                b"<svg><!-- <g><g><g> --><![CDATA[<g><g>]]></svg>",
+                usize::MAX
+            ),
+            1
+        );
+        assert_eq!(
+            nesting_depth(br#"<svg><g a="/>" b='>'><rect/></g></svg>"#, usize::MAX),
+            2
+        );
+        assert_eq!(
+            nesting_depth(b"<svg><g></svg>", usize::MAX),
+            2,
+            "unbalanced input still counts"
+        );
+    }
+
+    fn wrapped(prolog: &str, levels: usize) -> Vec<u8> {
+        let mut s = String::from(prolog);
+        s.push_str(&String::from_utf8(nested(levels)).unwrap());
+        s.into_bytes()
+    }
+
+    #[test]
+    fn a_bracket_quoted_in_the_doctype_does_not_hide_the_nesting() {
+        // A `[` inside the DOCTYPE's quoted system id opens no internal
+        // subset; treating it as one skipped the whole document.
+        let svg = wrapped(r#"<!DOCTYPE svg SYSTEM "a[b.dtd">"#, 50_000);
+        assert!(nesting_depth(&svg, MAX_SVG_DEPTH) > MAX_SVG_DEPTH);
+        let err = rasterize(&svg).unwrap_err();
+        assert!(err.contains("nested too deeply"), "{err}");
+    }
+
+    #[test]
+    fn an_unterminated_internal_subset_does_not_hide_the_nesting() {
+        let svg = wrapped("<!DOCTYPE svg [ <!ENTITY a 'b'> >", 50_000);
+        assert!(nesting_depth(&svg, MAX_SVG_DEPTH) > MAX_SVG_DEPTH);
+    }
+
+    #[test]
+    fn a_quoted_subset_end_does_not_hide_the_nesting() {
+        // `]>` inside an entity value does not close the internal subset.
+        let svg = wrapped(r#"<!DOCTYPE svg [ <!ENTITY a "]>"> ]>"#, 50_000);
+        assert!(nesting_depth(&svg, MAX_SVG_DEPTH) > MAX_SVG_DEPTH);
+    }
+
+    #[test]
+    fn nesting_hidden_in_an_entity_is_refused() {
+        // The parser expands `&deep;` in place, so the markup in its value
+        // nests as deep as if it were written out.
+        let mut deep = "<g>".repeat(50_000);
+        deep.push_str(&"</g>".repeat(50_000));
+        let mut s = format!(r#"<!DOCTYPE svg [ <!ENTITY deep "{deep}"> ]>"#);
+        s.push_str(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">&deep;</svg>"#,
+        );
+        assert!(nesting_depth(s.as_bytes(), MAX_SVG_DEPTH) > MAX_SVG_DEPTH);
+        let err = rasterize(s.as_bytes()).unwrap_err();
+        assert!(err.contains("nested too deeply"), "{err}");
+    }
+
+    #[test]
+    fn markup_in_an_entity_counts_once_per_possible_expansion() {
+        let svg = br#"<!DOCTYPE svg [<!ENTITY a "<g><g>x</g></g>">]><svg>&a;</svg>"#;
+        assert_eq!(
+            nesting_depth(svg, usize::MAX),
+            1 + 2 * ENTITY_EXPANSION_DEPTH
+        );
+    }
+
+    #[test]
+    fn the_scan_stops_once_the_limit_is_passed() {
+        // Only "more than the limit" matters, so a huge file is not
+        // walked to its end.
+        assert_eq!(
+            nesting_depth(&nested(50_000), MAX_SVG_DEPTH),
+            MAX_SVG_DEPTH + 1
+        );
+        assert_eq!(nesting_depth(&nested(3), MAX_SVG_DEPTH), 4);
+    }
+
+    #[test]
+    fn an_svg_with_plain_entities_still_renders() {
+        // Negative: Illustrator exports declare namespace entities in an
+        // internal subset; those add no nesting.
+        let svg = wrapped(
+            r#"<?xml version="1.0"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [
+  <!ENTITY ns_svg "http://www.w3.org/2000/svg">
+  <!-- a comment with ]> in it -->
+]>
+"#,
+            100,
+        );
+        assert_eq!(nesting_depth(&svg, usize::MAX), 101);
+        let (png, _, _) = rasterize(&svg).unwrap();
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert!(img.pixels().any(|p| p[2] == 255 && p[3] == 255));
+    }
+
+    #[test]
+    fn a_doctype_without_a_subset_still_counts_what_follows() {
+        // Negative: a DOCTYPE ends at its first unquoted `>`.
+        let svg = wrapped(r#"<!DOCTYPE svg SYSTEM "x>y.dtd">"#, 3);
+        assert_eq!(nesting_depth(&svg, usize::MAX), 4);
     }
 
     #[test]

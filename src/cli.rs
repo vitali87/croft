@@ -402,12 +402,16 @@ pub enum CliCommand {
     },
     /// Print a JSON template for translating croft's UI into `lang` (#621).
     ///
-    /// Every palette title, with the built-in translation filled in where one
-    /// exists. Fill in the rest and save it as
-    /// `<config>/locales/<lang>.json`.
+    /// Every palette title, with your own or the built-in translation filled
+    /// in where one exists. `--write` updates `<config>/locales/<lang>.json`
+    /// in place, keeping what it already holds; fill in the rest there.
     LocaleTemplate {
         /// Language code, such as `de` or `fr`.
         lang: String,
+        /// Update `<config>/locales/<lang>.json` in place instead of printing,
+        /// keeping every translation already in it (#1148).
+        #[arg(long, default_value_t = false)]
+        write: bool,
     },
     /// Open a workspace inside its dev container (#617).
     ///
@@ -801,7 +805,7 @@ impl Cli {
                 }
                 Ok(())
             }
-            Some(CliCommand::LocaleTemplate { lang }) => {
+            Some(CliCommand::LocaleTemplate { lang, write }) => {
                 // The language croft loads for this locale: `de_DE.UTF-8` and
                 // `de-DE` both read `locales/de.json`, whose built-in catalog
                 // seeds the template.
@@ -811,8 +815,31 @@ impl Cli {
                     );
                     std::process::exit(1);
                 };
-                eprintln!("Save this as locales/{code}.json in croft's config directory.");
-                println!("{}", crate::i18n::template(&code, &[]));
+                let path = crate::prefs::config_dir()
+                    .join("locales")
+                    .join(format!("{code}.json"));
+                if write {
+                    match crate::i18n::write_template(&path, &code) {
+                        Ok((total, todo)) => {
+                            eprintln!(
+                                "Updated {}: {todo} of {total} strings still to translate.",
+                                path.display()
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("croft locale-template: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                // A shell redirect onto this same file has already emptied
+                // it, which is why `--write` exists.
+                eprintln!(
+                    "Run `croft locale-template {code} --write` to update locales/{code}.json in croft's config directory in place."
+                );
+                let user = std::fs::read_to_string(&path).ok();
+                println!("{}", crate::i18n::template(&code, user.as_deref(), &[]));
                 Ok(())
             }
             Some(CliCommand::Devcontainer { path, rebuild }) => {

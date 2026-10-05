@@ -103,6 +103,9 @@ pub struct CompiledMatcher {
     /// fires only for commands it claims. No glob ⇒ every command.
     applies_to: Option<String>,
     pub background: Option<Background>,
+    /// The rest of a tasks.json matcher list (`["$tsc", "$eslint-stylish"]`):
+    /// batch scans run each and concatenate, as VS Code does (#1240).
+    also: Vec<CompiledMatcher>,
 }
 
 /// Severity words every matcher understands; `severity_map` extends them.
@@ -162,6 +165,16 @@ impl CompiledMatcher {
 
     /// Scan a whole output block (a finished command, or a watch window).
     pub fn scan_batch(&self, output: &str) -> Vec<BuildDiag> {
+        let mut out = self.scan_batch_own(output);
+        for m in &self.also {
+            out.extend(m.scan_batch(output));
+        }
+        out
+    }
+
+    /// [`Self::scan_batch`] for this matcher alone, without the rest of its
+    /// list.
+    fn scan_batch_own(&self, output: &str) -> Vec<BuildDiag> {
         if self.patterns.is_empty() {
             let mut diags = crate::build_matchers::scan(output);
             if let Some(tag) = self.builtin_filter {
@@ -521,6 +534,7 @@ fn compile_row(row: MatcherRow) -> Result<CompiledMatcher, String> {
         severity_map,
         applies_to: row.applies_to,
         background,
+        also: Vec::new(),
     })
 }
 
@@ -546,6 +560,7 @@ pub fn well_known(name: &str) -> Option<CompiledMatcher> {
                     .unwrap(),
                     ends: Regex::new(r"Watching for file changes\.").unwrap(),
                 }),
+                also: Vec::new(),
             });
         }
         _ => return None,
@@ -557,17 +572,29 @@ pub fn well_known(name: &str) -> Option<CompiledMatcher> {
         severity_map: BTreeMap::new(),
         applies_to: None,
         background: None,
+        also: Vec::new(),
     })
 }
 
 /// Translate a tasks.json `problemMatcher` value (string, object, or
-/// array — first usable entry wins) into a matcher. `None` means "no
+/// array — every usable entry runs) into a matcher. `None` means "no
 /// usable matcher": unknown `$names` and untranslatable shapes degrade to
 /// the built-in first-match-wins scan rather than erroring.
 pub fn from_tasks_json(value: &serde_json::Value) -> Option<CompiledMatcher> {
     match value {
         serde_json::Value::String(s) => well_known(s),
-        serde_json::Value::Array(items) => items.iter().find_map(from_tasks_json),
+        serde_json::Value::Array(items) => {
+            let mut all: Vec<CompiledMatcher> = items.iter().filter_map(from_tasks_json).collect();
+            // A background entry anywhere makes it a watch task (VS Code), and
+            // the pane's watch engine reads the head's `background`.
+            let head = all.iter().position(|m| m.background.is_some()).unwrap_or(0);
+            if all.is_empty() {
+                return None;
+            }
+            let mut head = all.remove(head);
+            head.also.extend(all);
+            Some(head)
+        }
         serde_json::Value::Object(o) => from_vscode_object(o),
         _ => None,
     }
@@ -641,6 +668,7 @@ fn from_vscode_object(o: &serde_json::Map<String, serde_json::Value>) -> Option<
         severity_map: BTreeMap::new(),
         applies_to: None,
         background: None,
+        also: Vec::new(),
     });
     Some(CompiledMatcher {
         name: if o.contains_key("owner") {
@@ -657,6 +685,7 @@ fn from_vscode_object(o: &serde_json::Map<String, serde_json::Value>) -> Option<
         severity_map: base.severity_map,
         applies_to: None,
         background: background.or(base.background),
+        also: Vec::new(),
     })
 }
 
@@ -833,6 +862,52 @@ mod tests {
         assert_eq!(out[0].file, "main.c");
         assert!(well_known("$tsc-watch").unwrap().background.is_some());
         assert!(well_known("$made-up-name").is_none());
+    }
+
+    /// gcc diagnostics, then eslint's default "stylish" report (#1240).
+    const GCC_THEN_ESLINT: &str = "bad.c:2:11: error: initialization of 'int' from 'char *'\nbad.c:3:10: error: 'y' undeclared\n\nweb/app.js\n  1:5  error  a is assigned a value but never used  no-unused-vars\n  2:5  error  b is assigned a value but never used  no-unused-vars\n\n\u{2716} 2 problems (2 errors, 0 warnings)\n";
+
+    /// Every matcher in a tasks.json list runs, in either order, as in VS
+    /// Code: a compile-and-lint task reports both tools' errors.
+    #[test]
+    fn a_problem_matcher_list_runs_every_matcher() {
+        for list in [
+            serde_json::json!(["$gcc", "$eslint-stylish"]),
+            serde_json::json!(["$eslint-stylish", "$gcc"]),
+        ] {
+            let m = from_tasks_json(&list).unwrap();
+            let out = m.scan_batch(GCC_THEN_ESLINT);
+            let files: Vec<&str> = out.iter().map(|d| d.file.as_str()).collect();
+            assert_eq!(
+                files.iter().filter(|f| **f == "bad.c").count(),
+                2,
+                "{list}: {out:?}"
+            );
+            assert_eq!(
+                files.iter().filter(|f| **f == "web/app.js").count(),
+                2,
+                "{list}: {out:?}"
+            );
+        }
+    }
+
+    /// A background matcher anywhere in the list makes the task a watch
+    /// task, as in VS Code.
+    #[test]
+    fn a_background_matcher_anywhere_in_a_list_makes_a_watch_task() {
+        let m = from_tasks_json(&serde_json::json!(["$gcc", "$tsc-watch"])).unwrap();
+        assert!(m.background.is_some());
+    }
+
+    /// Entries that don't translate are skipped, and a single usable one is
+    /// exactly that matcher: no other tool's rows leak in.
+    #[test]
+    fn a_list_with_one_usable_matcher_reports_only_its_rows() {
+        let m = from_tasks_json(&serde_json::json!(["$nope", "$gcc"])).unwrap();
+        let out = m.scan_batch(GCC_THEN_ESLINT);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out.iter().all(|d| d.file == "bad.c"));
+        assert!(from_tasks_json(&serde_json::json!(["$nope", "$also-nope"])).is_none());
     }
 
     #[test]
