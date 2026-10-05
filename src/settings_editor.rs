@@ -6,6 +6,10 @@
 //! Writing goes to one layer file at a time with [`set_key`]; the caller
 //! re-merges afterwards.
 
+// The Settings editor view (the next step of #612) is what calls these; until
+// it lands, only the tests do.
+#![allow(dead_code)]
+
 use crate::config_layers::LayerKind;
 use serde_json::Value;
 use std::collections::BTreeMap;
