@@ -3479,6 +3479,15 @@ pub struct App {
     /// is waiting for the next bake (see [`MINIMAP_EDIT_REBAKE`]).
     minimap_baked_at: Option<std::time::Instant>,
     minimap_edit_pending: bool,
+    /// The strip was last drawn as braille text, where the terminal cannot
+    /// draw images (#1231); `minimap_content_h` then counts dot rows.
+    minimap_text: bool,
+    /// The braille cells for the text strip, rebuilt only when the same
+    /// signature the image bake keys on changes.
+    minimap_text_cache: Option<(MinimapSig, Vec<BrailleCell>)>,
+    /// Whether the editor was wide enough for the strip on the last frame,
+    /// so turning the minimap on can say why it does not show.
+    minimap_room: bool,
     /// The buffer ratatui drew last, and what each small chrome image (the
     /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
     /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
@@ -4915,6 +4924,59 @@ const MINIMAP_EDIT_REBAKE: std::time::Duration = std::time::Duration::from_milli
 /// exactly as a plain whole-file fit would, so normal files are unaffected.
 const MINIMAP_MAX_LINE_PX: u32 = 6;
 
+/// Source characters folded into one braille dot column of the text minimap,
+/// so the 6-cell strip spans 48 columns of code, like the image's 1px a char.
+const MINIMAP_TEXT_CHARS_PER_DOT: u32 = 4;
+
+/// One cell of the text minimap: its braille glyph and ink colour, or `None`
+/// for a blank cell.
+type BrailleCell = Option<(char, (u8, u8, u8))>;
+
+/// Fold a minimap raster into braille cells for terminals that cannot draw
+/// images (#1231): each cell is 2x4 dots, each dot `MINIMAP_TEXT_CHARS_PER_DOT`
+/// raster columns wide and one raster row tall, lit when any of its pixels is
+/// ink (not `bg`). A cell takes the colour of its first lit pixel. Cells come
+/// back row-major, `cell_w` to a row.
+fn braille_minimap(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    bg: (u8, u8, u8),
+    cell_w: u16,
+    cell_h: u16,
+) -> Vec<BrailleCell> {
+    // Braille dot bits by (dot column, dot row), U+2800 + bits.
+    const BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+    let xs = MINIMAP_TEXT_CHARS_PER_DOT;
+    let ink = |x: u32, y: u32| -> Option<(u8, u8, u8)> {
+        if x >= w || y >= h {
+            return None;
+        }
+        let i = ((y * w + x) * 4) as usize;
+        let px = (rgba[i], rgba[i + 1], rgba[i + 2]);
+        (px != bg).then_some(px)
+    };
+    let mut cells = Vec::with_capacity(cell_w as usize * cell_h as usize);
+    for cy in 0..cell_h as u32 {
+        for cx in 0..cell_w as u32 {
+            let mut bits = 0u8;
+            let mut colour = None;
+            for (dx, column) in BITS.iter().enumerate() {
+                for (dy, bit) in column.iter().enumerate() {
+                    let y = cy * 4 + dy as u32;
+                    let x0 = (cx * 2 + dx as u32) * xs;
+                    if let Some(px) = (x0..x0 + xs).find_map(|x| ink(x, y)) {
+                        bits |= bit;
+                        colour.get_or_insert(px);
+                    }
+                }
+            }
+            cells.push(colour.map(|c| (char::from_u32(0x2800 + bits as u32).unwrap_or(' '), c)));
+        }
+    }
+    cells
+}
+
 /// Cached full-document raster for the minimap. The expensive part (walking
 /// every line's syntax spans) runs only when `sig` changes; scrolling reuses
 /// `rgba` and just re-composites the viewport box on top.
@@ -5786,6 +5848,9 @@ impl App {
             minimap_content_h: 0,
             minimap_baked_at: None,
             minimap_edit_pending: false,
+            minimap_text: false,
+            minimap_text_cache: None,
+            minimap_room: true,
             drawn_buffer: None,
             chrome_sent: std::collections::HashMap::new(),
             chrome_seen: std::collections::HashSet::new(),
@@ -18865,6 +18930,17 @@ impl App {
             let paint_history = self.scrub_view.is_some();
             let active_idx = self.editor_layout.active_dfs_index();
             let focused_area = if self.editor_layout.is_split() {
+                let mut rects = rects;
+                // The active group carries the minimap (#1231).
+                let minimap = self.carve_minimap(rects[active_idx]);
+                if let Some((ed_rect, full_strip, _)) = minimap {
+                    frame.render_widget(
+                        ratatui::widgets::Block::default()
+                            .style(Style::default().bg(self.theme.editor_bg())),
+                        full_strip,
+                    );
+                    rects[active_idx] = ed_rect;
+                }
                 let active_area = rects[active_idx];
                 frame.render_widget(&mut self.editor, active_area);
                 let inactive_rects: Vec<Rect> = rects
@@ -18893,9 +18969,10 @@ impl App {
                     self.update_editor_image_overlay(0, active_area);
                     self.disable_editor_image(1);
                 }
-                // ponytail: no minimap while the editor is split; per-group
-                // minimaps when someone asks for them.
-                self.disable_minimap_image();
+                match minimap {
+                    Some((_, _, img_rect)) => self.paint_minimap(frame, img_rect),
+                    None => self.disable_minimap_image(),
+                }
                 active_area
             } else if let Some((ed_rect, full_strip, img_rect)) = self.carve_minimap(editor_area) {
                 // Bg-fill the whole strip column so no stale cells show
@@ -18910,7 +18987,7 @@ impl App {
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, ed_rect);
                 self.disable_editor_image(1);
-                self.update_minimap_overlay(img_rect);
+                self.paint_minimap(frame, img_rect);
                 ed_rect
             } else {
                 frame.render_widget(&mut self.editor, editor_area);
@@ -59362,6 +59439,88 @@ impl App {
     fn disable_minimap_image(&mut self) {
         self.overlays.minimap.disable();
         self.minimap_img_rect = Rect::default();
+        self.minimap_text = false;
+    }
+
+    /// Draw the minimap into `strip`: the raster where the terminal draws
+    /// images, else braille text (#1231), so it shows in tmux, Alacritty,
+    /// GNOME Terminal and plain xterm too.
+    fn paint_minimap(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
+        if self.inline_images_enabled() && self.cell_pixel.is_some() {
+            self.minimap_text = false;
+            self.update_minimap_overlay(strip);
+        } else {
+            self.overlays.minimap.disable();
+            self.render_text_minimap(frame.buffer_mut(), strip);
+        }
+    }
+
+    /// The braille minimap (#1231): the same raster the image path bakes, at
+    /// one dot row a line (folded to fit a longer file), with the visible
+    /// lines tinted like the image's viewport box.
+    fn render_text_minimap(&mut self, buf: &mut ratatui::buffer::Buffer, strip: Rect) {
+        self.minimap_img_rect = strip;
+        self.minimap_text = true;
+        if strip.width == 0 || strip.height == 0 {
+            return;
+        }
+        let (first, end) = self.editor.minimap_span();
+        let total = end - first;
+        let w = strip.width as u32 * 2 * MINIMAP_TEXT_CHARS_PER_DOT;
+        let h = strip.height as u32 * 4;
+        let content_h = (total as u32).clamp(1, h);
+        self.minimap_content_h = content_h;
+        let bg = self.theme.editor_bg_rgb();
+        let light = 0.299 * bg.0 as f32 + 0.587 * bg.1 as f32 + 0.114 * bg.2 as f32 > 140.0;
+        let fg = if light {
+            (0x38, 0x3a, 0x41)
+        } else {
+            (0xc5, 0xcd, 0xd9)
+        };
+        let sig = (
+            self.editor.path.clone(),
+            self.editor.edit_seq,
+            w,
+            h,
+            bg,
+            (first, end),
+            self.editor.highlight_generation(),
+        );
+        if self.minimap_text_cache.as_ref().map(|(k, _)| k) != Some(&sig) {
+            let rgba = self.editor.minimap_rgba(w, h, content_h, bg, fg);
+            let cells = braille_minimap(&rgba, w, h, bg, strip.width, strip.height);
+            self.minimap_text_cache = Some((sig, cells));
+        }
+        let Some((_, cells)) = self.minimap_text_cache.as_ref() else {
+            return;
+        };
+        // The visible lines, in cell rows, get a faint wash of the text colour.
+        let top = self.editor.scroll.saturating_sub(first);
+        let rows = self.editor.visible_rows();
+        let to_cell = |line: usize| line * content_h as usize / total.max(1) / 4;
+        let (view_top, view_end) = (to_cell(top), to_cell(top + rows.max(1) - 1));
+        let mix = |a: u8, b: u8| ((a as u16 * 85 + b as u16 * 15) / 100) as u8;
+        let wash = Color::Rgb(mix(bg.0, fg.0), mix(bg.1, fg.1), mix(bg.2, fg.2));
+        for (i, cell) in cells.iter().enumerate() {
+            let (cx, cy) = (i % strip.width as usize, i / strip.width as usize);
+            let back = if total > 0 && (view_top..=view_end).contains(&cy) {
+                wash
+            } else {
+                Color::Rgb(bg.0, bg.1, bg.2)
+            };
+            let Some(out) = buf.cell_mut((strip.x + cx as u16, strip.y + cy as u16)) else {
+                continue;
+            };
+            match cell {
+                Some((glyph, (r, g, b))) => {
+                    out.set_char(*glyph).set_fg(Color::Rgb(*r, *g, *b));
+                }
+                None => {
+                    out.set_char(' ');
+                }
+            }
+            out.set_bg(back);
+        }
     }
 
     /// Show/hide the editor minimap (⌥⌘M, the minimap right-click menu, the
@@ -59372,25 +59531,26 @@ impl App {
         if !self.minimap_visible {
             self.disable_minimap_image();
         }
-        self.status = if self.minimap_visible {
+        self.status = if self.minimap_visible && !self.minimap_room {
+            format!(
+                "Minimap on: it shows once the editor is {} columns wide",
+                MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH
+            )
+        } else if self.minimap_visible {
             String::from("Minimap on")
         } else {
             String::from("Minimap off")
         };
     }
 
-    /// Carve the minimap strip off `editor_area` when the minimap is on (v1:
-    /// unsplit, image-capable terminals, enough width). Returns
+    /// Carve the minimap strip off `editor_area` (the active group's rect in a
+    /// split) when the minimap is on and the editor has room. Returns
     /// `(editor_rect, full_strip, image_rect)`: the editor renders into
     /// `editor_rect`, the whole `full_strip` column is bg-filled, and the
     /// raster image occupies `image_rect` (aligned to the editor's text rows).
-    fn carve_minimap(&self, editor_area: Rect) -> Option<(Rect, Rect, Rect)> {
-        if !self.minimap_visible
-            || self.editor_layout.is_split()
-            || !self.inline_images_enabled()
-            || self.cell_pixel.is_none()
-            || editor_area.width < MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH
-        {
+    fn carve_minimap(&mut self, editor_area: Rect) -> Option<(Rect, Rect, Rect)> {
+        self.minimap_room = editor_area.width >= MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH;
+        if !self.minimap_visible || !self.minimap_room {
             return None;
         }
         let w = MINIMAP_WIDTH_CELLS;
@@ -59477,7 +59637,12 @@ impl App {
         if r.height == 0 || total == 0 {
             return;
         }
-        let ch_px = self.cell_pixel.map(|(_, h)| h).unwrap_or(1).max(1);
+        // The text strip maps four dot rows to a cell (#1231).
+        let ch_px = if self.minimap_text {
+            4
+        } else {
+            self.cell_pixel.map(|(_, h)| h).unwrap_or(1).max(1)
+        };
         let dy_px = (row.saturating_sub(r.y)) as u32 * ch_px;
         let content_h = self.minimap_content_h.max(1);
         let line = first + (dy_px as usize * total / content_h as usize).min(total - 1);

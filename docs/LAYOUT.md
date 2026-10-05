@@ -89,7 +89,7 @@ The collapse is also held off whenever something else on screen depends on the s
 
 * Tree-sitter highlighting, side-by-side splits, and bracket-match highlighting.
 * Inline previews for images / PDFs / spreadsheets. The rendered Markdown / notebook / document view is selectable: drag to select the text you can see, `Cmd`/`Ctrl`+`C` copies the rendered text rather than the source, `Esc` clears.
-* A minimap: a rasterized file preview in a right-edge strip; click or drag to jump, right-click to toggle or re-side it.
+* A minimap: a file preview in a right-edge strip beside the active editor group; click or drag to jump, right-click to toggle or re-side it. Terminals with inline images (Kitty, iTerm2, WezTerm, sixel) get a rasterized preview; everywhere else (tmux, Alacritty, GNOME Terminal, plain xterm) it is drawn in braille dots. It needs an editor at least 50 columns wide.
 * A breadcrumbs bar: the file path plus the enclosing symbol trail at the caret, click to jump.
 * Sticky scroll: the enclosing scope headers pinned to the top while you scroll.
 * Code folding: LSP fold ranges when the server provides them, with an indentation + `#region`-marker + comment-run fallback. Collapse from a gutter chevron or `Cmd`/`Ctrl`+`K` chords, including Fold All Block Comments and Fold/Unfold All Regions.

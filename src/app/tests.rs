@@ -58295,6 +58295,9 @@ fn sarif_columns_are_chosen_with_c_shown_on_rows_and_remembered() {
         let (tmp, log) = sarif_fixture();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.editor.open(&log).unwrap();
+        // The row is read at a fixed width; the minimap strip, drawn in
+        // every terminal since #1231, would take six of its columns.
+        app.minimap_visible = false;
         assert!(
             app.editor.sarif.as_ref().unwrap().columns.is_empty(),
             "none by default"
@@ -70515,4 +70518,158 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+// --- Minimap without inline images (#1231) --------------------------------
+
+/// An app with a 300-line Rust file open, in a terminal that cannot draw
+/// inline images (tmux, Alacritty, GNOME Terminal, plain xterm).
+fn text_minimap_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("long.rs");
+    let body: String = (0..300)
+        .map(|i| format!("fn f{i}() {{ let value = {i}; }}\n"))
+        .collect();
+    std::fs::write(&path, body).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::None;
+    app.cell_pixel = None;
+    app.editor.open(&path).unwrap();
+    (tmp, app)
+}
+
+fn is_braille(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+}
+
+/// The braille cells drawn inside `r`.
+fn braille_in(term: &ratatui::Terminal<ratatui::backend::TestBackend>, r: Rect) -> usize {
+    let buf = term.backend().buffer();
+    let mut n = 0;
+    for y in r.y..r.y + r.height {
+        for x in r.x..r.x + r.width {
+            if is_braille(buf[(x, y)].symbol()) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn the_minimap_draws_as_braille_without_inline_images() {
+    let (_tmp, mut app) = text_minimap_app();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.minimap_img_rect;
+    assert_eq!(strip.width, 6, "the strip is carved: {strip:?}");
+    assert!(
+        braille_in(&term, strip) > 0,
+        "the strip shows the file's shape:\n{}",
+        screen_text(&term)
+    );
+    let text = app.editor.last_full_area;
+    assert_eq!(
+        strip.x,
+        text.x + text.width,
+        "the strip sits right of the text"
+    );
+}
+
+#[test]
+fn a_click_on_the_text_minimap_jumps_to_that_part_of_the_file() {
+    let (_tmp, mut app) = text_minimap_app();
+    draw(&mut app, 160, 40);
+    let strip = app.minimap_img_rect;
+    assert!(strip.height > 0);
+    assert_eq!(app.editor.scroll, 0);
+    // 300 lines at one dot row each fill 75 cell rows; the strip is shorter,
+    // so the whole file is folded into it and the bottom row is the end.
+    left_click(&mut app, strip.x + 2, strip.y + strip.height - 1);
+    assert!(
+        app.editor.cursor_row > 250,
+        "the bottom of the strip is the end of the file: row {}",
+        app.editor.cursor_row
+    );
+}
+
+#[test]
+fn the_minimap_stays_on_the_active_group_in_a_split() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.split_editor();
+    assert!(app.editor_layout.is_split());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.minimap_img_rect;
+    let active = app.editor.last_full_area;
+    assert_eq!(strip.width, 6, "a split keeps the minimap: {strip:?}");
+    assert!(braille_in(&term, strip) > 0, "{}", screen_text(&term));
+    assert!(
+        strip.x == active.x + active.width || strip.x + strip.width == active.x,
+        "the strip is beside the active group: strip {strip:?}, group {active:?}"
+    );
+}
+
+#[test]
+fn the_minimap_off_draws_no_strip() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.toggle_minimap();
+    assert_eq!(app.status, "Minimap off");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.minimap_img_rect, Rect::default());
+    let screen = screen_text(&term);
+    assert!(
+        !screen.chars().any(|c| is_braille(&c.to_string())),
+        "{screen}"
+    );
+}
+
+#[test]
+fn turning_the_minimap_on_in_a_narrow_editor_says_why_it_is_hidden() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.toggle_minimap();
+    draw(&mut app, 70, 30);
+    app.toggle_minimap();
+    assert!(
+        app.status.starts_with("Minimap on") && app.status.contains("wide"),
+        "{}",
+        app.status
+    );
+    // With room, the toggle just says it is on.
+    app.toggle_minimap();
+    draw(&mut app, 160, 40);
+    app.toggle_minimap();
+    assert_eq!(app.status, "Minimap on");
+}
+
+#[test]
+fn braille_minimap_folds_each_two_by_four_dot_block_into_a_cell() {
+    let bg = (0, 0, 0);
+    let ink = (200, 100, 50);
+    // One cell: 2 dot columns of 4 source chars each, 4 dot rows.
+    let (w, h) = (2 * MINIMAP_TEXT_CHARS_PER_DOT, 4);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = 0xff;
+    }
+    let cells = braille_minimap(&rgba, w, h, bg, 1, 1);
+    assert_eq!(cells, vec![None], "a blank block is a blank cell");
+    // Ink in the second char of the first dot column, top row: dot 1.
+    let idx = 4;
+    rgba[idx..idx + 3].copy_from_slice(&[ink.0, ink.1, ink.2]);
+    assert_eq!(
+        braille_minimap(&rgba, w, h, bg, 1, 1),
+        vec![Some(('\u{2801}', ink))]
+    );
+    // Every dot lit is the full cell.
+    for px in rgba.chunks_exact_mut(4) {
+        px[..3].copy_from_slice(&[ink.0, ink.1, ink.2]);
+    }
+    assert_eq!(
+        braille_minimap(&rgba, w, h, bg, 1, 1),
+        vec![Some(('\u{28ff}', ink))]
+    );
 }
