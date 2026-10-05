@@ -503,7 +503,16 @@ fn pyproject_tasks_on(root: &Path, uv_on_path: bool) -> Vec<Task> {
     };
     let mut out: Vec<Task> = names
         .into_iter()
-        .map(|name| task(format!("{script_prefix}{name}")))
+        .map(|name| {
+            // A quoted TOML key can hold shell syntax; the terminal runs this
+            // line, so the name goes in as one word.
+            let word = if needs_quote(name) {
+                quote_word(name)
+            } else {
+                name.clone()
+            };
+            task(format!("{script_prefix}{word}"))
+        })
         .collect();
     if text.contains("pytest") {
         out.push(task(pytest));
@@ -988,6 +997,22 @@ mod tests {
                 t.command
             })
             .collect()
+    }
+
+    /// A script key with shell syntax in it runs as one quoted word, never
+    /// as a second command.
+    #[test]
+    fn a_script_name_with_shell_syntax_is_quoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[project.scripts]\n\"a; touch pwned\" = \"x:a\"\nserve = \"x:run\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), true),
+            ["uv run 'a; touch pwned'", "uv run serve"]
+        );
     }
 
     const POETRY_PYPROJECT: &str = "[tool.poetry]\nname = \"calc\"\nversion = \"0.1.0\"\n\n[tool.poetry.group.dev.dependencies]\npytest = \"^8\"\n\n[tool.poetry.scripts]\ncalc = \"calc:main\"\n";
