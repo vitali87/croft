@@ -1,0 +1,1 @@
+fix: In a shared session, a `--solo` participant can save once the session owner quits (or crashes): the owner now heartbeats and says goodbye on the relay, the participant's files fall back to saving locally with a status saying so, and when an owner joins again those files rejoin it with the edits made meanwhile instead of forking.

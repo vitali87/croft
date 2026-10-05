@@ -1,0 +1,1 @@
+fix: Terminal command history and Re-run Command record a multi-line command without the shell's continuation prompt (`> `, or zsh's `for> `), so recalling it runs the command instead of a redirect that creates or truncates a file (#1250).

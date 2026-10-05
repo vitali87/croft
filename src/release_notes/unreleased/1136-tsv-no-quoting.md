@@ -1,0 +1,1 @@
+fix: TSV files are read and saved without CSV quoting: a cell that starts with `"` no longer swallows the rows after it, and saving a one-cell edit no longer rewrites `5"` as `"5"""`, strips the quotes from `"Pro" ruler` or adds a stray `"` line.
