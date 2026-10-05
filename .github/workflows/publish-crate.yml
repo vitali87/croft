@@ -116,6 +116,9 @@ jobs:
           # The token is not needed after the fetch; leaving it
           # in .git/config lets any later step push with it.
           persist-credentials: false
+          # Full history: a handoff after an earlier upload tags the commit
+          # that introduced the version, found by walking back to it.
+          fetch-depth: 0
 
       - name: Install the pinned toolchain
         run: rustup show
@@ -159,6 +162,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.decide.outputs.version }}
+          UPLOADED_EARLIER: ${{ steps.index.outputs.uploaded }}
         run: |
           set -euo pipefail
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -166,21 +170,34 @@ jobs:
             exit 1
           fi
           tag="v${VERSION}"
+          # A handoff after an earlier upload whose tagging failed tags the
+          # commit that introduced this version, not main's head: the head
+          # may have moved on without a bump, and the release must build what
+          # crates.io already holds. Without an earlier upload this job just
+          # published the head.
+          commit="$GITHUB_SHA"
+          if [ "$UPLOADED_EARLIER" = "true" ]; then
+            commit="$(git log --first-parent -1 --format=%H -G "^version *= *\"${VERSION//./\\.}\"" -- Cargo.toml)"
+            if [ -z "$commit" ]; then
+              echo "::error::could not find the commit that set version $VERSION"
+              exit 1
+            fi
+          fi
           # An existing tag is reused only if it names the commit this job
           # published: release.yml builds whatever the tag points at. An
           # annotated tag's `^{}` line is the commit it peels to.
           target="$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" \
             | awk -v t="refs/tags/$tag" '$2 == t "^{}" { p = $1 } $2 == t { d = $1 } END { print (p != "" ? p : d) }')"
           if [ -n "$target" ]; then
-            if [ "$target" != "$GITHUB_SHA" ]; then
-              echo "::error::$tag already points at $target, not at $GITHUB_SHA, the commit just published"
+            if [ "$target" != "$commit" ]; then
+              echo "::error::$tag already points at $target, not at $commit, the commit published"
               exit 1
             fi
-            echo "$tag already exists at $GITHUB_SHA"
+            echo "$tag already exists at $commit"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "$tag" -m "croft $VERSION" "$GITHUB_SHA"
+            git tag -a "$tag" -m "croft $VERSION" "$commit"
             # gh's credential helper, not a token in the remote URL, so the
             # token never lands in .git/config or the log.
             gh auth setup-git

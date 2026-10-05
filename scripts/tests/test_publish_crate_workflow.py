@@ -71,7 +71,18 @@ class WorkflowContract(unittest.TestCase):
         # release.yml builds what the tag points at; a stale tag at another
         # commit would ship binaries that are not the crate just published.
         self.assertIn('"refs/tags/$tag^{}"', self.text)
-        self.assertIn('if [ "$target" != "$GITHUB_SHA" ]; then', self.text)
+        self.assertIn('if [ "$target" != "$commit" ]; then', self.text)
+
+    def test_a_handoff_after_an_earlier_upload_tags_the_commit_that_set_the_version(self):
+        # The head can move on without a bump between an upload and a
+        # handoff retry; the tag goes on the commit that introduced the
+        # version, which is what crates.io holds, not on the newer head.
+        _, publish = re.split(r"(?m)^  publish:$", self.text)
+        self.assertIn("UPLOADED_EARLIER: ${{ steps.index.outputs.uploaded }}", publish)
+        self.assertIn('commit="$GITHUB_SHA"', publish)
+        self.assertIn("git log --first-parent -1 --format=%H -G", publish)
+        self.assertIn('git tag -a "$tag" -m "croft $VERSION" "$commit"', publish)
+        self.assertIn("fetch-depth: 0", publish)
 
     def test_release_workflow_can_be_dispatched_on_the_tag(self):
         # The tag is pushed with the workflow token, which never triggers
