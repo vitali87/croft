@@ -11661,8 +11661,11 @@ fn hot_exit_backup_stays_when_croft_does_not_quit_cleanly() {
         .unwrap();
     assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "Esc");
     app.update_status = UpdateStatus::Ready;
-    app.handle_key(key(KeyCode::F(9), KeyModifiers::NONE))
-        .unwrap();
+    app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
     assert!(app.pending_reexec && app.quit, "setup: the relaunch armed");
     assert_eq!(
         hot_exit_files(cache.path(), tmp.path()).len(),
