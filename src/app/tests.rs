@@ -38759,6 +38759,96 @@ fn refresh_run_debug_syncs_the_config_row() {
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
 }
 
+/// A Rust buffer with the caret inside `value`, and the given keybindings.
+fn lsp_nav_app(keymap: &str) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("lib.rs"),
+        "fn main() {\n    let value = 1;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9;
+    app.keymap = crate::keymap::Keymap::from_json(keymap);
+    (app, tmp)
+}
+
+#[test]
+fn a_rebound_chord_runs_go_to_definition_and_rename_symbol() {
+    // #1212: keybindings.json rows naming the caret-driven LSP actions were
+    // rejected as unknown ids, so the only way in was the F-key.
+    let (mut app, _tmp) = lsp_nav_app(
+        r#"[
+            { "key": "ctrl+alt+d", "command": "go_to_definition" },
+            { "key": "ctrl+alt+r", "command": "rename_symbol" },
+            { "key": "ctrl+alt+u", "command": "go_to_references" },
+            { "key": "ctrl+alt+t", "command": "go_to_type_definition" },
+            { "key": "ctrl+alt+i", "command": "go_to_implementations" },
+            { "key": "ctrl+alt+l", "command": "go_to_declaration" }
+        ]"#,
+    );
+    let chord = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+
+    app.handle_key(chord('d')).unwrap();
+    assert!(
+        app.definition_request_id.is_some(),
+        "the bound chord sends the definition request at the caret"
+    );
+    app.handle_key(chord('u')).unwrap();
+    assert!(app.references_request_id.is_some(), "references");
+    app.handle_key(chord('t')).unwrap();
+    assert!(app.type_definition_request_id.is_some(), "type definition");
+    app.handle_key(chord('i')).unwrap();
+    assert!(app.implementation_request_id.is_some(), "implementations");
+    app.handle_key(chord('l')).unwrap();
+    assert!(app.declaration_request_id.is_some(), "declaration");
+    app.handle_key(chord('r')).unwrap();
+    assert!(
+        app.prepare_rename_request.is_some(),
+        "the bound chord starts a rename at the caret"
+    );
+    assert_eq!(app.status, "Preparing rename…");
+}
+
+#[test]
+fn the_f_keys_still_go_to_definition_and_rename_without_a_keymap() {
+    let (mut app, _tmp) = lsp_nav_app("[]");
+    app.handle_key(key(KeyCode::F(12), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.definition_request_id.is_some(), "F12");
+    app.handle_key(key(KeyCode::F(12), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.references_request_id.is_some(), "Shift+F12");
+    app.handle_key(key(KeyCode::F(2), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.prepare_rename_request.is_some(), "F2");
+}
+
+#[test]
+fn a_rebound_go_to_definition_on_a_non_text_view_says_so_and_sends_nothing() {
+    let (mut app, tmp) = lsp_nav_app(
+        r#"[
+            { "key": "ctrl+alt+d", "command": "go_to_definition" },
+            { "key": "ctrl+alt+r", "command": "rename_symbol" }
+        ]"#,
+    );
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(app.editor.has_non_text_view(), "precondition");
+    let chord = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+
+    app.handle_key(chord('d')).unwrap();
+    assert!(app.definition_request_id.is_none());
+    assert_eq!(app.status, "Go to Definition needs a text file");
+    app.handle_key(chord('r')).unwrap();
+    assert!(app.prepare_rename_request.is_none());
+    assert_eq!(app.status, "Rename Symbol needs a text file");
+}
+
 #[test]
 fn rename_symbol_defers_the_prompt_until_a_verdict_arrives() {
     // #254 item 6: F2 no longer opens the prompt straight away — it fires
