@@ -46193,8 +46193,18 @@ impl App {
             .get(self.active_terminal)
             .and_then(|t| t.pid())
             .and_then(cwd_of_pid)
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(|| self.workspace_root().to_path_buf());
+            .filter(|p| p.is_dir());
+        let Some(cwd) = cwd else {
+            // Guessing the workspace root would widen `rg foo` run from a
+            // subdirectory to every file (#1201).
+            if crate::quickfix::parse_search_command(input).is_none() {
+                return false;
+            }
+            self.status = String::from(
+                "Search not seeded: can't tell which directory the terminal searched from",
+            );
+            return true;
+        };
         self.seed_search_from_command_in(input, &cwd)
     }
 

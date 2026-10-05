@@ -23702,15 +23702,34 @@ fn seeding_search_replaces_stale_include_and_exclude_filters() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.search.include = String::from("*.md");
     app.search.exclude = String::from("vendor");
-    assert!(app.seed_search_from_command("rg TODO"));
+    assert!(seed_at_root(&mut app, "rg TODO"));
     assert_eq!(
         app.search.include, "",
         "a bare rg scanned everything; a stale include must not filter the seeded search"
     );
     assert_eq!(app.search.exclude, "");
-    assert!(app.seed_search_from_command("rg -g '*.rs' -g '!target' TODO"));
+    assert!(seed_at_root(&mut app, "rg -g '*.rs' -g '!target' TODO"));
     assert_eq!(app.search.include, "*.rs");
     assert_eq!(app.search.exclude, "target");
+}
+
+/// Seed Search as if the terminal ran `input` at the workspace root.
+fn seed_at_root(app: &mut App, input: &str) -> bool {
+    let root = app.workspace_root().to_path_buf();
+    app.seed_search_from_command_in(input, &root)
+}
+
+/// Negative: with no terminal whose directory croft can read, a search is
+/// refused rather than guessed to have run at the workspace root, which
+/// would widen `rg color` run from src/ to every file (#1201).
+#[test]
+fn a_search_with_no_known_terminal_directory_is_not_seeded() {
+    let (_tmp, mut app) = grep_scope_app();
+    app.search.query = String::from("untouched");
+    assert!(app.seed_search_from_command("rg color"), "still a search");
+    assert_eq!(app.search.query, "untouched");
+    assert!(app.status.contains("Search not seeded"), "{}", app.status);
+    assert!(!app.seed_search_from_command("ls -la"), "not a search");
 }
 
 /// The workspace of #1201: one `color` in src/, one in docs/ and one in a
@@ -23749,7 +23768,7 @@ fn seeded_scope(app: &App, root: &std::path::Path) -> Vec<&'static str> {
 fn seeded_search_covers_only_the_paths_the_grep_searched() {
     let (tmp, mut app) = grep_scope_app();
     let root = tmp.path();
-    assert!(app.seed_search_from_command("rg -n color src/"));
+    assert!(seed_at_root(&mut app, "rg -n color src/"));
     assert_eq!(app.search.query, "color");
     assert_eq!(
         seeded_scope(&app, root),
@@ -23757,7 +23776,7 @@ fn seeded_search_covers_only_the_paths_the_grep_searched() {
         "include: {:?}",
         app.search.include
     );
-    assert!(app.seed_search_from_command("grep -rn color src/style.py docs"));
+    assert!(seed_at_root(&mut app, "grep -rn color src/style.py docs"));
     assert_eq!(seeded_scope(&app, root), ["docs/guide.md", "src/style.py"]);
 }
 
@@ -23766,16 +23785,16 @@ fn seeded_search_covers_only_the_paths_the_grep_searched() {
 fn seeded_search_keeps_the_rg_type_filter() {
     let (tmp, mut app) = grep_scope_app();
     let root = tmp.path();
-    assert!(app.seed_search_from_command("rg -t py color"));
+    assert!(seed_at_root(&mut app, "rg -t py color"));
     assert_eq!(
         seeded_scope(&app, root),
         ["src/style.py", "vendor/lib.py"],
         "include: {:?}",
         app.search.include
     );
-    assert!(app.seed_search_from_command("rg --type-not py color"));
+    assert!(seed_at_root(&mut app, "rg --type-not py color"));
     assert_eq!(seeded_scope(&app, root), ["docs/guide.md"]);
-    assert!(app.seed_search_from_command("rg -t py color src"));
+    assert!(seed_at_root(&mut app, "rg -t py color src"));
     assert_eq!(seeded_scope(&app, root), ["src/style.py"]);
 }
 
@@ -23855,7 +23874,7 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
     app.search.include = String::from("**/*.rs,**/*.toml");
     app.search.focus_field(SearchField::Include);
     app.search.select_all_active();
-    assert!(app.seed_search_from_command("rg -g '*.md' TODO"));
+    assert!(seed_at_root(&mut app, "rg -g '*.md' TODO"));
     assert_eq!(
         app.search.field,
         SearchField::Query,

@@ -37,6 +37,10 @@ pub struct SearchCommand {
     /// `-v`/`--invert-match` or a files-without-match listing: the command
     /// printed what does NOT match the pattern.
     pub inverted: bool,
+    /// Whether a named directory is searched through. rg, ag, ack and git
+    /// grep always do; grep only with `-r`/`-R`/`--recursive`/`-d recurse`,
+    /// and with no path at all it reads stdin.
+    pub recursive: bool,
 }
 
 /// Consume `idx`'s token as a flag value (or take the inline `--flag=value`
@@ -96,6 +100,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
     let mut types_not: Vec<String> = Vec::new();
     let mut inverted = false;
     let is_rg = matches!(prog, "rg" | "ripgrep");
+    let mut recursive = !matches!(prog, "grep" | "egrep" | "fgrep");
 
     // Append a glob to one of the panel's comma-separated filter lists.
     fn push_glob(list: &mut Option<String>, glob: String) {
@@ -139,6 +144,12 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                 "word-regexp" => whole_word = true,
                 "invert-match" | "files-without-match" | "files-without-matches" => inverted = true,
                 "fixed-strings" => use_regex = false,
+                "recursive" | "dereference-recursive" => recursive = true,
+                "directories" => {
+                    if take_value(inline_val, &tokens, &mut idx).as_deref() == Some("recurse") {
+                        recursive = true;
+                    }
+                }
                 "extended-regexp" | "perl-regexp" => use_regex = true,
                 "regexp" => {
                     let v = take_value(inline_val, &tokens, &mut idx);
@@ -196,6 +207,19 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                     // files without a match.
                     'L' if !is_rg => inverted = true,
                     'F' => use_regex = false,
+                    'r' | 'R' => recursive = true,
+                    'd' => {
+                        let rest: String = chars[ci + 1..].iter().collect();
+                        let v = if rest.is_empty() {
+                            take_value(None, &tokens, &mut idx)
+                        } else {
+                            Some(rest)
+                        };
+                        if v.as_deref() == Some("recurse") {
+                            recursive = true;
+                        }
+                        break;
+                    }
                     'E' | 'P' => use_regex = true,
                     'e' | 'g' => {
                         let rest: String = chars[ci + 1..].iter().collect();
@@ -230,7 +254,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                         break;
                     }
                     // Short flags that take a value we don't use.
-                    'f' | 'm' | 'A' | 'B' | 'C' | 't' | 'T' | 'd' => {
+                    'f' | 'm' | 'A' | 'B' | 'C' | 't' | 'T' => {
                         if chars[ci + 1..].is_empty() {
                             let _ = take_value(None, &tokens, &mut idx);
                         }
@@ -267,6 +291,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
         types,
         types_not,
         inverted,
+        recursive,
     })
 }
 
@@ -375,6 +400,9 @@ pub fn scope_filters(
     if sc.inverted {
         return Err(String::from("the grep lists what does not match (-v / -L)"));
     }
+    if !sc.recursive && sc.paths.is_empty() {
+        return Err(String::from("the grep read stdin, not files (no -r)"));
+    }
     let mut exclude: Vec<String> = sc
         .exclude
         .as_deref()
@@ -448,6 +476,9 @@ pub fn scope_filters(
             .join("/");
         if rel.contains(',') {
             return Err(format!("{typed} has a comma in its path"));
+        }
+        if !sc.recursive && canon.is_dir() {
+            return Err(format!("grep without -r skips the directory {typed}"));
         }
         scopes.push((globset_escape(&rel), canon.is_dir()));
     }
@@ -720,5 +751,43 @@ mod tests {
         );
         assert!(f("rg -g '*.rs' -t py x", root).is_err());
         assert!(f("rg -g 'src/*.rs' x src", root).is_err());
+    }
+
+    /// grep without `-r` reads stdin when given no path and skips a named
+    /// directory, so neither seeds a scope; a named file still does.
+    #[test]
+    fn a_grep_without_recursion_seeds_only_the_files_it_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/style.py"), "").unwrap();
+        let f = |cmd: &str| scope_filters(&parse(cmd).unwrap(), root, root);
+        assert!(f("grep color").unwrap_err().contains("stdin"));
+        assert!(
+            f("grep color src")
+                .unwrap_err()
+                .contains("skips the directory src")
+        );
+        assert_eq!(f("grep color src/style.py").unwrap().0, "./src/style.py");
+        for cmd in [
+            "grep -r color src",
+            "grep -Rn color src",
+            "grep --recursive color src",
+            "grep -d recurse color src",
+            "grep --directories=recurse color src",
+            "egrep -rn color src",
+        ] {
+            assert_eq!(f(cmd).unwrap().0, "./src/**", "{cmd}");
+        }
+        // Negative: the tools that recurse on their own need no flag.
+        for cmd in [
+            "rg color src",
+            "git grep color src",
+            "ag color src",
+            "ack color src",
+        ] {
+            assert_eq!(f(cmd).unwrap().0, "./src/**", "{cmd}");
+        }
+        assert_eq!(parse("grep -d skip color src").unwrap().pattern, "color");
     }
 }
