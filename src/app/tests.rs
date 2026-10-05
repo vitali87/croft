@@ -23725,6 +23725,9 @@ fn seed_at_root(app: &mut App, input: &str) -> bool {
 #[test]
 fn a_search_with_no_known_terminal_directory_is_not_seeded() {
     let (_tmp, mut app) = grep_scope_app();
+    // No pane to read a directory from: the app's own shell would answer
+    // with the workspace root.
+    app.active_terminal = app.terminals.len();
     app.search.query = String::from("untouched");
     assert!(app.seed_search_from_command("rg color"), "still a search");
     assert_eq!(app.search.query, "untouched");
