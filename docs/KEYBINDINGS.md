@@ -12,7 +12,8 @@ Per platform:
 
 | Keys | Action |
 |------|--------|
-| `Ctrl+s` / `Cmd+s` | Save the open file |
+| `Ctrl+s` / `Cmd+s` | Save the open file. A folder of its path that is gone (removed by a `git checkout`, say) is created again |
+| Command Palette: `File: Save As…` | Write the open file's buffer to a prompted path (workspace-relative, prefilled with its own) and make the tab that file. Missing folders are created; an existing file is never overwritten. Bind `save_as` in keybindings.json for a key |
 | A file you have unsaved edits in changes on disk | A prompt asks what to do. Typing `reload` + Enter replaces the buffer with the disk version, after recording your unsaved version in Local History (TIMELINE). Esc, or Enter on any other answer (keys typed before you noticed the prompt), keeps your edits; the box says so under the field |
 | Typing `(` `[` `{` or a quote | Auto-closing pairs: the pair inserts with the caret between (openers never before a word, quotes never after one); typing the closer steps over; a selection is surrounded; backspace inside an empty pair deletes both. Settings gear → "Auto Closing Pairs" toggles |
 | `Ctrl+q` | Quit |
@@ -216,7 +217,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | Click the left chevron (`▸`/`▾`) | Expand / collapse the Replace row (expanding focuses it); while a replacement is typed, every result row previews the match crossed out with the expanded replacement beside it |
 | Type in Replace, then `Enter` or click the replace-all icon | Raise the Replace All confirmation — "Replace N occurrence(s) across M file(s)?" — then `Enter`/`Y` rewrites on disk, `Esc` cancels (regex mode honours `$1` capture references); files open with unsaved changes are skipped and named, and the search re-runs afterward |
 | Click the `...` icon | Expand / collapse the "files to include" and "files to exclude" glob inputs |
-| Type globs into include / exclude | Restrict the search to / from matching files (comma-separated, VS Code style; a bare `*.rs` matches at any depth). Editing re-runs the search live |
+| Type globs into include / exclude | Restrict the search to / from matching files (comma-separated, VS Code style; a bare `*.rs` matches at any depth, and brace alternates like `*.{ts,tsx}` are one glob). A glob that doesn't compile shows as `invalid glob: …` in red above its box, and an include box with no valid glob matches nothing. Editing re-runs the search live |
 | `Tab` | Cycle focus through the visible inputs (search → replace → include → exclude) |
 | `↑` / `↓` + `Enter`, or click a result | Open the file at the matched line in the replaceable preview tab |
 | Double-click a result | Pin its tab, so moving to the next result opens beside it instead of replacing it |
@@ -225,7 +226,8 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 
 | Keys | Action |
 |------|--------|
-| Type in the message box | Edit the commit message (the box scrolls horizontally when the message outgrows it) |
+| Type in the message box | Edit the commit message (the box scrolls horizontally when the message outgrows it, and grows a row per line up to six, then scrolls). Pasted text keeps its line breaks |
+| `Shift`+`Enter` / `Alt`+`Enter` | Start a new line in the commit message (a blank line, then the body and trailers); `Up` / `Down` move between its lines |
 | `Enter` | Commit all tracked changes with the message |
 | Click ✓ Commit | Same as `Enter` |
 | Click a change row | Open that file's diff against HEAD in a read-only editor tab |
@@ -318,7 +320,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | Command Palette "Merge: Open Merge Editor" | Three-way merge editor on the active file: Current and Incoming panes above an editable Result (the real buffer — LSP, undo, and save all apply), sourced from the git index stages or synthesized from the file's conflict markers. Non-overlapping edits pre-resolve into the Result; only truly overlapping hunks remain as conflicts. `F7`/`Shift`+`F7` hop conflicts, `Alt`+`↑`/`↓` scrolls the source panes, each conflict's `[ ]` checkboxes (click) or the Merge Conflict accept commands choose sides — both checked is the combination, "Merge: Accept Combination (Incoming First)" flips the order, "Merge: Ignore (Keep Base)" keeps the ancestor text, and editing the Result by hand marks that conflict manually resolved. The header counts "k/n resolved"; "Merge: Complete Merge" refuses until n/n |
 | Command Palette "Merge: Show Base" | Toggle the common-ancestor pane between Current and Incoming in the merge editor |
 | Command Palette "Debug: Add Watch Expression" | Add a WATCH row to the Run and Debug panel (also the panel's "+ Add Expression" row): the expression re-evaluates at every stop, a changed value highlights, a rejected one reads `<not available>`; each row's `✕` removes it, "Debug: Remove All Watch Expressions" clears the list. The expression list lives for the croft run; values and the changed-baseline reset when a debug session ends |
-| `F2` | Rename Symbol across every file it touches (open tabs edit in-memory and stay dirty). The prompt is validated by `textDocument/prepareRename` first when the server supports it: it pre-fills the server's exact symbol range / placeholder, and an invalid position fails fast with the server's own message instead of a generic error; servers without the capability keep the word-under-cursor prompt |
+| `F2` | Rename Symbol across every file it touches (open tabs edit in-memory and stay dirty). The prompt is validated by `textDocument/prepareRename` first when the server supports it: it pre-fills the server's exact symbol range / placeholder, and an invalid position fails fast with the server's own message instead of a generic error; servers without the capability keep the word-under-cursor prompt. A reply that arrives after you have typed into a file it edits is refused, with a status saying so, rather than applied at positions that no longer hold the symbol |
 | `F12` / `Ctrl`+click | Go to Definition (`Shift`+`Ctrl`+click navigates back); `Ctrl` because mouse reports carry no `Cmd` bit and `Option` belongs to multi-cursor. On a range the language server marked as a link (`textDocument/documentLink`: a URL in a comment, an import specifier), the click follows the link instead — web targets to the system opener (or to your own browser through the relay in a remote session), `file://` targets into the editor; any other scheme is refused, since the target is the server's choice and the link text need not reveal it |
 | `q`{a-z} … `q` (vim Normal) | Record a keyboard macro into a register: `qa` starts, any editing follows, a bare `q` stops. A red `● REC @a` badge shows in the status bar while recording. The gesture that starts or stops a recording is never itself recorded |
 | `@`{a-z} / `@@` (vim Normal) | Replay a register, or repeat the last macro. Counts apply: `3@a` runs it three times. Replay aborts on the first key that errors, leaving earlier iterations applied, and a replay longer than 100,000 keys is refused rather than run — the same limits the palette commands carry, since both share one replay path. Iterations never merge into each other — each starts a fresh undo step — but a macro containing several kinds of edit still undoes in the steps those edits would make on their own |
@@ -402,7 +404,7 @@ CSV, TSV, and xlsx grids are editable (xlsx cell edits write through a real xlsx
 | `Enter` / `F2` | Edit the cell in place (caret at the end) |
 | `Enter` (while editing) | Commit and move down; `Tab` commits and moves right; `Esc` cancels |
 | `Delete` | Clear the cell |
-| `Cmd+S` | CSV/TSV: rewrite the file with its own delimiter and quoting. xlsx: write ONLY the touched cells (styles, widths, untouched formulas survive). An external change refuses once and the next Cmd+S overwrites; an xlsx formula cell is held back separately, and the Cmd+S after ITS refusal replaces the formula |
+| `Cmd+S` | CSV/TSV: rewrite the file with its own delimiter, quoting CSV cells that need it and never quoting TSV (a `"` in a TSV is a plain character). xlsx: write ONLY the touched cells (styles, widths, untouched formulas survive). An external change refuses once and the next Cmd+S overwrites; an xlsx formula cell is held back separately, and the Cmd+S after ITS refusal replaces the formula |
 | Click a cell | Select it; a second click on the selected cell opens the editor |
 | Palette: Sheet: Insert Row Below / Delete Row / Insert Column Right / Delete Column | Structure edits anchored on the selected cell |
 | Wheel down / up over the grid | Pan three rows |

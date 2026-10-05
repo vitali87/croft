@@ -1,0 +1,1 @@
+fix: The side-by-side diff clips each side by screen width, so lines with CJK or other double-width characters stay in their half: the seam is drawn on every row and the right side no longer starts at a different column or loses its tail off the pane.

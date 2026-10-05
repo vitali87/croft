@@ -1,0 +1,1 @@
+fix: Typing a bracket inside a string no longer auto-inserts its closer before the closing quote: an opener only auto-closes before whitespace, a closer or punctuation, as in VS Code, so "(" stays "(".

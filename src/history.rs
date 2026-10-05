@@ -514,6 +514,58 @@ fn prune_in(root_dir: &Path, abs_path: &Path) {
     sweep_abandoned_staging(&dir, std::time::SystemTime::now());
 }
 
+/// Carry the history of `old` to `new` after an Explorer rename or move, so
+/// TIMELINE keeps listing the file's snapshots under its new name (the store
+/// is keyed by path, so they were otherwise orphaned). A moved folder carries
+/// every file under it, walked at `new` since `old` is gone. Snapshots `new`
+/// already has are kept: on a clash at the same instant the target's wins,
+/// with its own sidecars. Best-effort, like recording.
+pub fn move_path(root_dir: &Path, old: &Path, new: &Path) {
+    let is_dir = std::fs::symlink_metadata(new).is_ok_and(|m| m.is_dir());
+    if is_dir {
+        let Ok(read) = std::fs::read_dir(new) else {
+            return;
+        };
+        for entry in read.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            move_path(root_dir, &old.join(&name), &new.join(&name));
+        }
+        return;
+    }
+    let from = dir_for(root_dir, old);
+    if !from.is_dir() {
+        return;
+    }
+    let to = dir_for(root_dir, new);
+    if !to.exists() && std::fs::rename(&from, &to).is_ok() {
+        return;
+    }
+    if create_private_dir(&to).is_err() {
+        return;
+    }
+    // Instants the target already holds, read before anything moves in, so
+    // a clashing snapshot's sidecars stay behind with it.
+    let taken: std::collections::HashSet<u64> = entries_in(root_dir, new)
+        .into_iter()
+        .map(|s| s.millis)
+        .collect();
+    if let Ok(read) = std::fs::read_dir(&from) {
+        for entry in read.filter_map(|e| e.ok()) {
+            let file = entry.path();
+            let millis = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok());
+            if millis.is_some_and(|m| taken.contains(&m)) {
+                continue;
+            }
+            let _ = std::fs::rename(&file, to.join(entry.file_name()));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&from);
+    prune_in(root_dir, new);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,5 +1081,87 @@ mod tests {
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(SEATS_EXT))
             .count();
         assert_eq!(sidecars, 0, "an unattributed map writes no sidecar");
+    }
+
+    fn snap_millis(root: &Path, f: &Path) -> Vec<u64> {
+        entries_in(root, f).iter().map(|s| s.millis).collect()
+    }
+
+    /// A renamed file's snapshots follow it to the new name, and the old
+    /// name has none left (#1246).
+    #[test]
+    fn move_path_carries_a_files_snapshots_to_its_new_name() {
+        let hist = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let (old, new) = (
+            work.path().join("notes.txt"),
+            work.path().join("journal.txt"),
+        );
+        std::fs::write(&new, b"v3").unwrap();
+        record_in(hist.path(), &old, b"v1", 1_000).unwrap();
+        record_kept_in(hist.path(), &old, b"v2", 60_000).unwrap();
+        move_path(hist.path(), &old, &new);
+        assert_eq!(snap_millis(hist.path(), &new), vec![60_000, 1_000]);
+        assert!(
+            is_kept(&dir_for(hist.path(), &new), 60_000),
+            "sidecars travel too"
+        );
+        assert!(entries_in(hist.path(), &old).is_empty());
+    }
+
+    /// A moved folder carries the history of every file under it.
+    #[test]
+    fn move_path_carries_every_file_under_a_moved_folder() {
+        let hist = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let (old, new) = (work.path().join("docs"), work.path().join("notes"));
+        std::fs::create_dir_all(new.join("deep")).unwrap();
+        std::fs::write(new.join("a.md"), b"a").unwrap();
+        std::fs::write(new.join("deep").join("b.md"), b"b").unwrap();
+        record_in(hist.path(), &old.join("a.md"), b"a0", 1_000).unwrap();
+        record_in(hist.path(), &old.join("deep").join("b.md"), b"b0", 2_000).unwrap();
+        move_path(hist.path(), &old, &new);
+        assert_eq!(snap_millis(hist.path(), &new.join("a.md")), vec![1_000]);
+        assert_eq!(
+            snap_millis(hist.path(), &new.join("deep").join("b.md")),
+            vec![2_000]
+        );
+        assert!(entries_in(hist.path(), &old.join("a.md")).is_empty());
+    }
+
+    /// Moving onto a path that already has history merges the two; on a
+    /// clash at the same instant the target's snapshot wins, seats and all.
+    #[test]
+    fn move_path_merges_into_the_targets_existing_history() {
+        let hist = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let (old, new) = (work.path().join("a.txt"), work.path().join("b.txt"));
+        std::fs::write(&new, b"x").unwrap();
+        record_in(hist.path(), &old, b"old-1", 1_000).unwrap();
+        record_kept_in(hist.path(), &old, b"old-clash", 50_000).unwrap();
+        record_in(hist.path(), &new, b"new-clash", 50_000).unwrap();
+        move_path(hist.path(), &old, &new);
+        assert_eq!(snap_millis(hist.path(), &new), vec![50_000, 1_000]);
+        let clash = snapshot_file_in(hist.path(), &new, 50_000).unwrap();
+        assert_eq!(std::fs::read(clash).unwrap(), b"new-clash");
+        assert!(
+            !is_kept(&dir_for(hist.path(), &new), 50_000),
+            "the losing snapshot's sidecar does not attach to the winner"
+        );
+        assert!(entries_in(hist.path(), &old).is_empty());
+    }
+
+    /// Only the moved path's history moves.
+    #[test]
+    fn move_path_leaves_other_files_history_alone() {
+        let hist = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let (old, new) = (work.path().join("a.txt"), work.path().join("b.txt"));
+        let other = work.path().join("c.txt");
+        std::fs::write(&new, b"x").unwrap();
+        record_in(hist.path(), &other, b"c", 1_000).unwrap();
+        move_path(hist.path(), &old, &new);
+        assert_eq!(snap_millis(hist.path(), &other), vec![1_000]);
+        assert!(entries_in(hist.path(), &new).is_empty());
     }
 }

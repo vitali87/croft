@@ -96,12 +96,22 @@ mod linux {
     /// when one of them succeeded. Returns `false` when none are installed,
     /// which happens in headless SSH sessions — the caller sends OSC 52 then.
     pub fn write_string(text: &str) -> bool {
-        write_via(&["wl-copy"], text)
-            || write_via(&["xclip", "-selection", "clipboard"], text)
-            || write_via(&["xsel", "--clipboard", "--input"], text)
+        // One deadline for the whole copy, fallbacks included, as for paste.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        write_via(&["wl-copy"], text, deadline)
+            || write_via(&["xclip", "-selection", "clipboard"], text, deadline)
+            || write_via(&["xsel", "--clipboard", "--input"], text, deadline)
     }
 
-    fn write_via(argv: &[&str], text: &str) -> bool {
+    fn write_via(argv: &[&str], text: &str, deadline: std::time::Instant) -> bool {
+        // Bounded by `deadline`, through the program's exit (#1154): a copy
+        // runs on the UI thread, and a helper that never exits (xclip on an
+        // X display that never answers) froze croft for good. The text goes
+        // in on a thread, so a helper that never reads its stdin can't block
+        // a write past the pipe buffer either.
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
         let Ok(mut child) = Command::new(argv[0])
             .args(&argv[1..])
             .stdin(Stdio::piped())
@@ -112,15 +122,48 @@ mod linux {
             return false;
         };
         let Some(mut stdin) = child.stdin.take() else {
-            let _ = child.wait();
+            give_up(&mut child);
             return false;
         };
-        if stdin.write_all(text.as_bytes()).is_err() {
-            let _ = child.wait();
+        let bytes = text.as_bytes().to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let written = stdin.write_all(&bytes).is_ok();
+            drop(stdin);
+            let _ = tx.send(written);
+        });
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if rx.recv_timeout(left) != Ok(true) {
+            give_up(&mut child);
             return false;
         }
-        drop(stdin);
-        child.wait().map(|s| s.success()).unwrap_or(false)
+        wait_by(&mut child, deadline).is_some_and(|s| s.success())
+    }
+
+    /// Kill a helper croft has stopped waiting on, and reap it.
+    fn give_up(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The helper's exit status, or None (and the helper killed) once
+    /// `deadline` passes first.
+    fn wait_by(
+        child: &mut std::process::Child,
+        deadline: std::time::Instant,
+    ) -> Option<std::process::ExitStatus> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => {
+                    give_up(child);
+                    return None;
+                }
+            }
+        }
     }
 
     /// Read text from the system clipboard on Linux.
@@ -161,10 +204,6 @@ mod linux {
             let _ = stdout.read_to_end(&mut buf);
             let _ = tx.send(buf);
         });
-        let give_up = |child: &mut std::process::Child| {
-            let _ = child.kill();
-            let _ = child.wait();
-        };
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         let Ok(bytes) = rx.recv_timeout(left) else {
             give_up(&mut child);
@@ -172,18 +211,7 @@ mod linux {
         };
         // Stdout closing is not exiting: a program can close it and keep
         // running, so the wait is bounded too.
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                _ => {
-                    give_up(&mut child);
-                    return None;
-                }
-            }
-        };
+        let status = wait_by(&mut child, deadline)?;
         if !status.success() {
             return None;
         }
@@ -192,6 +220,52 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
+        fn soon() -> std::time::Instant {
+            std::time::Instant::now() + std::time::Duration::from_secs(1)
+        }
+
+        /// #1154: a copy helper that never exits is given up on at the
+        /// deadline, and so is one that never reads the text it's handed.
+        #[test]
+        fn a_clipboard_writer_that_never_exits_is_given_up_on() {
+            let started = std::time::Instant::now();
+            assert!(!super::write_via(
+                &["sh", "-c", "cat >/dev/null; sleep 30"],
+                "hi",
+                soon()
+            ));
+            let big = "x".repeat(1 << 20);
+            assert!(!super::write_via(&["sh", "-c", "sleep 30"], &big, soon()));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "took {:?}",
+                started.elapsed()
+            );
+        }
+
+        /// A helper that takes the text and exits still copies, a failing
+        /// one doesn't, and a spent deadline starts nothing.
+        #[test]
+        fn a_clipboard_writer_that_exits_still_copies() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("clip");
+            let sink = format!("cat > '{}'", out.display());
+            assert!(super::write_via(&["sh", "-c", &sink], "copied", soon()));
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "copied");
+            assert!(!super::write_via(
+                &["sh", "-c", "cat >/dev/null; exit 1"],
+                "x",
+                soon()
+            ));
+            std::fs::remove_file(&out).unwrap();
+            assert!(!super::write_via(
+                &["sh", "-c", &sink],
+                "late",
+                std::time::Instant::now()
+            ));
+            assert!(!out.exists(), "nothing ran");
+        }
+
         #[test]
         fn a_clipboard_reader_that_never_answers_is_given_up_on() {
             let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(1);

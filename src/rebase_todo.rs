@@ -63,6 +63,19 @@ pub fn set_action(line: &str, action: &str) -> Option<String> {
     Some(format!("{action} {rest}"))
 }
 
+/// Whether `line` is a commit line an action key can rewrite.
+pub fn is_commit_line(line: &str) -> bool {
+    set_action(line, "pick").is_some()
+}
+
+/// Whether a commit line above `row` survives to take a squash or fixup:
+/// git stops the rebase on a squash with nothing picked before it.
+pub fn has_kept_commit_above(lines: &[String], row: usize) -> bool {
+    lines[..row.min(lines.len())]
+        .iter()
+        .any(|l| is_commit_line(l) && !matches!(l.split_whitespace().next(), Some("drop" | "d")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

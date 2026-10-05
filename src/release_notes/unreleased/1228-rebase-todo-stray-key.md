@@ -1,0 +1,1 @@
+fix: In the interactive rebase plan, an action key no longer types its letter into a blank line or moves the caret off the last commit, and squash or fixup on the first commit is refused with a status message, so a stray key can't make git stop the rebase (#1228).
