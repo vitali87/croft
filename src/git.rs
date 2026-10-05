@@ -1288,6 +1288,36 @@ pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<
     }
 }
 
+/// The commits that touched `rel_path`, newest first, each with the name
+/// the file had there: `git log --follow`, so the walk carries on past a
+/// rename under the old name (#1304). Paths are relative to `root`, as
+/// [`read_file_at_rev`] takes them. Empty when git fails.
+pub fn follow_names(root: &Path, rel_path: &str, limit: usize) -> Vec<(String, String)> {
+    let Ok(out) = run_git(
+        root,
+        &[
+            "log",
+            "--follow",
+            &format!("-n{limit}"),
+            "--name-only",
+            "--relative",
+            "--format=%x1e%H",
+            "--",
+            rel_path,
+        ],
+    ) else {
+        return Vec::new();
+    };
+    out.split('\x1e')
+        .filter_map(|record| {
+            let mut lines = record.lines();
+            let hash = lines.next()?.trim();
+            let path = lines.map(str::trim).find(|l| !l.is_empty())?;
+            (!hash.is_empty()).then(|| (hash.to_string(), unquote_porcelain_path(path)))
+        })
+        .collect()
+}
+
 /// The name `rel_path` had in commit `hash`, from the same `--follow` walk
 /// [`file_history`] lists. None when the commit is not in that history.
 fn path_at_commit(root: &Path, hash: &str, rel_path: &str) -> Option<String> {
@@ -4528,6 +4558,49 @@ mod tests {
         // A summary containing the field separator is impossible (git emits the
         // literal subject), but a malformed line missing fields is dropped.
         assert!(parse_file_history("oops-no-fields", now).is_empty());
+    }
+
+    #[test]
+    fn follow_names_lists_the_old_name_before_a_rename() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(p)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::create_dir(p.join("sub")).unwrap();
+        std::fs::write(p.join("sub/old.py"), "a = 1\nb = 2\nc = 3\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add"]);
+        git(&["mv", "sub/old.py", "sub/new.py"]);
+        git(&["commit", "-q", "-m", "rename"]);
+        let names: Vec<String> = follow_names(p, "sub/new.py", 10)
+            .into_iter()
+            .map(|(hash, path)| {
+                assert_eq!(hash.len(), 40, "full hashes, as the scrubber keys them");
+                path
+            })
+            .collect();
+        assert_eq!(names, ["sub/new.py", "sub/old.py"]);
+        // From a workspace rooted in the subfolder, paths are relative to it.
+        let names: Vec<String> = follow_names(&p.join("sub"), "new.py", 10)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(names, ["new.py", "old.py"]);
+        assert!(follow_names(p, "missing.py", 10).is_empty());
     }
 
     #[test]

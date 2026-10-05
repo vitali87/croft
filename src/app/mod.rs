@@ -4243,6 +4243,13 @@ pub struct App {
     /// Each scrubbed commit's tree under the workspace root, for the
     /// Explorer's dimming (#371); `None` records that the listing failed.
     scrub_trees: std::collections::HashMap<String, Option<std::sync::Arc<crate::git::CommitTree>>>,
+    /// Per workspace-relative path, the name the file had at each commit
+    /// the scrubber walks, so history before a rename reads the old name
+    /// (#1304). One `--follow` walk per file per scrub.
+    scrub_names: std::collections::HashMap<
+        String,
+        std::sync::Arc<std::collections::HashMap<String, String>>,
+    >,
     /// Builds highlighted historical views off the UI thread (#371),
     /// started on the first step.
     scrub_builder: Option<crate::scrubber::ViewBuilder>,
@@ -6180,6 +6187,7 @@ impl App {
             scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
             scrub_trees: std::collections::HashMap::new(),
+            scrub_names: std::collections::HashMap::new(),
             scrub_builder: None,
             scrub_views: std::collections::VecDeque::new(),
             scrub_plain: std::collections::VecDeque::new(),
@@ -37584,6 +37592,7 @@ impl App {
         self.scrub_view = None;
         self.scrub_view_key = None;
         self.tree.scrub_tree = None;
+        self.scrub_names.clear();
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
             return;
@@ -39075,11 +39084,12 @@ impl App {
             self.status = String::from("The open file is outside the workspace");
             return None;
         };
+        let name = self.scrub_name_at(&rel, &commit.hash);
         let text = self
             .scrub_cache
             .entry((commit.hash.clone(), rel.clone()))
             .or_insert_with(|| {
-                crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                crate::git::read_file_at_rev(&root, &commit.hash, &name)
                     .ok()
                     .map(std::sync::Arc::from)
             })
@@ -39195,9 +39205,25 @@ impl App {
             width: body.width,
             height: 1,
         };
+        // Before a rename, say what the file was called then (#1304).
+        let rel = self.editor.path.as_ref().and_then(|p| {
+            p.strip_prefix(self.workspace_root())
+                .ok()
+                .map(|r| r.to_string_lossy().into_owned())
+        });
         let label = match (scrub.position(), scrub.commit()) {
             (crate::scrubber::Position::At(i), Some(c)) => {
-                format!(" {} {}/{} ", c.short_hash, scrub.len() - i, scrub.len())
+                let then = rel.as_ref().and_then(|rel| {
+                    self.scrub_names
+                        .get(rel)?
+                        .get(&c.hash)
+                        .filter(|n| *n != rel)
+                });
+                let n = scrub.len() - i;
+                match then {
+                    Some(old) => format!(" {} {n}/{} \u{b7} {old} ", c.short_hash, scrub.len()),
+                    None => format!(" {} {n}/{} ", c.short_hash, scrub.len()),
+                }
             }
             _ => String::from(" working tree "),
         };
@@ -39320,12 +39346,13 @@ impl App {
             None => (take(&mut self.scrub_plain), false),
         };
         // Neither ready (the first step, or a jump): build the stand-in here.
+        let name = self.scrub_name_at(&rel, &commit.hash);
         let view = view.or_else(|| {
             let text = self
                 .scrub_cache
                 .entry((commit.hash.clone(), rel.clone()))
                 .or_insert_with(|| {
-                    crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                    crate::git::read_file_at_rev(&root, &commit.hash, &name)
                         .ok()
                         .map(std::sync::Arc::from)
                 })
@@ -39342,6 +39369,35 @@ impl App {
         self.scrub_view = Some(view);
         self.scrub_view_key = Some((key, finished));
         self.request_scrub_views(&root, &path, &rel);
+    }
+
+    /// The name `rel` had at each commit the scrubber walks (#1304), keyed
+    /// by full hash; a commit missing from it had no older name.
+    fn scrub_names(
+        &mut self,
+        rel: &str,
+    ) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+        if let Some(names) = self.scrub_names.get(rel) {
+            return std::sync::Arc::clone(names);
+        }
+        let Some(scrub) = self.scrubber.as_ref() else {
+            return Default::default();
+        };
+        let touched = crate::git::follow_names(self.workspace_root(), rel, SCRUB_COMMIT_LIMIT);
+        let names =
+            std::sync::Arc::new(crate::scrubber::names_by_commit(scrub.commits(), &touched));
+        self.scrub_names
+            .insert(rel.to_string(), std::sync::Arc::clone(&names));
+        names
+    }
+
+    /// The name to read `rel` by at commit `hash`: its name there when the
+    /// file was renamed since, else `rel` itself.
+    fn scrub_name_at(&mut self, rel: &str, hash: &str) -> String {
+        self.scrub_names(rel)
+            .get(hash)
+            .cloned()
+            .unwrap_or_else(|| rel.to_string())
     }
 
     /// Put the finished view being left back among the kept ones, so
@@ -39437,6 +39493,7 @@ impl App {
     /// stand-ins for the ones with neither a stand-in nor a finished view,
     /// and finished views for the ones without one; most urgent first.
     fn request_scrub_views(&mut self, root: &Path, path: &Path, rel: &str) {
+        let names = self.scrub_names(rel);
         let Some(scrub) = self.scrubber.as_ref() else {
             return;
         };
@@ -39450,6 +39507,15 @@ impl App {
                 },
                 path: path.to_path_buf(),
                 short: c.short_hash.clone(),
+                read_rel: names.get(&c.hash).map_or(rel, String::as_str).to_string(),
+                // A parent past the walked commits keeps the commit's name.
+                parent_rel: c
+                    .parents
+                    .first()
+                    .and_then(|p| names.get(p))
+                    .or_else(|| names.get(&c.hash))
+                    .map_or(rel, String::as_str)
+                    .to_string(),
                 parent: c.parents.first().cloned(),
                 text: self
                     .scrub_cache

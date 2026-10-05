@@ -70516,3 +70516,126 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
+
+/// The repo from #1304: `old.py` gets v1 and v2, is renamed to `new.py`, an
+/// unrelated commit lands, then `new.py` gets v3. Returns the repo and the
+/// text after each version.
+fn renamed_file_repo() -> (tempfile::TempDir, [&'static str; 3]) {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    let texts = [
+        "def v1():\n    pass\n",
+        "def v1():\n    pass\n\ndef v2():\n    pass\n",
+        "def v1():\n    pass\n\ndef v2():\n    pass\n\ndef v3():\n    pass\n",
+    ];
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    std::fs::write(tmp.path().join("old.py"), texts[0]).unwrap();
+    git(&["add", "old.py"]);
+    git(&["commit", "-q", "-m", "v1 in old.py"]);
+    std::fs::write(tmp.path().join("old.py"), texts[1]).unwrap();
+    git(&["commit", "-q", "-am", "v2"]);
+    git(&["mv", "old.py", "new.py"]);
+    git(&["commit", "-q", "-m", "rename"]);
+    std::fs::write(tmp.path().join("notes.txt"), "unrelated\n").unwrap();
+    git(&["add", "notes.txt"]);
+    git(&["commit", "-q", "-m", "unrelated"]);
+    std::fs::write(tmp.path().join("new.py"), texts[2]).unwrap();
+    git(&["commit", "-q", "-am", "v3"]);
+    (tmp, texts)
+}
+
+fn lines_of(text: &str) -> Vec<String> {
+    text.lines().map(str::to_string).collect()
+}
+
+#[test]
+fn scrubbing_follows_a_renamed_file_back_past_the_rename() {
+    let (repo, texts) = renamed_file_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("new.py")).unwrap();
+    app.scrub_history();
+    fn step(app: &mut App) -> &mut crate::widgets::editor::Editor {
+        assert!(app.handle_scrubber_key(KeyCode::Left));
+        settle_scrub_view(app);
+        app.scrub_view.as_mut().unwrap()
+    }
+    assert_eq!(step(&mut app).lines, lines_of(texts[2]), "v3");
+    assert_eq!(step(&mut app).lines, lines_of(texts[1]), "unrelated");
+    let view = step(&mut app);
+    assert_eq!(view.lines, lines_of(texts[1]), "rename");
+    for row in 0..view.lines.len() {
+        assert_eq!(
+            view.git_mark_at(row),
+            None,
+            "the rename changed no line, so row {row} has no mark"
+        );
+    }
+    let view = step(&mut app);
+    assert_eq!(view.lines, lines_of(texts[1]), "v2 shows old.py's text");
+    assert_eq!(
+        view.git_mark_at(4),
+        Some(crate::widgets::editor::GitMark::Added),
+        "v2's own change is marked against v1 in old.py"
+    );
+    assert_eq!(view.git_mark_at(0), None);
+    assert_eq!(step(&mut app).lines, lines_of(texts[0]), "v1 in old.py");
+}
+
+#[test]
+fn the_scrub_bar_names_the_file_as_it_was_called_before_a_rename() {
+    let (repo, _) = renamed_file_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("new.py")).unwrap();
+    app.scrub_history();
+    let bar = |app: &mut App| {
+        settle_scrub_view(app);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let y = app.scrub_slider.y;
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect::<String>()
+    };
+    for _ in 0..3 {
+        assert!(app.handle_scrubber_key(KeyCode::Left));
+    }
+    let at_rename = bar(&mut app);
+    assert!(!at_rename.contains("old.py"), "{at_rename}");
+    assert!(app.handle_scrubber_key(KeyCode::Left));
+    let at_v2 = bar(&mut app);
+    assert!(at_v2.contains("2/5 \u{b7} old.py"), "{at_v2}");
+}
+
+#[test]
+fn a_file_added_later_still_did_not_exist_before_it() {
+    // Negative: following renames must not invent a history for a file
+    // that was created, not moved.
+    let (repo, _) = renamed_file_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("notes.txt")).unwrap();
+    app.scrub_history();
+    for _ in 0..3 {
+        assert!(app.handle_scrubber_key(KeyCode::Left));
+    }
+    settle_scrub_view(&mut app);
+    let view = app.scrub_view.as_ref().unwrap();
+    assert_eq!(view.lines.len(), 1, "{:?}", view.lines);
+    assert!(
+        view.lines[0].starts_with("(notes.txt did not exist at "),
+        "{:?}",
+        view.lines
+    );
+}
