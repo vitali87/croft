@@ -50,6 +50,12 @@ pub enum Provision {
         package: &'static str,
         version: Option<&'static str>,
         bin: &'static str,
+        /// The Termux package the install reroutes to on Android, where uv
+        /// cannot run. Termux packages ty and ruff under their PyPI names, so
+        /// a manifest that says nothing gets `package`; `None` is a tool
+        /// Termux does not package at all (rumdl, #851), which is left to a
+        /// copy on PATH rather than sent to a `pkg install` bound to fail.
+        termux_pkg: Option<&'static str>,
     },
     /// A prebuilt binary downloaded from a release URL and unpacked under
     /// `~/.croft/servers/<name>/`. Host-agnostic: each `targets` entry is a full
@@ -856,8 +862,11 @@ pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
                 package, version, ..
             } => run_npm_install(name, language, package, *version),
             Provision::Uv {
-                package, version, ..
-            } => run_uv_install(name, language, package, *version),
+                package,
+                version,
+                bin,
+                termux_pkg,
+            } => run_uv_install(name, language, package, *version, bin, *termux_pkg),
             Provision::Binary {
                 targets,
                 bin,
@@ -998,10 +1007,28 @@ fn run_termux_pkg_install(name: &'static str, language: Language, package: &str)
 /// `uv tool install <pkg>` into croft's own uv tool dir. Requires `uv` on the
 /// system; uv pulls a suitable Python interpreter itself, so nothing else is
 /// needed on the box. On Termux the install reroutes to the native `pkg`
-/// backend instead of the unreachable uv chain.
-fn run_uv_install(name: &'static str, language: Language, package: &str, version: Option<&str>) {
+/// backend instead of the unreachable uv chain, or, for a tool Termux does not
+/// package, says so and leaves it to a copy the user puts on PATH.
+fn run_uv_install(
+    name: &'static str,
+    language: Language,
+    package: &str,
+    version: Option<&str>,
+    bin: &str,
+    termux_pkg: Option<&str>,
+) {
     if crate::iterm2_inline::detect_termux() {
-        run_termux_pkg_install(name, language, package);
+        match termux_pkg {
+            Some(pkg) => run_termux_pkg_install(name, language, pkg),
+            None => {
+                log_file::log(&format!(
+                    "lsp[{name}] cannot auto-install on Termux: no Termux package for {package}"
+                ));
+                set_status(format!(
+                    "{name} unavailable: Termux has no package for it (install `{bin}` on PATH yourself)"
+                ));
+            }
+        }
         return;
     }
     let Some(uv) = ensure_uv() else {
@@ -1430,16 +1457,23 @@ mod tests {
 
     #[test]
     fn uv_provisioned_python_servers_use_their_termux_repo_package_names() {
-        // The Termux pkg backend reuses `Provision::Uv`'s PyPI package name
-        // as the Termux package name. That only works because Termux packages
-        // ty and ruff under exactly those names (verified in termux-packages
-        // on 2026-06-10); this test pins the assumption on croft's side.
+        // The Termux pkg backend installs ty and ruff under their PyPI names,
+        // which works because Termux packages them under exactly those names
+        // (verified in termux-packages on 2026-06-10); this test pins the
+        // assumption on croft's side.
         for (config, expected) in [
             (crate::lsp::config::ServerConfig::ty(), "ty"),
             (crate::lsp::config::ServerConfig::ruff(), "ruff"),
         ] {
             match config.provision {
-                Some(Provision::Uv { package, .. }) => assert_eq!(package, expected),
+                Some(Provision::Uv {
+                    package,
+                    termux_pkg,
+                    ..
+                }) => {
+                    assert_eq!(package, expected);
+                    assert_eq!(termux_pkg, Some(expected));
+                }
                 other => panic!("expected Uv provision for {expected}, got {other:?}"),
             }
         }

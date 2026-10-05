@@ -1,0 +1,1 @@
+fix: The Attach to Python Process picker shows each process's command line again, with the PID column padded so 4- and 5-digit PIDs line up, and no longer lists croft's own pdb attach sessions (#868).

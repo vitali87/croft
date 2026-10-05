@@ -8,12 +8,21 @@
 # here and a download that does not match is refused before it is written.
 # PATH-first, so a marksman from brew/nix/mason wins. The release has no
 # bionic build, so on Termux the install reroutes to `pkg install marksman`
-# (Termux builds the same release against its own dotnet). The built-in
-# Markdown lint (src/markdown_lint.rs) keeps running beside it. Bump by editing
+# (Termux builds the same release against its own dotnet). Bump by editing
 # the release tag in every URL and re-pinning every digest.
+#
+# rumdl (#851) runs beside it at priority 1: markdownlint's full rule set and
+# more (84 rules, reading `.markdownlint.*` / `.rumdl.toml`), quick fixes, and
+# document formatting. Where the two overlap (navigation, completion, symbols)
+# the per-capability selector keeps marksman; code actions and diagnostics are
+# gathered from both. It is a maturin binary wheel on PyPI, so uv installs it
+# pinned, as it does ty and ruff; a rumdl on PATH wins. Termux has no package
+# for it (`termux_pkg = false`), so on Android it is used only from PATH
+# (`cargo install rumdl`). While it runs, the built-in lint
+# (src/markdown_lint.rs, four of those same rules) stands down.
 id = "lsp-markdown"
-name = "Markdown (marksman)"
-description = "Markdown language support via marksman."
+name = "Markdown (marksman, rumdl)"
+description = "Markdown language support via marksman, with rumdl for linting and formatting."
 builtin = true
 api_version = 1
 
@@ -29,3 +38,11 @@ args = ["server"]
 language = "markdown"
 priority = 0
 provision = { kind = "binary", bin = "marksman", archive = "raw", termux_pkg = "marksman", targets = { "macos" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-macos", "linux-x86_64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-x64", "linux-aarch64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-arm64" }, sha256 = { "macos" = "6a801c17b5ac0dba69787c5282b3b3bd416e66c96253fae098d311c6bbd1833b", "linux-x86_64" = "be5098e8213219269c47fc0d916a66fa31ce0602ec967475c722260aabf26087", "linux-aarch64" = "db8e124527f7f8048e3e6c91821b9c52ef173d92c01e47d221bf1337afd962fb" } }
+
+[[language_servers]]
+name = "rumdl"
+command = "rumdl"
+args = ["server"]
+language = "markdown"
+priority = 1
+provision = { kind = "uv", package = "rumdl", version = "0.2.77", bin = "rumdl", termux_pkg = false }

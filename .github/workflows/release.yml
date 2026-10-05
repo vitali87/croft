@@ -259,9 +259,10 @@ jobs:
             gh release create "$tag" --title "$tag" --notes-file "$notes" \
               dist/croft-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
           else
-            # Every shipped version has a notes file by the release-hygiene
-            # gate, so a missing one means the tag does not match any version
-            # that went through it. Say so rather than inventing a body.
+            # Every version has a notes file: version-bump.yml writes it in
+            # the commit that sets the version, and before that ci.yml's
+            # release-notes gate required one. A missing one means the tag
+            # does not match any version. Say so rather than inventing a body.
             echo "no src/release_notes/$version.md for tag $tag" >&2
             exit 1
           fi

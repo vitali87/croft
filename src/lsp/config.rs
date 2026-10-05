@@ -119,6 +119,7 @@ impl ServerConfig {
                 package: "ty",
                 version: None,
                 bin: "ty",
+                termux_pkg: Some("ty"),
             }),
         }
     }
@@ -160,6 +161,7 @@ impl ServerConfig {
                 package: "ruff",
                 version: None,
                 bin: "ruff",
+                termux_pkg: Some("ruff"),
             }),
         }
     }
@@ -320,6 +322,7 @@ mod tests {
                 package: "ty",
                 version: None,
                 bin: "ty",
+                termux_pkg: Some("ty"),
             })
         );
     }

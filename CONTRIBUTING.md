@@ -172,55 +172,76 @@ git merge-base --is-ancestor origin/main HEAD && echo ok || echo "main is NOT me
 git log -1 --format=%p            # a merge has two parents; one means it is not one
 ```
 
-Run it in the same breath as the version re-read below — both answer "is this
-branch really current with main", and neither is visible in a diff.
-
-**Your version was valid when you branched and is stale by the time you merge.**
-The release gate compares your head against the merge base, so it passes as
-long as your branch is above main *at that point*. Two branches can both pass
-legitimately and only the second to merge conflicts. Re-read
-`git show origin/main:Cargo.toml` in the same breath as the final
-`gh pr checks`, which is one command.
+Run it in the same breath as the final `gh pr checks`: it answers "is this
+branch really current with main", which is not visible in a diff.
 
 
-## Every shipped change is a release
+## Every shipped change carries release notes
 
 A PR that changes anything compiled into the binary (`src/`, `assets/`,
-`build.rs`, `Cargo.toml`, `Cargo.lock`) must also:
-
-* **bump `version` in `Cargo.toml`** — two different binaries must never share
-  a version and differ only in commit hash, and
-* **write `src/release_notes/<version>.md`** — one file per version, named
-  for the version in `Cargo.toml`. The welcome panel's "IN THIS RELEASE" card
-  describes the single version it is baked into, so a missing or stale list
-  means the panel lies about what the running build ships.
-
-One highlight per line, each prefixed `feature:` or `fix:`, which selects the
-card's glyph and tint. Blank lines and `#` headings are ignored:
+`build.rs`, `Cargo.toml`, `Cargo.lock`) adds one file to
+`src/release_notes/unreleased/`, named for the change and starting with its
+issue number so no two PRs pick the same name, for example `862-hot-exit.md`.
+It holds the change's highlights, one per line, each prefixed `feature:` or
+`fix:`, which selects the card's glyph and tint. Blank lines and `#` headings
+are ignored:
 
 ```text
 feature: Cmd+F now searches a rendered colour log.
 fix: A copy larger than the cap no longer splits a character.
 ```
 
-A missing file for the current version is a **build** error, not an empty
-panel, so a binary always describes itself.
+A PR **never** changes `version` in `Cargo.toml` and never writes
+`src/release_notes/<version>.md`. The version is assigned after the merge
+(below), so there is nothing to keep current with main: no PR edits the same
+line as another, and none has to move its number when another merges first.
 
-Notes live in one file per version rather than one shared file because two
-versions' notes never conflict in content, only in the file they shared: with
-several PRs open, every merge forced a rebase through it, and the version
-number had to be reserved by hand between contributors. Only the current
-version's file may change in a PR: an older one describes a release that has
-already shipped.
+A build carries the pending notes when there are any: its welcome card heads
+them "IN THIS BUILD (vX.Y.Z+)", since they are changes on top of that release.
+With none pending it shows its own version's notes under "IN THIS RELEASE".
+A build with neither is a **build** error, not an empty panel, so a binary
+always describes itself.
 
-CI enforces all of it (the `version bump + release notes` job), the 1000 cap
-included. Docs, CI, and
-test-only PRs are exempt: `src/app/tests.rs` and `tests/` by path, and a `.rs`
-file whose diff touches nothing outside a `#[cfg(test)]` module, since most of
-croft's unit tests sit beside the code they cover and a change confined to them
-produces a byte-identical binary. Anything that filter is unsure about counts
-as shipped, so an unexpected bump request is the failure it prefers over a
-waived one.
+CI enforces it (the `release notes` job, `scripts/release.py check`): a shipped
+change must add a fragment that says something, and no PR may change the
+version or any version's notes. Docs, CI, and test-only PRs are exempt:
+`src/app/tests.rs` and `tests/` by path, and a `.rs` file whose diff touches
+nothing outside a `#[cfg(test)]` module, since most of croft's unit tests sit
+beside the code they cover and a change confined to them produces a
+byte-identical binary. Anything that filter is unsure about counts as shipped,
+so an unexpected request for notes is the failure it prefers over a waived one.
+Fixing a typo in a pending fragment changes no code and owes no fragment of its
+own. A fragment pending on main may be edited, or moved to another name, but
+not deleted: the next release would leave it out.
+
+Why fragments: notes in one shared file put every open PR on the others'
+rebase path (#399), and then a version bump in every PR put every open PR in
+conflict on the version lines of `Cargo.toml` and `Cargo.lock` whenever any of
+them merged. Each PR's notes in a file only it names never conflict.
+
+### Releases are cut after merge
+
+On every push to main, `.github/workflows/version-bump.yml` runs
+`scripts/release.py cut`: it folds every pending fragment, in file-name order,
+into `src/release_notes/<next>.md`, removes the fragments, bumps `version` in
+`Cargo.toml` and croft's entry in `Cargo.lock`, and pushes one
+`chore: release <next>` commit. A merge that shipped nothing leaves no fragment
+and releases nothing. Runs are serialized and queued, so two merges close
+together never take the same number, a release asked for by hand waits its
+turn rather than being replaced, and merges that land while one run is going
+are released together by the next. A run whose push loses the race to a merge cuts again on
+the new main. A version's notes, once written, describe that release and are
+never edited.
+
+The workflow pushes past main's pull-request rule with a deploy key, as
+code-graph-rag's version bump does: a deploy key with **write** access, whose
+private key is the repository secret `VERSION_BUMP_SSH_KEY`. Without that
+secret the job fails and says so, and the notes stay pending until it is set.
+
+The bump is a patch. For a minor or major release, run the workflow by hand
+(Actions → version bump → Run workflow) on main and pick the component.
+Publishing is unchanged: pushing a `v<version>` tag runs `release.yml`, whose
+release body is `src/release_notes/<version>.md`.
 
 ### crates.io publishes every 50 bumps
 
@@ -245,16 +266,13 @@ version bump uses. A bump that would take one to 1000 carries into the next
 component and resets the lower ones to 0: `0.1.999` is followed by `0.2.0`,
 never `0.1.1000`, and `0.999.999` by `1.0.0`. A version already past the cap
 carries on its next bump the same way, which is why the release after
-`0.1.1244` is `0.2.0`. Let the helper pick the number rather than adding one
-by hand:
+`0.1.1244` is `0.2.0`. `scripts/release.py cut` takes the next number from
+`scripts/next_version.py`, which holds the rule:
 
 ```bash
-python3 scripts/next_version.py "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)"   # next patch
-python3 scripts/next_version.py 0.2.7 minor                                          # 0.3.0
+python3 scripts/next_version.py 0.2.999          # 0.3.0
+python3 scripts/next_version.py 0.2.7 minor      # 0.3.0
 ```
-
-Skipping numbers to stay clear of other open PRs is still fine; the gate only
-refuses a version that does not go up or has a component at or above 1000.
 
 ## Show it: a visible change comes with a recording
 

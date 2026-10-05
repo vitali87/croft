@@ -1,0 +1,1 @@
+fix: On Linux, a copy whose clipboard helper (wl-copy, xclip, xsel) never exits, such as xclip on a stalled X forward, no longer freezes croft for good: croft gives up on the helper after two seconds and falls back to OSC 52, as paste already did.

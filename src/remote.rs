@@ -546,7 +546,7 @@ fn run_croft_session(
     // `hash(launch arg)` the dtach socket uses — NOT the remote croft's
     // `workspace_root`. The workspace diverges from the launch identity (a
     // no-path launch opens the login dir, but the user may then open a
-    // subfolder, and that opened root is also preserved across the F9 re-exec),
+    // subfolder, and that opened root is also preserved across a self re-exec),
     // so a workspace-keyed relay desynced the moment the opened folder differed
     // from where the pump's `pwd` lands. The key is deterministic, so carrying
     // it in env is freeze-safe: dtach freezes it at first launch, but every
@@ -879,7 +879,7 @@ pub fn launch_croft_with(
     if remote_croft_present(&ssh).unwrap_or(false) {
         // A croft is already installed: attach to it right away. Any update
         // cross-builds and ships on a background thread, and the running
-        // remote croft offers the F9 reload once the new binary lands. The
+        // remote croft offers a relaunch once the new binary lands. The
         // user must never wait behind a build for a session that already
         // exists.
         spawn_background_install(&ssh);
@@ -1002,6 +1002,40 @@ impl SshControl {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A stand-in for `ssh` in this test thread, so the commands built here
+    /// can run against a local shim.
+    static TEST_SSH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn ssh_program() -> OsString {
+    #[cfg(test)]
+    if let Some(p) = TEST_SSH.with(|p| p.borrow().clone()) {
+        return p.into_os_string();
+    }
+    OsString::from("ssh")
+}
+
+/// A background command whose output croft reads: `script` on `host` over
+/// the control socket.
+fn ssh_socket_read(socket_path: &Path, host: &str, script: &str) -> Command {
+    let mut command = ssh_socket_command(socket_path, true);
+    // Background commands null all three streams; a reader needs stdout
+    // back, or `output()` hands it an empty string (#1247).
+    command.arg(host).arg(script).stdout(Stdio::piped());
+    command
+}
+
+/// The remote's config-file hashes, or `None` when they can't be read.
+fn read_remote_hashes(mut command: Command) -> Option<std::collections::BTreeMap<String, String>> {
+    let out = command.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    crate::config_sync::parse_remote_listing(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// Build an ssh invocation over an existing control socket.
 ///
 /// `background` marks a command that runs *while the remote session owns the
@@ -1012,7 +1046,7 @@ impl SshControl {
 /// onto the alt screen. The interactive session is the one caller that must
 /// keep the terminal, so it passes `false`.
 fn ssh_socket_command(socket_path: &Path, background: bool) -> Command {
-    let mut command = Command::new("ssh");
+    let mut command = Command::new(ssh_program());
     command
         .arg("-S")
         .arg(socket_path)
@@ -1963,7 +1997,7 @@ fn write_relay_err(host: &str, socket: &Path, inbox_dir: &str, request_id: &str,
 /// from the launch identity — a no-path launch opens the login dir, the user
 /// then opens a subfolder, and the pump (which only knows the launch arg) can't
 /// see that divergence. The launch arg is the one identity both sides share and
-/// that is invariant across an in-session workspace change and the F9 re-exec.
+/// that is invariant across an in-session workspace change and a self re-exec.
 /// `DefaultHasher` has fixed SipHash keys, so the value is deterministic across
 /// croft processes.
 pub(crate) fn relay_session_id(launch_arg: &str) -> String {
@@ -2401,19 +2435,15 @@ fn push_config_files(ssh: &SshControl, resolution: &SyncResolution, log: &mut dy
 
     // What is there now, so a copy edited on the remote is never replaced
     // (#262). Unreadable means unknown, and unknown is not permission.
-    let remote = match ssh
-        .background_shell(&crate::config_sync::remote_hash_script())
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            crate::config_sync::parse_remote_hashes(&String::from_utf8_lossy(&out.stdout))
-        }
-        _ => {
-            log(String::from(
-                "Config sync: could not read the remote's copies; pushing nothing rather than risk overwriting them",
-            ));
-            return;
-        }
+    let Some(remote) = read_remote_hashes(ssh_socket_read(
+        &ssh.socket_path,
+        &ssh.host,
+        &crate::config_sync::remote_hash_script(),
+    )) else {
+        log(String::from(
+            "Config sync: could not read the remote's copies; pushing nothing rather than risk overwriting them",
+        ));
+        return;
     };
     let state_path = crate::config_sync::SyncState::path();
     let mut state = crate::config_sync::SyncState::load(&state_path);
@@ -2617,9 +2647,12 @@ impl ConfigRepush {
 /// one, remote first, so `+` lines are what a push would bring.
 fn print_config_diff(ssh: &SshControl, name: &str) -> Result<()> {
     let local = crate::prefs::config_dir().join(name);
-    let out = ssh
-        .background_shell(&format!("cat ~/.config/croft/{name} 2>/dev/null"))
-        .output()?;
+    let out = ssh_socket_read(
+        &ssh.socket_path,
+        &ssh.host,
+        &format!("cat ~/.config/croft/{name} 2>/dev/null"),
+    )
+    .output()?;
     let tmp = std::env::temp_dir().join(format!("croft-sync-{}-{name}", std::process::id()));
     std::fs::write(&tmp, &out.stdout)?;
     let local_arg = if local.is_file() {
@@ -2841,15 +2874,12 @@ fn push_over_bulk_lane(
         return all_failed();
     }
     // The connect-time rule (#262): never over a copy edited there since.
-    let mut hashes = ssh_socket_command(socket, true);
-    hashes
-        .arg(host)
-        .arg(crate::config_sync::remote_hash_script());
-    let remote = match hashes.output() {
-        Ok(out) if out.status.success() => {
-            crate::config_sync::parse_remote_hashes(&String::from_utf8_lossy(&out.stdout))
-        }
-        _ => return all_failed(),
+    let Some(remote) = read_remote_hashes(ssh_socket_read(
+        socket,
+        host,
+        &crate::config_sync::remote_hash_script(),
+    )) else {
+        return all_failed();
     };
     let state_path = crate::config_sync::SyncState::path();
     let mut state = crate::config_sync::SyncState::load(&state_path);
@@ -3958,6 +3988,96 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// A fake `ssh` for this test thread: it drops ssh's own flags and the
+    /// host, then runs the remote command locally with `home` as `$HOME`.
+    #[cfg(unix)]
+    fn fake_ssh(dir: &Path, home: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = dir.join("ssh");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-o) shift 2;; -*) shift;; *) break;; esac; done\nshift\nHOME='{}' exec sh -c \"$*\"\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        TEST_SSH.with(|p| *p.borrow_mut() = Some(shim));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_config_hash_read_sees_the_remotes_files() {
+        // #1247: background ssh nulls stdout, so `.output()` read nothing
+        // and every remote copy counted as absent, then got overwritten.
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".config/croft");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("triggers.json"), "{\"c\": \"#123456\"}\n").unwrap();
+        fake_ssh(bin.path(), home.path());
+        let got = read_remote_hashes(ssh_socket_read(
+            &bin.path().join("ctl"),
+            "box",
+            &crate::config_sync::remote_hash_script(),
+        ))
+        .expect("the listing reads");
+        assert_eq!(
+            got.get("triggers.json"),
+            Some(&crate::config_sync::content_hash(b"{\"c\": \"#123456\"}\n")),
+            "{got:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_config_diff_read_returns_the_remote_copy() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".config/croft");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("triggers.json"), "remote copy\n").unwrap();
+        fake_ssh(bin.path(), home.path());
+        let out = ssh_socket_read(
+            &bin.path().join("ctl"),
+            "box",
+            "cat ~/.config/croft/triggers.json 2>/dev/null",
+        )
+        .output()
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "remote copy\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_still_keeps_ssh_off_the_terminal() {
+        // Negative: the read must not take the user's stdin or write
+        // diagnostics over the screen: `-n`, and `cat` on the remote ends at
+        // once on an empty stdin.
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fake_ssh(bin.path(), home.path());
+        let mut cmd = ssh_socket_read(&bin.path().join("ctl"), "box", "cat && echo done >&2");
+        assert!(cmd.get_args().any(|a| a == "-n"));
+        let out = cmd.output().unwrap();
+        assert!(out.stdout.is_empty());
+        assert!(out.stderr.is_empty(), "stderr stays off the terminal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_listing_pushes_nothing() {
+        // Negative: a failed read is unknown, never "absent everywhere".
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fake_ssh(bin.path(), home.path());
+        assert_eq!(
+            read_remote_hashes(ssh_socket_read(&bin.path().join("ctl"), "box", "exit 255")),
+            None
+        );
+    }
 
     #[cfg(unix)]
     #[test]

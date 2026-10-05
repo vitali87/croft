@@ -32,6 +32,7 @@ Install the remaining servers yourself:
 ```bash
 pkg install nodejs     # lets croft set up the TypeScript / JavaScript server
 pkg install gopls      # Go (picked up from PATH)
+cargo install rumdl    # Markdown linting and formatting (Termux packages no rumdl; picked up from PATH)
 ```
 
 `croft remote <host>` also needs **`rsync`** on the phone to sync the source tree to the box. A stock Termux has none, so the connect fails with `running rsync to remote: spawning streaming subprocess: No such file or directory`:

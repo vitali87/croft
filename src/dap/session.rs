@@ -65,6 +65,9 @@ pub enum DapEvent {
         /// so a watch row can render `<not available>` instead of the error.
         success: bool,
     },
+    /// What an `exception` stop threw (#864), from the `exceptionInfo`
+    /// response: `ModuleNotFoundError: No module named 'requests'`.
+    ExceptionInfo { summary: String },
 }
 
 /// Why an adapter refused `launch`/`attach`: DAP puts the full text in
@@ -195,7 +198,8 @@ pub fn initialize_request() -> Value {
 /// adapter is spawned and the `launch` shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterKind {
-    /// debugpy (CPython 3.14+), launches the `.py` source directly.
+    /// debugpy (the adapter on croft's CPython 3.14+ venv), launches the `.py`
+    /// source directly under the project's own interpreter.
     Debugpy,
     /// lldb-dap, launches a compiled binary (Rust / C / C++).
     LldbDap,
@@ -511,8 +515,8 @@ pub fn set_exception_breakpoints_request(filters: &[String]) -> Value {
     })
 }
 
-/// Build a thread-scoped execution request (`continue` / `next` / `stepIn` /
-/// `stepOut`).
+/// Build a thread-scoped request (`continue` / `next` / `stepIn` /
+/// `stepOut`, and `exceptionInfo`, which takes the same `threadId`).
 pub fn thread_request(command: &str, thread_id: i64) -> Value {
     json!({
         "type": "request",
@@ -575,6 +579,40 @@ pub fn parse_evaluate_result(response: &Value) -> Option<String> {
         .get("result")?
         .as_str()
         .map(str::to_string)
+}
+
+/// One line naming what an `exceptionInfo` response says was thrown (#864):
+/// `exceptionId: description`, with only the description's first line (an
+/// adapter may append the stack) and without repeating an id the
+/// description already opens with. None when the response names nothing.
+pub fn exception_summary(response: &Value) -> Option<String> {
+    let body = response.get("body")?;
+    let text = |pointer: &str| {
+        body.pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+    };
+    // debugpy pads the id with "(note: full exception trace is shown but
+    // execution is paused at: …)" when the stop is outside user code.
+    let id = text("/exceptionId")
+        .split("(note:")
+        .next()
+        .unwrap_or("")
+        .trim();
+    let description = [text("/description"), text("/details/message")]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .and_then(|s| s.lines().next())
+        .unwrap_or("")
+        .trim();
+    match (id.is_empty(), description.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(id.to_string()),
+        (true, false) => Some(description.to_string()),
+        (false, false) if description.starts_with(id) => Some(description.to_string()),
+        (false, false) => Some(format!("{id}: {description}")),
+    }
 }
 
 /// Build a `scopes` request for one stack frame (locals / globals containers).
@@ -1006,6 +1044,11 @@ pub struct DapSession {
     /// In-flight `evaluate` requests: request `seq` -> (context, expression), so
     /// the response can be turned into an [`DapEvent::Evaluated`].
     pending_evals: std::collections::HashMap<i64, (String, String)>,
+    /// The `seq` of the `exceptionInfo` request the current exception stop
+    /// sent (#864). Only its reply names what was thrown: a resume, a newer
+    /// stop or the end of the session clears it, so a reply that lands
+    /// after the program moved on is dropped instead of labelling it.
+    exception_info_seq: Option<i64>,
     /// Active exception-breakpoint filter ids (debugpy: `raised`, `uncaught`).
     /// Sent on `initialized` and whenever toggled. Defaults to `uncaught` so an
     /// unhandled exception pauses the debugger instead of silently exiting.
@@ -1172,6 +1215,7 @@ impl DapSession {
             selected_frame: None,
             pending_var_refs: std::collections::HashMap::new(),
             pending_evals: std::collections::HashMap::new(),
+            exception_info_seq: None,
             exception_filters: vec![String::from("uncaught")],
             known_thread: None,
             capabilities: Value::Null,
@@ -1364,6 +1408,15 @@ impl DapSession {
                     self.threads = parse_threads(&msg);
                     out.push(DapEvent::InspectionUpdated);
                 }
+                Some("exceptionInfo") => {
+                    let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                    if req_seq.is_some() && req_seq == self.exception_info_seq {
+                        self.exception_info_seq = None;
+                        if let Some(summary) = exception_summary(&msg) {
+                            out.push(DapEvent::ExceptionInfo { summary });
+                        }
+                    }
+                }
                 Some("scopes") => {
                     self.scopes = parse_scopes(&msg);
                     let refs: Vec<i64> = self.scopes.iter().map(|s| s.variables_ref).collect();
@@ -1493,7 +1546,7 @@ impl DapSession {
                 let _ = t.send(configuration_done_request());
                 self.phase = SessionPhase::Running;
             }
-            DapEvent::Stopped { thread_id, .. } => {
+            DapEvent::Stopped { thread_id, reason } => {
                 // Run to Cursor's breakpoint lives for one stop, whichever
                 // breakpoint or step produced it.
                 if let Some((path, _)) = self.run_to.take() {
@@ -1506,10 +1559,21 @@ impl DapSession {
                 self.clear_inspection();
                 let _ = self.active().send(stack_trace_request(*thread_id));
                 let _ = self.active().send(threads_request());
+                // "Paused (exception)" alone does not say what was thrown
+                // (#864); the answer arrives as `ExceptionInfo`, for this
+                // stop only.
+                self.exception_info_seq = None;
+                if reason == "exception" && self.supports("supportsExceptionInfoRequest") {
+                    self.exception_info_seq = self
+                        .active()
+                        .send(thread_request("exceptionInfo", *thread_id))
+                        .ok();
+                }
             }
             DapEvent::Continued => {
                 self.phase = SessionPhase::Running;
                 self.current_location = None;
+                self.exception_info_seq = None;
                 self.clear_inspection();
             }
             DapEvent::Terminated => {
@@ -1520,13 +1584,15 @@ impl DapSession {
                 if from_child || self.child.is_none() {
                     self.phase = SessionPhase::Terminated;
                     self.current_location = None;
+                    self.exception_info_seq = None;
                     self.clear_inspection();
                 }
             }
             DapEvent::Output { .. } => {}
             DapEvent::BreakpointsUpdated
             | DapEvent::InspectionUpdated
-            | DapEvent::Evaluated { .. } => {}
+            | DapEvent::Evaluated { .. }
+            | DapEvent::ExceptionInfo { .. } => {}
         }
         // Suppress the parent's own `terminated` for js-debug while a child is
         // still live (the parent can wind down its bootstrap connection first).
@@ -1639,6 +1705,7 @@ impl DapSession {
         if let Some(tid) = self.stopped_thread {
             let _ = self.active().send(thread_request("continue", tid));
             self.phase = SessionPhase::Running;
+            self.exception_info_seq = None;
         }
     }
 
@@ -1658,6 +1725,8 @@ impl DapSession {
     pub fn step(&mut self, command: &str) {
         if let Some(tid) = self.stopped_thread {
             let _ = self.active().send(thread_request(command, tid));
+            // The stop is over; its exception reply no longer applies (#864).
+            self.exception_info_seq = None;
         }
     }
 
@@ -1673,6 +1742,7 @@ impl DapSession {
         }
         let _ = self.transport.send(req);
         self.phase = SessionPhase::Terminated;
+        self.exception_info_seq = None;
     }
 }
 
@@ -2622,6 +2692,51 @@ while True:
         assert_eq!(parse_evaluate_result(&json!({"body": {}})), None);
     }
 
+    /// #864: what an exception stop threw, on one line.
+    #[test]
+    fn exception_summary_names_the_type_and_message() {
+        let debugpy = json!({ "body": {
+            "exceptionId": "ModuleNotFoundError",
+            "description": "No module named 'requests'",
+            "breakMode": "unhandled",
+            "details": { "message": "No module named 'requests'", "stackTrace": "..." }
+        }});
+        assert_eq!(
+            exception_summary(&debugpy).as_deref(),
+            Some("ModuleNotFoundError: No module named 'requests'")
+        );
+        // What a real debugpy sends for an uncaught exception it pauses on
+        // outside the user's own frames: the note is not part of the name.
+        let noted = json!({ "body": {
+            "exceptionId": "ValueError       (note: full exception trace is shown but \
+                            execution is paused at: _run_module_as_main)",
+            "description": "boom 42"
+        }});
+        assert_eq!(
+            exception_summary(&noted).as_deref(),
+            Some("ValueError: boom 42")
+        );
+        // A description that already names the type, followed by the stack
+        // (js-debug's shape), is not prefixed twice or run onto one line.
+        let js = json!({ "body": {
+            "exceptionId": "Error",
+            "description": "Error: boom\n    at main (/w/app.js:3:9)"
+        }});
+        assert_eq!(exception_summary(&js).as_deref(), Some("Error: boom"));
+        let only_details = json!({ "body": {
+            "exceptionId": "panic",
+            "details": { "message": "index out of range" }
+        }});
+        assert_eq!(
+            exception_summary(&only_details).as_deref(),
+            Some("panic: index out of range")
+        );
+        let only_id = json!({ "body": { "exceptionId": "KeyError", "description": "" } });
+        assert_eq!(exception_summary(&only_id).as_deref(), Some("KeyError"));
+        assert_eq!(exception_summary(&json!({ "body": {} })), None);
+        assert_eq!(exception_summary(&json!({ "success": false })), None);
+    }
+
     #[test]
     fn reverse_request_response_references_request_seq() {
         let r = reverse_request_response(42, "runInTerminal", false);
@@ -3044,6 +3159,321 @@ while True:
             vec![(String::from("var:total"), String::from("total"))]
         );
         session.disconnect();
+    }
+
+    /// #864 against a fake adapter: an `exception` stop asks the adapter
+    /// what was thrown, and the answer comes back as one event.
+    #[test]
+    fn an_exception_stop_reports_what_was_thrown() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let script = FAKE_DAP
+            .replace(r#""reason": "breakpoint""#, r#""reason": "exception""#)
+            .replace(
+                r#""supportsHitConditionalBreakpoints": True"#,
+                r#""supportsHitConditionalBreakpoints": True, "supportsExceptionInfoRequest": True"#,
+            )
+            .replace(
+                "    elif c == \"disconnect\":",
+                r#"    elif c == "exceptionInfo":
+        reply(req, {"exceptionId": "ModuleNotFoundError",
+                    "description": "No module named 'requests'", "breakMode": "unhandled"})
+    elif c == "disconnect":"#,
+            );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        let mut summary = None;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the fake adapter to answer exceptionInfo",
+            || {
+                for ev in session.poll() {
+                    if let DapEvent::ExceptionInfo { summary: s } = ev {
+                        summary = Some(s);
+                    }
+                }
+                summary.is_some()
+            },
+        );
+        let asked = requests(&log)
+            .into_iter()
+            .find(|q| q["command"] == "exceptionInfo")
+            .expect("exceptionInfo was requested");
+        assert_eq!(asked["arguments"]["threadId"], 1);
+        assert_eq!(
+            summary.as_deref(),
+            Some("ModuleNotFoundError: No module named 'requests'")
+        );
+        session.disconnect();
+    }
+
+    /// Run FAKE_DAP to one stop for `reason`, its `initialize` advertising
+    /// `supportsExceptionInfoRequest` or not, then disconnect. Returns every
+    /// request the adapter saw and every `ExceptionInfo` the session raised.
+    fn one_stop_then_disconnect(
+        reason: &str,
+        supports_exception_info: bool,
+    ) -> (Vec<Value>, Vec<String>) {
+        let mut script = FAKE_DAP
+            .replace(
+                r#""reason": "breakpoint""#,
+                &format!(r#""reason": "{reason}""#),
+            )
+            .replace(
+                "    elif c == \"disconnect\":",
+                r#"    elif c == "exceptionInfo":
+        reply(req, {"exceptionId": "KeyError", "description": "'x'"})
+    elif c == "disconnect":"#,
+            );
+        if supports_exception_info {
+            script = script.replace(
+                r#""supportsHitConditionalBreakpoints": True"#,
+                r#""supportsHitConditionalBreakpoints": True, "supportsExceptionInfoRequest": True"#,
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        let mut summaries = Vec::new();
+        let mut drain = |session: &mut DapSession| {
+            for ev in session.poll() {
+                if let DapEvent::ExceptionInfo { summary } = ev {
+                    summaries.push(summary);
+                }
+            }
+        };
+        // The stop's follow-ups all go out together, `threads` among them.
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the fake adapter to stop",
+            || {
+                drain(&mut session);
+                requests(&log).iter().any(|q| q["command"] == "threads")
+            },
+        );
+        // Anything the stop sent is logged before the disconnect that follows.
+        session.disconnect();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the fake adapter to log the disconnect",
+            || {
+                drain(&mut session);
+                requests(&log).iter().any(|q| q["command"] == "disconnect")
+            },
+        );
+        (requests(&log), summaries)
+    }
+
+    /// #864 guard: only an `exception` stop asks what was thrown. A
+    /// breakpoint stop, from an adapter that does support `exceptionInfo`,
+    /// sends no such request and reports no exception.
+    #[test]
+    fn a_breakpoint_stop_does_not_ask_what_was_thrown() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (reqs, summaries) = one_stop_then_disconnect("breakpoint", true);
+        assert!(
+            !reqs.iter().any(|q| q["command"] == "exceptionInfo"),
+            "{reqs:?}"
+        );
+        assert!(summaries.is_empty(), "{summaries:?}");
+    }
+
+    /// #864 guard: an adapter that does not advertise
+    /// `supportsExceptionInfoRequest` is not sent one on an exception stop,
+    /// which it would answer with an error.
+    #[test]
+    fn an_exception_stop_skips_exception_info_the_adapter_lacks() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (reqs, summaries) = one_stop_then_disconnect("exception", false);
+        assert!(
+            reqs.iter().any(|q| q["command"] == "stackTrace"),
+            "the stop was handled: {reqs:?}"
+        );
+        assert!(
+            !reqs.iter().any(|q| q["command"] == "exceptionInfo"),
+            "{reqs:?}"
+        );
+        assert!(summaries.is_empty(), "{summaries:?}");
+    }
+
+    /// FAKE_DAP stopping on an exception and advertising `exceptionInfo`,
+    /// with `arms` (Python `elif` arms) in place of its `continue` arm: they
+    /// decide when each held `exceptionInfo` request is answered, through
+    /// `answer(req, name, text)`, and send `marker()`, an output line after
+    /// which every earlier reply has been read.
+    fn held_exception_info_session(arms: &str) -> (tempfile::TempDir, PathBuf, DapSession) {
+        let script = FAKE_DAP
+            .replace(r#""reason": "breakpoint""#, r#""reason": "exception""#)
+            .replace(
+                r#""supportsHitConditionalBreakpoints": True"#,
+                r#""supportsHitConditionalBreakpoints": True, "supportsExceptionInfoRequest": True"#,
+            )
+            .replace(
+                "def stopped():",
+                r#"held = []
+def answer(req, name, text):
+    reply(req, {"exceptionId": name, "description": text})
+def marker():
+    send({"type": "event", "event": "output", "body": {"category": "stdout", "output": "MARKER\n"}})
+def stopped():"#,
+            )
+            .replace("    elif c == \"continue\":\n        reply(req)\n        stopped()\n", arms);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        (tmp, log, session)
+    }
+
+    /// Poll `session` to its exception stop, with the `exceptionInfo` request
+    /// sent, run `then`, and poll to the fake's marker. Returns every
+    /// `ExceptionInfo` the session raised after `then`, in order.
+    fn exception_info_after(
+        session: &mut DapSession,
+        log: &Path,
+        then: impl FnOnce(&mut DapSession),
+    ) -> Vec<String> {
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "an exception stop that asks what was thrown",
+            || {
+                session.poll();
+                session.stopped_thread.is_some()
+                    && requests(log)
+                        .iter()
+                        .any(|q| q["command"] == "exceptionInfo")
+            },
+        );
+        then(session);
+        let mut summaries = Vec::new();
+        let mut marked = false;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the fake adapter's marker",
+            || {
+                for ev in session.poll() {
+                    match ev {
+                        DapEvent::ExceptionInfo { summary } => summaries.push(summary),
+                        DapEvent::Output { text, .. } if text.contains("MARKER") => marked = true,
+                        _ => {}
+                    }
+                }
+                marked
+            },
+        );
+        summaries
+    }
+
+    /// #864: an `exceptionInfo` reply that arrives after the program moved
+    /// on describes a stop that is over, and is dropped: after Continue,
+    /// after a Step, and after the session was ended. The adapter holds the
+    /// reply until that request, so the order is fixed.
+    #[test]
+    fn an_exception_reply_that_arrives_after_the_stop_ended_is_dropped() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let arms = r#"    elif c == "exceptionInfo":
+        held.append(req)
+    elif c in ("continue", "next", "disconnect"):
+        reply(req)
+        for h in held:
+            answer(h, "KeyError", "'x'")
+        marker()
+"#;
+        type Move = fn(&mut DapSession);
+        let moves: [(&str, Move); 3] = [
+            ("continue", DapSession::continue_execution),
+            ("step", |s| s.step("next")),
+            ("disconnect", DapSession::disconnect),
+        ];
+        let late: Vec<(&str, Vec<String>)> = moves
+            .into_iter()
+            .map(|(name, then)| {
+                let (_tmp, log, mut session) = held_exception_info_session(arms);
+                let late = exception_info_after(&mut session, &log, then);
+                session.disconnect();
+                (name, late)
+            })
+            .filter(|(_, late)| !late.is_empty())
+            .collect();
+        assert!(late.is_empty(), "reported after the stop ended: {late:?}");
+    }
+
+    /// #864 guard: a reply for an older stop that lands after a newer
+    /// exception stop's own does not overwrite it; the newer stop keeps its
+    /// summary.
+    #[test]
+    fn an_older_stops_exception_reply_does_not_overwrite_the_newer_ones() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let arms = r#"    elif c == "exceptionInfo":
+        held.append(req)
+        if len(held) == 2:
+            answer(held[1], "ValueError", "new")
+            answer(held[0], "KeyError", "'old'")
+            marker()
+    elif c == "continue":
+        reply(req)
+        stopped()
+"#;
+        let (_tmp, log, mut session) = held_exception_info_session(arms);
+        let seen = exception_info_after(&mut session, &log, DapSession::continue_execution);
+        session.disconnect();
+        assert_eq!(seen, vec![String::from("ValueError: new")]);
     }
 
     #[test]

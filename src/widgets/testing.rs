@@ -79,6 +79,17 @@ pub struct TestingPanel {
     /// A run just ended red; consumed once by the app (#358), so a failing
     /// run notifies once, not once per test.
     failed_run: bool,
+    /// The last discovery's lister exited nonzero (a collection error, a
+    /// build failure), which an empty tree alone cannot tell from a project
+    /// with no tests (#845). Cleared when anything starts again.
+    discovery_failed: bool,
+    /// The summary's "see OUTPUT › Test Runner" pointer, as last drawn:
+    /// clicking it opens the runner's output. Empty when not shown.
+    pub last_output_hint: Rect,
+    /// What the run in flight (or the last one) reported: passed, failed,
+    /// skipped. Reset when a run starts, so it describes that run alone,
+    /// never the older results still in the tree (#856).
+    run_tally: (usize, usize, usize),
     /// The last coverage run's report (#263).
     pub coverage: Option<crate::testing::coverage::Coverage>,
     coverage_error: Option<crate::testing::worker::CoverageError>,
@@ -126,6 +137,9 @@ impl TestingPanel {
             last_run_ok: None,
             run_reported_failed: false,
             failed_run: false,
+            discovery_failed: false,
+            last_output_hint: Rect::default(),
+            run_tally: (0, 0, 0),
             coverage: None,
             coverage_error: None,
             coverage_fresh: false,
@@ -159,6 +173,8 @@ impl TestingPanel {
         self.last_run_ok = None;
         self.run_reported_failed = false;
         self.failed_run = false;
+        self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
         self.progress = None;
         self.scroll = 0;
     }
@@ -173,6 +189,8 @@ impl TestingPanel {
         self.last_run_ok = None;
         self.run_reported_failed = false;
         self.failed_run = false;
+        self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
         self.progress = None;
         // The refusal latch and rollback snapshot belong to the old
         // workspace; carrying either across a re-root would surface a stale
@@ -198,6 +216,8 @@ impl TestingPanel {
         self.progress = None;
         self.run_reported_failed = false;
         self.failed_run = false;
+        self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
         // Snapshot the pre-run status (None = about to be inserted) so a
         // worker refusal can put the tree back exactly.
         let old = self.cases.iter().find(|c| c.name == name).map(|c| c.status);
@@ -217,6 +237,8 @@ impl TestingPanel {
         self.progress = None;
         self.run_reported_failed = false;
         self.failed_run = false;
+        self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
         // Snapshot each selected case's pre-run status for a refusal rollback.
         self.prerun = Vec::new();
         for c in &mut self.cases {
@@ -232,6 +254,13 @@ impl TestingPanel {
     pub fn apply_case(&mut self, case: TestCase) {
         if case.status == TestStatus::Failed {
             self.run_reported_failed = true;
+        }
+        let (passed, failed, skipped) = &mut self.run_tally;
+        match case.status {
+            TestStatus::Passed => *passed += 1,
+            TestStatus::Failed => *failed += 1,
+            TestStatus::Skipped => *skipped += 1,
+            TestStatus::NotRun | TestStatus::Running => {}
         }
         match self.cases.binary_search_by(|c| c.name.cmp(&case.name)) {
             Ok(i) => {
@@ -262,14 +291,23 @@ impl TestingPanel {
         }
     }
 
-    /// A run or discovery finished. `ok` is the runner's exit success for a run,
-    /// or `None` for discovery (which reports no pass/fail). A marked case the
-    /// run never reported (compile error, a test renamed since discovery) is
-    /// rolled back like a refusal — its old result returns, a start-inserted
-    /// case disappears — instead of spinning its Running dot forever.
+    /// A run or discovery finished. `ok` is the runner's exit success. For a
+    /// run it is the verdict; for a discovery it only says whether the
+    /// listing worked (#845), so it marks a failed discovery and never
+    /// becomes a run's pass or fail (the app still sees `None` for it). A
+    /// marked case the run never reported (compile error, a test renamed
+    /// since discovery) is rolled back like a refusal — its old result
+    /// returns, a start-inserted case disappears — instead of spinning its
+    /// Running dot forever.
     pub fn on_finished(&mut self, ok: Option<bool>) {
+        let discovery = self.activity == Activity::Discovering;
         self.activity = Activity::Idle;
         self.progress = None;
+        if discovery {
+            self.discovery_failed = ok == Some(false);
+            self.finished = Some(None);
+            return;
+        }
         for (name, old) in std::mem::take(&mut self.prerun) {
             let Some(i) = self.cases.iter().position(|c| c.name == name) else {
                 continue;
@@ -328,6 +366,44 @@ impl TestingPanel {
     /// error or a runner that died, when the tally is meaningless.
     pub fn run_reported_failed(&self) -> bool {
         self.run_reported_failed
+    }
+
+    /// Whether the last discovery or run failed without the tree showing
+    /// why: a listing that errored, or a run that exited nonzero with no
+    /// Failed case (a build failure, a collection error, a runner that never
+    /// started). The summary then points at the runner's own output (#845).
+    pub fn failed_unexplained(&self) -> bool {
+        self.activity == Activity::Idle
+            && (self.discovery_failed
+                || (self.last_run_ok == Some(false) && !self.run_reported_failed))
+    }
+
+    /// How the run that just ended went, as one status-bar line (#856):
+    /// `label` names what ran, `ok` is the runner's exit success and `secs`
+    /// how long the run took. One result reads `label passed (0.4 s)`,
+    /// several `label: 1 failed, 2 passed (1.3 s)`. A run that failed with
+    /// no failing test to show points at the runner's output instead.
+    pub fn run_outcome(&self, label: &str, ok: bool, secs: f64) -> String {
+        let (passed, failed, skipped) = self.run_tally;
+        if !ok && failed == 0 {
+            return String::from("Run failed — see OUTPUT › Test Runner");
+        }
+        let took = format!("({secs:.1} s)");
+        match (passed, failed, skipped) {
+            (0, 0, 0) => format!("{label}: no test ran {took}"),
+            (1, 0, 0) => format!("{label} passed {took}"),
+            (0, 1, 0) => format!("{label} failed {took}"),
+            (0, 0, 1) => format!("{label} skipped {took}"),
+            _ => {
+                let counts: Vec<String> =
+                    [(failed, "failed"), (passed, "passed"), (skipped, "skipped")]
+                        .iter()
+                        .filter(|(n, _)| *n > 0)
+                        .map(|(n, what)| format!("{n} {what}"))
+                        .collect();
+                format!("{label}: {} {took}", counts.join(", "))
+            }
+        }
     }
 
     /// A coverage run's report arrived (#263): keep it for the explorer
@@ -593,6 +669,7 @@ impl Widget for &mut TestingPanel {
             crate::gradient::paint_gradient_box(buf, area);
         }
         self.last_area = area;
+        self.last_output_hint = Rect::default();
         if inner.height == 0 || inner.width == 0 {
             return;
         }
@@ -665,9 +742,12 @@ impl Widget for &mut TestingPanel {
                 Style::default().fg(self.theme.accent()),
             );
         } else if self.cases.is_empty() {
-            // A run that wiped the tree and then failed (compile error on a
-            // full run) must not hide behind the kickoff hint.
-            let (text, color) = if self.last_run_ok == Some(false) {
+            // A run or discovery that wiped the tree and then failed (compile
+            // error on a full run, a collection error) must not hide behind
+            // the kickoff hint.
+            let (text, color) = if self.discovery_failed {
+                ("Discovery failed", self.theme.git_deleted())
+            } else if self.last_run_ok == Some(false) {
                 ("Run failed", self.theme.git_deleted())
             } else {
                 ("Run All Tests (Enter)", self.theme.ui(COLOR_DIM))
@@ -689,12 +769,14 @@ impl Widget for &mut TestingPanel {
             if let Some(pct) = self.coverage.as_ref().and_then(|c| c.percent()) {
                 tally.push_str(&format!(" · {pct:.0}% covered"));
             }
-            let summary = if run_failed {
+            let summary = if self.discovery_failed {
+                format!("discovery failed · {tally}")
+            } else if run_failed {
                 format!("run failed · {tally}")
             } else {
                 tally
             };
-            let color = if failed > 0 || run_failed {
+            let color = if failed > 0 || run_failed || self.discovery_failed {
                 self.theme.git_deleted()
             } else {
                 self.theme.git_added()
@@ -710,8 +792,31 @@ impl Widget for &mut TestingPanel {
 
         // Tree.
         self.build_rows();
-        let body_y0 = inner.y + 2;
-        let body_h = inner.height.saturating_sub(2);
+        let mut body_y0 = inner.y + 2;
+        let mut body_h = inner.height.saturating_sub(2);
+
+        // A failure the tree cannot explain says where the reason is: the
+        // runner's own output, a click (or `o`) away (#845). It takes the
+        // row under the summary and the tree starts below it.
+        if self.failed_unexplained() && body_h > 0 {
+            let hint = "see OUTPUT › Test Runner";
+            let room = avail(inner.x + 1);
+            buf.set_stringn(
+                inner.x + 1,
+                body_y0,
+                hint,
+                room,
+                Style::default().fg(self.theme.accent()),
+            );
+            self.last_output_hint = Rect {
+                x: inner.x + 1,
+                y: body_y0,
+                width: hint.chars().count().min(room) as u16,
+                height: 1,
+            };
+            body_y0 += 1;
+            body_h -= 1;
+        }
 
         // While compiling the test binary the tree is empty; show the latest
         // cargo status line there so a multi-minute discovery visibly moves.
@@ -1333,5 +1438,184 @@ mod tests {
             .collect();
         assert_eq!(cells, "75% ", "right-aligned against the glyph: {header:?}");
         assert!(header.contains("parse::tests"), "{header:?}");
+    }
+
+    /// #845: a discovery whose lister exited nonzero with nothing listed
+    /// looked exactly like a project with no tests: an empty tree under the
+    /// "Run All Tests (Enter)" kickoff. It must say "Discovery failed" and
+    /// point at the runner's output, and a click there must be findable.
+    /// Neither a failed nor a working discovery is a run's verdict.
+    #[test]
+    fn a_failed_discovery_says_so_and_points_at_the_runner_output() {
+        let area = Rect::new(0, 0, 32, 10);
+        let row = |buf: &Buffer, y: u16| -> String {
+            (0..area.width).map(|x| buf[(x, y)].symbol()).collect()
+        };
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Discovering);
+        p.on_finished(Some(false));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(
+            row(&buf, 2).contains("Discovery failed"),
+            "{:?}",
+            row(&buf, 2)
+        );
+        assert!(
+            row(&buf, 3).contains("see OUTPUT › Test Runner"),
+            "{:?}",
+            row(&buf, 3)
+        );
+        let hint = p.last_output_hint;
+        assert_eq!(
+            (hint.x, hint.y),
+            (2, 3),
+            "the hint is clickable where drawn"
+        );
+        assert_eq!(hint.width, 24);
+        assert!(!p.take_failed_run(), "a failed listing is not a red run");
+        assert_eq!(p.take_finished(), Some(None), "nor a run's verdict");
+
+        // With some tests listed, the tally carries the marker instead.
+        p.on_busy_started(Activity::Discovering);
+        p.apply_case(TestCase {
+            name: "m::a".into(),
+            status: TestStatus::NotRun,
+        });
+        p.on_finished(Some(false));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(
+            row(&buf, 2).contains("discovery failed"),
+            "{:?}",
+            row(&buf, 2)
+        );
+        assert!(p.last_output_hint.width > 0);
+        assert_eq!(p.first_row_y, 4, "the tree starts below the hint");
+
+        // A listing that works: no marker, no hint, and still no verdict.
+        p.on_busy_started(Activity::Discovering);
+        p.on_finished(Some(true));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(row(&buf, 2).contains("Run All Tests (Enter)"));
+        assert_eq!(p.last_output_hint, Rect::default());
+        assert_eq!(p.take_finished(), Some(None));
+
+        // A run that dies unexplained gets the same pointer.
+        p.on_busy_started(Activity::Running);
+        p.on_finished(Some(false));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert!(row(&buf, 2).contains("Run failed"), "{:?}", row(&buf, 2));
+        assert!(row(&buf, 3).contains("see OUTPUT › Test Runner"));
+        // ...but not while the next one is in flight.
+        p.start_single("m::a");
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_eq!(p.last_output_hint, Rect::default());
+    }
+
+    /// #856: the status-bar line a finished run leaves is built from what
+    /// that run alone reported, never from older results still in the tree.
+    #[test]
+    fn the_run_outcome_counts_only_what_this_run_reported() {
+        let case = |name: &str, status| TestCase {
+            name: name.into(),
+            status,
+        };
+        let mut p = TestingPanel::new();
+        p.apply_case(case("m::old", TestStatus::Failed));
+        p.apply_case(case("m::skip", TestStatus::NotRun));
+
+        p.start_single("m::a");
+        p.apply_case(case("m::a", TestStatus::Passed));
+        p.on_finished(Some(true));
+        assert_eq!(p.run_outcome("a", true, 0.42), "a passed (0.4 s)");
+
+        p.start_single("m::old");
+        p.apply_case(case("m::old", TestStatus::Failed));
+        p.on_finished(Some(false));
+        assert_eq!(p.run_outcome("old", false, 2.0), "old failed (2.0 s)");
+
+        p.start_single("m::skip");
+        p.apply_case(case("m::skip", TestStatus::Skipped));
+        p.on_finished(Some(true));
+        assert_eq!(p.run_outcome("skip", true, 0.1), "skip skipped (0.1 s)");
+
+        p.start_filter("m::");
+        for (name, status) in [
+            ("m::a", TestStatus::Failed),
+            ("m::old", TestStatus::Passed),
+            ("m::skip", TestStatus::Passed),
+        ] {
+            p.apply_case(case(name, status));
+        }
+        p.on_finished(Some(false));
+        assert_eq!(
+            p.run_outcome("suite m", false, 1.26),
+            "suite m: 1 failed, 2 passed (1.3 s)"
+        );
+
+        // A run that died before reporting anything (a build failure).
+        p.start_single("m::a");
+        p.on_finished(Some(false));
+        assert_eq!(
+            p.run_outcome("a", false, 9.0),
+            "Run failed — see OUTPUT › Test Runner"
+        );
+        // One that matched nothing, and said so by exiting 0.
+        p.start_single("m::gone");
+        p.on_finished(Some(true));
+        assert_eq!(
+            p.run_outcome("gone", true, 0.1),
+            "gone: no test ran (0.1 s)"
+        );
+    }
+
+    /// #845 guard: a red run whose failure is a row in the tree explains
+    /// itself, so it gets no "see OUTPUT" pointer and the tree keeps the
+    /// row under the summary. Only an unexplained failure points away.
+    #[test]
+    fn a_red_run_with_its_failure_in_the_tree_gets_no_output_pointer() {
+        let area = Rect::new(0, 0, 32, 10);
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "m::a".into(),
+            status: TestStatus::Failed,
+        });
+        p.on_finished(Some(false));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let screen: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(!p.failed_unexplained());
+        assert!(!screen.contains("OUTPUT"), "{screen:?}");
+        assert_eq!(p.last_output_hint, Rect::default());
+        assert_eq!(p.first_row_y, 3, "the tree starts under the summary");
+        assert!(p.take_failed_run(), "it is still a red run");
+    }
+
+    /// #845 guard: in a panel too narrow for the whole pointer, the text and
+    /// its click area are clipped together, short of the watch glyphs, so a
+    /// click on the header's glyphs never lands on it.
+    #[test]
+    fn a_narrow_panel_clips_the_output_pointer_and_its_click_area_together() {
+        let area = Rect::new(0, 0, 16, 8);
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Discovering);
+        p.on_finished(Some(false));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let hint = p.last_output_hint;
+        let drawn: String = (hint.x..hint.x + hint.width)
+            .map(|x| buf[(x, hint.y)].symbol())
+            .collect();
+        assert_eq!(drawn, "see OUTPUT");
+        assert!(hint.x + hint.width < p.last_watch_all.x, "{hint:?}");
+        assert_eq!(buf[(hint.x + hint.width, hint.y)].symbol(), " ");
     }
 }

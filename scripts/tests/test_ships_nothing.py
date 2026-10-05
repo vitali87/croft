@@ -1,16 +1,16 @@
 """Tests for scripts/ships_nothing.py: the release gate's test-only filter.
 
-The `version bump + release notes` job says in its own comment that
+The `release notes` job says in its own comment that
 "test-only changes ship nothing and are exempt", and then encodes test-only
 as a path list. croft keeps most unit tests in a `#[cfg(test)] mod tests`
 beside the code they cover, so the ordinary shape of a test-only fix here is
 a diff inside a shipped file (#461).
 
-The direction of failure matters more than the coverage: waiving a bump that
-was needed puts two different binaries on one version, while asking for a
-bump that was not needed only costs a version number. Anything the parse is
-unsure about therefore counts as shipped, and the tests below pin that as
-much as they pin the exemption.
+The direction of failure matters more than the coverage: waiving notes that
+were needed ships a change no release covers, so two different binaries can
+share a version, while asking for notes that were not needed only costs a line
+of notes. Anything the parse is unsure about therefore counts as shipped, and
+the tests below pin that as much as they pin the exemption.
 """
 
 from __future__ import annotations

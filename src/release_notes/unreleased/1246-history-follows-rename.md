@@ -1,0 +1,1 @@
+fix: Local history follows a file renamed or moved in the Explorer (F2, cut and paste, drag and drop), including every file under a moved folder, so TIMELINE keeps listing its snapshots instead of "No history".
