@@ -1,0 +1,1 @@
+fix: A Git LFS file's diff compares the checked-out content with HEAD's content instead of with the LFS pointer, and staging, unstaging or reverting one hunk of it is refused with a reason instead of writing the raw file into the index.
