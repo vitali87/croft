@@ -1,0 +1,1 @@
+fix: Format Document, Format Selection and format on save no longer apply a formatter's late reply to text typed after the request; the edits are dropped with a status saying so, and a format-on-save writes the file as it is instead of overwriting what you typed.

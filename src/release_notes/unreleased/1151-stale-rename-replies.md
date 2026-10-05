@@ -1,0 +1,1 @@
+fix: A rename, quick fix or Explorer move whose language server answers after you have typed into a file it edits no longer writes the new name over your fresh text; the edit is refused and the status bar says which file changed.

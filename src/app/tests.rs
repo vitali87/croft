@@ -565,6 +565,46 @@ fn overlays_render_on_a_tiny_terminal_without_panicking() {
     draw(&mut app, 8, 3);
 }
 
+/// #1132: editor groups that can't all sit at their minimum width ran past
+/// the frame, and the tab strip painted the first column outside it.
+#[test]
+fn splitting_the_editor_in_a_narrow_window_renders_without_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let draw = |app: &mut App, w: u16, h: u16| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    };
+    let mut app = app_with_open_file(tmp.path(), "api.py", "def f():\n    pass\n");
+    draw(&mut app, 80, 24);
+    for _ in 0..4 {
+        app.split_editor();
+        draw(&mut app, 80, 24);
+    }
+    assert_eq!(app.editor_layout.leaf_count(), 5);
+    draw(&mut app, 60, 20);
+    draw(&mut app, 22, 8);
+
+    let mut two = app_with_open_file(tmp.path(), "b.py", "x = 1\n");
+    two.split_editor();
+    draw(&mut two, 22, 8);
+    draw(&mut two, 20, 8);
+}
+
+/// #1132 (comment): the secondary side bar's OUTLINE scrollbar at 30x9.
+#[test]
+fn a_secondary_side_bar_in_a_narrow_window_renders_without_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src: String = (0..80)
+        .map(|i| format!("def f{i}():\n    pass\n"))
+        .collect();
+    let mut app = app_with_open_file(tmp.path(), "sessions.py", &src);
+    app.toggle_secondary_side_bar();
+    for (w, h) in [(120, 35), (30, 9), (30, 24), (12, 9)] {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    }
+}
+
 #[test]
 fn terminal_warning_swallows_a_key_and_dismisses_for_the_session() {
     // While the unsupported-terminal nudge is up, any non-D key dismisses it
@@ -6607,12 +6647,22 @@ fn key_to_bytes_unknown_returns_empty() {
 
 #[test]
 fn ctrl_s_is_save_key() {
-    assert!(is_save_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+    for kitty in [false, true] {
+        assert!(is_save_key(
+            key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            kitty
+        ));
+    }
 }
 
 #[test]
 fn cmd_s_is_save_key() {
-    assert!(is_save_key(key(KeyCode::Char('s'), KeyModifiers::SUPER)));
+    for kitty in [false, true] {
+        assert!(is_save_key(
+            key(KeyCode::Char('s'), KeyModifiers::SUPER),
+            kitty
+        ));
+    }
 }
 
 #[test]
@@ -6669,24 +6719,123 @@ fn plain_dot_and_modified_dot_are_not_quick_fix_key() {
 
 #[test]
 fn shift_ctrl_s_is_save_key() {
-    // Some terminals report capital S with Ctrl pressed.
+    // Without the kitty keyboard protocol a terminal may capitalise the
+    // letter of a plain Ctrl+S, so Ctrl+Shift+S saves there.
     let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
-    assert!(is_save_key(key(KeyCode::Char('S'), mods)));
+    assert!(is_save_key(key(KeyCode::Char('S'), mods), false));
+    // An uppercase S with Ctrl but no Shift reported saves everywhere.
+    for kitty in [false, true] {
+        assert!(is_save_key(
+            key(KeyCode::Char('S'), KeyModifiers::CONTROL),
+            kitty
+        ));
+    }
+}
+
+#[test]
+fn ctrl_shift_s_is_the_source_control_jump_where_shift_is_reported() {
+    // #857: the kitty keyboard protocol reports Shift explicitly, so
+    // Ctrl+Shift+S there is the Source Control jump the docs promise, like
+    // Cmd+Shift+S everywhere; Save lets it go.
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    for c in ['s', 'S'] {
+        assert!(!is_save_key(key(KeyCode::Char(c), ctrl_shift), true));
+        assert!(is_source_control_jump_key(key(
+            KeyCode::Char(c),
+            ctrl_shift
+        )));
+        let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+        assert!(!is_save_key(key(KeyCode::Char(c), cmd_shift), false));
+    }
+}
+
+/// #857 end to end: with the editor focused, Ctrl+Shift+S jumps to Source
+/// Control and leaves the dirty buffer unsaved, while Ctrl+S still saves.
+#[test]
+fn ctrl_shift_s_in_the_editor_jumps_to_source_control_without_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "on disk").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.kitty_keys = true;
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.insert_str("edited ");
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    app.handle_key(key(KeyCode::Char('s'), ctrl_shift)).unwrap();
+    assert_eq!(app.sidebar_view, SidebarView::SourceControl);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "on disk",
+        "not saved"
+    );
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().trim_end(),
+        "edited on disk"
+    );
+}
+
+/// #857 negative: the jump needs the Shift *reported*. Where the terminal
+/// (or tmux 3.5+, or tmux with `extended-keys on`) sends no Shift flag,
+/// Ctrl+S and a Ctrl+uppercase-S still save and the side bar stays put,
+/// and without the kitty keyboard protocol even a reported Shift saves.
+#[test]
+fn ctrl_s_without_a_reported_shift_still_saves_and_stays_put() {
+    let cases = [
+        (true, KeyCode::Char('s'), KeyModifiers::CONTROL),
+        (true, KeyCode::Char('S'), KeyModifiers::CONTROL),
+        (
+            false,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+    ];
+    for (kitty, code, mods) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "on disk").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.kitty_keys = kitty;
+        app.editor.open_pinned(&path).unwrap();
+        app.focus_pane(Pane::Editor);
+        let before = app.sidebar_view;
+        app.editor.insert_str("edited ");
+        app.handle_key(key(code, mods)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim_end(),
+            "edited on disk",
+            "{code:?} {mods:?} kitty={kitty} saves"
+        );
+        assert_eq!(app.sidebar_view, before, "{code:?} {mods:?}: no jump");
+        assert_ne!(app.sidebar_view, SidebarView::SourceControl);
+    }
 }
 
 #[test]
 fn plain_s_is_not_save_key() {
-    assert!(!is_save_key(key(KeyCode::Char('s'), KeyModifiers::NONE)));
+    assert!(!is_save_key(
+        key(KeyCode::Char('s'), KeyModifiers::NONE),
+        true
+    ));
 }
 
 #[test]
 fn ctrl_q_is_not_save_key() {
-    assert!(!is_save_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+    assert!(!is_save_key(
+        key(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        true
+    ));
 }
 
 #[test]
 fn alt_s_is_not_save_key() {
-    assert!(!is_save_key(key(KeyCode::Char('s'), KeyModifiers::ALT)));
+    assert!(!is_save_key(
+        key(KeyCode::Char('s'), KeyModifiers::ALT),
+        true
+    ));
 }
 
 #[test]
@@ -6710,6 +6859,7 @@ fn git_status_spans_clean_branch_is_green() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -6734,6 +6884,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6761,6 +6912,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6780,6 +6932,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -10073,6 +10226,53 @@ fn sheet_grid_editing_types_commits_and_saves_with_the_delimiter() {
     );
 }
 
+/// stock.csv from #1137: the widget row's unquoted `1,200` gives it the
+/// only third field, so deleting it shrinks the sheet to two columns.
+fn sheet_app_on_stock_csv() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("stock.csv");
+    std::fs::write(&p, "item,qty\nbolt,4\nwidget,1,200\nnut,9\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    (tmp, app)
+}
+
+#[test]
+fn deleting_the_only_row_reaching_the_last_column_keeps_the_caret_in_the_sheet() {
+    let (_tmp, mut app) = sheet_app_on_stock_csv();
+    app.handle_sheet_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert_eq!((data.cur_row, data.cur_col, data.col_count()), (1, 2, 3));
+
+    // Panicked with "range end index 2 out of range for slice of length 2".
+    app.sheet_structure_op(crate::widgets::command_palette::Command::SheetDeleteRow);
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert_eq!(data.col_count(), 2);
+    assert_eq!(data.cur_col, 1, "the caret moves onto the last column left");
+    assert!(data.scroll_col <= data.cur_col);
+    assert_eq!(data.cell(1, 0), "nut");
+    // The grid still moves and renders from there.
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Left, KeyModifiers::NONE));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+}
+
+#[test]
+fn deleting_a_row_that_leaves_the_column_count_alone_keeps_the_caret_column() {
+    // Negative: bolt is not the widest row, so the sheet keeps its three
+    // columns and the caret stays where it was.
+    let (_tmp, mut app) = sheet_app_on_stock_csv();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.sheet_structure_op(crate::widgets::command_palette::Command::SheetDeleteRow);
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert_eq!(data.col_count(), 3);
+    assert_eq!((data.cur_row, data.cur_col), (0, 1));
+    assert_eq!(data.cell(0, 0), "widget");
+}
+
 #[test]
 fn hex_typing_edits_bytes_and_cmd_s_writes_them_in_place() {
     // #173 end-to-end: hex-pane nibble typing, Tab to the ASCII pane,
@@ -12501,6 +12701,186 @@ fn a_push_runs_off_the_ui_thread_and_reports_when_it_lands() {
     assert_eq!(remote_head, local_head);
 }
 
+/// Run git in `dir` and return its trimmed stdout ("" on failure).
+fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A committed repo whose `main` tracks `<remote>/main` in a bare repo, for
+/// each named remote, then a local branch `topic` with one more commit and
+/// no upstream (#1245).
+fn unpublished_topic_repo(remotes: &[&str]) -> (tempfile::TempDir, Vec<tempfile::TempDir>) {
+    let tmp = make_committed_repo();
+    let bares: Vec<_> = remotes
+        .iter()
+        .map(|name| {
+            let bare = tempfile::tempdir().unwrap();
+            git_stdout(bare.path(), &["init", "-q", "--bare"]);
+            git_stdout(
+                tmp.path(),
+                &["remote", "add", name, bare.path().to_str().unwrap()],
+            );
+            git_stdout(tmp.path(), &["push", "-q", "-u", name, "main"]);
+            bare
+        })
+        .collect();
+    git_stdout(tmp.path(), &["checkout", "-q", "-b", "topic"]);
+    std::fs::write(tmp.path().join("seed.txt"), b"two\n").unwrap();
+    git_stdout(tmp.path(), &["commit", "-qam", "two"]);
+    (tmp, bares)
+}
+
+/// Push on a branch nobody has published runs `push -u origin topic`
+/// instead of failing with "has no upstream branch".
+#[test]
+fn push_on_a_branch_with_no_upstream_publishes_it() {
+    let (tmp, bares) = unpublished_topic_repo(&["origin"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.push_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert!(
+        app.status.contains("published topic to origin"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        git_stdout(tmp.path(), &["rev-parse", "--abbrev-ref", "topic@{u}"]),
+        "origin/topic"
+    );
+    assert_eq!(
+        git_stdout(bares[0].path(), &["rev-parse", "topic"]),
+        git_stdout(tmp.path(), &["rev-parse", "HEAD"])
+    );
+}
+
+/// Commit & Push on an unpublished branch commits, then publishes.
+#[test]
+fn commit_and_push_on_a_branch_with_no_upstream_publishes_it() {
+    let (tmp, bares) = unpublished_topic_repo(&["origin"]);
+    std::fs::write(tmp.path().join("seed.txt"), b"three\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.message = String::from("three");
+    app.commit_and_push_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert_eq!(
+        git_stdout(tmp.path(), &["log", "-1", "--format=%s"]),
+        "three"
+    );
+    assert_eq!(
+        git_stdout(bares[0].path(), &["rev-parse", "topic"]),
+        git_stdout(tmp.path(), &["rev-parse", "HEAD"])
+    );
+}
+
+/// Sync on an unpublished branch has nothing to pull: it publishes instead
+/// of failing on the pull's "no tracking information".
+#[test]
+fn sync_on_a_branch_with_no_upstream_publishes_without_pulling() {
+    let (tmp, bares) = unpublished_topic_repo(&["origin"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert_eq!(app.status, "Synced");
+    assert_eq!(
+        git_stdout(tmp.path(), &["rev-parse", "--abbrev-ref", "topic@{u}"]),
+        "origin/topic"
+    );
+    assert_eq!(
+        git_stdout(bares[0].path(), &["rev-parse", "topic"]),
+        git_stdout(tmp.path(), &["rev-parse", "HEAD"])
+    );
+}
+
+/// With two remotes and no `origin`, publishing would be a guess: Push says
+/// so and neither remote gets the branch.
+#[test]
+fn push_with_several_remotes_and_no_origin_does_not_guess() {
+    let (tmp, bares) = unpublished_topic_repo(&["alpha", "beta"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.push_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert!(app.status.contains("remote.pushDefault"), "{}", app.status);
+    for bare in &bares {
+        assert_eq!(git_stdout(bare.path(), &["branch", "--list", "topic"]), "");
+    }
+    assert_eq!(
+        git_stdout(tmp.path(), &["rev-parse", "--abbrev-ref", "topic@{u}"]),
+        ""
+    );
+}
+
+/// A repo with no remote at all has nowhere to publish to.
+#[test]
+fn push_with_no_remote_says_there_is_nowhere_to_publish() {
+    let (tmp, _) = unpublished_topic_repo(&[]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.push_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert!(app.status.contains("no remote"), "{}", app.status);
+}
+
+/// A branch that already tracks one still pulls on Sync: the new-branch
+/// path must not skip the pull for it.
+#[test]
+fn sync_on_a_tracked_branch_still_pulls_first() {
+    let (tmp, bares) = unpublished_topic_repo(&["origin"]);
+    git_stdout(tmp.path(), &["checkout", "-q", "main"]);
+    let other = tempfile::tempdir().unwrap();
+    git_stdout(
+        other.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "main",
+            bares[0].path().to_str().unwrap(),
+            ".",
+        ],
+    );
+    git_stdout(other.path(), &["config", "user.email", "a@b"]);
+    git_stdout(other.path(), &["config", "user.name", "a"]);
+    std::fs::write(other.path().join("theirs.txt"), b"theirs\n").unwrap();
+    git_stdout(other.path(), &["add", "theirs.txt"]);
+    git_stdout(other.path(), &["commit", "-qm", "theirs"]);
+    git_stdout(other.path(), &["push", "-q", "origin", "main"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status, "Synced",
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert!(tmp.path().join("theirs.txt").exists());
+    assert_eq!(
+        git_stdout(bares[0].path(), &["branch", "--list", "topic"]),
+        ""
+    );
+}
+
 /// Opening a config file must not reload the active tab in place: it held
 /// unsaved edits to another file, which were silently discarded.
 #[test]
@@ -13185,6 +13565,81 @@ fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
         log_out.contains("fix: plain cmd-enter"),
         "Cmd+Enter must still commit locally (push is bound to Ctrl+Enter only): log={log_out:?}"
     );
+}
+
+/// A repo with `seed.txt` changed and the Source Control panel open on it,
+/// ready to commit (#1241).
+fn scm_ready_to_commit() -> (tempfile::TempDir, App) {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    });
+    app.set_sidebar_view(SidebarView::SourceControl);
+    (tmp, app)
+}
+
+fn last_commit_message(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A pasted multi-line message is committed with its subject, blank line
+/// and body intact, not glued into one line.
+#[test]
+fn a_pasted_multi_line_message_commits_with_its_body() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    app.handle_paste("Fix rounding\r\n\r\nTotals were floats\r\nFixes #42");
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        last_commit_message(tmp.path()),
+        "Fix rounding\n\nTotals were floats\nFixes #42\n\n"
+    );
+}
+
+/// Shift+Enter and Alt+Enter start a new line; neither commits.
+#[test]
+fn shift_or_alt_enter_adds_a_line_instead_of_committing() {
+    for modifier in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        let (tmp, mut app) = scm_ready_to_commit();
+        for c in "subj".chars() {
+            app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_source_control_key(key(KeyCode::Enter, modifier));
+        app.handle_source_control_key(key(KeyCode::Enter, modifier));
+        for c in "body".chars() {
+            app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.source_control.message, "subj\n\nbody", "{modifier:?}");
+        assert_eq!(
+            last_commit_message(tmp.path()),
+            "init\n\n",
+            "{modifier:?} must not commit"
+        );
+        app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(last_commit_message(tmp.path()), "subj\n\nbody\n\n");
+    }
+}
+
+/// Plain Enter still commits a one-line message straight away.
+#[test]
+fn plain_enter_still_commits_a_one_line_message() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    for c in "one line".chars() {
+        app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(last_commit_message(tmp.path()), "one line\n\n");
+    assert_eq!(app.source_control.message, "");
 }
 
 #[test]
@@ -20755,6 +21210,388 @@ fn run_spec_does_not_walk_above_workspace_root() {
     );
 }
 
+/// #864: F5 on a script ran it under croft's private debug venv, where the
+/// project's packages are missing, so `import requests` stopped the run on
+/// line 1. The program runs under the interpreter Run picks: the nearest
+/// venv inside the workspace, else python3.
+#[test]
+fn a_debugged_script_runs_under_the_interpreter_run_uses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let pkg = root.join("src").join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let file = pkg.join("main.py");
+    std::fs::write(&file, b"import requests\n").unwrap();
+
+    let bare = super::project_python_for(&pkg, root);
+    assert_eq!(
+        bare.file_name().and_then(|n| n.to_str()),
+        Some("python3"),
+        "no venv: python3, got {}",
+        bare.display()
+    );
+    assert!(!bare.to_string_lossy().contains("debug-venv"));
+
+    let venv = make_venv(root, ".venv");
+    assert_eq!(super::project_python_for(&pkg, root), venv);
+    assert_eq!(
+        super::debuggee_python(&pkg, root, std::env::var_os("PATH").as_deref()),
+        Some(venv.clone()),
+        "F5's debuggee is Run's interpreter"
+    );
+    let req =
+        crate::dap::session::launch_request(&file, &super::project_python_for(&pkg, root), false);
+    assert_eq!(
+        req["arguments"]["python"][0],
+        &*venv.to_string_lossy(),
+        "the launch names the project's venv"
+    );
+    // The same interpreter Run spawns for this file.
+    let spec = App::run_spec_for(&file, root).unwrap();
+    assert_eq!(spec.program, venv.to_string_lossy());
+}
+
+/// #864 for launch.json: a Python config that names no interpreter runs
+/// under the venv nearest its program (or its cwd, for a `module`), and one
+/// that names its own keeps it.
+#[test]
+fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one() {
+    use crate::dap::configs::{SubstCtx, debugpy_request, parse_launch_json, resolve};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ctx = SubstCtx {
+        workspace_folder: root.to_path_buf(),
+        file: None,
+    };
+    let python_of = |json: &str| {
+        let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
+        let rc = resolve(&cfg, &ctx).unwrap();
+        let cwd = rc.cwd.clone().unwrap_or_else(|| root.to_path_buf());
+        let adapter = Path::new("/home/u/.croft/debug-venv/bin/python");
+        let req = debugpy_request(&rc, &super::config_project_python(&rc, &cwd, root, adapter));
+        req["arguments"]["python"].clone()
+    };
+    let program = r#"[{"name":"P","type":"python","program":"${workspaceFolder}/app/main.py"}]"#;
+
+    let fallback = python_of(program);
+    let fallback = fallback[0].as_str().unwrap();
+    assert!(
+        fallback.ends_with("python3") && !fallback.contains("debug-venv"),
+        "no venv: python3, got {fallback}"
+    );
+
+    let venv = make_venv(root, ".venv");
+    assert_eq!(python_of(program)[0], &*venv.to_string_lossy());
+
+    // A module launch has no program path: its cwd's venv is the one.
+    let svc = root.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    let svc_venv = make_venv(&svc, "venv");
+    assert_eq!(
+        python_of(r#"[{"name":"M","type":"python","module":"svc.main","cwd":"svc"}]"#)[0],
+        &*svc_venv.to_string_lossy()
+    );
+
+    assert_eq!(
+        python_of(
+            r#"[{"name":"E","type":"python","program":"app/main.py","python":"/opt/py/bin/python3.9"}]"#
+        ),
+        "/opt/py/bin/python3.9",
+        "an explicit python wins"
+    );
+}
+
+/// #864 review: a config naming both `module` and `program` launches the
+/// module (debugpy refuses a request naming both, so the program is dropped),
+/// so its interpreter comes from its `cwd`, never from beside the program
+/// the request no longer carries. A program launch still uses the venv
+/// beside its program.
+#[test]
+fn a_module_launch_that_also_names_a_program_runs_under_its_cwds_venv() {
+    use crate::dap::configs::{SubstCtx, debugpy_request, parse_launch_json, resolve};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ctx = SubstCtx {
+        workspace_folder: root.to_path_buf(),
+        file: None,
+    };
+    let request_of = |json: &str| {
+        let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
+        let rc = resolve(&cfg, &ctx).unwrap();
+        let cwd = rc.cwd.clone().unwrap_or_else(|| root.to_path_buf());
+        let adapter = Path::new("/home/u/.croft/debug-venv/bin/python");
+        debugpy_request(&rc, &super::config_project_python(&rc, &cwd, root, adapter))
+    };
+    let root_venv = make_venv(root, ".venv");
+    let tools = root.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tools_venv = make_venv(&tools, ".venv");
+
+    let both = request_of(
+        r#"[{"name":"T","type":"python","module":"pytest","program":"tools/helper.py"}]"#,
+    );
+    assert_eq!(
+        both["arguments"]["module"], "pytest",
+        "the module is launched"
+    );
+    assert!(
+        both["arguments"].get("program").is_none(),
+        "the program is dropped"
+    );
+    assert_eq!(
+        both["arguments"]["python"][0],
+        &*root_venv.to_string_lossy(),
+        "the module runs under its cwd's venv, not the dropped program's"
+    );
+
+    let program = request_of(r#"[{"name":"P","type":"python","program":"tools/helper.py"}]"#);
+    assert_eq!(
+        program["arguments"]["python"][0],
+        &*tools_venv.to_string_lossy(),
+        "a program launch keeps the venv beside its program"
+    );
+}
+
+/// #864 guard: the debuggee's interpreter is looked up no higher than the
+/// workspace root, as Run's is. A venv in the folder above the workspace
+/// belongs to some other project and is not picked up.
+#[test]
+fn a_venv_above_the_workspace_is_not_the_debuggee_interpreter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = make_venv(tmp.path(), ".venv");
+    let root = tmp.path().join("proj");
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+
+    assert_eq!(
+        super::debuggee_python(&pkg, &root, None),
+        None,
+        "a venv above the workspace is not the project's"
+    );
+    let py = super::project_python_for(&pkg, &root);
+    assert_ne!(py, outside, "nor Run's");
+    assert!(!py.starts_with(tmp.path()), "got {}", py.display());
+}
+
+/// #864 guard: a nearer venv beats the workspace root's, for the debuggee
+/// exactly as for Run, so a sub-project debugs against its own packages.
+#[test]
+fn a_nearer_venv_beats_the_workspace_roots_for_the_debuggee() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let root_venv = make_venv(root, ".venv");
+    let svc = root.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    let svc_venv = make_venv(&svc, "venv");
+
+    assert_eq!(
+        super::debuggee_python(&svc, root, None),
+        Some(svc_venv.clone())
+    );
+    assert_eq!(super::project_python_for(&svc, root), svc_venv);
+    assert_eq!(
+        super::debuggee_python(root, root, None),
+        Some(root_venv.clone())
+    );
+    assert_eq!(super::project_python_for(root, root), root_venv);
+}
+
+/// A stand-in venv interpreter ([`make_venv`]) whose `pyvenv.cfg` says it
+/// is Python `version`.
+fn make_venv_of(dir: &Path, venv_name: &str, version: &str) -> PathBuf {
+    let py = make_venv(dir, venv_name);
+    std::fs::write(
+        dir.join(venv_name).join("pyvenv.cfg"),
+        format!("home = /usr/bin\ninclude-system-site-packages = false\nversion = {version}\n"),
+    )
+    .unwrap();
+    py
+}
+
+/// #864: a debuggee interpreter older than 3.14 is named, since 3.14 is
+/// attach's floor (PEP 768) and not launch's.
+#[test]
+fn a_debuggee_older_than_3_14_is_named_with_the_attach_floor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let py = make_venv_of(tmp.path(), ".venv", "3.12.4");
+    assert_eq!(
+        super::debuggee_python_note(&py),
+        Ok(Some(String::from(
+            "under Python 3.12 (.venv); attach needs 3.14+"
+        )))
+    );
+}
+
+/// #864 guard: 3.14 and newer say nothing, and neither does an interpreter
+/// whose version cannot be read (the launch then speaks for itself).
+#[test]
+fn a_3_14_debuggee_or_an_unreadable_one_gets_no_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let py314 = make_venv_of(tmp.path(), "py314", "3.14.0");
+    assert_eq!(super::debuggee_python_note(&py314), Ok(None));
+    let py315 = make_venv_of(tmp.path(), "py315", "3.15.1");
+    assert_eq!(super::debuggee_python_note(&py315), Ok(None));
+    let unknown = make_venv(tmp.path(), "unknown");
+    assert_eq!(super::debuggee_python_note(&unknown), Ok(None));
+}
+
+/// #864: an interpreter below debugpy's own floor (3.10) cannot host the
+/// debuggee at all, so the launch refuses it by name. 3.10 itself is fine.
+#[test]
+fn a_debuggee_debugpy_cannot_run_under_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = make_venv_of(tmp.path(), ".venv", "3.9.18");
+    assert_eq!(
+        super::debuggee_python_note(&old),
+        Err(String::from(
+            "Python 3.9 (.venv) is too old to debug: debugpy needs 3.10+"
+        ))
+    );
+    let floor = make_venv_of(tmp.path(), "venv", "3.10.0");
+    assert_eq!(
+        super::debuggee_python_note(&floor),
+        Ok(Some(String::from(
+            "under Python 3.10 (venv); attach needs 3.14+"
+        )))
+    );
+}
+
+/// #864: a launch.json config's version check reads the interpreter the
+/// request actually runs: its `python` (a path or a command line) or the
+/// legacy `pythonPath`, and nothing for a request that names neither.
+#[test]
+fn a_launch_requests_own_interpreter_is_the_one_checked() {
+    use serde_json::json;
+    let python = |args: serde_json::Value| {
+        super::launch_request_python(&json!({ "arguments": args }), Path::new("/work/proj"))
+    };
+    assert_eq!(
+        python(json!({ "python": "/opt/py/bin/python3.9" })),
+        Some(PathBuf::from("/opt/py/bin/python3.9"))
+    );
+    assert_eq!(
+        python(json!({ "python": ["/p/.venv/bin/python", "-X", "dev"] })),
+        Some(PathBuf::from("/p/.venv/bin/python"))
+    );
+    assert_eq!(
+        python(json!({ "pythonPath": "/legacy/python" })),
+        Some(PathBuf::from("/legacy/python"))
+    );
+    assert_eq!(python(json!({ "program": "a.py" })), None);
+}
+
+/// #864 review: a relative interpreter in launch.json is found where
+/// debugpy starts it: the request's `cwd`, else a program's folder, else
+/// the folder the adapter runs in. The version check used to run it from
+/// croft's own folder, which can hold a different file of that name.
+#[test]
+fn a_relative_launch_python_is_checked_where_debugpy_runs_it() {
+    use serde_json::json;
+    let python = |args: serde_json::Value| {
+        super::launch_request_python(&json!({ "arguments": args }), Path::new("/work/proj"))
+    };
+    assert_eq!(
+        python(json!({ "python": ".venv/bin/python", "cwd": "/work/proj/api" })),
+        Some(PathBuf::from("/work/proj/api/.venv/bin/python")),
+        "from the request's cwd"
+    );
+    assert_eq!(
+        python(json!({
+            "python": ["venv/bin/python", "-X", "dev"],
+            "program": "/work/proj/tools/run.py"
+        })),
+        Some(PathBuf::from("/work/proj/tools/venv/bin/python")),
+        "from the program's folder when the request names no cwd"
+    );
+    assert_eq!(
+        python(json!({ "python": "./py/bin/python", "module": "pytest" })),
+        Some(PathBuf::from("/work/proj/py/bin/python")),
+        "from the adapter's folder for a module launch"
+    );
+}
+
+/// #864 review guard: only a relative path with a folder in it moves. A
+/// bare name is a PATH lookup for debugpy too, and an absolute path is
+/// already where it is.
+#[test]
+fn a_bare_or_absolute_launch_python_is_checked_as_written() {
+    use serde_json::json;
+    let python = |args: serde_json::Value| {
+        super::launch_request_python(&json!({ "arguments": args }), Path::new("/work/proj"))
+    };
+    assert_eq!(
+        python(json!({ "python": "python3", "cwd": "/work/proj/api" })),
+        Some(PathBuf::from("python3"))
+    );
+    assert_eq!(
+        python(json!({ "python": "/opt/py/bin/python3.12", "cwd": "/work/proj/api" })),
+        Some(PathBuf::from("/opt/py/bin/python3.12"))
+    );
+}
+
+/// #864, through F5: a project venv debugpy cannot run under is refused
+/// before any adapter starts, on the status line and the panel.
+#[test]
+fn f5_refuses_a_project_venv_too_old_for_debugpy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    make_venv_of(&root, ".venv", "3.9.18");
+    let file = root.join("main.py");
+    std::fs::write(&file, "print('hi')\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.debug_start_or_continue();
+    let started = !app.debug_sessions.is_empty();
+    if started {
+        app.debug_stop();
+    }
+    assert_eq!(
+        app.status, "Python 3.9 (.venv) is too old to debug: debugpy needs 3.10+",
+        "a session started: {started}"
+    );
+    assert!(!started);
+    assert!(app.run_debug.feedback_is_error);
+}
+
+/// #864 regression guard: with no venv and no `python3` on PATH, a bare
+/// `python3` cannot start, where the launch used to run under the debug
+/// venv. Nothing is found, so the launch keeps the debug venv's python; a
+/// `python3` on PATH is still preferred, as for Run.
+#[test]
+fn a_debuggee_with_no_venv_and_no_python3_is_left_to_the_debug_venv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let empty = tmp.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let no_python = std::env::join_paths([&empty]).unwrap();
+    assert_eq!(super::debuggee_python(&pkg, &root, Some(&no_python)), None);
+    assert_eq!(super::debuggee_python(&pkg, &root, None), None, "no PATH");
+
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("python3"), b"#!/bin/sh\n").unwrap();
+    let with_python = std::env::join_paths([&empty, &bin]).unwrap();
+    assert_eq!(
+        super::debuggee_python(&pkg, &root, Some(&with_python)),
+        Some(bin.join("python3"))
+    );
+}
+
+/// #864 guard: the fallback never overrides a venv the project has, even
+/// with nothing on PATH.
+#[test]
+fn a_project_venv_is_the_debuggee_whatever_path_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let venv = make_venv(root, ".venv");
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let empty = std::env::join_paths([root.join("empty-bin")]).unwrap();
+    assert_eq!(super::debuggee_python(&pkg, root, Some(&empty)), Some(venv));
+}
+
 #[test]
 fn run_active_file_with_no_open_file_records_feedback_and_does_not_spawn_terminal() {
     let tmp = tempfile::tempdir().unwrap();
@@ -23022,6 +23859,136 @@ fn sync_outline_populates_from_tree_sitter_without_a_language_server() {
         !app.outline.is_empty(),
         "tree-sitter must surface the struct and two functions"
     );
+}
+
+// ---- A large file's outline is parsed off the UI thread (#1150) ----
+
+/// A Python module of `defs` functions: past the inline-parse limit when
+/// `defs` is large.
+fn python_module(defs: usize) -> String {
+    (0..defs)
+        .map(|i| format!("def f{i}(x):\n    return x + {i}\n"))
+        .collect()
+}
+
+/// What `sync_lsp` records after an edit, without starting a server: the
+/// outline keys on it.
+fn note_edit_for_outline(app: &mut App) {
+    let path = app.editor.path.clone().unwrap();
+    app.lsp_last_seen.insert(path, app.editor.edit_seq);
+}
+
+/// Tick `sync_outline` until the outline holds a symbol named `name`.
+fn sync_outline_until_symbol(app: &mut App, name: &str) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the off-thread outline parse",
+        || {
+            app.sync_outline();
+            app.outline.symbols().iter().any(|s| s.name == name)
+        },
+    );
+}
+
+#[test]
+fn typing_in_a_large_file_does_not_reparse_its_outline_on_the_ui_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(60_000));
+    note_edit_for_outline(&mut app);
+    sync_outline_until_symbol(&mut app, "f59999");
+    app.editor.cursor_row = app.editor.lines.len() - 1;
+    app.editor.cursor_col = 0;
+    for c in "def added(): pass".chars() {
+        app.editor.insert_char(c);
+    }
+    note_edit_for_outline(&mut app);
+    let started = std::time::Instant::now();
+    app.sync_outline();
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(250),
+        "a keystroke's outline sync took {took:?}"
+    );
+    assert!(
+        app.outline.symbols().iter().any(|s| s.name == "f59999"),
+        "the previous outline stays until the new one lands"
+    );
+    sync_outline_until_symbol(&mut app, "added");
+}
+
+#[test]
+fn a_burst_of_typing_in_a_large_file_ends_on_the_outline_of_its_last_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(20_000));
+    note_edit_for_outline(&mut app);
+    sync_outline_until_symbol(&mut app, "f19999");
+    app.editor.cursor_row = app.editor.lines.len() - 1;
+    for c in "def burst(): pass".chars() {
+        app.editor.insert_char(c);
+        note_edit_for_outline(&mut app);
+        app.sync_outline();
+    }
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the parse of the last keystroke",
+        || {
+            app.sync_outline();
+            app.outline_parse.is_none() && app.outline_parsed_for == app.outline_synced
+        },
+    );
+    assert!(app.outline.symbols().iter().any(|s| s.name == "burst"));
+    app.sync_outline();
+    assert!(
+        app.outline_parse.is_none(),
+        "with no new edit, no new parse"
+    );
+}
+
+#[test]
+fn a_small_file_outline_still_lands_in_the_same_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "small.py", &python_module(50));
+    note_edit_for_outline(&mut app);
+    app.sync_outline();
+    assert_eq!(app.outline.symbols().len(), 50);
+    assert!(app.outline_parse.is_none(), "no worker for a small file");
+}
+
+#[test]
+fn a_syntax_parse_landing_after_the_language_servers_outline_does_not_replace_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(20_000));
+    let path = app.editor.path.clone().unwrap();
+    note_edit_for_outline(&mut app);
+    app.sync_outline();
+    assert!(app.outline_parse.is_some(), "the parse is running");
+    let mut from_server = app_outline_symbol_named("FromServer");
+    from_server.range_end_line = 40_000;
+    assert!(app.apply_outline_symbols(path, app.editor.edit_seq, vec![from_server]));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the off-thread outline parse",
+        || {
+            app.sync_outline();
+            app.outline_parse.is_none()
+        },
+    );
+    let names: Vec<_> = app
+        .outline
+        .symbols()
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["FromServer"]);
+}
+
+fn app_outline_symbol_named(name: &str) -> crate::lsp::manager::OutlineSymbol {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut probe = app_with_open_file(tmp.path(), "one.py", "def one(x):\n    return x\n");
+    probe.sync_outline();
+    let mut symbol = probe.outline.symbols()[0].clone();
+    symbol.name = name.to_string();
+    symbol
 }
 
 #[test]
@@ -26580,6 +27547,43 @@ fn chrome_narrow_frame_shrinks_primary_to_keep_editor_min() {
     assert_eq!(l.right.width, RIGHT_PANE_MIN, "editor keeps its minimum");
     let p = l.primary_side.expect("primary still shown, just narrower");
     assert_eq!(p.width, 100 - ACTIVITY_BAR_WIDTH - RIGHT_PANE_MIN);
+}
+
+#[test]
+fn chrome_drops_a_secondary_side_bar_the_window_cannot_fit() {
+    // #1132 (comment): at 30 columns the 30-column secondary bar was placed
+    // past the right edge of the frame, and its scrollbar wrote outside it.
+    let narrow = Rect::new(0, 0, 30, 9);
+    for pos in [SideBarPosition::Left, SideBarPosition::Right] {
+        let l = compute_chrome_layout(narrow, true, true, true, pos, 20, 30);
+        assert!(
+            l.secondary_side.is_none(),
+            "{pos:?}: {:?}",
+            l.secondary_side
+        );
+        for r in [l.activity, l.primary_side, Some(l.right)]
+            .into_iter()
+            .flatten()
+        {
+            assert!(r.right() <= narrow.right(), "{pos:?}: {r:?}");
+        }
+    }
+}
+
+#[test]
+fn chrome_keeps_the_secondary_side_bar_when_it_fits() {
+    // Negative: with room for it next to the editor's minimum, the secondary
+    // bar keeps its full width.
+    let l = compute_chrome_layout(
+        main_band(),
+        true,
+        false,
+        true,
+        SideBarPosition::Left,
+        20,
+        30,
+    );
+    assert_eq!(l.secondary_side.map(|s| s.width), Some(30));
 }
 
 #[test]
@@ -31835,6 +32839,144 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     );
 }
 
+/// A relay on a temp socket with `plan.txt` from #1147 beside it, plus an
+/// owner and a `--solo` guest that have both opened it and bootstrapped.
+fn collab_owner_and_guest_on_plan() -> (tempfile::TempDir, std::path::PathBuf, App, App) {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("plan.txt");
+    std::fs::write(&file, "Owner: alice\nDue: Friday").unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
+    guest.collab_config = Some((socket, crate::collab::CollabRole::Guest));
+    owner.open_file_at_launch(&file);
+    guest.open_file_at_launch(&file);
+    pump_apps_until(&mut [&mut owner, &mut guest], "bootstrap", |apps| {
+        apps[1]
+            .collab
+            .as_ref()
+            .is_some_and(|s| s.is_live("plan.txt"))
+    });
+    (tmp, file, owner, guest)
+}
+
+/// Poll every app's collab session until `done` holds (5s bound).
+fn pump_apps_until(apps: &mut [&mut App], what: &str, done: impl Fn(&[&mut App]) -> bool) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done(apps) {
+        assert!(Instant::now() < deadline, "never settled: {what}");
+        for app in apps.iter_mut() {
+            app.poll_collab();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The guest's edit to line 2 of `plan.txt`, typed and synced to the owner.
+fn guest_moves_the_due_date(owner: &mut App, guest: &mut App) {
+    guest.editor.cursor_row = 1;
+    guest.editor.cursor_col = "Due: Friday".len();
+    guest.editor.insert_str(" -> moved to Monday");
+    pump_apps_until(&mut [owner, guest], "the edit reaches the owner", |apps| {
+        apps[0]
+            .editor
+            .lines
+            .get(1)
+            .is_some_and(|l| l.ends_with("Monday"))
+    });
+}
+
+/// #1147: once the owner quits, the guest's Cmd+S writes the file instead
+/// of deferring to an owner that is gone.
+#[test]
+fn a_guest_saves_to_disk_once_the_owner_quits() {
+    use std::time::{Duration, Instant};
+    let (_tmp, file, mut owner, mut guest) = collab_owner_and_guest_on_plan();
+    guest_moves_the_due_date(&mut owner, &mut guest);
+    drop(owner);
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !guest.status.contains("owner left") {
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    guest.save();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "Owner: alice\nDue: Friday -> moved to Monday",
+        "{}",
+        guest.status
+    );
+}
+
+/// #1147: a new owner on the same relay gets the edits the stranded guest
+/// made after the first owner left, instead of the two forking.
+#[test]
+fn a_new_owner_receives_the_stranded_guests_edits() {
+    use std::time::{Duration, Instant};
+    let (tmp, file, mut owner, mut guest) = collab_owner_and_guest_on_plan();
+    guest_moves_the_due_date(&mut owner, &mut guest);
+    let socket = owner.collab_config.clone().unwrap().0;
+    drop(owner);
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !guest.status.contains("owner left") {
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    guest.editor.cursor_row = 0;
+    guest.editor.cursor_col = "Owner: alice".len();
+    guest.editor.insert_str(" and bob");
+    let mut owner2 = App::new(tmp.path().to_path_buf()).unwrap();
+    owner2.collab_config = Some((socket, crate::collab::CollabRole::Owner));
+    owner2.open_file_at_launch(&file);
+    pump_apps_until(
+        &mut [&mut owner2, &mut guest],
+        "the new owner converges",
+        |apps| {
+            apps[0].editor.lines == apps[1].editor.lines
+                && apps[0].editor.lines[0].ends_with("and bob")
+        },
+    );
+    assert_eq!(
+        guest.editor.lines,
+        vec!["Owner: alice and bob", "Due: Friday -> moved to Monday"]
+    );
+}
+
+/// While the owner is still there, a guest's save stays with the owner,
+/// however long the session runs between saves.
+#[test]
+fn a_guest_save_still_defers_to_an_owner_that_is_present() {
+    use std::time::{Duration, Instant};
+    let (_tmp, file, mut owner, mut guest) = collab_owner_and_guest_on_plan();
+    guest_moves_the_due_date(&mut owner, &mut guest);
+    let until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < until {
+        owner.poll_collab();
+        guest.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    guest.save();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "Owner: alice\nDue: Friday"
+    );
+    assert!(guest.status.contains("owner saves"), "{}", guest.status);
+}
+
 /// Splitting (or reopening) a live shared file loads the DISK copy, which
 /// is stale by construction: a guest never writes shared files, so an
 /// unsaved session's work exists only in buffers and replicas. The stale
@@ -36300,6 +37442,145 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
     );
 }
 
+/// #1244: `gone.txt` deleted on one branch and modified on the other, mid
+/// `git merge feature`. `deleted_on_feature` picks which side deleted it.
+fn modify_delete_repo(tmp: &std::path::Path, deleted_on_feature: bool) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.join("gone.txt"), "x\ny\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-q", "-b", "feature"]);
+    if deleted_on_feature {
+        git(&["rm", "-q", "gone.txt"]);
+        git(&["commit", "-qm", "delete"]);
+    } else {
+        std::fs::write(tmp.join("gone.txt"), "x\ny-feature\n").unwrap();
+        git(&["commit", "-aqm", "edit"]);
+    }
+    git(&["checkout", "-q", "main"]);
+    if deleted_on_feature {
+        std::fs::write(tmp.join("gone.txt"), "x\ny-main\n").unwrap();
+        git(&["commit", "-aqm", "edit"]);
+    } else {
+        git(&["rm", "-q", "gone.txt"]);
+        git(&["commit", "-qm", "delete"]);
+    }
+    let merge = git(&["merge", "feature"]);
+    assert!(!merge.status.success(), "modify/delete must conflict");
+}
+
+fn git_out(tmp: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn open_modify_delete(tmp: &std::path::Path, deleted_on_feature: bool) -> App {
+    modify_delete_repo(tmp, deleted_on_feature);
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry_named(&mut app, "gone.txt");
+    app.open_source_control_entry(idx);
+    assert!(app.editor.merge.is_some(), "{}", app.status);
+    app
+}
+
+fn wait_for_conflicted_entry_named(app: &mut App, name: &str) -> usize {
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let mut found = None;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1000),
+        "the git worker to report the conflicted entry",
+        || {
+            let _ = app.drain_git_responses();
+            found = app.source_control.entries.iter().position(|e| {
+                e.kind == crate::git::ChangeKind::Conflicted && e.path.ends_with(name)
+            });
+            found.is_some()
+        },
+    );
+    found.unwrap()
+}
+
+#[test]
+fn taking_the_incoming_deletion_removes_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_modify_delete(tmp.path(), true);
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
+    app.complete_merge();
+    assert!(!tmp.path().join("gone.txt").exists(), "{}", app.status);
+    assert_eq!(git_out(tmp.path(), &["ls-files", "gone.txt"]), "");
+    assert_eq!(
+        git_out(tmp.path(), &["status", "--porcelain", "gone.txt"]),
+        "D  gone.txt\n"
+    );
+    assert!(app.status.contains("removed gone.txt"), "{}", app.status);
+    assert!(
+        app.editor
+            .find_any_tab_with_path(&tmp.path().join("gone.txt"))
+            .is_none(),
+        "the tab for the removed file closes"
+    );
+}
+
+#[test]
+fn taking_the_current_deletion_removes_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_modify_delete(tmp.path(), false);
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllCurrent);
+    app.complete_merge();
+    assert!(!tmp.path().join("gone.txt").exists(), "{}", app.status);
+    assert_eq!(git_out(tmp.path(), &["ls-files", "gone.txt"]), "");
+}
+
+#[test]
+fn keeping_the_modified_side_of_a_modify_delete_stages_it() {
+    // Negative: the side that kept the file still wins as before.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_modify_delete(tmp.path(), true);
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllCurrent);
+    app.complete_merge();
+    assert_eq!(git_out(tmp.path(), &["show", ":gone.txt"]), "x\ny-main\n");
+    assert_eq!(git_out(tmp.path(), &["ls-files", "-u", "gone.txt"]), "");
+    assert!(tmp.path().join("gone.txt").exists());
+}
+
+#[test]
+fn the_deleted_side_says_so_in_its_pane_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_modify_delete(tmp.path(), true);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let text: String = (a.y..a.y + a.height)
+        .map(|y| {
+            (a.x..a.x + a.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("INCOMING (theirs): deleted"), "{text}");
+    assert!(text.contains("CURRENT (yours)") && !text.contains("CURRENT (yours): deleted"));
+}
+
 #[test]
 fn merge_editor_accepts_toggles_and_manual_edits_update_the_counter() {
     let tmp = tempfile::tempdir().unwrap();
@@ -36710,6 +37991,28 @@ fn f12_family_chords_route_alt_to_peek() {
         !is_peek_definition_key(shift_alt),
         "peek requires ALT alone in the F12 family"
     );
+}
+
+/// A task declaring `["$gcc", "$eslint-stylish"]` puts both tools' errors
+/// in PROBLEMS, not just the first matcher's (#1240).
+#[test]
+fn a_task_with_a_matcher_list_reports_every_matchers_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let matcher =
+        crate::problem_matchers::from_tasks_json(&serde_json::json!(["$gcc", "$eslint-stylish"]))
+            .map(std::sync::Arc::new);
+    app.assign_task_matcher(9, matcher);
+    let out = "bad.c:3:10: error: 'y' undeclared\n\nweb/app.js\n  1:5  error  a is unused  no-unused-vars\n";
+    assert!(app.apply_build_scan(9, Some(tmp.path()), "gcc -c bad.c; ./lint.sh", out));
+    let mut files: Vec<String> = app
+        .problems
+        .groups()
+        .iter()
+        .map(|g| g.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["app.js", "bad.c"]);
 }
 
 #[test]
@@ -43856,6 +45159,209 @@ fn a_rename_landing_before_a_keystroke_in_a_symbol_tab_is_kept() {
     );
 }
 
+// ---- A late workspace edit never lands on text typed since (#1151) ----
+
+/// `calc.srn` open in the editor, caret at its start, as in the issue.
+fn app_with_calc_open(tmp: &tempfile::TempDir) -> (App, PathBuf) {
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("calc.srn");
+    std::fs::write(&file, "total = 1\nprint(total)\ntotal += 2\n").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.focus = Pane::Editor;
+    (app, file)
+}
+
+/// The server's rename of `total` to `sum` in calc.srn, computed against
+/// the text the file held when the request went out.
+fn rename_total_to_sum(file: &Path) -> Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)> {
+    let span = |row, col| crate::widgets::editor::TextSpanEdit {
+        start: (row, col),
+        end: (row, col + 5),
+        new_text: String::from("sum"),
+        utf16: false,
+    };
+    vec![(file.to_path_buf(), vec![span(0, 0), span(1, 6), span(2, 0)])]
+}
+
+/// The issue's keystrokes while the server works: a `# header` line above.
+fn type_a_header_line(app: &mut App) {
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    for c in "# header".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_rename_reply_for_a_buffer_typed_into_since_the_request_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.rename_baseline = app.editor.edit_seqs();
+    type_a_header_line(&mut app);
+    app.land_rename(Some(rename_total_to_sum(&file)));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "# header\ntotal = 1\nprint(total)\ntotal += 2",
+        "no edit lands at the stale positions"
+    );
+    assert_eq!(
+        app.status,
+        "Rename cancelled: calc.srn changed while the server was working; press F2 again"
+    );
+}
+
+#[test]
+fn a_rename_reply_for_an_untouched_buffer_still_renames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.rename_baseline = app.editor.edit_seqs();
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.land_rename(Some(rename_total_to_sum(&file)));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "sum = 1\nprint(sum)\nsum += 2",
+        "a caret move is not an edit"
+    );
+    assert_eq!(app.status, "Renamed 3 occurrence(s) across 1 file(s)");
+}
+
+#[test]
+fn a_rename_still_rewrites_a_closed_file_when_another_buffer_was_typed_into() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_calc_open(&tmp);
+    let closed = app.tree.root.join("other.srn");
+    std::fs::write(&closed, "total = 1\nprint(total)\ntotal += 2\n").unwrap();
+    app.rename_baseline = app.editor.edit_seqs();
+    type_a_header_line(&mut app);
+    app.land_rename(Some(rename_total_to_sum(&closed)));
+    assert_eq!(
+        std::fs::read_to_string(&closed).unwrap(),
+        "sum = 1\nprint(sum)\nsum += 2\n",
+        "the typing was in a file the rename leaves alone"
+    );
+    assert_eq!(app.status, "Renamed 3 occurrence(s) across 1 file(s)");
+}
+
+#[test]
+fn a_rename_reply_with_no_baseline_is_applied_as_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.land_rename(Some(rename_total_to_sum(&file)));
+    assert_eq!(app.editor.lines[0], "sum = 1");
+    assert!(app.rename_baseline.is_empty());
+}
+
+fn quick_fix_renaming_total(file: &Path) -> crate::lsp::manager::CodeActionItem {
+    crate::lsp::manager::CodeActionItem {
+        title: String::from("Rename to sum"),
+        server: String::from("slowrename"),
+        edits: rename_total_to_sum(file),
+        command: None,
+        needs_resolve: false,
+        resolve_action: None,
+        is_preferred: false,
+    }
+}
+
+#[test]
+fn a_quick_fix_for_a_buffer_typed_into_since_the_request_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.code_action_baseline = app.editor.edit_seqs();
+    type_a_header_line(&mut app);
+    app.apply_code_action(quick_fix_renaming_total(&file));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "# header\ntotal = 1\nprint(total)\ntotal += 2"
+    );
+    assert_eq!(
+        app.status,
+        "Quick fix cancelled: calc.srn changed while the server was working; try it again"
+    );
+}
+
+#[test]
+fn a_quick_fix_for_an_untouched_buffer_still_applies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.code_action_baseline = app.editor.edit_seqs();
+    app.apply_code_action(quick_fix_renaming_total(&file));
+    assert_eq!(app.editor.lines.join("\n"), "sum = 1\nprint(sum)\nsum += 2");
+    assert_eq!(
+        app.status,
+        "Rename to sum: changed 3 edit(s) across 1 file(s)"
+    );
+}
+
+/// An Explorer rename of `calc.srn` to `sums.srn` whose server answer also
+/// renames `total` inside the moved file, which is open in a tab.
+fn move_calc_to_sums(app: &App, file: &Path) -> PendingFileMove {
+    let root = app.tree.root.clone();
+    PendingFileMove {
+        request_id: 9,
+        op: FileMove::Rename {
+            parent: root.clone(),
+            old: file.to_path_buf(),
+            new_name: String::from("sums.srn"),
+        },
+        renames: vec![crate::lsp::manager::FileRenameOp {
+            old: file.to_path_buf(),
+            new: root.join("sums.srn"),
+            is_dir: false,
+        }],
+        deadline: std::time::Instant::now(),
+        baseline: app.editor.edit_seqs(),
+    }
+}
+
+#[test]
+fn a_file_move_moves_but_leaves_a_buffer_typed_into_since_the_request_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    let pending = move_calc_to_sums(&app, &file);
+    type_a_header_line(&mut app);
+    app.finish_file_move(pending, rename_total_to_sum(&file));
+    assert!(
+        app.tree.root.join("sums.srn").exists(),
+        "the move still ran"
+    );
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "# header\ntotal = 1\nprint(total)\ntotal += 2"
+    );
+    assert!(
+        app.status
+            .ends_with("; references not updated: sums.srn changed while the server was working"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn a_file_move_still_updates_an_untouched_buffer_it_moved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    let pending = move_calc_to_sums(&app, &file);
+    app.finish_file_move(pending, rename_total_to_sum(&file));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(app.tree.root.join("sums.srn").as_path())
+    );
+    assert_eq!(app.editor.lines.join("\n"), "sum = 1\nprint(sum)\nsum += 2");
+    assert!(
+        app.status.contains("references updated in 1 file"),
+        "{}",
+        app.status
+    );
+}
+
 #[test]
 fn peek_references_with_nothing_to_ask_does_not_arm_on_a_stale_request() {
     let tmp = tempfile::tempdir().unwrap();
@@ -46590,6 +48096,98 @@ fn ctrl_b_still_toggles_the_side_bar_outside_the_terminal() {
     );
 }
 
+fn focused_terminal_app(dir: &std::path::Path) -> App {
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.clipboard_reader = || Some(String::from("CLIP"));
+    app
+}
+
+fn pty_bytes(app: &App) -> Vec<u8> {
+    app.terminals[app.active_terminal].written_bytes_for_test()
+}
+
+/// Ctrl+Q inside vim or nano in a focused terminal is the app's key
+/// (visual block, search backwards, XON), not a quit that kills the
+/// shell and every unsaved tab with it (#1290).
+#[test]
+fn ctrl_q_in_a_focused_terminal_reaches_the_app_instead_of_quitting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = focused_terminal_app(tmp.path());
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(!app.quit, "Ctrl+Q in the terminal must not quit croft");
+    assert!(
+        pty_bytes(&app).contains(&0x11),
+        "Ctrl+Q must reach the PTY as 0x11"
+    );
+}
+
+/// Ctrl+V is vim's visual block and nano's page down, so in a focused
+/// terminal it goes to the app as 0x16 (#1290). Pasting keeps
+/// Ctrl+Shift+V and Cmd+V, as in VS Code on Linux.
+#[test]
+fn ctrl_v_in_a_focused_terminal_reaches_the_app_and_shifted_paste_still_pastes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = focused_terminal_app(tmp.path());
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        pty_bytes(&app),
+        vec![0x16],
+        "Ctrl+V must reach the PTY as 0x16"
+    );
+    assert!(!app.status.starts_with("Paste"), "Ctrl+V must not paste");
+
+    // A paste either lands in the PTY or, with no clipboard tool on the
+    // box, reports why on the status bar; it never sends the raw byte.
+    for chord in [
+        key(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+        key(KeyCode::Char('v'), KeyModifiers::SUPER),
+    ] {
+        app.status.clear();
+        let before = pty_bytes(&app).len();
+        app.handle_key(chord).unwrap();
+        let sent = pty_bytes(&app)[before..].to_vec();
+        assert!(
+            !sent.contains(&0x16),
+            "{chord:?} pastes rather than sending 0x16"
+        );
+        assert!(
+            !sent.is_empty() || app.status.starts_with("Paste"),
+            "{chord:?} still pastes the clipboard"
+        );
+    }
+}
+
+/// The release is about the focused terminal only: from the editor,
+/// Ctrl+Q still quits (#1290).
+#[test]
+fn ctrl_q_still_quits_outside_the_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.quit, "with the editor focused, Ctrl+Q still quits");
+}
+
+/// The PROBLEMS tab owns the panel pane while it is shown, so there is no
+/// app to hand Ctrl+Q to: it still quits (#1290).
+#[test]
+fn ctrl_q_still_quits_from_the_problems_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = focused_terminal_app(tmp.path());
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.quit, "Ctrl+Q quits when the panel shows PROBLEMS");
+}
+
 #[test]
 fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
     // The two gestures are orthogonal: entering maximize does not clear the
@@ -48760,15 +50358,15 @@ fn a_diff_view_in_an_inactive_split_group_is_refreshed_too() {
 
 #[test]
 fn a_rewrite_that_only_changes_bytes_still_refreshes_the_byte_facts() {
-    // A final newline added to the working file changes no line text, so the
-    // rows come back identical -- but `right_no_final_nl` and the "bytes
-    // differ, lines equal" banner feed the hunk patch and the header. The
+    // A switch back from CRLF changes no line text, so the rows come back
+    // identical -- but `right_crlf` and the "bytes differ, lines equal"
+    // banner feed the hunk patch and the header. The
     // same-content skip must see those facts as content, or stage/revert
     // would build a patch from bytes no longer on disk.
     let (tmp, f) = repo_with_seed("a\nb\n");
     let root = tmp.path().to_path_buf();
     let mut app = App::new(root.clone()).unwrap();
-    std::fs::write(&f, "a\nb").unwrap();
+    std::fs::write(&f, "a\r\nb\r\n").unwrap();
     app.editor
         .open_head_diff_with_text(
             std::path::PathBuf::from("seed.txt (HEAD)"),
@@ -48783,7 +50381,7 @@ fn a_rewrite_that_only_changes_bytes_still_refreshes_the_byte_facts() {
     });
     let d = app.editor.diff.as_ref().unwrap();
     assert!(
-        d.right_no_final_nl && d.bytes_differ_but_lines_equal,
+        d.right_crlf.iter().all(|&cr| cr) && d.bytes_differ_but_lines_equal,
         "precondition: {d:?}"
     );
 
@@ -48794,8 +50392,8 @@ fn a_rewrite_that_only_changes_bytes_still_refreshes_the_byte_facts() {
     );
     let d = app.editor.diff.as_ref().unwrap();
     assert!(
-        !d.right_no_final_nl,
-        "the working side now ends in a newline"
+        !d.right_crlf.iter().any(|&cr| cr),
+        "the working side is LF again"
     );
     assert!(
         !d.bytes_differ_but_lines_equal,
@@ -51909,6 +53507,253 @@ fn a_switched_to_member_replays_its_queued_stop() {
     app.debug_stop();
 }
 
+/// #867: the Debug Console lived only in the sidebar, cut at its edge.
+/// Program output and REPL results are mirrored, whole, to OUTPUT's
+/// "Debug Console" channel, where they read at full width and can be
+/// searched and copied.
+#[test]
+fn the_debug_console_is_mirrored_to_an_output_channel() {
+    use crate::dap::session::DapEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let tag = format!("mirror-{}", std::process::id());
+    let printed = format!("{tag} {}", "wide ".repeat(40));
+    let event = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"{printed}\n"}}}}"#
+    );
+    app.debug_sessions.push("P", stub_emitting(&[&event]));
+    let mirrored = |text: &str| {
+        crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+            .unwrap_or_default()
+            .iter()
+            .any(|l| l.text == text)
+    };
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the program's output to reach the Debug Console channel",
+        || {
+            app.poll_dap();
+            mirrored(&printed)
+        },
+    );
+
+    let (_, p) = app
+        .debug_sessions
+        .iter_named_mut_indexed()
+        .find(|(i, _)| *i == 0)
+        .unwrap();
+    p.backlog.push(DapEvent::Evaluated {
+        context: String::from("repl"),
+        expression: format!("describe('{tag}')"),
+        result: format!("'{tag} described'"),
+        success: true,
+    });
+    app.poll_dap();
+    assert!(mirrored(&format!("❯ describe('{tag}')")), "the REPL echo");
+    assert!(mirrored(&format!("'{tag} described'")), "and its result");
+    app.debug_stop();
+}
+
+/// #867 guard: the mirror carries what the console shows and nothing more.
+/// debugpy's `telemetry` banner, which the console drops, stays out of the
+/// channel too, and a printed line lands there once, not once per poll.
+#[test]
+fn the_debug_console_mirror_skips_telemetry_and_copies_each_line_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let tag = format!("mirror-once-{}", std::process::id());
+    let telemetry = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"telemetry","output":"{tag} ptvsd"}}}}"#
+    );
+    let printed = format!(
+        r#"{{"seq":2,"type":"event","event":"output","body":{{"category":"stdout","output":"{tag} printed\n"}}}}"#
+    );
+    app.debug_sessions
+        .push("P", stub_emitting(&[&telemetry, &printed]));
+    let count = |text: &str| {
+        crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| l.text == text)
+            .count()
+    };
+    let line = format!("{tag} printed");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the printed line to reach the Debug Console channel",
+        || {
+            app.poll_dap();
+            count(&line) > 0
+        },
+    );
+    for _ in 0..5 {
+        app.poll_dap();
+    }
+    let channel = crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE).unwrap_or_default();
+    let in_panel = app.debug_console.iter().filter(|l| **l == line).count();
+    app.debug_stop();
+    assert_eq!(count(&line), 1, "once");
+    assert!(
+        !channel
+            .iter()
+            .any(|l| l.text.contains(&format!("{tag} ptvsd"))),
+        "telemetry is not mirrored"
+    );
+    assert_eq!(in_panel, 1, "and the panel keeps its own copy");
+}
+
+/// A stand-in debug adapter (#864) that stops on an exception as soon as it
+/// is configured, advertising `exceptionInfo`. With `answer_at_once` it
+/// answers that request as it comes; otherwise it holds the answer until
+/// `continue`, then prints `MARKER`, after which the late answer has been
+/// read.
+fn exception_stop_adapter(dir: &Path, answer_at_once: bool) -> crate::dap::session::DapSession {
+    let script = format!(
+        r#"
+import json, sys
+AT_ONCE = {at_once}
+seq = [1000]
+held = []
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length))
+def send(msg):
+    seq[0] += 1
+    msg["seq"] = seq[0]
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+def reply(req, body=None):
+    send({{"type": "response", "request_seq": req["seq"], "success": True,
+          "command": req["command"], "body": body or {{}}}})
+def answer(req):
+    reply(req, {{"exceptionId": "KeyError", "description": "'x'"}})
+while True:
+    req = read()
+    if req is None:
+        break
+    c = req["command"]
+    if c == "initialize":
+        reply(req, {{"supportsExceptionInfoRequest": True}})
+        send({{"type": "event", "event": "initialized"}})
+    elif c == "configurationDone":
+        reply(req)
+        send({{"type": "event", "event": "stopped", "body": {{"reason": "exception", "threadId": 1}}}})
+    elif c == "exceptionInfo":
+        if AT_ONCE:
+            answer(req)
+        else:
+            held.append(req)
+    elif c == "continue":
+        reply(req)
+        for h in held:
+            answer(h)
+        send({{"type": "event", "event": "output", "body": {{"category": "stdout", "output": "MARKER\n"}}}})
+    elif c == "disconnect":
+        reply(req)
+        break
+    else:
+        reply(req)
+"#,
+        at_once = if answer_at_once { "True" } else { "False" }
+    );
+    let path = dir.join("fake_dap.py");
+    std::fs::write(&path, script).unwrap();
+    crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[path.display().to_string()],
+        dir,
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("python3 spawns")
+}
+
+/// #864: an `exceptionInfo` answer that arrives after Continue describes a
+/// stop that is over. It must not put "Paused on exception" on the status
+/// line of a program that is running again.
+#[test]
+fn an_exception_answer_after_continue_does_not_say_paused() {
+    use crate::dap::session::SessionPhase;
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("P", exception_stop_adapter(tmp.path(), false));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the exception stop",
+        || {
+            app.poll_dap();
+            app.debug_sessions
+                .focused()
+                .is_some_and(|s| s.phase == SessionPhase::Stopped)
+        },
+    );
+    app.debug_start_or_continue();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the late answer and the marker after it",
+        || {
+            app.poll_dap();
+            app.debug_console.iter().any(|l| l == "MARKER")
+        },
+    );
+    let status = app.status.clone();
+    let feedback = app.run_debug.feedback.clone().unwrap_or_default();
+    app.debug_stop();
+    assert!(!status.contains("Paused"), "status: {status}");
+    assert!(!feedback.contains("KeyError"), "feedback: {feedback}");
+}
+
+/// #864 guard: an answer that arrives while the program is still stopped
+/// names the exception, on the status line and in the panel.
+#[test]
+fn an_exception_answer_while_stopped_names_the_exception() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("P", exception_stop_adapter(tmp.path(), true));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the exception to be named",
+        || {
+            app.poll_dap();
+            app.status.contains("KeyError")
+        },
+    );
+    let feedback = app.run_debug.feedback.clone();
+    let status = app.status.clone();
+    app.debug_stop();
+    assert_eq!(status, "Paused on exception: KeyError: 'x'");
+    assert_eq!(
+        feedback.as_deref(),
+        Some("Paused (exception): KeyError: 'x'")
+    );
+}
+
 /// A workspace with two source files and breakpoints set in both (#250).
 fn app_with_breakpoints() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
@@ -52229,6 +54074,101 @@ fn stop_all_false_leaves_the_siblings_running() {
     app.debug_stop();
 }
 
+/// #867: the issue's recording shows "Debug session ended" in the panel
+/// while the status bar still read "Debugging out.p… · F10 step over ·
+/// Shift+F5 stop". A session that ends on its own says so on the status
+/// line as well.
+#[test]
+fn a_session_ending_on_its_own_says_so_on_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Debug session ended")
+    );
+    assert_eq!(app.status, "Debug session ended");
+}
+
+/// #867: the run that never reached its breakpoint says that on the
+/// status line too, as the panel does.
+#[test]
+fn a_run_that_never_hit_its_breakpoint_says_so_on_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .breakpoints
+        .entry(tmp.path().join("out.py"))
+        .or_default()
+        .insert(1);
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(app.status, "Program exited without hitting a breakpoint");
+}
+
+/// #867 guard: the end message is written once, when the session ends. A
+/// status set after that (the user's next action) survives later polls.
+#[test]
+fn a_status_set_after_the_debug_session_ended_is_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    app.status = String::from("Saved out.py");
+    for _ in 0..5 {
+        app.poll_dap();
+    }
+    assert_eq!(app.status, "Saved out.py");
+}
+
+/// #867 guard: a postDebugTask reports after the end, so its message is
+/// the one left on the status line, not the end message.
+#[test]
+fn a_post_debug_task_message_outlives_the_end_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.debug_post_tasks = vec![String::from("missing")];
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert!(
+        app.status
+            .starts_with("postDebugTask \"missing\" not found"),
+        "{}",
+        app.status
+    );
+}
+
+/// #867 guard: when the focused member of a `stopAll` compound ends, the
+/// status keeps saying why the rest stopped rather than the plain end
+/// message.
+#[test]
+fn stop_all_keeps_its_explanation_when_the_focused_member_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(0);
+    app.debug_stop_all = true;
+
+    poll_until_shrinks(&mut app, 2);
+    assert!(
+        app.debug_sessions.is_empty(),
+        "{:?}",
+        app.debug_sessions.names()
+    );
+    assert_eq!(
+        app.status,
+        "A ended — stopAll stopped the rest of the compound"
+    );
+}
+
 /// A compound that is REFUSED (here, it names a configuration no
 /// launch.json declares) leaves the running set alone, so it must not leave
 /// its `stopAll` behind either: that set never asked for it.
@@ -52375,6 +54315,81 @@ fn live_run_lands_a_real_run_on_the_tab() {
     assert!(app.status.starts_with("Live Run: ok"), "{}", app.status);
 }
 
+// ---- Local history follows Explorer renames and moves (#1246) ----
+
+fn app_with_history(root: &std::path::Path) -> (App, tempfile::TempDir) {
+    let hist = tempfile::tempdir().unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    (app, hist)
+}
+
+#[test]
+fn renaming_a_file_in_the_explorer_keeps_its_local_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("notes.txt"), "v3\n").unwrap();
+    let (mut app, _hist) = app_with_history(&root);
+    crate::history::record_in(&app.history_root, &root.join("notes.txt"), b"v1\n", 1_000).unwrap();
+    crate::history::record_in(&app.history_root, &root.join("notes.txt"), b"v2\n", 60_000).unwrap();
+    assert!(app.run_file_move(FileMove::Rename {
+        parent: root.clone(),
+        old: root.join("notes.txt"),
+        new_name: String::from("journal.txt"),
+    }));
+    let moved = crate::history::entries_in(&app.history_root, &root.join("journal.txt"));
+    assert_eq!(
+        moved.iter().map(|s| s.millis).collect::<Vec<_>>(),
+        [60_000, 1_000]
+    );
+    assert!(crate::history::entries_in(&app.history_root, &root.join("notes.txt")).is_empty());
+}
+
+#[test]
+fn cutting_a_folder_into_another_keeps_its_files_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::create_dir_all(root.join("archive")).unwrap();
+    std::fs::write(root.join("docs").join("a.md"), "a\n").unwrap();
+    let (mut app, _hist) = app_with_history(&root);
+    let old = root.join("docs").join("a.md");
+    crate::history::record_in(&app.history_root, &old, b"a0\n", 1_000).unwrap();
+    assert!(app.run_file_move(FileMove::Paste {
+        dest_dir: root.join("archive"),
+        paths: vec![root.join("docs")],
+    }));
+    let new = root.join("archive").join("docs").join("a.md");
+    assert!(new.exists());
+    assert_eq!(crate::history::entries_in(&app.history_root, &new).len(), 1);
+    assert!(crate::history::entries_in(&app.history_root, &old).is_empty());
+}
+
+/// A copy is a new file: the original keeps its history, the copy starts
+/// empty.
+#[test]
+fn copying_a_file_leaves_its_history_with_the_original() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    let (mut app, _hist) = app_with_history(&root);
+    crate::history::record_in(&app.history_root, &root.join("a.txt"), b"a0\n", 1_000).unwrap();
+    assert!(app.apply_paste_or_drop(
+        &root.join("sub"),
+        &[root.join("a.txt")],
+        ExplorerClipMode::Copy
+    ));
+    assert!(root.join("sub").join("a.txt").exists());
+    assert_eq!(
+        crate::history::entries_in(&app.history_root, &root.join("a.txt")).len(),
+        1
+    );
+    assert!(
+        crate::history::entries_in(&app.history_root, &root.join("sub").join("a.txt")).is_empty()
+    );
+}
+
 // ---- Explorer moves ask the servers first (#610) ----
 
 #[test]
@@ -52397,6 +54412,7 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
             is_dir: false,
         }],
         deadline: std::time::Instant::now(),
+        baseline: Vec::new(),
     };
     let edits = vec![(
         root.join("main.py"),
@@ -52513,6 +54529,7 @@ fn a_failed_move_leaves_the_importers_alone_and_edits_follow_a_moved_file() {
             is_dir: true,
         }],
         deadline: std::time::Instant::now(),
+        baseline: Vec::new(),
     };
     app.finish_file_move(pending, edit(root.join("main.rs")));
     assert_eq!(
@@ -52536,6 +54553,7 @@ fn a_failed_move_leaves_the_importers_alone_and_edits_follow_a_moved_file() {
             is_dir: true,
         }],
         deadline: std::time::Instant::now(),
+        baseline: Vec::new(),
     };
     app.finish_file_move(pending, edit(root.join("pkg/lib.rs")));
     assert_eq!(
@@ -52559,6 +54577,7 @@ fn a_pending_move_goes_ahead_at_its_deadline_without_an_answer() {
         },
         renames: Vec::new(),
         deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+        baseline: Vec::new(),
     });
     assert!(app.tick_file_moves());
     assert!(app.pending_file_move.is_none());
@@ -52818,7 +54837,11 @@ fn rebase_todo_keys_set_the_action_and_step_down() {
     ))
     .unwrap();
     assert_eq!(app.editor.lines[1], "fixup bbb222 second");
-    assert_eq!(app.editor.cursor_row, 2, "the caret moves to the next line");
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "no commit line follows, so the caret stays on the last one"
+    );
+    app.editor.cursor_row = 2;
     app.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Char('d'),
         KeyModifiers::NONE,
@@ -52828,6 +54851,97 @@ fn rebase_todo_keys_set_the_action_and_step_down() {
         app.editor.lines[2], "d# comment",
         "a comment line types normally"
     );
+}
+
+fn press_rebase_keys(app: &mut App, keys: &str) {
+    for c in keys.chars() {
+        app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        ))
+        .unwrap();
+    }
+}
+
+const REBASE_PLAN: &str = "pick aaa111 c2\npick bbb222 c3\npick ccc333 c4\n\n# Rebase 805d070..ccc333 onto 805d070 (3 commands)\n#\n";
+
+#[test]
+fn a_key_past_the_last_commit_leaves_the_plan_valid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    app.editor.cursor_row = 1;
+    press_rebase_keys(&mut app, "sss");
+    assert_eq!(
+        &app.editor.lines[..4],
+        &["pick aaa111 c2", "squash bbb222 c3", "squash ccc333 c4", ""],
+        "the third key lands on the last commit again, not the blank line"
+    );
+    assert_eq!(app.editor.cursor_row, 2);
+}
+
+#[test]
+fn an_action_key_on_a_blank_plan_line_types_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    app.editor.cursor_row = 3;
+    press_rebase_keys(&mut app, "psd");
+    assert_eq!(app.editor.lines[3], "", "the blank line stays blank");
+    assert_eq!(app.editor.cursor_row, 3);
+}
+
+#[test]
+fn the_caret_skips_comments_to_the_next_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "git-rebase-todo",
+        "pick aaa111 c2\n# keep this one\n\npick bbb222 c3\n",
+    );
+    press_rebase_keys(&mut app, "r");
+    assert_eq!(app.editor.lines[0], "reword aaa111 c2");
+    assert_eq!(app.editor.cursor_row, 3, "past the comment and the blank");
+    press_rebase_keys(&mut app, "f");
+    assert_eq!(app.editor.lines[3], "fixup bbb222 c3");
+}
+
+#[test]
+fn squash_on_the_first_commit_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    press_rebase_keys(&mut app, "s");
+    assert_eq!(
+        app.editor.lines[0], "pick aaa111 c2",
+        "the line is unchanged"
+    );
+    assert_eq!(app.editor.cursor_row, 0, "the caret stays put");
+    assert!(
+        app.status.contains("Can't squash the first commit"),
+        "{}",
+        app.status
+    );
+    press_rebase_keys(&mut app, "f");
+    assert_eq!(app.editor.lines[0], "pick aaa111 c2");
+    assert!(app.status.contains("Can't fixup"), "{}", app.status);
+}
+
+#[test]
+fn squash_below_only_dropped_commits_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    press_rebase_keys(&mut app, "ds");
+    assert_eq!(app.editor.lines[0], "drop aaa111 c2");
+    assert_eq!(app.editor.lines[1], "pick bbb222 c3");
+    assert!(app.status.contains("Can't squash"), "{}", app.status);
+}
+
+#[test]
+fn other_actions_on_the_first_commit_still_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    press_rebase_keys(&mut app, "e");
+    assert_eq!(app.editor.lines[0], "edit aaa111 c2");
+    assert_eq!(app.editor.cursor_row, 1);
+    assert_eq!(app.status, crate::rebase_todo::HINT);
 }
 
 #[test]
@@ -53495,10 +55609,104 @@ fn a_sticky_note_is_a_box_that_follows_its_line_and_takes_replies() {
     );
 
     app.editor.comment_focus = None;
-    app.editor.cursor_row = 0;
+    app.editor.cursor_row = 3;
     app.delete_sticky_note_here();
     term.draw(|fr| app.render(fr)).unwrap();
     assert!(!app.editor.comment_boxes.iter().any(|x| x.id == b.id));
+}
+
+/// An App on a 120-line `mod.py` with one note on line 113 (row 112), drawn
+/// once so the note has its box.
+fn app_with_a_note_far_down() -> (
+    tempfile::TempDir,
+    App,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("mod.py");
+    let src: String = (0..60)
+        .map(|i| format!("def f{i}(x):\n    return x + {i}\n"))
+        .collect();
+    std::fs::write(&f, src).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor.cursor_row = 112;
+    app.add_sticky_note("TODO before release, f56 must handle negative x");
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|fr| app.render(fr)).unwrap();
+    (tmp, app, term)
+}
+
+fn live_note_bodies(app: &App) -> Vec<String> {
+    app.notes.live().map(|n| n.body.clone()).collect()
+}
+
+/// #1131: Delete Note with the caret on line 1 must not reach down to a
+/// note on line 113 the user can't see.
+#[test]
+fn delete_note_leaves_a_note_further_down_the_file_alone() {
+    let (_tmp, mut app, _term) = app_with_a_note_far_down();
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 0;
+    app.delete_sticky_note_here();
+    assert_eq!(
+        live_note_bodies(&app),
+        vec!["TODO before release, f56 must handle negative x"],
+        "the note on line 113 survives"
+    );
+    assert_eq!(app.status, "No note on this line");
+}
+
+/// The note on the caret's own line still goes, and the status names it.
+#[test]
+fn delete_note_removes_the_note_on_the_caret_line() {
+    let (_tmp, mut app, _term) = app_with_a_note_far_down();
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 112;
+    app.delete_sticky_note_here();
+    assert!(live_note_bodies(&app).is_empty());
+    assert_eq!(
+        app.status,
+        "Note deleted on line 113: TODO before release, f56 must handle"
+    );
+}
+
+/// A note whose box has focus goes wherever the caret is.
+#[test]
+fn delete_note_removes_the_focused_note_whatever_the_caret_line() {
+    let (_tmp, mut app, _term) = app_with_a_note_far_down();
+    let id = app
+        .editor
+        .comment_boxes
+        .iter()
+        .find(|b| b.body.starts_with("TODO before release"))
+        .map(|b| b.id)
+        .expect("the note is drawn as a box");
+    app.editor.cursor_row = 0;
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id,
+        reply: String::new(),
+        cursor: 0,
+    });
+    app.delete_sticky_note_here();
+    assert!(live_note_bodies(&app).is_empty());
+    assert!(
+        app.status.starts_with("Note deleted on line 113"),
+        "{}",
+        app.status
+    );
+}
+
+/// A caret below every note doesn't wrap round to delete one above it.
+#[test]
+fn delete_note_below_the_last_note_deletes_nothing() {
+    let (_tmp, mut app, _term) = app_with_a_note_far_down();
+    app.editor.comment_focus = None;
+    app.editor.cursor_row = 119;
+    app.delete_sticky_note_here();
+    assert_eq!(live_note_bodies(&app).len(), 1);
+    assert_eq!(app.status, "No note on this line");
 }
 
 /// A test-built App never reads the developer's own settings layers: a
@@ -56750,6 +58958,137 @@ fn adding_a_codeql_database_from_a_folder_lists_and_persists_it() {
     });
 }
 
+/// Drain the database download or extraction in flight until it lands.
+fn wait_for_codeql_db_job(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(20),
+        "the CodeQL database job",
+        || {
+            app.drain_codeql_db_job();
+            app.codeql_db_job.is_none()
+        },
+    );
+}
+
+/// A one-database CodeQL zip (Java) at `dir/<name>.zip`.
+fn codeql_db_zip(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use std::io::Write as _;
+    let zp = dir.join(format!("{name}.zip"));
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&zp).unwrap());
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    z.start_file("python/codeql-database.yml", opts).unwrap();
+    z.write_all(b"primaryLanguage: \"python\"\n").unwrap();
+    z.finish().unwrap();
+    zp
+}
+
+/// A stand-in `gh`: lists one `python` database, and downloads `zip` once
+/// a `go` file appears in `dir` (or after five seconds), as a large
+/// database takes its time.
+fn slow_fake_gh(dir: &std::path::Path, zip: &std::path::Path) -> std::path::PathBuf {
+    let gh = dir.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *--jq*) echo python; exit 0;; esac\n\
+             i=0; while [ ! -f '{go}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done\n\
+             cat '{zip}'\n",
+            go = dir.join("go").display(),
+            zip = zip.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    gh
+}
+
+#[test]
+fn adding_a_codeql_database_from_github_returns_at_once_and_lands_later() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = codeql_db_zip(tmp.path(), "requests-db");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = slow_fake_gh(tmp.path(), &zip);
+        let started = std::time::Instant::now();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Github,
+            "psf/requests",
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the download held the UI for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            app.status,
+            "Adding the CodeQL database psf/requests\u{2026}"
+        );
+        assert!(app.codeql.databases.is_empty(), "not there yet");
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Github,
+            "pallets/flask",
+        );
+        assert_eq!(
+            app.status, "Still adding the CodeQL database psf/requests",
+            "one download at a time"
+        );
+        std::fs::write(tmp.path().join("go"), b"").unwrap();
+        wait_for_codeql_db_job(&mut app);
+        assert_eq!(app.status, "Added CodeQL database python (python)");
+        assert_eq!(app.codeql.databases.len(), 1);
+        let entry = &app.codeql.databases[0];
+        assert!(
+            entry.path.starts_with(home.path()),
+            "extracted under croft's cache: {}",
+            entry.path.display()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(App::codeql_db_cache_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".download.zip"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the download is removed once unpacked"
+        );
+    });
+}
+
+#[test]
+fn a_failed_github_download_says_why_and_adds_nothing() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = tmp.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho 'HTTP 404: Not Found' >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh;
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Github,
+            "psf/requests python",
+        );
+        wait_for_codeql_db_job(&mut app);
+        assert_eq!(app.status, "Download failed: HTTP 404: Not Found");
+        assert!(app.codeql.databases.is_empty());
+        let cache = App::codeql_db_cache_dir();
+        let left = std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "no partial download left in {}", cache.display());
+    });
+}
+
 #[test]
 fn adding_a_codeql_database_from_an_archive_extracts_it_first() {
     // The cache-dir override is process-global; serialize with the
@@ -56771,6 +59110,7 @@ fn adding_a_codeql_database_from_an_archive_extracts_it_first() {
             crate::widgets::input_prompt::CodeqlDbSource::Archive,
             &zp.display().to_string(),
         );
+        wait_for_codeql_db_job(&mut app);
         assert_eq!(app.codeql.databases.len(), 1, "{}", app.status);
         let entry = &app.codeql.databases[0];
         assert_eq!(entry.language.as_deref(), Some("java"));
@@ -63915,6 +66255,121 @@ fn resuming_after_a_build_drops_diagnostics_no_open_tab_owns() {
     );
 }
 
+// ---- A late formatter reply never lands on text typed since (#1127) ----
+
+/// The issue's `week.notes`, with `bread` added after `milk`: the buffer a
+/// format request is sent for.
+fn app_with_week_notes(tmp: &tempfile::TempDir) -> (App, PathBuf) {
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "week.notes",
+        "# shopping list\nmilk\neggs\n# todo\ncall bob\npay rent\n",
+    );
+    let file = app.editor.path.clone().unwrap();
+    type_at_line_end(&mut app, 1, "\nbread");
+    (app, file)
+}
+
+fn type_at_line_end(app: &mut App, row: usize, text: &str) {
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = app.editor.lines[row].chars().count();
+    for c in text.chars() {
+        if c == '\n' {
+            app.editor.insert_newline();
+        } else {
+            app.editor.insert_char(c);
+        }
+    }
+}
+
+/// What the request path records when it sends `textDocument/formatting`.
+fn send_format_request(app: &mut App, file: &Path, on_save: bool) {
+    app.format_request_id = Some(41);
+    app.format_request_seq = app.format_target_seq(file);
+    if on_save {
+        app.save_after_format = Some(file.to_path_buf());
+    }
+}
+
+/// The formatter's answer for the text it was sent: upper-case the two
+/// `# ` headings, on lines 0 and 4.
+fn uppercase_headings() -> Vec<crate::widgets::editor::TextSpanEdit> {
+    [(0, "# shopping list"), (4, "# todo")]
+        .into_iter()
+        .map(|(row, line)| crate::widgets::editor::TextSpanEdit {
+            start: (row, 0),
+            end: (row, line.len()),
+            new_text: line.to_uppercase(),
+            utf16: false,
+        })
+        .collect()
+}
+
+#[test]
+fn a_format_on_save_reply_for_a_buffer_typed_into_since_saves_it_unformatted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_week_notes(&tmp);
+    send_format_request(&mut app, &file, true);
+    type_at_line_end(&mut app, 2, "\nbutter");
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    let typed = "# shopping list\nmilk\nbread\nbutter\neggs\n# todo\ncall bob\npay rent";
+    assert_eq!(app.editor.lines.join("\n"), typed, "eggs survives");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("{typed}\n"),
+        "and reaches disk"
+    );
+    assert!(app.save_after_format.is_none());
+    assert_eq!(
+        app.status,
+        "Saved week.notes without formatting: it changed while the formatter was running"
+    );
+}
+
+#[test]
+fn a_format_document_reply_for_a_buffer_typed_into_since_is_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_week_notes(&tmp);
+    send_format_request(&mut app, &file, false);
+    type_at_line_end(&mut app, 2, "\nbutter");
+    let before = app.editor.lines.clone();
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    assert_eq!(app.editor.lines, before);
+    assert_eq!(
+        app.status,
+        "Format skipped: week.notes changed while the formatter was running; format again"
+    );
+}
+
+#[test]
+fn a_format_reply_for_an_untouched_buffer_is_still_applied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_week_notes(&tmp);
+    send_format_request(&mut app, &file, false);
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 2;
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "# SHOPPING LIST\nmilk\nbread\neggs\n# TODO\ncall bob\npay rent",
+        "a caret move is not an edit"
+    );
+    assert_eq!(app.status, "Formatted document");
+}
+
+#[test]
+fn a_format_on_save_reply_for_an_untouched_buffer_saves_the_formatted_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_week_notes(&tmp);
+    send_format_request(&mut app, &file, true);
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "# SHOPPING LIST\nmilk\nbread\neggs\n# TODO\ncall bob\npay rent\n"
+    );
+    assert!(app.save_after_format.is_none());
+}
+
 /// #694 review: a format-on-save in flight when the servers stop is saved at
 /// once, unformatted, rather than left armed for an unrelated reply.
 #[test]
@@ -66015,6 +68470,184 @@ fn a_launch_json_python_config_passes_args_and_env_file() {
     assert_eq!(who.as_deref(), Some("'croft'"));
 }
 
+/// #864 against a real debugpy: F5 on a script importing a module only the
+/// project's `.venv` has stopped with "Paused (exception)" on line 1, since
+/// the program ran under croft's debug venv. It now reaches its breakpoint
+/// with the module's value, and the exception it raises next is named.
+/// Needs `~/.croft/debug-venv` and a `python3` with `venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn f5_debugs_a_script_against_the_project_venv_and_names_its_exception() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let made = std::process::Command::new("python3")
+        .args(["-m", "venv", "--without-pip"])
+        .arg(root.join(".venv"))
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let site = std::process::Command::new(root.join(".venv/bin/python"))
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ])
+        .output()
+        .unwrap();
+    let site = PathBuf::from(String::from_utf8(site.stdout).unwrap().trim());
+    std::fs::write(site.join("croftdep.py"), "VALUE = 42\n").unwrap();
+    let file = root.join("main.py");
+    std::fs::write(
+        &file,
+        "import croftdep\nvalue = croftdep.VALUE\nraise ValueError(f\"boom {value}\")\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.editor
+        .breakpoints
+        .entry(file.clone())
+        .or_default()
+        .insert(3);
+    app.debug_start_or_continue();
+    let value = debug_until_local(&mut app, "value", 90);
+    assert_eq!(
+        value.as_deref(),
+        Some("42"),
+        "status {:?}, feedback {:?}",
+        app.status,
+        app.run_debug.feedback
+    );
+    app.debug_start_or_continue();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline
+        && !app
+            .run_debug
+            .feedback
+            .as_deref()
+            .is_some_and(|f| f.contains("ValueError"))
+    {
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let feedback = app.run_debug.feedback.clone();
+    let status = app.status.clone();
+    app.debug_stop();
+    assert_eq!(
+        feedback.as_deref(),
+        Some("Paused (exception): ValueError: boom 42"),
+        "status {status:?}"
+    );
+    assert!(status.contains("ValueError: boom 42"), "{status}");
+}
+
+/// A real `python3 -m venv --without-pip` at `dir`, and its purelib
+/// site-packages directory.
+fn real_venv(dir: &Path) -> PathBuf {
+    let made = std::process::Command::new("python3")
+        .args(["-m", "venv", "--without-pip"])
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let site = std::process::Command::new(dir.join("bin/python"))
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ])
+        .output()
+        .unwrap();
+    PathBuf::from(String::from_utf8(site.stdout).unwrap().trim())
+}
+
+/// #864 against a real debugpy: F5 under a project venv older than 3.14
+/// names its version, on the status line and as the Debug Console's first
+/// line, and still debugs. Skipped when `python3` is already 3.14+.
+/// Needs `~/.croft/debug-venv` and a `python3` with `venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn f5_names_a_project_python_older_than_3_14() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    real_venv(&root.join(".venv"));
+    let version = std::process::Command::new(root.join(".venv/bin/python"))
+        .args(["-c", "import sys; print('%d.%d' % sys.version_info[:2])"])
+        .output()
+        .unwrap();
+    let version = String::from_utf8(version.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let (major, minor) = version.split_once('.').unwrap();
+    let minor: u32 = minor.parse().unwrap();
+    if major != "3" || !(10..14).contains(&minor) {
+        eprintln!("python3 is {version}: nothing to name");
+        return;
+    }
+    let file = root.join("main.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.debug_start_or_continue();
+    let started = !app.debug_sessions.is_empty();
+    let status = app.status.clone();
+    let console = app.debug_console.clone();
+    app.debug_stop();
+    let want = format!("Debugging main.py under Python {version} (.venv); attach needs 3.14+");
+    assert!(started, "{status}");
+    assert!(status.starts_with(&want), "{status}");
+    assert!(
+        status.contains("F10 step over"),
+        "the key hints stay: {status}"
+    );
+    assert_eq!(console.first(), Some(&want), "{console:?}");
+}
+
+/// #864 against a real debugpy: Debug Test at Cursor runs pytest under
+/// the venv nearest the test file, as F5 and Live Run pick it, not only a
+/// workspace-root `.venv`. The only venv here is `svc/venv`, holding a
+/// stand-in `pytest` module that records `sys.prefix`; the root-only lookup
+/// ran a `python3` without it.
+/// Needs `~/.croft/debug-venv` and a `python3` with `venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn debug_test_at_cursor_runs_pytest_under_the_nearest_venv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("pytest.ini"), "[pytest]\n").unwrap();
+    let svc = root.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    let site = real_venv(&svc.join("venv"));
+    let pytest = site.join("pytest");
+    std::fs::create_dir_all(&pytest).unwrap();
+    std::fs::write(pytest.join("__init__.py"), "").unwrap();
+    let main = pytest.join("__main__.py");
+    std::fs::write(&main, "import sys\nprefix = sys.prefix\nprint(prefix)\n").unwrap();
+    let test = svc.join("test_app.py");
+    std::fs::write(&test, "def test_prefix():\n    assert True\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&test).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor
+        .breakpoints
+        .entry(main.clone())
+        .or_default()
+        .insert(3);
+    app.debug_test_at_cursor();
+    let prefix = debug_until_local(&mut app, "prefix", 90);
+    let status = app.status.clone();
+    app.debug_stop();
+    let prefix = prefix.unwrap_or_else(|| panic!("no stop in pytest; status {status:?}"));
+    assert!(prefix.contains("svc/venv"), "sys.prefix {prefix}");
+}
+
 /// #250, against a real lldb-dap: a Rust binary that needs a CLI argument
 /// and an env var is debugged from a config whose `cargo build`
 /// preLaunchTask builds it first. Needs cargo and lldb-dap.
@@ -66275,4 +68908,1611 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         "{synced:?} in {:?}",
         app.settings_chain
     );
+}
+
+/// #1203: open `notes/plan.md`, type a line, then take its folder away the
+/// way `git checkout` of a branch without it does.
+fn app_with_plan_whose_folder_was_removed(tmp: &std::path::Path) -> App {
+    std::fs::create_dir(tmp.join("notes")).unwrap();
+    let mut app = app_with_open_file(tmp, "notes/plan.md", "# Plan\n\n- step one\n");
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = "- step one".len();
+    app.editor.insert_str("\n- step two");
+    std::fs::remove_dir_all(tmp.join("notes")).unwrap();
+    app
+}
+
+#[test]
+fn saving_a_file_whose_folder_was_removed_puts_the_folder_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    // The first press may stop to say the file changed on disk; the second
+    // is the consent to write it anyway.
+    app.save();
+    if app.editor.dirty {
+        app.save();
+    }
+    assert!(!app.editor.dirty, "still unsaved: {}", app.status);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("notes/plan.md")).unwrap(),
+        "# Plan\n\n- step one\n- step two\n"
+    );
+}
+
+#[test]
+fn a_save_whose_folder_is_now_a_file_still_fails_and_leaves_that_file_alone() {
+    // Negative: putting a missing folder back must not paper over a path
+    // that can't be a folder. A file now sits where the folder was.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    std::fs::write(tmp.path().join("notes"), "a file, not a folder\n").unwrap();
+    app.save();
+    app.save();
+    assert!(app.editor.dirty, "the edits are still only in the buffer");
+    assert!(app.status.starts_with("Save failed"), "{}", app.status);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("notes")).unwrap(),
+        "a file, not a folder\n"
+    );
+}
+
+/// Run File: Save As… the way the palette does and answer its prompt.
+fn save_as(app: &mut App, answer: &str) {
+    let cmd = crate::widgets::command_palette::Command::from_id("save_as")
+        .expect("there is a File: Save As… command");
+    app.run_command(cmd);
+    let prompt = app.prompt.as_mut().expect("Save As asks for a path");
+    prompt.buffer = answer.to_string();
+    app.commit_prompt();
+}
+
+#[test]
+fn save_as_writes_the_buffer_to_a_new_path_and_moves_the_tab_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    let cmd = crate::widgets::command_palette::Command::from_id("save_as")
+        .expect("there is a File: Save As… command");
+    app.run_command(cmd);
+    assert_eq!(
+        app.prompt.as_ref().map(|p| p.buffer.as_str()),
+        Some("notes/plan.md"),
+        "the prompt starts from the tab's own path"
+    );
+    app.prompt = None;
+    save_as(&mut app, "drafts/plan.txt");
+    let saved = tmp.path().join("drafts/plan.txt");
+    assert!(
+        app.prompt.is_none(),
+        "{:?}",
+        app.prompt.as_ref().map(|p| &p.error)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        "# Plan\n\n- step one\n- step two\n"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(saved.as_path()));
+    assert!(!app.editor.dirty);
+    assert!(
+        app.editor.language().is_none(),
+        "a .txt file has no grammar"
+    );
+    assert!(
+        !tmp.path().join("notes").exists(),
+        "the old path is not recreated"
+    );
+    // The tab now belongs to the new file: the next save goes there.
+    app.editor.insert_str("!");
+    app.save();
+    assert!(!app.editor.dirty, "{}", app.status);
+    assert!(
+        std::fs::read_to_string(&saved)
+            .unwrap()
+            .contains("- step two!")
+    );
+}
+
+#[test]
+fn save_as_does_not_overwrite_another_file() {
+    // Negative: an existing file at the answer is left as it was, and the
+    // tab keeps its own path and its unsaved edits.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    std::fs::write(tmp.path().join("README.md"), "# app\n").unwrap();
+    save_as(&mut app, "README.md");
+    let error = app.prompt.as_ref().and_then(|p| p.error.clone());
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|e| e.contains("already exists")),
+        "{error:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "# app\n"
+    );
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("notes/plan.md").as_path())
+    );
+    assert!(app.editor.dirty);
+    // Nor does a blank answer go anywhere.
+    save_as(&mut app, "  ");
+    assert!(app.prompt.as_ref().is_some_and(|p| p.error.is_some()));
+    assert!(app.editor.dirty);
+}
+
+#[test]
+fn a_save_as_that_fails_leaves_the_tab_where_it_was() {
+    // Negative: a path that can't be written keeps the tab on its own path
+    // with its edits, so nothing is lost and Save As can be tried again.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_plan_whose_folder_was_removed(tmp.path());
+    std::fs::write(tmp.path().join("blocker"), "").unwrap();
+    save_as(&mut app, "blocker/plan.md");
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("notes/plan.md").as_path())
+    );
+    assert!(app.editor.dirty);
+    let error = app.prompt.as_ref().and_then(|p| p.error.clone());
+    assert!(error.is_some(), "the prompt stays open with the reason");
+}
+
+/// #852: every bottom-panel tab is reachable from the keyboard. Each tab
+/// names the palette command that shows it (`show_command` has no
+/// catch-all, so a new tab cannot compile without one, and the strip paints
+/// from `ALL`, so a clickable tab is always in this loop); here each command
+/// must be in the palette and must land on its tab, panel shown and
+/// focused, from a hidden panel on another tab.
+#[test]
+fn every_bottom_panel_tab_is_reachable_from_the_palette() {
+    use crate::widgets::command_palette::ALL_COMMANDS;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for tab in BottomPanelTab::ALL {
+        let cmd = tab.show_command();
+        assert!(
+            ALL_COMMANDS.contains(&cmd),
+            "{cmd:?} (shows {tab:?}) is missing from the palette"
+        );
+        app.show_terminal = false;
+        app.focus_pane(Pane::Editor);
+        app.bottom_panel_tab = if tab == BottomPanelTab::Terminal {
+            BottomPanelTab::Problems
+        } else {
+            BottomPanelTab::Terminal
+        };
+        app.run_command(cmd);
+        assert_eq!(app.bottom_panel_tab, tab, "{cmd:?}");
+        assert!(app.show_terminal, "{cmd:?} must reveal the panel");
+        assert!(
+            app.focus == Pane::Terminal,
+            "{cmd:?} must focus the panel so its keys work at once"
+        );
+    }
+}
+
+/// #852: VS Code's `Ctrl/Cmd+Shift+M` and `+U` show PROBLEMS and OUTPUT from
+/// any pane, the live terminal included, and `Cmd+Shift+T` brings the
+/// TERMINAL tab back rather than focusing whichever tab was last up.
+#[test]
+fn panel_tab_chords_switch_between_problems_output_and_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('M'), ctrl_shift)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Problems);
+    assert!(app.focus == Pane::Terminal);
+    // From the PROBLEMS view itself.
+    app.handle_key(key(KeyCode::Char('u'), cmd_shift)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    app.handle_key(key(KeyCode::Char('T'), cmd_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Terminal,
+        "Cmd+Shift+T must bring the TERMINAL tab forward"
+    );
+    assert!(app.focus == Pane::Terminal);
+    // From the live shell: the chord is croft's, as the side bar jumps are.
+    app.handle_key(key(KeyCode::Char('U'), ctrl_shift)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    // Plain Ctrl+M / Ctrl+U stay the shell's (Enter, kill line).
+    assert!(!is_show_problems_key(key(
+        KeyCode::Char('m'),
+        KeyModifiers::CONTROL
+    )));
+    assert!(!is_show_output_key(key(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL
+    )));
+    // Cmd+Opt+Shift+U is Transform to Uppercase, not OUTPUT.
+    assert!(!is_show_output_key(key(
+        KeyCode::Char('U'),
+        cmd_shift | KeyModifiers::ALT
+    )));
+}
+
+/// #852: Output: Select Channel… is the OUTPUT toolbar's click-only channel
+/// dropdown as a keyboard picker; choosing a row shows that channel.
+#[test]
+fn output_select_channel_picks_a_channel_from_the_keyboard() {
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The bus is process-wide, so the channel carries a name no other test
+    // uses and the picker is narrowed to it.
+    let channel = "Keyboard Reach 852";
+    crate::output::push(channel, crate::output::OutputLevel::Info, "hello");
+    app.run_command(Command::OutputSelectChannel);
+    let picker = app.list_picker.as_mut().expect("the channel picker opens");
+    assert_eq!(picker.purpose, ListPurpose::OutputChannel);
+    for c in "reach 852".chars() {
+        picker.push_char(c);
+    }
+    assert_eq!(picker.visible_count(), 1);
+    app.confirm_list_picker();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    assert!(app.focus == Pane::Terminal);
+    assert_eq!(app.output.selected_name().as_deref(), Some(channel));
+}
+
+/// #852: File: New File… / New Folder… open the Explorer's create prompt
+/// from any pane: beside the active file from the editor, in the Explorer
+/// selection while the Explorer has focus (as its own chords do).
+#[test]
+fn new_file_and_folder_from_the_palette_open_the_create_prompt() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+    let mut app = app_with_open_file(tmp.path(), "sub/a.txt", "x");
+    let file_dir = app
+        .editor
+        .path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap();
+    assert!(file_dir.ends_with("sub"));
+    app.run_command(Command::NewFile);
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::File),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &file_dir),
+        _ => panic!("File: New File… must open the New File prompt"),
+    }
+    app.prompt = None;
+    app.focus_pane(Pane::Tree);
+    app.sidebar_view = SidebarView::Explorer;
+    app.run_command(Command::NewFolder);
+    let explorer_dir = app.explorer_create_target_dir();
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::Folder),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &explorer_dir),
+        _ => panic!("File: New Folder… must open the New Folder prompt"),
+    }
+}
+
+/// #852: Select All is on the palette, the route on Linux where `Ctrl+A` is
+/// line start; it selects the active buffer and hands the editor focus.
+#[test]
+fn select_all_from_the_palette_selects_the_active_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "one\ntwo");
+    app.focus_pane(Pane::Tree);
+    app.run_command(crate::widgets::command_palette::Command::SelectAll);
+    assert_eq!(app.editor.selection_text(), "one\ntwo");
+    assert!(app.focus == Pane::Editor);
+}
+
+/// #852: `Ctrl+Alt+S` is File: Save All: every dirty tab reaches disk, not
+/// only the active one, and a second press says there is nothing left.
+#[test]
+fn save_all_writes_every_dirty_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // App::new loads the developer's real prefs: pin every mode that would
+    // save on its own, or defer the write, off.
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.unsaved_count(), 2);
+    app.handle_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.unsaved_count(), 0, "{}", app.status);
+    assert!(std::fs::read_to_string(&a).unwrap().contains('X'));
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(app.status, "Saved 2 editors");
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(app.status, "Save All: nothing to save");
+    // Shift is Convert Indentation to Spaces; plain Ctrl+S is Save.
+    assert!(!is_save_all_key(key(
+        KeyCode::Char('S'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_save_all_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL
+    )));
+}
+
+/// #852 regression, driven by keys alone: from the editor with the panel
+/// hidden, `Ctrl+Shift+M` shows PROBLEMS, `Ctrl+Shift+U` shows OUTPUT and
+/// `Cmd+Shift+T` brings TERMINAL back over them, each time with the panel
+/// shown and focused.
+#[test]
+fn panel_tab_chords_reach_problems_output_and_terminal_by_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+    app.show_terminal = false;
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('M'), ctrl_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Problems,
+        "Ctrl+Shift+M must show PROBLEMS"
+    );
+    assert!(app.show_terminal, "Ctrl+Shift+M must reveal the panel");
+    assert!(app.focus == Pane::Terminal);
+    app.handle_key(key(KeyCode::Char('U'), ctrl_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Output,
+        "Ctrl+Shift+U must show OUTPUT"
+    );
+    app.handle_key(key(KeyCode::Char('T'), cmd_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Terminal,
+        "Cmd+Shift+T must bring TERMINAL forward"
+    );
+    assert!(app.focus == Pane::Terminal);
+}
+
+/// #852 regression, driven by keys alone: `Ctrl+Alt+S` writes every dirty
+/// tab to disk, the inactive one included, not only the active tab.
+#[test]
+fn ctrl_alt_s_writes_the_inactive_dirty_tab_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(
+        std::fs::read_to_string(&a).unwrap().contains('X'),
+        "the inactive tab a.txt must reach disk"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert!(app.editor.editors.iter().all(|e| !e.dirty));
+}
+
+/// #852 negative: Save All writes only what auto save may write blind. An
+/// inactive tab whose file changed on disk keeps the external text, stays
+/// dirty and is reported, while the other dirty tab still saves.
+#[test]
+fn save_all_never_overwrites_an_external_change_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    std::fs::write(&a, "external change wins\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "external change wins\n",
+        "Save All must not write over a file changed on disk"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(app.unsaved_count(), 1, "the conflicted tab stays dirty");
+    assert!(
+        app.status.contains("1 editor still unsaved"),
+        "the leftover tab is reported, not a clean \"Saved\": {:?}",
+        app.status
+    );
+}
+
+/// #852 negative: plain `Ctrl+S` is still File: Save, not Save All; the
+/// inactive dirty tab stays unsaved on disk.
+#[test]
+fn plain_ctrl_s_still_saves_only_the_active_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "aaa");
+    assert_eq!(app.unsaved_count(), 1);
+}
+
+/// #852 boundary: with no file open, File: New File… from the editor has
+/// no "beside the active file" and falls back to the Explorer's target.
+#[test]
+fn palette_new_file_with_no_file_open_uses_the_explorer_target() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.editor.path.is_none());
+    app.focus_pane(Pane::Editor);
+    let explorer_dir = app.explorer_create_target_dir();
+    app.run_command(Command::NewFile);
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::File),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &explorer_dir),
+        _ => panic!("File: New File… must open the New File prompt"),
+    }
+}
+
+/// Types `text` into whatever overlay has the keyboard, one key at a time.
+fn type_keys_852(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+/// Opens the Command Palette with `Cmd+Shift+P`, as a user would.
+fn open_palette_852(app: &mut App) {
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(
+        app.command_palette.is_some(),
+        "Cmd+Shift+P opens the palette"
+    );
+}
+
+/// #852 (comment 2): the Customize Layout popup opens from the keyboard.
+/// Typing its name in the palette and pressing Enter shows the popup with
+/// its rows, where before the palette said "No commands match".
+#[test]
+fn typing_customize_layout_in_the_palette_opens_the_popup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "customize layout");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("View: Customize Layout… opens the Customize Layout popup");
+    assert!(
+        menu.items.iter().any(|e| matches!(
+            e,
+            MenuEntry::Item {
+                action: MenuAction::ToggleStatusBar,
+                ..
+            }
+        )),
+        "the popup is the Customize Layout one"
+    );
+}
+
+/// #852 (comment 2): the palette query "layout" finds the layout commands,
+/// so a bar hidden with a click can be brought back from the keyboard.
+#[test]
+fn palette_query_layout_lists_the_customize_layout_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "layout");
+    let titles: Vec<String> = app
+        .command_palette
+        .as_ref()
+        .unwrap()
+        .results
+        .iter()
+        .map(|r| r.title().to_string())
+        .collect();
+    for want in [
+        "View: Customize Layout…",
+        "View: Toggle Activity Bar Visibility",
+        "View: Toggle Status Bar Visibility",
+        "View: Toggle Primary Side Bar Position",
+        "View: Set Panel Alignment…",
+        "View: Set Quick Input Position…",
+    ] {
+        assert!(
+            titles.iter().any(|t| t == want),
+            "\"layout\" must find {want:?}; got {titles:?}"
+        );
+    }
+}
+
+/// #852 (comment 2): Activity Bar, Status Bar and Primary Side Bar Position
+/// toggle from the palette, typed and run with Enter.
+#[test]
+fn palette_toggles_the_activity_bar_status_bar_and_side_bar_position() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.activity_bar_visible = true;
+    app.status_bar_visible = true;
+    app.side_bar_position = SideBarPosition::Left;
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "toggle status bar visibility");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.status_bar_visible, "the status bar hides");
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "toggle activity bar visibility");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.activity_bar_visible, "the activity bar hides");
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "toggle primary side bar position");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.side_bar_position, SideBarPosition::Right);
+}
+
+/// #852 (comment 2): Panel Alignment and Quick Input Position are set from
+/// the palette through a picker of their options.
+#[test]
+fn palette_sets_panel_alignment_and_quick_input_position_by_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.panel_alignment = PanelAlignment::Center;
+    app.quick_input_position = QuickInputPosition::Top;
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "set panel alignment");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_some(), "the alignment picker opens");
+    type_keys_852(&mut app, "justify");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.panel_alignment, PanelAlignment::Justify);
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "set quick input position");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_some(), "the position picker opens");
+    type_keys_852(&mut app, "center");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.quick_input_position, QuickInputPosition::Center);
+}
+
+/// Renders `app` at `w`x`h` and returns the frame's buffer.
+fn render_buffer_852(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let backend = ratatui::backend::TestBackend::new(w, h);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// #852 (comment 1): the OPEN EDITORS header carries VS Code's Save All
+/// action; clicking it writes every dirty tab and leaves the section as it
+/// was (the click is the button's, not the header's collapse toggle).
+#[test]
+fn clicking_save_all_on_the_open_editors_header_saves_every_dirty_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.explorer_views = Default::default();
+    app.explorer_views.toggle(ExplorerView::OpenEditors);
+    app.open_editors.collapsed = false;
+    app.sidebar_view = SidebarView::Explorer;
+    app.show_tree = true;
+    let buf = render_buffer_852(&mut app, 120, 40);
+    let hdr = app.open_editors.last_area;
+    assert!(hdr.height > 0, "OPEN EDITORS is on screen");
+    let save_all_x = (hdr.x..hdr.x + hdr.width)
+        .find(|&x| buf[(x, hdr.y)].symbol() == "\u{eb49}")
+        .expect("the OPEN EDITORS header paints a Save All (codicon save-all) action");
+    left_click(&mut app, save_all_x, hdr.y);
+    assert!(
+        std::fs::read_to_string(&a).unwrap().contains('X'),
+        "Save All writes the inactive tab"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert!(
+        !app.open_editors.collapsed,
+        "the button's click does not also collapse the section"
+    );
+}
+
+/// #852: a file dirty in two splits is one unsaved file, as the Explorer's
+/// unsaved badge counts it, so Save All does not report it twice.
+#[test]
+fn save_all_counts_a_file_dirty_in_two_splits_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.focus_editor_group(true);
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    let dirty_buffers = app
+        .editor
+        .editors
+        .iter()
+        .chain(
+            app.editor_layout
+                .inactive_groups()
+                .into_iter()
+                .flat_map(|g| g.editors.iter()),
+        )
+        .filter(|e| e.dirty && e.path.as_deref() == Some(a.as_path()))
+        .count();
+    assert_eq!(dirty_buffers, 2, "fixture: a.txt is dirty in both splits");
+    assert_eq!(app.unsaved_count(), 1, "one file, counted once");
+}
+
+/// #852: a file with a symbol tab is one file on disk; Save All writes it
+/// once and says "Saved 1 editor", not 2.
+#[test]
+fn save_all_reports_a_file_with_a_symbol_tab_as_one_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert!(
+        app.editor.editors.iter().all(|e| e.dirty),
+        "fixture: both tabs hold the edit"
+    );
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "fn a() {\n    1\n}\nfn b() {\n    27\n}"
+    );
+    assert_eq!(app.status, "Saved 1 editor");
+}
+
+/// #852 guard: no Customize Layout row ships mouse-only. Every row names
+/// the palette command that reaches it (a new row fails here until it has
+/// one), the command is in the palette and found by "layout", and running
+/// it (choosing the row's option where it opens a picker) lands on the
+/// state the row's click sets, from a state where that option is not yet
+/// the active one.
+#[test]
+fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command, LAYOUT_COMMANDS};
+    fn command_for(action: &MenuAction) -> Option<Command> {
+        match action {
+            MenuAction::ToggleActivityBar => Some(Command::ToggleActivityBar),
+            MenuAction::ToggleSideBar => Some(Command::ToggleSideBar),
+            MenuAction::ToggleSecondarySideBar => Some(Command::ToggleSecondarySideBar),
+            MenuAction::TogglePanel => Some(Command::ToggleTerminal),
+            MenuAction::ToggleStatusBar => Some(Command::ToggleStatusBar),
+            MenuAction::ToggleMinimap => Some(Command::ToggleMinimap),
+            MenuAction::ToggleAutoHideSideBar => Some(Command::ToggleAutoHideSideBar),
+            MenuAction::SetSideBarPosition(_) => Some(Command::ToggleSideBarPosition),
+            MenuAction::SetPanelAlignment(_) => Some(Command::SetPanelAlignment),
+            MenuAction::SetQuickInputPosition(_) => Some(Command::SetQuickInputPosition),
+            MenuAction::ToggleZenMode => Some(Command::ToggleZenMode),
+            _ => None,
+        }
+    }
+    // A radio row's setting moved off the row's option first.
+    fn off_option(app: &mut App, action: &MenuAction) {
+        match *action {
+            MenuAction::SetSideBarPosition(p) => {
+                app.side_bar_position = if p == SideBarPosition::Left {
+                    SideBarPosition::Right
+                } else {
+                    SideBarPosition::Left
+                };
+            }
+            MenuAction::SetPanelAlignment(al) => {
+                app.panel_alignment = if al == PanelAlignment::Left {
+                    PanelAlignment::Center
+                } else {
+                    PanelAlignment::Left
+                };
+            }
+            MenuAction::SetQuickInputPosition(p) => {
+                app.quick_input_position = if p == QuickInputPosition::Top {
+                    QuickInputPosition::Center
+                } else {
+                    QuickInputPosition::Top
+                };
+            }
+            _ => {}
+        }
+    }
+    let snapshot = |app: &App| {
+        (
+            app.activity_bar_visible,
+            app.show_tree,
+            app.secondary_side_bar_visible,
+            app.show_terminal,
+            app.status_bar_visible,
+            app.minimap_visible,
+            app.sidebar_auto_hide,
+            app.side_bar_position,
+            app.panel_alignment,
+            app.quick_input_position,
+            app.zen_mode,
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let rows: Vec<(String, MenuAction)> = App::new(tmp.path().to_path_buf())
+        .unwrap()
+        .customize_layout_items()
+        .into_iter()
+        .filter_map(|e| match e {
+            MenuEntry::Item { label, action } => Some((label, action)),
+            _ => None,
+        })
+        .collect();
+    assert!(rows.len() >= 12, "the popup's rows: {rows:?}");
+    for (label, action) in rows {
+        let cmd = command_for(&action)
+            .unwrap_or_else(|| panic!("Customize Layout row {label:?} has no palette command"));
+        assert!(ALL_COMMANDS.contains(&cmd), "{cmd:?} is not in the palette");
+        assert!(
+            LAYOUT_COMMANDS.contains(&cmd),
+            "{cmd:?} is not found by the query \"layout\""
+        );
+        let mut by_click = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut by_palette = App::new(tmp.path().to_path_buf()).unwrap();
+        off_option(&mut by_click, &action);
+        off_option(&mut by_palette, &action);
+        assert_eq!(snapshot(&by_click), snapshot(&by_palette), "fixture");
+        by_click.dispatch_menu_action(action.clone(), tmp.path().to_path_buf());
+        by_palette.run_command(cmd);
+        if let Some(picker) = by_palette.list_picker.as_mut() {
+            let option = label.trim_start_matches('\u{2713}').trim().to_lowercase();
+            for c in option.chars() {
+                picker.push_char(c);
+            }
+            assert_eq!(picker.visible_count(), 1, "{cmd:?} offers {option:?}");
+            by_palette.confirm_list_picker();
+        }
+        assert_eq!(
+            snapshot(&by_palette),
+            snapshot(&by_click),
+            "{cmd:?} must do what the row {label:?} does"
+        );
+    }
+}
+
+/// #852 negative: the palette's layout commands change the layout and
+/// nothing else; the Customize Layout popup's re-open is the click route's
+/// (it keeps the popup up between clicks) and must not pop over the editor
+/// after a palette command.
+#[test]
+fn palette_layout_commands_leave_the_customize_layout_popup_closed() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for cmd in [
+        Command::ToggleActivityBar,
+        Command::ToggleStatusBar,
+        Command::ToggleSideBarPosition,
+    ] {
+        app.run_command(cmd);
+        assert!(
+            app.context_menu.is_none(),
+            "{cmd:?} must not open the Customize Layout popup"
+        );
+    }
+    // Twice is a round trip: every toggle is back where it started.
+    let fresh = App::new(tmp.path().to_path_buf()).unwrap();
+    for cmd in [
+        Command::ToggleActivityBar,
+        Command::ToggleStatusBar,
+        Command::ToggleSideBarPosition,
+    ] {
+        app.run_command(cmd);
+    }
+    assert_eq!(app.activity_bar_visible, fresh.activity_bar_visible);
+    assert_eq!(app.status_bar_visible, fresh.status_bar_visible);
+    assert_eq!(app.side_bar_position, fresh.side_bar_position);
+}
+
+/// #852 negative: the alignment picker opens on the current alignment and
+/// Esc leaves it unchanged; only a chosen row changes it.
+#[test]
+fn dismissing_the_panel_alignment_picker_keeps_the_alignment() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.panel_alignment = PanelAlignment::Right;
+    app.run_command(Command::SetPanelAlignment);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    assert_eq!(
+        picker.selected_row().map(|r| r.id.as_str()),
+        Some("right"),
+        "the picker opens on the current alignment"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_none());
+    assert_eq!(app.panel_alignment, PanelAlignment::Right);
+}
+
+/// #852 negative: a collapsed OPEN EDITORS hides its Save All action, as
+/// VS Code hides a collapsed view's actions, and a click on the header
+/// title still just toggles the section and saves nothing.
+#[test]
+fn open_editors_save_all_hides_while_collapsed_and_the_title_click_still_toggles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.explorer_views = Default::default();
+    app.explorer_views.toggle(ExplorerView::OpenEditors);
+    app.open_editors.collapsed = true;
+    app.sidebar_view = SidebarView::Explorer;
+    app.show_tree = true;
+    let buf = render_buffer_852(&mut app, 120, 40);
+    let hdr = app.open_editors.last_area;
+    assert!(hdr.height > 0, "OPEN EDITORS is on screen");
+    assert!(
+        !(hdr.x..hdr.x + hdr.width).any(|x| buf[(x, hdr.y)].symbol() == "\u{eb49}"),
+        "a collapsed section paints no Save All"
+    );
+    assert_eq!(app.open_editors.save_all_btn, Rect::default());
+    // The rightmost header cells, where the button sits when expanded.
+    left_click(&mut app, hdr.x + hdr.width - 2, hdr.y);
+    assert!(!app.open_editors.collapsed, "the header click expands it");
+    let _ = render_buffer_852(&mut app, 120, 40);
+    left_click(&mut app, hdr.x + 3, hdr.y);
+    assert!(app.open_editors.collapsed, "the title click collapses it");
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "aaa",
+        "no header click saved anything"
+    );
+    assert!(app.editor.dirty);
+}
+
+// #852 (comment 3): the editor-tab actions (the tab menu's Close Others,
+// Close to the Right, Close Saved, Close All, Pin / Unpin and Keep Open) are
+// palette commands under VS Code's names, so they can be searched, bound in
+// keybindings.json, and run on Linux without Super.
+
+/// An app with `names` open as kept (non-preview) tabs in one group, the
+/// last one active and focused. Auto-save is off so an edited tab stays
+/// dirty.
+fn tabs_app_852(names: &[&str]) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    for name in names {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, "x\n").unwrap();
+        app.editor.open_pinned(&p).unwrap();
+    }
+    app.focus_pane(Pane::Editor);
+    (app, tmp)
+}
+
+/// A group's tabs by file name, in strip order.
+fn tab_names_852(tabs: &crate::widgets::editor::EditorTabs) -> Vec<String> {
+    tabs.editors
+        .iter()
+        .map(|e| {
+            e.path
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Runs `query` from the palette as a user does: `Cmd+Shift+P`, type it,
+/// Enter. Returns the title of the row Enter ran, `None` when none matched.
+fn run_in_palette_852(app: &mut App, query: &str) -> Option<String> {
+    open_palette_852(app);
+    type_keys_852(app, query);
+    let ran = app
+        .command_palette
+        .as_ref()
+        .and_then(|p| p.selected_item())
+        .map(|item| item.title().to_string());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    ran
+}
+
+/// The palette's rows for `query`, then Esc.
+fn palette_rows_852(app: &mut App, query: &str) -> Vec<String> {
+    open_palette_852(app);
+    type_keys_852(app, query);
+    let rows = app
+        .command_palette
+        .as_ref()
+        .map(|p| p.results.iter().map(|i| i.title().to_string()).collect())
+        .unwrap_or_default();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    rows
+}
+
+/// Makes the active tab dirty the way a user does, by typing into it.
+fn type_into_active_tab_852(app: &mut App) {
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('Z'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.dirty,
+        "fixture: the active tab has unsaved edits"
+    );
+}
+
+/// #852 (comment 3): View: Close Other Editors in Group, typed into the
+/// palette, closes every other tab and keeps the active one, as the tab
+/// menu's Close Others does. Before, the palette had no such command.
+#[test]
+fn palette_close_other_editors_keeps_only_the_active_tab() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+    app.editor.select(1);
+    let ran = run_in_palette_852(&mut app, "View: Close Other Editors in Group");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["b.rs"],
+        "the palette ran {ran:?}"
+    );
+    assert_eq!(app.status, "Closed 3 other tabs");
+}
+
+/// #852 (comment 3): View: Close Editors to the Right in Group closes the
+/// tabs right of the active one and keeps it active.
+#[test]
+fn palette_close_editors_to_the_right_closes_only_the_tabs_right_of_the_active_one() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+    app.editor.select(1);
+    let ran = run_in_palette_852(&mut app, "View: Close Editors to the Right in Group");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["a.rs", "b.rs"],
+        "the palette ran {ran:?}"
+    );
+    assert_eq!(app.editor.active_index(), 1, "b.rs stays active");
+    assert_eq!(app.status, "Closed 2 tabs to the right");
+}
+
+/// #852 (comment 3): View: Close Saved Editors in Group closes the saved
+/// tabs and keeps the one with unsaved edits, unwritten.
+#[test]
+fn palette_close_saved_editors_closes_the_saved_tabs_and_keeps_the_dirty_one() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.editor.select(1);
+    type_into_active_tab_852(&mut app);
+    let ran = run_in_palette_852(&mut app, "View: Close Saved Editors in Group");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["b.rs"],
+        "the palette ran {ran:?}"
+    );
+    assert!(app.editor.dirty, "the unsaved edit is kept");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("b.rs")).unwrap(),
+        "x\n",
+        "and not written"
+    );
+    assert_eq!(app.status, "Closed 2 saved tabs");
+}
+
+/// #852 (comment 3): View: Close All Editors closes every tab.
+#[test]
+fn palette_close_all_editors_closes_every_tab() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    let ran = run_in_palette_852(&mut app, "View: Close All Editors");
+    assert!(
+        app.editor.is_blank_initial(),
+        "the palette ran {ran:?}; tabs left: {:?}",
+        tab_names_852(&app.editor)
+    );
+    assert_eq!(app.status, "Closed 3 tabs");
+}
+
+/// #852 (comment 3): View: Pin Editor pins the active tab (it moves to the
+/// pinned block on the left) and View: Unpin Editor unpins it.
+#[test]
+fn palette_pin_editor_and_unpin_editor_pin_and_unpin_the_active_tab() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    let ran = run_in_palette_852(&mut app, "View: Pin Editor");
+    assert!(app.editor.pinned, "the palette ran {ran:?}");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["c.rs", "a.rs", "b.rs"],
+        "a pinned tab moves leftmost"
+    );
+    assert_eq!(app.status, "Pinned tab");
+    let ran = run_in_palette_852(&mut app, "View: Unpin Editor");
+    assert!(!app.editor.pinned, "the palette ran {ran:?}");
+    assert_eq!(
+        app.editor.path.as_deref().and_then(Path::file_name),
+        Some(std::ffi::OsStr::new("c.rs"))
+    );
+    assert_eq!(app.status, "Unpinned tab");
+}
+
+/// #852 (comment 3): as in VS Code, the palette offers Pin Editor on an
+/// unpinned tab and Unpin Editor on a pinned one, never the one that would
+/// do nothing.
+#[test]
+fn the_palette_offers_pin_editor_or_unpin_editor_by_the_active_tab() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs"]);
+    let rows = palette_rows_852(&mut app, "pin editor");
+    assert!(rows.iter().any(|t| t == "View: Pin Editor"), "{rows:?}");
+    assert!(
+        !rows.iter().any(|t| t == "View: Unpin Editor"),
+        "an unpinned tab has nothing to unpin: {rows:?}"
+    );
+    let idx = app.editor.active_index();
+    app.dispatch_menu_action(MenuAction::ToggleTabPin(idx), tmp.path().to_path_buf());
+    assert!(app.editor.pinned, "fixture: the tab menu pinned it");
+    let rows = palette_rows_852(&mut app, "pin editor");
+    assert!(rows.iter().any(|t| t == "View: Unpin Editor"), "{rows:?}");
+    assert!(
+        !rows.iter().any(|t| t == "View: Pin Editor"),
+        "a pinned tab is already pinned: {rows:?}"
+    );
+}
+
+/// #852 (comment 3): View: Keep Editor keeps the preview tab open, as the
+/// tab menu's Keep Open does.
+#[test]
+fn palette_keep_editor_keeps_the_preview_tab_open() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs"]);
+    let p = tmp.path().join("p.rs");
+    std::fs::write(&p, "x\n").unwrap();
+    app.editor.open_preview(&p).unwrap();
+    assert!(app.editor.preview, "fixture: p.rs is the preview tab");
+    let ran = run_in_palette_852(&mut app, "View: Keep Editor");
+    assert!(!app.editor.preview, "the palette ran {ran:?}");
+    assert_eq!(app.status, "Kept tab open");
+}
+
+/// #852 (comment 3, its GIF): the tab menu's words work in the palette too.
+/// "keep open" found no command at all; it now runs View: Keep Editor.
+#[test]
+fn typing_the_tab_menus_keep_open_in_the_palette_keeps_the_preview_tab() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs"]);
+    let p = tmp.path().join("p.rs");
+    std::fs::write(&p, "x\n").unwrap();
+    app.editor.open_preview(&p).unwrap();
+    let ran = run_in_palette_852(&mut app, "keep open");
+    assert_eq!(ran.as_deref(), Some("View: Keep Editor"));
+    assert!(!app.editor.preview, "the preview tab is kept");
+}
+
+/// #852 (comment 3): the tab commands bind from keybindings.json like any
+/// palette command, which gives Close Others (no chord of its own) and Pin
+/// a key on Linux without Super.
+#[test]
+fn keybindings_json_chords_run_pin_editor_and_close_other_editors() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[
+            { "key": "ctrl+alt+p", "command": "pin_editor" },
+            { "key": "ctrl+alt+o", "command": "close_other_editors" }
+        ]"#,
+    );
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(app.editor.pinned, "ctrl+alt+p pins the active c.rs");
+    assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
+    app.editor.select(2);
+    app.handle_key(key(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["c.rs", "b.rs"],
+        "ctrl+alt+o closes the others, the pinned tab surviving as in the tab menu"
+    );
+}
+
+/// #852 (comment 3): the Keyboard Shortcuts editor lists each tab command
+/// with the chord croft has for it, like every other palette command.
+#[test]
+fn the_keyboard_shortcuts_editor_lists_the_editor_tab_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_keyboard_shortcuts();
+    let picker = app.list_picker.as_ref().expect("the editor opens");
+    for (id, title, chord) in [
+        (
+            "close_other_editors",
+            "View: Close Other Editors in Group",
+            "\u{2014}",
+        ),
+        (
+            "close_editors_to_the_right",
+            "View: Close Editors to the Right in Group",
+            "Cmd+K →",
+        ),
+        (
+            "close_saved_editors",
+            "View: Close Saved Editors in Group",
+            "Cmd+K U",
+        ),
+        ("close_all_editors", "View: Close All Editors", "Cmd+K W"),
+        ("pin_editor", "View: Pin Editor", "Cmd+K P"),
+        ("unpin_editor", "View: Unpin Editor", "Cmd+K P"),
+        ("keep_editor", "View: Keep Editor", "Cmd+K Shift+P"),
+    ] {
+        let row = picker
+            .rows
+            .iter()
+            .find(|r| r.id == format!("kb:{id}"))
+            .unwrap_or_else(|| panic!("no Keyboard Shortcuts row for {id}"));
+        assert_eq!(row.label, format!("{title}  \u{00b7}  {chord}"));
+    }
+}
+
+/// A split whose right (active) group is `[b.rs (pinned), c.rs, p.rs
+/// (preview), d.rs (unsaved), e.rs]` with `active` selected, beside a left
+/// group `[a.rs, b.rs]`.
+fn split_tabs_app_852(active: &str) -> (App, tempfile::TempDir) {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs"]);
+    app.split_editor();
+    assert!(app.editor_layout.is_split(), "fixture: two groups");
+    for name in ["c.rs", "d.rs", "e.rs"] {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, "x\n").unwrap();
+        app.editor.open_pinned(&p).unwrap();
+    }
+    app.editor.toggle_pin(0);
+    app.editor.select(1);
+    let p = tmp.path().join("p.rs");
+    std::fs::write(&p, "x\n").unwrap();
+    app.editor.open_preview(&p).unwrap();
+    app.editor.select(3);
+    type_into_active_tab_852(&mut app);
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["b.rs", "c.rs", "p.rs", "d.rs", "e.rs"],
+        "fixture"
+    );
+    let idx = tab_names_852(&app.editor)
+        .iter()
+        .position(|n| n == active)
+        .unwrap();
+    app.editor.select(idx);
+    app.status.clear();
+    (app, tmp)
+}
+
+/// Every group's tabs as (name, pinned, preview, dirty), the active group
+/// first, then the active index, whether the layout is split, the status
+/// line and the reopen stack (by file name: each fixture has its own
+/// directory).
+type TabsSnapshot852 = (
+    Vec<Vec<(String, bool, bool, bool)>>,
+    usize,
+    bool,
+    String,
+    Vec<String>,
+);
+
+fn tabs_snapshot_852(app: &App) -> TabsSnapshot852 {
+    let group = |tabs: &crate::widgets::editor::EditorTabs| {
+        tab_names_852(tabs)
+            .into_iter()
+            .zip(&tabs.editors)
+            .map(|(n, e)| (n, e.pinned, e.preview, e.dirty))
+            .collect::<Vec<_>>()
+    };
+    let mut groups = vec![group(&app.editor)];
+    groups.extend(app.editor_layout.inactive_groups().into_iter().map(group));
+    (
+        groups,
+        app.editor.active_index(),
+        app.editor_layout.is_split(),
+        app.status.clone(),
+        app.closed_tabs
+            .iter()
+            .map(|t| t.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+/// #852 (comment 3) guard: each close / pin / keep row of the tab menu
+/// names the palette command that does its job on the active tab, and the
+/// command leaves every group's tabs, the status line and the reopen stack
+/// exactly as a click on the row does, whether the tab is plain, pinned or
+/// a preview, beside an unsaved tab and another split group.
+#[test]
+fn every_tab_menu_close_pin_and_keep_row_has_a_palette_command_that_does_the_same() {
+    use crate::widgets::command_palette::Command;
+    fn command_id(label: &str, action: &MenuAction) -> Option<&'static str> {
+        match action {
+            MenuAction::CloseOtherTabs(_) => Some("close_other_editors"),
+            MenuAction::CloseTabsToRight(_) => Some("close_editors_to_the_right"),
+            MenuAction::CloseSavedTabs => Some("close_saved_editors"),
+            MenuAction::CloseAllTabs => Some("close_all_editors"),
+            MenuAction::KeepTabOpen(_) => Some("keep_editor"),
+            MenuAction::ToggleTabPin(_) if label == "Pin" => Some("pin_editor"),
+            MenuAction::ToggleTabPin(_) => Some("unpin_editor"),
+            _ => None,
+        }
+    }
+    let mut covered: Vec<&str> = Vec::new();
+    for active in ["c.rs", "b.rs", "p.rs"] {
+        let (app, _tmp) = split_tabs_app_852(active);
+        let idx = app.editor.active_index();
+        let path = app.editor.tab_path(idx);
+        let items = build_tab_context_menu_items(
+            idx,
+            app.editor.tab_count(),
+            app.editor_layout.is_split(),
+            path.as_deref(),
+            false,
+            app.editor.is_preview(idx),
+            app.editor.is_pinned(idx),
+        );
+        for (label, action) in items.into_iter().filter_map(|e| match e {
+            MenuEntry::Item { label, action } => Some((label, action)),
+            _ => None,
+        }) {
+            let Some(id) = command_id(&label, &action) else {
+                continue;
+            };
+            let cmd = Command::from_id(id).unwrap_or_else(|| {
+                panic!("the tab menu's {label:?} (on {active}) has no palette command {id:?}")
+            });
+            let (mut by_click, tmp_click) = split_tabs_app_852(active);
+            let (mut by_palette, _tmp_palette) = split_tabs_app_852(active);
+            by_click.dispatch_menu_action(action.clone(), tmp_click.path().to_path_buf());
+            by_palette.run_command(cmd);
+            assert_eq!(
+                tabs_snapshot_852(&by_palette),
+                tabs_snapshot_852(&by_click),
+                "{cmd:?} on {active} must do what the tab menu's {label:?} does"
+            );
+            covered.push(id);
+        }
+    }
+    for id in [
+        "close_other_editors",
+        "close_editors_to_the_right",
+        "close_saved_editors",
+        "close_all_editors",
+        "pin_editor",
+        "unpin_editor",
+        "keep_editor",
+    ] {
+        assert!(
+            covered.contains(&id),
+            "{id} was never compared: {covered:?}"
+        );
+    }
+}
+
+/// #852 (comment 3) negative: Close Other Editors in Group keeps the active
+/// tab and every pinned tab, as the tab menu's Close Others does, and the
+/// tabs it closes go on the reopen stack.
+#[test]
+fn palette_close_other_editors_keeps_the_active_and_the_pinned_tabs() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+    app.dispatch_menu_action(MenuAction::ToggleTabPin(0), tmp.path().to_path_buf());
+    app.editor.select(2);
+    run_in_palette_852(&mut app, "View: Close Other Editors in Group");
+    assert_eq!(tab_names_852(&app.editor), ["a.rs", "c.rs"]);
+    assert!(app.editor.editors[0].pinned, "the pinned a.rs survives");
+    assert_eq!(app.editor.active_index(), 1, "c.rs stays active");
+    let reopen: Vec<String> = app
+        .closed_tabs
+        .iter()
+        .map(|t| t.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(reopen, ["b.rs", "d.rs"]);
+    assert_eq!(app.status, "Closed 2 other tabs");
+}
+
+/// #852 (comment 3) negative: Close Editors to the Right on the last tab
+/// closes nothing and says so, rather than touching the tabs to its left.
+#[test]
+fn palette_close_editors_to_the_right_on_the_last_tab_closes_nothing() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    run_in_palette_852(&mut app, "View: Close Editors to the Right in Group");
+    assert_eq!(tab_names_852(&app.editor), ["a.rs", "b.rs", "c.rs"]);
+    assert_eq!(app.editor.active_index(), 2);
+    assert!(app.closed_tabs.is_empty(), "nothing to reopen");
+    assert_eq!(app.status, "No tabs to the right to close");
+}
+
+/// #852 (comment 3) negative: the group-scoped tab commands act on the
+/// focused split only. The other split's tabs, including its copy of a file
+/// the command closes here, stay exactly as they were.
+#[test]
+fn palette_tab_commands_leave_the_other_split_alone() {
+    for (title, active) in [
+        ("View: Close Other Editors in Group", "c.rs"),
+        ("View: Close Editors to the Right in Group", "c.rs"),
+        ("View: Close Saved Editors in Group", "c.rs"),
+        ("View: Pin Editor", "c.rs"),
+        ("View: Unpin Editor", "b.rs"),
+        ("View: Keep Editor", "p.rs"),
+    ] {
+        let (mut app, _tmp) = split_tabs_app_852(active);
+        let before = tabs_snapshot_852(&app);
+        let ran = run_in_palette_852(&mut app, title);
+        assert_eq!(ran.as_deref(), Some(title));
+        let after = tabs_snapshot_852(&app);
+        assert!(after.2, "{title}: still split");
+        assert_ne!(after.0[0], before.0[0], "{title} changed the focused group");
+        assert_eq!(
+            after.0[1..],
+            before.0[1..],
+            "{title} must leave the other split alone"
+        );
+    }
+}
+
+/// #852 (comment 3) negative: with no file open, Pin, Unpin and Keep only
+/// say so. The welcome screen's placeholder is not pinned (Cmd+K P used to
+/// pin it) and Close Others / Close to the Right have nothing to close.
+#[test]
+fn tab_commands_with_no_editor_open_only_say_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap =
+        crate::keymap::Keymap::from_json(r#"[{ "key": "ctrl+alt+u", "command": "unpin_editor" }]"#);
+    assert!(app.editor.is_blank_initial(), "fixture: the welcome screen");
+    for (title, status) in [
+        ("View: Pin Editor", "No editor is open"),
+        ("View: Keep Editor", "No editor is open"),
+        (
+            "View: Close Other Editors in Group",
+            "No other tabs to close",
+        ),
+        (
+            "View: Close Editors to the Right in Group",
+            "No tabs to the right to close",
+        ),
+    ] {
+        let ran = run_in_palette_852(&mut app, title);
+        assert_eq!(ran.as_deref(), Some(title));
+        assert_eq!(app.status, status, "{title}");
+        assert!(app.editor.is_blank_initial(), "{title}");
+        assert!(!app.editor.pinned, "{title}");
+    }
+    app.handle_key(key(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.status, "No editor is open", "a key bound to Unpin");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.editor.pinned, "Cmd+K P pins no placeholder");
+    assert_eq!(app.status, "No editor is open");
+}
+
+/// #852 (comment 3) negative: Pin Editor and Unpin Editor are not toggles.
+/// Bound to their own keys, each leaves a tab already in its state alone,
+/// as VS Code's `when` clauses do; Keep Editor on a kept tab changes nothing.
+#[test]
+fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[
+            { "key": "ctrl+alt+p", "command": "pin_editor" },
+            { "key": "ctrl+alt+u", "command": "unpin_editor" },
+            { "key": "ctrl+alt+k", "command": "keep_editor" }
+        ]"#,
+    );
+    let press = |app: &mut App, c: char| {
+        app.handle_key(key(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .unwrap();
+    };
+    press(&mut app, 'u');
+    assert!(!app.editor.pinned, "Unpin does not pin");
+    assert_eq!(tab_names_852(&app.editor), ["a.rs", "b.rs", "c.rs"]);
+    assert_eq!(app.status, "Tab is not pinned");
+    press(&mut app, 'p');
+    assert!(app.editor.pinned);
+    press(&mut app, 'p');
+    assert!(app.editor.pinned, "a second Pin does not unpin");
+    assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
+    assert_eq!(app.status, "Tab is already pinned");
+    press(&mut app, 'k');
+    assert!(
+        !app.editor.preview && app.editor.pinned,
+        "Keep changes nothing"
+    );
+    assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
+    assert_eq!(app.status, "Tab is already kept open");
+}
+
+/// Workspace `tl/` holding the repo `tl/sub/` (#1227): the workspace root
+/// is in no repo, so its worker has no `repo_root`.
+fn nested_repo_1227() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&sub)
+            .args(&args)
+            .status();
+    }
+    let f = sub.join("plain.txt");
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-m", "plain", "--quiet"]] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&sub)
+            .args(&args)
+            .status();
+    }
+    (tmp, f)
+}
+
+#[test]
+fn git_gutter_baseline_comes_from_a_repo_below_the_workspace_root() {
+    let (tmp, f) = nested_repo_1227();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.sync_git_gutters();
+    assert_eq!(
+        app.editor.git_head_lines,
+        Some(vec!["one".to_string(), "two".to_string()]),
+        "the committed text of sub/plain.txt is the gutter baseline"
+    );
+}
+
+#[test]
+fn git_gutter_baseline_stays_empty_for_a_file_outside_any_repo() {
+    let (tmp, _) = nested_repo_1227();
+    let loose = tmp.path().join("loose.txt");
+    std::fs::write(&loose, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&loose).unwrap();
+    app.sync_git_gutters();
+    assert_eq!(app.editor.git_head_lines, None);
+}
+
+#[test]
+fn source_control_lists_the_repo_found_one_folder_down() {
+    let (tmp, _) = nested_repo_1227();
+    std::fs::create_dir(tmp.path().join("plain_dir")).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".hidden/.git")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    let _ = render_buf(&mut app);
+    let sub = tmp.path().join("sub").canonicalize().unwrap();
+    assert_eq!(
+        app.source_control.nested_repos,
+        vec![(String::from("sub/"), sub.clone())],
+        "only sub/ holds a repo; hidden folders are skipped"
+    );
+    assert_eq!(
+        app.source_control.last_init_repo_button_area,
+        Rect::default()
+    );
+    let (btn, _) = app.source_control.nested_repo_button_areas[0].clone();
+    left_click(&mut app, btn.x + btn.width / 2, btn.y + 1);
+    assert_eq!(app.workspace_root(), sub.as_path());
+}
+
+#[test]
+fn source_control_still_offers_initialize_with_no_repo_below() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("plain_dir")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    let _ = render_buf(&mut app);
+    assert!(app.source_control.nested_repos.is_empty());
+    assert!(app.source_control.last_init_repo_button_area.width > 0);
 }

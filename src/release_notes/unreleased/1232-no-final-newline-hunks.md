@@ -1,0 +1,1 @@
+fix: Staging or reverting a hunk at the end of a file that has no final newline on one side works now: the line whose only change is that newline shows as changed in the diff, the way git reports it, instead of making S fail with "patch does not apply" and R leave the file modified (#1232).

@@ -34,8 +34,9 @@ pub struct Row {
     pub layer: LayerKind,
 }
 
-/// The string settings whose values come from a fixed set, with the value
-/// an empty string means listed first.
+/// The string settings whose values come from a fixed set. An empty
+/// (default) value counts as the first choice, so Enter moves it to the
+/// second.
 pub fn choices(key: &str) -> Option<Vec<String>> {
     let fixed: &[&str] = match key {
         "problems_scope" => &["whole_project", "open_files"],
@@ -122,8 +123,9 @@ pub fn next_value(row: &Row) -> Option<Value> {
 }
 
 /// `text` (a layer file's JSON object, or empty) with `key` set to `value`,
-/// pretty-printed with keys in sorted order; every other key keeps its
-/// value. An error when the text is not a JSON object.
+/// pretty-printed; every other key keeps its value and its place (croft's
+/// serde_json preserves order), and a new key goes last. An error when the
+/// text is not a JSON object.
 pub fn set_key(text: &str, key: &str, value: Value) -> Result<String, String> {
     let mut map = if text.trim().is_empty() {
         serde_json::Map::new()
