@@ -23709,6 +23709,137 @@ fn seeding_search_replaces_stale_include_and_exclude_filters() {
     assert_eq!(app.search.exclude, "target");
 }
 
+/// The workspace of #1201: one `color` in src/, one in docs/ and one in a
+/// vendored file that must never be rewritten.
+fn grep_scope_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    for (rel, body) in [
+        ("src/style.py", "color = \"red\"\n"),
+        ("docs/guide.md", "Set the color in style.py.\n"),
+        (
+            "vendor/lib.py",
+            "color = \"keep\"  # third-party, do not touch\n",
+        ),
+    ] {
+        let f = tmp.path().join(rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, body).unwrap();
+    }
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    (tmp, app)
+}
+
+/// The files of [`grep_scope_app`] the seeded Search (and so Replace All)
+/// would cover.
+fn seeded_scope(app: &App, root: &std::path::Path) -> Vec<&'static str> {
+    let filter = crate::widgets::search::PathFilter::new(&app.search.include, &app.search.exclude);
+    ["docs/guide.md", "src/style.py", "vendor/lib.py"]
+        .into_iter()
+        .filter(|rel| filter.allows(root, &root.join(rel)))
+        .collect()
+}
+
+/// `rg -n color src/` searched one directory; the seeded Search must too,
+/// or Replace All rewrites docs/ and the vendored file (#1201).
+#[test]
+fn seeded_search_covers_only_the_paths_the_grep_searched() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(app.seed_search_from_command("rg -n color src/"));
+    assert_eq!(app.search.query, "color");
+    assert_eq!(
+        seeded_scope(&app, root),
+        ["src/style.py"],
+        "include: {:?}",
+        app.search.include
+    );
+    assert!(app.seed_search_from_command("grep -rn color src/style.py docs"));
+    assert_eq!(seeded_scope(&app, root), ["docs/guide.md", "src/style.py"]);
+}
+
+/// `rg -t py` searched Python files only, so the markdown guide stays out.
+#[test]
+fn seeded_search_keeps_the_rg_type_filter() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(app.seed_search_from_command("rg -t py color"));
+    assert_eq!(
+        seeded_scope(&app, root),
+        ["src/style.py", "vendor/lib.py"],
+        "include: {:?}",
+        app.search.include
+    );
+    assert!(app.seed_search_from_command("rg --type-not py color"));
+    assert_eq!(seeded_scope(&app, root), ["docs/guide.md"]);
+    assert!(app.seed_search_from_command("rg -t py color src"));
+    assert_eq!(seeded_scope(&app, root), ["src/style.py"]);
+}
+
+/// After `cd src`, a bare `rg color` searched src/ only.
+#[test]
+fn seeded_search_runs_from_the_panes_directory() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(app.seed_search_from_command_in("rg color", &root.join("src")));
+    assert_eq!(seeded_scope(&app, root), ["src/style.py"]);
+    assert!(app.seed_search_from_command_in("rg color ../vendor", &root.join("src")));
+    assert_eq!(seeded_scope(&app, root), ["vendor/lib.py"]);
+}
+
+/// A scope croft can't reproduce is refused with the reason, leaving the
+/// panel untouched, instead of seeding a wider search: an inverted match
+/// (`-v` lists the lines that don't match), an unknown rg type, a path
+/// outside the workspace or one that doesn't exist.
+#[test]
+fn a_grep_whose_scope_cant_be_reproduced_refuses_to_seed() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    for cmd in [
+        "rg -v color src/",
+        "grep -rL color .",
+        "rg -t nosuchtype color",
+        "rg color ../",
+        "rg color missing/",
+    ] {
+        app.status.clear();
+        assert!(
+            app.seed_search_from_command_in(cmd, root),
+            "{cmd} is a search"
+        );
+        assert!(
+            app.status.starts_with("Search not seeded: "),
+            "{cmd}: status {:?}",
+            app.status
+        );
+        assert_eq!(app.search.query, "", "{cmd} must not seed the panel");
+    }
+}
+
+/// Negative: a search that covered the whole workspace still seeds the
+/// whole workspace, and an rg `-L` (follow symlinks) is not an inversion.
+#[test]
+fn a_grep_over_the_whole_workspace_still_seeds_every_file() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    for cmd in [
+        "rg color",
+        "grep -rn color .",
+        "rg -L color",
+        "git grep color -- .",
+    ] {
+        assert!(app.seed_search_from_command_in(cmd, root));
+        assert_eq!(app.search.query, "color", "{cmd}");
+        assert_eq!(
+            seeded_scope(&app, root),
+            ["docs/guide.md", "src/style.py", "vendor/lib.py"],
+            "{cmd}: include {:?}",
+            app.search.include
+        );
+    }
+    assert!(app.seed_search_from_command_in("rg -g '*.md' color", root));
+    assert_eq!(app.search.include, "*.md");
+}
+
 /// A byte-range selection made in the Include field before the seed must not
 /// survive into the (shorter) seeded text: the next keystroke used to
 /// replace_range the stale span and panic out of bounds.

@@ -14,9 +14,12 @@
 // seeded query is shown in the panel for the user to correct, never applied
 // blindly. Upgrade to per-tool flag tables if that proves too coarse.
 
+use std::path::{Path, PathBuf};
+
 /// A terminal search command reduced to what the Search panel needs. The three
 /// booleans map 1:1 onto `search::SearchOpts`; `include` onto the panel's
-/// files-to-include glob.
+/// files-to-include glob. `paths`, `types` and `types_not` are the scope the
+/// command searched, turned into globs by [`scope_filters`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchCommand {
     pub pattern: String,
@@ -25,6 +28,15 @@ pub struct SearchCommand {
     pub use_regex: bool,
     pub include: Option<String>,
     pub exclude: Option<String>,
+    /// The files and directories named after the pattern, as typed.
+    pub paths: Vec<String>,
+    /// rg `-t`/`--type` names.
+    pub types: Vec<String>,
+    /// rg `-T`/`--type-not` names.
+    pub types_not: Vec<String>,
+    /// `-v`/`--invert-match` or a files-without-match listing: the command
+    /// printed what does NOT match the pattern.
+    pub inverted: bool,
 }
 
 /// Consume `idx`'s token as a flag value (or take the inline `--flag=value`
@@ -78,6 +90,12 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
     let mut include: Option<String> = None;
     let mut exclude: Option<String> = None;
     let mut pattern: Option<String> = None;
+    // A pattern given by `-e`/`--regexp` makes every positional a path.
+    let mut positionals: Vec<String> = Vec::new();
+    let mut types: Vec<String> = Vec::new();
+    let mut types_not: Vec<String> = Vec::new();
+    let mut inverted = false;
+    let is_rg = matches!(prog, "rg" | "ripgrep");
 
     // Append a glob to one of the panel's comma-separated filter lists.
     fn push_glob(list: &mut Option<String>, glob: String) {
@@ -105,9 +123,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
         let tok = tokens[idx].clone();
         idx += 1;
         if flags_done {
-            if pattern.is_none() {
-                pattern = Some(tok);
-            }
+            positionals.push(tok);
             continue;
         }
         if tok == "--" {
@@ -121,6 +137,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                 "ignore-case" | "smart-case" => case_sensitive = false,
                 "case-sensitive" => case_sensitive = true,
                 "word-regexp" => whole_word = true,
+                "invert-match" | "files-without-match" | "files-without-matches" => inverted = true,
                 "fixed-strings" => use_regex = false,
                 "extended-regexp" | "perl-regexp" => use_regex = true,
                 "regexp" => {
@@ -146,6 +163,15 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                         push_glob(&mut exclude, v);
                     }
                 }
+                "type" | "type-not" if is_rg => {
+                    if let Some(v) = take_value(inline_val, &tokens, &mut idx) {
+                        if name == "type" {
+                            types.push(v);
+                        } else {
+                            types_not.push(v);
+                        }
+                    }
+                }
                 // Long flags that take a value we don't use; drop the value so
                 // it isn't mistaken for the pattern.
                 "file" | "max-count" | "type" | "type-not" | "context" | "after-context"
@@ -165,6 +191,10 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                     'i' | 'S' => case_sensitive = false,
                     's' if dash_s_is_case_sensitive => case_sensitive = true,
                     'w' => whole_word = true,
+                    'v' => inverted = true,
+                    // rg's `-L` follows symlinks; elsewhere it lists the
+                    // files without a match.
+                    'L' if !is_rg => inverted = true,
                     'F' => use_regex = false,
                     'E' | 'P' => use_regex = true,
                     'e' | 'g' => {
@@ -183,6 +213,22 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                         }
                         break; // consumed the rest of this token
                     }
+                    't' | 'T' if is_rg => {
+                        let rest: String = chars[ci + 1..].iter().collect();
+                        let v = if rest.is_empty() {
+                            take_value(None, &tokens, &mut idx)
+                        } else {
+                            Some(rest)
+                        };
+                        if let Some(v) = v {
+                            if chars[ci] == 't' {
+                                types.push(v);
+                            } else {
+                                types_not.push(v);
+                            }
+                        }
+                        break;
+                    }
                     // Short flags that take a value we don't use.
                     'f' | 'm' | 'A' | 'B' | 'C' | 't' | 'T' | 'd' => {
                         if chars[ci + 1..].is_empty() {
@@ -194,14 +240,19 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                 }
                 ci += 1;
             }
-        } else if pattern.is_none() {
-            // First positional token is the pattern; later positionals are
-            // paths/files we ignore.
-            pattern = Some(tok);
+        } else {
+            positionals.push(tok);
         }
     }
 
-    let pattern = pattern?;
+    // Without `-e`, the first positional is the pattern; the rest are the
+    // files and directories searched.
+    let mut positionals = positionals.into_iter();
+    let pattern = match pattern {
+        Some(p) => p,
+        None => positionals.next()?,
+    };
+    let paths: Vec<String> = positionals.collect();
     if pattern.is_empty() {
         return None;
     }
@@ -212,7 +263,237 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
         use_regex,
         include,
         exclude,
+        paths,
+        types,
+        types_not,
+        inverted,
     })
+}
+
+/// The globs of the common rg file types (`rg --type-list`), so `rg -t py`
+/// seeds a search over the same files. A type missing here refuses the seed
+/// rather than widening it to every file.
+fn rg_type_globs(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "c" => &["*.[chH]", "*.[chH].in", "*.cats"],
+        "cpp" => &[
+            "*.[ChH]",
+            "*.[ChH].in",
+            "*.[ch]pp",
+            "*.[ch]pp.in",
+            "*.[ch]xx",
+            "*.[ch]xx.in",
+            "*.cc",
+            "*.cc.in",
+            "*.hh",
+            "*.hh.in",
+            "*.inl",
+        ],
+        "cs" | "csharp" => &["*.cs"],
+        "css" => &["*.css", "*.scss"],
+        "csv" => &["*.csv"],
+        "dart" => &["*.dart"],
+        "docker" => &["*Dockerfile*"],
+        "elixir" => &["*.eex", "*.ex", "*.exs", "*.heex", "*.leex", "*.livemd"],
+        "go" => &["*.go"],
+        "html" => &["*.ejs", "*.htm", "*.html"],
+        "java" => &["*.java", "*.jsp", "*.jspx", "*.properties"],
+        "js" => &["*.cjs", "*.js", "*.jsx", "*.mjs", "*.vue"],
+        "json" => &["*.json", "*.sarif", "composer.lock"],
+        "kotlin" => &["*.kt", "*.kts"],
+        "lua" => &["*.lua"],
+        "make" => &[
+            "*.mak",
+            "*.mk",
+            "[Gg][Nn][Uu]makefile",
+            "[Gg][Nn][Uu]makefile.am",
+            "[Gg][Nn][Uu]makefile.in",
+            "[Mm]akefile",
+            "[Mm]akefile.am",
+            "[Mm]akefile.in",
+        ],
+        "md" | "markdown" => &[
+            "*.markdown",
+            "*.md",
+            "*.mdown",
+            "*.mdwn",
+            "*.mdx",
+            "*.mkd",
+            "*.mkdn",
+        ],
+        "php" => &[
+            "*.php", "*.php3", "*.php4", "*.php5", "*.php7", "*.php8", "*.pht", "*.phtml",
+        ],
+        "py" => &["*.py", "*.pyi"],
+        "ruby" => &[
+            "*.gemspec",
+            "*.rb",
+            "*.rbw",
+            ".irbrc",
+            "Gemfile",
+            "Rakefile",
+            "config.ru",
+        ],
+        "rust" => &["*.rs"],
+        "scala" => &["*.sbt", "*.scala"],
+        "sh" => &["*.bash", "*.csh", "*.ksh", "*.sh", "*.tcsh", "*.zsh"],
+        "sql" => &["*.psql", "*.sql"],
+        "swift" => &["*.swift"],
+        "toml" => &["*.toml", "Cargo.lock"],
+        "ts" => &["*.cts", "*.mts", "*.ts", "*.tsx"],
+        "txt" => &["*.txt"],
+        "xml" => &[
+            "*.dtd",
+            "*.rng",
+            "*.sch",
+            "*.xhtml",
+            "*.xjb",
+            "*.xml",
+            "*.xml.dist",
+            "*.xsd",
+            "*.xsl",
+            "*.xslt",
+        ],
+        "yaml" => &["*.yaml", "*.yml"],
+        "zig" => &["*.zig"],
+        _ => return None,
+    })
+}
+
+/// The Search panel's (files-to-include, files-to-exclude) lists for `sc`,
+/// covering exactly what the terminal command searched: its paths (resolved
+/// against `cwd`, the pane shell's directory, or `cwd` itself when none was
+/// named), its `-g`/`--include` globs and its rg `-t`/`-T` types. Scopes are
+/// anchored to `root` with VS Code's `./` prefix. Anything that can't be
+/// mapped exactly is an `Err` naming why: a Replace All seeded from a
+/// terminal search must never cover more files than that search did (#1201).
+pub fn scope_filters(
+    sc: &SearchCommand,
+    cwd: &Path,
+    root: &Path,
+) -> Result<(String, String), String> {
+    if sc.inverted {
+        return Err(String::from("the grep lists what does not match (-v / -L)"));
+    }
+    let mut exclude: Vec<String> = sc
+        .exclude
+        .as_deref()
+        .map(|e| {
+            crate::widgets::search::split_globs(e)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for t in &sc.types_not {
+        let globs =
+            rg_type_globs(t).ok_or_else(|| format!("croft doesn't know rg's type '{t}'"))?;
+        exclude.extend(globs.iter().map(|g| g.to_string()));
+    }
+    let includes: Vec<String> = sc
+        .include
+        .as_deref()
+        .map(|i| {
+            crate::widgets::search::split_globs(i)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut type_globs: Vec<String> = Vec::new();
+    for t in &sc.types {
+        let globs =
+            rg_type_globs(t).ok_or_else(|| format!("croft doesn't know rg's type '{t}'"))?;
+        type_globs.extend(globs.iter().map(|g| g.to_string()));
+    }
+    if !includes.is_empty() && !type_globs.is_empty() {
+        return Err(String::from("the grep combines -g globs with -t types"));
+    }
+    let names = if includes.is_empty() {
+        type_globs
+    } else {
+        includes
+    };
+
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let named: Vec<PathBuf> = if sc.paths.is_empty() {
+        vec![cwd.to_path_buf()]
+    } else {
+        sc.paths
+            .iter()
+            .map(|p| match p.strip_prefix("~/") {
+                Some(rest) => std::env::var_os("HOME")
+                    .map(|h| PathBuf::from(h).join(rest))
+                    .unwrap_or_else(|| PathBuf::from(p)),
+                None => cwd.join(p),
+            })
+            .collect()
+    };
+    // (path relative to root, is a directory); an empty path is the root.
+    let mut scopes: Vec<(String, bool)> = Vec::new();
+    for (abs, typed) in named.iter().zip(
+        sc.paths
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::repeat(".")),
+    ) {
+        let canon = abs
+            .canonicalize()
+            .map_err(|_| format!("{typed} doesn't exist"))?;
+        let rel = canon
+            .strip_prefix(&root)
+            .map_err(|_| format!("{typed} is outside the workspace"))?;
+        let rel = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if rel.contains(',') {
+            return Err(format!("{typed} has a comma in its path"));
+        }
+        scopes.push((globset_escape(&rel), canon.is_dir()));
+    }
+
+    let include = if scopes.iter().any(|(rel, _)| rel.is_empty()) {
+        // The whole workspace: only the name filters narrow it.
+        names
+    } else {
+        let mut out = Vec::new();
+        for (rel, is_dir) in &scopes {
+            if !is_dir {
+                // rg searches a file it is handed whatever its globs say.
+                out.push(format!("./{rel}"));
+            } else if names.is_empty() {
+                out.push(format!("./{rel}/**"));
+            } else {
+                for g in &names {
+                    if g.contains('/') {
+                        return Err(format!(
+                            "the grep's glob {g} has a / and it also names a path"
+                        ));
+                    }
+                    out.push(format!("./{rel}/**/{g}"));
+                }
+            }
+        }
+        out
+    };
+    Ok((include.join(","), exclude.join(",")))
+}
+
+/// `s` with glob metacharacters escaped, so a file named `a[1].txt` matches
+/// only itself.
+fn globset_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '*' | '?' | '[' | ']' | '{' | '}' => {
+                out.push('[');
+                out.push(c);
+                out.push(']');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -380,5 +661,64 @@ mod tests {
         let c = parse("grep -r --exclude-dir dist TODO .").unwrap();
         assert_eq!(c.pattern, "TODO");
         assert_eq!(c.exclude.as_deref(), Some("dist"));
+    }
+
+    #[test]
+    fn positionals_after_the_pattern_are_the_searched_paths() {
+        let c = parse("rg -n color src/ docs/a.md").unwrap();
+        assert_eq!(c.pattern, "color");
+        assert_eq!(c.paths, ["src/", "docs/a.md"]);
+        // With -e every positional is a path, the first one included.
+        let c = parse("grep -rn -e color src").unwrap();
+        assert_eq!(c.pattern, "color");
+        assert_eq!(c.paths, ["src"]);
+        let c = parse("rg -- -TODO src").unwrap();
+        assert_eq!(c.paths, ["src"]);
+    }
+
+    #[test]
+    fn rg_types_are_kept_and_other_tools_dash_t_is_not_a_type() {
+        let c = parse("rg -tpy --type=rust -T md color").unwrap();
+        assert_eq!(c.types, ["py", "rust"]);
+        assert_eq!(c.types_not, ["md"]);
+        // grep's -T is --initial-tab; it names no type.
+        let c = parse("grep -rT color .").unwrap();
+        assert!(c.types.is_empty() && c.types_not.is_empty());
+    }
+
+    #[test]
+    fn inverted_listings_are_flagged_but_rg_dash_l_follows_links() {
+        assert!(parse("rg -v color").unwrap().inverted);
+        assert!(parse("grep --invert-match color .").unwrap().inverted);
+        assert!(parse("grep -rL color .").unwrap().inverted);
+        assert!(parse("rg --files-without-match color").unwrap().inverted);
+        assert!(!parse("rg -L color").unwrap().inverted);
+        assert!(!parse("rg -l color").unwrap().inverted);
+    }
+
+    #[test]
+    fn scope_filters_anchor_dirs_files_and_name_globs_to_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/a[1]")).unwrap();
+        std::fs::write(root.join("main.rs"), "").unwrap();
+        let f = |cmd: &str, cwd: &Path| scope_filters(&parse(cmd).unwrap(), cwd, root);
+        assert_eq!(f("rg x src", root).unwrap().0, "./src/**");
+        assert_eq!(f("rg x main.rs", root).unwrap().0, "./main.rs");
+        assert_eq!(f("rg -g '*.rs' x src", root).unwrap().0, "./src/**/*.rs");
+        assert_eq!(f("rg x", &root.join("src")).unwrap().0, "./src/**");
+        assert_eq!(
+            f("rg x .", &root.join("src/a[1]")).unwrap().0,
+            "./src/a[[]1[]]/**"
+        );
+        assert_eq!(
+            f("rg -t rust -T md x", root).unwrap(),
+            (
+                "*.rs".into(),
+                "*.markdown,*.md,*.mdown,*.mdwn,*.mdx,*.mkd,*.mkdn".into()
+            )
+        );
+        assert!(f("rg -g '*.rs' -t py x", root).is_err());
+        assert!(f("rg -g 'src/*.rs' x src", root).is_err());
     }
 }

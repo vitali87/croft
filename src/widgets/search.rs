@@ -109,7 +109,7 @@ pub struct PathFilter {
 /// The entries of a comma-separated glob list. Commas inside `{...}`
 /// belong to a brace alternate, so `*.{ts,tsx}, docs/**` is two entries
 /// (#1251).
-fn split_globs(raw: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn split_globs(raw: &str) -> impl Iterator<Item = &str> {
     let mut depth = 0usize;
     let mut start = 0;
     let mut parts = Vec::new();
@@ -130,8 +130,11 @@ fn split_globs(raw: &str) -> impl Iterator<Item = &str> {
 
 fn compile_glob(pat: &str) -> Option<Glob> {
     // VS Code convention: a pattern without a path separator matches at
-    // any depth, so `*.rs` finds Rust files in every subdirectory.
-    let expanded = if pat.contains('/') {
+    // any depth, so `*.rs` finds Rust files in every subdirectory, and a
+    // leading `./` anchors the pattern to the workspace root.
+    let expanded = if let Some(anchored) = pat.strip_prefix("./") {
+        anchored.to_string()
+    } else if pat.contains('/') {
         pat.to_string()
     } else {
         format!("**/{pat}")
@@ -3718,6 +3721,18 @@ mod tests {
         let root = Path::new("/proj");
         assert!(f.allows(root, Path::new("/proj/src/main.rs")));
         assert!(f.allows(root, Path::new("/proj/a/b/c.py")));
+    }
+
+    #[test]
+    fn path_filter_dot_slash_anchors_a_glob_to_the_root() {
+        let root = Path::new("/ws");
+        let f = PathFilter::new("./main.rs,./src/**", "");
+        assert!(f.allows(root, Path::new("/ws/main.rs")));
+        assert!(f.allows(root, Path::new("/ws/src/deep/x.rs")));
+        assert!(!f.allows(root, Path::new("/ws/lib/main.rs")));
+        assert!(!f.allows(root, Path::new("/ws/vendor/src/x.rs")));
+        // Negative: a bare name still matches at any depth.
+        assert!(PathFilter::new("main.rs", "").allows(root, Path::new("/ws/lib/main.rs")));
     }
 
     #[test]
