@@ -1,0 +1,1 @@
+fix: Source Control fills the commit message with git's own when a merge, cherry-pick, revert or squash is in progress, so finishing a conflicted merge commits "Merge branch 'other'" instead of failing with "Empty commit message".

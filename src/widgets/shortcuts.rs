@@ -38,7 +38,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Ctrl+Q",
-                description: "Quit",
+                description: "Quit (in a focused terminal it goes to the app there)",
                 handler: "",
             },
             ShortcutEntry {
