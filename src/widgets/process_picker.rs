@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
-use crate::dap::discovery::PyTarget;
+use crate::dap::discovery::{PyTarget, elide_middle};
 
 /// The picker's owned state.
 pub struct ProcessPicker {
@@ -69,14 +69,58 @@ impl ProcessPicker {
     }
 }
 
+/// The gutter before an unselected row; a selected one shows `> `.
+const ROW_PREFIX: &str = "  ";
+/// Blank columns kept between a row's end and the popup's right border.
+const ROW_END_GAP: usize = 1;
+/// Between a row's PID, version and command line (see `target_label`).
+const LABEL_SEPARATOR: &str = "  ·  ";
+
+/// `label` cut to `room` columns (#1283). The command line after the PID
+/// and version loses its middle, marked with `…`, so the row keeps its PID
+/// and version at the start and the script and arguments at the end, which
+/// tell processes apart. Before, the end was cut off with no mark.
+fn fit_label(label: &str, room: usize) -> String {
+    if label.chars().count() <= room {
+        return label.to_string();
+    }
+    let cmd_at = label
+        .match_indices(LABEL_SEPARATOR)
+        .nth(1)
+        .map(|(at, sep)| at + sep.len());
+    match cmd_at {
+        Some(at) if label[..at].chars().count() < room => {
+            let fixed = label[..at].chars().count();
+            format!(
+                "{}{}",
+                &label[..at],
+                elide_middle(&label[at..], room - fixed)
+            )
+        }
+        _ => elide_middle(label, room),
+    }
+}
+
 pub fn render_process_picker(
     picker: &mut ProcessPicker,
     area: Rect,
     buf: &mut Buffer,
     theme: crate::theme::Theme,
 ) {
-    let width = area.width.saturating_mul(7) / 10;
-    let width = width.clamp(40, 110).min(area.width);
+    // Wide enough for the longest row, up to 90% of the terminal (#1283):
+    // a fixed 110-column cap cut every command line before its arguments,
+    // however wide the window. Short rows keep the usual size.
+    let usual = (area.width.saturating_mul(7) / 10).clamp(40, 110);
+    let rows_width = picker
+        .targets
+        .iter()
+        .map(|t| t.label.chars().count() + ROW_PREFIX.chars().count() + ROW_END_GAP + 2)
+        .max()
+        .unwrap_or(0);
+    let rows_width = u16::try_from(rows_width).unwrap_or(u16::MAX);
+    let width = usual
+        .max(rows_width.min(area.width.saturating_mul(9) / 10))
+        .min(area.width);
     let height = area.height.saturating_mul(6) / 10;
     let height = height.max(8).min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -143,10 +187,11 @@ pub fn render_process_picker(
         } else {
             Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
         };
-        let prefix = if is_selected { "> " } else { "  " };
+        let prefix = if is_selected { "> " } else { ROW_PREFIX };
+        let room = (inner.width as usize).saturating_sub(prefix.chars().count() + ROW_END_GAP);
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), row_style),
-            Span::styled(target.label.clone(), row_style),
+            Span::styled(fit_label(&target.label, room), row_style),
         ]));
     }
     Widget::render(Paragraph::new(lines), inner, buf);
@@ -189,6 +234,70 @@ mod tests {
     fn empty_picker_has_no_selection() {
         let p = ProcessPicker::new(vec![]);
         assert_eq!(p.selected_target(), None);
+    }
+
+    fn labelled(pid: u32, cmd: &str) -> PyTarget {
+        PyTarget {
+            label: format!("PID {pid}  ·  Python 3.14.0  ·  {cmd}"),
+            ..target(pid)
+        }
+    }
+
+    /// The text of every screen row of a `w`x`h` frame with `p` drawn.
+    fn draw(p: &mut ProcessPicker, w: u16, h: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        render_process_picker(p, area, &mut buf, crate::theme::Theme::default());
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// #1283: the popup was capped at 110 columns, so a wider terminal
+    /// still cut every row before the arguments that tell processes apart.
+    /// It grows with the terminal to fit its rows.
+    #[test]
+    fn a_wide_terminal_shows_a_long_command_line_whole() {
+        let cmd = format!("python3.14 {} --queue emails", "w".repeat(120));
+        let mut p = ProcessPicker::new(vec![labelled(1, &cmd)]);
+        let rows = draw(&mut p, 250, 30);
+        assert!(
+            rows.iter().any(|r| r.contains(&format!("{cmd} "))),
+            "{rows:#?}"
+        );
+    }
+
+    /// #1283: a row too long for the popup loses the middle of its command
+    /// line, marked with an ellipsis, and keeps the PID and version at the
+    /// start and the arguments at the end. Before, the end was cut off
+    /// with no mark.
+    #[test]
+    fn a_row_too_long_for_the_popup_keeps_its_pid_and_its_arguments() {
+        let cmd = format!("python3.14 {} -m http.server 8766", "d".repeat(150));
+        let mut p = ProcessPicker::new(vec![labelled(10686, &cmd)]);
+        let rows = draw(&mut p, 100, 30);
+        let row = rows
+            .iter()
+            .find(|r| r.contains("PID 10686"))
+            .expect("the row is drawn");
+        assert!(
+            row.contains("PID 10686  ·  Python 3.14.0  ·  python3.14 d"),
+            "{row}"
+        );
+        assert!(row.contains("d…d"), "{row}");
+        assert!(row.contains("http.server 8766 "), "{row}");
+    }
+
+    /// #1283 negative: a row that fits is drawn as is, with no ellipsis,
+    /// and a list of short rows keeps the popup at its usual minimum.
+    #[test]
+    fn a_row_that_fits_is_drawn_unchanged() {
+        let mut p = ProcessPicker::new(vec![labelled(7, "python3 manage.py runserver")]);
+        let rows = draw(&mut p, 250, 30);
+        let row = rows.iter().find(|r| r.contains("PID 7")).expect("drawn");
+        assert!(row.contains("PID 7  ·  Python 3.14.0  ·  python3 manage.py runserver "));
+        assert!(!rows.iter().any(|r| r.contains('…')), "{rows:#?}");
+        assert!(p.last_rect.width <= 110, "{:?}", p.last_rect);
     }
 
     /// This popup has no prompt or separator, so its click hit-test starts
