@@ -16756,6 +16756,56 @@ impl App {
         };
     }
 
+    /// Terminal: Run Selected Text in Active Terminal (#1292): send the
+    /// editor's selection, or with none the caret's line, to the active
+    /// pane, then Enter. A block goes as one paste, bracketed when the
+    /// program in the pane asked for it, and Enter follows outside the
+    /// brackets so it runs. Without a selection the caret steps to the next
+    /// non-blank line, so repeated runs walk through a script. Focus stays
+    /// in the editor.
+    fn run_selected_text_in_terminal(&mut self) {
+        if !self.editor_is_text() {
+            self.status = String::from("Run Selected Text works on text tabs");
+            return;
+        }
+        let selected = self.editor.selection_text();
+        let stepping = selected.is_empty();
+        let text = if stepping {
+            self.editor
+                .lines
+                .get(self.editor.cursor_row)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            selected
+        };
+        let text = text.trim_end_matches(['\n', '\r']);
+        if stepping {
+            let next = (self.editor.cursor_row + 1..self.editor.lines.len())
+                .find(|&r| !self.editor.lines[r].trim().is_empty());
+            if let Some(row) = next {
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = 0;
+            }
+        }
+        if text.trim().is_empty() {
+            self.status = String::from("Nothing to run on this line");
+            return;
+        }
+        let lines = text.lines().count();
+        let text = text.to_string();
+        self.show_terminal = true;
+        self.bottom_panel_tab = BottomPanelTab::Terminal;
+        self.reveal_terminal_pane(self.active_terminal);
+        self.paste_terminal_input(text.as_bytes());
+        self.write_terminal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        self.status = format!(
+            "Ran {lines} line{} in {}",
+            if lines == 1 { "" } else { "s" },
+            self.terminal().label()
+        );
+    }
+
     /// Paste counterpart of [`Self::write_terminal_key`] (bracketed-paste
     /// aware per pane): normally just the active pane, mirrored to every
     /// non-excluded pane while broadcast is on (the focused pane always
@@ -49226,6 +49276,7 @@ impl App {
                 self.status = format!("Problems: {}", self.problems.scope.label());
             }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
+            Cmd::RunSelectedText => self.run_selected_text_in_terminal(),
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
                     self.terminal_status(format!(

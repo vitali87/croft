@@ -291,6 +291,9 @@ pub enum Command {
     ProblemsToggleScope,
     DiffToggleIgnoreWhitespace,
     NewTerminal,
+    /// Terminal: Run Selected Text in Active Terminal (#1292): the
+    /// editor's selection, or the caret's line, run in the active pane.
+    RunSelectedText,
     // --- Run / debug ---
     StartDebugging,
     SelectDebugConfig,
@@ -679,6 +682,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ProblemsToggleScope,
     Command::DiffToggleIgnoreWhitespace,
     Command::NewTerminal,
+    Command::RunSelectedText,
     Command::StartDebugging,
     Command::SelectDebugConfig,
     Command::AddDebugConfig,
@@ -1050,6 +1054,7 @@ impl Command {
             Command::ProblemsToggleScope => "Problems: Toggle Scope (Open Files / Whole Project)",
             Command::DiffToggleIgnoreWhitespace => "Diff: Toggle Ignore Whitespace",
             Command::NewTerminal => "Terminal: Create New Terminal",
+            Command::RunSelectedText => "Terminal: Run Selected Text in Active Terminal",
             Command::StartDebugging => "Debug: Start Debugging",
             Command::SelectDebugConfig => "Debug: Select and Start Debugging",
             Command::AddDebugConfig => "Debug: Add Configuration…",
@@ -1409,6 +1414,7 @@ impl Command {
             Command::ProblemsToggleScope => "",
             Command::DiffToggleIgnoreWhitespace => "",
             Command::NewTerminal => "Cmd+T",
+            Command::RunSelectedText => "",
             Command::KeyboardShortcuts => "F1",
             Command::UpdateCroft => "Cmd+Shift+F9",
             Command::StartDebugging => "F5",
@@ -1767,6 +1773,7 @@ impl Command {
             Command::ProblemsToggleScope => "problems_toggle_scope",
             Command::DiffToggleIgnoreWhitespace => "diff_toggle_ignore_whitespace",
             Command::NewTerminal => "new_terminal",
+            Command::RunSelectedText => "run_selected_text",
             Command::StartDebugging => "start_debugging",
             Command::SelectDebugConfig => "select_debug_config",
             Command::AddDebugConfig => "add_debug_config",
