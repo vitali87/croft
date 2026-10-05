@@ -245,6 +245,17 @@ pub(crate) enum PanelAlignment {
     Justify,
 }
 
+impl PanelAlignment {
+    /// Every alignment with its picker id and label, in the Customize
+    /// Layout popup's order (View: Set Panel Alignment…, #852).
+    const OPTIONS: [(PanelAlignment, &'static str, &'static str); 4] = [
+        (PanelAlignment::Left, "left", "Left"),
+        (PanelAlignment::Center, "center", "Center"),
+        (PanelAlignment::Right, "right", "Right"),
+        (PanelAlignment::Justify, "justify", "Justify"),
+    ];
+}
+
 /// Where the quick input (command palette / Go to File) anchors vertically.
 /// VS Code's "Quick Input Position". Persisted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -253,6 +264,15 @@ pub(crate) enum QuickInputPosition {
     #[default]
     Top,
     Center,
+}
+
+impl QuickInputPosition {
+    /// Both positions with their picker id and label, in the Customize
+    /// Layout popup's order (View: Set Quick Input Position…, #852).
+    const OPTIONS: [(QuickInputPosition, &'static str, &'static str); 2] = [
+        (QuickInputPosition::Top, "top", "Top"),
+        (QuickInputPosition::Center, "center", "Center"),
+    ];
 }
 
 /// One in-flight `textDocument/selectionRange` request (#254): the
@@ -326,7 +346,18 @@ fn compute_chrome_layout(
     } else {
         0
     };
-    let secondary_w = if secondary_visible { secondary_w } else { 0 };
+    // A secondary side bar the window can't seat beside the editor's minimum
+    // is dropped: reserving it anyway placed it past the frame's right edge,
+    // where its scrollbar wrote outside the buffer (#1132).
+    let fits = main.width
+        >= activity_w
+            .saturating_add(secondary_w)
+            .saturating_add(RIGHT_PANE_MIN);
+    let secondary_w = if secondary_visible && fits {
+        secondary_w
+    } else {
+        0
+    };
     // Reserve activity + secondary first, then fit the primary side bar in
     // what's left while keeping RIGHT_PANE_MIN for the editor column.
     let reserved = activity_w.saturating_add(secondary_w);
@@ -501,19 +532,20 @@ fn lldb_dap_missing_message() -> String {
 /// python3. The debug venv's python is only the debugpy ADAPTER host — the
 /// debuggee must be this one, or a pytest module launch can't import pytest.
 fn project_python(root: &Path) -> PathBuf {
+    project_python_on(root, std::env::var_os("PATH").as_deref())
+        .unwrap_or_else(|| PathBuf::from("python3"))
+}
+
+/// [`project_python`] with `path_var` as `PATH`, None where it would fall
+/// back to a bare `python3`: no `.venv` and no `python3` on `path_var`.
+fn project_python_on(root: &Path, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let venv = root.join(".venv").join("bin").join("python");
     if venv.is_file() {
-        return venv;
+        return Some(venv);
     }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("python3");
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    PathBuf::from("python3")
+    std::env::split_paths(path_var?)
+        .map(|dir| dir.join("python3"))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Whether `path` is a regular file with the executable bit set — i.e. a
@@ -868,6 +900,44 @@ enum BottomPanelTab {
     Output,
     Ports,
     Captures,
+}
+
+impl BottomPanelTab {
+    /// Every tab, in the strip's left-to-right order (VS Code's panel-group
+    /// order). The strip paints from this list, so a tab cannot be
+    /// clickable without being in it.
+    const ALL: [BottomPanelTab; 5] = [
+        BottomPanelTab::Problems,
+        BottomPanelTab::Output,
+        BottomPanelTab::Terminal,
+        BottomPanelTab::Ports,
+        BottomPanelTab::Captures,
+    ];
+
+    /// The tab's strip label, padded to its click target.
+    fn label(self) -> &'static str {
+        match self {
+            BottomPanelTab::Problems => " PROBLEMS ",
+            BottomPanelTab::Output => " OUTPUT ",
+            BottomPanelTab::Terminal => " TERMINAL ",
+            BottomPanelTab::Ports => " PORTS ",
+            BottomPanelTab::Captures => " CAPTURES ",
+        }
+    }
+
+    /// The palette command that shows this tab (#852). No catch-all: a new
+    /// tab fails to compile until it names one, so no tab ships reachable
+    /// only by a click on the strip.
+    fn show_command(self) -> crate::widgets::command_palette::Command {
+        use crate::widgets::command_palette::Command;
+        match self {
+            BottomPanelTab::Terminal => Command::FocusTerminal,
+            BottomPanelTab::Problems => Command::ShowProblems,
+            BottomPanelTab::Output => Command::ShowOutput,
+            BottomPanelTab::Ports => Command::ShowPorts,
+            BottomPanelTab::Captures => Command::ShowCaptures,
+        }
+    }
 }
 
 /// A transient, click-only notification that a browsable port just appeared in
@@ -1664,6 +1734,12 @@ enum PrGhJob {
 /// of the operation, applied to the app when it arrives.
 type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
 
+/// The file the OUTLINE shows and the edit seq it was synced at.
+type OutlineKey = (PathBuf, Option<u64>);
+
+/// Where an off-thread outline parse delivers its symbols (#1150).
+type OutlineParse = std::sync::mpsc::Receiver<Vec<crate::lsp::manager::OutlineSymbol>>;
+
 /// The BREAKPOINTS section of the debug tree (#250): a header and one row per
 /// breakpoint, or nothing when there are none.
 fn breakpoint_section_rows(count: usize) -> Vec<crate::widgets::run_debug::DebugRow> {
@@ -1805,6 +1881,8 @@ struct PendingFileMove {
     op: FileMove,
     renames: Vec<crate::lsp::manager::FileRenameOp>,
     deadline: std::time::Instant,
+    /// The open buffers' `edit_seq`s when the request went out (#1151).
+    baseline: Vec<(PathBuf, u64)>,
 }
 
 /// A Search Editor tab's label (#615): not a file on disk, so it names the
@@ -2462,6 +2540,10 @@ enum PromptKind {
     /// Rename the entry at `path`. The prompt's `target_dir` holds the
     /// entry's parent; `buffer` is pre-filled with the current basename.
     Rename(PathBuf),
+    /// File: Save As… (#1203): a path for the active tab's buffer, relative
+    /// to `target_dir` (the workspace root) unless absolute. `buffer` starts
+    /// as the tab's own path.
+    SaveAs,
     /// LSP "Rename Symbol" (F2 in the editor): rename the identifier at
     /// `(row, col)` in `path`. `buffer` is pre-filled with the symbol; on
     /// commit the new name drives a `textDocument/rename` request.
@@ -2940,6 +3022,10 @@ pub struct App {
     /// The file the TIMELINE has been fetched (or is being fetched) for, so the
     /// fetch fires exactly once per active-file change.
     timeline_fetched: Option<PathBuf>,
+    /// When and for which folder the subfolder-repo scan behind the
+    /// Source Control empty state last ran (#1227); rescanned at most
+    /// every couple of seconds while that card shows.
+    nested_repo_scan: Option<(PathBuf, std::time::Instant)>,
     /// Off-thread per-line git blame for the active editor (GitLens-style
     /// inline annotation). Fetched once per (file, HEAD) like the gutter.
     blame_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::BlameLine>)>,
@@ -3245,6 +3331,9 @@ pub struct App {
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
+    /// A database being downloaded or extracted (#1155): what is being
+    /// added, for the status line, and where its folder arrives.
+    codeql_db_job: Option<(String, std::sync::mpsc::Receiver<Result<PathBuf, String>>)>,
     /// A CodeQL document being made (#578: View CFG, the alert and result
     /// views): the file it writes or why not, and the status lines for
     /// each.
@@ -3954,6 +4043,17 @@ pub struct App {
     /// to, so `sync_outline` re-requests symbols exactly once per tab switch or
     /// edit batch. `None` seq means the file has no language server.
     outline_synced: Option<(PathBuf, Option<u64>)>,
+    /// A large buffer's syntax outline being parsed off the UI thread
+    /// (#1150): the `outline_synced` key its snapshot was taken at, and
+    /// where the symbols land. One at a time; typing meanwhile coalesces
+    /// into one fresh parse when it lands.
+    outline_parse: Option<(OutlineKey, OutlineParse)>,
+    /// The `outline_synced` key the last off-thread parse was started for.
+    outline_parsed_for: Option<(PathBuf, Option<u64>)>,
+    /// The file and edit seq whose language-server outline last landed: a
+    /// syntax parse of that same buffer finishing later must not replace
+    /// the richer symbols.
+    outline_lsp_landed: Option<(PathBuf, u64)>,
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
     call_hierarchy_request_id: Option<u64>,
@@ -3980,6 +4080,9 @@ pub struct App {
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
+    /// The open buffers' `edit_seq`s when the in-flight rename went out
+    /// (#1151): a reply for a buffer edited since is refused.
+    rename_baseline: Vec<(PathBuf, u64)>,
     /// An Explorer rename or move waiting on the servers' `willRenameFiles`
     /// edit (#610); it runs when the answer lands or its deadline passes.
     pending_file_move: Option<PendingFileMove>,
@@ -3990,6 +4093,9 @@ pub struct App {
     /// True when the in-flight format request is Format Selection (#254)
     /// — the drain words its statuses accordingly.
     format_request_selection: bool,
+    /// The `edit_seq` of the tab the in-flight format request was computed
+    /// against (#1127): a reply for a buffer typed into since is dropped.
+    format_request_seq: Option<u64>,
     /// VS Code's `editor.formatOnType` (#254): typing a server trigger
     /// character runs onTypeFormatting at the spot. Off by default.
     format_on_type: bool,
@@ -4003,6 +4109,9 @@ pub struct App {
     /// (the reply is one resolved action to apply directly) rather than the
     /// initial `textDocument/codeAction` (whose reply opens the picker).
     code_action_pending_resolve: bool,
+    /// The open buffers' `edit_seq`s when the code-action (or resolve)
+    /// request whose edits are pending went out (#1151).
+    code_action_baseline: Vec<(PathBuf, u64)>,
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
@@ -4217,6 +4326,13 @@ pub struct App {
     /// completes a `Cmd+K`-prefixed chord (VS Code's two-key model). `None`
     /// when no chord is in flight.
     cmd_k_leader: Option<std::time::Instant>,
+    /// Whether croft asked the terminal for the kitty keyboard protocol at
+    /// startup (what `croft keys` reports as `kitty=`). A terminal that
+    /// honours it reports `Shift` held with `Ctrl` explicitly, so
+    /// `Ctrl+Shift+S` can be told from `Ctrl+S` (#857); one that ignores it
+    /// sends the same control byte for both, never a `Shift`. False until
+    /// `run` asks.
+    kitty_keys: bool,
     /// Native modal (vim-style) editing for the editor pane. When enabled it
     /// supersedes the always-on `editor_vim_chord` convenience layer.
     vim: crate::vim::VimState,
@@ -5507,6 +5623,7 @@ impl App {
             test_jump_rx,
             test_jump_tx,
             timeline_fetched: None,
+            nested_repo_scan: None,
             blame_rx,
             blame_tx,
             blame_fetched: None,
@@ -5627,6 +5744,7 @@ impl App {
             codeql_perf_compare: None,
             codeql_query_help: None,
             codeql_pack_job: None,
+            codeql_db_job: None,
             codeql_ast_job: None,
             codeql_doc_job: None,
             codeql_results_walk: None,
@@ -5827,6 +5945,7 @@ impl App {
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
+            kitty_keys: false,
             vim: crate::vim::VimState::new(),
             vim_last_find: None,
             vim_visual_line: false,
@@ -6004,14 +6123,17 @@ impl App {
             signature_help_request_id: None,
             signature_help_anchor: None,
             rename_request_id: None,
+            rename_baseline: Vec::new(),
             pending_file_move: None,
             prepare_rename_request: None,
             format_request_id: None,
+            format_request_seq: None,
             format_request_selection: false,
             format_on_type: loaded_prefs.format_on_type,
             on_type_request: None,
             code_action_request_id: None,
             code_action_pending_resolve: false,
+            code_action_baseline: Vec::new(),
             pending_code_actions: Vec::new(),
             review_boxes: None,
             review_pending: Vec::new(),
@@ -6102,6 +6224,9 @@ impl App {
             peek_refs: None,
             references_want_peek: false,
             outline_synced: None,
+            outline_parse: None,
+            outline_parsed_for: None,
+            outline_lsp_landed: None,
             declaration_request_id: None,
             type_definition_request_id: None,
             implementation_request_id: None,
@@ -7795,7 +7920,8 @@ impl App {
     /// Count of open editors with unsaved edits, across the active group and any
     /// split groups, deduped by path (a file open in two splits is one unsaved
     /// file; each dirty path-less buffer counts once). Drives the Explorer
-    /// activity badge, mirroring VS Code.
+    /// activity badge, mirroring VS Code, and Save All's "Saved N editors"
+    /// (#852).
     fn unsaved_count(&self) -> usize {
         let mut paths: std::collections::HashSet<&std::path::Path> =
             std::collections::HashSet::new();
@@ -7973,7 +8099,7 @@ impl App {
             self.search.query.clone(),
             self.search.opts,
         ));
-        let term = if self.search.query.trim().is_empty() {
+        let term = if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             None
         } else {
             Some(self.search.query.clone())
@@ -8569,6 +8695,34 @@ impl App {
             .to_path_buf()
     }
 
+    /// Feed the Source Control empty state the repos one folder below the
+    /// active root when that root is in none (#1227), so it offers to open
+    /// them rather than `git init` around them. A depth-1 `read_dir`,
+    /// rerun at most every two seconds while the card shows.
+    fn sync_nested_repos(&mut self) {
+        if self.source_control.status.in_repo {
+            self.source_control.nested_repos.clear();
+            self.nested_repo_scan = None;
+            return;
+        }
+        let root = self.active_scm_root.clone();
+        let fresh = self
+            .nested_repo_scan
+            .as_ref()
+            .is_some_and(|(r, at)| *r == root && at.elapsed() < Duration::from_secs(2));
+        if fresh {
+            return;
+        }
+        self.source_control.nested_repos = crate::git::child_repos(&root)
+            .into_iter()
+            .filter_map(|p| {
+                let name = p.file_name()?.to_string_lossy().into_owned();
+                Some((format!("{name}/"), p))
+            })
+            .collect();
+        self.nested_repo_scan = Some((root, std::time::Instant::now()));
+    }
+
     /// The git worker for a workspace root: the primary's, or the
     /// matching secondary's (#149).
     fn git_worker_for_root(&self, ws_root: &Path) -> &GitWorker {
@@ -8648,19 +8802,17 @@ impl App {
         // each file resolves against the repo of ITS owning workspace
         // root (#149). Precompute (workspace root → repo toplevel) so the
         // editor loop below borrows nothing else off self.
-        let repo_bases: Vec<(PathBuf, PathBuf)> = self
+        // A root in no repo (or with no status reply yet) maps to `None`,
+        // and the file's own repo is asked instead: a workspace opened
+        // above its repo still gets gutters (#1227).
+        let repo_bases: Vec<(PathBuf, Option<PathBuf>)> = self
             .roots
             .iter()
             .map(Path::to_path_buf)
             .collect::<Vec<_>>()
             .into_iter()
             .map(|ws| {
-                let repo = self
-                    .git_worker_for_root(&ws)
-                    .status()
-                    .repo_root
-                    .clone()
-                    .unwrap_or_else(|| ws.clone());
+                let repo = self.git_worker_for_root(&ws).status().repo_root.clone();
                 (ws, repo)
             })
             .collect();
@@ -8669,7 +8821,8 @@ impl App {
                 .iter()
                 .filter(|(ws, _)| path.starts_with(ws))
                 .max_by_key(|(ws, _)| ws.components().count())
-                .map(|(_, repo)| repo.clone())
+                .and_then(|(_, repo)| repo.clone())
+                .or_else(|| path.parent().and_then(crate::git::repo_toplevel))
         };
         let mut fetched: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
             std::collections::HashMap::new();
@@ -9048,6 +9201,9 @@ impl App {
                 }
                 if rect_contains(t.header_views_btn, col, row) {
                     return Some("Views and More Actions");
+                }
+                if self.open_editors.hit_save_all(col, row) {
+                    return Some("Save All");
                 }
             }
             SidebarView::Remote => {
@@ -10640,17 +10796,79 @@ impl App {
             // Tree-sitter paints the outline instantly from the buffer's own
             // syntax tree, before any language server replies. The LSP request
             // below refines it with richer kinds/detail when (and if) it lands.
-            let syntax = self.compute_syntax_outline(&path);
             let lsp_pending = seq.is_some();
-            self.outline
-                .set_syntax_symbols(path.clone(), syntax, lsp_pending);
+            if outline_parses_inline(&self.editor.lines) {
+                let syntax = self.compute_syntax_outline(&path);
+                self.outline
+                    .set_syntax_symbols(path.clone(), syntax, lsp_pending);
+            } else if self.outline.path.as_ref() != Some(&path) {
+                // A large buffer is parsed off the UI thread (#1150); until
+                // that lands, another file's outline must never stand in.
+                self.outline
+                    .set_syntax_symbols(path.clone(), Vec::new(), true);
+            }
             if lsp_pending && let (Some(lsp), Some(seq)) = (self.lsp.as_ref(), seq) {
                 lsp.request_document_symbols(path, seq);
             }
         }
+        let landed = self.drain_outline_parse();
+        self.start_outline_parse();
         // Follow-cursor every tick; cheap (O(symbols)) and only repaints when
         // the enclosing symbol actually changes.
-        self.outline.follow_caret(self.editor.cursor_row as u32)
+        self.outline.follow_caret(self.editor.cursor_row as u32) | landed
+    }
+
+    /// Parse a large buffer's syntax outline on a worker (#1150): inline, a
+    /// multi-megabyte file re-parsed from scratch on every keystroke and each
+    /// character took seconds to appear. Starts only when no parse is
+    /// running and the buffer moved past the last one started, so a burst of
+    /// typing costs one parse when it ends, not one per key.
+    fn start_outline_parse(&mut self) {
+        if self.outline_parse.is_some() || self.outline_parsed_for == self.outline_synced {
+            return;
+        }
+        let Some(key) = self.outline_synced.clone() else {
+            return;
+        };
+        if self.editor.path.as_ref() != Some(&key.0) || outline_parses_inline(&self.editor.lines) {
+            return;
+        }
+        let (path, lines) = (key.0.clone(), self.editor.lines.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(syntax_outline_for(&path, &lines));
+        });
+        self.outline_parsed_for = Some(key.clone());
+        self.outline_parse = Some((key, rx));
+    }
+
+    /// Apply a finished off-thread outline parse, if the buffer is still the
+    /// one it parsed and the language server's outline of that same buffer
+    /// has not landed first. True when the outline changed.
+    fn drain_outline_parse(&mut self) -> bool {
+        let Some((key, rx)) = &self.outline_parse else {
+            return false;
+        };
+        let symbols = match rx.try_recv() {
+            Ok(symbols) => symbols,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.outline_parse = None;
+                return false;
+            }
+        };
+        let key = key.clone();
+        self.outline_parse = None;
+        if self.outline_synced.as_ref() != Some(&key) {
+            return false;
+        }
+        let (path, seq) = key;
+        if seq.is_some_and(|seq| self.outline_lsp_landed == Some((path.clone(), seq))) {
+            return false;
+        }
+        self.outline
+            .set_syntax_symbols(path, symbols, seq.is_some());
+        true
     }
 
     /// Keep the Explorer's non-OUTLINE stacked sub-views current: re-project the
@@ -11007,6 +11225,9 @@ impl App {
         // filled. Keep the syntactic symbols rather than flashing "No symbols".
         if symbols.is_empty() && !self.outline.is_empty() {
             return false;
+        }
+        if !symbols.is_empty() {
+            self.outline_lsp_landed = Some((path.clone(), seq));
         }
         self.outline.set_symbols(path, symbols);
         self.outline.follow_caret(self.editor.cursor_row as u32);
@@ -12124,6 +12345,107 @@ impl App {
         });
     }
 
+    /// Show or hide the activity bar. The Customize Layout row and the
+    /// palette's View: Toggle Activity Bar Visibility (#852) both land here.
+    fn toggle_activity_bar(&mut self) {
+        self.activity_bar_visible = !self.activity_bar_visible;
+        // The bar is a structural auto-hide suppression, and unlike Zen
+        // it flips here on its own. A pending collapse armed against the
+        // old chrome would otherwise sit armed while `allowed()` declines
+        // for it, then fire on the first idle tick after the bar comes
+        // back, with no focus move of the user's own.
+        //
+        // Cancel the collapse. And when the bar goes AWAY, drop the pin
+        // too — for the reason `toggle_side_bar` already refuses to bank
+        // one in that state: no collapse can fire while the bar is
+        // hidden, so a pin held across that period is unconsumable, and
+        // it silently eats the first real collapse after the bar
+        // returns. Those two sites disagreed about the same question
+        // until this line; the bank-time answer is the right one.
+        //
+        // Revealing the bar leaves any pin alone: a pin banked while the
+        // bar is visible belongs to a reveal that can still be honoured.
+        self.sidebar_dwell.disarm();
+        if !self.activity_bar_visible {
+            self.sidebar_pinned_open = false;
+        }
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+    }
+
+    /// Show or hide the status bar: the Customize Layout row and View:
+    /// Toggle Status Bar Visibility (#852).
+    fn toggle_status_bar(&mut self) {
+        self.status_bar_visible = !self.status_bar_visible;
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+    }
+
+    /// Dock the primary side bar (and the activity bar with it) to `pos`:
+    /// the Customize Layout radio rows and View: Toggle Primary Side Bar
+    /// Position (#852).
+    fn set_side_bar_position(&mut self, pos: SideBarPosition) {
+        self.side_bar_position = pos;
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+    }
+
+    /// The bottom panel's alignment: the Customize Layout radio rows and
+    /// View: Set Panel Alignment… (#852).
+    fn set_panel_alignment(&mut self, al: PanelAlignment) {
+        self.panel_alignment = al;
+        self.persist_layout();
+    }
+
+    /// Where the quick input anchors: the Customize Layout radio rows and
+    /// View: Set Quick Input Position… (#852).
+    fn set_quick_input_position(&mut self, pos: QuickInputPosition) {
+        self.quick_input_position = pos;
+        self.persist_layout();
+    }
+
+    /// View: Set Panel Alignment… (#852): the popup's Panel Alignment radio
+    /// group as a keyboard picker, opened on the current alignment.
+    fn open_panel_alignment_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = PanelAlignment::OPTIONS
+            .iter()
+            .map(|(_, id, label)| ListRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        let mut picker = ListPicker::new(ListPurpose::PanelAlignment, "Panel Alignment", rows);
+        picker.selected = PanelAlignment::OPTIONS
+            .iter()
+            .position(|(al, ..)| *al == self.panel_alignment)
+            .unwrap_or(0);
+        self.open_list_picker(picker, "No panel alignments");
+    }
+
+    /// View: Set Quick Input Position… (#852): the popup's Quick Input
+    /// Position radio group as a keyboard picker, opened on the current one.
+    fn open_quick_input_position_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = QuickInputPosition::OPTIONS
+            .iter()
+            .map(|(_, id, label)| ListRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        let mut picker = ListPicker::new(
+            ListPurpose::QuickInputPosition,
+            "Quick Input Position",
+            rows,
+        );
+        picker.selected = QuickInputPosition::OPTIONS
+            .iter()
+            .position(|(pos, ..)| *pos == self.quick_input_position)
+            .unwrap_or(0);
+        self.open_list_picker(picker, "No quick input positions");
+    }
+
     /// Hide the activity bar's inline images when the bar is collapsed so the
     /// OSC-1337 icons don't ghost over the editor; arm a re-emit when shown.
     fn after_chrome_visibility_change(&mut self) {
@@ -12458,6 +12780,7 @@ impl App {
     /// their hit-test rects are zeroed so a stale click can't reach them.
     fn render_explorer_sections(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.open_editors.last_area = Rect::default();
+        self.open_editors.save_all_btn = Rect::default();
         self.outline.last_area = Rect::default();
         self.timeline.last_area = Rect::default();
         self.dependencies.last_area = Rect::default();
@@ -13219,17 +13542,50 @@ impl App {
             return false;
         }
         self.rename_request_id = None;
+        self.land_rename(edits);
+        true
+    }
+
+    /// Apply a rename reply, unless a buffer it edits was typed into after
+    /// the request went out (#1151): its positions were computed against
+    /// the text as it was then, and would land on whatever sits there now.
+    fn land_rename(
+        &mut self,
+        edits: Option<Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)>>,
+    ) {
+        let baseline = std::mem::take(&mut self.rename_baseline);
         match edits {
-            Some(files) => match self.apply_rename_edits(&files) {
-                Ok((file_count, occ)) => {
-                    self.status =
-                        format!("Renamed {occ} occurrence(s) across {file_count} file(s)");
+            Some(files) => {
+                if let Some(file) = self.stale_edit_target(&baseline, &files) {
+                    self.status = format!(
+                        "Rename cancelled: {file} changed while the server was working; press F2 again"
+                    );
+                    return;
                 }
-                Err(e) => self.status = format!("Rename failed: {e}"),
-            },
+                match self.apply_rename_edits(&files) {
+                    Ok((file_count, occ)) => {
+                        self.status =
+                            format!("Renamed {occ} occurrence(s) across {file_count} file(s)");
+                    }
+                    Err(e) => self.status = format!("Rename failed: {e}"),
+                }
+            }
             None => self.status = String::from("Rename produced no changes"),
         }
-        true
+    }
+
+    /// The first file of a workspace edit whose open buffer changed after
+    /// `baseline` was taken, named for the status bar (#1151).
+    fn stale_edit_target(
+        &self,
+        baseline: &[(PathBuf, u64)],
+        files: &[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)],
+    ) -> Option<String> {
+        files
+            .iter()
+            .filter(|(_, edits)| !edits.is_empty())
+            .find(|(path, _)| self.editor.edited_since(baseline, path))
+            .map(|(path, _)| self.status_path(path))
     }
 
     /// Apply an LSP rename `WorkspaceEdit` (already normalised to per-file
@@ -13275,18 +13631,33 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        let Some(lsp) = self.lsp.as_mut() else {
+        if self.lsp.is_none() {
             self.status = String::from("No language server for this file");
             return;
-        };
+        }
         // Mirror the editor's indentation preference; servers that carry their
         // own config (rustfmt, ruff, prettier) ignore these but the fields are
         // required by the LSP request.
         let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let seq = self.format_target_seq(&path);
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
         let id = lsp.request_formatting(path, tab_size, insert_spaces);
         self.format_request_id = Some(id);
+        self.format_request_seq = seq;
         self.format_request_selection = false;
         self.status = String::from("Formatting document");
+    }
+
+    /// The `edit_seq` of the tab a format reply for `path` lands in (the
+    /// one `apply_rename_to_open_tab` picks), or `None` when no tab holds it.
+    fn format_target_seq(&self, path: &std::path::Path) -> Option<u64> {
+        let idx = self
+            .editor
+            .find_tab_with_path(path)
+            .or_else(|| self.editor.find_any_tab_with_path(path))?;
+        Some(self.editor.editors[idx].edit_seq)
     }
 
     /// "Format Selection" (#254): `textDocument/rangeFormatting` over the
@@ -13308,12 +13679,14 @@ impl App {
         let start = self.editor.pos_to_utf16(sr, sc);
         let end = self.editor.pos_to_utf16(er, ec);
         let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let seq = self.format_target_seq(&path);
         let Some(lsp) = self.lsp.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
         let id = lsp.request_range_formatting(path, start, end, tab_size, insert_spaces);
         self.format_request_id = Some(id);
+        self.format_request_seq = seq;
         self.format_request_selection = true;
         self.status = String::from("Formatting selection");
     }
@@ -13341,7 +13714,21 @@ impl App {
             return false;
         }
         self.format_request_id = None;
+        self.land_format(edits, unsupported, path);
+        true
+    }
+
+    /// Apply a formatter's reply to the request in flight, then finish a
+    /// format-on-save. Split from [`Self::drain_lsp_format`] so tests can
+    /// deliver a reply without a server.
+    fn land_format(
+        &mut self,
+        edits: Option<Vec<crate::widgets::editor::TextSpanEdit>>,
+        unsupported: bool,
+        path: Option<PathBuf>,
+    ) {
         let selection = std::mem::take(&mut self.format_request_selection);
+        let requested_at = self.format_request_seq.take();
         if unsupported {
             self.status = if selection {
                 String::from("No range formatter available for this file")
@@ -13349,9 +13736,29 @@ impl App {
                 String::from("No formatter available for this file")
             };
             self.complete_pending_save();
-            return true;
+            return;
         }
         match (edits, path) {
+            // The edits are positions in the text the server was sent; typed
+            // into since, they land on the wrong lines (#1127). Drop them, as
+            // VS Code does, and let a format-on-save write what is there.
+            (Some(edits), Some(path))
+                if !edits.is_empty() && self.format_target_seq(&path) != requested_at =>
+            {
+                let file = self.status_path(&path);
+                let saving = self.save_after_format.is_some();
+                self.complete_pending_save();
+                self.status = if saving {
+                    format!(
+                        "Saved {file} without formatting: it changed while the formatter was running"
+                    )
+                } else {
+                    format!(
+                        "Format skipped: {file} changed while the formatter was running; format again"
+                    )
+                };
+                return;
+            }
             (Some(edits), Some(path)) if !edits.is_empty() => {
                 match self.editor.apply_rename_to_open_tab(&path, &edits) {
                     Some(_) => {
@@ -13376,7 +13783,6 @@ impl App {
         // A format-on-save write is deferred until now so the disk file gets the
         // formatted text in one go.
         self.complete_pending_save();
-        true
     }
 
     /// VS Code "Quick Fix" (`Cmd+.`): ask the language server for the code
@@ -13524,6 +13930,28 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
+        // A modify/delete conflict resolved to the deleting side leaves an
+        // empty Result: the resolution is "no file", so remove it from the
+        // index and the disk, as `git rm` would (#1244).
+        if self
+            .editor
+            .merge
+            .as_ref()
+            .is_some_and(|mv| mv.deleted.is_some())
+            && self.editor.lines.iter().all(|l| l.is_empty())
+        {
+            let rel = self.repo_rel(&path);
+            let root = self.scm_root();
+            match crate::git::remove_path(&root, &rel) {
+                Ok(()) => {
+                    self.close_tabs_with_path_everywhere(&path);
+                    self.refresh_source_control();
+                    self.status = format!("Merge complete: removed {rel}");
+                }
+                Err(e) => self.status = format!("Remove failed: {e}"),
+            }
+            return;
+        }
         if self.editor.dirty {
             self.save();
         }
@@ -13570,18 +13998,29 @@ impl App {
         let to_lines = |s: String| -> Vec<String> { s.lines().map(str::to_string).collect() };
         let ours = crate::git::read_file_at_stage(&canon_root, &rel, 2).map(to_lines);
         let theirs = crate::git::read_file_at_stage(&canon_root, &rel, 3).map(to_lines);
+        let mut deleted = None;
         let sides = match (ours, theirs) {
             // Neither stage exists: the path is not unmerged in git at
             // all — fall through to marker synthesis below.
             (Err(_), Err(_)) => None,
             // Unmerged: a missing single stage is a deleted side (DU/UD)
-            // and a missing base is added-by-both (AA) — both mean "that
-            // side is empty", not an error.
+            // and a missing base is added-by-both (AA). Both read as an
+            // empty side; a deleted one is also remembered, so taking it
+            // removes the file rather than staging an empty one (#1244).
             (o, t) => {
-                let base = crate::git::read_file_at_stage(&canon_root, &rel, 1)
-                    .map(&to_lines)
-                    .unwrap_or_default();
-                Some((base, o.unwrap_or_default(), t.unwrap_or_default()))
+                let base = crate::git::read_file_at_stage(&canon_root, &rel, 1).map(&to_lines);
+                if base.is_ok() {
+                    deleted = match (&o, &t) {
+                        (Err(_), Ok(_)) => Some(crate::merge_editor::CheckSide::Current),
+                        (Ok(_), Err(_)) => Some(crate::merge_editor::CheckSide::Incoming),
+                        _ => None,
+                    };
+                }
+                Some((
+                    base.unwrap_or_default(),
+                    o.unwrap_or_default(),
+                    t.unwrap_or_default(),
+                ))
             }
         };
         let built = match sides {
@@ -13597,6 +14036,7 @@ impl App {
             self.status = format!("{rel} has no merge conflicts");
             return false;
         };
+        mv.deleted = deleted;
         if let Err(e) = self.editor.open_pinned(path) {
             self.status = format!("Open failed: {e}");
             return false;
@@ -13812,6 +14252,7 @@ impl App {
         let id = lsp.request_code_action(path, row, col, row, col, diagnostics);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = false;
+        self.code_action_baseline = self.editor.edit_seqs();
         self.status = String::from("Finding quick fixes");
     }
 
@@ -13921,6 +14362,12 @@ impl App {
     /// that returns a still-edit-less action after resolve can't loop.
     fn apply_resolved_code_action(&mut self, item: crate::lsp::manager::CodeActionItem) {
         let mut applied = false;
+        if let Some(file) = self.stale_edit_target(&self.code_action_baseline, &item.edits) {
+            self.status = format!(
+                "Quick fix cancelled: {file} changed while the server was working; try it again"
+            );
+            return;
+        }
         if !item.edits.is_empty() {
             match self.apply_rename_edits(&item.edits) {
                 Ok((files, occ)) => {
@@ -13964,6 +14411,7 @@ impl App {
         let id = lsp.request_code_action_resolve(path, item.server, action);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = true;
+        self.code_action_baseline = self.editor.edit_seqs();
         self.status = String::from("Resolving quick fix");
     }
 
@@ -17526,13 +17974,7 @@ impl App {
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
-        let tabs = [
-            (BottomPanelTab::Problems, " PROBLEMS "),
-            (BottomPanelTab::Output, " OUTPUT "),
-            (BottomPanelTab::Terminal, " TERMINAL "),
-            (BottomPanelTab::Ports, " PORTS "),
-            (BottomPanelTab::Captures, " CAPTURES "),
-        ];
+        let tabs = BottomPanelTab::ALL.map(|tab| (tab, tab.label()));
 
         // Lay each tab out left to right, recording its hit rect (which, for
         // PROBLEMS, spans the label and the pill together).
@@ -17649,6 +18091,31 @@ impl App {
             self.show_terminal = true;
         }
         self.focus_pane(Pane::Terminal);
+    }
+
+    /// Output: Select Channel… (#852): the OUTPUT toolbar's channel dropdown
+    /// as a keyboard picker, opened on the channel shown now. Choosing one
+    /// shows it in the OUTPUT tab.
+    fn open_output_channel_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        // The panel only syncs while painted; a tab never shown yet would
+        // otherwise open the picker on the wrong channel.
+        self.output.sync();
+        let current = self.output.selected_name();
+        let rows: Vec<ListRow> = crate::output::channel_names()
+            .into_iter()
+            .map(|name| ListRow {
+                id: name.clone(),
+                label: name,
+            })
+            .collect();
+        let selected = rows
+            .iter()
+            .position(|r| Some(&r.id) == current.as_ref())
+            .unwrap_or(0);
+        let mut picker = ListPicker::new(ListPurpose::OutputChannel, "Output Channels", rows);
+        picker.selected = selected;
+        self.open_list_picker(picker, "No output channels yet");
     }
 
     /// Split the editor into two side-by-side columns (`Cmd+\`). The new
@@ -18156,6 +18623,7 @@ impl App {
                         height: usable_area.height - graph_h,
                         ..usable_area
                     };
+                    self.sync_nested_repos();
                     frame.render_widget(&mut self.source_control, scm_area);
                     if graph_h > 0 {
                         let graph_area = Rect {
@@ -20755,6 +21223,17 @@ impl App {
                 ]),
                 "Enter to rename, Esc to cancel",
             ),
+            PromptKind::SaveAs => (
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::raw("> "),
+                    ratatui::text::Span::styled(
+                        p.buffer.as_str(),
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    ),
+                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
+                ]),
+                "Enter to save, Esc to cancel (missing folders are created)",
+            ),
             PromptKind::RenameSymbol { .. } => (
                 ratatui::text::Line::from(vec![
                     ratatui::text::Span::raw("> "),
@@ -21118,18 +21597,7 @@ impl App {
             }
             // Cmd+K →: close the editors to the right of the active tab.
             KeyCode::Right if plain => {
-                let from = self.editor.active_index();
-                self.record_closed_tabs_where(|i, ed| i > from && !ed.pinned);
-                let removed = self.editor.close_to_right(from);
-                if removed > 0 {
-                    self.sync_open_file_poll_mtime();
-                    self.status = if removed == 1 {
-                        String::from("Closed 1 tab to the right")
-                    } else {
-                        format!("Closed {removed} tabs to the right")
-                    };
-                    self.poke_cursor();
-                }
+                self.close_tabs_to_right(self.editor.active_index());
                 true
             }
             // Cmd+K S: mark the active file as the compare anchor.
@@ -21235,17 +21703,11 @@ impl App {
             // chord below). Must precede the case-insensitive 'p' arm, which
             // would swallow the shifted press.
             KeyCode::Char('P') if shifted && plain => {
-                if self.editor.keep_open(self.editor.active_index()) {
-                    self.status = String::from("Kept tab open");
-                    self.poke_cursor();
-                }
+                self.keep_tab_open(self.editor.active_index());
                 true
             }
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'p') => {
-                let idx = self.editor.active_index();
-                let pinned = self.editor.toggle_pin(idx);
-                self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
-                self.poke_cursor();
+                self.toggle_tab_pin(self.editor.active_index());
                 true
             }
             // Cmd+K Shift+O: move the active tab into a new window. Must precede
@@ -21915,7 +22377,7 @@ impl App {
         // is what made the user's first attempt feel inert.
         let sc_focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
-        if is_save_key(key) && !sc_focused {
+        if is_save_key(key, self.kitty_keys) && !sc_focused {
             self.save();
             return Ok(());
         }
@@ -21954,10 +22416,8 @@ impl App {
             return Ok(());
         }
         if is_terminal_focus_key(key) {
-            if !self.show_terminal {
-                self.show_terminal = true;
-            }
-            self.focus_pane(Pane::Terminal);
+            // The TERMINAL tab, not whichever panel tab was last up (#852).
+            self.set_bottom_panel_tab(BottomPanelTab::Terminal);
             return Ok(());
         }
         if is_run_build_task_key(key) {
@@ -22006,6 +22466,20 @@ impl App {
             self.set_sidebar_view(SidebarView::Extensions);
             return Ok(());
         }
+        // The bottom panel's tabs (#852), claimed from any pane like the
+        // side bar jumps above.
+        if is_show_problems_key(key) {
+            self.set_bottom_panel_tab(BottomPanelTab::Problems);
+            return Ok(());
+        }
+        if is_show_output_key(key) {
+            self.set_bottom_panel_tab(BottomPanelTab::Output);
+            return Ok(());
+        }
+        if is_save_all_key(key) {
+            self.save_all();
+            return Ok(());
+        }
         if self.is_remote && is_drop_to_local_key(key) {
             self.drop_to_local = true;
             self.quit = true;
@@ -22040,15 +22514,20 @@ impl App {
         // everywhere, which is what keeps the sidebar reachable from the
         // terminal; only the Ctrl form is released, matching iTerm2 and
         // Ghostty, which reserve Cmd and pass Ctrl through.
-        let terminal_owns_ctrl_b = self.focus == Pane::Terminal
+        //
+        // Ctrl+Q follows the same rule (#1290): it is vim's visual block,
+        // nano's search backwards and the shell's XON, and quitting from
+        // inside one of them killed the app, the shell and every unsaved
+        // tab. Quit keeps Ctrl+Q from every other pane.
+        let terminal_owns_ctrl = self.focus == Pane::Terminal
             && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal)
             && key.modifiers == KeyModifiers::CONTROL;
-        if is_sidebar_toggle_key(key) && !terminal_owns_ctrl_b {
+        if is_sidebar_toggle_key(key) && !terminal_owns_ctrl {
             self.toggle_side_bar();
             return Ok(());
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) if !terminal_owns_ctrl => {
                 self.quit = true;
                 return Ok(());
             }
@@ -22232,7 +22711,7 @@ impl App {
             self.status = String::from("Replace All is owner-only in a shared session");
             return;
         }
-        if self.search.query.trim().is_empty() {
+        if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             self.status = String::from("Replace All: enter a search term first");
             return;
         }
@@ -22412,8 +22891,32 @@ impl App {
                 self.source_control.end();
                 self.poke_cursor();
             }
-            KeyCode::Up => self.source_control.scroll_up(1),
-            KeyCode::Down => self.source_control.scroll_down(1),
+            // In a multi-line message Up/Down move between its lines; on
+            // its first/last line they scroll the change list as before.
+            KeyCode::Up => {
+                if self.source_control.move_cursor_up() {
+                    self.poke_cursor();
+                } else {
+                    self.source_control.scroll_up(1);
+                }
+            }
+            KeyCode::Down => {
+                if self.source_control.move_cursor_down() {
+                    self.poke_cursor();
+                } else {
+                    self.source_control.scroll_down(1);
+                }
+            }
+            // Shift/Alt+Enter start a new message line (the commit body),
+            // VS Code's multi-line SCM input; plain Enter commits.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.source_control.insert_char('\n');
+                self.poke_cursor();
+            }
             KeyCode::Enter => self.commit_source_control(),
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -23394,6 +23897,26 @@ impl App {
             .collect();
         match crate::testing::worker::runner_for(&root) {
             Some(crate::testing::worker::Runner::Pytest) => {
+                // The interpreter F5 and Live Run pick, from the test file's
+                // folder up (#864), not only a root `.venv`; refused before
+                // any setup when debugpy cannot run under it.
+                let test_dir = self
+                    .editor
+                    .path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .filter(|dir| dir.starts_with(&root))
+                    .unwrap_or(&root)
+                    .to_path_buf();
+                let project_py =
+                    debuggee_python(&test_dir, &root, std::env::var_os("PATH").as_deref());
+                let note = match project_py.as_deref().map_or(Ok(None), debuggee_python_note) {
+                    Ok(note) => note,
+                    Err(refusal) => {
+                        self.debug_error(refusal);
+                        return;
+                    }
+                };
                 let adapter_py = match crate::dap::install::ensure_debug_venv() {
                     Ok(py) => py,
                     Err(e) => {
@@ -23401,7 +23924,7 @@ impl App {
                         return;
                     }
                 };
-                let project_py = project_python(&root);
+                let project_py = project_py.unwrap_or_else(|| adapter_py.clone());
                 let request =
                     crate::dap::session::pytest_debug_launch_request(&project_py, &root, &name);
                 let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
@@ -23416,10 +23939,15 @@ impl App {
                         self.debug_sessions.replace_with(name.clone(), session);
                         self.run_debug.feedback = Some(format!("Debugging test {name}"));
                         self.run_debug.feedback_is_error = false;
+                        let lead =
+                            with_python_note(format!("Debugging test {name}"), note.as_deref());
                         self.status = self.with_failure_note(format!(
-                            "Debugging test {name} — F5 continue · F10 step over · Shift+F5 stop"
+                            "{lead} — F5 continue · F10 step over · Shift+F5 stop"
                         ));
                         self.reveal_debug_view();
+                        if note.is_some() {
+                            self.debug_console_push(lead);
+                        }
                     }
                     Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
                 }
@@ -28550,37 +29078,90 @@ impl App {
         value: &str,
     ) {
         use crate::widgets::input_prompt::CodeqlDbSource;
-        let found: Result<PathBuf, String> = match source {
-            CodeqlDbSource::Folder => {
-                let dir = self.typed_path(value);
-                crate::codeql_db::find_database_in(&dir).ok_or_else(|| {
-                    format!(
+        if source == CodeqlDbSource::Folder {
+            let dir = self.typed_path(value);
+            match crate::codeql_db::find_database_in(&dir) {
+                Some(found) => self.register_codeql_database(&found),
+                None => {
+                    self.status = format!(
                         "{} is not a CodeQL database (no codeql-database.yml)",
                         dir.display()
+                    );
+                }
+            }
+            return;
+        }
+        // Downloads and extraction run on a worker (#1155): a database is
+        // commonly hundreds of megabytes, and inline the whole UI froze until
+        // it was on disk.
+        if let Some((what, _)) = &self.codeql_db_job {
+            self.status = format!("Still adding the CodeQL database {what}");
+            return;
+        }
+        let cache = Self::codeql_db_cache_dir();
+        let (what, job): (String, Box<dyn FnOnce() -> Result<PathBuf, String> + Send>) =
+            match source {
+                CodeqlDbSource::Archive => {
+                    let zip = self.typed_path(value);
+                    let stem = zip
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| String::from("database"));
+                    (
+                        zip.display().to_string(),
+                        Box::new(move || Self::extract_codeql_zip(&cache, &zip, &stem)),
                     )
-                })
-            }
-            CodeqlDbSource::Archive => {
-                let zip = self.typed_path(value);
-                let stem = zip
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| String::from("database"));
-                self.extract_codeql_zip(&zip, &stem)
-            }
-            CodeqlDbSource::Url => self.download_codeql_zip_from_url(value.trim()),
-            CodeqlDbSource::Github => self.download_codeql_db_from_github(value.trim()),
+                }
+                CodeqlDbSource::Url => {
+                    let url = value.trim().to_string();
+                    (
+                        url.clone(),
+                        Box::new(move || Self::download_codeql_zip_from_url(&cache, &url)),
+                    )
+                }
+                CodeqlDbSource::Github => {
+                    let repo = value.trim().to_string();
+                    let gh = self.gh_program.clone();
+                    (
+                        repo.clone(),
+                        Box::new(move || Self::download_codeql_db_from_github(&gh, &cache, &repo)),
+                    )
+                }
+                CodeqlDbSource::Folder => unreachable!("added above"),
+            };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.status = format!("Adding the CodeQL database {what}\u{2026}");
+        self.codeql_db_job = Some((what, rx));
+    }
+
+    /// Register a database that finished downloading or extracting (#1155).
+    pub fn drain_codeql_db_job(&mut self) -> bool {
+        let Some((what, rx)) = self.codeql_db_job.as_ref() else {
+            return false;
         };
-        let dir = match found {
-            Ok(d) => d,
-            Err(why) => {
-                self.status = why;
-                return;
-            }
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(format!(
+                "Adding the CodeQL database {what} stopped unexpectedly"
+            )),
         };
+        self.codeql_db_job = None;
+        match outcome {
+            Ok(dir) => self.register_codeql_database(&dir),
+            Err(why) => self.status = why,
+        }
+        true
+    }
+
+    /// Add a database folder to the saved list and make it current.
+    fn register_codeql_database(&mut self, dir: &std::path::Path) {
         let path = Self::codeql_db_store_path();
         let mut store = crate::codeql_db::DatabaseStore::load(&path);
-        match store.add(&dir) {
+        match store.add(dir) {
             Ok(i) => {
                 if let Err(e) = store.save(&path) {
                     self.status = format!("Could not save the database list: {e}");
@@ -28601,14 +29182,19 @@ impl App {
         }
     }
 
-    fn extract_codeql_zip(&self, zip: &std::path::Path, name: &str) -> Result<PathBuf, String> {
-        let dest = Self::codeql_db_cache_dir().join(name);
+    /// Unpack `zip` into `cache/<name>`. Runs on the add-database worker.
+    fn extract_codeql_zip(
+        cache: &std::path::Path,
+        zip: &std::path::Path,
+        name: &str,
+    ) -> Result<PathBuf, String> {
+        let dest = cache.join(name);
         crate::codeql_db::extract_zip(zip, &dest, None)?;
         crate::codeql_db::find_database_in(&dest)
             .ok_or_else(|| format!("{} holds no CodeQL database", zip.display()))
     }
 
-    fn download_codeql_zip_from_url(&self, url: &str) -> Result<PathBuf, String> {
+    fn download_codeql_zip_from_url(cache: &std::path::Path, url: &str) -> Result<PathBuf, String> {
         if !url.starts_with("https://") {
             return Err(String::from("A database URL must be https://"));
         }
@@ -28622,20 +29208,22 @@ impl App {
             .unwrap_or("database")
             .trim_end_matches(".zip")
             .to_string();
-        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
-        if let Some(dir) = tmp.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
+        let tmp = cache.join(format!("{name}.download.zip"));
+        std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
         let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         std::io::copy(&mut resp.into_reader(), &mut f).map_err(|e| e.to_string())?;
-        let out = self.extract_codeql_zip(&tmp, &name);
+        let out = Self::extract_codeql_zip(cache, &tmp, &name);
         let _ = std::fs::remove_file(&tmp);
         out
     }
 
     /// `owner/repo` or `owner/repo language`. With no language, the one
     /// database GitHub has is used; several need the language named.
-    fn download_codeql_db_from_github(&self, value: &str) -> Result<PathBuf, String> {
+    fn download_codeql_db_from_github(
+        gh: &std::path::Path,
+        cache: &std::path::Path,
+        value: &str,
+    ) -> Result<PathBuf, String> {
         let mut parts = value.split_whitespace();
         let repo = parts
             .next()
@@ -28651,7 +29239,7 @@ impl App {
         let language = match parts.next() {
             Some(l) => l.to_string(),
             None => {
-                let out = std::process::Command::new("gh")
+                let out = std::process::Command::new(gh)
                     .args([
                         "api",
                         &format!("/repos/{repo}/code-scanning/codeql/databases"),
@@ -28682,23 +29270,26 @@ impl App {
                 }
             }
         };
-        let out = std::process::Command::new("gh")
+        // Streamed straight to disk: a database can be larger than the
+        // memory croft should hold at once.
+        let name = format!("{}-{language}", repo.replace('/', "-"));
+        let tmp = cache.join(format!("{name}.download.zip"));
+        std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
+        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let out = std::process::Command::new(gh)
             .args(crate::codeql_db::github_database_args(&repo, &language))
+            .stdin(std::process::Stdio::null())
+            .stdout(file)
             .output()
             .map_err(|e| format!("could not run gh: {e}"))?;
         if !out.status.success() {
+            let _ = std::fs::remove_file(&tmp);
             return Err(format!(
                 "Download failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        let name = format!("{}-{language}", repo.replace('/', "-"));
-        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
-        if let Some(dir) = tmp.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&tmp, &out.stdout).map_err(|e| e.to_string())?;
-        let result = self.extract_codeql_zip(&tmp, &name);
+        let result = Self::extract_codeql_zip(cache, &tmp, &name);
         let _ = std::fs::remove_file(&tmp);
         result
     }
@@ -29051,6 +29642,12 @@ impl App {
                     self.run_debug.feedback_is_error = false;
                     self.watch_baseline_pending = true;
                 }
+                // What the exception stop threw (#864): the panel's pill and
+                // the status line, which has the width the pill lacks.
+                DapEvent::ExceptionInfo { summary } => {
+                    self.run_debug.feedback = Some(format!("Paused (exception): {summary}"));
+                    self.status = format!("Paused on exception: {summary}");
+                }
                 DapEvent::BreakpointsUpdated => {
                     // Mirror the adapter's unverified set into the editor so the
                     // gutter can hollow out inert breakpoints, and warn once if
@@ -29133,7 +29730,8 @@ impl App {
                 }
                 // `stopAll: true` (#567): the siblings go too, and the rest
                 // of this arm reports the ended run as for a lone session.
-                if self.debug_stop_all && !self.debug_sessions.is_empty() {
+                let stopped_all = self.debug_stop_all && !self.debug_sessions.is_empty();
+                if stopped_all {
                     self.debug_stop();
                     self.status =
                         format!("{ended_name} ended — stopAll stopped the rest of the compound");
@@ -29159,9 +29757,16 @@ impl App {
                         self.run_debug.feedback_is_error = true;
                     }
                     None => {
-                        self.run_debug.feedback = Some(
-                            debug_end_message(had_breakpoints, self.debug_ever_stopped).to_string(),
-                        );
+                        let msg =
+                            debug_end_message(had_breakpoints, self.debug_ever_stopped).to_string();
+                        // The status bar still read "Debugging x — F5
+                        // continue · F10 step over" after the end (#867).
+                        // stopAll's own explanation above is left standing,
+                        // and a postDebugTask below may report over this.
+                        if !stopped_all {
+                            self.status = msg.clone();
+                        }
+                        self.run_debug.feedback = Some(msg);
                         self.run_debug.feedback_is_error = false;
                     }
                 }
@@ -29406,9 +30011,16 @@ impl App {
     }
 
     /// Append a line to the debug console, capping the backlog so a chatty
-    /// program can't grow it without bound.
+    /// program can't grow it without bound. The line is mirrored to OUTPUT's
+    /// "Debug Console" channel (#867), where it reads at full width and can
+    /// be searched and copied; that channel keeps its own cap.
     fn debug_console_push(&mut self, line: String) {
         const CAP: usize = 1000;
+        crate::output::push(
+            crate::output::CHANNEL_DEBUG_CONSOLE,
+            crate::output::OutputLevel::Info,
+            &line,
+        );
         self.debug_console.push(line);
         if self.debug_console.len() > CAP {
             let overflow = self.debug_console.len() - CAP;
@@ -30378,6 +30990,8 @@ impl App {
             .clone()
             .unwrap_or_else(|| self.active_workspace_root());
         let name = rc.name.clone();
+        // The debuggee interpreter's note (#864), for a Python launch.
+        let mut python_note = None;
         let result = match rc.kind {
             AdapterKind::Debugpy => {
                 if rc.request == RequestKind::Launch && rc.program.is_none() && rc.module.is_none()
@@ -30391,11 +31005,28 @@ impl App {
                     Ok(py) => {
                         let adapter_args =
                             vec![String::from("-m"), String::from("debugpy.adapter")];
+                        let program_py =
+                            config_project_python(&rc, &cwd, &self.active_workspace_root(), &py);
+                        let request = configs::debugpy_request(&rc, &program_py);
+                        // Whichever interpreter runs the program, the
+                        // config's own included (#864).
+                        if rc.request == RequestKind::Launch {
+                            match launch_request_python(&request, &cwd)
+                                .as_deref()
+                                .map_or(Ok(None), debuggee_python_note)
+                            {
+                                Ok(note) => python_note = note,
+                                Err(refusal) => {
+                                    self.debug_error(format!("config \"{name}\": {refusal}"));
+                                    return;
+                                }
+                            }
+                        }
                         crate::dap::session::DapSession::launch_with(
                             &py.to_string_lossy(),
                             &adapter_args,
                             &cwd,
-                            configs::debugpy_request(&rc, &py),
+                            request,
                             breakpoints,
                         )
                     }
@@ -30519,9 +31150,12 @@ impl App {
                 };
                 self.run_debug.feedback = Some(format!("{verb} {name}"));
                 self.run_debug.feedback_is_error = false;
-                self.status =
-                    format!("{verb} {name} — F5 continue · F10 step over · Shift+F5 stop");
+                let lead = with_python_note(format!("{verb} {name}"), python_note.as_deref());
+                self.status = format!("{lead} — F5 continue · F10 step over · Shift+F5 stop");
                 self.reveal_debug_view();
+                if python_note.is_some() {
+                    self.debug_console_push(lead);
+                }
             }
             Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
         }
@@ -30579,6 +31213,26 @@ impl App {
                 return;
             }
         }
+        let debug_root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        // The debug venv hosts only the adapter; the program runs under
+        // the interpreter Run would use, so its packages import (#864).
+        // One debugpy cannot run under is refused before any setup.
+        let program_py = debuggee_python(
+            path.parent().unwrap_or(&debug_root),
+            &debug_root,
+            std::env::var_os("PATH").as_deref(),
+        );
+        let note = match program_py.as_deref().map_or(Ok(None), debuggee_python_note) {
+            Ok(note) => note,
+            Err(refusal) => {
+                self.debug_error(refusal);
+                return;
+            }
+        };
         let py = match crate::dap::install::ensure_debug_venv() {
             Ok(py) => py,
             Err(e) => {
@@ -30586,20 +31240,16 @@ impl App {
                 return;
             }
         };
+        let program_py = program_py.unwrap_or_else(|| py.clone());
         let breakpoints = self.collect_editor_breakpoints();
         let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
         let py_str = py.to_string_lossy().into_owned();
-        let debug_root = self
-            .roots
-            .owning_root(&path)
-            .unwrap_or_else(|| self.roots.primary())
-            .to_path_buf();
         match crate::dap::session::DapSession::launch(
             &py_str,
             &adapter_args,
             &debug_root,
             &path,
-            &py,
+            &program_py,
             breakpoints,
             false,
         ) {
@@ -30611,9 +31261,14 @@ impl App {
                 self.debug_sessions.replace_with(name.clone(), session);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
-                self.status =
-                    format!("Debugging {name} — F5 continue · F10 step over · Shift+F5 stop");
+                let lead = with_python_note(format!("Debugging {name}"), note.as_deref());
+                self.status = format!("{lead} — F5 continue · F10 step over · Shift+F5 stop");
                 self.reveal_debug_view();
+                // After the reveal, which clears the console; it outlasts
+                // the status line.
+                if note.is_some() {
+                    self.debug_console_push(lead);
+                }
             }
             Err(e) => {
                 self.debug_error(format!("Failed to start debugger: {e}"));
@@ -31895,7 +32550,7 @@ impl App {
     pub fn push_source_control(&mut self) {
         let root = self.scm_root();
         self.spawn_git_net("push", move || {
-            let r = crate::git::push_current_branch(&root);
+            let r = crate::git::push_or_publish(&root);
             Box::new(move |app: &mut App| app.finish_push(r))
         });
     }
@@ -31977,13 +32632,17 @@ impl App {
 
     /// Sync = pull then push, mirroring VS Code's sync button. A failed
     /// pull short-circuits (we never push on top of an unmerged tree); a
-    /// successful pull followed by a failed push reports both halves.
+    /// successful pull followed by a failed push reports both halves. A
+    /// branch with no upstream has nothing to pull, so it is published.
     pub fn sync_source_control(&mut self) {
         let root = self.scm_root();
         self.spawn_git_net("sync", move || {
-            let pull = crate::git::pull_current_branch(&root);
+            let pull = match crate::git::unpublished_branch(&root) {
+                Some(_) => Ok(String::from("nothing, branch not published yet")),
+                None => crate::git::pull_current_branch(&root),
+            };
             // Never push on top of a failed pull.
-            let push = pull.is_ok().then(|| crate::git::push_current_branch(&root));
+            let push = pull.is_ok().then(|| crate::git::push_or_publish(&root));
             Box::new(move |app: &mut App| app.finish_sync(pull, push))
         });
     }
@@ -32434,12 +33093,9 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         };
-        self.spawn_scm_op(
-            "push -u origin",
-            "Published",
-            "Publish branch",
-            move |root| crate::git::publish_branch(root, &branch),
-        );
+        self.spawn_scm_op("push -u", "Published", "Publish branch", move |root| {
+            crate::git::publish_branch(root, &branch)
+        });
     }
 
     /// Open the read-only "Git Output" log in an editor tab (VS Code's Git
@@ -33883,7 +34539,9 @@ impl App {
         true
     }
 
-    /// Notes: Delete Note: the focused note, else the next from the caret.
+    /// Notes: Delete Note: the focused note, else the one on the caret's
+    /// line. A note further down is never reached for: a tombstone can't be
+    /// undone, so the command deletes only a note the user is on (#1131).
     fn delete_sticky_note_here(&mut self) {
         let id = self
             .editor
@@ -33896,16 +34554,27 @@ impl App {
                 let lines = &self.editor.lines;
                 self.notes
                     .on_file(&file)
-                    .map(|n| (n.place(lines), Self::note_box_id(&n.id)))
-                    .filter(|(row, _)| *row >= self.editor.cursor_row)
-                    .min()
-                    .map(|(_, id)| id)
+                    .find(|n| n.place(lines) == self.editor.cursor_row)
+                    .map(|n| Self::note_box_id(&n.id))
             });
-        match id {
-            Some(id) if self.change_note_box(id, |n| n.deleted = true) => {
-                self.status = String::from("Note deleted");
-            }
-            _ => self.status = String::from("No note here"),
+        let Some(note) = id
+            .and_then(|id| self.note_box_ids.get(&id))
+            .and_then(|note_id| self.notes.get(note_id))
+        else {
+            self.status = String::from("No note on this line");
+            return;
+        };
+        let line = note.place(&self.editor.lines) + 1;
+        let first = note.body.lines().next().unwrap_or_default();
+        // The first words, cut at a space so the status doesn't end mid-word.
+        let mut gist = truncate_for_display(first, 40);
+        if gist.len() < first.len()
+            && let Some(cut) = gist.rfind(' ')
+        {
+            gist.truncate(cut);
+        }
+        if id.is_some_and(|id| self.change_note_box(id, |n| n.deleted = true)) {
+            self.status = format!("Note deleted on line {line}: {gist}");
         }
     }
 
@@ -34680,6 +35349,29 @@ impl App {
                 CollabEvent::BootstrapTimedOut { file } => {
                     self.status = format!("{file}: no session owner answered; editing locally");
                 }
+                CollabEvent::OwnerLeft => {
+                    self.status = String::from("The session owner left; saves now write to disk");
+                }
+                CollabEvent::OwnerReturned { files } => {
+                    // The new owner starts from the file on disk, so that is
+                    // the merge base for this guest's work since the owner
+                    // left (#1147): only this side's changes replay, and any
+                    // the new owner already made survive.
+                    for file in files {
+                        match crate::collab::contained_path(&root, &file)
+                            .and_then(|p| std::fs::read_to_string(p).ok())
+                        {
+                            Some(disk) => {
+                                self.collab_offline_base
+                                    .insert(file, disk.replace("\r\n", "\n"));
+                            }
+                            None => {
+                                self.collab_offline_base.remove(&file);
+                            }
+                        }
+                    }
+                    self.status = String::from("The session owner is back; rejoining shared files");
+                }
                 CollabEvent::Caret {
                     file,
                     site,
@@ -35397,6 +36089,27 @@ impl App {
                     );
                 }
             }
+            ListPurpose::OutputChannel => {
+                self.output.sync();
+                self.output.select_by_name(&row.id);
+                self.set_bottom_panel_tab(BottomPanelTab::Output);
+            }
+            ListPurpose::PanelAlignment => {
+                if let Some((al, ..)) = PanelAlignment::OPTIONS
+                    .iter()
+                    .find(|(_, id, _)| *id == row.id)
+                {
+                    self.set_panel_alignment(*al);
+                }
+            }
+            ListPurpose::QuickInputPosition => {
+                if let Some((pos, ..)) = QuickInputPosition::OPTIONS
+                    .iter()
+                    .find(|(_, id, _)| *id == row.id)
+                {
+                    self.set_quick_input_position(*pos);
+                }
+            }
             ListPurpose::Settings => {
                 match row.id.as_str() {
                     "toggle:format_on_save" => self.toggle_format_on_save(),
@@ -36015,7 +36728,7 @@ impl App {
         self.status = format!("Committed: {commit_summary}");
         let root = self.scm_root();
         self.spawn_git_net("push", move || {
-            let r = crate::git::push_current_branch(&root);
+            let r = crate::git::push_or_publish(&root);
             Box::new(move |app: &mut App| app.finish_commit_and_push(commit_summary, r))
         });
         self.active_git_bypass_debounce();
@@ -39948,7 +40661,7 @@ impl App {
                 // horizontally and the user lands on the match instead of the
                 // line's leftmost cell - which on a 200k-char line means
                 // never seeing the match without manual scrolling.
-                let needle = self.search.query.trim();
+                let needle = crate::widgets::search::as_typed(&self.search.query);
                 let opts = self.search.opts;
                 let line = self.editor.lines.get(row).cloned().unwrap_or_default();
                 // Locate the first match on the line: its start column and
@@ -42531,11 +43244,12 @@ impl App {
             self.copy_terminal_selection();
             return;
         }
-        // Cmd+V / Ctrl+V / Ctrl+Shift+V: paste local clipboard into the
-        // embedded shell. Without this, raw Ctrl+V bytes (\x16) just go
-        // through to the shell unchanged, and Cmd+V — when not eaten by
-        // the host terminal's menu shortcut — would do nothing useful.
-        if is_clipboard_paste_key(key) {
+        // Cmd+V / Ctrl+Shift+V: paste local clipboard into the embedded
+        // shell; Cmd+V, when not eaten by the host terminal's menu
+        // shortcut, would otherwise do nothing useful. Plain Ctrl+V is the
+        // app's (#1290): vim's visual block and nano's page down need the
+        // 0x16 byte, as in VS Code's terminal on Linux.
+        if is_clipboard_paste_key(key) && !is_plain_ctrl_v(key) {
             self.paste_clipboard_into_terminal();
             return;
         }
@@ -42671,7 +43385,7 @@ impl App {
     }
 
     /// Paste the host clipboard into the terminal: the chord (Cmd+V /
-    /// Ctrl+V / Ctrl+Shift+V) and the pane menu's "Paste" both land here, so
+    /// Ctrl+Shift+V) and the pane menu's "Paste" both land here, so
     /// bracketed paste, broadcast fan-out and the remote-clipboard fallback
     /// behave identically whichever one the user reached for.
     ///
@@ -46609,6 +47323,13 @@ impl App {
                 })
                 .collect();
         palette.set_extension_commands(ext_commands);
+        // VS Code offers Pin Editor on an unpinned tab and Unpin Editor on
+        // a pinned one (#852), never the one that would do nothing.
+        palette.set_hidden(vec![if self.editor.is_pinned(self.editor.active_index()) {
+            crate::widgets::command_palette::Command::PinEditor
+        } else {
+            crate::widgets::command_palette::Command::UnpinEditor
+        }]);
         let count = palette.results.len();
         self.command_palette = Some(palette);
         self.overlays.command_palette_clear.request();
@@ -48038,6 +48759,16 @@ impl App {
             Cmd::PreviousBookmark => self.goto_bookmark(false),
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
+            Cmd::SaveAs => self.open_save_as_prompt(),
+            Cmd::SaveAll => self.save_all(),
+            Cmd::NewFile => {
+                let target = self.palette_create_target_dir();
+                self.open_create_prompt(CreateKind::File, target);
+            }
+            Cmd::NewFolder => {
+                let target = self.palette_create_target_dir();
+                self.open_create_prompt(CreateKind::Folder, target);
+            }
             Cmd::Undo => {
                 self.status = if self.editor.undo() {
                     String::from("Undo")
@@ -48052,6 +48783,16 @@ impl App {
                     String::from("Nothing to redo")
                 };
             }
+            // The keyboard route on Linux, where Ctrl+A is line start and a
+            // terminal without Super forwarding never delivers Cmd+A (#852).
+            Cmd::SelectAll => {
+                self.focus_pane(Pane::Editor);
+                self.editor.select_all();
+                self.status = format!(
+                    "Selected {} chars",
+                    self.editor.selection_text().chars().count()
+                );
+            }
             Cmd::CloseEditor => {
                 self.record_closed_tab_at(self.editor.active_index());
                 if self.editor.close_active() {
@@ -48061,6 +48802,15 @@ impl App {
                 }
             }
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
+            // The tab menu's rows (#852), on the active tab and through the
+            // same methods its clicks and the Cmd+K chords use.
+            Cmd::CloseOtherEditors => self.close_other_tabs(self.editor.active_index()),
+            Cmd::CloseEditorsToTheRight => self.close_tabs_to_right(self.editor.active_index()),
+            Cmd::CloseSavedEditors => self.close_saved_tabs(),
+            Cmd::CloseAllEditors => self.close_all_tabs(),
+            Cmd::PinEditor => self.set_active_tab_pinned(true),
+            Cmd::UnpinEditor => self.set_active_tab_pinned(false),
+            Cmd::KeepEditor => self.keep_tab_open(self.editor.active_index()),
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::TakeTheTour => self.start_demo(),
@@ -48483,6 +49233,34 @@ impl App {
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
+            // Each tab names the command that shows it, so the palette reads
+            // the tab from there rather than keeping a second mapping.
+            Cmd::FocusTerminal
+            | Cmd::ShowProblems
+            | Cmd::ShowOutput
+            | Cmd::ShowPorts
+            | Cmd::ShowCaptures => {
+                if let Some(tab) = BottomPanelTab::ALL
+                    .into_iter()
+                    .find(|tab| tab.show_command() == cmd)
+                {
+                    self.set_bottom_panel_tab(tab);
+                }
+            }
+            Cmd::OutputSelectChannel => self.open_output_channel_picker(),
+            // The Customize Layout popup's rows (#852), through the same
+            // setters its clicks use.
+            Cmd::ToggleActivityBar => self.toggle_activity_bar(),
+            Cmd::ToggleStatusBar => self.toggle_status_bar(),
+            Cmd::ToggleSideBarPosition => {
+                self.set_side_bar_position(match self.side_bar_position {
+                    SideBarPosition::Left => SideBarPosition::Right,
+                    SideBarPosition::Right => SideBarPosition::Left,
+                })
+            }
+            Cmd::SetPanelAlignment => self.open_panel_alignment_picker(),
+            Cmd::SetQuickInputPosition => self.open_quick_input_position_picker(),
+            Cmd::CustomizeLayout => self.open_customize_layout_menu(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
             Cmd::ProblemsToggleProjectAuto => {
                 // auto -> on -> off -> auto. Cycling rather than a boolean
@@ -52357,6 +53135,10 @@ impl App {
                     if rect_contains(self.open_editors.last_scrollbar, m.column, m.row) {
                         self.open_editors.scroll_to_bar_y(m.row);
                         self.open_editors_scrollbar_drag = true;
+                    } else if self.open_editors.hit_save_all(m.column, m.row) {
+                        // VS Code's Save All on the section header (#852),
+                        // checked first: the header row holds the button.
+                        self.save_all();
                     } else if self.open_editors.hit_header(m.column, m.row) {
                         self.open_editors.toggle_collapse();
                     } else if let Some(idx) = self.open_editors.row_at(m.row)
@@ -52894,6 +53676,10 @@ impl App {
                     }
                     if self.source_control.click_init_repo_button(m.column, m.row) {
                         self.initialize_repository();
+                        return;
+                    }
+                    if let Some(repo) = self.source_control.click_nested_repo(m.column, m.row) {
+                        self.change_workspace_root(repo);
                         return;
                     }
                     if self.source_control.click_button(m.column, m.row) {
@@ -54334,6 +55120,14 @@ impl App {
     /// immediately but skips the editor that currently HAS focus (it has
     /// not lost it yet). Returns true when anything changed on screen.
     fn sweep_auto_save(&mut self, require_delay: bool) -> bool {
+        let skip_active = !require_delay && self.focus == Pane::Editor;
+        self.sweep_dirty_buffers(require_delay, skip_active)
+    }
+
+    /// Write every dirty buffer the auto-save rules allow, in every split,
+    /// leaving the active tab alone when `skip_active`. Shared by the
+    /// auto-save sweep and File: Save All (#852).
+    fn sweep_dirty_buffers(&mut self, require_delay: bool, skip_active: bool) -> bool {
         // Each saved tab's own map rides along (#349): the recorder must not
         // look it up by path afterwards, since a split can hold the same file
         // in a second buffer with a different map.
@@ -54354,9 +55148,9 @@ impl App {
             .filter(|p| !self.symbol_path_is_live(p))
             .collect();
         // The tab that still holds focus is not saved by the focus-change
-        // mode: only buffers that LOST focus are written.
-        let keep_focused =
-            (!require_delay && self.focus == Pane::Editor).then(|| self.editor.active_index());
+        // mode: only buffers that LOST focus are written. Save All skips it
+        // too, having just saved it the explicit way.
+        let keep_focused = skip_active.then(|| self.editor.active_index());
         // Collab guests never write shared (workspace) files; the session
         // owner is the single writer (docs/MULTIPLAYER.md, Phase D).
         let guest = self.is_collab_guest();
@@ -54494,6 +55288,45 @@ impl App {
             self.record_history_snapshot_of(&path, seats, described);
         }
         true
+    }
+
+    /// File: Save All (#852, `Cmd+Opt+S` / `Ctrl+Alt+S`): the active tab
+    /// saves exactly as `Cmd+S` would (format on save, hex and sheet edits,
+    /// the overwrite prompt), then every other dirty buffer in every split
+    /// is written by the auto-save rules, which leave a tab that must not
+    /// be written blind (a disk conflict, a lossy encoding, an unresolved
+    /// merge, a hex or sheet edit) to its own `Cmd+S`.
+    fn save_all(&mut self) {
+        let before = self.unsaved_count();
+        if before == 0 {
+            self.status = String::from("Save All: nothing to save");
+            return;
+        }
+        if self.editor.dirty {
+            self.save();
+        }
+        let active_status = self.status.clone();
+        self.sweep_dirty_buffers(false, true);
+        // A format-on-save write lands with its formatter reply: it is on
+        // its way, not left behind.
+        let pending = usize::from(self.save_after_format.is_some());
+        let left = self.unsaved_count().saturating_sub(pending);
+        self.status = if left == 0 {
+            format!(
+                "Saved {before} editor{}",
+                if before == 1 { "" } else { "s" }
+            )
+        } else if self.editor.dirty && pending == 0 {
+            // The active tab's own refusal names the reason and the key
+            // that consents; a summary would bury it.
+            active_status
+        } else {
+            format!(
+                "Save All: {left} editor{} still unsaved - open {} and press Cmd+S",
+                if left == 1 { "" } else { "s" },
+                if left == 1 { "it" } else { "each" }
+            )
+        };
     }
 
     fn toggle_auto_save(&mut self) {
@@ -55091,7 +55924,7 @@ impl App {
     }
 
     /// In a `git-rebase-todo` tab (#620), a plain p/r/e/s/f/d on a commit
-    /// line sets its action and moves to the next line. Off in vim mode,
+    /// line sets its action and moves to the next commit line. Off in vim mode,
     /// where those letters are vim commands. Returns whether it acted.
     fn rebase_todo_key(&mut self, key: KeyEvent) -> bool {
         let KeyCode::Char(c) = key.code else {
@@ -55114,9 +55947,21 @@ impl App {
         let Some(line) = self.editor.lines.get(row).cloned() else {
             return false;
         };
+        // A blank line takes no action and must not take the letter either:
+        // git stops the rebase on a stray `s` (#1228).
+        if line.trim().is_empty() {
+            self.status = String::from(crate::rebase_todo::HINT);
+            return true;
+        }
         let Some(new_line) = crate::rebase_todo::set_action(&line, action) else {
             return false;
         };
+        if matches!(action, "squash" | "fixup")
+            && !crate::rebase_todo::has_kept_commit_above(&self.editor.lines, row)
+        {
+            self.status = format!("Can't {action} the first commit: no commit above it");
+            return true;
+        }
         self.editor
             .apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
                 start: (row, 0),
@@ -55124,7 +55969,14 @@ impl App {
                 new_text: new_line,
                 utf16: false,
             }]);
-        self.editor.cursor_row = (row + 1).min(self.editor.lines.len().saturating_sub(1));
+        // On to the next commit line, past comments and the trailing blank;
+        // the last commit keeps the caret (#1228).
+        if let Some(next) = self.editor.lines[row + 1..]
+            .iter()
+            .position(|l| crate::rebase_todo::is_commit_line(l))
+        {
+            self.editor.cursor_row = row + 1 + next;
+        }
         self.editor.cursor_col = 0;
         self.status = String::from(crate::rebase_todo::HINT);
         true
@@ -55580,9 +56432,7 @@ impl App {
         let lines = tab.lines.clone();
         let root = self.roots.primary().to_path_buf();
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let python = find_python_venv(&dir, &root)
-            .map(|(py, _)| py)
-            .unwrap_or_else(|| project_python(&root));
+        let python = project_python_for(&dir, &root);
         self.live_run_sent.insert(path.clone(), lines.clone());
         if let Some(runner) = &self.live_run_runner {
             runner.submit(crate::live_run::Job {
@@ -55887,7 +56737,8 @@ impl App {
         // guest is its only author, and refusing meant the work could never
         // persist anywhere. Same when there is NO session at all (relay
         // link down, reconnect pending): with nobody to defer to, blocking
-        // strands the offline work in RAM for the whole outage.
+        // strands the offline work in RAM for the whole outage. And when
+        // the owner left (#1147): there is nobody to save for this guest.
         if self.is_collab_guest()
             && self
                 .editor
@@ -55897,7 +56748,7 @@ impl App {
                 .is_some_and(|file| {
                     self.collab
                         .as_ref()
-                        .is_some_and(|s| !s.is_local_only(&file))
+                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
                 })
         {
             self.status =
@@ -57230,6 +58081,19 @@ impl App {
         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root)
     }
 
+    /// Where the palette's File: New File… / New Folder… create (#852): the
+    /// Explorer selection while the Explorer has focus, as its own chords
+    /// do; otherwise beside the active file, falling back to the selection
+    /// when no file is open.
+    fn palette_create_target_dir(&self) -> PathBuf {
+        if !self.is_explorer_focused()
+            && let Some(dir) = self.editor.path.as_deref().and_then(Path::parent)
+        {
+            return dir.to_path_buf();
+        }
+        self.explorer_create_target_dir()
+    }
+
     /// VS Code-style type-to-jump for the Explorer. Each printable
     /// keystroke arriving while the file tree is focused appends to a
     /// short-lived prefix buffer and snaps selection to the first
@@ -57330,45 +58194,12 @@ impl App {
                     self.collapse_split_if_empty();
                 }
             }
-            MenuAction::CloseOtherTabs(keep_idx) => {
-                self.record_closed_tabs_where(|i, ed| i != keep_idx && !ed.pinned);
-                let removed = self.editor.close_others(keep_idx);
-                if removed > 0 {
-                    self.sync_open_file_poll_mtime();
-                    self.status = if removed == 1 {
-                        String::from("Closed 1 other tab")
-                    } else {
-                        format!("Closed {removed} other tabs")
-                    };
-                    self.poke_cursor();
-                }
-            }
-            MenuAction::CloseTabsToRight(from_idx) => {
-                self.record_closed_tabs_where(|i, ed| i > from_idx && !ed.pinned);
-                let removed = self.editor.close_to_right(from_idx);
-                if removed > 0 {
-                    self.sync_open_file_poll_mtime();
-                    self.status = if removed == 1 {
-                        String::from("Closed 1 tab to the right")
-                    } else {
-                        format!("Closed {removed} tabs to the right")
-                    };
-                    self.poke_cursor();
-                }
-            }
+            MenuAction::CloseOtherTabs(keep_idx) => self.close_other_tabs(keep_idx),
+            MenuAction::CloseTabsToRight(from_idx) => self.close_tabs_to_right(from_idx),
             MenuAction::CloseAllTabs => self.close_all_tabs(),
             MenuAction::CloseSavedTabs => self.close_saved_tabs(),
-            MenuAction::KeepTabOpen(idx) => {
-                if self.editor.keep_open(idx) {
-                    self.status = String::from("Kept tab open");
-                    self.poke_cursor();
-                }
-            }
-            MenuAction::ToggleTabPin(idx) => {
-                let pinned = self.editor.toggle_pin(idx);
-                self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
-                self.poke_cursor();
-            }
+            MenuAction::KeepTabOpen(idx) => self.keep_tab_open(idx),
+            MenuAction::ToggleTabPin(idx) => self.toggle_tab_pin(idx),
             MenuAction::SplitEditor => self.split_editor(),
             MenuAction::SplitEditorLeft => {
                 self.split_editor_dir(editor_layout::SplitDir::Horizontal, false)
@@ -57517,29 +58348,7 @@ impl App {
             MenuAction::ToggleExplorerView(view) => self.toggle_explorer_view(view),
             MenuAction::OpenCustomizeLayout => self.open_customize_layout_menu(),
             MenuAction::ToggleActivityBar => {
-                self.activity_bar_visible = !self.activity_bar_visible;
-                // The bar is a structural auto-hide suppression, and unlike Zen
-                // it flips here on its own. A pending collapse armed against the
-                // old chrome would otherwise sit armed while `allowed()` declines
-                // for it, then fire on the first idle tick after the bar comes
-                // back, with no focus move of the user's own.
-                //
-                // Cancel the collapse. And when the bar goes AWAY, drop the pin
-                // too — for the reason `toggle_side_bar` already refuses to bank
-                // one in that state: no collapse can fire while the bar is
-                // hidden, so a pin held across that period is unconsumable, and
-                // it silently eats the first real collapse after the bar
-                // returns. Those two sites disagreed about the same question
-                // until this line; the bank-time answer is the right one.
-                //
-                // Revealing the bar leaves any pin alone: a pin banked while the
-                // bar is visible belongs to a reveal that can still be honoured.
-                self.sidebar_dwell.disarm();
-                if !self.activity_bar_visible {
-                    self.sidebar_pinned_open = false;
-                }
-                self.persist_layout();
-                self.after_chrome_visibility_change();
+                self.toggle_activity_bar();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleActivityBar);
             }
             MenuAction::ToggleSideBar => {
@@ -57560,25 +58369,19 @@ impl App {
                 self.open_customize_layout_menu_on(&MenuAction::TogglePanel);
             }
             MenuAction::ToggleStatusBar => {
-                self.status_bar_visible = !self.status_bar_visible;
-                self.persist_layout();
-                self.after_chrome_visibility_change();
+                self.toggle_status_bar();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleStatusBar);
             }
             MenuAction::SetSideBarPosition(pos) => {
-                self.side_bar_position = pos;
-                self.persist_layout();
-                self.after_chrome_visibility_change();
+                self.set_side_bar_position(pos);
                 self.open_customize_layout_menu_on(&MenuAction::SetSideBarPosition(pos));
             }
             MenuAction::SetPanelAlignment(al) => {
-                self.panel_alignment = al;
-                self.persist_layout();
+                self.set_panel_alignment(al);
                 self.open_customize_layout_menu_on(&MenuAction::SetPanelAlignment(al));
             }
             MenuAction::SetQuickInputPosition(pos) => {
-                self.quick_input_position = pos;
-                self.persist_layout();
+                self.set_quick_input_position(pos);
                 self.open_customize_layout_menu_on(&MenuAction::SetQuickInputPosition(pos));
             }
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
@@ -57674,11 +58477,92 @@ impl App {
         }
     }
 
-    /// Cmd+K W / tab context "Close All": close every tab in EVERY editor
-    /// group, not just the focused one, collapsing any split back to a single
-    /// blank pane. A side-by-side layout (e.g. `cgr duplicates` diffs) would
-    /// otherwise only empty the clicked group and look like a single close
-    /// once the blank group collapsed away.
+    /// Tab context "Close Others" and View: Close Other Editors in Group
+    /// (#852): close every tab of the focused group but `keep_idx` and the
+    /// pinned ones, recording each for Reopen Closed Editor.
+    fn close_other_tabs(&mut self, keep_idx: usize) {
+        self.record_closed_tabs_where(|i, ed| i != keep_idx && !ed.pinned);
+        let removed = self.editor.close_others(keep_idx);
+        if removed == 0 {
+            self.status = String::from("No other tabs to close");
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 other tab")
+        } else {
+            format!("Closed {removed} other tabs")
+        };
+        self.poke_cursor();
+    }
+
+    /// Cmd+K →, tab context "Close to the Right" and View: Close Editors to
+    /// the Right in Group (#852): close the focused group's unpinned tabs
+    /// right of `from_idx`, recording each for Reopen Closed Editor.
+    fn close_tabs_to_right(&mut self, from_idx: usize) {
+        self.record_closed_tabs_where(|i, ed| i > from_idx && !ed.pinned);
+        let removed = self.editor.close_to_right(from_idx);
+        if removed == 0 {
+            self.status = String::from("No tabs to the right to close");
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 tab to the right")
+        } else {
+            format!("Closed {removed} tabs to the right")
+        };
+        self.poke_cursor();
+    }
+
+    /// Cmd+K ⇧P, tab context "Keep Open" and View: Keep Editor (#852):
+    /// promote the preview tab at `idx` so the next single-click open does
+    /// not replace it.
+    fn keep_tab_open(&mut self, idx: usize) {
+        if self.editor.is_blank_initial() {
+            self.status = String::from("No editor is open");
+        } else if self.editor.keep_open(idx) {
+            self.status = String::from("Kept tab open");
+            self.poke_cursor();
+        } else {
+            self.status = String::from("Tab is already kept open");
+        }
+    }
+
+    /// Cmd+K P and tab context "Pin" / "Unpin": flip the pin of the tab at
+    /// `idx`. The welcome screen's placeholder is not a tab to pin.
+    fn toggle_tab_pin(&mut self, idx: usize) {
+        if self.editor.is_blank_initial() {
+            self.status = String::from("No editor is open");
+            return;
+        }
+        let pinned = self.editor.toggle_pin(idx);
+        self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
+        self.poke_cursor();
+    }
+
+    /// View: Pin Editor (`pin`) / View: Unpin Editor (#852): the active
+    /// tab's pin, through the tab menu's toggle. Each is a no-op on a tab
+    /// already in that state, so a key bound to one never does the other.
+    fn set_active_tab_pinned(&mut self, pin: bool) {
+        let idx = self.editor.active_index();
+        if !self.editor.is_blank_initial() && self.editor.is_pinned(idx) == pin {
+            self.status = String::from(if pin {
+                "Tab is already pinned"
+            } else {
+                "Tab is not pinned"
+            });
+            return;
+        }
+        self.toggle_tab_pin(idx);
+    }
+
+    /// Cmd+K W / tab context "Close All" / View: Close All Editors (#852):
+    /// close every tab in EVERY editor group, not just the focused one,
+    /// collapsing any split back to a single blank pane. A side-by-side
+    /// layout (e.g. `cgr duplicates` diffs) would otherwise only empty the
+    /// clicked group and look like a single close once the blank group
+    /// collapsed away.
     fn close_all_tabs(&mut self) {
         let mut removed = self.editor.close_all();
         if self.editor_layout.is_split() {
@@ -57703,8 +58587,9 @@ impl App {
     }
 
     /// Close every saved (non-dirty) editor tab, keeping any with unsaved
-    /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
-    /// surfaces produce the same status line and split-collapse behavior.
+    /// changes. Shared by the tab context menu, the `Cmd+K U` chord and View:
+    /// Close Saved Editors in Group (#852) so every surface produces the same
+    /// status line and split-collapse behavior.
     fn close_saved_tabs(&mut self) {
         let removed = self.editor.close_saved();
         if removed == 0 {
@@ -61716,6 +62601,11 @@ impl App {
             }
             _ => false,
         };
+        // Removing the only row that reached the last column shrinks the
+        // sheet's width too, so the caret column can be past the end (#1137).
+        let last_col = data.col_count().saturating_sub(1);
+        data.cur_col = data.cur_col.min(last_col);
+        data.scroll_col = data.scroll_col.min(data.cur_col);
         if changed {
             view.dirty = true;
             let visible = sheet_visible_rows(self.editor.last_inner);
@@ -62187,6 +63077,7 @@ impl App {
             op,
             renames,
             deadline: std::time::Instant::now() + FILE_MOVE_DEADLINE,
+            baseline: self.editor.edit_seqs(),
         });
     }
 
@@ -62232,11 +63123,27 @@ impl App {
                 .into_iter()
                 .map(|(path, e)| (moved_path(&path, &pending.renames), e))
                 .collect();
-            match self.apply_rename_edits(&edits) {
-                Ok((files, _)) => {
-                    self.status = format!("{moved_status}, references updated in {files} file(s)");
+            // The move carried open tabs to their new paths; so too their
+            // request-time seqs, for the check below to find them.
+            let baseline: Vec<_> = pending
+                .baseline
+                .iter()
+                .map(|(path, seq)| (moved_path(path, &pending.renames), *seq))
+                .collect();
+            if let Some(file) = self.stale_edit_target(&baseline, &edits) {
+                self.status = format!(
+                    "{moved_status}; references not updated: {file} changed while the server was working"
+                );
+            } else {
+                match self.apply_rename_edits(&edits) {
+                    Ok((files, _)) => {
+                        self.status =
+                            format!("{moved_status}, references updated in {files} file(s)");
+                    }
+                    Err(e) => {
+                        self.status = format!("{moved_status}; could not update references: {e}")
+                    }
                 }
-                Err(e) => self.status = format!("{moved_status}; could not update references: {e}"),
             }
         }
         if let Some(lsp) = self.lsp.as_mut() {
@@ -62267,6 +63174,7 @@ impl App {
                     }
                     self.rename_open_path_everywhere(&old, &new_path);
                     self.rename_review_boxes_path(&old, &new_path);
+                    crate::history::move_path(&self.history_root, &old, &new_path);
                     self.sync_open_file_poll_mtime();
                     true
                 }
@@ -62310,6 +63218,7 @@ impl App {
                     if matches!(mode, ExplorerClipMode::Cut) {
                         self.rename_open_path_everywhere(src, &p);
                         self.rename_review_boxes_path(src, &p);
+                        crate::history::move_path(&self.history_root, src, &p);
                     }
                     placed.push(p);
                 }
@@ -62387,6 +63296,52 @@ impl App {
             String::from(".")
         } else {
             rel.display().to_string()
+        }
+    }
+
+    /// File: Save As… (#1203): ask where to write the active tab's buffer.
+    fn open_save_as_prompt(&mut self) {
+        if self.editor.has_non_text_view() {
+            self.status = String::from("Save As works on text tabs; this one is a preview");
+            return;
+        }
+        let buffer = self
+            .editor
+            .path
+            .as_deref()
+            .map(|p| self.status_path(p))
+            .unwrap_or_default();
+        self.prompt = Some(Prompt {
+            label: String::from("Save As"),
+            buffer,
+            kind: PromptKind::SaveAs,
+            target_dir: self.tree.root.clone(),
+            error: None,
+        });
+    }
+
+    /// Write the active tab's buffer to `path` and move the tab there; the
+    /// error says why not, with the tab left as it was.
+    fn save_as(&mut self, path: &Path) -> Result<(), String> {
+        use crate::widgets::editor::SaveOutcome;
+        match self.editor.save_as(path) {
+            Ok(SaveOutcome::Saved) => {
+                self.status = self.editor.status.clone();
+                let seats = self.editor.provenance_to_record();
+                let described = self.editor.bytes_for_disk();
+                self.record_history_snapshot_of(path, seats, described);
+                self.sync_open_file_poll_mtime();
+                if let Some(idx) = path.parent().and_then(|d| self.tree.index_of_dir(d)) {
+                    self.tree.refresh_children(idx);
+                }
+                Ok(())
+            }
+            Ok(SaveOutcome::EncodingLoss) => Err(format!(
+                "Some characters can't be written as {}",
+                self.editor.encoding.name()
+            )),
+            Ok(SaveOutcome::DiskConflict) => unreachable!("save_as never checks for a conflict"),
+            Err(e) => Err(format!("Save failed: {e}")),
         }
     }
 
@@ -62530,6 +63485,25 @@ impl App {
                     }
                 }
             }
+            PromptKind::SaveAs => {
+                let answer = prompt.buffer.trim().to_string();
+                let target = prompt.target_dir.join(&answer);
+                let error = if answer.is_empty() {
+                    Some(String::from("Enter a path to save to"))
+                } else if self.editor.path.as_deref() != Some(target.as_path()) && target.exists() {
+                    Some(format!("{answer} already exists"))
+                } else {
+                    self.save_as(&target).err()
+                };
+                match error {
+                    Some(e) => {
+                        if let Some(p) = self.prompt.as_mut() {
+                            p.error = Some(e);
+                        }
+                    }
+                    None => self.prompt = None,
+                }
+            }
             PromptKind::RenameSymbol { path, row, col } => {
                 let new_name = prompt.buffer.trim().to_string();
                 if new_name.is_empty() {
@@ -62549,6 +63523,7 @@ impl App {
                 };
                 let id = lsp.request_rename(path, line, character, new_name);
                 self.rename_request_id = Some(id);
+                self.rename_baseline = self.editor.edit_seqs();
                 self.prompt = None;
                 self.status = String::from("Renaming symbol");
             }
@@ -63349,6 +64324,8 @@ fn is_explorer_jump_key(key: KeyEvent) -> bool {
 /// `Ctrl/Cmd+Shift+S`: jump to the Source Control sidebar view from any pane.
 /// This is croft's Source Control gesture. Croft has no editor Save-As (Cmd+S
 /// alone saves), so claiming Cmd+Shift+S is collision-free even while editing.
+/// `Ctrl+Shift+S` gets here only when [`is_save_key`] let it go, which needs
+/// the kitty keyboard protocol to have reported the Shift (#857).
 fn is_source_control_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 's')
 }
@@ -63374,6 +64351,34 @@ fn is_remote_jump_key(key: KeyEvent) -> bool {
 /// GlobalKeyMap forwarder (no menu relocation) to deliver it here.
 fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
+}
+
+/// `Ctrl/Cmd+Shift+M`: show the PROBLEMS tab from any pane, VS Code's
+/// "View: Focus Problems" (#852).
+fn is_show_problems_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'm')
+}
+
+/// `Ctrl/Cmd+Shift+U`: show the OUTPUT tab from any pane, VS Code's
+/// "View: Toggle Output" chord (#852).
+fn is_show_output_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'u')
+}
+
+/// `Cmd+Opt+S` / `Ctrl+Alt+S`: File: Save All (#852). VS Code's macOS chord;
+/// its Linux `Ctrl+K S` is croft's Select for Compare. Shift is rejected:
+/// `Cmd+Opt+Shift+S` converts indentation to spaces.
+fn is_save_all_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'s') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// The TurnDone status fragment for a turn's notes: the file is named only
@@ -63922,6 +64927,23 @@ fn syntax_outline_for(
     crate::outline_syntax::symbols_for_lines(path, lines)
 }
 
+/// The largest buffer whose syntax outline is parsed on the UI thread
+/// (#1150). A from-scratch parse costs about a quarter of a millisecond per
+/// kilobyte, so this keeps it within a frame; larger buffers go to
+/// [`App::start_outline_parse`].
+const OUTLINE_INLINE_MAX_BYTES: usize = 64 * 1024;
+
+/// Whether `lines` is small enough to parse for the outline inline.
+fn outline_parses_inline(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .try_fold(0usize, |bytes, l| {
+            let bytes = bytes + l.len() + 1;
+            (bytes <= OUTLINE_INLINE_MAX_BYTES).then_some(bytes)
+        })
+        .is_some()
+}
+
 /// The breadcrumb scope chain for `line`: the indices of every outline symbol
 /// whose range encloses the caret line, ordered outermost first (the enclosing
 /// class before the method inside it). Sibling symbols never overlap, so the
@@ -63998,10 +65020,11 @@ fn is_focus_group_right_key(key: KeyEvent) -> bool {
 }
 
 /// `Cmd+Shift+T` (Mac SUPER+SHIFT+T): focus the Terminal pane from any
-/// pane, un-hiding it if it was collapsed via Ctrl+J. SUPER-only so the
-/// cross-platform `Ctrl+Shift+T` (split-terminal) chord keeps its
-/// historical meaning - the two chords share the same letter but are
-/// disambiguated by the modifier.
+/// pane, un-hiding it if it was collapsed via Ctrl+J and bringing its
+/// TERMINAL tab forward over PROBLEMS / OUTPUT / PORTS / CAPTURES (#852).
+/// SUPER-only so the cross-platform `Ctrl+Shift+T` (split-terminal) chord
+/// keeps its historical meaning - the two chords share the same letter but
+/// are disambiguated by the modifier.
 fn is_terminal_focus_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -64266,7 +65289,10 @@ fn is_completion_trigger_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-fn is_save_key(key: KeyEvent) -> bool {
+/// `Cmd+S` / `Ctrl+S`: save the open file. `kitty_keys` is
+/// [`App::kitty_keys`]: whether `Shift` held with `Ctrl` is reported
+/// explicitly.
+fn is_save_key(key: KeyEvent, kitty_keys: bool) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
@@ -64279,13 +65305,12 @@ fn is_save_key(key: KeyEvent) -> bool {
     let has_super = key.modifiers.contains(KeyModifiers::SUPER);
     let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // Cmd+Shift+S is reserved for the Source Control jump
-    // (`is_source_control_jump_key`), so reject Shift when Super is
-    // held. Ctrl+Shift+S still triggers Save because some terminals
-    // capitalise the letter when Ctrl is held and the user genuinely
-    // means Ctrl+S — that's the existing `shift_ctrl_s_is_save_key`
-    // contract we want to preserve.
-    if has_super && has_shift {
+    // Cmd+Shift+S is the Source Control jump (`is_source_control_jump_key`),
+    // and so is Ctrl+Shift+S where the kitty keyboard protocol reports the
+    // Shift explicitly (#857). Without it, a Shift beside Ctrl may be a
+    // terminal capitalising a plain Ctrl+S, so there Ctrl+Shift+S still
+    // saves; an uppercase S with Ctrl and no Shift reported saves everywhere.
+    if has_shift && (has_super || (has_ctrl && kitty_keys)) {
         return false;
     }
     has_super || has_ctrl
@@ -64487,6 +65512,16 @@ fn is_clipboard_paste_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Ctrl+V with no other modifier (or its raw 0x16 form), which the
+/// terminal hands to the app rather than pasting (#1290).
+fn is_plain_ctrl_v(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('\u{16}') => true,
+        KeyCode::Char(c) => c.eq_ignore_ascii_case(&'v') && key.modifiers == KeyModifiers::CONTROL,
+        _ => false,
+    }
 }
 
 fn is_search_editing_shortcut(key: KeyEvent) -> bool {
@@ -65288,12 +66323,13 @@ fn sheet_follow_cursor(view: &mut crate::sheet::SheetView, idx: usize, visible: 
     if data.cur_col < data.scroll_col {
         data.scroll_col = data.cur_col;
     } else {
-        // Advance until the cursor column's right edge fits.
+        // Advance until the cursor column's right edge fits. `get`, since a
+        // caller that shrank the sheet may not have clamped the caret yet.
         while data.scroll_col < data.cur_col {
-            let used: usize = data.col_widths[data.scroll_col..=data.cur_col]
-                .iter()
-                .map(|&w| w as usize + 1)
-                .sum();
+            let Some(span) = data.col_widths.get(data.scroll_col..=data.cur_col) else {
+                break;
+            };
+            let used: usize = span.iter().map(|&w| w as usize + 1).sum();
             if used <= body_w {
                 break;
             }
@@ -65704,6 +66740,117 @@ fn find_python_venv(start: &Path, workspace_root: &Path) -> Option<(PathBuf, Pat
             _ => return None,
         }
     }
+}
+
+/// The interpreter that runs Python code in `dir`: the nearest venv up to
+/// `workspace_root` ([`find_python_venv`]), else [`project_python`]. Live
+/// Run and the debugger's program both use it, so a script debugs against
+/// the same installed packages it runs with (#864).
+fn project_python_for(dir: &Path, workspace_root: &Path) -> PathBuf {
+    find_python_venv(dir, workspace_root)
+        .map(|(py, _)| py)
+        .unwrap_or_else(|| project_python(workspace_root))
+}
+
+/// The interpreter a debugged Python program in `dir` runs under (#864):
+/// the one Run would use ([`project_python_for`]) when it exists, a venv or
+/// a `python3` on `path_var`. None otherwise, and the launch keeps the debug
+/// venv's own python, where the program always ran, rather than a bare
+/// `python3` that cannot start.
+fn debuggee_python(
+    dir: &Path,
+    workspace_root: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    find_python_venv(dir, workspace_root)
+        .map(|(py, _)| py)
+        .or_else(|| project_python_on(workspace_root, path_var))
+}
+
+/// What a Python debug launch says about the interpreter its program runs
+/// under (#864). Err is the refusal when debugpy cannot run there at all;
+/// Some is the clause naming one older than attach's 3.14 floor, `under
+/// Python 3.12 (.venv); attach needs 3.14+`; None is for 3.14+, or a version
+/// that cannot be read (the launch then reports for itself).
+fn debuggee_python_note(python: &Path) -> Result<Option<String>, String> {
+    use crate::dap::install::{DEBUGPY_MIN_PYTHON, python_version, pyvenv_cfg};
+    use crate::dap::remote_attach::MIN_ATTACH_VERSION;
+    let Some(version) = python_version(python) else {
+        return Ok(None);
+    };
+    let (major, minor) = (version.major, version.minor);
+    // A venv by its folder name, as the issue's `.venv`; else the path.
+    let label = pyvenv_cfg(python)
+        .and_then(|cfg| Some(cfg.parent()?.file_name()?.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| python.display().to_string());
+    // Minor versions only: a 3.10.0 debuggee meets debugpy's 3.10 floor.
+    if (major, minor) < (DEBUGPY_MIN_PYTHON.major, DEBUGPY_MIN_PYTHON.minor) {
+        return Err(format!(
+            "Python {major}.{minor} ({label}) is too old to debug: debugpy needs {}.{}+",
+            DEBUGPY_MIN_PYTHON.major, DEBUGPY_MIN_PYTHON.minor
+        ));
+    }
+    if !version.supports_remote_attach() {
+        return Ok(Some(format!(
+            "under Python {major}.{minor} ({label}); attach needs {}.{}+",
+            MIN_ATTACH_VERSION.major, MIN_ATTACH_VERSION.minor
+        )));
+    }
+    Ok(None)
+}
+
+/// `lead` followed by the note on the debuggee's interpreter, if any (#864).
+fn with_python_note(lead: String, note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("{lead} {note}"),
+        None => lead,
+    }
+}
+
+/// The interpreter a debugpy `launch` request runs its program under: its
+/// `python` (a path, or a command line whose first word is one) or legacy
+/// `pythonPath`. A relative path with a folder in it is found where debugpy
+/// starts it, so the version check runs the same file (#864 review): the
+/// request's `cwd`, else the folder of a `program`, else `adapter_dir`, the
+/// folder the adapter runs in. A bare name is left to PATH, as debugpy
+/// leaves it.
+fn launch_request_python(request: &serde_json::Value, adapter_dir: &Path) -> Option<PathBuf> {
+    let args = &request["arguments"];
+    let python = args.get("python").or_else(|| args.get("pythonPath"))?;
+    let python = PathBuf::from(python.as_str().or_else(|| python.get(0)?.as_str())?);
+    if python.is_absolute() || python.components().count() < 2 {
+        return Some(python);
+    }
+    let program_dir = args["program"]
+        .as_str()
+        .and_then(|p| Path::new(p).parent())
+        .filter(|dir| !dir.as_os_str().is_empty());
+    let launch_dir = match args["cwd"].as_str() {
+        Some(cwd) => adapter_dir.join(cwd),
+        None => program_dir.map_or_else(|| adapter_dir.to_path_buf(), |d| adapter_dir.join(d)),
+    };
+    Some(launch_dir.join(python))
+}
+
+/// The interpreter a launch.json Python config's program runs under when
+/// the config names none (#864): resolved from the program's directory,
+/// or from `cwd` for a `module` launch, as [`debuggee_python`] does, with
+/// `adapter_python` (the debug venv's) only when that finds nothing.
+fn config_project_python(
+    rc: &crate::dap::configs::ResolvedConfig,
+    cwd: &Path,
+    workspace_root: &Path,
+    adapter_python: &Path,
+) -> PathBuf {
+    // A `module` launch drops `program` from the request (debugpy refuses
+    // both), so the program's directory says nothing about what runs.
+    let program = rc.program.as_deref().filter(|_| rc.module.is_none());
+    let dir = program
+        .map(|p| crate::dap::configs::absolute_in(p, cwd))
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    debuggee_python(&dir, workspace_root, std::env::var_os("PATH").as_deref())
+        .unwrap_or_else(|| adapter_python.to_path_buf())
 }
 
 const TERMINAL_ADD_LABEL: &str = " + ";
@@ -67106,6 +68253,7 @@ pub fn run(
         PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
     )
     .is_ok();
+    app.kitty_keys = kbd_enhanced;
     {
         use std::io::Write;
         out.write_all(&set_title_seq(&title)).ok();
@@ -67147,6 +68295,9 @@ pub fn run(
     let mut terminal: CroftTerminal = Terminal::new(backend).context("create terminal")?;
 
     let result = main_loop(&mut app, &mut terminal);
+    // An owner's goodbye goes out now (#1147): the drop-to-local and
+    // self-update exits below never drop the App.
+    drop(app.collab.take());
 
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
@@ -67689,6 +68840,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_perf_compare()
             | app.drain_codeql_query_help()
             | app.drain_codeql_pack_job()
+            | app.drain_codeql_db_job()
             | app.drain_codeql_cli_download()
             | app.drain_codeql_cli_check()
             | app.drain_codeql_code_search()

@@ -182,22 +182,23 @@ pub(crate) fn render_keybind_block_with(keymap: &crate::keymap::Keymap) -> Strin
 }
 
 /// Drop any previously-installed croft block (between the markers, inclusive)
-/// from existing config content, leaving every other line untouched.
+/// from existing config content, leaving every other line untouched. An
+/// opening marker with no closing marker after it is no block: only that
+/// marker line goes, and the user's lines after it stay (#1149).
 fn strip_managed_block(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
     let mut kept: Vec<&str> = Vec::new();
-    let mut in_block = false;
-    for line in content.lines() {
-        if line.trim() == BLOCK_BEGIN {
-            in_block = true;
-            continue;
-        }
-        if in_block {
-            if line.trim() == BLOCK_END {
-                in_block = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == BLOCK_BEGIN {
+            match lines[i + 1..].iter().position(|l| l.trim() == BLOCK_END) {
+                Some(end) => i += end + 2,
+                None => i += 1,
             }
             continue;
         }
-        kept.push(line);
+        kept.push(lines[i]);
+        i += 1;
     }
     kept.join("\n")
 }
@@ -322,6 +323,59 @@ mod tests {
         assert_eq!(once, twice);
         // Exactly one managed block survives.
         assert_eq!(twice.matches(BLOCK_BEGIN).count(), 1);
+    }
+
+    /// #1149: an opening marker with no closing one is no block; the lines
+    /// after it are the user's and stay.
+    #[test]
+    fn an_opening_marker_without_a_closing_one_keeps_the_lines_after_it() {
+        let block = render_keybind_block();
+        let existing =
+            format!("font-size = 13\n{BLOCK_BEGIN}\ntheme = dracula\nwindow-padding-x = 8\n");
+        let merged = merge_config(&existing, &block);
+        assert_eq!(
+            merged,
+            format!("font-size = 13\ntheme = dracula\nwindow-padding-x = 8\n\n{block}\n")
+        );
+        assert_eq!(
+            merged.matches(BLOCK_BEGIN).count(),
+            1,
+            "the stray marker goes"
+        );
+    }
+
+    /// A complete old block between user lines is still replaced, and the
+    /// lines after it kept.
+    #[test]
+    fn a_complete_block_is_still_replaced_and_lines_after_it_kept() {
+        let block = render_keybind_block();
+        let existing = format!(
+            "font-size = 13\n{BLOCK_BEGIN}\nkeybind = cmd+x=csi:1u\n{BLOCK_END}\ntheme = dracula\nwindow-padding-x = 8\n"
+        );
+        let merged = merge_config(&existing, &block);
+        assert_eq!(
+            merged,
+            format!("font-size = 13\ntheme = dracula\nwindow-padding-x = 8\n\n{block}\n")
+        );
+        assert!(!merged.contains("cmd+x=csi:1u"), "the old block's lines go");
+    }
+
+    #[test]
+    fn install_keeps_settings_after_a_stray_opening_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::write(
+            &cfg,
+            format!("font-size = 13\n{BLOCK_BEGIN}\ntheme = dracula\nwindow-padding-x = 8\n"),
+        )
+        .unwrap();
+        install_keybinds(&cfg).unwrap();
+        let content = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            content.contains("theme = dracula\nwindow-padding-x = 8\n"),
+            "{content}"
+        );
+        assert_eq!(content.matches(BLOCK_BEGIN).count(), 1);
     }
 
     #[test]

@@ -1,0 +1,1 @@
+fix: Ctrl+Shift+S jumps to Source Control instead of saving in terminals that report Shift through the kitty keyboard protocol (kitty, Ghostty, WezTerm, Alacritty), and in tmux 3.2 to 3.4 with extended-keys always (#857).
