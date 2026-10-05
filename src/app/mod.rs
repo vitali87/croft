@@ -15938,7 +15938,7 @@ impl App {
             if self.terminal_find.is_some() && self.terminal_find_pane == idx {
                 self.terminal_find_match = None;
                 self.terminals[idx].set_current_match(None, 0);
-                let (lines, _top) = self.terminals[idx].grid_lines();
+                let lines = find_texts(self.terminals[idx].find_lines());
                 if let Some(state) = self.terminal_find.as_mut() {
                     state.set_match_count(
                         crate::widgets::editor_find::count_matches(
@@ -50121,7 +50121,7 @@ impl App {
         } else {
             String::new()
         };
-        let (lines, _top) = self.terminal().grid_lines();
+        let lines = find_texts(self.terminal().find_lines());
         let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
         state.set_match_count(
             crate::widgets::editor_find::count_matches(&lines, &initial, opts),
@@ -50198,7 +50198,7 @@ impl App {
     /// re-highlight every occurrence, and re-anchor on the most recent match.
     fn terminal_find_set_query(&mut self, new_query: String) {
         let opts = self.search.opts;
-        let (lines, _top) = self.terminal().grid_lines();
+        let lines = find_texts(self.terminal().find_lines());
         let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
         if let Some(state) = self.terminal_find.as_mut() {
             state.query = new_query.clone();
@@ -50227,10 +50227,14 @@ impl App {
         if needle.is_empty() {
             return;
         }
-        let (lines, top, now) = self.terminal().grid_lines_and_clock();
-        if lines.is_empty() {
+        // Logical lines, soft-wrapped rows joined, so a match the pane's
+        // width cut in two is found (#1275). A match is named by its line's
+        // first row and a char index into the joined text.
+        let (find_lines, now) = self.terminal().find_lines_and_clock();
+        if find_lines.is_empty() {
             return;
         }
+        let lines: Vec<String> = find_lines.iter().map(|l| l.text.clone()).collect();
         let anchor = self.terminal_find_match;
         let (from_row, from_col) = match anchor {
             Some((clock, abs, col, _len)) => {
@@ -50238,7 +50242,7 @@ impl App {
                 // anchored, so navigation walks from the match's TEXT, not
                 // from the viewport row it occupied at anchor time.
                 let abs = abs - (now - clock) as i32;
-                let row = (abs - top).clamp(0, lines.len() as i32 - 1) as usize;
+                let row = find_lines.iter().rposition(|l| l.start <= abs).unwrap_or(0);
                 (row, col)
             }
             // No anchor: start past the last line's end so `prev` lands on the
@@ -50268,11 +50272,12 @@ impl App {
         let Some(m) = m else {
             return;
         };
-        let abs_line = top + m.row as i32;
+        let abs_line = find_lines[m.row].start;
         self.terminal_find_match = Some((now, abs_line, m.col_chars, m.len_chars));
         self.terminal_mut()
             .set_current_match(Some((abs_line, m.col_chars, m.len_chars)), now);
-        self.terminal_mut().scroll_to_line(abs_line);
+        self.terminal_mut()
+            .scroll_to_line(find_lines[m.row].line_of(m.col_chars));
         let idx =
             crate::widgets::editor_find::match_index_at(&lines, &needle, opts, m.row, m.col_chars);
         if let Some(state) = self.terminal_find.as_mut() {
@@ -64034,6 +64039,11 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
     // never swallowed); on Termux Ctrl is the command key, and this predicate
     // only runs while the Explorer is focused, so there is no suspend to clash.
     has_cmd(key.modifiers)
+}
+
+/// The text terminal find searches: one string per logical line (#1275).
+fn find_texts(lines: Vec<crate::widgets::terminal::FindLine>) -> Vec<String> {
+    lines.into_iter().map(|l| l.text).collect()
 }
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
