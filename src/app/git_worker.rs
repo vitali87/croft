@@ -117,6 +117,7 @@ impl GitWorker {
                         self.status = s.clone();
                         if let Some(p) = panel.as_deref_mut() {
                             p.status = s;
+                            p.seed_prepared_message();
                         }
                         changed = true;
                     }
