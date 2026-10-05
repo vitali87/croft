@@ -70516,3 +70516,162 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
+
+/// A diagnostic for the Problems panel, as a language server reports it.
+fn problem(
+    line: u32,
+    severity: crate::lsp::manager::DiagnosticSeverity,
+    message: &str,
+) -> crate::widgets::problems::ProblemItem {
+    crate::widgets::problems::ProblemItem {
+        line,
+        col: 0,
+        col_utf16: true,
+        severity,
+        message: message.into(),
+        source: "ruff".into(),
+    }
+}
+
+#[test]
+fn the_problems_tab_is_announced_with_its_counts_and_top_entry() {
+    use crate::lsp::manager::DiagnosticSeverity::{Error, Warning};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Problems, no problems");
+    assert_eq!(snap.item, None);
+    app.problems
+        .set_groups(vec![crate::widgets::problems::ProblemGroup {
+            path: tmp.path().join("app.py"),
+            name: "app.py".into(),
+            rel_dir: String::new(),
+            items: vec![
+                problem(3, Error, "Undefined name `totl`"),
+                problem(4, Error, "Type mismatch"),
+                problem(4, Warning, "Unused variable"),
+            ],
+        }]);
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Problems, 2 errors, 1 warning");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("app.py line 4: Undefined name `totl` (ruff)")
+    );
+}
+
+#[test]
+fn the_terminal_tab_is_still_announced_as_its_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Terminal 1");
+    assert_eq!(snap.item, None);
+}
+
+#[test]
+fn the_output_ports_and_captures_tabs_are_announced_by_name_and_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+
+    let channel = "a11y-1295-channel";
+    crate::output::push(channel, crate::output::OutputLevel::Info, "hello");
+    app.output.sync();
+    assert!(app.output.select_by_name(channel));
+    app.bottom_panel_tab = BottomPanelTab::Output;
+    assert_eq!(app.a11y_snapshot().focus, format!("Output, {channel}"));
+
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    let snap = app.a11y_snapshot();
+    assert_eq!((snap.focus.as_str(), snap.item), ("Ports, none", None));
+    app.ports.upsert(
+        3000,
+        Some("http://localhost:3000".into()),
+        Some("node".into()),
+        crate::widgets::ports::PortOrigin::Local,
+    );
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Ports, 1 port");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("Port 3000, node, http://localhost:3000")
+    );
+
+    app.bottom_panel_tab = BottomPanelTab::Captures;
+    assert_eq!(app.a11y_snapshot().focus, "Captures, none");
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: "zsh".into(),
+        shell_pid: None,
+        message: "Build failed".into(),
+        line: "error: build failed".into(),
+    });
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Captures, 1 capture");
+    assert_eq!(snap.item.as_deref(), Some("Build failed, from zsh"));
+}
+
+#[test]
+fn search_results_are_announced_with_the_count_and_the_selected_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Search;
+    assert_eq!(app.a11y_snapshot().focus, "Search");
+    assert_eq!(
+        app.a11y_snapshot().item,
+        None,
+        "no results, nothing selected"
+    );
+    let hit = |file: &str, line_no: usize, text: &str| crate::widgets::search::SearchHit {
+        path: tmp.path().join(file),
+        line_no,
+        line_text: text.into(),
+    };
+    app.search.hits = vec![
+        hit("app.py", 1, "def total(xs):"),
+        hit("b.py", 1, "total = 0"),
+        hit("b.py", 3, "total += i"),
+    ];
+    app.search.selected = 2;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Search, 3 matches in 2 files");
+    assert_eq!(snap.item.as_deref(), Some("b.py line 3: total += i"));
+}
+
+#[test]
+fn the_selected_source_control_change_is_announced() {
+    use crate::git::{ChangeEntry, ChangeKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::SourceControl;
+    let change = |path: &str, kind| ChangeEntry {
+        path: path.into(),
+        kind,
+        additions: 1,
+        deletions: 0,
+    };
+    app.source_control.entries = vec![
+        change("app.py", ChangeKind::Modified),
+        change("new.py", ChangeKind::StagedAdded),
+    ];
+    app.source_control.selected_change = None;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Source Control, 2 changes");
+    assert_eq!(snap.item, None, "nothing selected, nothing read");
+    app.source_control.selected_change = Some(1);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("new.py, added, staged")
+    );
+    app.source_control.selected_change = Some(0);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("app.py, modified")
+    );
+}

@@ -55594,11 +55594,15 @@ impl App {
                     status,
                 }
             }
-            Pane::Terminal => Snapshot {
-                focus: format!("{} {}", tr("Terminal"), self.active_terminal + 1),
-                status,
-                ..Default::default()
-            },
+            Pane::Terminal => {
+                let (focus, item) = self.bottom_panel_a11y();
+                Snapshot {
+                    focus,
+                    item,
+                    status,
+                    ..Default::default()
+                }
+            }
             Pane::Tree => {
                 let (focus, item) = match self.sidebar_view {
                     SidebarView::Explorer => (
@@ -55608,8 +55612,8 @@ impl App {
                             .and_then(|p| p.file_name())
                             .map(|n| n.to_string_lossy().into_owned()),
                     ),
-                    SidebarView::Search => (tr("Search"), None),
-                    SidebarView::SourceControl => (tr("Source Control"), None),
+                    SidebarView::Search => self.search_a11y(),
+                    SidebarView::SourceControl => self.source_control_a11y(),
                     SidebarView::Remote => (tr("Remote"), None),
                     SidebarView::RunDebug => (tr("Run and Debug"), None),
                     SidebarView::Extensions => (tr("Extensions"), None),
@@ -55624,6 +55628,149 @@ impl App {
                 }
             }
         }
+    }
+
+    /// What screen reader mode says for the bottom panel's front tab
+    /// (#1295): the tab's name with what it holds, and its row in focus.
+    /// The panel is one `Pane` whichever tab is in front, so the tab, not
+    /// the pane, decides.
+    fn bottom_panel_a11y(&self) -> (String, Option<String>) {
+        let tr = |s: &str| crate::i18n::tr(s).into_owned();
+        let with = |name: &str, what: String| format!("{}, {what}", tr(name));
+        match self.bottom_panel_tab {
+            BottomPanelTab::Terminal => (
+                format!("{} {}", tr("Terminal"), self.active_terminal + 1),
+                None,
+            ),
+            BottomPanelTab::Problems => {
+                let errors = self.problems.error_count();
+                let warnings = self.problems.warning_count();
+                let others = self.problems.total_count() - errors - warnings;
+                let counts: Vec<String> = [
+                    (errors, "error", "errors"),
+                    (warnings, "warning", "warnings"),
+                    (others, "info", "infos"),
+                ]
+                .into_iter()
+                .filter(|(n, ..)| *n > 0)
+                .map(|(n, one, many)| a11y_count(n, one, many))
+                .collect();
+                let counts = if counts.is_empty() {
+                    String::from("no problems")
+                } else {
+                    counts.join(", ")
+                };
+                let item = self.problems.top_diagnostic().map(|(group, it)| {
+                    let source = if it.source.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", it.source)
+                    };
+                    format!(
+                        "{} line {}: {}{source}",
+                        group.name,
+                        it.line + 1,
+                        it.message
+                    )
+                });
+                (with("Problems", counts), item)
+            }
+            BottomPanelTab::Output => (
+                match self.output.selected_name() {
+                    Some(channel) => with("Output", channel),
+                    None => tr("Output"),
+                },
+                None,
+            ),
+            BottomPanelTab::Ports => {
+                let n = self.ports.len();
+                let item = self.ports.selected().map(|p| {
+                    let mut said = format!("Port {}", p.port);
+                    for part in [&p.process, &p.url].into_iter().flatten() {
+                        said.push_str(", ");
+                        said.push_str(part);
+                    }
+                    said
+                });
+                let count = if n == 0 {
+                    String::from("none")
+                } else {
+                    a11y_count(n, "port", "ports")
+                };
+                (with("Ports", count), item)
+            }
+            BottomPanelTab::Captures => {
+                let n = self.captures.len();
+                let item = self
+                    .captures
+                    .selected_entry()
+                    .map(|c| format!("{}, from {}", c.message, c.pane));
+                let count = if n == 0 {
+                    String::from("none")
+                } else {
+                    a11y_count(n, "capture", "captures")
+                };
+                (with("Captures", count), item)
+            }
+        }
+    }
+
+    /// The Search sidebar for screen reader mode (#1295): how many matches
+    /// in how many files, and the selected match as `file line N: text`.
+    fn search_a11y(&self) -> (String, Option<String>) {
+        let name = crate::i18n::tr("Search").into_owned();
+        let hits = &self.search.hits;
+        if hits.is_empty() {
+            return (name, None);
+        }
+        let files = hits
+            .iter()
+            .map(|h| &h.path)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let focus = format!(
+            "{name}, {} in {}",
+            a11y_count(hits.len(), "match", "matches"),
+            a11y_count(files, "file", "files")
+        );
+        let item = self.search.selected_hit().map(|h| {
+            let rel = h
+                .path
+                .strip_prefix(self.workspace_root())
+                .unwrap_or(&h.path);
+            format!("{} line {}: {}", rel.display(), h.line_no, h.line_text)
+        });
+        (focus, item)
+    }
+
+    /// The Source Control sidebar for screen reader mode (#1295): how many
+    /// changes, and the selected one as `path, what happened to it`.
+    fn source_control_a11y(&self) -> (String, Option<String>) {
+        use crate::git::ChangeKind;
+        let name = crate::i18n::tr("Source Control").into_owned();
+        let entries = &self.source_control.entries;
+        if entries.is_empty() {
+            return (name, None);
+        }
+        let focus = format!("{name}, {}", a11y_count(entries.len(), "change", "changes"));
+        let item = self
+            .source_control
+            .selected_change
+            .and_then(|i| entries.get(i))
+            .map(|e| {
+                let what = match e.kind {
+                    ChangeKind::StagedAdded => "added, staged",
+                    ChangeKind::StagedModified => "modified, staged",
+                    ChangeKind::StagedDeleted => "deleted, staged",
+                    ChangeKind::StagedRenamed => "renamed, staged",
+                    ChangeKind::Modified => "modified",
+                    ChangeKind::Deleted => "deleted",
+                    ChangeKind::Untracked => "untracked",
+                    ChangeKind::Conflicted => "conflicted",
+                };
+                format!("{}, {what}", e.path)
+            });
+        (focus, item)
     }
 
     /// Feed this frame's snapshot to the announcer (#621).
@@ -64405,6 +64552,12 @@ fn is_sidebar_toggle_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// `n` with the word for one or for many, as screen reader mode reads a
+/// count: "1 error", "3 matches".
+fn a11y_count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// `⌥⌘B` (macOS) / `Ctrl+Alt+B` (Linux): toggle the secondary side bar (the
