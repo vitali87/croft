@@ -14,6 +14,7 @@ Per platform:
 |------|--------|
 | `Ctrl+s` / `Cmd+s` | Save the open file. A folder of its path that is gone (removed by a `git checkout`, say) is created again |
 | Command Palette: `File: Save As…` | Write the open file's buffer to a prompted path (workspace-relative, prefilled with its own) and make the tab that file. Missing folders are created; an existing file is never overwritten. Bind `save_as` in keybindings.json for a key |
+| Command Palette: `File: Revert File` | Drop the open file's unsaved edits for the text on disk, as one undo step: `Cmd`+`Z` brings the edits back. A tab with nothing unsaved is left alone. Bind `revert_file` in keybindings.json for a key |
 | Typing `(` `[` `{` or a quote | Auto-closing pairs: the pair inserts with the caret between (openers never before a word, quotes never after one); typing the closer steps over; a selection is surrounded; backspace inside an empty pair deletes both. Settings gear → "Auto Closing Pairs" toggles |
 | `Ctrl+q` | Quit (from any pane but a focused terminal, where it goes to the app running there: vim, nano, the shell's XON) |
 | `F1` | Open the shortcuts modal |

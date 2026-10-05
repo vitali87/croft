@@ -9247,6 +9247,26 @@ impl Editor {
         Ok(())
     }
 
+    /// File: Revert File (#1285): [`Self::revert_to_disk`] as one undo
+    /// step. A reload starts a fresh history, so the history from before it
+    /// is carried across with the reverted-away text on top: undo brings
+    /// the edits back, marked unsaved, and redo reverts again.
+    pub fn revert_as_undo_step(&mut self) -> Result<()> {
+        let mut undo = std::mem::take(&mut self.undo_stack);
+        undo.push(self.snapshot());
+        let reverted = self.revert_to_disk();
+        if reverted.is_err() {
+            // Nothing was replaced: the history stays as it was.
+            undo.pop();
+        }
+        self.undo_stack = undo;
+        self.trim_undo_stack();
+        self.redo_stack.clear();
+        self.undo_step_id = next_undo_step_id();
+        self.last_edit_kind = None;
+        reverted
+    }
+
     /// FS-sync sweep entry point, applied to every open tab. Compares the
     /// file's current disk stamp against the buffer's last-synced stamp and:
     ///   * clean buffer + external change -> silently reload (VS Code's

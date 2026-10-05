@@ -48623,6 +48623,7 @@ impl App {
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
+            Cmd::RevertFile => self.revert_file(),
             Cmd::SaveAll => self.save_all(),
             Cmd::NewFile => {
                 let target = self.palette_create_target_dir();
@@ -63142,6 +63143,27 @@ impl App {
             String::from(".")
         } else {
             rel.display().to_string()
+        }
+    }
+
+    /// File: Revert File (#1285): drop the active tab's unsaved edits for
+    /// the text on disk. One undo step, so Ctrl+Z brings the edits back.
+    fn revert_file(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("This tab has no file to revert to");
+            return;
+        };
+        let name = self.status_path(&path);
+        if !self.editor.dirty {
+            self.status = format!("{name} has no unsaved changes");
+            return;
+        }
+        match self.editor.revert_as_undo_step() {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = format!("Reverted {name}");
+            }
+            Err(e) => self.status = format!("Revert failed: {e}"),
         }
     }
 
