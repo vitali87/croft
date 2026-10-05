@@ -682,6 +682,110 @@ fn locale_template_accepts_a_full_locale() {
     assert!(stderr.contains("locales/de.json"), "{stderr}");
 }
 
+/// A French translation in progress, as `locales/fr.json` under a scratch
+/// config directory.
+fn config_with_french_started() -> (tempfile::TempDir, std::path::PathBuf) {
+    let cfg = tempfile::tempdir().unwrap();
+    let file = cfg.path().join("croft/locales/fr.json");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        "{\n  \"File: Save\": \"Enregistrer\",\n  \"View: Toggle Terminal\": \"Afficher le terminal\"\n}\n",
+    )
+    .unwrap();
+    (cfg, file)
+}
+
+fn json_object(text: &str) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone()
+}
+
+/// #1148: refreshing a translation in place keeps every value already
+/// translated and adds the strings it lacks.
+#[test]
+fn locale_template_write_keeps_the_translations_already_in_the_file() {
+    let (cfg, file) = config_with_french_started();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "fr", "--write"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let map = json_object(&std::fs::read_to_string(&file).unwrap());
+    assert_eq!(map["File: Save"], "Enregistrer");
+    assert_eq!(map["View: Toggle Terminal"], "Afficher le terminal");
+    assert!(map.len() > 2, "the missing strings are added");
+    assert!(stderr.contains("locales/fr.json"), "{stderr}");
+}
+
+/// #1148: the printed template carries the user's own translations too, so
+/// saving it elsewhere doesn't drop them.
+#[test]
+fn locale_template_prints_the_users_own_translations() {
+    let (cfg, _file) = config_with_french_started();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "fr"])
+        .assert()
+        .success();
+    let map = json_object(&String::from_utf8(out.get_output().stdout.clone()).unwrap());
+    assert_eq!(map["File: Save"], "Enregistrer");
+}
+
+/// With no file yet, `--write` starts one, creating `locales/`.
+#[test]
+fn locale_template_write_starts_a_new_translation() {
+    let cfg = tempfile::tempdir().unwrap();
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "fr", "--write"])
+        .assert()
+        .success();
+    let map =
+        json_object(&std::fs::read_to_string(cfg.path().join("croft/locales/fr.json")).unwrap());
+    assert_eq!(map["File: Save"], "");
+}
+
+/// A file that isn't a JSON object of strings is left as it is: `--write`
+/// refuses rather than replacing what it can't read.
+#[test]
+fn locale_template_write_leaves_an_unreadable_file_alone() {
+    let (cfg, file) = config_with_french_started();
+    let broken = "{\n  \"File: Save\": \"Enregistrer\",\n";
+    std::fs::write(&file, broken).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "fr", "--write"])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
+    assert!(stderr.contains("fr.json"), "{stderr}");
+}
+
+/// English needs no translation file: `--write` writes nothing.
+#[test]
+fn locale_template_write_for_english_writes_nothing() {
+    let cfg = tempfile::tempdir().unwrap();
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .args(["locale-template", "en", "--write"])
+        .assert()
+        .failure()
+        .code(1);
+    assert!(!cfg.path().join("croft/locales").exists());
+}
+
 /// The real binary on a pty with `HOME` at `dir`, for tests that type raw
 /// terminal bytes at croft and read back what it did. Killed on drop.
 #[cfg(unix)]
