@@ -13606,6 +13606,34 @@ fn a_pasted_multi_line_message_commits_with_its_body() {
     );
 }
 
+/// #1334: in the Source Control box Home/End work on the caret's line and
+/// Ctrl+Home/Ctrl+End on the whole message.
+#[test]
+fn scm_home_end_follow_the_carets_line_and_ctrl_takes_the_whole_message() {
+    let (_tmp, mut app) = scm_ready_to_commit();
+    app.handle_paste("Add rounding\n\nRounds to cents.\nFixes 42");
+    let press = |app: &mut App, code: KeyCode, mods: KeyModifiers| {
+        app.handle_source_control_key(key(code, mods));
+    };
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+    press(&mut app, KeyCode::End, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.message,
+        "Add rounding\n\n[Rounds to cents.]\nFixes 42"
+    );
+    press(&mut app, KeyCode::Home, KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+    press(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Char('.'), KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.message,
+        ">Add rounding\n\n[Rounds to cents.]\nFixes 42."
+    );
+}
+
 /// Shift+Enter and Alt+Enter start a new line; neither commits.
 #[test]
 fn shift_or_alt_enter_adds_a_line_instead_of_committing() {
