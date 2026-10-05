@@ -82,8 +82,11 @@ pub fn unavailable_message(state: InstallState, termux: bool) -> &'static str {
         (InstallState::Failed, true) => {
             "  zoxide auto-install failed. Run `pkg install zoxide` in the terminal pane, then try again."
         }
-        (InstallState::Failed, false) => {
+        (InstallState::Failed, false) if cfg!(target_os = "macos") => {
             "  zoxide auto-install failed. Install it manually (e.g. `brew install zoxide`), then try again."
+        }
+        (InstallState::Failed, false) => {
+            "  zoxide auto-install failed. Install it with your package manager (e.g. `apt install zoxide`), then try again."
         }
         _ => "  zoxide is not installed on this host.",
     }
@@ -478,8 +481,12 @@ mod tests {
             "pkg is Termux-only; never suggest it on macOS/Linux"
         );
         assert!(
-            failed_elsewhere.contains("brew install zoxide"),
-            "the non-Termux failed message must name a manual install route"
+            failed_elsewhere.contains(if cfg!(target_os = "macos") {
+                "brew install zoxide"
+            } else {
+                "apt install zoxide"
+            }),
+            "the non-Termux failed message must name this platform's install route"
         );
         for termux in [false, true] {
             assert!(

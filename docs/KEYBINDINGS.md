@@ -192,7 +192,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`C` / `Cmd`+`C` | Copy selected paths to the explorer clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut selected paths |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste into the focused folder (move on Cut, copy on Copy) |
-| `Cmd`+`Z` | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed |
+| `Ctrl`+`Z` / `Cmd`+`Z` | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed. From any pane, the palette's "Go: Jump to Directory (zoxide)…" opens the same popup |
 | Drag a row onto a folder | Move the selection into it (`Alt`-drag to copy instead) |
 | `Delete` / `Backspace` / `Cmd`+`Backspace` | Move every selected path to the OS Trash (after a confirmation popup — `Enter` to trash, `Esc` to keep) |
 | `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder |

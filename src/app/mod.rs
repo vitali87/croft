@@ -48712,6 +48712,7 @@ impl App {
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
             Cmd::ShowSourceControl => self.set_sidebar_view(SidebarView::SourceControl),
             Cmd::AddWorkspaceFolder => self.open_add_folder_picker(),
+            Cmd::JumpToDirectory => self.open_zoxide_jump(),
             Cmd::SaveWorkspaceAs => {
                 use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
                 let suggestion = {
@@ -64008,14 +64009,13 @@ fn is_toggle_wrap_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// Explorer-pane shortcut: `Cmd+Z` — open the zoxide jump popup. `z` for
-/// **z**oxide; the user's shell still uses `j` for the same jump. Requires
-/// SUPER (iTerm2 already forwards Cmd+Z as `Char('z') + SUPER` for the
-/// editor's undo via the `CMD_Z` GlobalKeyMap entry). Off Termux it rejects
-/// CONTROL so a terminal `Ctrl+Z` suspend never reaches it and it stays
-/// distinct from the Ctrl-based terminal-toggle chords on `j`; on Termux,
-/// where Ctrl is the Cmd surrogate, `Ctrl+Z` opens the popup (this predicate
-/// only runs while the Explorer is focused, so there is no suspend to clash).
+/// Explorer-pane shortcut: `Cmd+Z` / `Ctrl+Z` — open the zoxide jump popup.
+/// `z` for **z**oxide; the user's shell still uses `j` for the same jump.
+/// `Ctrl+Z` counts on every platform, as the Make Root chords do (#1294):
+/// xterm, GNOME Terminal, Konsole and tmux never deliver Super, and this
+/// predicate only runs while the Explorer is focused, so a `Ctrl+Z` here is
+/// never a shell's suspend or the editor's undo. The Explorer has no undo
+/// of its own to clash with.
 /// SHIFT is rejected because `Cmd+Shift+Z` is the reserved redo chord.
 /// Editor-pane `Cmd+Z` is untouched: this predicate is only consulted from
 /// `handle_explorer_shortcut`, which runs solely when the Explorer is
@@ -64030,10 +64030,7 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    // `has_cmd` is SUPER-only off Termux (so a terminal `Ctrl+Z` suspend is
-    // never swallowed); on Termux Ctrl is the command key, and this predicate
-    // only runs while the Explorer is focused, so there is no suspend to clash.
-    has_cmd(key.modifiers)
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".

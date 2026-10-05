@@ -22553,11 +22553,12 @@ fn relative_clipboard_text_is_relative_inside_root_and_absolute_outside() {
 }
 
 #[test]
-fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
-    // Cmd+Z (SUPER) opens the Explorer jump popup. Ctrl+Z must NOT — it
-    // is the shell suspend in the terminal, and the editor's undo lives on
-    // Ctrl/Cmd+Z in its own (editor-focused) path. Cmd+Shift+Z is the
-    // reserved redo chord. Cmd+J stays free for terminal manipulation.
+fn zoxide_jump_key_is_cmd_or_ctrl_z_and_never_redo() {
+    // Cmd+Z and Ctrl+Z open the Explorer jump popup (#1294): most Linux
+    // terminals never deliver Super, and this predicate runs only while the
+    // Explorer is focused, where Ctrl+Z is no shell suspend or editor undo.
+    // Cmd+Shift+Z is the reserved redo chord. Cmd+J stays free for terminal
+    // manipulation.
     assert!(is_tree_zoxide_jump_key(key(
         KeyCode::Char('z'),
         KeyModifiers::SUPER
@@ -22567,20 +22568,86 @@ fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
         "letter match must be case-insensitive"
     );
     assert!(
-        !is_tree_zoxide_jump_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
-        "Ctrl+Z must not open the popup; it is shell suspend / editor undo"
+        is_tree_zoxide_jump_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+        "Ctrl+Z is the jump on terminals that never send Super"
     );
-    assert!(
-        !is_tree_zoxide_jump_key(key(
-            KeyCode::Char('z'),
-            KeyModifiers::SUPER | KeyModifiers::SHIFT
-        )),
-        "Cmd+Shift+Z is reserved for redo and must not open the popup"
-    );
+    for (mods, why) in [
+        (
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            "Cmd+Shift+Z is redo",
+        ),
+        (
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            "Ctrl+Shift+Z is redo",
+        ),
+        (KeyModifiers::ALT, "Alt+Z is not the jump"),
+        (
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            "Ctrl+Alt+Z is not the jump",
+        ),
+        (KeyModifiers::NONE, "a bare z is type-to-find"),
+    ] {
+        assert!(
+            !is_tree_zoxide_jump_key(key(KeyCode::Char('z'), mods)),
+            "{why}"
+        );
+    }
     assert!(
         !is_tree_zoxide_jump_key(key(KeyCode::Char('j'), KeyModifiers::SUPER)),
         "Cmd+J must stay free for terminal manipulation"
     );
+}
+
+/// On a terminal that never sends Super, Ctrl+Z with the Explorer focused
+/// opens the jump through the real key path (#1294).
+#[test]
+fn ctrl_z_in_the_explorer_opens_the_zoxide_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Explorer;
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_some(), "status: {}", app.status);
+}
+
+/// Negative: with the editor focused, Ctrl+Z is still undo and never the
+/// jump.
+#[test]
+fn ctrl_z_in_the_editor_still_undoes_and_opens_no_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_at(&file, 0, 0).unwrap();
+    app.focus = Pane::Editor;
+    app.editor.cursor_col = 3;
+    app.editor.insert_char('!');
+    assert_eq!(app.editor.lines[0], "one!");
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_none());
+    assert_eq!(app.editor.lines[0], "one", "Ctrl+Z undid the edit");
+}
+
+/// The jump is reachable from the palette with any pane focused, so a
+/// terminal without Super still has a way in (#1294).
+#[test]
+fn the_palette_has_a_zoxide_jump_command_that_works_from_any_pane() {
+    use crate::widgets::command_palette::ALL_COMMANDS;
+    let cmd = ALL_COMMANDS
+        .iter()
+        .copied()
+        .find(|c| c.title().to_lowercase().contains("zoxide"))
+        .expect("a palette command for the zoxide jump");
+    assert_eq!(cmd.title(), "Go: Jump to Directory (zoxide)…");
+    for pane in [Pane::Editor, Pane::Terminal, Pane::Tree] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus = pane;
+        app.run_command(cmd);
+        assert!(app.zoxide_jump.is_some(), "{}", app.status);
+    }
 }
 
 #[test]
