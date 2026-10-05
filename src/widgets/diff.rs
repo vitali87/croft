@@ -258,6 +258,40 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Background of the changed characters within a removed line (#1351),
+/// stronger than the line's own tint, as VS Code's
+/// `diffEditor.removedTextBackground`.
+pub const INTRALINE_REMOVED_BG: (u8, u8, u8) = (0x8c, 0x2f, 0x2f);
+/// Background of the changed characters within an added line (#1351), as
+/// VS Code's `diffEditor.insertedTextBackground`.
+pub const INTRALINE_ADDED_BG: (u8, u8, u8) = (0x2f, 0x7a, 0x45);
+
+/// The changed characters of a replaced line against its new version
+/// (#1351), as `(start, end)` char ranges for the old and the new line:
+/// what is left once the common prefix and suffix are trimmed, which marks
+/// the usual edit (a value, a name, an inserted argument) exactly. `None`
+/// when the lines are equal, or share under 30% of the longer one, so a
+/// rewritten line keeps its plain tint rather than turning into confetti.
+pub fn changed_char_ranges(old: &str, new: &str) -> Option<((usize, usize), (usize, usize))> {
+    let a: Vec<char> = old.chars().collect();
+    let b: Vec<char> = new.chars().collect();
+    if a == b {
+        return None;
+    }
+    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suffix = a[prefix..]
+        .iter()
+        .rev()
+        .zip(b[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let longer = a.len().max(b.len());
+    if (prefix + suffix) * 10 < longer * 3 {
+        return None;
+    }
+    Some(((prefix, a.len() - suffix), (prefix, b.len() - suffix)))
+}
+
 /// One visual row in a side-by-side diff view. The left column shows
 /// `left_lines[left]` (or blank when `Added`) and the right column shows
 /// `right_lines[right]` (or blank when `Removed`).
@@ -1934,6 +1968,32 @@ mod seat_group_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1351: the changed characters of a paired line, by common prefix
+    /// and suffix: `1.5` → `2.5` is just `1` and `2`.
+    #[test]
+    fn changed_chars_trim_the_common_prefix_and_suffix() {
+        assert_eq!(
+            changed_char_ranges("backoff=1.5", "backoff=2.5"),
+            Some(((8, 9), (8, 9)))
+        );
+        assert_eq!(
+            changed_char_ranges("abc", "abXc"),
+            Some(((2, 2), (2, 3))),
+            "an insertion marks only the new side"
+        );
+    }
+
+    /// #1351 negative: identical lines and lines sharing too little have no
+    /// ranges.
+    #[test]
+    fn changed_chars_are_none_for_equal_or_rewritten_lines() {
+        assert_eq!(changed_char_ranges("same", "same"), None);
+        assert_eq!(
+            changed_char_ranges("alpha beta gamma", "quite other words"),
+            None
+        );
+    }
 
     fn lines(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
