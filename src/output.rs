@@ -54,6 +54,10 @@ pub const CHANNEL_FLEET: &str = "Fleet";
 pub const CHANNEL_REMOTE: &str = "Remote";
 /// Notification-sink delivery failures (#358).
 pub const CHANNEL_NOTIFICATIONS: &str = "Notifications";
+/// The Run and Debug panel's console, mirrored (#867): program output and
+/// REPL results at full width, searchable and copyable, where the sidebar
+/// shows only a narrow tail.
+pub const CHANNEL_DEBUG_CONSOLE: &str = "Debug Console";
 
 /// One line in a channel: when it arrived, how severe, and the text.
 #[derive(Clone, Debug, PartialEq)]

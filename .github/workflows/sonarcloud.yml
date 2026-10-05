@@ -63,4 +63,4 @@ jobs:
         # Pinned to a commit, not the v8 tag: this step can read SONAR_TOKEN,
         # and a tag can be moved to different code. .github/dependabot.yml
         # keeps the pin current.
-        uses: SonarSource/sonarqube-scan-action@ba9859eae8dd6bd29e412f25ddbbef3d032000f4 # v8.2.2
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0

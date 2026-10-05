@@ -2459,13 +2459,13 @@ impl PtyTerminal {
             return String::new();
         }
         let term = self.term.lock();
-        extract_selection_text(
+        without_continuation_prompts(&extract_selection_text(
             &term,
             line,
             col,
             d.output_start - 1,
             term.columns().saturating_sub(1),
-        )
+        ))
     }
 
     /// Select the command's output span (and snap the view to it), so the
@@ -4483,7 +4483,7 @@ fn ansi_rows(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)>
             {
                 continue;
             }
-            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            let ch = cell_glyph(cell.c);
             // Only the flags an SGR carries: the soft-wrap mark on a row's
             // last cell and a wide char's own flag are not styles, and keyed
             // on them a run of one colour was reset and set again around them
@@ -4557,6 +4557,15 @@ pub fn row_wraps(term: &Term<VoidListener>, line_idx: i32) -> bool {
 /// the function silently re-reads the live grid at the viewport row,
 /// which is a different cell entirely once `display_offset > 0` and
 /// the user gets the wrong line on the clipboard.
+/// What a grid cell shows: a blank for an empty cell and for a control
+/// char. alacritty leaves `'\t'` in the cell a TAB started from so copy
+/// can give the tab back, but painted raw the host terminal jumps to its
+/// own tab stop while ratatui counts one cell, and the rest of the row
+/// lands too far right over the previous frame's text (#1287).
+fn cell_glyph(c: char) -> char {
+    if c == '\0' || c.is_control() { ' ' } else { c }
+}
+
 /// One grid row as text plus a char-index → grid-column map. A wide char
 /// (CJK, emoji) occupies two grid columns — the `WIDE_CHAR` cell and a
 /// spacer cell — so the spacers are skipped, making the text read
@@ -4575,7 +4584,7 @@ pub fn row_text_and_cols(term: &Term<VoidListener>, line_idx: i32) -> (String, V
         {
             continue;
         }
-        s.push(if cell.c == '\0' { ' ' } else { cell.c });
+        s.push(cell_glyph(cell.c));
         cols.push(c);
     }
     (s, cols)
@@ -4611,13 +4620,42 @@ fn last_command_input_text(
     if cl <= bl {
         return String::new();
     }
-    extract_selection_text(
+    without_continuation_prompts(&extract_selection_text(
         term,
         bl,
         b.col_rec,
         cl - 1,
         term.columns().saturating_sub(1),
-    )
+    ))
+}
+
+/// Typed input read off the screen, minus the shell's continuation prompt
+/// on each line after the first (#1250). Only a hard newline starts such a
+/// line, so a soft-wrapped row is never touched. The prompt is bash's `> `
+/// or zsh's `%_> ` (`for> `, `cmdsubst dquote> `); stored as input, a
+/// recalled command would run it as a redirect.
+fn without_continuation_prompts(text: &str) -> String {
+    let strip = |line: &str| -> String {
+        let is_ps2 = |head: &str| {
+            !head.starts_with(' ') && head.chars().all(|c| c.is_ascii_lowercase() || c == ' ')
+        };
+        if let Some(i) = line.find("> ")
+            && is_ps2(&line[..i])
+        {
+            return line[i + 2..].to_string();
+        }
+        match line.strip_suffix('>') {
+            Some(head) if is_ps2(head) => String::new(),
+            _ => line.to_string(),
+        }
+    };
+    let mut lines = text.split('\n');
+    let mut out = lines.next().unwrap_or_default().to_string();
+    for line in lines {
+        out.push('\n');
+        out.push_str(&strip(line));
+    }
+    out
 }
 
 /// The finished command's OUTPUT: the rows between the newest `133;C` mark
@@ -5364,7 +5402,7 @@ impl Widget for &mut PtyTerminal {
                 let line_idx = (y as i32) - (display_offset as i32);
                 let p = Point::new(Line(line_idx), Column(x as usize));
                 let cell = &term.grid()[p];
-                let mut display_char = if cell.c == '\0' { ' ' } else { cell.c };
+                let mut display_char = cell_glyph(cell.c);
                 let mut style = Style::default();
                 if let Some(c) = ansi_to_ratatui(cell.fg, &self.palette) {
                     style = style.fg(c);
@@ -9156,6 +9194,76 @@ mod tests {
         (tmp, t)
     }
 
+    /// A TAB leaves `'\t'` in the cell it started from (so copy can give
+    /// the tab back). Painted raw, the host terminal jumped to its own tab
+    /// stop while ratatui counted one cell, so the gap kept the previous
+    /// frame's text and the rest of the row landed too far right (#1287).
+    #[test]
+    fn a_tab_paints_as_blank_cells_and_the_next_text_lands_on_the_tab_stop() {
+        let (_tmp, mut t) = quiet_pty();
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        t.feed_bytes_for_test(b"\x1b[2J\x1b[Ha\tb\r\n");
+        for cell in buf.content.iter_mut() {
+            cell.set_symbol("X");
+        }
+        (&mut t).render(area, &mut buf);
+        let row: Vec<String> = (0..area.width)
+            .map(|x| buf[(x, 1)].symbol().to_string())
+            .collect();
+        let a = row.iter().position(|c| c == "a").expect("a is painted");
+        assert!(
+            row.iter().all(|c| !c.chars().any(char::is_control)),
+            "no control char reaches the host terminal: {row:?}"
+        );
+        assert_eq!(
+            row[a + 1..a + 8].concat(),
+            " ".repeat(7),
+            "the tab's gap is blank, not the old frame: {row:?}"
+        );
+        assert_eq!(row[a + 8], "b", "b sits on the next tab stop: {row:?}");
+    }
+
+    /// The text views of the grid (find, `croft record` casts, the web
+    /// client) send no raw TAB either, while copy still gives it back.
+    #[test]
+    fn grid_text_views_blank_a_tab_but_copy_keeps_it() {
+        let (_tmp, mut t) = quiet_pty();
+        t.resize(40, 10);
+        t.feed_bytes_for_test(b"\x1b[2J\x1b[Ha\tb\r\n");
+        let row = {
+            let term = t.term.lock();
+            row_text_and_cols(&term, 0).0
+        };
+        assert!(row.starts_with("a       b"), "{row:?}");
+        let ansi = t.grid_lines_ansi();
+        let first = ansi
+            .iter()
+            .find(|(plain, _)| plain.starts_with('a'))
+            .unwrap();
+        assert!(
+            !first.0.contains('\t') && !first.1.contains('\t'),
+            "{first:?}"
+        );
+        assert!(first.0.starts_with("a       b"), "{first:?}");
+
+        let line = {
+            let term = t.term.lock();
+            (0..term.screen_lines() as i32)
+                .find(|&l| row_text_and_cols(&term, l).0.starts_with('a'))
+                .unwrap()
+        };
+        let mut sel = Selection::new(line, 0);
+        sel.head = (line, 8);
+        t.set_selection(Some(sel));
+        assert!(
+            t.selection_text().starts_with("a\t"),
+            "copy keeps the tab: {:?}",
+            t.selection_text()
+        );
+    }
+
     /// An alt-screen round trip (`git log`, vim, htop) used to wipe every
     /// arrival stamp (the alternate grid has no history, so the cursor's
     /// absolute id collapsed and looked like an ED 3 wipe) and then
@@ -10230,6 +10338,81 @@ mod tests {
             "the output block must ride the completion; got {:?}",
             f.output
         );
+    }
+
+    /// Run `typed` as the input between a `133;B` and `133;C` mark, and
+    /// return what the finished command recorded and what Re-run reads.
+    fn recorded_command(typed: &str) -> (String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = format!(
+            "printf '\\033]133;A\\007$ \\033]133;B\\007{typed}\\n\\033]133;C\\007out\\n\\033]133;D;0\\007'"
+        );
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script], tmp.path()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut finished = Vec::new();
+        while std::time::Instant::now() < deadline {
+            finished.extend(term.drain_finished_commands());
+            if !finished.is_empty() && !term.command_decorations().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let f = finished
+            .first()
+            .expect("the 133;D must yield a FinishedCommand");
+        let deco = term.command_decorations()[0];
+        (f.cmd.clone(), term.command_input_text(&deco))
+    }
+
+    #[test]
+    fn a_multi_line_command_is_recorded_without_its_continuation_prompt() {
+        // #1250: bash's PS2 `> ` was stored as typed input, and recalling
+        // the command ran `> cat notes` as a redirect.
+        let (cmd, rerun) = recorded_command("for f in a b; do\\n> cat notes; done");
+        assert_eq!(cmd, "for f in a b; do\ncat notes; done");
+        assert_eq!(rerun, cmd, "Re-run reads the same text");
+        let (cmd, _) = recorded_command("ls \\\\\\n> -la");
+        assert_eq!(cmd, "ls \\\n-la");
+    }
+
+    #[test]
+    fn zsh_continuation_prompts_are_dropped_too() {
+        let (cmd, _) = recorded_command("for f in a b\\nfor> do echo $f\\nfor> done");
+        assert_eq!(cmd, "for f in a b\ndo echo $f\ndone");
+        let (cmd, _) = recorded_command("echo \"a\\ndquote> b\"");
+        assert_eq!(cmd, "echo \"a\nb\"");
+    }
+
+    #[test]
+    fn redirects_typed_by_the_user_stay_in_the_command() {
+        // Negative: only the prompt goes. A `>` the user typed, on the first
+        // line or at the start of a continuation line, is kept.
+        let (cmd, _) = recorded_command("echo hi > out.txt");
+        assert_eq!(cmd, "echo hi > out.txt");
+        let (cmd, _) = recorded_command("{ echo a\\n> > log; }");
+        assert_eq!(cmd, "{ echo a\n> log; }");
+    }
+
+    #[test]
+    fn an_empty_continuation_line_keeps_no_prompt() {
+        // The grid drops a row's trailing blanks, so an empty line after
+        // `> ` reads as a bare `>`.
+        assert_eq!(
+            without_continuation_prompts("ls \\\n>\n> -la"),
+            "ls \\\n\n-la"
+        );
+        assert_eq!(without_continuation_prompts("for x\nfor>"), "for x\n");
+        assert_eq!(without_continuation_prompts("a\n>> log"), "a\n>> log");
+    }
+
+    #[test]
+    fn a_soft_wrapped_line_is_not_a_continuation() {
+        // Negative: a long line wraps with no newline and no PS2, so text
+        // that happens to sit at the start of the next row is kept.
+        let long = format!("echo {}> x", "y".repeat(78));
+        let (cmd, _) = recorded_command(&long);
+        assert_eq!(cmd, long);
     }
 
     #[test]

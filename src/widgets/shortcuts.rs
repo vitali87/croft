@@ -38,7 +38,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Ctrl+Q",
-                description: "Quit",
+                description: "Quit (in a focused terminal it goes to the app there)",
                 handler: "",
             },
             ShortcutEntry {
@@ -133,8 +133,23 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+Shift+T",
-                description: "Focus the Terminal pane (un-hides it if collapsed)",
+                description: "Focus the Terminal pane (un-hides it if collapsed, brings its TERMINAL tab forward)",
                 handler: "is_terminal_focus_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+M",
+                description: "Show the PROBLEMS tab (PORTS / CAPTURES: the palette's View: Show Ports / Show Captures)",
+                handler: "is_show_problems_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+U",
+                description: "Show the OUTPUT tab (pick a channel with the palette's Output: Select Channel…)",
+                handler: "is_show_output_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+S",
+                description: "Save All: every file with unsaved edits, in every tab and split",
+                handler: "is_save_all_key",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+B",
@@ -395,6 +410,21 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Cmd/Ctrl+W",
                 description: "Close the active tab",
                 handler: "is_close_tab_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K →",
+                description: "Close the tabs right of the active one (palette: View: Close Editors to the Right in Group; View: Close Other Editors in Group closes all but it)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K U / Cmd+K W",
+                description: "Close the saved tabs, keeping unsaved ones / every tab in every split (palette: View: Close Saved Editors in Group / View: Close All Editors)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K P / Cmd+K Shift+P",
+                description: "Pin or unpin the active tab / keep the preview tab open (palette: View: Pin Editor, View: Unpin Editor, View: Keep Editor)",
+                handler: "",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+1..9",
