@@ -12801,7 +12801,11 @@ fn sync_on_a_branch_with_no_upstream_publishes_without_pulling() {
         "{:?}",
         app.source_control.commit_feedback
     );
-    assert_eq!(app.status, "Synced");
+    // One line naming what each half did (#858).
+    assert_eq!(
+        app.status,
+        "Synced: pulled: nothing, branch not published yet | pushed: published topic to origin"
+    );
     assert_eq!(
         git_stdout(tmp.path(), &["rev-parse", "--abbrev-ref", "topic@{u}"]),
         "origin/topic"
@@ -12869,9 +12873,10 @@ fn sync_on_a_tracked_branch_still_pulls_first() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sync_source_control();
     wait_for_git_net(&mut app);
-    assert_eq!(
-        app.status, "Synced",
-        "{:?}",
+    assert!(
+        app.status.starts_with("Synced: pulled: Fast-forward"),
+        "{}: {:?}",
+        app.status,
         app.source_control.commit_feedback
     );
     assert!(tmp.path().join("theirs.txt").exists());
