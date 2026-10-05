@@ -6859,6 +6859,7 @@ fn git_status_spans_clean_branch_is_green() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -6883,6 +6884,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6910,6 +6912,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6929,6 +6932,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -13561,6 +13565,81 @@ fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
         log_out.contains("fix: plain cmd-enter"),
         "Cmd+Enter must still commit locally (push is bound to Ctrl+Enter only): log={log_out:?}"
     );
+}
+
+/// A repo with `seed.txt` changed and the Source Control panel open on it,
+/// ready to commit (#1241).
+fn scm_ready_to_commit() -> (tempfile::TempDir, App) {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    });
+    app.set_sidebar_view(SidebarView::SourceControl);
+    (tmp, app)
+}
+
+fn last_commit_message(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A pasted multi-line message is committed with its subject, blank line
+/// and body intact, not glued into one line.
+#[test]
+fn a_pasted_multi_line_message_commits_with_its_body() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    app.handle_paste("Fix rounding\r\n\r\nTotals were floats\r\nFixes #42");
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        last_commit_message(tmp.path()),
+        "Fix rounding\n\nTotals were floats\nFixes #42\n\n"
+    );
+}
+
+/// Shift+Enter and Alt+Enter start a new line; neither commits.
+#[test]
+fn shift_or_alt_enter_adds_a_line_instead_of_committing() {
+    for modifier in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        let (tmp, mut app) = scm_ready_to_commit();
+        for c in "subj".chars() {
+            app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_source_control_key(key(KeyCode::Enter, modifier));
+        app.handle_source_control_key(key(KeyCode::Enter, modifier));
+        for c in "body".chars() {
+            app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.source_control.message, "subj\n\nbody", "{modifier:?}");
+        assert_eq!(
+            last_commit_message(tmp.path()),
+            "init\n\n",
+            "{modifier:?} must not commit"
+        );
+        app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(last_commit_message(tmp.path()), "subj\n\nbody\n\n");
+    }
+}
+
+/// Plain Enter still commits a one-line message straight away.
+#[test]
+fn plain_enter_still_commits_a_one_line_message() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    for c in "one line".chars() {
+        app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(last_commit_message(tmp.path()), "one line\n\n");
+    assert_eq!(app.source_control.message, "");
 }
 
 #[test]
@@ -48015,6 +48094,98 @@ fn ctrl_b_still_toggles_the_side_bar_outside_the_terminal() {
         app.show_tree, before,
         "with the editor focused, Ctrl+B is still croft's"
     );
+}
+
+fn focused_terminal_app(dir: &std::path::Path) -> App {
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.clipboard_reader = || Some(String::from("CLIP"));
+    app
+}
+
+fn pty_bytes(app: &App) -> Vec<u8> {
+    app.terminals[app.active_terminal].written_bytes_for_test()
+}
+
+/// Ctrl+Q inside vim or nano in a focused terminal is the app's key
+/// (visual block, search backwards, XON), not a quit that kills the
+/// shell and every unsaved tab with it (#1290).
+#[test]
+fn ctrl_q_in_a_focused_terminal_reaches_the_app_instead_of_quitting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = focused_terminal_app(tmp.path());
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(!app.quit, "Ctrl+Q in the terminal must not quit croft");
+    assert!(
+        pty_bytes(&app).contains(&0x11),
+        "Ctrl+Q must reach the PTY as 0x11"
+    );
+}
+
+/// Ctrl+V is vim's visual block and nano's page down, so in a focused
+/// terminal it goes to the app as 0x16 (#1290). Pasting keeps
+/// Ctrl+Shift+V and Cmd+V, as in VS Code on Linux.
+#[test]
+fn ctrl_v_in_a_focused_terminal_reaches_the_app_and_shifted_paste_still_pastes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = focused_terminal_app(tmp.path());
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        pty_bytes(&app),
+        vec![0x16],
+        "Ctrl+V must reach the PTY as 0x16"
+    );
+    assert!(!app.status.starts_with("Paste"), "Ctrl+V must not paste");
+
+    // A paste either lands in the PTY or, with no clipboard tool on the
+    // box, reports why on the status bar; it never sends the raw byte.
+    for chord in [
+        key(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+        key(KeyCode::Char('v'), KeyModifiers::SUPER),
+    ] {
+        app.status.clear();
+        let before = pty_bytes(&app).len();
+        app.handle_key(chord).unwrap();
+        let sent = pty_bytes(&app)[before..].to_vec();
+        assert!(
+            !sent.contains(&0x16),
+            "{chord:?} pastes rather than sending 0x16"
+        );
+        assert!(
+            !sent.is_empty() || app.status.starts_with("Paste"),
+            "{chord:?} still pastes the clipboard"
+        );
+    }
+}
+
+/// The release is about the focused terminal only: from the editor,
+/// Ctrl+Q still quits (#1290).
+#[test]
+fn ctrl_q_still_quits_outside_the_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.quit, "with the editor focused, Ctrl+Q still quits");
+}
+
+/// The PROBLEMS tab owns the panel pane while it is shown, so there is no
+/// app to hand Ctrl+Q to: it still quits (#1290).
+#[test]
+fn ctrl_q_still_quits_from_the_problems_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = focused_terminal_app(tmp.path());
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.quit, "Ctrl+Q quits when the panel shows PROBLEMS");
 }
 
 #[test]
