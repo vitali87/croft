@@ -1,0 +1,1 @@
+fix: Ctrl+Q and Ctrl+V in a focused terminal now reach the app running there (vim's visual block, nano's search backwards and page down) instead of quitting croft with unsaved tabs or pasting; quit keeps Ctrl+Q from every other pane and paste keeps Ctrl+Shift+V, Cmd+V and the pane menu

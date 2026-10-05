@@ -699,6 +699,27 @@ fn display_width(c: char) -> usize {
     }
 }
 
+/// The longest prefix of `s` at most `budget` columns wide, with its width
+/// in columns. Measured by [`display_width`], so a wide glyph never pushes a
+/// label past the cells it was given.
+fn clip_to_width(s: &str, budget: usize) -> (String, usize) {
+    let mut short = String::new();
+    let mut width = 0;
+    // A label is data: a control character in it (ESC, BEL) would reach
+    // the terminal as a command, so it is dropped. TAB becomes a space, as
+    // in a saved terminal transcript, so the words it parts stay apart.
+    let shown = s.chars().map(|c| if c == '\t' { ' ' } else { c });
+    for c in shown.filter(|c| !c.is_control()) {
+        let cw = display_width(c);
+        if width + cw > budget {
+            break;
+        }
+        short.push(c);
+        width += cw;
+    }
+    (short, width)
+}
+
 /// Where a bar that grows from `zero` starts: at `zero` when it has
 /// height, one pixel above it when the value is exactly zero.
 fn y0_floor(zero: f64, y: f64) -> f64 {
@@ -761,7 +782,7 @@ pub fn text(ds: &Dataset, kind: ChartKind, title: Option<&str>, cols: u16, rows:
             for s in &ds.series {
                 let vals = downsample(&s.values, dw);
                 let m = vals.len().max(1);
-                let mut prev: Option<usize> = None;
+                let mut prev: Option<(usize, usize)> = None;
                 for (i, v) in vals.iter().enumerate() {
                     if !v.is_finite() {
                         prev = None;
@@ -769,15 +790,12 @@ pub fn text(ds: &Dataset, kind: ChartKind, title: Option<&str>, cols: u16, rows:
                     }
                     let x = if m == 1 { 0 } else { i * (dw - 1) / (m - 1) };
                     let y = ((hi - v) / span * (dh - 1) as f64).round() as usize;
-                    let (a, b) = match prev {
-                        Some(p) if p < y => (p + 1, y),
-                        Some(p) if p > y => (y, p - 1),
-                        _ => (y, y),
-                    };
-                    for yy in a..=b {
-                        grid[yy / 4][x / 2] |= DOT_BITS[x % 2][yy % 4];
-                    }
-                    prev = Some(y);
+                    // Joined to the previous point across however many dot
+                    // columns lie between them: with fewer points than
+                    // columns, filling only this point's own column left a
+                    // row of disconnected ticks (#847).
+                    draw_segment(&mut grid, prev.unwrap_or((x, y)), (x, y));
+                    prev = Some((x, y));
                 }
             }
             for (r, row) in grid.iter().enumerate() {
@@ -792,6 +810,33 @@ pub fn text(ds: &Dataset, kind: ChartKind, title: Option<&str>, cols: u16, rows:
                 for bits in row {
                     out.push(char::from_u32(BRAILLE_BASE + bits).unwrap_or(' '));
                 }
+                out.push('\n');
+            }
+            // The first and last `--x` labels under the ends of the line, as
+            // the bar chart labels its bars: without them `--x date` changed
+            // nothing here (#847). The line spans the full width, so the
+            // first label starts at its left end and the last ends at its
+            // right.
+            if let Some(labels) = &ds.labels
+                && let Some(first) = labels.first()
+            {
+                let _ = write!(out, "{:>w$} ", "", w = label_w - 1);
+                let last = labels.last().filter(|_| labels.len() > 1);
+                // Up to half the row is kept for the last label, the first
+                // takes the rest, and the last then grows into whatever the
+                // first left over. One space always parts them.
+                let last_w = last.map_or(0, |l| clip_to_width(l, (plot_cols - 1) / 2).1);
+                let (first, first_w) =
+                    clip_to_width(first, plot_cols - usize::from(last.is_some()) - last_w);
+                let (last, last_w) = match last {
+                    Some(l) => clip_to_width(l, plot_cols - 1 - first_w),
+                    None => (String::new(), 0),
+                };
+                out.push_str(&first);
+                for _ in first_w..plot_cols - last_w {
+                    out.push(' ');
+                }
+                out.push_str(&last);
                 out.push('\n');
             }
         }
@@ -861,16 +906,7 @@ pub fn text(ds: &Dataset, kind: ChartKind, title: Option<&str>, cols: u16, rows:
                     let budget = cell.saturating_sub(gap).max(1);
                     // Wide glyphs (CJK, emoji) take two columns: truncate and
                     // pad by display width so labels stay under their bars.
-                    let mut short = String::new();
-                    let mut width = 0;
-                    for c in l.chars() {
-                        let cw = display_width(c);
-                        if width + cw > budget {
-                            break;
-                        }
-                        short.push(c);
-                        width += cw;
-                    }
+                    let (short, width) = clip_to_width(l, budget);
                     out.push_str(&short);
                     for _ in width..cell {
                         out.push(' ');
@@ -896,6 +932,34 @@ pub fn text(ds: &Dataset, kind: ChartKind, title: Option<&str>, cols: u16, rows:
         ));
     }
     out
+}
+
+/// Light every braille dot on the straight segment from `a` to `b`, both
+/// `(x, y)` in dot coordinates and both lit (Bresenham). A point with no
+/// predecessor is the segment from itself to itself, and two points in one
+/// column are a vertical run.
+fn draw_segment(grid: &mut [Vec<u32>], a: (usize, usize), b: (usize, usize)) {
+    let (mut x, mut y) = (a.0 as isize, a.1 as isize);
+    let (x1, y1) = (b.0 as isize, b.1 as isize);
+    let (dx, dy) = ((x1 - x).abs(), -(y1 - y).abs());
+    let (sx, sy) = ((x1 - x).signum(), (y1 - y).signum());
+    let mut err = dx + dy;
+    loop {
+        let (cx, cy) = (x as usize, y as usize);
+        grid[cy / 4][cx / 2] |= DOT_BITS[cx % 2][cy % 4];
+        if (x, y) == (x1, y1) {
+            return;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1444,7 +1508,7 @@ mod tests {
         let d = ds("month,sales\nJan,10\nFeb,30\nMar,20\n");
         let line = text(&d, ChartKind::Line, None, 30, 4);
         let rows: Vec<&str> = line.lines().collect();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5, "four chart rows and the labels: {rows:?}");
         assert!(
             rows[0].trim_start().starts_with("30"),
             "top row carries the max: {rows:?}"
@@ -1452,6 +1516,10 @@ mod tests {
         assert!(
             rows[3].trim_start().starts_with("10"),
             "bottom row carries the min: {rows:?}"
+        );
+        assert!(
+            rows[4].contains("Jan") && rows[4].contains("Mar"),
+            "the first and last labels sit under the line: {rows:?}"
         );
         assert!(
             line.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
@@ -1478,6 +1546,234 @@ mod tests {
             }],
         };
         assert!(text(&nan_only, ChartKind::Line, None, 20, 3).contains("no data"));
+    }
+
+    /// Which dot columns of a text line chart have any dot lit, read back
+    /// from the braille it printed (the axis labels are not braille).
+    fn lit_dot_columns(chart: &str) -> Vec<bool> {
+        let rows: Vec<Vec<u32>> = chart
+            .lines()
+            .map(|r| {
+                r.chars()
+                    .filter(|c| ('\u{2800}'..='\u{28ff}').contains(c))
+                    .map(|c| c as u32 - BRAILLE_BASE)
+                    .collect()
+            })
+            .filter(|cells: &Vec<u32>| !cells.is_empty())
+            .collect();
+        let cells = rows.first().map_or(0, Vec::len);
+        (0..cells * 2)
+            .map(|x| {
+                let column: u32 = DOT_BITS[x % 2].iter().sum();
+                rows.iter().any(|r| r[x / 2] & column != 0)
+            })
+            .collect()
+    }
+
+    /// #847: `seq 1 5 | croft plot --text` drew five vertical ticks about
+    /// fourteen columns apart, because each point filled only its own dot
+    /// column. The first point sits in dot column 0 and the last in the
+    /// last one, so a joined line lights every column in between.
+    #[test]
+    fn a_line_with_fewer_points_than_columns_is_joined_not_ticks() {
+        let chart = text(&ds("1\n2\n3\n4\n5\n"), ChartKind::Line, None, 60, 8);
+        let lit = lit_dot_columns(&chart);
+        assert!(
+            lit.len() > 100,
+            "the chart is wide enough to show it: {chart}"
+        );
+        assert!(
+            lit.iter().all(|&l| l),
+            "every dot column from the first point to the last is lit:\n{chart}"
+        );
+
+        // A falling line and a flat one join too.
+        for input in ["5\n4\n1\n", "3\n3\n3\n"] {
+            let chart = text(&ds(input), ChartKind::Line, None, 40, 6);
+            assert!(
+                lit_dot_columns(&chart).iter().all(|&l| l),
+                "{input:?} is joined:\n{chart}"
+            );
+        }
+
+        // A missing value is still a gap: the line does not jump across it.
+        let gapped = Dataset {
+            labels: None,
+            series: vec![Series {
+                name: "v".into(),
+                values: vec![1.0, 2.0, f64::NAN, 4.0, 5.0],
+            }],
+        };
+        let chart = text(&gapped, ChartKind::Line, None, 40, 6);
+        assert!(
+            lit_dot_columns(&chart).iter().any(|&l| !l),
+            "the NaN leaves a gap:\n{chart}"
+        );
+    }
+
+    /// #847: `--x` labelled the bar chart's bars but never the line chart,
+    /// so `--x date` changed nothing there. The first and last labels now
+    /// sit under the line's two ends.
+    #[test]
+    fn the_text_line_chart_is_labelled_at_both_ends() {
+        let input = "date,amount\n2026-01-01,5\n2026-01-02,9\n2026-01-03,2\n2026-01-04,7\n\
+                     2026-01-05,4\n2026-01-06,8\n2026-01-07,3\n";
+        let d = parse(input, Some("date"), &["amount".to_string()]).unwrap();
+        let chart = text(&d, ChartKind::Line, None, 60, 8);
+        let rows: Vec<&str> = chart.lines().collect();
+        assert_eq!(rows.len(), 9, "eight chart rows and the labels: {chart}");
+        let labels = rows[8];
+        let chart_row = rows[0];
+        let plot_start = chart_row
+            .find(|c: char| ('\u{2800}'..='\u{28ff}').contains(&c))
+            .unwrap();
+        assert_eq!(
+            labels.find("2026-01-01"),
+            Some(plot_start),
+            "the first label starts under the line's left end:\n{chart}"
+        );
+        assert!(
+            labels.ends_with("2026-01-07"),
+            "the last label ends under its right end:\n{chart}"
+        );
+        assert_eq!(
+            labels.chars().count(),
+            chart_row.chars().count(),
+            "the labels row is exactly as wide as the chart:\n{chart}"
+        );
+
+        // Labels too long to fit side by side are clipped, never overflow
+        // or run into each other.
+        let long = "k,v\nthe-very-first-label-of-all,1\nthe-very-last-label-of-all,2\n";
+        let chart = text(&ds(long), ChartKind::Line, None, 20, 3);
+        let rows: Vec<&str> = chart.lines().collect();
+        let labels = rows.last().unwrap();
+        assert_eq!(
+            labels.chars().count(),
+            rows[0].chars().count(),
+            "clipped to the chart's width:\n{chart}"
+        );
+        let words: Vec<&str> = labels.split_whitespace().collect();
+        assert_eq!(words.len(), 2, "a space parts the two labels:\n{chart}");
+        assert!(
+            "the-very-first-label-of-all".starts_with(words[0])
+                && "the-very-last-label-of-all".starts_with(words[1])
+                && words.iter().all(|w| w.len() >= 4),
+            "each label is a readable prefix of its own:\n{chart}"
+        );
+
+        // Unlabelled input gains no labels row.
+        let bare = text(&ds("1\n2\n3\n"), ChartKind::Line, None, 20, 3);
+        assert_eq!(bare.lines().count(), 3, "{bare}");
+    }
+
+    /// #847 guard: a one-point line has one label, and it is not printed
+    /// twice as both the first and the last.
+    #[test]
+    fn a_one_point_line_wears_its_label_once() {
+        let chart = text(&ds("k,v\nonly,5\n"), ChartKind::Line, None, 30, 3);
+        let labels = chart.lines().last().unwrap();
+        assert_eq!(labels.matches("only").count(), 1, "{chart}");
+        assert_eq!(labels.trim(), "only", "{chart}");
+    }
+
+    /// #847 guard: the end labels are clipped by display width, so a wide
+    /// glyph never pushes the row past the chart, at any width down to the
+    /// narrowest chart `text` draws.
+    #[test]
+    fn line_end_labels_measure_wide_glyphs_and_never_overflow() {
+        let d = ds("k,v\n日本語の最初のラベル,1\n中,2\n最後の日本語ラベル,3\n");
+        for cols in 1..=30 {
+            let chart = text(&d, ChartKind::Line, None, cols, 3);
+            let rows: Vec<&str> = chart.lines().collect();
+            assert_eq!(rows.len(), 4, "three chart rows and the labels:\n{chart}");
+            let width = |r: &str| r.chars().map(display_width).sum::<usize>();
+            assert!(
+                width(rows[3]) <= width(rows[0]),
+                "{cols} cols: labels row wider than the chart:\n{chart}"
+            );
+        }
+    }
+
+    /// Review finding: a label is data from the CSV, so an ESC or BEL in it
+    /// reached the terminal as a command, under the bars and now under the
+    /// line's ends too.
+    #[test]
+    fn labels_reach_the_terminal_without_control_characters() {
+        let line = "k,v\n\u{1b}[2Jfirst,1\nlast\u{7},2\n";
+        let bars = "k,v\n\u{1b}]0;x\u{7}a,1\nb\u{1b}[31m,2\n";
+        for (input, kind, shown) in [
+            (line, ChartKind::Line, ["[2Jfirst", "last"]),
+            (bars, ChartKind::Bar, ["]0;xa", "b[31m"]),
+        ] {
+            let chart = text(&ds(input), kind, None, 40, 4);
+            assert!(
+                !chart.chars().any(|c| c.is_control() && c != '\n'),
+                "{kind:?} wrote a control character: {chart:?}"
+            );
+            let labels = chart.lines().last().unwrap();
+            assert!(
+                shown.iter().all(|s| labels.contains(s)),
+                "{kind:?} keeps the rest of each label: {chart:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_labels_are_drawn_as_written_and_a_tab_as_a_space() {
+        // Short enough for a bar's six cells at this width.
+        let input = "k,v\ncafé№,1\nend\t½,2\n";
+        for kind in [ChartKind::Line, ChartKind::Bar] {
+            let chart = text(&ds(input), kind, None, 40, 4);
+            let rows: Vec<&str> = chart.lines().collect();
+            let labels = rows.last().unwrap();
+            assert!(
+                labels.contains("café№") && labels.contains("end ½"),
+                "{kind:?}: a TAB is a space, every other character kept: {chart}"
+            );
+            if kind == ChartKind::Line {
+                assert_eq!(
+                    labels.chars().count(),
+                    rows[0].chars().count(),
+                    "the labels row is as wide as the chart:\n{chart}"
+                );
+            }
+        }
+    }
+
+    /// #847 guard: points are joined within a series, never from one
+    /// series' last point to the next series' first. A low flat series and
+    /// a high flat one leave the rows between them empty.
+    #[test]
+    fn two_series_are_not_joined_to_each_other() {
+        let chart = text(
+            &ds("low,high\n0,10\n0,10\n0,10\n"),
+            ChartKind::Line,
+            None,
+            30,
+            4,
+        );
+        let rows: Vec<&str> = chart.lines().collect();
+        assert_eq!(rows.len(), 4, "{chart}");
+        for middle in &rows[1..3] {
+            assert!(
+                middle
+                    .chars()
+                    .filter(|c| ('\u{2800}'..='\u{28ff}').contains(c))
+                    .all(|c| c == '\u{2800}'),
+                "no segment crosses between the series:\n{chart}"
+            );
+        }
+    }
+
+    /// #847 guard: the end labels belong to the line chart only; a spark
+    /// with `--x` labels is still its single row of blocks.
+    #[test]
+    fn the_spark_gains_no_labels_row() {
+        let d = ds("month,sales\nJan,10\nFeb,30\nMar,20\n");
+        let spark = text(&d, ChartKind::Spark, None, 10, 1);
+        assert_eq!(spark.lines().count(), 1, "{spark}");
+        assert!(!spark.contains("Jan") && !spark.contains("Mar"), "{spark}");
     }
 
     /// The acceptance budget: 10k rows parse and render as text and SVG well

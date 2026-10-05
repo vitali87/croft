@@ -1,0 +1,1 @@
+fix: a TAB in the integrated terminal now paints as blank cells up to the tab stop, instead of leaving earlier output in the gap and pushing the rest of the line out of place (`printf` tables, `go test`, `time`)
