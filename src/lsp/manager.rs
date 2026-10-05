@@ -6873,8 +6873,23 @@ fn standard_semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
 }
 
 fn build_client_capabilities() -> ClientCapabilities {
+    // `linkSupport` on every goto: without it a server flattens each
+    // `LocationLink` into a `Location` over the whole declaration, and the
+    // jump lands on its first character instead of the name, lines above it
+    // in a multi-line declaration (#1284). `def_location` reads a link's
+    // `targetSelectionRange`.
+    let goto = || {
+        Some(lsp_types::GotoCapability {
+            dynamic_registration: Some(false),
+            link_support: Some(true),
+        })
+    };
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
+            definition: goto(),
+            declaration: goto(),
+            type_definition: goto(),
+            implementation: goto(),
             completion: Some(CompletionClientCapabilities {
                 dynamic_registration: Some(false),
                 context_support: Some(true),
@@ -7527,6 +7542,58 @@ mod tests {
         let caps = build_client_capabilities();
         let window = caps.window.expect("window capabilities must be set");
         assert_eq!(window.work_done_progress, Some(true));
+    }
+
+    /// Without `linkSupport` a server turns each `LocationLink` into a
+    /// `Location` spanning the whole declaration, so F12 lands on its first
+    /// character, lines above a name in a multi-line declaration (#1284).
+    #[test]
+    fn client_capabilities_ask_for_location_links_on_every_goto() {
+        let caps = build_client_capabilities();
+        let td = caps.text_document.expect("text document capabilities");
+        for (name, goto) in [
+            ("definition", td.definition),
+            ("declaration", td.declaration),
+            ("typeDefinition", td.type_definition),
+            ("implementation", td.implementation),
+        ] {
+            let goto = goto.unwrap_or_else(|| panic!("{name} capability must be declared"));
+            assert_eq!(goto.link_support, Some(true), "{name}.linkSupport");
+            assert_eq!(goto.dynamic_registration, Some(false), "{name}");
+        }
+    }
+
+    /// Negative: a server that still answers with a plain `Location`
+    /// jumps to its start, and a link whose declaration starts lines above
+    /// its name lands on the name, not the declaration.
+    #[test]
+    fn a_plain_location_still_jumps_to_its_start_and_a_link_to_its_name() {
+        let uri = Url::from_file_path("/tmp/config.ts").unwrap();
+        let plain = GotoDefinitionResponse::Array(vec![Location {
+            uri: uri.clone(),
+            range: lsp_types::Range::new(Position::new(7, 0), Position::new(11, 10)),
+        }]);
+        assert_eq!(
+            def_location(&plain),
+            Some((PathBuf::from("/tmp/config.ts"), 7, 0))
+        );
+        let link = GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: uri,
+            target_range: lsp_types::Range::new(Position::new(7, 0), Position::new(11, 10)),
+            target_selection_range: lsp_types::Range::new(
+                Position::new(10, 2),
+                Position::new(10, 7),
+            ),
+        }]);
+        assert_eq!(
+            def_location(&link),
+            Some((PathBuf::from("/tmp/config.ts"), 10, 2))
+        );
+        assert_eq!(
+            def_locations(&link),
+            vec![(PathBuf::from("/tmp/config.ts"), 10, 2)]
+        );
     }
 
     #[test]
