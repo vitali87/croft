@@ -2353,6 +2353,57 @@ pub fn commit_amend_no_edit(root: &Path) -> Result<String, String> {
     run_mutation(root, &["commit", "--amend", "--no-edit"])
 }
 
+/// Undo Last Commit (#1350), as VS Code does it: `git reset --soft HEAD~1`,
+/// so HEAD moves to the parent and the commit's changes stay staged, or
+/// on the root commit `git update-ref -d HEAD`, which leaves the branch
+/// unborn with every file staged. Returns the undone commit's message, for
+/// the message box. Refused while a merge, rebase, cherry-pick or revert
+/// is in progress: moving HEAD under one of those breaks it.
+pub fn undo_last_commit(root: &Path) -> Result<String, String> {
+    if let Some(op) = operation_in_progress(root) {
+        return Err(format!(
+            "a {op} is in progress; finish or abort it before undoing a commit"
+        ));
+    }
+    let message = run_git(root, &["log", "-1", "--format=%B", "HEAD"])
+        .map_err(|_| String::from("there is no commit to undo"))?;
+    if run_git(root, &["rev-parse", "--verify", "-q", "HEAD~1"]).is_ok() {
+        run_mutation(root, &["reset", "--soft", "HEAD~1"])?;
+    } else {
+        run_mutation(root, &["update-ref", "-d", "HEAD"])?;
+    }
+    Ok(message)
+}
+
+/// The git operation in progress in `root`'s repository, by the state
+/// file git keeps for it, or `None`.
+fn operation_in_progress(root: &Path) -> Option<&'static str> {
+    const STATES: [(&str, &str); 5] = [
+        ("MERGE_HEAD", "merge"),
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ];
+    let mut args = vec!["rev-parse"];
+    for (file, _) in STATES {
+        args.extend(["--git-path", file]);
+    }
+    let paths = run_git(root, &args).ok()?;
+    paths
+        .lines()
+        .zip(STATES)
+        .find(|(path, _)| root.join(path.trim()).exists())
+        .map(|(_, (_, op))| op)
+}
+
+/// Whether HEAD is already on its upstream (`HEAD` is an ancestor of
+/// `@{u}`), so undoing it rewrites published history and needs a force
+/// push later (#1350). No upstream is not pushed.
+pub fn head_is_on_upstream(root: &Path) -> bool {
+    run_git(root, &["merge-base", "--is-ancestor", "HEAD", "@{u}"]).is_ok()
+}
+
 // --- Bulk staging --------------------------------------------------------
 
 /// Stage every change, tracked and untracked (`git add -A`).
@@ -3903,6 +3954,105 @@ mod tests {
             .arg(p)
             .args(["commit", "-m", "init", "--quiet"])
             .status();
+    }
+
+    /// `git -C p <args>`, asserting it succeeded; its stdout, trimmed.
+    fn git_in(p: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// #1350: Undo Last Commit is `reset --soft HEAD~1`: HEAD goes back to
+    /// the parent, the commit's changes are staged, and its message comes
+    /// back for the box.
+    #[test]
+    fn undo_last_commit_moves_head_back_and_keeps_the_changes_staged() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let parent = git_in(p, &["rev-parse", "HEAD"]);
+        std::fs::write(p.join("b.txt"), "b\n").unwrap();
+        git_in(p, &["add", "b.txt"]);
+        git_in(p, &["commit", "-q", "-m", "Add b\n\nWith a body."]);
+        assert_eq!(undo_last_commit(p).as_deref(), Ok("Add b\n\nWith a body."));
+        assert_eq!(git_in(p, &["rev-parse", "HEAD"]), parent);
+        assert_eq!(git_in(p, &["diff", "--cached", "--name-only"]), "b.txt");
+        assert_eq!(std::fs::read_to_string(p.join("b.txt")).unwrap(), "b\n");
+    }
+
+    /// #1350: undoing the root commit leaves the branch unborn with every
+    /// file staged, as VS Code does with `update-ref -d HEAD`.
+    #[test]
+    fn undo_last_commit_on_the_root_commit_leaves_an_unborn_branch_staged() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        assert_eq!(undo_last_commit(p).as_deref(), Ok("init"));
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(!head.status.success(), "the branch is unborn");
+        assert_eq!(git_in(p, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(git_in(p, &["diff", "--cached", "--name-only"]), "seed.txt");
+    }
+
+    /// #1350 negative: in the middle of a merge, rebase, cherry-pick or
+    /// revert the undo is refused, says why, and leaves HEAD alone.
+    #[test]
+    fn undo_last_commit_refuses_during_a_merge() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let head = git_in(p, &["rev-parse", "HEAD"]);
+        std::fs::write(p.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+        let err = undo_last_commit(p).unwrap_err();
+        assert!(err.contains("merge"), "{err}");
+        assert_eq!(git_in(p, &["rev-parse", "HEAD"]), head);
+    }
+
+    /// #1350 negative: a repository with no commit has nothing to undo.
+    #[test]
+    fn undo_last_commit_with_no_commit_says_so() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        git_in(p, &["init", "-q", "-b", "main"]);
+        let err = undo_last_commit(p).unwrap_err();
+        assert!(err.contains("no commit"), "{err}");
+    }
+
+    /// #1350: whether HEAD is already on its upstream, so the app can warn
+    /// that undoing it means a force push later. No upstream is not pushed.
+    #[test]
+    fn head_on_upstream_follows_the_tracking_branch() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        assert!(!head_is_on_upstream(p), "no upstream yet");
+        let remote = TempDir::new().unwrap();
+        git_in(remote.path(), &["init", "-q", "--bare"]);
+        git_in(
+            p,
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        git_in(p, &["push", "-q", "-u", "origin", "main"]);
+        assert!(head_is_on_upstream(p), "pushed");
+        std::fs::write(p.join("c.txt"), "c\n").unwrap();
+        git_in(p, &["add", "c.txt"]);
+        git_in(p, &["commit", "-q", "-m", "local only"]);
+        assert!(!head_is_on_upstream(p), "a local commit is not pushed");
     }
 
     #[test]
