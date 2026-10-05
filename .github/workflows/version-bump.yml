@@ -1,0 +1,113 @@
+# Assigns croft's version after a merge, once, on main.
+#
+# A pull request never changes `version` or writes a version's notes. It adds
+# a fragment, src/release_notes/unreleased/<name>.md, that no other PR names
+# (ci.yml's `release notes` job checks that). On every push to main this job
+# folds the pending fragments into src/release_notes/<next>.md, removes them,
+# bumps Cargo.toml and croft's entry in Cargo.lock, and pushes that as one
+# `chore: release <next>` commit. The rules live in scripts/release.py and are
+# tested in scripts/tests/test_release.py; this file only runs them.
+#
+# Why: when every PR bumped the version and wrote that version's notes, every
+# open PR edited the same line, so each merge put all the others in conflict,
+# and a PR whose number main reached had to take a new number and rename its
+# notes.
+#
+# The shape is code-graph-rag's version bump: a deploy key pushes past main's
+# pull-request rule (the ruleset lets deploy keys bypass it, and a push with
+# the workflow token could not). Two things are added. Runs are serialized
+# and queued, so two merges close together never compute the same number. A
+# push that loses a race with a merge is redone on the new main rather than
+# dropped.
+#
+# A merge that shipped nothing leaves no fragment, and the job then commits
+# nothing. Merges that land while a run is still going are released together
+# by the next run: each run folds every fragment pending on main when it
+# starts.
+#
+# Tags and GitHub releases stay manual: pushing `v<version>` still runs
+# release.yml, which publishes src/release_notes/<version>.md as the body.
+name: version bump
+
+on:
+  push:
+    branches: [main]
+  # For a minor or major release: run it by hand on main. With no fragment
+  # pending it releases nothing, as a push would.
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which component to bump (MINOR and PATCH stay below 1000)
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+# The job writes through the deploy key, never the workflow token.
+permissions:
+  contents: read
+
+# One run at a time, and never cancelled: a cancelled run could stop between
+# its commit and its push. Every queued run waits its turn (`queue: max`):
+# by default a group keeps one pending run and a newer one replaces it, and
+# a minor or major release asked for by hand would have been replaced by
+# the next merge's patch run.
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  release:
+    name: fold the notes and bump the version
+    # The job's own commit triggers this workflow again (a deploy-key push
+    # does, unlike a workflow-token push). That run finds nothing pending and
+    # pushes nothing, so it needs no skip; a skip by commit message would
+    # also skip a merged PR whose title began the same way.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: The deploy key is set
+        env:
+          KEY: ${{ secrets.VERSION_BUMP_SSH_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::secrets.VERSION_BUMP_SSH_KEY is not set, so the pending release notes cannot be released. Add a deploy key with write access and its private key as that secret (CONTRIBUTING.md, 'Releases are cut after merge')."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          # The newest main, not the triggering commit: a queued run may start
+          # after more merges have landed.
+          ref: main
+          ssh-key: ${{ secrets.VERSION_BUMP_SSH_KEY }}
+
+      - name: Fold the notes, bump the version and push
+        env:
+          # A choice input, and release.py refuses anything but the three
+          # kinds before it writes.
+          BUMP: ${{ inputs.bump || 'patch' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin main
+            git reset -q --hard origin/main
+            new="$(python3 scripts/release.py cut "$BUMP")"
+            if [ -z "$new" ]; then
+              echo "No release notes are pending on main; nothing to release."
+              exit 0
+            fi
+            git add -A src/release_notes Cargo.toml Cargo.lock
+            git commit -q -m "chore: release $new"
+            if git push -q origin HEAD:main; then
+              echo "Released $new."
+              echo "Released **$new**: \`src/release_notes/$new.md\`." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "main moved while releasing $new; starting again from the new main."
+            sleep $((attempt * 5))
+          done
+          echo "::error::The release commit could not be pushed after 5 attempts."
+          exit 1

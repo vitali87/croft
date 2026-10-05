@@ -42,10 +42,6 @@ pub enum InputPurpose {
     NewWorktreeLane,
     /// The command to run across the fleet (#363).
     FleetCommand,
-    /// A new value for the setting `key` (#612).
-    SettingValue {
-        key: String,
-    },
     /// The host to push the syncable config to now (#262).
     SyncConfigHost,
     /// The pull request to review (#365): a number, `#n`, or its URL.
@@ -156,6 +152,10 @@ pub enum InputPurpose {
     DismissAlertComment {
         number: u64,
         reason: usize,
+    },
+    /// A new value for the setting `key` (#612).
+    SettingValue {
+        key: String,
     },
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.

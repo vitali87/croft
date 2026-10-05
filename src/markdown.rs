@@ -11,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::highlight::{
-    HiSpan, LangKind, LangRegistry, compute_line_starts, highlight_text, lang_for_extension,
+    HiSpan, LangKind, LangRegistry, compute_line_starts, highlight_text, lang_for_fence,
 };
 use crate::theme::Theme;
 
@@ -710,22 +710,6 @@ pub struct MdImage {
     /// Reserved line count, from the image's aspect at build time.
     pub rows: u16,
     pub path: std::path::PathBuf,
-}
-
-/// Map a fenced code block's info string to a highlighter language. Accepts
-/// the common fence names and falls back to the file-extension table.
-fn lang_for_fence(info: &str) -> Option<LangKind> {
-    let tag = info.split_whitespace().next().unwrap_or("");
-    Some(match tag.to_ascii_lowercase().as_str() {
-        "rust" => LangKind::Rust,
-        "python" => LangKind::Python,
-        "javascript" => LangKind::JavaScript,
-        "typescript" => LangKind::TypeScript,
-        "golang" => LangKind::Go,
-        "shell" | "console" | "terminal" => LangKind::Bash,
-        "codeql" => LangKind::Ql,
-        other => return lang_for_extension(other),
-    })
 }
 
 /// Convert one highlighted source line into owned spans, filling unstyled

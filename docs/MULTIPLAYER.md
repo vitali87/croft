@@ -210,10 +210,10 @@ displaces nothing.
 
 A remote croft is updated underneath its session: the launching machine ships
 a new binary to `~/.cargo/bin/croft` while the old one runs. The inner croft
-offers `F9` to re-exec into it; the **host** replaces its own process image,
-keeping the session alive. The listening socket, the PTY master and the inner
-child's pid ride through the `exec` by number, so the successor adopts the
-running session instead of binding and spawning a new one.
+offers `Ctrl+Shift+F9` to re-exec into it; the **host** replaces its own
+process image, keeping the session alive. The listening socket, the PTY master
+and the inner child's pid ride through the `exec` by number, so the successor
+adopts the running session instead of binding and spawning a new one.
 
 Accepted client connections cannot ride along: they are ordinary fds and die
 at the `exec`. So the host broadcasts `HostSwap` first, and a client seeing it
@@ -421,6 +421,18 @@ hint, reconnects through the normal 2s-backoff path, and guest files
 re-bootstrap. EOF used to be indistinguishable from an idle socket, so a
 killed relay left `is_live` true forever while every op vanished — with saves
 still gated, a guest's work existed only in RAM.
+
+**So is the owner leaving.** The relay outlives the owner, so a guest's link
+stays up after the owner quits. The owner heartbeats on the relay
+(`CollabMsg::OwnerHere`, every second) and says goodbye when its session
+drops (`OwnerLeft`). A guest that hears the goodbye, or stops hearing a
+heartbeat it used to hear for 15 seconds, turns its live files local-only:
+the save gate stands down and the status says "The session owner left; saves
+now write to disk". When an owner's heartbeat is heard again, those files
+re-bootstrap from it, merging against the file on disk (the text a new owner
+starts from), so the guest's work since the owner left reaches the new owner
+instead of forking from it. A guest that never heard a heartbeat (an older
+owner) never decides the owner left.
 
 A previously-attached buffer that diverged while the link was down holds work
 that exists nowhere else (its ops never left the machine), so the re-bootstrap

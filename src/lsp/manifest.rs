@@ -45,6 +45,7 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-toml/extension.toml"),
     include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
     include_str!("../../assets/extensions/lsp-lua/extension.toml"),
+    include_str!("../../assets/extensions/lsp-markdown/extension.toml"),
     include_str!("../../assets/extensions/dap-python/extension.toml"),
     include_str!("../../assets/extensions/dap-lldb/extension.toml"),
     include_str!("../../assets/extensions/dap-js/extension.toml"),
@@ -412,13 +413,15 @@ pub struct ProvisionDecl {
     #[serde(default)]
     pub archive: Option<ArchiveKindDecl>,
     /// `binary`: literal path to the executable inside the unpacked archive.
-    /// Absent for a single-file `.gz`.
+    /// Absent for a single-file `.gz` or a `raw` asset.
     #[serde(default)]
     pub bin_path: Option<String>,
-    /// `binary`: Termux/Android package name for `pkg install`, used when the
-    /// cross-distro release can't run on Android (absent → PATH fallback).
+    /// Termux/Android package for `pkg install`, where the normal install
+    /// can't run. `binary`: absent (or `false`) leaves Android to a copy on
+    /// PATH. `uv`: absent means Termux names it like PyPI (`package`), and
+    /// `false` says Termux does not package it at all.
     #[serde(default)]
-    pub termux_pkg: Option<String>,
+    pub termux_pkg: Option<TermuxPkgDecl>,
     /// `binary`: per-platform SHA-256 of the asset, keyed like `targets`.
     /// Three outcomes: no map at all installs unverified; a platform with an
     /// entry has its download verified before anything is unpacked; a map that
@@ -445,6 +448,17 @@ pub enum ArchiveKindDecl {
     /// (cargo-dist's layout).
     #[serde(rename = "tar.xz")]
     TarXz,
+    /// No archive: the asset is the executable itself.
+    Raw,
+}
+
+/// A manifest's `termux_pkg`: a Termux package name, or `false` for a tool
+/// Termux does not package (`true` means the default for the provision kind).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TermuxPkgDecl {
+    Name(String),
+    Flag(bool),
 }
 
 /// A server registration extracted from a manifest: its priority, the language
@@ -639,6 +653,11 @@ impl ProvisionDecl {
                 package: package(),
                 version,
                 bin,
+                termux_pkg: match &self.termux_pkg {
+                    None | Some(TermuxPkgDecl::Flag(true)) => Some(package()),
+                    Some(TermuxPkgDecl::Name(name)) => Some(intern(name)),
+                    Some(TermuxPkgDecl::Flag(false)) => None,
+                },
             },
             ProvisionKind::Binary => Provision::Binary {
                 targets: intern_pairs(&self.targets),
@@ -647,9 +666,13 @@ impl ProvisionDecl {
                     ArchiveKindDecl::Gz => ArchiveKind::Gz,
                     ArchiveKindDecl::Zip => ArchiveKind::Zip,
                     ArchiveKindDecl::TarXz => ArchiveKind::TarXz,
+                    ArchiveKindDecl::Raw => ArchiveKind::Raw,
                 },
                 bin_path: self.bin_path.as_deref().map(intern),
-                termux_pkg: self.termux_pkg.as_deref().map(intern),
+                termux_pkg: match &self.termux_pkg {
+                    Some(TermuxPkgDecl::Name(name)) => Some(intern(name)),
+                    None | Some(TermuxPkgDecl::Flag(_)) => None,
+                },
                 sha256: intern_pairs(&self.sha256),
             },
         }
@@ -953,6 +976,60 @@ provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { 
             "the archive kind reads `tar.xz`"
         );
         assert_eq!(bin, "csvlens");
+    }
+
+    /// `archive = "raw"` names an asset that is the executable itself (#834).
+    #[test]
+    fn a_raw_archive_kind_parses() {
+        const DECL: &str = r#"
+id = "r"
+name = "r"
+api_version = 1
+
+[[language_servers]]
+name = "rbin"
+command = "rbin"
+language = "markdown"
+provision = { kind = "binary", bin = "rbin", archive = "raw", targets = { "macos" = "https://example.invalid/rbin" } }
+"#;
+        let m = parse(DECL).expect("the manifest parses");
+        let p = m.language_servers[0]
+            .provision
+            .as_ref()
+            .expect("provisioned")
+            .to_provision();
+        let Provision::Binary { archive, .. } = p else {
+            panic!("a binary provision was declared");
+        };
+        assert_eq!(archive, ArchiveKind::Raw, "the archive kind reads `raw`");
+    }
+
+    /// A uv tool's Termux package defaults to its PyPI name (ty, ruff), can be
+    /// named, and `termux_pkg = false` says Termux has none (rumdl, #851).
+    #[test]
+    fn a_uv_provision_reads_its_termux_package() {
+        let termux_pkg_of = |extra: &str| {
+            let src = format!(
+                "id = \"u\"\nname = \"u\"\napi_version = 1\n\n[[language_servers]]\nname = \"u\"\ncommand = \"u\"\nlanguage = \"markdown\"\nprovision = {{ kind = \"uv\", package = \"pypi-u\", bin = \"u\"{extra} }}\n"
+            );
+            let m = parse(&src).expect("the manifest parses");
+            let Provision::Uv { termux_pkg, .. } = m.language_servers[0]
+                .provision
+                .as_ref()
+                .expect("provisioned")
+                .to_provision()
+            else {
+                panic!("a uv provision was declared");
+            };
+            termux_pkg
+        };
+        assert_eq!(
+            termux_pkg_of(""),
+            Some("pypi-u"),
+            "defaults to the PyPI name"
+        );
+        assert_eq!(termux_pkg_of(", termux_pkg = \"t-u\""), Some("t-u"));
+        assert_eq!(termux_pkg_of(", termux_pkg = false"), None);
     }
 
     const PYTHON: &str = include_str!("../../assets/extensions/lsp-python/extension.toml");

@@ -1,0 +1,1 @@
+fix: The Search sidebar searches and replaces the query exactly as typed: a trailing space in `return ` no longer lets it match `returned`, so Replace All no longer rewrites words you never searched for, and a query of spaces finds those spaces. Only a line break left at either end by a paste is dropped.

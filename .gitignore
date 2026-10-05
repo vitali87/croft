@@ -35,6 +35,8 @@ preview*.svg
 .cgr-hash-cache.json
 .cgr-dir-mtimes.json
 .cgr-parser-fingerprint
+.cgr-exclusion-state.json
+.qdrant_code_embeddings/
 .tmp/
 
 # Debugger build artifacts (build_debuggable_binary drops <stem>.dbg next to source)

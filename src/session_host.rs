@@ -325,7 +325,7 @@ pub fn stale_marker_path(socket: &Path) -> PathBuf {
 
 /// Sidecar holding the croft version this host process runs (#652). A host
 /// swap (#238) moves the host onto a new binary without touching the inner
-/// croft, which keeps its version until an F9 reload; this is how the inner
+/// croft, which keeps its version until it relaunches; this is how the inner
 /// croft learns the version a reattaching client would get.
 pub fn host_version_path(socket: &Path) -> PathBuf {
     let mut name = socket.file_name().unwrap_or_default().to_os_string();

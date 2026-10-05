@@ -919,6 +919,13 @@ struct LangCapabilitySupport {
     /// Concatenated on-type trigger characters per language (#254);
     /// a missing entry means "not probed yet".
     on_type_triggers: HashMap<Language, String>,
+    /// The servers reporting on each open document, by name (#851): the
+    /// built-in Markdown lint stands down for a file only while rumdl
+    /// reports on it. A document the app never opened here (one shown only
+    /// in a split's other group) has no entry, and a server leaves the
+    /// lists it was on when it is retired from document pulls or given up
+    /// on after crashing.
+    document_servers: HashMap<PathBuf, Vec<String>>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -1643,6 +1650,29 @@ impl LspManager {
             .is_ok_and(|s| s.will_rename.values().any(|w| *w))
     }
 
+    /// Whether the server named `name` reports on the open document `path`
+    /// (#851). Read synchronously by the app: the built-in Markdown lint
+    /// stands down for a file rumdl, which covers its rules, reports on.
+    pub fn document_reported_by(&self, path: &Path, name: &str) -> bool {
+        self.capability_support.lock().is_ok_and(|s| {
+            s.document_servers
+                .get(path)
+                .is_some_and(|names| names.iter().any(|n| n == name))
+        })
+    }
+
+    /// Test hook: record `names` as the servers reporting on `path`, as an
+    /// open would, without starting any.
+    #[cfg(test)]
+    pub fn set_document_servers_for_test(&self, path: &Path, names: &[&str]) {
+        if let Ok(mut support) = self.capability_support.lock() {
+            support.document_servers.insert(
+                path.to_path_buf(),
+                names.iter().map(|n| n.to_string()).collect(),
+            );
+        }
+    }
+
     /// Whether the server for `lang` implements call hierarchy. `None` means
     /// no server has reported yet. Drives the right-click menu rows.
     pub fn language_supports_call_hierarchy(&self, lang: Language) -> Option<bool> {
@@ -1973,6 +2003,18 @@ struct ManagedClient {
     /// would accrue one leak per refresh for the whole session. Asking it
     /// once and then stopping bounds the damage at exactly one.
     diagnostic_pull_stalled: Arc<AtomicBool>,
+    /// Whether the server answers `textDocument/diagnostic` (#866), which
+    /// advertising `diagnosticProvider` at all promises. croft declares the
+    /// pull capability for the workspace pull (#533), and servers such as
+    /// rumdl and the VS Code JSON, CSS and HTML servers then stop pushing,
+    /// so for them a document pull is the only way diagnostics arrive.
+    supports_document_diagnostics: bool,
+    /// Set once this server lets a document pull expire; it is not asked
+    /// again, for the reason `diagnostic_pull_stalled` gives.
+    document_pull_stalled: Arc<AtomicBool>,
+    /// The newest pull generation per document (#866). A pull an edit has
+    /// overtaken neither goes out nor, answered late, lands over a newer one.
+    document_pull_generations: Arc<StdMutex<HashMap<PathBuf, u64>>>,
     supports_hover: bool,
     supports_definition: bool,
     supports_document_symbol: bool,
@@ -2677,6 +2719,17 @@ impl WorkerState {
                     .into_iter()
                     .filter(|m| m.client.try_lock().map_or(true, |c| !c.has_exited()))
                     .collect();
+                // The dead ones report on nothing any more.
+                if let Ok(mut support) = self.capability_support.lock() {
+                    for (path, doc) in &self.docs {
+                        if (doc.language, doc.project_root.clone()) != key {
+                            continue;
+                        }
+                        if let Some(names) = support.document_servers.get_mut(path) {
+                            names.retain(|n| alive.iter().any(|m| &m.name == n));
+                        }
+                    }
+                }
                 self.restarts.incomplete.remove(&key);
                 self.clients.insert(key, alive);
                 continue;
@@ -2693,6 +2746,13 @@ impl WorkerState {
                     let _ =
                         tokio::time::timeout(std::time::Duration::from_secs(3), client.shutdown())
                             .await;
+                }
+            }
+            if let Ok(mut support) = self.capability_support.lock() {
+                for (path, doc) in &self.docs {
+                    if (doc.language, doc.project_root.clone()) == key {
+                        support.document_servers.remove(path);
+                    }
                 }
             }
             self.docs
@@ -2793,6 +2853,7 @@ impl WorkerState {
                             signature_help_supported(&caps.signature_help_provider);
                         let supports_workspace_diagnostics =
                             workspace_diagnostics_supported(&caps.diagnostic_provider);
+                        let supports_document_diagnostics = caps.diagnostic_provider.is_some();
                         let diagnostic_identifier =
                             diagnostic_identifier_of(&caps.diagnostic_provider);
                         let supports_hover = hover_supported(&caps.hover_provider);
@@ -2883,6 +2944,9 @@ impl WorkerState {
                                 DiagnosticResultIds::default(),
                             )),
                             diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
+                            supports_document_diagnostics,
+                            document_pull_stalled: Arc::new(AtomicBool::new(false)),
+                            document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
                             supports_hover,
                             supports_definition,
                             supports_document_symbol,
@@ -3054,6 +3118,32 @@ impl WorkerState {
                 log_file::log(&format!("lsp[{name}] did_open failed: {e}"));
             }
         }
+        // Pull-mode servers report only when asked (#866); ask at once, since
+        // nothing is typed yet to debounce.
+        let key: ClientKey = (lang, project_root.clone());
+        let pulls = self
+            .clients
+            .get(&key)
+            .map(|cs| document_pull_targets(cs.iter(), &path, &uri, &self.capability_support))
+            .unwrap_or_default();
+        spawn_document_pulls(
+            pulls,
+            self.diagnostics_tx.clone(),
+            std::time::Duration::ZERO,
+        );
+        // Who reports on it (#851): every server open on it, less any retired
+        // from document pulls, since those report nothing.
+        let reporting: Vec<String> = self
+            .clients
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|c| !c.document_pull_stalled.load(Ordering::Relaxed))
+            .map(|c| c.name.clone())
+            .collect();
+        if let Ok(mut support) = self.capability_support.lock() {
+            support.document_servers.insert(path.clone(), reporting);
+        }
         self.docs.insert(
             path,
             DocState {
@@ -3087,6 +3177,12 @@ impl WorkerState {
                 log_file::log(&format!("lsp[{name}] did_change failed: {e}"));
             }
         }
+        let pulls = self
+            .clients
+            .get(&key)
+            .map(|cs| document_pull_targets(cs.iter(), &path, &uri, &self.capability_support))
+            .unwrap_or_default();
+        spawn_document_pulls(pulls, self.diagnostics_tx.clone(), DOCUMENT_PULL_DEBOUNCE);
     }
 
     async fn save_doc(&mut self, path: PathBuf) {
@@ -3116,6 +3212,9 @@ impl WorkerState {
         let Some(doc) = self.docs.remove(&path) else {
             return;
         };
+        if let Ok(mut support) = self.capability_support.lock() {
+            support.document_servers.remove(&path);
+        }
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
@@ -3131,6 +3230,27 @@ impl WorkerState {
             let mut client = client_arc.lock().await;
             if let Err(e) = client.did_close(uri.clone()) {
                 log_file::log(&format!("lsp[{name}] did_close failed: {e}"));
+            }
+        }
+        // A pulled set describes an open buffer (#866): withdraw it, and
+        // drop the generation so a pull still in flight stands down. A
+        // server that also reports per workspace keeps covering the closed
+        // file through that pull, so its rows stay.
+        for managed in self.clients.get(&key).into_iter().flatten() {
+            if !managed.supports_document_diagnostics {
+                continue;
+            }
+            managed
+                .document_pull_generations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&path);
+            if !managed.supports_workspace_diagnostics {
+                let _ = self.diagnostics_tx.send(DiagnosticsUpdate {
+                    path: path.clone(),
+                    server: managed.name.clone(),
+                    diagnostics: Vec::new(),
+                });
             }
         }
     }
@@ -4264,13 +4384,32 @@ impl WorkerState {
     }
 
     /// Pull whole-project diagnostics from every spawned server that
-    /// advertises `workspaceDiagnostics` (#533). Fire-and-forget: the reports
-    /// land on the diagnostics channel the push path already feeds.
+    /// advertises `workspaceDiagnostics` (#533), and every open document's
+    /// from each server that answers `textDocument/diagnostic` (#866): a
+    /// server's `workspace/diagnostic/refresh` asks the client to re-pull
+    /// everything it holds. Fire-and-forget: the reports land on the
+    /// diagnostics channel the push path already feeds.
     fn request_workspace_diagnostics(&self) {
         spawn_workspace_pull(
             workspace_pull_targets(self.clients.values().flatten()),
             self.diagnostics_tx.clone(),
         );
+        for (path, doc) in &self.docs {
+            let Ok(uri) = Url::from_file_path(path) else {
+                continue;
+            };
+            let key: ClientKey = (doc.language, doc.project_root.clone());
+            let pulls = self
+                .clients
+                .get(&key)
+                .map(|cs| document_pull_targets(cs.iter(), path, &uri, &self.capability_support))
+                .unwrap_or_default();
+            spawn_document_pulls(
+                pulls,
+                self.diagnostics_tx.clone(),
+                std::time::Duration::ZERO,
+            );
+        }
     }
 
     /// `workspace/symbol`: fan the query out to every running server that
@@ -6124,6 +6263,220 @@ fn apply_workspace_report(
     forwarded
 }
 
+/// Settle time before a document pull goes out after an edit (#866): a
+/// burst of keystrokes sends one pull, for its last edit, not one per key.
+const DOCUMENT_PULL_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Ceiling on one `textDocument/diagnostic` pull (#866). A server that lets
+/// one expire is retired from document pulls, for the reason
+/// `ManagedClient::diagnostic_pull_stalled` gives.
+const DOCUMENT_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Generation numbers for document pulls (#866), unique for the whole
+/// session. A per-document count would start over when a document is
+/// closed and reopened, and a pull from before the close could then pass
+/// for the reopened buffer's latest.
+static NEXT_DOCUMENT_PULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One `textDocument/diagnostic` pull (#866): a server that answers it, the
+/// document, and the generation this pull stands for.
+struct DocumentPull {
+    name: String,
+    client: Arc<TokioMutex<LspClient>>,
+    identifier: Option<String>,
+    stalled: Arc<AtomicBool>,
+    generations: Arc<StdMutex<HashMap<PathBuf, u64>>>,
+    generation: u64,
+    path: PathBuf,
+    uri: Url,
+    /// Whether the server also answers the workspace pull, which keeps its
+    /// sets fresh after it is retired from document pulls.
+    reports_per_workspace: bool,
+    /// Where the documents the server reports on are recorded (#851).
+    support: CapabilitySupport,
+}
+
+impl DocumentPull {
+    /// Whether no later pull for this document has been issued since this
+    /// one. Otherwise an edit overtook it, and its answer would describe text
+    /// the buffer no longer holds.
+    fn is_current(&self) -> bool {
+        let generations = self.generations.lock().unwrap_or_else(|e| e.into_inner());
+        generations.get(&self.path) == Some(&self.generation)
+    }
+
+    /// Once a pull expired and retired the server from document pulls: it
+    /// reports on none of its documents any more, so it leaves their
+    /// reporter lists (#851; the built-in Markdown lint comes back where it
+    /// stood down for rumdl), and the sets it pulled for them are withdrawn,
+    /// as nothing will refresh them after an edit. A server that also
+    /// reports per workspace keeps those.
+    fn retire(&self, tx: &std_mpsc::Sender<DiagnosticsUpdate>) {
+        let served: Vec<PathBuf> = self
+            .generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        if let Ok(mut support) = self.support.lock() {
+            for path in &served {
+                if let Some(names) = support.document_servers.get_mut(path) {
+                    names.retain(|n| *n != self.name);
+                }
+            }
+        }
+        if self.reports_per_workspace {
+            return;
+        }
+        for path in served {
+            let _ = tx.send(DiagnosticsUpdate {
+                path,
+                server: self.name.clone(),
+                diagnostics: Vec::new(),
+            });
+        }
+    }
+}
+
+/// The pulls an opened or edited document calls for (#866): one per server
+/// among `clients` that answers `textDocument/diagnostic` and has not been
+/// retired, each stamped with a new generation so any older pull for the
+/// document stands down.
+fn document_pull_targets<'a>(
+    clients: impl Iterator<Item = &'a ManagedClient>,
+    path: &Path,
+    uri: &Url,
+    support: &CapabilitySupport,
+) -> Vec<DocumentPull> {
+    clients
+        .filter(|c| c.supports_document_diagnostics)
+        .filter(|c| !c.document_pull_stalled.load(Ordering::Relaxed))
+        .map(|c| {
+            let generation = {
+                let mut generations = c
+                    .document_pull_generations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let next = NEXT_DOCUMENT_PULL.fetch_add(1, Ordering::Relaxed);
+                generations.insert(path.to_path_buf(), next);
+                next
+            };
+            DocumentPull {
+                name: c.name.clone(),
+                client: c.client.clone(),
+                identifier: c.diagnostic_identifier.clone(),
+                stalled: c.document_pull_stalled.clone(),
+                generations: c.document_pull_generations.clone(),
+                generation,
+                path: path.to_path_buf(),
+                uri: uri.clone(),
+                reports_per_workspace: c.supports_workspace_diagnostics,
+                support: support.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Run each pull off the worker loop once `debounce` has passed (#866),
+/// forwarding its report under the server's name on the channel the push
+/// path feeds, so the app stores it like any published set.
+fn spawn_document_pulls(
+    targets: Vec<DocumentPull>,
+    tx: std_mpsc::Sender<DiagnosticsUpdate>,
+    debounce: std::time::Duration,
+) {
+    spawn_document_pulls_within(targets, tx, debounce, DOCUMENT_PULL_TIMEOUT);
+}
+
+/// [`spawn_document_pulls`] with the ceiling passed in, so a test can watch
+/// the timeout path without waiting [`DOCUMENT_PULL_TIMEOUT`] for it.
+fn spawn_document_pulls_within(
+    targets: Vec<DocumentPull>,
+    tx: std_mpsc::Sender<DiagnosticsUpdate>,
+    debounce: std::time::Duration,
+    ceiling: std::time::Duration,
+) {
+    for target in targets {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if !debounce.is_zero() {
+                tokio::time::sleep(debounce).await;
+            }
+            // Overtaken by a later edit while it waited, or the server was
+            // retired meanwhile: nothing to ask.
+            if !target.is_current() || target.stalled.load(Ordering::Relaxed) {
+                return;
+            }
+            // As in the workspace pull, the client is not held across the
+            // await: a server that never answers must not wedge `open_doc`.
+            let server = {
+                let client = target.client.lock().await;
+                client.detached_server()
+            };
+            let resp = tokio::time::timeout(
+                ceiling,
+                crate::lsp::client::LspRequests::document_diagnostics_on(
+                    server,
+                    target.uri.clone(),
+                    target.identifier.clone(),
+                ),
+            )
+            .await;
+            let report = match resp {
+                Ok(Ok(report)) => report,
+                Ok(Err(e)) => {
+                    log_file::log(&format!(
+                        "lsp[{}] textDocument/diagnostic error: {e:#}",
+                        target.name
+                    ));
+                    return;
+                }
+                Err(_) => {
+                    target.stalled.store(true, Ordering::Relaxed);
+                    log_file::log(&format!(
+                        "lsp[{}] textDocument/diagnostic timed out after {}s; \
+                         retiring it from document pulls for this session",
+                        target.name,
+                        ceiling.as_secs()
+                    ));
+                    target.retire(&tx);
+                    return;
+                }
+            };
+            if !target.is_current() {
+                return;
+            }
+            let Some(items) = document_report_items(report) else {
+                return;
+            };
+            let _ = tx.send(DiagnosticsUpdate {
+                path: target.path.clone(),
+                server: target.name.clone(),
+                diagnostics: items
+                    .iter()
+                    .map(crate::lsp::client::convert_diagnostic)
+                    .collect(),
+            });
+        });
+    }
+}
+
+/// The diagnostics a `textDocument/diagnostic` answer carries for the
+/// document itself (#866). `None` for an answer with none of its own: an
+/// `Unchanged` report, which croft never invites by sending a previous result
+/// id, or a bare partial result.
+fn document_report_items(
+    result: lsp_types::DocumentDiagnosticReportResult,
+) -> Option<Vec<lsp_types::Diagnostic>> {
+    match result {
+        lsp_types::DocumentDiagnosticReportResult::Report(
+            lsp_types::DocumentDiagnosticReport::Full(full),
+        ) => Some(full.full_document_diagnostic_report.items),
+        _ => None,
+    }
+}
+
 /// The server's `diagnosticProvider.identifier`, echoed back on every pull.
 ///
 /// A server that registered several diagnostic sources uses it to tell which
@@ -7269,6 +7622,9 @@ while True:
             diagnostic_identifier: None,
             diagnostic_result_ids: Arc::new(TokioMutex::new(DiagnosticResultIds::default())),
             diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
+            supports_document_diagnostics: false,
+            document_pull_stalled: Arc::new(AtomicBool::new(false)),
+            document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
             supports_completion: false,
             supports_signature_help: false,
             supports_hover: false,
@@ -7385,6 +7741,301 @@ while True:
                 "a pull queued before retirement must issue no request: each \
                  one leaves an entry in async-lsp's outgoing map that only a \
                  response can drain, and this server never answers"
+            );
+        });
+    }
+
+    /// A stub language server that advertises `diagnosticProvider` without
+    /// workspace pulls, as rumdl and the VS Code JSON server do (#866). Each
+    /// `textDocument/diagnostic` it receives appends a line to `receipt`;
+    /// with `answer` it replies with one error, "stub problem", and without
+    /// it never replies.
+    fn document_pull_server_script(dir: &Path, answer: bool) -> (PathBuf, PathBuf) {
+        let path = dir.join(format!("doc_pull_server_{answer}.py"));
+        let receipt = dir.join(format!("doc-pulls-{answer}"));
+        let reply = if answer {
+            r#"write({"jsonrpc": "2.0", "id": msg["id"], "result": {"kind": "full", "items": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                 "severity": 1, "message": "stub problem"}]}})"#
+        } else {
+            "pass"
+        };
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+import json, sys
+
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def write(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read()
+    if msg is None:
+        break
+    method = msg.get("method")
+    if method == "initialize":
+        write({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"capabilities": {{
+            "diagnosticProvider": {{"interFileDependencies": False, "workspaceDiagnostics": False}}
+        }}}}}})
+    elif method == "textDocument/diagnostic":
+        with open(sys.argv[1], "a") as f:
+            f.write("pull\n")
+        {reply}
+    elif "id" in msg:
+        write({{"jsonrpc": "2.0", "id": msg["id"], "result": None}})
+"#
+            ),
+        )
+        .expect("write stub server");
+        (path, receipt)
+    }
+
+    /// Spawn the document-pull stub and wrap it as a client that answers
+    /// `textDocument/diagnostic`, the shape `document_pull_targets` keeps.
+    async fn document_pull_client(
+        python: &Path,
+        root: &Path,
+        answer: bool,
+    ) -> (ManagedClient, PathBuf) {
+        let (script, receipt) = document_pull_server_script(root, answer);
+        let config = ServerConfig {
+            name: "doc-pull",
+            command: python.to_string_lossy().into_owned(),
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                receipt.to_string_lossy().into_owned(),
+            ],
+            language: Language::MARKDOWN,
+            initialization_options: None,
+            provision: None,
+        };
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let client = LspClient::spawn(
+            &config,
+            root,
+            build_client_capabilities(),
+            &[],
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+            prog_tx,
+        )
+        .await
+        .expect("the stub server handshakes");
+        let mut managed = managed_client_for_pull_test(client);
+        managed.name = String::from("doc-pull");
+        managed.supports_workspace_diagnostics = false;
+        managed.supports_document_diagnostics = true;
+        (managed, receipt)
+    }
+
+    fn stub_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// #866: a server that only reports when asked has its answer forwarded
+    /// under its own name, on the channel a push lands on, so the app stores
+    /// it like any published set.
+    #[test]
+    fn a_document_pull_forwards_the_report_under_the_servers_name() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("a.md");
+        let uri = Url::from_file_path(&file).expect("a file uri");
+        let support: CapabilitySupport = Arc::default();
+        stub_runtime().block_on(async {
+            let (managed, _receipt) = document_pull_client(&python, &root, true).await;
+            let pulls = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            assert_eq!(pulls.len(), 1, "a diagnosticProvider server is pulled");
+            let (tx, rx) = std_mpsc::channel();
+            spawn_document_pulls_within(
+                pulls,
+                tx,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(20),
+            );
+            let update = tokio::task::spawn_blocking(move || {
+                rx.recv_timeout(crate::test_budget::spawn_budget(
+                    std::time::Duration::from_secs(5),
+                ))
+            })
+            .await
+            .expect("the waiter")
+            .expect("the pulled report arrives");
+            assert_eq!(update.path, file);
+            assert_eq!(update.server, "doc-pull");
+            let messages: Vec<&str> = update
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect();
+            assert_eq!(messages, ["stub problem"]);
+        });
+    }
+
+    /// #866: while typing, only the newest pull for a document goes out. One
+    /// an edit overtook is dropped before it is sent, so a slow answer about
+    /// older text can never land over a newer one.
+    #[test]
+    fn a_document_pull_an_edit_overtook_is_never_sent() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("a.md");
+        let uri = Url::from_file_path(&file).expect("a file uri");
+        let support: CapabilitySupport = Arc::default();
+        stub_runtime().block_on(async {
+            let (managed, receipt) = document_pull_client(&python, &root, true).await;
+            let older = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            let newer = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            let (tx, rx) = std_mpsc::channel();
+            let ceiling = std::time::Duration::from_secs(20);
+            spawn_document_pulls_within(older, tx.clone(), std::time::Duration::ZERO, ceiling);
+            spawn_document_pulls_within(newer, tx, std::time::Duration::ZERO, ceiling);
+            let first = tokio::task::spawn_blocking(move || {
+                let budget = crate::test_budget::spawn_budget(std::time::Duration::from_secs(5));
+                let first = rx.recv_timeout(budget);
+                // Room for a wrongly sent second answer to arrive too.
+                let second = rx.recv_timeout(std::time::Duration::from_millis(500));
+                (first, second)
+            })
+            .await
+            .expect("the waiter");
+            assert!(first.0.is_ok(), "the newest pull is answered");
+            assert!(first.1.is_err(), "and only it");
+            let pulls = std::fs::read_to_string(&receipt).unwrap_or_default();
+            assert_eq!(
+                pulls.lines().count(),
+                1,
+                "the overtaken pull never went out"
+            );
+        });
+    }
+
+    /// #866: a pull still out when its document closes is not the latest
+    /// pull once the document reopens, so its late answer, about the text
+    /// before the close, can never land on the reopened buffer.
+    #[test]
+    fn a_pull_from_before_a_close_is_stale_after_the_reopen() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("a.md");
+        let uri = Url::from_file_path(&file).expect("a file uri");
+        let support: CapabilitySupport = Arc::default();
+        stub_runtime().block_on(async {
+            let (managed, _receipt) = document_pull_client(&python, &root, true).await;
+            let before = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            // What `close_doc` does to the document's generation.
+            managed
+                .document_pull_generations
+                .lock()
+                .unwrap()
+                .remove(&file);
+            let after = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            assert!(after[0].is_current(), "the reopened document's pull");
+            assert!(
+                !before[0].is_current(),
+                "the pull from before the close is stale"
+            );
+        });
+    }
+
+    /// #866: a server that lets a document pull go unanswered is retired
+    /// from document pulls, as one that stalls a workspace pull is (#533):
+    /// every unanswered request leaks an entry async-lsp can never drain. It
+    /// then reports on nothing: its pulled sets are withdrawn and it leaves
+    /// the file's reporters, so the built-in Markdown lint returns where it
+    /// stood down for rumdl (#851).
+    #[test]
+    fn an_unanswered_document_pull_retires_the_server() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("a.md");
+        let uri = Url::from_file_path(&file).expect("a file uri");
+        let support: CapabilitySupport = Arc::default();
+        stub_runtime().block_on(async {
+            let (managed, _receipt) = document_pull_client(&python, &root, false).await;
+            // Opened with another server beside it (#851).
+            support.lock().unwrap().document_servers.insert(
+                file.clone(),
+                vec![String::from("doc-pull"), String::from("other")],
+            );
+            let pulls = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            let (tx, rx) = std_mpsc::channel();
+            spawn_document_pulls_within(
+                pulls,
+                tx,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(200),
+            );
+            let retired = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !managed.document_pull_stalled.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(retired.is_ok(), "the unanswered pull retires the server");
+            assert!(
+                document_pull_targets(std::iter::once(&managed), &file, &uri, &support).is_empty(),
+                "and it is not asked again"
+            );
+            let withdrawn = tokio::task::spawn_blocking(move || {
+                rx.recv_timeout(crate::test_budget::spawn_budget(
+                    std::time::Duration::from_secs(5),
+                ))
+            })
+            .await
+            .expect("the waiter")
+            .expect("its pulled set is withdrawn");
+            assert_eq!(
+                (withdrawn.path, withdrawn.server.as_str()),
+                (file.clone(), "doc-pull")
+            );
+            assert!(withdrawn.diagnostics.is_empty());
+            assert_eq!(
+                support.lock().unwrap().document_servers[&file],
+                ["other"],
+                "it no longer counts as reporting on the file, and only it left"
             );
         });
     }

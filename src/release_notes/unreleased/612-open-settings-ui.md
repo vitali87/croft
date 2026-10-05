@@ -1,0 +1,1 @@
+feature: "Preferences: Open Settings (UI)" opens a searchable Settings editor: Enter flips a toggle, cycles a choice, or asks for a number or text, then writes it to your user settings and applies it at once (#612).

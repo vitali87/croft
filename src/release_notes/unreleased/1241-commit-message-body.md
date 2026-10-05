@@ -1,0 +1,1 @@
+fix: Commit messages can have a body. The Source Control message box keeps pasted line breaks (instead of gluing the lines together), Shift+Enter or Alt+Enter starts a new line while Enter still commits, the box grows a row per line (scrolling past six), and Up/Down move between its lines.

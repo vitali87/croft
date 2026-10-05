@@ -3,14 +3,12 @@
 # recognises but ships no LSP for (highlighting comes from tree-sitter, a
 # separate path). Keeping them here preserves the exact `Language::from_extension`
 # surface now that it is data-driven, and models "a language is a contribution"
-# the same way a third-party language extension would.
+# the same way a third-party language extension would. A format that gains a
+# bundled server moves to that server's extension, as Markdown did to
+# `lsp-markdown`; none is left today, but this stays the home for the next one.
 id = "core-languages"
 name = "Core language identities"
 description = "File-type identities for formats with no bundled language server."
 builtin = true
 hidden = true
 api_version = 1
-
-[[languages]]
-id = "markdown"
-extensions = ["md", "markdown"]

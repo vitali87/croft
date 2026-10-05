@@ -56,7 +56,7 @@ With [Homebrew](https://brew.sh) on macOS or Linux, no toolchain and no compile:
 brew install vitali87/croft/croft
 ```
 
-Upgrade with `brew upgrade croft`; croft's own updater (F9) leaves a Homebrew
+Upgrade with `brew upgrade croft`; croft's own updater (`Ctrl+Shift+F9`) leaves a Homebrew
 install to brew. Each release updates the formula, and it installs the same
 prebuilt archives as below.
 
@@ -136,7 +136,7 @@ croft demo                       # a guided tour in a throwaway sample project (
 croft view report.pdf            # from any pane: open a file in the croft you are sitting in
 cat data.csv | croft view -      # ...or pipe it in (staged to ~/.cache/croft, 0600, swept at the next launch once a day old)
 croft theme-import theme.json    # use a VS Code colour theme in croft
-croft locale-template fr         # start translating croft's UI (see docs/SETTINGS.md)
+croft locale-template fr --write # start or update a translation of croft's UI (see docs/SETTINGS.md)
 croft theme-import dracula-theme.theme-dracula   # ...or fetch one from the marketplace
 croft --help
 ```

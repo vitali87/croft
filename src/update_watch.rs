@@ -365,11 +365,11 @@ fn self_install_command_with(cargo: PathBuf, manifest_dir: &str) -> std::process
 /// local croft, reported through the same [`UpdateEvent`] lifecycle the
 /// remote watcher uses so the app consumes both with one state machine:
 /// `InProgress` immediately, then `Ready` (new binary at the install path,
-/// F9 re-execs into it) or `Failed` (old binary keeps running).
+/// the updater re-execs into it) or `Failed` (old binary keeps running).
 pub struct SelfInstall {
     rx: Receiver<UpdateEvent>,
     /// Where cargo said it wrote the binary, parsed from its output on
-    /// success; read by the F9 re-exec.
+    /// success; read by the updater's re-exec.
     installed: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 

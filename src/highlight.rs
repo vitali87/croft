@@ -1,6 +1,6 @@
 use ratatui::style::{Color, Modifier, Style};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 use crate::theme::SyntaxPalette;
@@ -37,6 +37,18 @@ pub const HIGHLIGHT_NAMES: &[&str] = &[
     "variable",
     "variable.builtin",
     "variable.parameter",
+    // Markdown: tree-sitter-md's own captures (nvim-treesitter's `text.*`
+    // names) plus the `text.list` / `text.quote` / `text.strike` the
+    // Markdown overlays add. No other bundled grammar captures `text.*`.
+    "text.emphasis",
+    "text.list",
+    "text.literal",
+    "text.quote",
+    "text.reference",
+    "text.strike",
+    "text.strong",
+    "text.title",
+    "text.uri",
 ];
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -380,6 +392,87 @@ const LUA_OVERLAY_QUERY: &str = r#"
 (hash_bang_line) @comment
 "#;
 
+/// Captures appended LAST onto tree-sitter-md's block highlights query, so
+/// they win under last-match-wins. The bundled query leaves heading markers,
+/// list and task markers, and quote markers on `punctuation.special`, which
+/// every theme paints in the default foreground; these give them the heading,
+/// list and quote styles, colour a whole block quote, and embolden a table's
+/// header row.
+const MARKDOWN_BLOCK_OVERLAY_QUERY: &str = r#"
+[
+  (atx_h1_marker)
+  (atx_h2_marker)
+  (atx_h3_marker)
+  (atx_h4_marker)
+  (atx_h5_marker)
+  (atx_h6_marker)
+  (setext_h1_underline)
+  (setext_h2_underline)
+] @text.title
+[
+  (list_marker_plus)
+  (list_marker_minus)
+  (list_marker_star)
+  (list_marker_dot)
+  (list_marker_parenthesis)
+  (task_list_marker_checked)
+  (task_list_marker_unchecked)
+] @text.list
+(block_quote) @text.quote
+[
+  (block_quote_marker)
+  (block_continuation)
+] @text.quote
+(pipe_table_header (pipe_table_cell) @text.strong)
+"#;
+
+/// Replaces tree-sitter-md's block injection query rather than extending it,
+/// because its patterns cannot work here as written. The block grammar leaves
+/// anonymous hint nodes inside the ranges it hands off (the `*` of `**bold**`
+/// in an `inline`, the brackets of `fn main() {}` in a fence), and
+/// tree-sitter-highlight cuts every child out of an injection's range unless
+/// `injection.include-children` is set, so the injected parser would see the
+/// text with those characters gone. Neovim, whose query this is, excludes only
+/// named children. A second pattern on the same node would inject it twice,
+/// so the whole query is croft's. It also hands table cells to the inline
+/// grammar (a cell has no `inline` child), as nvim-treesitter does, and drops
+/// the bundled query's older "anything between two leading `---`" YAML rule,
+/// since front matter parses as `minus_metadata`.
+const MARKDOWN_BLOCK_INJECTION_QUERY: &str = r#"
+(fenced_code_block
+  (info_string
+    (language) @injection.language)
+  (code_fence_content) @injection.content
+  (#set! injection.include-children))
+
+((html_block) @injection.content
+  (#set! injection.language "html")
+  (#set! injection.include-children))
+
+((minus_metadata) @injection.content
+  (#set! injection.language "yaml")
+  (#set! injection.include-children))
+
+((plus_metadata) @injection.content
+  (#set! injection.language "toml")
+  (#set! injection.include-children))
+
+((inline) @injection.content
+  (#set! injection.language "markdown_inline")
+  (#set! injection.include-children))
+
+((pipe_table_cell) @injection.content
+  (#set! injection.language "markdown_inline")
+  (#set! injection.include-children))
+"#;
+
+/// Captures appended onto tree-sitter-md's inline highlights query, which
+/// leaves strikethrough and email autolinks uncaptured.
+const MARKDOWN_INLINE_OVERLAY_QUERY: &str = r#"
+(strikethrough) @text.strike
+(email_autolink) @text.uri
+"#;
+
 /// The active code-highlight palette. Seeded to the historical Base16-Ocean
 /// defaults so highlighting works before any theme is applied, then overwritten
 /// by `set_syntax_palette` on every theme switch. A process-wide `RwLock`
@@ -429,6 +522,19 @@ fn palette_style_for_name(p: &SyntaxPalette, name: &str) -> Style {
         | "punctuation.delimiter"
         | "punctuation.special"
         | "variable" => fg(p.fg),
+        // Markdown, on the theme's own roles: headings take the keyword hue in
+        // bold (VS Code Dark+'s `markup.heading` is its keyword blue), code
+        // the string hue (`markup.inline.raw`), quotes the comment hue, and
+        // emphasis only restyles the default foreground.
+        "text.title" => fg(p.keyword).add_modifier(Modifier::BOLD),
+        "text.list" => fg(p.keyword),
+        "text.literal" => fg(p.string),
+        "text.quote" => fg(p.comment),
+        "text.reference" => fg(p.function),
+        "text.uri" => fg(p.function).add_modifier(Modifier::UNDERLINED),
+        "text.emphasis" => fg(p.fg).add_modifier(Modifier::ITALIC),
+        "text.strong" => fg(p.fg).add_modifier(Modifier::BOLD),
+        "text.strike" => fg(p.fg).add_modifier(Modifier::CROSSED_OUT),
         _ => fg(p.fg),
     }
 }
@@ -678,6 +784,24 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
     })
 }
 
+/// Map a fenced code block's info string to a highlighter language. Accepts
+/// the common fence names and falls back to the file-extension table. Shared
+/// by the rendered preview and the editor's Markdown injections, so a fence
+/// colours the same in both.
+pub fn lang_for_fence(info: &str) -> Option<LangKind> {
+    let tag = info.split_whitespace().next().unwrap_or("");
+    Some(match tag.to_ascii_lowercase().as_str() {
+        "rust" => LangKind::Rust,
+        "python" => LangKind::Python,
+        "javascript" => LangKind::JavaScript,
+        "typescript" => LangKind::TypeScript,
+        "golang" => LangKind::Go,
+        "shell" | "console" | "terminal" => LangKind::Bash,
+        "codeql" => LangKind::Ql,
+        other => return lang_for_extension(other),
+    })
+}
+
 fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
     let mut cfg = match kind {
         LangKind::Rust => {
@@ -847,14 +971,21 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             "",
         )
         .ok()?,
-        LangKind::Markdown => HighlightConfiguration::new(
-            tree_sitter_md::LANGUAGE.into(),
-            "markdown",
-            tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
-            tree_sitter_md::INJECTION_QUERY_BLOCK,
-            "",
-        )
-        .ok()?,
+        LangKind::Markdown => {
+            let highlights = format!(
+                "{}\n{}",
+                tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+                MARKDOWN_BLOCK_OVERLAY_QUERY,
+            );
+            HighlightConfiguration::new(
+                tree_sitter_md::LANGUAGE.into(),
+                "markdown",
+                &highlights,
+                MARKDOWN_BLOCK_INJECTION_QUERY,
+                "",
+            )
+            .ok()?
+        }
         LangKind::Go => HighlightConfiguration::new(
             tree_sitter_go::LANGUAGE.into(),
             "go",
@@ -955,24 +1086,68 @@ pub struct HiSpan {
 // first highlight, blocking the first paint. The cache is process-wide (not
 // thread-local) so a background prewarm thread can build the configs while the
 // UI paints, and the UI thread then reads the finished build straight out of
-// the cache. The config is immutable after `build_config` calls `configure`, so
-// an `Arc` is safe to hand out across threads.
-static SHARED_CONFIGS: OnceLock<Mutex<HashMap<LangKind, Arc<HighlightConfiguration>>>> =
+// the cache. The config is immutable after `build_config` calls `configure` and
+// lives for the rest of the process, so it is leaked to `&'static` once per
+// language (a bounded, one-time cost): an injection callback has to hand
+// tree-sitter a borrow that outlives the highlight pass, which a cached `Arc`
+// cannot.
+static SHARED_CONFIGS: OnceLock<Mutex<HashMap<LangKind, &'static HighlightConfiguration>>> =
     OnceLock::new();
 
 /// Build once per process and return the shared highlight configuration for
 /// `kind`, or `None` if the language has no tree-sitter config. The expensive
 /// `build_config` runs outside the lock so a UI-thread highlight never blocks
-/// behind the background prewarm; if two threads race, the double-check keeps a
-/// single shared `Arc` and discards the loser's build.
-fn shared_config(kind: LangKind) -> Option<Arc<HighlightConfiguration>> {
+/// behind the background prewarm; if two threads race, the double-check keeps
+/// the first build and drops the loser's, so only one is ever leaked.
+fn shared_config(kind: LangKind) -> Option<&'static HighlightConfiguration> {
     let cache = SHARED_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cfg) = cache.lock().unwrap().get(&kind) {
-        return Some(Arc::clone(cfg));
+        return Some(cfg);
     }
-    let built = Arc::new(build_config(kind)?);
+    let built = build_config(kind)?;
     let mut guard = cache.lock().unwrap();
-    Some(Arc::clone(guard.entry(kind).or_insert(built)))
+    Some(
+        guard
+            .entry(kind)
+            .or_insert_with(|| Box::leak(Box::new(built))),
+    )
+}
+
+/// tree-sitter-md's inline grammar (emphasis, code spans, links), which the
+/// block grammar injects into every paragraph, heading and table cell as
+/// `markdown_inline`. Not a [`LangKind`]: no file is ever inline Markdown on
+/// its own. Built once per process, like [`shared_config`].
+fn markdown_inline_config() -> Option<&'static HighlightConfiguration> {
+    static INLINE: OnceLock<Option<&'static HighlightConfiguration>> = OnceLock::new();
+    *INLINE.get_or_init(|| {
+        let highlights = format!(
+            "{}\n{}",
+            tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+            MARKDOWN_INLINE_OVERLAY_QUERY,
+        );
+        let mut cfg = HighlightConfiguration::new(
+            tree_sitter_md::INLINE_LANGUAGE.into(),
+            "markdown_inline",
+            &highlights,
+            tree_sitter_md::INJECTION_QUERY_INLINE,
+            "",
+        )
+        .ok()?;
+        cfg.configure(HIGHLIGHT_NAMES);
+        Some(&*Box::leak(Box::new(cfg)))
+    })
+}
+
+/// The configuration a Markdown injection names: the inline grammar for
+/// `markdown_inline`, else a fenced block's language (`rust`, `py`, ...),
+/// front matter's `yaml` / `toml`, or an HTML block's `html`. An unknown name
+/// (`latex`, a fence tag croft has no grammar for) stays uninjected, so the
+/// block keeps its literal colour.
+fn markdown_injection(name: &str) -> Option<&'static HighlightConfiguration> {
+    if name == "markdown_inline" {
+        return markdown_inline_config();
+    }
+    shared_config(lang_for_fence(name)?)
 }
 
 /// Pre-build the tree-sitter highlight configurations so the first file open
@@ -1009,7 +1184,7 @@ impl LangRegistry {
     /// Return the shared configuration for `kind`, building it once per process.
     /// Takes `&mut self` for call-site compatibility, but state lives in the
     /// process-wide `SHARED_CONFIGS` so all editors reuse one build.
-    pub fn get(&mut self, kind: LangKind) -> Option<Arc<HighlightConfiguration>> {
+    pub fn get(&mut self, kind: LangKind) -> Option<&'static HighlightConfiguration> {
         shared_config(kind)
     }
 }
@@ -1058,7 +1233,12 @@ fn highlight_text_with_palette(
         None => return (per_line, protected),
     };
     let mut hl = Highlighter::new();
-    let events = match hl.highlight(cfg.as_ref(), text, None, |_| None) {
+    // Only Markdown resolves its injections (inline text, fenced code, front
+    // matter): elsewhere they stay off, as they always have been.
+    let injects = kind == LangKind::Markdown;
+    let events = match hl.highlight(cfg, text, None, |name| {
+        injects.then(|| markdown_injection(name)).flatten()
+    }) {
         Ok(e) => e,
         Err(_) => return (per_line, protected),
     };
@@ -1518,14 +1698,14 @@ def f() -> Config:\n\
     fn highlight_configs_are_shared_across_editors() {
         // The query-compilation cost must be paid once per process, not once
         // per editor tab: a new tab's first paint should never rebuild the
-        // config. Two independent registries must hand out the same `Arc`.
+        // config. Two independent registries must hand out the same build.
         prewarm_configs();
         let mut a = LangRegistry::new();
         let mut b = LangRegistry::new();
         let ca = a.get(LangKind::Rust).expect("rust config");
         let cb = b.get(LangKind::Rust).expect("rust config");
         assert!(
-            Arc::ptr_eq(&ca, &cb),
+            std::ptr::eq(ca, cb),
             "every editor must share one built highlight config"
         );
     }
@@ -2403,5 +2583,135 @@ def f() -> Config:\n\
         assert_eq!(style(2, "@file"), palette_style_for_name(&p, "type"));
         assert_eq!(style(2, "name"), palette_style_for_name(&p, "property"));
         assert_eq!(lang_for_extension("dbscheme"), Some(LangKind::Dbscheme));
+    }
+
+    /// #654: Markdown in the editor was all but colourless. The block
+    /// grammar's `text.*` captures had no palette role, its markers sat on the
+    /// default-foreground `punctuation.special`, and no injection was ever
+    /// resolved, so emphasis, code spans, links and fenced code went uncoloured
+    /// too. Each element now takes a theme role, and a fence is coloured by
+    /// its own language.
+    #[test]
+    fn markdown_elements_and_fenced_code_take_theme_styles() {
+        let mut reg = LangRegistry::new();
+        let src = "# Title here\n\
+                   \n\
+                   - item with **bold**, *slanted*, ~~gone~~ and `code`\n\
+                   \n\
+                   > quoted words\n\
+                   \n\
+                   See [the docs](https://example.com).\n\
+                   \n\
+                   | Head |\n\
+                   | ---- |\n\
+                   | `cell` |\n\
+                   \n\
+                   ```rust\n\
+                   fn main() {}\n\
+                   ```\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let p = SyntaxPalette::BASE16;
+        let h =
+            highlight_text_with_palette(&mut reg, LangKind::Markdown, src.as_bytes(), &ls, &p).0;
+        let lines: Vec<&str> = src.lines().collect();
+        let style = |line: usize, text: &str| {
+            span_at(&h[line], lines[line], text)
+                .unwrap_or_else(|| panic!("no span for {text:?} on {:?}", lines[line]))
+                .style
+        };
+        let role = |name: &str| palette_style_for_name(&p, name);
+        assert_eq!(style(0, "#"), role("text.title"));
+        assert_eq!(style(0, "Title"), role("text.title"));
+        assert_eq!(style(2, "-"), role("text.list"));
+        assert_eq!(style(2, "bold"), role("text.strong"));
+        assert_eq!(style(2, "slanted"), role("text.emphasis"));
+        assert_eq!(style(2, "gone"), role("text.strike"));
+        assert_eq!(style(2, "code"), role("text.literal"));
+        assert_eq!(style(4, ">"), role("text.quote"));
+        assert_eq!(style(4, "quoted"), role("text.quote"));
+        assert_eq!(style(6, "the docs"), role("text.reference"));
+        assert_eq!(style(6, "https://example.com"), role("text.uri"));
+        assert_eq!(style(8, "Head"), role("text.strong"));
+        assert_eq!(style(10, "cell"), role("text.literal"));
+        assert_eq!(
+            style(13, "fn"),
+            role("keyword"),
+            "the rust fence is injected"
+        );
+        // Token for token, the fence colours as the same line would in a
+        // `.rs` file.
+        let rust_src = "fn main() {}\n";
+        let rust_ls = compute_line_starts(rust_src.as_bytes());
+        let rust = highlight_text_with_palette(
+            &mut reg,
+            LangKind::Rust,
+            rust_src.as_bytes(),
+            &rust_ls,
+            &p,
+        )
+        .0;
+        for token in ["fn", "main"] {
+            let standalone = span_at(&rust[0], "fn main() {}", token)
+                .expect("rust span")
+                .style;
+            assert_eq!(style(13, token), standalone, "{token} in the fence");
+        }
+        // None of them is the plain foreground a colourless file shows.
+        for name in [
+            "text.title",
+            "text.list",
+            "text.literal",
+            "text.quote",
+            "text.reference",
+            "text.uri",
+            "text.emphasis",
+            "text.strong",
+            "text.strike",
+        ] {
+            assert_ne!(role(name), role("variable"), "{name} is styled");
+        }
+    }
+
+    /// YAML front matter is handed to the YAML grammar, so its keys colour as
+    /// they would in a `.yaml` file rather than as Markdown prose.
+    #[test]
+    fn markdown_front_matter_highlights_as_yaml() {
+        let mut reg = LangRegistry::new();
+        let src = "---\ntitle: Notes\n---\n\n# Notes\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let p = SyntaxPalette::BASE16;
+        let h =
+            highlight_text_with_palette(&mut reg, LangKind::Markdown, src.as_bytes(), &ls, &p).0;
+        let yaml_src = "title: Notes\n";
+        let yaml_ls = compute_line_starts(yaml_src.as_bytes());
+        let yaml = highlight_text_with_palette(
+            &mut reg,
+            LangKind::Yaml,
+            yaml_src.as_bytes(),
+            &yaml_ls,
+            &p,
+        )
+        .0;
+        let in_md = span_at(&h[1], "title: Notes", "title").expect("front matter span");
+        let in_yaml = span_at(&yaml[0], "title: Notes", "title").expect("yaml span");
+        assert_eq!(in_md.style, in_yaml.style);
+        assert_ne!(in_md.style, palette_style_for_name(&p, "variable"));
+    }
+
+    /// Only Markdown resolves injections: an HTML `<script>` stays as it was
+    /// (uninjected), so enabling Markdown's fences changes no other language.
+    #[test]
+    fn injections_stay_off_outside_markdown() {
+        let mut reg = LangRegistry::new();
+        let src = "<script>const x = 1;</script>\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let p = SyntaxPalette::BASE16;
+        let h = highlight_text_with_palette(&mut reg, LangKind::Html, src.as_bytes(), &ls, &p).0;
+        let line = src.lines().next().unwrap();
+        let konst = span_at(&h[0], line, "const");
+        assert!(
+            konst.is_none_or(|sp| sp.style != palette_style_for_name(&p, "keyword")),
+            "the script body is not highlighted as JavaScript: {konst:?}"
+        );
     }
 }

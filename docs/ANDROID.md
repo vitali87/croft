@@ -4,7 +4,7 @@ Setup notes for running croft as a native Android binary inside [Termux](https:/
 
 croft compiles and runs natively on Android via the same `cargo install` as every other platform. Two things differ: there is no `Cmd` key, and mainline Termux supports no inline-image protocol. croft handles both, plus the lack of a usable soft keyboard, in-process.
 
-There is **no required setup command**: the activity-bar font, the `Ctrl` modifier, and the on-screen keyboard all come up on their own. The only manual steps are optional — `pkg install nodejs` for TypeScript / JavaScript and `pkg install gopls` for Go. croft provisions Python's `ty`/`ruff` and Rust's `rust-analyzer` itself on first use.
+There is **no required setup command**: the activity-bar font, the `Ctrl` modifier, and the on-screen keyboard all come up on their own. The only manual steps are optional — `pkg install nodejs` for TypeScript / JavaScript and `pkg install gopls` for Go. croft provisions Python's `ty`/`ruff`, Rust's `rust-analyzer` and Markdown's `marksman` itself on first use.
 
 ## Install
 
@@ -25,12 +25,14 @@ The curl-based installers croft uses on macOS and Linux cannot run on a stock Te
 - **zoxide**, which backs the `Ctrl`+`Z` directory-jump popup.
 - **ty** and **ruff** (the Python servers), because `uv` — croft's provisioning chain elsewhere — does not support Android.
 - **rust-analyzer**, whose cross-distro release binary is built against glibc and won't run on Android's bionic libc, so croft reroutes to the Termux package as it does for `ty`/`ruff`.
+- **marksman** (the Markdown server), for the same reason: none of its release binaries runs on bionic, so croft installs the Termux package instead.
 
 Install the remaining servers yourself:
 
 ```bash
 pkg install nodejs     # lets croft set up the TypeScript / JavaScript server
 pkg install gopls      # Go (picked up from PATH)
+cargo install rumdl    # Markdown linting and formatting (Termux packages no rumdl; picked up from PATH)
 ```
 
 `croft remote <host>` also needs **`rsync`** on the phone to sync the source tree to the box. A stock Termux has none, so the connect fails with `running rsync to remote: spawning streaming subprocess: No such file or directory`:

@@ -242,8 +242,8 @@ What the project does to keep what ships trustworthy:
 - **Pinned toolchain.** `rust-toolchain.toml` fixes the exact Rust version so
   every machine compiles with the same compiler.
 - **Locked dependencies.** `Cargo.lock` is committed, releases build with
-  `--locked`, and a dependency change needs a version bump and release notes
-  that CI enforces.
+  `--locked`, and a dependency change needs release notes that CI enforces
+  and a new version, assigned after merge.
 - **Pinned GitHub Actions.** Third-party actions are pinned to a commit SHA,
   not a movable tag, and Dependabot keeps those pins current weekly.
 - **Keyless signing.** Releases are signed with Sigstore from the workflow's

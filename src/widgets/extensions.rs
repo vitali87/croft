@@ -147,6 +147,7 @@ fn chip_for(id: &str) -> Option<(char, Color)> {
         "lsp-toml" => ('\u{e615}', (0x9c, 0x42, 0x21)), // seti-config, toml brown
         "lsp-cpp" => ('\u{e7a3}', (0x00, 0x59, 0x9c)), // dev-cplusplus, C++ blue
         "lsp-lua" => ('\u{e620}', (0x00, 0x00, 0x80)), // seti-lua, blue
+        "lsp-markdown" => ('\u{f48a}', (0x51, 0x9a, 0xba)), // oct-markdown, the explorer's .md blue
         "dap-python" => ('\u{eb91}', (0x37, 0x76, 0xab)), // cod-debug_alt, python blue
         "dap-lldb" => ('\u{eb91}', (0xce, 0x6a, 0x3a)), // cod-debug_alt, rust orange
         "dap-js" => ('\u{eb91}', (0xf7, 0xdf, 0x1e)), // cod-debug_alt, JS yellow
