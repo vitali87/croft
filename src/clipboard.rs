@@ -88,6 +88,7 @@ pub fn write_string(text: &str) -> bool {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io::Write;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     /// Write `text` to the system clipboard on Linux.
@@ -117,6 +118,7 @@ mod linux {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn()
         else {
             return false;
@@ -140,8 +142,18 @@ mod linux {
         wait_by(&mut child, deadline).is_some_and(|s| s.success())
     }
 
-    /// Kill a helper croft has stopped waiting on, and reap it.
+    /// Kill a helper croft has stopped waiting on, with everything it
+    /// started, and reap it. Its own group (`process_group(0)` at spawn),
+    /// because a child it forked keeps the pipe open: croft's writer thread
+    /// stayed blocked until that child exited, then wrote into a closed pipe.
     fn give_up(child: &mut std::process::Child) {
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: a negative pid addresses the helper's own process
+            // group; the call only sends a signal.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -195,6 +207,7 @@ mod linux {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn()
             .ok()?;
         let mut stdout = child.stdout.take()?;
@@ -241,6 +254,79 @@ mod linux {
                 "took {:?}",
                 started.elapsed()
             );
+        }
+
+        /// Whether `pid` has exited (or is a zombie no one has reaped yet),
+        /// polled for up to two seconds.
+        fn gone_soon(pid: &str) -> bool {
+            let stat = format!("/proc/{pid}/stat");
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let state = std::fs::read_to_string(&stat)
+                    .ok()
+                    .and_then(|s| s.rsplit(") ").next().map(|t| t.starts_with('Z')));
+                if state.unwrap_or(true) {
+                    return true;
+                }
+                if std::time::Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        /// A helper croft gives up on takes what it started with it. A child
+        /// left holding the pipe kept croft's writer thread blocked until it
+        /// exited on its own, and that late write raised SIGPIPE, which
+        /// killed the whole test binary in CI.
+        #[test]
+        fn giving_up_on_a_clipboard_writer_kills_what_it_started() {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let script = format!("sleep 30 <&0 & echo $! > '{}'; wait", pidfile.display());
+            let big = "x".repeat(1 << 20);
+            assert!(!super::write_via(&["sh", "-c", &script], &big, soon()));
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let pid = pid.trim();
+            assert!(
+                gone_soon(pid),
+                "the helper's child {pid} outlived the give-up"
+            );
+        }
+
+        /// The same for a paste: a reader croft gives up on doesn't leave a
+        /// child holding its stdout.
+        #[test]
+        fn giving_up_on_a_clipboard_reader_kills_what_it_started() {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let script = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            assert_eq!(super::read_via(&["sh", "-c", &script], deadline), None);
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let pid = pid.trim();
+            assert!(
+                gone_soon(pid),
+                "the helper's child {pid} outlived the give-up"
+            );
+        }
+
+        /// Negative: a helper that copies and exits keeps what it left
+        /// behind, as xclip and wl-copy leave a process serving the
+        /// selection. Only a helper croft gives up on loses its children.
+        #[test]
+        fn a_clipboard_writer_that_copies_keeps_what_it_left_running() {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let script = format!(
+                "cat >/dev/null; sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'",
+                pidfile.display()
+            );
+            assert!(super::write_via(&["sh", "-c", &script], "kept", soon()));
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let pid = pid.trim();
+            assert!(!gone_soon(pid), "the selection server {pid} was killed");
+            let _ = std::process::Command::new("kill").arg(pid).status();
         }
 
         /// A helper that takes the text and exits still copies, a failing
