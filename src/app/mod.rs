@@ -3275,6 +3275,12 @@ pub struct App {
     /// is not a focusable `Pane`, so it gets its own drag latch rather than
     /// riding `scrollbar_drag`.
     outline_scrollbar_drag: bool,
+    /// The secondary side bar's own view of the Outline (scroll and hit
+    /// rects), swapped into `outline` around that bar's render and mouse
+    /// handling so the two hosts scroll and click independently (#1326).
+    secondary_outline: crate::widgets::outline::OutlineView,
+    /// The secondary Outline's scrollbar thumb is being dragged.
+    secondary_outline_scrollbar_drag: bool,
     /// Scrollbar-thumb drag latches for the other stacked Explorer sub-views,
     /// matching `outline_scrollbar_drag` (none is a focusable `Pane`).
     open_editors_scrollbar_drag: bool,
@@ -5722,6 +5728,8 @@ impl App {
             scrollbar_drag: None,
             editor_hscrollbar_drag: false,
             outline_scrollbar_drag: false,
+            secondary_outline: Default::default(),
+            secondary_outline_scrollbar_drag: false,
             open_editors_scrollbar_drag: false,
             timeline_scrollbar_drag: false,
             deps_scrollbar_drag: false,
@@ -15119,12 +15127,10 @@ impl App {
     /// collapse state is saved/restored so the Explorer's own OUTLINE section
     /// (which may render the same widget afterward) keeps its toggle.
     fn render_secondary_side_bar(&mut self, frame: &mut ratatui::Frame, area: Option<Rect>) {
-        let Some(area) = area else {
+        let Some(area) = area.filter(|a| a.width > 0 && a.height > 0) else {
+            self.secondary_outline.forget_area();
             return;
         };
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
         // A left border + bg fill so the panel reads as a distinct column,
         // like the primary side bar's seam against the editor.
         let block = ratatui::widgets::Block::default()
@@ -15133,14 +15139,48 @@ impl App {
             .style(Style::default().bg(self.theme.editor_bg()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let saved_collapsed = self.outline.collapsed;
-        self.outline.collapsed = false;
         self.outline.theme = self.theme;
         self.outline.focus_gradient = self.theme.gradient();
         self.outline.focused = false;
         self.outline.hover_pointer = self.pointer_cell;
-        frame.render_widget(&mut self.outline, inner);
-        self.outline.collapsed = saved_collapsed;
+        self.with_secondary_outline(|outline| frame.render_widget(outline, inner));
+    }
+
+    /// Run `f` on the Outline as the secondary side bar shows it: that bar's
+    /// own scroll and hit rects swapped in (#1326), and never folded, since
+    /// the Outline is all the bar holds.
+    fn with_secondary_outline<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::widgets::outline::OutlinePanel) -> R,
+    ) -> R {
+        let mut view = std::mem::take(&mut self.secondary_outline);
+        self.outline.swap_view(&mut view);
+        let collapsed = std::mem::replace(&mut self.outline.collapsed, false);
+        let out = f(&mut self.outline);
+        self.outline.collapsed = collapsed;
+        self.outline.swap_view(&mut view);
+        self.secondary_outline = view;
+        out
+    }
+
+    /// A left click inside the secondary side bar's Outline: the scrollbar
+    /// lane scrolls (and arms a drag), a symbol row jumps the editor there
+    /// like the Explorer's OUTLINE does, and anything else is swallowed.
+    fn click_secondary_outline(&mut self, x: u16, y: u16) {
+        let (on_bar, target) = self.with_secondary_outline(|o| {
+            if rect_contains(o.last_scrollbar, x, y) {
+                o.scroll_to_bar_y(y);
+                (true, None)
+            } else {
+                (false, o.row_at(y).and_then(|idx| o.jump_target(idx)))
+            }
+        });
+        self.secondary_outline_scrollbar_drag = on_bar;
+        if let Some((path, line, col)) = target
+            && !self.jump_in_scrub_view(line)
+        {
+            self.go_to_definition(path, line, col);
+        }
     }
 
     /// Paint the three layout-control icons (Toggle Primary Side Bar, Toggle
@@ -51961,6 +52001,8 @@ impl App {
         // rather than the tree above.
         let in_outline = self.sidebar_view == SidebarView::Explorer
             && rect_contains(self.outline.last_area, m.column, m.row);
+        let in_secondary_outline = self.secondary_side_bar_visible
+            && rect_contains(self.secondary_outline.area(), m.column, m.row);
         let in_open_editors = self.sidebar_view == SidebarView::Explorer
             && rect_contains(self.open_editors.last_area, m.column, m.row);
         let in_timeline = self.sidebar_view == SidebarView::Explorer
@@ -52817,6 +52859,10 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if in_secondary_outline {
+                    self.click_secondary_outline(m.column, m.row);
+                    return;
+                }
                 // Markdown/rendered preview selection (#215): a press inside
                 // the rendered view starts a drag-selection over what the
                 // user can SEE, not the source buffer beneath it.
@@ -54282,6 +54328,10 @@ impl App {
                     self.outline.scroll_to_bar_y(m.row);
                     return;
                 }
+                if self.secondary_outline_scrollbar_drag {
+                    self.with_secondary_outline(|o| o.scroll_to_bar_y(m.row));
+                    return;
+                }
                 if self.open_editors_scrollbar_drag {
                     self.open_editors.scroll_to_bar_y(m.row);
                     return;
@@ -54636,6 +54686,9 @@ impl App {
                 if std::mem::take(&mut self.outline_scrollbar_drag) {
                     return;
                 }
+                if std::mem::take(&mut self.secondary_outline_scrollbar_drag) {
+                    return;
+                }
                 if std::mem::take(&mut self.open_editors_scrollbar_drag) {
                     return;
                 }
@@ -54694,7 +54747,9 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if in_outline {
+                if in_secondary_outline {
+                    self.with_secondary_outline(|o| o.scroll_down(3));
+                } else if in_outline {
                     self.outline.scroll_down(3);
                 } else if in_open_editors {
                     self.open_editors.scroll_down(3);
@@ -54767,7 +54822,9 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => {
-                if in_outline {
+                if in_secondary_outline {
+                    self.with_secondary_outline(|o| o.scroll_up(3));
+                } else if in_outline {
                     self.outline.scroll_up(3);
                 } else if in_open_editors {
                     self.open_editors.scroll_up(3);

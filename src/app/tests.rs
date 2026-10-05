@@ -70516,3 +70516,157 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
+
+/// An app with `n` symbols (`sym_000`, `sym_001`, …, symbol `i` on line
+/// `2 * i`) in an open file, the Explorer's OUTLINE expanded and the
+/// secondary side bar showing the same Outline (#1326).
+fn secondary_outline_app(tmp: &tempfile::TempDir, n: u32) -> (App, std::path::PathBuf) {
+    use crate::lsp::manager::{OutlineKind, OutlineSymbol};
+    let f = tmp.path().join("m.py");
+    let text: String = (0..n)
+        .map(|i| format!("def sym_{i:03}(x):\n    return x\n"))
+        .collect();
+    std::fs::write(&f, text).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.explorer_views = Default::default();
+    app.editor.open_pinned(&f).unwrap();
+    let syms = (0..n)
+        .map(|i| OutlineSymbol {
+            name: format!("sym_{i:03}"),
+            detail: None,
+            kind: OutlineKind::Function,
+            depth: 0,
+            line: 2 * i,
+            character: 4,
+            range_start_line: 2 * i,
+            range_end_line: 2 * i + 1,
+        })
+        .collect();
+    app.outline.set_symbols(f.clone(), syms);
+    app.outline.collapsed = false;
+    app.secondary_side_bar_visible = true;
+    (app, f)
+}
+
+/// The columns left of the editor (the Explorer) and right of it (the
+/// secondary side bar), so a symbol name in the editor text never counts.
+fn outline_hosts(app: &App) -> (std::ops::Range<u16>, std::ops::Range<u16>) {
+    let e = app.editor.last_full_area;
+    (0..e.x, e.x + e.width..e.x + e.width + 60)
+}
+
+/// Where `text` is painted, searching only columns `xs`.
+fn find_painted(
+    term: &ratatui::Terminal<ratatui::backend::TestBackend>,
+    text: &str,
+    xs: std::ops::Range<u16>,
+) -> Option<(u16, u16)> {
+    let buf = term.backend().buffer();
+    (0..buf.area.height).find_map(|y| {
+        let row: String = xs
+            .clone()
+            .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect();
+        let at = row.find(text)?;
+        Some((xs.start + row[..at].chars().count() as u16, y))
+    })
+}
+
+#[test]
+fn a_click_on_a_secondary_outline_row_jumps_to_that_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = secondary_outline_app(&tmp, 30);
+    // The usual reason for the secondary Outline: the primary side bar is
+    // hidden, so this is the only Outline on screen. The Explorer's OUTLINE
+    // section is folded, as it is by default.
+    app.toggle_side_bar();
+    app.outline.collapsed = true;
+    app.editor.cursor_row = 58;
+    let backend = ratatui::backend::TestBackend::new(160, 45);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let (_, right) = outline_hosts(&app);
+    let (x, y) = find_painted(&term, "sym_010", right).expect("sym_010 in the secondary bar");
+    left_click(&mut app, x + 2, y);
+    assert_eq!(
+        app.editor.cursor_row, 20,
+        "the caret moves to sym_010's line"
+    );
+}
+
+#[test]
+fn wheeling_one_outline_host_leaves_the_others_scroll_alone() {
+    use crossterm::event::MouseEventKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = secondary_outline_app(&tmp, 60);
+    let backend = ratatui::backend::TestBackend::new(160, 45);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let (left, right) = outline_hosts(&app);
+    assert!(find_painted(&term, "sym_000", left.clone()).is_some());
+    let (x, y) = find_painted(&term, "sym_005", right.clone()).expect("secondary rows");
+    wheel(&mut app, MouseEventKind::ScrollDown, x, y);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        find_painted(&term, "sym_000", right.clone()).is_none(),
+        "the secondary Outline scrolled"
+    );
+    assert!(
+        find_painted(&term, "sym_000", left.clone()).is_some(),
+        "the Explorer's OUTLINE did not move with it"
+    );
+
+    // And the other way round: the Explorer's wheel leaves the secondary be.
+    let (x, y) = find_painted(&term, "sym_002", left.clone()).expect("explorer rows");
+    wheel(&mut app, MouseEventKind::ScrollDown, x, y);
+    wheel(&mut app, MouseEventKind::ScrollDown, x, y);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        find_painted(&term, "sym_000", left).is_none(),
+        "the Explorer scrolled"
+    );
+    assert!(
+        find_painted(&term, "sym_003", right).is_some(),
+        "the secondary Outline kept its own offset"
+    );
+}
+
+#[test]
+fn a_click_on_the_explorer_outline_still_jumps_with_the_secondary_bar_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = secondary_outline_app(&tmp, 30);
+    let backend = ratatui::backend::TestBackend::new(160, 45);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let (left, _) = outline_hosts(&app);
+    let (x, y) = find_painted(&term, "sym_004", left).expect("sym_004 in the Explorer");
+    left_click(&mut app, x + 2, y);
+    assert_eq!(
+        app.editor.cursor_row, 8,
+        "the caret moves to sym_004's line"
+    );
+}
+
+#[test]
+fn a_click_on_the_secondary_outline_header_or_blank_rows_moves_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = secondary_outline_app(&tmp, 3);
+    app.toggle_side_bar();
+    app.outline.collapsed = true;
+    app.editor.cursor_row = 3;
+    let backend = ratatui::backend::TestBackend::new(160, 45);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let (_, right) = outline_hosts(&app);
+    let (x, y) = find_painted(&term, "OUTLINE", right.clone()).expect("secondary header");
+    left_click(&mut app, x + 1, y);
+    let (sx, sy) = find_painted(&term, "sym_002", right.clone()).unwrap();
+    // Well below the last symbol: inside the bar, on no row.
+    left_click(&mut app, sx, sy + 10);
+    assert_eq!(app.editor.cursor_row, 3, "neither click moved the caret");
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        find_painted(&term, "sym_000", right).is_some(),
+        "the header click did not fold the secondary Outline away"
+    );
+}

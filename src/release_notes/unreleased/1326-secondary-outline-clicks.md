@@ -1,0 +1,1 @@
+fix: Clicking a symbol in the secondary side bar's Outline now jumps the editor to it, its scrollbar can be clicked and dragged, and it scrolls independently of the Explorer's OUTLINE section instead of sharing one offset with it.
