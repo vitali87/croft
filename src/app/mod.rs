@@ -843,6 +843,15 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
         label,
         Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
     ));
+    // The operation git stopped in (#1356), as `main | MERGING`.
+    if let Some(op) = status.operation {
+        spans.push(Span::styled(
+            format!(" | {}", op.label()),
+            Style::default()
+                .fg(GIT_DIRTY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if status.ahead > 0 {
         spans.push(Span::styled(
             format!(" \u{2191}{}", status.ahead),
@@ -32733,6 +32742,97 @@ impl App {
         }
     }
 
+    /// The repository's operation in progress (#1356), read fresh, or
+    /// `None` with a status saying there is none.
+    fn git_operation_or_say(&mut self) -> Option<crate::git::RepoOp> {
+        let op = crate::git::repo_operation(&self.scm_root());
+        if op.is_none() {
+            self.status =
+                String::from("No merge, rebase, cherry-pick, revert or bisect in progress");
+        }
+        op
+    }
+
+    /// Abort the merge, rebase, cherry-pick or revert in progress, or reset
+    /// a bisect (#1356; VS Code's Abort Merge / Abort Rebase).
+    fn abort_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::abort_operation(&self.scm_root(), op);
+        let done = match op {
+            crate::git::RepoOp::Bisect => String::from("Bisect reset"),
+            _ => format!("Aborted the {}", op.command()),
+        };
+        self.run_scm_op(op.command(), r, &done);
+    }
+
+    /// Continue the rebase, cherry-pick or revert in progress once its
+    /// conflicts are resolved and staged (#1356; VS Code's Continue Rebase).
+    fn continue_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::continue_operation(&self.scm_root(), op);
+        self.report_git_operation_step(op, r, "Continued");
+    }
+
+    /// Skip the commit the rebase, cherry-pick or revert stopped on
+    /// (#1356).
+    fn skip_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::skip_operation(&self.scm_root(), op);
+        self.report_git_operation_step(op, r, "Skipped a commit of");
+    }
+
+    /// Mark the commit a bisect is on good or bad (#1356).
+    fn bisect_mark_source_control(&mut self, good: bool) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let r = crate::git::bisect_mark(&self.scm_root(), good);
+        self.run_scm_op("bisect", r, if good { "Marked good" } else { "Marked bad" });
+    }
+
+    /// Report a Continue or Skip, saying where the operation stands now:
+    /// finished, or stopped again (the next conflict, with its step).
+    fn report_git_operation_step(
+        &mut self,
+        op: crate::git::RepoOp,
+        r: Result<String, String>,
+        verb: &str,
+    ) {
+        let now = crate::git::repo_operation(&self.scm_root());
+        let done = match now {
+            None => format!("{verb} the {}, which is done", op.command()),
+            Some(next) => format!("{verb} the {}, now {}", op.command(), next.label()),
+        };
+        self.run_scm_op(op.command(), r, &done);
+    }
+
+    /// After a commit made from Source Control mid-rebase (#1356, the #989
+    /// path): carry on with the rebase, as VS Code's Commit button does
+    /// there, instead of leaving HEAD detached with the rest unapplied.
+    fn continue_rebase_after_commit(&mut self) {
+        let root = self.scm_root();
+        let Some(op @ crate::git::RepoOp::Rebase { .. }) = crate::git::repo_operation(&root) else {
+            return;
+        };
+        let r = crate::git::continue_operation(&root, op);
+        self.report_git_operation_step(op, r, "Committed and continued");
+    }
+
     /// Run an immediate git operation: log it, surface its summary or error
     /// in the commit-feedback line, and refresh the panel. The single path
     /// every "⋯"-menu leaf that acts now (vs. opening a modal) flows through.
@@ -32740,13 +32840,14 @@ impl App {
         self.log_git(label, &outcome);
         match outcome {
             Ok(summary) => {
-                self.source_control.commit_feedback = Some(if summary.is_empty() {
+                let said = if summary.is_empty() {
                     ok_prefix.to_string()
                 } else {
                     format!("{ok_prefix}: {summary}")
-                });
+                };
+                self.source_control.commit_feedback = Some(said.clone());
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("{ok_prefix}: {summary}");
+                self.status = said;
             }
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("{ok_prefix} failed: {err}"));
@@ -32931,10 +33032,14 @@ impl App {
             return;
         };
         let r = crate::git::commit_staged(&self.scm_root(), &message);
-        if r.is_ok() {
+        let committed = r.is_ok();
+        if committed {
             self.source_control.clear_message();
         }
         self.run_scm_op("commit -m", r, "Committed staged");
+        if committed {
+            self.continue_rebase_after_commit();
+        }
     }
 
     fn commit_all_source_control(&mut self) {
@@ -32946,10 +33051,14 @@ impl App {
             return;
         }
         let r = crate::git::commit_staged(&self.scm_root(), &message);
-        if r.is_ok() {
+        let committed = r.is_ok();
+        if committed {
             self.source_control.clear_message();
         }
         self.run_scm_op("commit (all)", r, "Committed all");
+        if committed {
+            self.continue_rebase_after_commit();
+        }
     }
 
     fn commit_amend_source_control(&mut self) {
@@ -33093,6 +33202,11 @@ impl App {
                 self.spawn_scm_op("fetch --all --prune", "Fetched", crate::git::fetch_all);
             }
             ScmAction::ShowGitOutput => self.show_git_output(),
+            ScmAction::ContinueOperation => self.continue_git_operation(),
+            ScmAction::SkipOperation => self.skip_git_operation(),
+            ScmAction::AbortOperation => self.abort_git_operation(),
+            ScmAction::BisectGood => self.bisect_mark_source_control(true),
+            ScmAction::BisectBad => self.bisect_mark_source_control(false),
             ScmAction::Commit => self.commit_source_control(),
             ScmAction::CommitStaged => self.commit_staged_source_control(),
             ScmAction::CommitAll => self.commit_all_source_control(),
@@ -37139,6 +37253,7 @@ impl App {
                 self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
+                self.continue_rebase_after_commit();
             }
             Err(err) => {
                 self.source_control.commit_feedback = Some(err.clone());
@@ -49251,6 +49366,9 @@ impl App {
             Cmd::ToggleCodeLens => self.toggle_code_lens(),
             Cmd::OpenSearchEditor => self.open_search_editor(),
             Cmd::RebaseAbort => self.abort_rebase_todo(),
+            Cmd::GitContinueOperation => self.continue_git_operation(),
+            Cmd::GitSkipOperation => self.skip_git_operation(),
+            Cmd::GitAbortOperation => self.abort_git_operation(),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
@@ -53490,6 +53608,9 @@ impl App {
                     if self.source_control.click_more(m.column, m.row) {
                         self.commit_menu_open = false;
                         self.scm_menu.open = !self.scm_menu.open;
+                        if self.scm_menu.open {
+                            self.scm_menu.operation = crate::git::repo_operation(&self.scm_root());
+                        }
                         if !self.scm_menu.open {
                             self.scm_menu.close();
                         }
@@ -55837,6 +55958,15 @@ impl App {
             .as_deref()
             .is_some_and(crate::rebase_todo::is_todo)
         {
+            // Outside the plan tab, a rebase stopped on a conflict is the
+            // one this means (#1356).
+            if matches!(
+                crate::git::repo_operation(&self.scm_root()),
+                Some(crate::git::RepoOp::Rebase { .. })
+            ) {
+                self.abort_git_operation();
+                return;
+            }
             self.status = String::from("Rebase: Abort works in a git-rebase-todo tab");
             return;
         }

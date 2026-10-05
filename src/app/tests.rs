@@ -6860,6 +6860,7 @@ fn git_status_spans_clean_branch_is_green() {
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
+        operation: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -6885,6 +6886,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
+        operation: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6913,6 +6915,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
+        operation: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6933,6 +6936,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
+        operation: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -12710,6 +12714,217 @@ fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The issue's repo (#1356): `main` and `feat` both change `f` from
+/// `base`, so merging, rebasing or cherry-picking one onto the other stops
+/// on a conflict.
+fn diverged_repo() -> tempfile::TempDir {
+    let tmp = make_committed_repo();
+    let p = tmp.path();
+    let f = p.join("f");
+    std::fs::write(&f, "base\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f"]) && git_succeeds(p, &["commit", "-qm", "base"]));
+    assert!(git_succeeds(p, &["checkout", "-qb", "feat"]));
+    std::fs::write(&f, "feat\n").unwrap();
+    assert!(git_succeeds(p, &["commit", "-qam", "feat"]));
+    assert!(git_succeeds(p, &["checkout", "-q", "main"]));
+    std::fs::write(&f, "mainline\n").unwrap();
+    assert!(git_succeeds(p, &["commit", "-qam", "main"]));
+    tmp
+}
+
+/// Run git in `dir` without an editor; true when it succeeded.
+fn git_succeeds(dir: &std::path::Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_EDITOR", "true")
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// #1356: a conflicted merge is reported as one, and Abort Merge from
+/// the Source Control menu puts HEAD and the tree back as they were.
+#[test]
+fn abort_merge_restores_the_pre_merge_head() {
+    use crate::git::RepoOp;
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    let before = git_stdout(p, &["rev-parse", "HEAD"]);
+    assert!(
+        !git_succeeds(p, &["merge", "feat"]),
+        "the merge must conflict"
+    );
+    assert_eq!(crate::git::repo_operation(p), Some(RepoOp::Merge));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::AbortOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git_stdout(p, &["status", "--porcelain"]), "");
+}
+
+/// #1356: Continue on a rebase whose conflict is resolved and staged
+/// finishes it on the branch, with the resolution on top of `main`.
+#[test]
+fn continue_rebase_finishes_it_on_the_branch() {
+    use crate::git::RepoOp;
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(
+        !git_succeeds(p, &["rebase", "main"]),
+        "the rebase must conflict"
+    );
+    assert_eq!(
+        crate::git::repo_operation(p),
+        Some(RepoOp::Rebase { step: 1, total: 1 })
+    );
+    std::fs::write(p.join("f"), "resolved\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitContinueOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["symbolic-ref", "--short", "HEAD"]), "feat");
+    assert_eq!(
+        git_stdout(p, &["log", "--format=%s", "-2"]),
+        "feat\nmain",
+        "feat replays on top of main"
+    );
+}
+
+/// #1356 (the #989 path): committing from Source Control mid-rebase
+/// carries on with the rebase instead of leaving HEAD detached.
+#[test]
+fn committing_mid_rebase_continues_the_rebase() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(!git_succeeds(p, &["rebase", "main"]));
+    std::fs::write(p.join("f"), "resolved\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.source_control.message = String::from("feat");
+    app.commit_source_control();
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["symbolic-ref", "--short", "HEAD"]), "feat");
+}
+
+/// #1356: Skip drops the conflicting commit and finishes the rebase.
+#[test]
+fn skip_drops_the_conflicting_rebase_commit() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(!git_succeeds(p, &["rebase", "main"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitSkipOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(std::fs::read_to_string(p.join("f")).unwrap(), "mainline\n");
+}
+
+/// #1356: a conflicted cherry-pick is reported, offered Continue and
+/// Abort in the menu, and Abort ends it.
+#[test]
+fn a_conflicted_cherry_pick_can_be_aborted() {
+    use crate::git::RepoOp;
+    use crate::widgets::scm_menu::{Node, ScmAction};
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(!git_succeeds(p, &["cherry-pick", "feat"]));
+    assert_eq!(crate::git::repo_operation(p), Some(RepoOp::CherryPick));
+    let actions: Vec<ScmAction> = crate::widgets::scm_menu::menu_for(Some(RepoOp::CherryPick))
+        .iter()
+        .filter_map(|n| match n {
+            Node::Item(l) => Some(l.action),
+            _ => None,
+        })
+        .collect();
+    assert!(actions.contains(&ScmAction::ContinueOperation));
+    assert!(actions.contains(&ScmAction::AbortOperation));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitAbortOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["status", "--porcelain"]), "");
+}
+
+/// #1356: the status bar and the git status name the operation and, for
+/// a rebase, the step.
+#[test]
+fn the_status_bar_names_the_operation_in_progress() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(!git_succeeds(p, &["merge", "feat"]));
+    let status = crate::git::query(p);
+    let text: String = git_status_spans(&status)
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+    assert!(text.contains("main") && text.contains("MERGING"), "{text}");
+    assert!(git_succeeds(p, &["merge", "--abort"]));
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(!git_succeeds(p, &["rebase", "main"]));
+    let status = crate::git::query(p);
+    let text: String = git_status_spans(&status)
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+    assert!(text.contains("REBASING 1/1"), "{text}");
+}
+
+/// #1356: bisect shows as BISECTING, and Abort is Bisect Reset.
+#[test]
+fn bisect_is_reported_and_reset() {
+    use crate::git::RepoOp;
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["bisect", "start", "main", "feat~1"]));
+    assert_eq!(crate::git::repo_operation(p), Some(RepoOp::Bisect));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitAbortOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+}
+
+/// #1356 negative: with nothing in progress the commands refuse and say
+/// so, HEAD stays put, and the menu offers no abort.
+#[test]
+fn with_nothing_in_progress_abort_and_continue_refuse() {
+    use crate::widgets::scm_menu::{Node, ScmAction};
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    let before = git_stdout(p, &["rev-parse", "HEAD"]);
+    assert_eq!(crate::git::repo_operation(p), None);
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitAbortOperation);
+    assert!(app.status.contains("No merge"), "{}", app.status);
+    app.run_command(crate::widgets::command_palette::Command::GitContinueOperation);
+    assert!(app.status.contains("No "), "{}", app.status);
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), before);
+    assert!(
+        !crate::widgets::scm_menu::menu_for(None)
+            .iter()
+            .any(|n| matches!(
+                n,
+                Node::Item(l) if l.action == ScmAction::AbortOperation
+            ))
+    );
+}
+
+/// #1356 negative: Continue refuses a merge (a commit concludes one) and
+/// leaves it in progress.
+#[test]
+fn continue_does_not_conclude_a_merge() {
+    use crate::git::RepoOp;
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(!git_succeeds(p, &["merge", "feat"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitContinueOperation);
+    assert_eq!(crate::git::repo_operation(p), Some(RepoOp::Merge));
+    assert!(app.status.contains("Commit"), "{}", app.status);
 }
 
 /// A committed repo whose `main` tracks `<remote>/main` in a bare repo, for

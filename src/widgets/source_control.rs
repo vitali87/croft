@@ -1300,6 +1300,16 @@ impl Widget for &mut SourceControlPanel {
                 .fg(self.theme.ui(Color::White))
                 .add_modifier(Modifier::BOLD),
         ));
+        // What git stopped in the middle of (#1356): the ⋯ menu holds its
+        // Continue / Abort.
+        if let Some(op) = self.status.operation {
+            spans.push(Span::styled(
+                format!("  {}", op.label()),
+                Style::default()
+                    .fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b)))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if self.status.ahead > 0 {
             spans.push(Span::styled(
                 format!("  \u{2191}{}", self.status.ahead),
@@ -1936,6 +1946,7 @@ mod tests {
             repo_root: None,
             changed_count: 0,
             prepared_message: None,
+            operation: None,
         }
     }
 
