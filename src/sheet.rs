@@ -289,25 +289,43 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
 impl SheetData {
     /// Sort the body rows by column `col` (#578, a sortable results
     /// table): ascending, or descending when they already are ascending,
-    /// so sorting the same column again reverses it. Cells that both read
-    /// as numbers compare as numbers, others as text without case. The
-    /// sort is stable, and the cursor stays on the row it was on. Returns
-    /// whether the order is now ascending.
+    /// so sorting the same column again reverses it. Cells that read as
+    /// numbers compare as numbers and come before the rest, which compare
+    /// as text without case. The sort is stable, and the cursor stays on
+    /// the row it was on. Returns whether the order is now ascending.
     pub fn sort_by_column(&mut self, col: usize) -> bool {
-        fn cmp(a: &str, b: &str) -> std::cmp::Ordering {
-            match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
-                (Ok(x), Ok(y)) => x.total_cmp(&y),
-                _ => a.to_lowercase().cmp(&b.to_lowercase()),
+        // Numbers sort before text. Comparing a mixed pair as text instead
+        // made the order cyclic (2 < 10 < "1a" < 2), and the standard sort
+        // panics on a comparator that is not a total order (#1134). Each
+        // cell is parsed and lowercased once, not on every comparison.
+        enum Key {
+            Num(f64),
+            Text(String),
+        }
+        fn cmp(a: &Key, b: &Key) -> std::cmp::Ordering {
+            use std::cmp::Ordering::{Greater, Less};
+            match (a, b) {
+                (Key::Num(x), Key::Num(y)) => x.total_cmp(y),
+                (Key::Num(_), Key::Text(_)) => Less,
+                (Key::Text(_), Key::Num(_)) => Greater,
+                (Key::Text(a), Key::Text(b)) => a.cmp(b),
             }
         }
-        let key = |r: &Vec<String>| r.get(col).cloned().unwrap_or_default();
-        let ascending = !self
+        let keys: Vec<Key> = self
             .rows
-            .windows(2)
-            .all(|w| cmp(&key(&w[0]), &key(&w[1])).is_le());
+            .iter()
+            .map(|r| {
+                let cell = r.get(col).map_or("", String::as_str);
+                match cell.trim().parse::<f64>() {
+                    Ok(x) => Key::Num(x),
+                    Err(_) => Key::Text(cell.to_lowercase()),
+                }
+            })
+            .collect();
+        let ascending = !keys.windows(2).all(|w| cmp(&w[0], &w[1]).is_le());
         let mut order: Vec<usize> = (0..self.rows.len()).collect();
         order.sort_by(|&i, &j| {
-            let o = cmp(&key(&self.rows[i]), &key(&self.rows[j]));
+            let o = cmp(&keys[i], &keys[j]);
             if ascending { o } else { o.reverse() }
         });
         let cursor = order.iter().position(|&i| i == self.cur_row);
@@ -666,6 +684,64 @@ mod tests {
         assert!(d.sort_by_column(0));
         assert_eq!(col(&d, 0), ["A", "b", "c"], "text without case");
         assert_eq!(d.headers, ["name", "count"], "the header stays put");
+    }
+
+    /// The 30 house numbers from #1134: plain numbers mixed with `65a`-style
+    /// values, which made the old comparator cyclic and the sort panic.
+    const HOUSES: [&str; 30] = [
+        "109", "114", "34", "63", "101", "62", "115", "65a", "97b", "117", "91", "116a", "94b",
+        "61", "46", "79", "27", "62", "67", "104", "118b", "91", "86", "79", "112", "94", "112a",
+        "31", "19", "58b",
+    ];
+
+    fn sheet_of(values: &[&str]) -> super::SheetData {
+        let mut csv = String::from("name,house\n");
+        for (i, v) in values.iter().enumerate() {
+            csv.push_str(&format!("p{i},{v}\n"));
+        }
+        super::parse_delimited(csv.as_bytes(), b',', "s").unwrap()
+    }
+
+    fn column(d: &super::SheetData, c: usize) -> Vec<String> {
+        d.rows.iter().map(|r| r[c].clone()).collect()
+    }
+
+    #[test]
+    fn sorting_numbers_mixed_with_65a_values_neither_panics_nor_cycles() {
+        let mut d = sheet_of(&HOUSES);
+        assert!(d.sort_by_column(1));
+        let got = column(&d, 1);
+        let nums: Vec<f64> = got.iter().map_while(|v| v.parse().ok()).collect();
+        assert!(
+            nums.windows(2).all(|w| w[0] <= w[1]),
+            "numbers ascend: {got:?}"
+        );
+        let rest = &got[nums.len()..];
+        assert!(
+            rest.iter().all(|v| v.parse::<f64>().is_err()),
+            "numbers first: {got:?}"
+        );
+        assert!(
+            rest.windows(2)
+                .all(|w| w[0].to_lowercase() <= w[1].to_lowercase())
+        );
+        assert_eq!(got.len(), HOUSES.len(), "no row lost");
+        // And back the other way: the exact reverse.
+        assert!(!d.sort_by_column(1));
+        let mut rev = column(&d, 1);
+        rev.reverse();
+        assert_eq!(rev, got);
+    }
+
+    #[test]
+    fn a_column_with_no_mixed_kinds_sorts_as_before() {
+        // Negative: all-text and all-number columns keep their old order.
+        let mut d = sheet_of(&["b", "A", "c"]);
+        d.sort_by_column(1);
+        assert_eq!(column(&d, 1), ["A", "b", "c"]);
+        let mut d = sheet_of(&["10", "-2.5", "9", "1e3"]);
+        d.sort_by_column(1);
+        assert_eq!(column(&d, 1), ["-2.5", "9", "10", "1e3"]);
     }
 
     #[test]

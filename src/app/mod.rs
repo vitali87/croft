@@ -346,7 +346,18 @@ fn compute_chrome_layout(
     } else {
         0
     };
-    let secondary_w = if secondary_visible { secondary_w } else { 0 };
+    // A secondary side bar the window can't seat beside the editor's minimum
+    // is dropped: reserving it anyway placed it past the frame's right edge,
+    // where its scrollbar wrote outside the buffer (#1132).
+    let fits = main.width
+        >= activity_w
+            .saturating_add(secondary_w)
+            .saturating_add(RIGHT_PANE_MIN);
+    let secondary_w = if secondary_visible && fits {
+        secondary_w
+    } else {
+        0
+    };
     // Reserve activity + secondary first, then fit the primary side bar in
     // what's left while keeping RIGHT_PANE_MIN for the editor column.
     let reserved = activity_w.saturating_add(secondary_w);
@@ -8095,7 +8106,7 @@ impl App {
             self.search.query.clone(),
             self.search.opts,
         ));
-        let term = if self.search.query.trim().is_empty() {
+        let term = if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             None
         } else {
             Some(self.search.query.clone())
@@ -22662,15 +22673,20 @@ impl App {
         // everywhere, which is what keeps the sidebar reachable from the
         // terminal; only the Ctrl form is released, matching iTerm2 and
         // Ghostty, which reserve Cmd and pass Ctrl through.
-        let terminal_owns_ctrl_b = self.focus == Pane::Terminal
+        //
+        // Ctrl+Q follows the same rule (#1290): it is vim's visual block,
+        // nano's search backwards and the shell's XON, and quitting from
+        // inside one of them killed the app, the shell and every unsaved
+        // tab. Quit keeps Ctrl+Q from every other pane.
+        let terminal_owns_ctrl = self.focus == Pane::Terminal
             && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal)
             && key.modifiers == KeyModifiers::CONTROL;
-        if is_sidebar_toggle_key(key) && !terminal_owns_ctrl_b {
+        if is_sidebar_toggle_key(key) && !terminal_owns_ctrl {
             self.toggle_side_bar();
             return Ok(());
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) if !terminal_owns_ctrl => {
                 self.quit = true;
                 return Ok(());
             }
@@ -22854,7 +22870,7 @@ impl App {
             self.status = String::from("Replace All is owner-only in a shared session");
             return;
         }
-        if self.search.query.trim().is_empty() {
+        if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             self.status = String::from("Replace All: enter a search term first");
             return;
         }
@@ -23034,8 +23050,32 @@ impl App {
                 self.source_control.end();
                 self.poke_cursor();
             }
-            KeyCode::Up => self.source_control.scroll_up(1),
-            KeyCode::Down => self.source_control.scroll_down(1),
+            // In a multi-line message Up/Down move between its lines; on
+            // its first/last line they scroll the change list as before.
+            KeyCode::Up => {
+                if self.source_control.move_cursor_up() {
+                    self.poke_cursor();
+                } else {
+                    self.source_control.scroll_up(1);
+                }
+            }
+            KeyCode::Down => {
+                if self.source_control.move_cursor_down() {
+                    self.poke_cursor();
+                } else {
+                    self.source_control.scroll_down(1);
+                }
+            }
+            // Shift/Alt+Enter start a new message line (the commit body),
+            // VS Code's multi-line SCM input; plain Enter commits.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.source_control.insert_char('\n');
+                self.poke_cursor();
+            }
             KeyCode::Enter => self.commit_source_control(),
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -40646,7 +40686,7 @@ impl App {
                 // horizontally and the user lands on the match instead of the
                 // line's leftmost cell - which on a 200k-char line means
                 // never seeing the match without manual scrolling.
-                let needle = self.search.query.trim();
+                let needle = crate::widgets::search::as_typed(&self.search.query);
                 let opts = self.search.opts;
                 let line = self.editor.lines.get(row).cloned().unwrap_or_default();
                 // Locate the first match on the line: its start column and
@@ -43229,11 +43269,12 @@ impl App {
             self.copy_terminal_selection();
             return;
         }
-        // Cmd+V / Ctrl+V / Ctrl+Shift+V: paste local clipboard into the
-        // embedded shell. Without this, raw Ctrl+V bytes (\x16) just go
-        // through to the shell unchanged, and Cmd+V — when not eaten by
-        // the host terminal's menu shortcut — would do nothing useful.
-        if is_clipboard_paste_key(key) {
+        // Cmd+V / Ctrl+Shift+V: paste local clipboard into the embedded
+        // shell; Cmd+V, when not eaten by the host terminal's menu
+        // shortcut, would otherwise do nothing useful. Plain Ctrl+V is the
+        // app's (#1290): vim's visual block and nano's page down need the
+        // 0x16 byte, as in VS Code's terminal on Linux.
+        if is_clipboard_paste_key(key) && !is_plain_ctrl_v(key) {
             self.paste_clipboard_into_terminal();
             return;
         }
@@ -43369,7 +43410,7 @@ impl App {
     }
 
     /// Paste the host clipboard into the terminal: the chord (Cmd+V /
-    /// Ctrl+V / Ctrl+Shift+V) and the pane menu's "Paste" both land here, so
+    /// Ctrl+Shift+V) and the pane menu's "Paste" both land here, so
     /// bracketed paste, broadcast fan-out and the remote-clipboard fallback
     /// behave identically whichever one the user reached for.
     ///
@@ -65486,6 +65527,16 @@ fn is_clipboard_paste_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Ctrl+V with no other modifier (or its raw 0x16 form), which the
+/// terminal hands to the app rather than pasting (#1290).
+fn is_plain_ctrl_v(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('\u{16}') => true,
+        KeyCode::Char(c) => c.eq_ignore_ascii_case(&'v') && key.modifiers == KeyModifiers::CONTROL,
+        _ => false,
+    }
 }
 
 fn is_search_editing_shortcut(key: KeyEvent) -> bool {

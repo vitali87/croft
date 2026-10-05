@@ -4489,7 +4489,7 @@ fn ansi_rows(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)>
             {
                 continue;
             }
-            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            let ch = cell_glyph(cell.c);
             // Only the flags an SGR carries: the soft-wrap mark on a row's
             // last cell and a wide char's own flag are not styles, and keyed
             // on them a run of one colour was reset and set again around them
@@ -4563,6 +4563,15 @@ pub fn row_wraps(term: &Term<VoidListener>, line_idx: i32) -> bool {
 /// the function silently re-reads the live grid at the viewport row,
 /// which is a different cell entirely once `display_offset > 0` and
 /// the user gets the wrong line on the clipboard.
+/// What a grid cell shows: a blank for an empty cell and for a control
+/// char. alacritty leaves `'\t'` in the cell a TAB started from so copy
+/// can give the tab back, but painted raw the host terminal jumps to its
+/// own tab stop while ratatui counts one cell, and the rest of the row
+/// lands too far right over the previous frame's text (#1287).
+fn cell_glyph(c: char) -> char {
+    if c == '\0' || c.is_control() { ' ' } else { c }
+}
+
 /// One grid row as text plus a char-index → grid-column map. A wide char
 /// (CJK, emoji) occupies two grid columns — the `WIDE_CHAR` cell and a
 /// spacer cell — so the spacers are skipped, making the text read
@@ -4581,7 +4590,7 @@ pub fn row_text_and_cols(term: &Term<VoidListener>, line_idx: i32) -> (String, V
         {
             continue;
         }
-        s.push(if cell.c == '\0' { ' ' } else { cell.c });
+        s.push(cell_glyph(cell.c));
         cols.push(c);
     }
     (s, cols)
@@ -5399,7 +5408,7 @@ impl Widget for &mut PtyTerminal {
                 let line_idx = (y as i32) - (display_offset as i32);
                 let p = Point::new(Line(line_idx), Column(x as usize));
                 let cell = &term.grid()[p];
-                let mut display_char = if cell.c == '\0' { ' ' } else { cell.c };
+                let mut display_char = cell_glyph(cell.c);
                 let mut style = Style::default();
                 if let Some(c) = ansi_to_ratatui(cell.fg, &self.palette) {
                     style = style.fg(c);
@@ -9189,6 +9198,76 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let t = PtyTerminal::new_running("/bin/sleep", &[String::from("30")], tmp.path()).unwrap();
         (tmp, t)
+    }
+
+    /// A TAB leaves `'\t'` in the cell it started from (so copy can give
+    /// the tab back). Painted raw, the host terminal jumped to its own tab
+    /// stop while ratatui counted one cell, so the gap kept the previous
+    /// frame's text and the rest of the row landed too far right (#1287).
+    #[test]
+    fn a_tab_paints_as_blank_cells_and_the_next_text_lands_on_the_tab_stop() {
+        let (_tmp, mut t) = quiet_pty();
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        t.feed_bytes_for_test(b"\x1b[2J\x1b[Ha\tb\r\n");
+        for cell in buf.content.iter_mut() {
+            cell.set_symbol("X");
+        }
+        (&mut t).render(area, &mut buf);
+        let row: Vec<String> = (0..area.width)
+            .map(|x| buf[(x, 1)].symbol().to_string())
+            .collect();
+        let a = row.iter().position(|c| c == "a").expect("a is painted");
+        assert!(
+            row.iter().all(|c| !c.chars().any(char::is_control)),
+            "no control char reaches the host terminal: {row:?}"
+        );
+        assert_eq!(
+            row[a + 1..a + 8].concat(),
+            " ".repeat(7),
+            "the tab's gap is blank, not the old frame: {row:?}"
+        );
+        assert_eq!(row[a + 8], "b", "b sits on the next tab stop: {row:?}");
+    }
+
+    /// The text views of the grid (find, `croft record` casts, the web
+    /// client) send no raw TAB either, while copy still gives it back.
+    #[test]
+    fn grid_text_views_blank_a_tab_but_copy_keeps_it() {
+        let (_tmp, mut t) = quiet_pty();
+        t.resize(40, 10);
+        t.feed_bytes_for_test(b"\x1b[2J\x1b[Ha\tb\r\n");
+        let row = {
+            let term = t.term.lock();
+            row_text_and_cols(&term, 0).0
+        };
+        assert!(row.starts_with("a       b"), "{row:?}");
+        let ansi = t.grid_lines_ansi();
+        let first = ansi
+            .iter()
+            .find(|(plain, _)| plain.starts_with('a'))
+            .unwrap();
+        assert!(
+            !first.0.contains('\t') && !first.1.contains('\t'),
+            "{first:?}"
+        );
+        assert!(first.0.starts_with("a       b"), "{first:?}");
+
+        let line = {
+            let term = t.term.lock();
+            (0..term.screen_lines() as i32)
+                .find(|&l| row_text_and_cols(&term, l).0.starts_with('a'))
+                .unwrap()
+        };
+        let mut sel = Selection::new(line, 0);
+        sel.head = (line, 8);
+        t.set_selection(Some(sel));
+        assert!(
+            t.selection_text().starts_with("a\t"),
+            "copy keeps the tab: {:?}",
+            t.selection_text()
+        );
     }
 
     /// An alt-screen round trip (`git log`, vim, htop) used to wipe every
