@@ -136,7 +136,7 @@ croft demo                       # a guided tour in a throwaway sample project (
 croft view report.pdf            # from any pane: open a file in the croft you are sitting in
 cat data.csv | croft view -      # ...or pipe it in (staged to ~/.cache/croft, 0600, swept at the next launch once a day old)
 croft theme-import theme.json    # use a VS Code colour theme in croft
-croft locale-template fr         # start translating croft's UI (see docs/SETTINGS.md)
+croft locale-template fr --write # start or update a translation of croft's UI (see docs/SETTINGS.md)
 croft theme-import dracula-theme.theme-dracula   # ...or fetch one from the marketplace
 croft --help
 ```
