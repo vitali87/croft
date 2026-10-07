@@ -20,6 +20,8 @@ The non-negotiables behind every decision in croft:
 
 ## Layout
 
+![croft: Explorer, a Rust file with highlighting and inline blame, Go to File, and cargo run in the terminal](docs/images/overview.gif)
+
 Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **panel** bottom right with PROBLEMS, OUTPUT, TERMINAL, CAPTURES, and PORTS tabs. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, Remote (SSH), Run and Debug, Extensions, and Testing, and holds the theme picker. Every seam drags to resize, and a **Customize Layout** popup mirrors VS Code's title-bar controls.
 
 The essentials are all there: full LSP editing (completion, hover, go-to-definition, rename, quick fixes, inlay hints) with tree-sitter highlighting, multi-cursor, minimap, git gutter, inline blame, and an optional vim mode; a real terminal with shell integration, splits, triggers, copy mode, and durable command history; Source Control with hunk staging and a commit graph; a Test Explorer; a zero-config task runner; Live Run, which re-runs a Python file as you type and shows every line's values inline; and debugging for Python, JavaScript/TypeScript, Rust, C, and C++ over DAP.
@@ -165,7 +167,7 @@ croft runs on macOS, Linux, Android, and Windows (via WSL2). The cross-platform 
 
 ## Keybindings
 
-Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](docs/KEYBINDINGS.md)**. The command modifier is `Cmd` on macOS and `Ctrl` on Linux / Android; the [platform guides](#platform-setup) cover getting `Cmd` chords through your terminal.
+Every action is reachable from the keyboard; press `F1` inside croft for the full reference. The complete tables (global, Explorer, Search, editor, vim mode, previews, terminal) live in **[KEYBINDINGS.md](docs/KEYBINDINGS.md)**. The command modifier is `Cmd` on macOS and `Ctrl` on Linux / Android, where `Ctrl`+`K` is also the `Cmd+K` chord leader; the [platform guides](#platform-setup) cover getting `Cmd` chords through your terminal and the few Linux chords that need `Super`.
 
 ## Goal
 

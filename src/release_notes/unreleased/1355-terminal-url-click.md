@@ -1,0 +1,1 @@
+fix: Cmd/Ctrl+click on a URL in the terminal opens the whole URL: parentheses in the path (Wikipedia, MSDN) are kept, and a URL that wraps onto the next row is read across the wrap, from any of its rows.
