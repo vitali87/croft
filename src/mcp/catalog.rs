@@ -205,4 +205,52 @@ mod tests {
         assert!(!is_catalog_entry("my-own-ext"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    /// Every uv-provisioned catalog server, run at its pinned version, must
+    /// answer `initialize`: an upstream dependency drift (mcp 2.x breaking
+    /// the 2026.6.4 Time and Fetch servers, #1297) fails here before a user
+    /// hits it. Needs uv and network; run with
+    /// `cargo test --bin croft -- --ignored catalog_uv_servers`.
+    #[test]
+    #[ignore = "needs uv and network"]
+    fn catalog_uv_servers_answer_initialize_at_their_pins() {
+        use std::io::Write;
+        let mut checked = 0;
+        for src in manifest::CATALOG_MANIFESTS {
+            let doc: toml::Value = toml::from_str(src).unwrap();
+            for server in doc
+                .get("mcp_servers")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(p) = server.get("provision") else {
+                    continue;
+                };
+                if p.get("kind").and_then(toml::Value::as_str) != Some("uv") {
+                    continue;
+                }
+                let field = |k: &str| p.get(k).and_then(toml::Value::as_str).unwrap().to_string();
+                let spec = format!("{}=={}", field("package"), field("version"));
+                let mut child = std::process::Command::new("uvx")
+                    .args(["--from", &spec, &field("bin")])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"croft","version":"test"}}}"#;
+                writeln!(child.stdin.take().unwrap(), "{init}").unwrap();
+                let out = child.wait_with_output().unwrap();
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    stdout.contains(r#""id":1,"result""#),
+                    "{spec} did not answer initialize:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 3, "found {checked} uv catalog servers");
+    }
 }
