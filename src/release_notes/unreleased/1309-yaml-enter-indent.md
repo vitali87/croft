@@ -1,0 +1,1 @@
+fix: In YAML, Enter after a key that opens a mapping (`services:`), a block scalar (`run: |`) or a list item (`- name: x`) indents the new line, so a compose or CI file typed line by line keeps its nesting.

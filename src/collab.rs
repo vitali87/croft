@@ -870,9 +870,12 @@ enum DocState {
 #[derive(Debug)]
 pub enum CollabEvent {
     /// Remote edits resolved against the local replica; replay the spans
-    /// sequentially onto the open buffer for `file`.
+    /// sequentially onto the open buffer for `file`. `site` is the author's
+    /// site id in that file, so the app can group one author's edits into a
+    /// single undo step (#1207).
     RemoteEdit {
         file: String,
+        site: u64,
         spans: Vec<ResolvedSpan>,
     },
     /// Bootstrap finished: swap the open buffer for `file` to `text` (the
@@ -1183,6 +1186,7 @@ impl CollabSession {
                         if !spans.is_empty() {
                             events.push(CollabEvent::RemoteEdit {
                                 file: env.file,
+                                site: env.site,
                                 spans,
                             });
                         }

@@ -9,7 +9,7 @@ api_version = 1
 [[mcp_servers]]
 id = "time"
 command = "mcp-server-time"
-provision = { kind = "uv", package = "mcp-server-time", version = "2026.6.4", bin = "mcp-server-time" }
+provision = { kind = "uv", package = "mcp-server-time", version = "2026.8.18", bin = "mcp-server-time" }
 
 [[commands]]
 id = "time.now"
