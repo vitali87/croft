@@ -32,6 +32,9 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(4);
 struct AgentState {
     session: CollabSession,
     peers: HashMap<u64, PeerCaret>,
+    /// The workspace the seat was started for, named in errors that tell
+    /// the user how to serve it.
+    workspace: std::path::PathBuf,
 }
 
 struct PeerCaret {
@@ -43,7 +46,7 @@ struct PeerCaret {
 
 /// Connect to the relay as a guest, retrying briefly (the dispatch just
 /// ensured the relay, but its accept loop may still be coming up).
-fn connect_state(socket: &Path, name: &str) -> Result<AgentState> {
+fn connect_state(socket: &Path, workspace: &Path, name: &str) -> Result<AgentState> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let channel = loop {
         if let Some(ch) = CollabChannel::connect(socket, CollabRole::Guest) {
@@ -59,6 +62,7 @@ fn connect_state(socket: &Path, name: &str) -> Result<AgentState> {
     Ok(AgentState {
         session: CollabSession::new(channel, name.to_string()),
         peers: HashMap::new(),
+        workspace: workspace.to_path_buf(),
     })
 }
 
@@ -174,9 +178,14 @@ fn call_tool(state: &Mutex<AgentState>, tool: &str, args: &Value) -> Option<Valu
                         break text_result(text);
                     }
                     if !st.session.is_bootstrapping(&file) || Instant::now() >= deadline {
+                        // Only a session croft hosts serves the seat, so a
+                        // plain window open on the workspace answers nobody
+                        // (#1289): say what does, not "start croft".
+                        let ws = st.workspace.display();
                         break error_result(format!(
-                            "no live croft session answered for {file}; start croft in \
-                             this workspace (the owner serves the file), then retry"
+                            "no croft session is sharing {ws}, so nobody served {file}: \
+                             open the workspace with `croft attach {ws}` (a plain `croft` \
+                             window does not host agents), then retry"
                         ));
                     }
                 }
@@ -309,8 +318,8 @@ fn tool_definitions() -> Value {
 }
 
 /// Serve the MCP loop on stdio until the driving client hangs up (EOF).
-pub fn run(socket: &Path, name: String) -> Result<()> {
-    let state = std::sync::Arc::new(Mutex::new(connect_state(socket, &name)?));
+pub fn run(socket: &Path, workspace: &Path, name: String) -> Result<()> {
+    let state = std::sync::Arc::new(Mutex::new(connect_state(socket, workspace, &name)?));
     {
         let state = std::sync::Arc::clone(&state);
         std::thread::spawn(move || {
@@ -377,7 +386,8 @@ mod tests {
                 let _ = relay_serve(&s);
             });
         }
-        let state = connect_state(&socket, "claude").expect("agent connects");
+        let state = connect_state(&socket, std::path::Path::new("/work/space"), "claude")
+            .expect("agent connects");
         (dir, socket, Mutex::new(state))
     }
 
@@ -431,6 +441,27 @@ mod tests {
             "the error teaches the fix: {}",
             text_of(&read)
         );
+    }
+
+    /// No owner on the relay: `collab_open` fails with what the user has to
+    /// do, not "start croft" (#1289). A plain `croft` window is running in
+    /// the workspace in that case and serves nobody, so the error names
+    /// `croft attach` and the workspace it was given.
+    #[test]
+    fn opening_with_no_owner_says_the_workspace_needs_croft_attach() {
+        let (_dir, _socket, state) = agent_over_relay();
+        let opened = call(&state, 1, "collab_open", json!({ "file": "src/m.rs" }));
+        assert_eq!(opened["result"]["isError"], true);
+        let msg = text_of(&opened);
+        assert!(
+            msg.contains("croft attach /work/space"),
+            "names the command and the workspace: {msg}"
+        );
+        assert!(
+            msg.contains("a plain `croft` window does not host agents"),
+            "says why the open window is not enough: {msg}"
+        );
+        assert!(!msg.contains("start croft in this workspace"), "{msg}");
     }
 
     /// End to end over a real relay: the agent opens a file served by a live

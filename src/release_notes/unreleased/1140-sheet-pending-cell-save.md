@@ -1,0 +1,1 @@
+fix: Saving a spreadsheet grid now includes the cell still being typed into, rather than leaving it out while saying "Saved" and marking the tab clean. An xlsx cell committed by clicking another cell is now written too, instead of "Saved (0 cells)". An editable grid or hex view with nothing to save says so instead of calling itself a read-only preview.
