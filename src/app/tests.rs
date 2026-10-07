@@ -14396,6 +14396,7 @@ fn committing_mid_rebase_continues_the_rebase() {
     let mut app = App::new(p.to_path_buf()).unwrap();
     app.source_control.message = String::from("feat");
     app.commit_source_control();
+    wait_for_git_net(&mut app);
     assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
     assert_eq!(git_stdout(p, &["symbolic-ref", "--short", "HEAD"]), "feat");
 }
