@@ -1,1 +1,1 @@
-fix: The zoxide directory jump opens with `Ctrl+Z` in the Explorer as well as `Cmd+Z`, and from any pane with the palette command "Go: Jump to Directory (zoxide)…", so terminals that never send Super can reach it; a failed install on Linux suggests `apt install zoxide` instead of brew.
+fix: The zoxide directory jump opens with `Ctrl+Z` in the Explorer as well as `Cmd+Z`, so terminals that never send Super can reach it there; a failed install on Linux suggests `apt install zoxide` instead of brew.
