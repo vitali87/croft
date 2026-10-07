@@ -3759,6 +3759,7 @@ mod tests {
             path: path.to_path_buf(),
             line_no,
             line_text: format!("line {line_no}"),
+            matches: 1,
         }
     }
 
