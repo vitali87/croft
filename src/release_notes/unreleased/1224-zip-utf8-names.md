@@ -1,0 +1,1 @@
+fix: The archive browser reads zip member names made by Linux `zip` (UTF-8 without the UTF-8 flag) as UTF-8, so non-ASCII names list correctly and Enter / E extract them under their real names instead of CP437 mojibake.

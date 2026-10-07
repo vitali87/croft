@@ -1,0 +1,1 @@
+fix: When no croft session serves the workspace, `croft collab-agent`'s `collab_open` now says to open it with `croft attach <workspace>` (a plain `croft` window does not host agents) instead of "start croft in this workspace", which pointed at a window that was already open; COLLABORATION.md says the same.
