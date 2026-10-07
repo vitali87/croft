@@ -600,13 +600,14 @@ impl LspClient {
             .context("did_change")
     }
 
-    pub fn did_save(&mut self, uri: Url) -> Result<()> {
-        // No `text`: rust-analyzer (the server this exists for) registers
-        // save notifications with includeText=false; it re-reads from disk.
+    /// `textDocument/didSave`, carrying `text` only for a server whose
+    /// `save` options set `includeText` (#854); the caller decides from the
+    /// capability, and skips a server that never asked for saves at all.
+    pub fn did_save(&mut self, uri: Url, text: Option<String>) -> Result<()> {
         self.server
             .did_save(DidSaveTextDocumentParams {
                 text_document: TextDocumentIdentifier { uri },
-                text: None,
+                text,
             })
             .context("did_save")
     }

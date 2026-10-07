@@ -222,6 +222,18 @@ impl Chord {
     }
 }
 
+/// What prose calls the portable `mod` modifier [`Chord::parse`] resolves:
+/// `Cmd` on macOS, `Ctrl` elsewhere. Text that tells a user which chord to
+/// press (the `croft demo` captions, #863) names the key they actually
+/// hold, not the Mac's everywhere.
+pub fn mod_key_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Ctrl"
+    }
+}
+
 /// The CSI-u escape `ESC [ <codepoint> ; <modbyte> u` as the space-separated
 /// hex-byte string iTerm2's "Send Hex Code" action wants (each decimal digit
 /// becomes its ASCII byte).
@@ -1201,6 +1213,16 @@ mod tests {
             KeyModifiers::CONTROL
         };
         assert_eq!(c, Chord::from_event(ev(KeyCode::Char('s'), expected)));
+    }
+
+    #[test]
+    fn the_mod_key_is_named_as_the_modifier_it_resolves_to() {
+        // #863: the name prose shows for `mod` parses back to the same
+        // chord, so a caption never names a key `mod` does not mean.
+        assert_eq!(
+            Chord::parse(&format!("{}+s", mod_key_name())),
+            Chord::parse("mod+s")
+        );
     }
 
     #[test]

@@ -1,0 +1,1 @@
+fix: Committing from Source Control no longer freezes croft while the repository's pre-commit and commit-msg hooks run; the commit runs in the background, the message stays in the box until it lands, and a hook can no longer grab croft's terminal.
