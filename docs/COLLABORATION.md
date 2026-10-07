@@ -55,6 +55,10 @@ Register croft's collab agent as an MCP server, for example with Claude Code:
 claude mcp add croft-collab -- croft collab-agent --workspace /abs/path/to/project
 ```
 
+The seat needs croft to host the workspace as a session: open it with
+`croft attach /abs/path/to/project`. A plain `croft` window does not serve agents, and
+`collab_open` says so rather than waiting on it.
+
 The agent joins the running session as a guest with `collab_open` / `collab_read` /
 `collab_replace` / `collab_caret` / `collab_status` tools: its edits stream into your editor
 live, its caret shows up named (default `claude`, `--name` overrides), and it can never write

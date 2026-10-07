@@ -202,6 +202,13 @@ With none pending it shows its own version's notes under "IN THIS RELEASE".
 A build with neither is a **build** error, not an empty panel, so a binary
 always describes itself.
 
+Every `chore: release` commit that bumps the version on `main` is then tagged `v<version>` by
+`.github/workflows/tag.yml`, which also starts `release.yml` for that tag, so a
+merged version is a published release without anyone cutting it by hand. A
+merge that ships nothing keeps the previous version, whose tag already exists,
+and is left untagged.
+
+
 CI enforces it (the `release notes` job, `scripts/release.py check`): a shipped
 change must add a fragment that says something, and no PR may change the
 version or any version's notes. Docs, CI, and test-only PRs are exempt:
