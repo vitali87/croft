@@ -1,0 +1,1 @@
+fix: Finishing a conflicted revert, cherry-pick, squash or merge from Source Control now commits the whole message git prepared, so "This reverts commit …" and "(cherry picked from commit …)" are no longer dropped.

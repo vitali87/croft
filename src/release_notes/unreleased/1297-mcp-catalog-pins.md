@@ -1,0 +1,1 @@
+fix: The Time and Web Fetch extensions work again: their servers are pinned to 2026.8.18 (the 2026.6.4 ones crash on import with mcp 2.x), a managed tool installed under an older pin is reinstalled at the new one, and a server that exits before answering now shows the last line of its error output instead of "closed or timed out".
