@@ -646,6 +646,8 @@ mod tests {
             character: 0,
             range_start_line: from,
             range_end_line: to,
+            range_start_character: 0,
+            range_end_character: u32::MAX,
         }
     }
 

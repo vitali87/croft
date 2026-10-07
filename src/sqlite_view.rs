@@ -70,6 +70,22 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
     Ok((headers, body, more))
 }
 
+/// The index of a table's last page (#1222), for Ctrl+End. Counting costs a
+/// scan, the same as the OFFSET fetch of that page does, so it runs only
+/// when asked for the end, never on open or on a page turn.
+pub fn last_page(path: &Path, table: &str) -> Result<usize, String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| e.to_string())?;
+    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+    let rows: i64 = conn
+        .query_row(&format!("SELECT count(*) FROM {quoted}"), [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok((rows.max(1) as usize - 1) / ROW_CAP)
+}
+
 /// The sheet name for a table page: honest about position, and about more
 /// rows following without claiming a total nobody counted.
 pub fn page_label(table: &str, page: usize, got: usize, more: bool) -> String {
@@ -179,6 +195,25 @@ mod tests {
             page_label("t", 1, rows.len(), more),
             format!("t: rows {}-{}", ROW_CAP + 1, ROW_CAP + 7)
         );
+    }
+
+    /// #1222: the last page's index, and 0 for an empty or one-page table.
+    #[test]
+    fn last_page_is_where_the_tables_rows_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("pages.sqlite");
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE e (n INTEGER); CREATE TABLE full_page (n INTEGER);
+             CREATE TABLE t (n INTEGER); WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < {}) INSERT INTO t SELECT x FROM c;
+             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < {ROW_CAP}) INSERT INTO full_page SELECT x FROM c;",
+            2 * ROW_CAP + 7
+        ))
+        .unwrap();
+        assert_eq!(last_page(&p, "t"), Ok(2));
+        assert_eq!(last_page(&p, "full_page"), Ok(0), "exactly one page");
+        assert_eq!(last_page(&p, "e"), Ok(0));
+        assert!(last_page(&p, "missing").is_err());
     }
 
     #[test]

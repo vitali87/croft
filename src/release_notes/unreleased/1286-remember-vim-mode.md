@@ -1,0 +1,1 @@
+fix: Vim mode is remembered across launches: Toggle Vim Mode saves it as `vim_mode` in config.json, Settings has an Editor: Vim Mode row, and croft import-vscode turns it on when VSCodeVim is installed.

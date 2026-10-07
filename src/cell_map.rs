@@ -90,6 +90,13 @@ impl CellMap {
             .position(|&(_, first, width)| width > 0 && cell >= first && cell < first + width)
             .unwrap_or(self.chars.len())
     }
+
+    /// Cells the whole line occupies: what a column of such lines has to be
+    /// padded against, where a character count under-measures every wide
+    /// character by one cell.
+    pub(crate) fn width(&self) -> u16 {
+        self.total
+    }
 }
 
 #[cfg(test)]
