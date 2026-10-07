@@ -13185,6 +13185,8 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
         is_delete_node_key,
         is_completion_trigger_key,
         is_save_all_key,
+        is_replace_in_files_key,
+        is_search_details_key,
         is_show_output_key,
         is_show_problems_key,
         is_update_croft_key,
@@ -17190,6 +17192,7 @@ fn finishing_a_conflicted_revert_commits_gits_whole_message() {
     let expected = format!("Revert \"Raise rate\"\n\nThis reverts commit {reverted}.");
     assert_eq!(app.source_control.message, expected);
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
     assert_eq!(last_commit_message(root), format!("{expected}\n\n"));
 }
 
