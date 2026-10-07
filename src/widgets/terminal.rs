@@ -1972,10 +1972,14 @@ impl PtyTerminal {
         // it re-splits the budget over the panes already open; registering
         // then trims them to the smaller share before this pane records.
         let rewind_budget = crate::rewind::budget();
-        rewind_budget.set_total(crate::rewind::configured_budget_bytes(
-            crate::prefs::Prefs::load_or_default().terminal_rewind_mb,
-            crate::remote::running_over_ssh(),
-        ));
+        let rewind_mb = crate::prefs::Prefs::load_or_default().terminal_rewind_mb;
+        // Off by default until it can be replayed (#1342), but the recorder's
+        // own tests drive it through real panes, and every spawn sets the one
+        // shared total: test panes all record under the same explicit figure
+        // rather than one turning it off under another.
+        #[cfg(test)]
+        let rewind_mb = rewind_mb.or(Some(128));
+        rewind_budget.set_total(crate::rewind::configured_budget_bytes(rewind_mb));
         let rewind = rewind_budget.register();
         let rewind_for_thread = rewind.clone();
         // MONOTONIC, not the wall clock. Every read the buffer offers —
@@ -3084,19 +3088,46 @@ impl PtyTerminal {
         self.term.lock().grid().display_offset() as i32
     }
 
-    /// Text of the grid row under screen cell `(col, row)`, plus the 0-based
-    /// column within that text the click landed on. Drives Cmd/Ctrl+click URL
-    /// detection. `None` when the cell is outside the content area.
+    /// Text of the logical line under screen cell `(col, row)`, plus the
+    /// 0-based char index within that text the click landed on. Drives
+    /// Cmd/Ctrl+click URL and `path:line` detection. A line the terminal
+    /// soft-wrapped (WRAPLINE) is stitched back together from all its rows,
+    /// so a long URL resolves whole from any of them (#1355). `None` when
+    /// the cell is outside the content area.
     pub fn line_text_at(&self, col: u16, row: u16) -> Option<(String, usize)> {
         let (r, c) = self.cell_at(col, row)?;
         let term = self.term.lock();
         let line = r as i32 - term.grid().display_offset() as i32;
-        let (text, cols_map) = row_text_and_cols(&term, line);
+        let (row_text, cols_map) = row_text_and_cols(&term, line);
         // Grid column → char index in the spacer-skipped text: the last
         // produced char at-or-before the clicked column, so clicking a wide
         // char's spacer cell resolves to the wide char itself.
         let idx = cols_map.iter().rposition(|&gc| gc <= c as usize)?;
-        Some((text, idx))
+        let top = -(term.grid().history_size() as i32);
+        let bottom = term.screen_lines() as i32 - 1;
+        let mut first = line;
+        while first > top && row_wraps(&term, first - 1) {
+            first -= 1;
+        }
+        let mut last = line;
+        while last < bottom && row_wraps(&term, last) {
+            last += 1;
+        }
+        if first == line && last == line {
+            return Some((row_text, idx));
+        }
+        let mut text = String::new();
+        let mut offset = 0;
+        for l in first..=last {
+            let part = if l == line {
+                offset = text.chars().count();
+                row_text.clone()
+            } else {
+                row_text_and_cols(&term, l).0
+            };
+            text.push_str(&part);
+        }
+        Some((text, offset + idx))
     }
 
     /// The OSC 8 hyperlink under a screen position (host cell coords), if
@@ -5017,6 +5048,7 @@ const SGR_FLAGS: Flags = Flags::BOLD
     .union(Flags::DOTTED_UNDERLINE)
     .union(Flags::DASHED_UNDERLINE)
     .union(Flags::INVERSE)
+    .union(Flags::HIDDEN)
     .union(Flags::STRIKEOUT);
 
 /// The SGR sequence that reproduces a cell's colours and attributes, or an
@@ -5046,6 +5078,9 @@ fn cell_sgr(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> String {
     }
     if flags.contains(Flags::INVERSE) {
         codes.push("7".into());
+    }
+    if flags.contains(Flags::HIDDEN) {
+        codes.push("8".into());
     }
     if flags.contains(Flags::STRIKEOUT) {
         codes.push("9".into());
@@ -5080,6 +5115,7 @@ fn style_is_default(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> bool {
                 | Flags::DOTTED_UNDERLINE
                 | Flags::DASHED_UNDERLINE
                 | Flags::INVERSE
+                | Flags::HIDDEN
                 | Flags::STRIKEOUT,
         )
 }
@@ -5428,6 +5464,17 @@ impl Widget for &mut PtyTerminal {
                 }
                 if flags.contains(Flags::INVERSE) {
                     style = style.add_modifier(Modifier::REVERSED);
+                }
+                // SGR 9: coding agents strike through finished todo items.
+                if flags.contains(Flags::STRIKEOUT) {
+                    style = style.add_modifier(Modifier::CROSSED_OUT);
+                }
+                // SGR 8 (conceal) paints a blank, not just HIDDEN, so the
+                // text stays hidden on a host terminal that ignores SGR 8.
+                // The grid keeps the real text for copy, as in xterm.
+                if flags.contains(Flags::HIDDEN) {
+                    style = style.add_modifier(Modifier::HIDDEN);
+                    display_char = ' ';
                 }
                 // Trigger highlight: the user's per-trigger colours over the
                 // matched span. Cursor / selection / find / quick-select all
@@ -7333,6 +7380,76 @@ mod tests {
             }
         }
         panic!("the faint sentinel never appeared in the rendered buffer");
+    }
+
+    /// A quiet pane fed the issue's bytes (#1288): two struck-through todo
+    /// items, a concealed password and a plain word.
+    fn strike_and_conceal_pane() -> (PtyTerminal, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("sleep 30")],
+            tmp.path(),
+        )
+        .unwrap();
+        term.feed_bytes_for_test(
+            b"\x1b[2J\x1b[H\x1b[9mDONE\x1b[0m [\x1b[8mhunter2\x1b[0m] PLAIN\r\n",
+        );
+        (term, tmp)
+    }
+
+    #[test]
+    fn struck_through_cells_paint_crossed_out_and_concealed_cells_paint_blank() {
+        let (mut term, _tmp) = strike_and_conceal_pane();
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut term, area, &mut buf);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let y = rows
+            .iter()
+            .position(|r| r.contains("DONE"))
+            .expect("the todo row is painted") as u16;
+        let row = &rows[y as usize];
+        assert!(!row.contains("hunter2"), "SGR 8 text is hidden: {row:?}");
+        assert!(row.contains("DONE [       ] PLAIN"), "{row:?}");
+        // Cells, not bytes: the pane border is a multi-byte glyph.
+        let at = |word: &str| row[..row.find(word).unwrap()].chars().count() as u16;
+        for x in at("DONE")..at("DONE") + 4 {
+            assert!(
+                buf[(x, y)].modifier.contains(Modifier::CROSSED_OUT),
+                "SGR 9 cell at {x} is struck through"
+            );
+        }
+        for x in at("PLAIN")..at("PLAIN") + 5 {
+            assert!(
+                !buf[(x, y)]
+                    .modifier
+                    .intersects(Modifier::CROSSED_OUT | Modifier::HIDDEN),
+                "plain cell at {x} carries neither"
+            );
+        }
+    }
+
+    #[test]
+    fn concealed_text_still_copies_and_exports_with_its_sgr() {
+        // Negative: hiding is paint-only, as in xterm. The grid, and so a
+        // copy, keeps the real text, and an export with styles writes the
+        // attributes back out as 8 and 9 for the reader to honour.
+        let (term, _tmp) = strike_and_conceal_pane();
+        let (lines, _) = term.grid_lines();
+        assert!(
+            lines.iter().any(|l| l.contains("DONE [hunter2] PLAIN")),
+            "{lines:?}"
+        );
+        let exported = term.grid_lines_ansi();
+        let (_, raw) = exported
+            .iter()
+            .find(|(p, _)| p.contains("hunter2"))
+            .expect("the row is exported");
+        assert!(raw.contains("\x1b[9mDONE"), "{raw:?}");
+        assert!(raw.contains("\x1b[8mhunter2"), "{raw:?}");
     }
 
     #[test]

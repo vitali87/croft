@@ -175,6 +175,12 @@ pub struct OutlineSymbol {
     pub character: u32,
     pub range_start_line: u32,
     pub range_end_line: u32,
+    /// The construct's start column on `range_start_line` and end column on
+    /// `range_end_line` (#1221), so symbols sharing a line (a one-line
+    /// interface's fields, a minified bundle's functions) are told apart.
+    /// `0` / `u32::MAX` when only the lines are known.
+    pub range_start_character: u32,
+    pub range_end_character: u32,
 }
 
 /// The Outline for one document. Keyed by `path` (the latest batch wins, like
@@ -740,6 +746,7 @@ enum Cmd {
     },
     SaveDoc {
         path: PathBuf,
+        text: String,
     },
     CloseDoc {
         path: PathBuf,
@@ -949,6 +956,10 @@ pub struct LspManager {
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     doc_highlights_rx: std_mpsc::Receiver<DocumentHighlightsResult>,
     linked_editing_rx: std_mpsc::Receiver<LinkedEditingResult>,
+    /// Test hook: a sender into `linked_editing_rx`, so app tests can
+    /// answer a linkedEditingRange request without a server.
+    #[cfg(test)]
+    linked_editing_test_tx: std_mpsc::Sender<LinkedEditingResult>,
     selection_ranges_rx: std_mpsc::Receiver<SelectionRangesResult>,
     calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
@@ -1010,6 +1021,8 @@ impl LspManager {
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
         let (linked_editing_tx, linked_editing_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let linked_editing_test_tx = linked_editing_tx.clone();
         let (selection_ranges_tx, selection_ranges_rx) = std_mpsc::channel();
         let (calls_tx, calls_rx) = std_mpsc::channel();
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
@@ -1106,6 +1119,8 @@ impl LspManager {
             ref_rx,
             doc_highlights_rx,
             linked_editing_rx,
+            #[cfg(test)]
+            linked_editing_test_tx,
             selection_ranges_rx,
             calls_rx,
             ws_symbols_rx,
@@ -1171,8 +1186,12 @@ impl LspManager {
     /// Notify the servers a document was written to disk. rust-analyzer only
     /// re-runs its check-on-save (`cargo check`, the source of most Rust
     /// PROBLEMS entries) on `textDocument/didSave`.
-    pub fn save_doc(&self, path: PathBuf) {
-        let _ = self.cmd_tx.send(Cmd::SaveDoc { path });
+    ///
+    /// `text` is the buffer as saved, in the form `change_doc` sends it. Only
+    /// a server whose `save` options ask for `includeText` receives it, and
+    /// only a server that asked for saves at all is notified (#854).
+    pub fn save_doc(&self, path: PathBuf, text: String) {
+        let _ = self.cmd_tx.send(Cmd::SaveDoc { path, text });
     }
 
     pub fn close_doc(&self, path: PathBuf) {
@@ -1577,6 +1596,12 @@ impl LspManager {
 
     pub fn drain_linked_editing(&self) -> Option<LinkedEditingResult> {
         self.linked_editing_rx.try_recv().ok()
+    }
+
+    /// Test hook: deliver `result` as if a server had answered.
+    #[cfg(test)]
+    pub fn push_linked_editing_for_test(&self, result: LinkedEditingResult) {
+        let _ = self.linked_editing_test_tx.send(result);
     }
 
     pub fn drain_selection_ranges(&self) -> Option<SelectionRangesResult> {
@@ -2003,6 +2028,9 @@ struct ManagedClient {
     /// would accrue one leak per refresh for the whole session. Asking it
     /// once and then stopping bounds the damage at exactly one.
     diagnostic_pull_stalled: Arc<AtomicBool>,
+    /// Whether to send this server `textDocument/didSave`, and with the text
+    /// or without it, read from its `textDocumentSync` (#854).
+    save_notify: SaveNotify,
     /// Whether the server answers `textDocument/diagnostic` (#866), which
     /// advertising `diagnosticProvider` at all promises. croft declares the
     /// pull capability for the workspace pull (#533), and servers such as
@@ -2362,7 +2390,7 @@ async fn worker_loop(
                     .await
             }
             Cmd::ChangeDoc { path, text } => state.change_doc(path, text).await,
-            Cmd::SaveDoc { path } => state.save_doc(path).await,
+            Cmd::SaveDoc { path, text } => state.save_doc(path, text).await,
             Cmd::CloseDoc { path } => state.close_doc(path).await,
             Cmd::RequestCompletion {
                 request_id,
@@ -2856,6 +2884,7 @@ impl WorkerState {
                         let supports_document_diagnostics = caps.diagnostic_provider.is_some();
                         let diagnostic_identifier =
                             diagnostic_identifier_of(&caps.diagnostic_provider);
+                        let save_notify = save_notify_of(&caps.text_document_sync);
                         let supports_hover = hover_supported(&caps.hover_provider);
                         let supports_definition = one_of_supported(&caps.definition_provider);
                         let supports_document_symbol =
@@ -2944,6 +2973,7 @@ impl WorkerState {
                                 DiagnosticResultIds::default(),
                             )),
                             diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
+                            save_notify,
                             supports_document_diagnostics,
                             document_pull_stalled: Arc::new(AtomicBool::new(false)),
                             document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
@@ -3185,7 +3215,7 @@ impl WorkerState {
         spawn_document_pulls(pulls, self.diagnostics_tx.clone(), DOCUMENT_PULL_DEBOUNCE);
     }
 
-    async fn save_doc(&mut self, path: PathBuf) {
+    async fn save_doc(&mut self, path: PathBuf, text: String) {
         let Some(doc) = self.docs.get(&path) else {
             return;
         };
@@ -3193,16 +3223,37 @@ impl WorkerState {
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
-        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>)> = match self.clients.get(&key) {
-            Some(cs) => cs
-                .iter()
-                .map(|c| (c.name.clone(), c.client.clone()))
-                .collect(),
-            None => return,
-        };
-        for (name, client_arc) in arcs {
+        // Only the servers that asked for saves (#854): ruff advertises no
+        // `save` and warns "no handler" on every notification it is sent.
+        let arcs: Vec<(String, Arc<TokioMutex<LspClient>>, SaveNotify)> =
+            match self.clients.get(&key) {
+                Some(cs) => cs
+                    .iter()
+                    .filter(|c| c.save_notify != SaveNotify::Never)
+                    .map(|c| (c.name.clone(), c.client.clone(), c.save_notify))
+                    .collect(),
+                None => return,
+            };
+        // The text is cloned only for a server that asks for it while another
+        // still waits after it; the last one gets the buffer itself.
+        let mut wanting = arcs
+            .iter()
+            .filter(|(_, _, notify)| *notify == SaveNotify::WithText)
+            .count();
+        let mut text = Some(text);
+        for (name, client_arc, notify) in arcs {
+            let text = if notify == SaveNotify::WithText {
+                wanting -= 1;
+                if wanting == 0 {
+                    text.take()
+                } else {
+                    text.clone()
+                }
+            } else {
+                None
+            };
             let mut client = client_arc.lock().await;
-            if let Err(e) = client.did_save(uri.clone()) {
+            if let Err(e) = client.did_save(uri.clone(), text) {
                 log_file::log(&format!("lsp[{name}] did_save failed: {e}"));
             }
         }
@@ -5095,7 +5146,17 @@ impl WorkerState {
         new_name: String,
         tx: &std_mpsc::Sender<RenameResult>,
     ) {
+        // Every early exit answers with no edits, so the caller's "Renaming
+        // symbol" always resolves (#1193).
+        let unanswerable = |path: PathBuf| {
+            let _ = tx.send(RenameResult {
+                request_id,
+                path,
+                edits: None,
+            });
+        };
         let Some(doc) = self.docs.get(&path) else {
+            unanswerable(path);
             return;
         };
         let lang = doc.language;
@@ -5105,6 +5166,7 @@ impl WorkerState {
         // without reopening the file. Cheap once the list is non-empty.
         self.ensure_clients(lang, &root).await;
         let Some(clients) = self.clients.get(&(lang, root)) else {
+            unanswerable(path);
             return;
         };
         let picked = clients
@@ -5112,14 +5174,11 @@ impl WorkerState {
             .find(|c| c.supports_rename)
             .map(|c| (c.name.clone(), c.client.clone()));
         let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(RenameResult {
-                request_id,
-                path,
-                edits: None,
-            });
+            unanswerable(path);
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
+            unanswerable(path);
             return;
         };
         let tx = tx.clone();
@@ -5966,6 +6025,50 @@ fn signature_help_supported(cap: &Option<lsp_types::SignatureHelpOptions>) -> bo
     cap.is_some()
 }
 
+/// Whether a server asked for `textDocument/didSave`, and with the saved
+/// text or without it (#854).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveNotify {
+    /// Not asked for, so not sent: ruff advertises no `save` and warns "no
+    /// handler" on every Ctrl+S that reaches it.
+    Never,
+    /// Sent bare; the server re-reads the file (rust-analyzer's `save: {}`).
+    WithoutText,
+    /// Sent carrying the text, for `save: { includeText: true }`.
+    WithText,
+}
+
+/// Read [`SaveNotify`] off a server's `textDocumentSync` capability (#854).
+///
+/// The options form says it outright: `save` present asks for the
+/// notification, absent asks for none ("if omitted the notification should
+/// not be sent"), and `includeText` asks for the text. The bare
+/// `TextDocumentSyncKind` number predates `save`, and VS Code, Neovim and
+/// Helix all read a kind other than `None` as "saves, without the text"
+/// (LSP issue #288). croft does the same, so a server that picked the old
+/// form keeps hearing about saves as it does in every other editor.
+///
+/// Dynamic registration is not consulted because croft declares none: with
+/// `synchronization.dynamicRegistration` false rust-analyzer advertises
+/// `save: {}` here instead of registering it later, which is what keeps its
+/// check-on-save running.
+fn save_notify_of(sync: &Option<lsp_types::TextDocumentSyncCapability>) -> SaveNotify {
+    use lsp_types::{TextDocumentSyncCapability as Sync, TextDocumentSyncSaveOptions as Save};
+    match sync {
+        Some(Sync::Options(options)) => match &options.save {
+            Some(Save::SaveOptions(save)) if save.include_text == Some(true) => {
+                SaveNotify::WithText
+            }
+            Some(Save::SaveOptions(_)) | Some(Save::Supported(true)) => SaveNotify::WithoutText,
+            Some(Save::Supported(false)) | None => SaveNotify::Never,
+        },
+        Some(Sync::Kind(kind)) if *kind != lsp_types::TextDocumentSyncKind::NONE => {
+            SaveNotify::WithoutText
+        }
+        Some(Sync::Kind(_)) | None => SaveNotify::Never,
+    }
+}
+
 /// Result ids from the last `workspace/diagnostic` pull, per file (#533).
 ///
 /// The incrementality contract: send back what the server last told us, and
@@ -6579,6 +6682,8 @@ fn flatten_symbols(resp: DocumentSymbolResponse) -> Vec<OutlineSymbol> {
                         character: start.character,
                         range_start_line: info.location.range.start.line,
                         range_end_line: info.location.range.end.line,
+                        range_start_character: info.location.range.start.character,
+                        range_end_character: info.location.range.end.character,
                     }
                 })
                 .collect();
@@ -6588,7 +6693,17 @@ fn flatten_symbols(resp: DocumentSymbolResponse) -> Vec<OutlineSymbol> {
     }
 }
 
+/// Each level in file order (#1220): tsserver sorts its navigation tree's
+/// children by name, so vtsls replies `Cart` before `sum`; VS Code orders by
+/// position client-side, and so does this.
 fn push_nested(syms: &[DocumentSymbol], depth: u16, out: &mut Vec<OutlineSymbol>) {
+    let mut syms: Vec<&DocumentSymbol> = syms.iter().collect();
+    syms.sort_by_key(|s| {
+        (
+            s.selection_range.start.line,
+            s.selection_range.start.character,
+        )
+    });
     for sym in syms {
         out.push(OutlineSymbol {
             name: sym.name.clone(),
@@ -6599,6 +6714,8 @@ fn push_nested(syms: &[DocumentSymbol], depth: u16, out: &mut Vec<OutlineSymbol>
             character: sym.selection_range.start.character,
             range_start_line: sym.range.start.line,
             range_end_line: sym.range.end.line,
+            range_start_character: sym.range.start.character,
+            range_end_character: sym.range.end.character,
         });
         if let Some(children) = &sym.children {
             push_nested(children, depth + 1, out);
@@ -6875,6 +6992,16 @@ fn standard_semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
 fn build_client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
+            // croft sends didSave, and only to a server that advertised
+            // `save` (#854). No dynamic registration: croft answers no
+            // `client/registerCapability`, and rust-analyzer registers didSave
+            // dynamically when told it may, instead of advertising `save`.
+            synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
+                dynamic_registration: Some(false),
+                will_save: Some(false),
+                will_save_wait_until: Some(false),
+                did_save: Some(true),
+            }),
             completion: Some(CompletionClientCapabilities {
                 dynamic_registration: Some(false),
                 context_support: Some(true),
@@ -7312,6 +7439,21 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    impl LspManager {
+        /// Test seam for App-level completion tests: swap the completion
+        /// reply channel for one the test holds, so a reply lands in
+        /// `drain_completion` at a chosen moment, as a slow server's does.
+        /// The worker's own sender then goes nowhere, which a test-built App
+        /// (no real servers) never uses anyway.
+        pub(crate) fn completion_reply_sender_for_test(
+            &mut self,
+        ) -> std_mpsc::Sender<CompletionResult> {
+            let (tx, rx) = std_mpsc::channel();
+            self.completion_rx = rx;
+            tx
+        }
+    }
+
     #[test]
     fn normalise_inlay_hint_flattens_parts_and_folds_padding() {
         // vtsls sends parts labels; rust-analyzer sends plain strings with
@@ -7622,6 +7764,7 @@ while True:
             diagnostic_identifier: None,
             diagnostic_result_ids: Arc::new(TokioMutex::new(DiagnosticResultIds::default())),
             diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
+            save_notify: SaveNotify::Never,
             supports_document_diagnostics: false,
             document_pull_stalled: Arc::new(AtomicBool::new(false)),
             document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
@@ -9169,6 +9312,30 @@ while True:
         );
     }
 
+    /// A rename for a file no server tracks (a tab opened by a relative
+    /// path, #1193) is answered with no edits instead of never, which left
+    /// "Renaming symbol" on the status bar forever.
+    #[test]
+    fn a_rename_for_an_untracked_file_is_answered_with_no_edits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let mut manager = LspManager::new(root).expect("manager");
+        let id = manager.request_rename(PathBuf::from("pkg/util.py"), 0, 4, "grand_total".into());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let result = loop {
+            if let Some(r) = manager.drain_rename() {
+                break Some(r);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let result = result.expect("the rename is answered");
+        assert_eq!(result.request_id, id);
+        assert!(result.edits.is_none());
+    }
+
     fn drain_hover_blocking(manager: &LspManager, timeout: Duration) -> Option<HoverResult> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -9838,6 +10005,10 @@ while True:
     /// Minimal LSP server that answers `initialize` and appends every
     /// incoming method name to the log file given as argv[1]. Lets a test
     /// assert exactly which notifications croft put on the wire.
+    ///
+    /// It advertises the `CAPABILITIES` a test prepends to the script (none
+    /// by default), and a `didSave` line also carries the notification's
+    /// `text` as JSON, so a test can tell a bare save from one with the text.
     const FAKE_LSP_RECORDER: &str = r#"
 import json, sys
 
@@ -9869,11 +10040,15 @@ while True:
     if msg is None:
         break
     method = msg.get("method", "")
-    log.write(method + "\n")
+    if method == "textDocument/didSave":
+        log.write(method + " " + json.dumps(msg["params"].get("text")) + "\n")
+    else:
+        log.write(method + "\n")
     log.flush()
     if "id" in msg:
         if method == "initialize":
-            send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
+            capabilities = globals().get("CAPABILITIES", {})
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": capabilities}})
         else:
             send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
     if method == "exit":
@@ -10179,36 +10354,49 @@ while True:
         handle.block_on(state.shutdown_all());
     }
 
-    /// Issue #37: rust-analyzer re-runs its check-on-save (`cargo check`, the
-    /// source of the Rust PROBLEMS entries) only when the client sends
-    /// `textDocument/didSave`. Saving a file must therefore emit didSave, or
-    /// the PROBLEMS panel goes permanently stale after the first open.
-    #[test]
-    fn save_doc_sends_did_save_notification_to_the_server() {
-        if !is_on_path("python3") {
-            eprintln!("SKIPPED: python3 not on PATH");
-            return;
-        }
+    /// Open, save and close one document against [`FAKE_LSP_RECORDER`]
+    /// advertising `capabilities` (a Python literal), and return the method
+    /// log once the close has arrived (#854).
+    ///
+    /// The close is the barrier that makes an ABSENT didSave observable: the
+    /// notifications travel one ordered stream, so a server that has seen
+    /// didClose has seen every didSave that was sent before it.
+    fn saves_seen_by(capabilities: &str) -> String {
+        saves_seen_by_each(&[capabilities]).remove(0)
+    }
+
+    /// [`saves_seen_by`] for several servers on the one document, each a
+    /// [`FAKE_LSP_RECORDER`] advertising its own `capabilities`, in order;
+    /// one method log per server.
+    fn saves_seen_by_each(capabilities: &[&str]) -> Vec<String> {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonicalize");
         let file = root.join("demo.py");
         std::fs::write(&file, "x = 1\n").expect("write demo");
-        let script = root.join("fake_lsp.py");
-        std::fs::write(&script, FAKE_LSP_RECORDER).expect("write fake server");
-        let log = root.join("methods.log");
-
         let mut registry = ServerRegistry::new();
-        registry.register(
-            Language::PYTHON,
-            ServerConfig {
-                name: "fake-recorder",
-                command: "python3".into(),
-                args: vec![script.display().to_string(), log.display().to_string()],
-                language: Language::PYTHON,
-                initialization_options: None,
-                provision: None,
-            },
-        );
+        let mut logs = Vec::new();
+        for (i, caps) in capabilities.iter().enumerate() {
+            let script = root.join(format!("fake_lsp_{i}.py"));
+            std::fs::write(
+                &script,
+                format!("CAPABILITIES = {caps}\n{FAKE_LSP_RECORDER}"),
+            )
+            .expect("write fake server");
+            let log = root.join(format!("methods_{i}.log"));
+            registry.register(
+                Language::PYTHON,
+                ServerConfig {
+                    // Named apart, so no server stands in for another.
+                    name: Box::leak(format!("fake-recorder-{i}").into_boxed_str()),
+                    command: "python3".into(),
+                    args: vec![script.display().to_string(), log.display().to_string()],
+                    language: Language::PYTHON,
+                    initialization_options: None,
+                    provision: None,
+                },
+            );
+            logs.push(log);
+        }
         let (diag_tx, _diag_rx) = std_mpsc::channel();
         let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut state = WorkerState {
@@ -10229,26 +10417,251 @@ while True:
         let runtime = LspRuntime::new().expect("runtime");
         runtime.handle().clone().block_on(async {
             state.open_doc(file.clone(), String::from("x = 1\n")).await;
-            state.save_doc(file.clone()).await;
+            state.save_doc(file.clone(), String::from("x = 2\n")).await;
+            state.close_doc(file.clone()).await;
         });
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let methods = loop {
-            let text = std::fs::read_to_string(&log).unwrap_or_default();
-            if text.contains("textDocument/didSave") || Instant::now() >= deadline {
-                break text;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        assert!(
-            methods.contains("textDocument/didOpen"),
-            "sanity: the fake server must have received didOpen; got: {methods:?}"
-        );
-        assert!(
-            methods.contains("textDocument/didSave"),
-            "saving a document must send textDocument/didSave; server received: {methods:?}"
+        // Up to three python3 servers start, initialize and see the document
+        // open, save and close: a base as wide as the other spawn waits,
+        // which costs nothing once every log shows didClose.
+        crate::test_budget::await_spawned(
+            Duration::from_secs(5),
+            "every fake server to receive didClose",
+            || {
+                logs.iter().all(|log| {
+                    std::fs::read_to_string(log)
+                        .unwrap_or_default()
+                        .contains("textDocument/didClose")
+                })
+            },
         );
         runtime.handle().clone().block_on(state.shutdown_all());
+        logs.iter()
+            .map(|log| {
+                let methods = std::fs::read_to_string(log).unwrap_or_default();
+                assert!(
+                    methods.contains("textDocument/didOpen"),
+                    "sanity: the fake server must have received didOpen; got: {methods:?}"
+                );
+                methods
+            })
+            .collect()
+    }
+
+    /// Issue #37: rust-analyzer re-runs its check-on-save (`cargo check`, the
+    /// source of the Rust PROBLEMS entries) only when the client sends
+    /// `textDocument/didSave`. Saving a file must therefore emit didSave, or
+    /// the PROBLEMS panel goes permanently stale after the first open.
+    ///
+    /// The server advertises what rust-analyzer does when the client declares
+    /// no dynamic registration (#854): `save: {}`, which asks for the
+    /// notification without the text.
+    #[test]
+    fn save_doc_sends_did_save_notification_to_the_server() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods =
+            saves_seen_by(r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {}}}"#);
+        assert!(
+            methods.lines().any(|l| l == "textDocument/didSave null"),
+            "saving a document must send textDocument/didSave, without the text \
+             the server did not ask for; server received: {methods:?}"
+        );
+    }
+
+    /// #854: a server whose `textDocumentSync` omits `save` asked not to be
+    /// told about saves ("if omitted the notification should not be sent").
+    /// This is ruff 0.15's exact capability, and it logs "Received
+    /// notification textDocument/didSave which does not have a handler" on
+    /// every Ctrl+S it is sent anyway.
+    #[test]
+    fn save_doc_skips_a_server_that_did_not_ask_for_saves() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(
+            r#"{"textDocumentSync": {"change": 2, "openClose": True, "willSave": False, "willSaveWaitUntil": False}}"#,
+        );
+        assert!(
+            !methods.contains("textDocument/didSave"),
+            "a server that advertised no `save` must not be sent didSave; \
+             server received: {methods:?}"
+        );
+    }
+
+    /// #854: `save: { includeText: true }` asks for the saved text in the
+    /// notification, and croft used to send `text: None` to everyone.
+    #[test]
+    fn save_doc_sends_the_text_to_a_server_that_asked_for_it() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+        );
+        assert!(
+            methods
+                .lines()
+                .any(|l| l == r#"textDocument/didSave "x = 2\n""#),
+            "includeText must put the saved buffer in didSave; server received: {methods:?}"
+        );
+    }
+
+    /// #854 guard: servers sharing a document are each answered by their
+    /// own capability, from the one save: the one that asked for the text
+    /// gets it, the one that asked for a bare save gets no text, and the one
+    /// that asked for nothing gets nothing.
+    #[test]
+    fn save_doc_answers_each_server_on_a_document_by_its_own_capability() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let logs = saves_seen_by_each(&[
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 2}}"#,
+        ]);
+        let saves = |log: &str| -> Vec<String> {
+            log.lines()
+                .filter(|l| l.starts_with("textDocument/didSave"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(saves(&logs[0]), vec![r#"textDocument/didSave "x = 2\n""#]);
+        assert_eq!(saves(&logs[1]), vec!["textDocument/didSave null"]);
+        assert!(saves(&logs[2]).is_empty(), "{:?}", logs[2]);
+    }
+
+    /// #854 review guard: the saved text reaches every server that asks for
+    /// it, not just the last one, which is handed the buffer itself while
+    /// the ones before it get a copy.
+    #[test]
+    fn every_server_that_asks_for_the_text_gets_it() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let logs = saves_seen_by_each(&[
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+        ]);
+        let saves = |log: &str| -> Vec<String> {
+            log.lines()
+                .filter(|l| l.starts_with("textDocument/didSave"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(saves(&logs[0]), vec![r#"textDocument/didSave "x = 2\n""#]);
+        assert_eq!(saves(&logs[1]), vec!["textDocument/didSave null"]);
+        assert_eq!(saves(&logs[2]), vec![r#"textDocument/didSave "x = 2\n""#]);
+    }
+
+    /// #854 guard: the fix does not reach a server that picked the older
+    /// `textDocumentSync: <kind>` number. That form predates `save`, and such
+    /// a server is still told about saves, without the text, as VS Code,
+    /// Neovim and Helix tell it.
+    #[test]
+    fn save_doc_still_sends_a_bare_save_to_a_server_with_the_old_sync_kind() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(r#"{"textDocumentSync": 2}"#);
+        assert!(
+            methods.lines().any(|l| l == "textDocument/didSave null"),
+            "server received: {methods:?}"
+        );
+    }
+
+    /// #854 guard: `includeText: false` asks for a bare save, never the text.
+    #[test]
+    fn save_doc_sends_no_text_when_include_text_is_false() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(
+            r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {"includeText": False}}}"#,
+        );
+        assert!(
+            methods.lines().any(|l| l == "textDocument/didSave null"),
+            "server received: {methods:?}"
+        );
+    }
+
+    /// #854: every shape `textDocumentSync` can take, read the way the spec
+    /// (and, for the pre-`save` kind number, VS Code) reads it.
+    #[test]
+    fn save_notify_reads_every_text_document_sync_shape() {
+        use lsp_types::{
+            SaveOptions, TextDocumentSyncCapability as Sync, TextDocumentSyncKind,
+            TextDocumentSyncOptions, TextDocumentSyncSaveOptions as Save,
+        };
+        let options = |save: Option<Save>| {
+            Some(Sync::Options(TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                save,
+                ..Default::default()
+            }))
+        };
+        let with = |include_text| Some(Save::SaveOptions(SaveOptions { include_text }));
+        assert_eq!(save_notify_of(&None), SaveNotify::Never);
+        assert_eq!(save_notify_of(&options(None)), SaveNotify::Never);
+        assert_eq!(
+            save_notify_of(&options(Some(Save::Supported(false)))),
+            SaveNotify::Never
+        );
+        assert_eq!(
+            save_notify_of(&options(Some(Save::Supported(true)))),
+            SaveNotify::WithoutText
+        );
+        assert_eq!(
+            save_notify_of(&options(with(None))),
+            SaveNotify::WithoutText
+        );
+        assert_eq!(
+            save_notify_of(&options(with(Some(false)))),
+            SaveNotify::WithoutText
+        );
+        assert_eq!(
+            save_notify_of(&options(with(Some(true)))),
+            SaveNotify::WithText
+        );
+        assert_eq!(
+            save_notify_of(&Some(Sync::Kind(TextDocumentSyncKind::FULL))),
+            SaveNotify::WithoutText
+        );
+        assert_eq!(
+            save_notify_of(&Some(Sync::Kind(TextDocumentSyncKind::NONE))),
+            SaveNotify::Never
+        );
+    }
+
+    /// #854: rust-analyzer advertises `save` only while the client declares
+    /// no dynamic registration for document sync; told it may register, it
+    /// drops `save` and sends `client/registerCapability`, which croft
+    /// declines, and check-on-save would stop. Pin the declaration.
+    #[test]
+    fn client_capabilities_declare_did_save_without_dynamic_registration() {
+        let caps = build_client_capabilities();
+        let sync = caps
+            .text_document
+            .and_then(|td| td.synchronization)
+            .expect("textDocument.synchronization must be declared");
+        assert_eq!(sync.did_save, Some(true));
+        assert_eq!(
+            sync.dynamic_registration,
+            Some(false),
+            "dynamic registration would move rust-analyzer's didSave to a \
+             registerCapability croft does not handle"
+        );
     }
 
     /// A fake server that advertises `inlayHintProvider` and answers
@@ -10919,5 +11332,115 @@ while True:
             "the site is the supertype's name, from selectionRange"
         );
         runtime.handle().clone().block_on(state.shutdown_all());
+    }
+
+    /// A nested `documentSymbol` reply from JSON.
+    fn nested_reply(json: serde_json::Value) -> DocumentSymbolResponse {
+        DocumentSymbolResponse::Nested(serde_json::from_value(json).unwrap())
+    }
+
+    fn doc_symbol(name: &str, line: u32, children: serde_json::Value) -> serde_json::Value {
+        let pos = serde_json::json!({"line": line, "character": 2});
+        let range = serde_json::json!({"start": pos, "end": pos});
+        serde_json::json!({
+            "name": name, "kind": 5, "range": range, "selectionRange": range,
+            "children": children,
+        })
+    }
+
+    /// #1220: tsserver sorts each level of its navigation tree by name, so
+    /// OUTLINE and Go to Symbol listed `Cart` before `sum` and `cents`
+    /// before `id`. Every level comes out in file order, as in VS Code.
+    #[test]
+    fn nested_symbols_list_in_file_order_at_every_level() {
+        let reply = nested_reply(serde_json::json!([
+            doc_symbol(
+                "Cart",
+                11,
+                serde_json::json!([
+                    doc_symbol("add", 13, serde_json::json!([])),
+                    doc_symbol("items", 12, serde_json::json!([])),
+                    doc_symbol("total", 16, serde_json::json!([])),
+                ])
+            ),
+            doc_symbol("handler", 6, serde_json::json!([])),
+            doc_symbol(
+                "Item",
+                0,
+                serde_json::json!([
+                    doc_symbol("cents", 0, serde_json::json!([])),
+                    doc_symbol("id", 0, serde_json::json!([])),
+                ])
+            ),
+            doc_symbol("sum", 2, serde_json::json!([])),
+        ]));
+        let mut reply = reply;
+        // `cents` is declared after `id` on the same line.
+        if let DocumentSymbolResponse::Nested(syms) = &mut reply {
+            let item = syms.iter_mut().find(|s| s.name == "Item").unwrap();
+            let fields = item.children.as_mut().unwrap();
+            fields[0].selection_range.start.character = 30;
+            fields[1].selection_range.start.character = 17;
+        }
+        let names: Vec<(String, u16)> = flatten_symbols(reply)
+            .into_iter()
+            .map(|s| (s.name, s.depth))
+            .collect();
+        let expected = [
+            ("Item", 0),
+            ("id", 1),
+            ("cents", 1),
+            ("sum", 0),
+            ("handler", 0),
+            ("Cart", 0),
+            ("items", 1),
+            ("add", 1),
+            ("total", 1),
+        ];
+        let expected: Vec<(String, u16)> =
+            expected.iter().map(|(n, d)| (n.to_string(), *d)).collect();
+        assert_eq!(names, expected);
+    }
+
+    /// Negative (#1220): a reply already in file order (Python, Rust) comes
+    /// out unchanged, children stay under their own parent, and the flat
+    /// `SymbolInformation` shape still sorts by position.
+    #[test]
+    fn symbols_already_in_file_order_and_flat_replies_are_unchanged() {
+        let reply = nested_reply(serde_json::json!([
+            doc_symbol(
+                "first",
+                1,
+                serde_json::json!([doc_symbol("late_child", 9, serde_json::json!([])),])
+            ),
+            doc_symbol("second", 4, serde_json::json!([])),
+        ]));
+        let names: Vec<(String, u16)> = flatten_symbols(reply)
+            .into_iter()
+            .map(|s| (s.name, s.depth))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("first".to_string(), 0),
+                ("late_child".to_string(), 1),
+                ("second".to_string(), 0)
+            ],
+            "a child declared after the next sibling's line stays under its parent"
+        );
+        let pos = |line: u32| {
+            serde_json::json!({"start": {"line": line, "character": 0},
+                                                 "end": {"line": line, "character": 1}})
+        };
+        let flat: Vec<lsp_types::SymbolInformation> = serde_json::from_value(serde_json::json!([
+            {"name": "b", "kind": 12, "location": {"uri": "file:///x.py", "range": pos(5)}},
+            {"name": "a", "kind": 12, "location": {"uri": "file:///x.py", "range": pos(2)}},
+        ]))
+        .unwrap();
+        let names: Vec<String> = flatten_symbols(DocumentSymbolResponse::Flat(flat))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["a", "b"]);
     }
 }
