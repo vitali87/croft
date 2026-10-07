@@ -37583,17 +37583,20 @@ impl App {
         self.spawn_commit(
             message,
             move || crate::git::commit_all_tracked(&root, &committed),
-            |app, r| match r {
-                Ok(summary) => {
-                    let headline = crate::git::headline(&summary);
-                    app.source_control.commit_feedback = Some(headline.to_string());
-                    app.source_control.commit_feedback_is_error = false;
-                    app.status = format!("Committed: {headline}");
-                    app.active_git_bypass_debounce();
-                    app.refresh_git_status_debounced();
-                    app.refresh_source_control();
+            |app, r| {
+                app.log_git("commit -am", &r);
+                match r {
+                    Ok(summary) => {
+                        let headline = crate::git::headline(&summary);
+                        app.source_control.commit_feedback = Some(headline.to_string());
+                        app.source_control.commit_feedback_is_error = false;
+                        app.status = format!("Committed: {headline}");
+                        app.active_git_bypass_debounce();
+                        app.refresh_git_status_debounced();
+                        app.refresh_source_control();
+                    }
+                    Err(err) => app.report_commit_failure(&err),
                 }
-                Err(err) => app.report_commit_failure(&err),
             },
         );
     }

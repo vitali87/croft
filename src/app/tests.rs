@@ -15507,6 +15507,7 @@ fn a_commit_reports_only_git_s_first_line_in_the_panel_and_status_bar() {
     app.source_control.message = "fix: one line".to_string();
     app.source_control.message_cursor = app.source_control.message.chars().count();
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
     let feedback = app
         .source_control
         .commit_feedback
@@ -15535,6 +15536,7 @@ fn a_refused_commit_names_the_reason_on_one_line() {
     app.source_control.message = "fix: nothing here".to_string();
     app.source_control.message_cursor = app.source_control.message.chars().count();
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
     assert!(app.source_control.commit_feedback_is_error);
     let feedback = app
         .source_control
@@ -72297,6 +72299,7 @@ fn scm_feedback_paints_nothing_over_the_merge_editor() {
             .to_string();
     app.source_control.message_cursor = app.source_control.message.chars().count();
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
     let subject = app
         .source_control
         .commit_feedback
