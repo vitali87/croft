@@ -49814,7 +49814,6 @@ impl App {
             }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
             Cmd::RunSelectedText => self.run_selected_text_in_terminal(),
-
             // Cmd+] / Cmd+[ (#843), which have no `Ctrl` form. The chords
             // work in the terminal pane; from the palette the commands bring
             // it up and focus it first, as VS Code's do.
