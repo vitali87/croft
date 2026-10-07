@@ -224,8 +224,13 @@ pub fn resolve_managed(
                 return Some((resolved, extra));
             }
         }
-        Provision::Uv { bin, .. } => {
-            if let Some(command) = uv_command(bin) {
+        Provision::Uv {
+            bin,
+            package,
+            version,
+            ..
+        } => {
+            if let Some(command) = uv_command(bin, package, *version) {
                 let mut resolved = config.clone();
                 resolved.command = command;
                 // uv writes a self-contained launcher (absolute shebang to the
@@ -265,7 +270,12 @@ pub fn provisioned_command(name: &str, provision: &Provision) -> Option<(String,
         Provision::Npm { bin, .. } => {
             npm_command(name, bin).map(|c| (c, node_path_prepend().into_iter().collect()))
         }
-        Provision::Uv { bin, .. } => uv_command(bin).map(|c| (c, Vec::new())),
+        Provision::Uv {
+            bin,
+            package,
+            version,
+            ..
+        } => uv_command(bin, package, *version).map(|c| (c, Vec::new())),
         Provision::Binary { bin, bin_path, .. } => {
             binary_command(name, bin, *bin_path).map(|c| (c, Vec::new()))
         }
@@ -292,13 +302,16 @@ fn npm_command(name: &str, bin: &str) -> Option<String> {
 /// Resolve an invocable command for a uv-provisioned server. Unlike vtsls,
 /// `ty`/`ruff` are user-facing tools the user may want to control the version
 /// of, so a copy already on PATH wins over croft's managed one; the managed
-/// copy is the fallback for a box that has neither.
-fn uv_command(bin: &str) -> Option<String> {
+/// copy is the fallback for a box that has neither. A managed copy installed
+/// under an older pin is not used, so the caller reinstalls it at the pin
+/// this build carries (#1297).
+fn uv_command(bin: &str, package: &str, version: Option<&str>) -> Option<String> {
     if crate::lsp::manager::is_on_path(bin) {
         return Some(bin.to_string());
     }
     if let Some(p) = managed_uv_binary(bin)
         && p.is_file()
+        && uv_tool_dir().is_none_or(|dir| uv_receipt_matches_pin(&dir, package, version))
     {
         return Some(p.to_string_lossy().into_owned());
     }
@@ -341,6 +354,33 @@ fn uv_tool_dir() -> Option<PathBuf> {
 /// croft's uv bin dir (`uv` writes entry-point launchers here).
 fn uv_bin_dir() -> Option<PathBuf> {
     Some(servers_dir()?.join("uv").join("bin"))
+}
+
+/// Whether the uv tool `package` under `tool_dir` was installed at `version`,
+/// read from the `uv-receipt.toml` uv writes beside it. An unpinned
+/// provision, or a receipt that can't be read, counts as a match: only a
+/// receipt naming a different pin is stale.
+fn uv_receipt_matches_pin(tool_dir: &Path, package: &str, version: Option<&str>) -> bool {
+    let Some(version) = version else {
+        return true;
+    };
+    let Ok(text) = std::fs::read_to_string(tool_dir.join(package).join("uv-receipt.toml")) else {
+        return true;
+    };
+    let Ok(receipt) = toml::from_str::<toml::Value>(&text) else {
+        return true;
+    };
+    let Some(reqs) = receipt
+        .get("tool")
+        .and_then(|t| t.get("requirements"))
+        .and_then(toml::Value::as_array)
+    else {
+        return true;
+    };
+    let want = format!("=={version}");
+    reqs.iter()
+        .filter(|r| r.get("name").and_then(toml::Value::as_str) == Some(package))
+        .any(|r| r.get("specifier").and_then(toml::Value::as_str) == Some(want.as_str()))
 }
 
 /// Absolute path to a managed uv-installed binary, whether or not it exists.
@@ -2021,6 +2061,54 @@ mod tests {
             "@vtsls/language-server",
             "no pin installs latest"
         );
+    }
+
+    /// A managed uv tool installed under an older pin is stale, so croft
+    /// reinstalls it at the pin it now carries instead of running the old,
+    /// broken copy forever (#1297).
+    #[test]
+    fn a_uv_receipt_under_another_pin_is_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("mcp-server-time");
+        std::fs::create_dir_all(&tool).unwrap();
+        std::fs::write(
+            tool.join("uv-receipt.toml"),
+            "[tool]\nrequirements = [{ name = \"mcp-server-time\", specifier = \"==2026.6.4\" }]\n",
+        )
+        .unwrap();
+        let dir = tmp.path();
+        assert!(!uv_receipt_matches_pin(
+            dir,
+            "mcp-server-time",
+            Some("2026.8.18")
+        ));
+        assert!(uv_receipt_matches_pin(
+            dir,
+            "mcp-server-time",
+            Some("2026.6.4")
+        ));
+    }
+
+    /// Negative: an unpinned tool (ty, ruff), a missing receipt or an
+    /// unreadable one is never treated as stale, so nothing reinstalls in a
+    /// loop.
+    #[test]
+    fn an_unpinned_or_unreadable_uv_receipt_is_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(
+            uv_receipt_matches_pin(dir, "ty", Some("0.1.0")),
+            "no receipt"
+        );
+        std::fs::create_dir_all(dir.join("ty")).unwrap();
+        std::fs::write(
+            dir.join("ty/uv-receipt.toml"),
+            "[tool]\nrequirements = [{ name = \"ty\" }]\n",
+        )
+        .unwrap();
+        assert!(uv_receipt_matches_pin(dir, "ty", None));
+        std::fs::write(dir.join("ty/uv-receipt.toml"), "not toml [").unwrap();
+        assert!(uv_receipt_matches_pin(dir, "ty", Some("0.1.0")));
     }
 
     #[test]

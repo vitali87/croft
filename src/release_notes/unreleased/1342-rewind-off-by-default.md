@@ -1,0 +1,1 @@
+fix: Terminal panes no longer record their output for a rewind view that does not exist yet: up to 128 MB (32 MB over SSH) of memory nothing could show. Set `terminal_rewind_mb` to record anyway; the memory report says when rewind is off.

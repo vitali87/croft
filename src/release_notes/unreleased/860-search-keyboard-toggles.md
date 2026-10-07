@@ -1,0 +1,2 @@
+fix: The Search sidebar's Replace row, match case / whole word / regex toggles and include/exclude inputs answer Ctrl/Cmd+Shift+H, Alt+C / Alt+W / Alt+R and Alt+D, and its header counts every occurrence ("4 results in 2 files"), matching Replace All (#860).
+fix: A Search result whose match sits past the side bar's width now drops leading context so the highlighted match and its replace preview show, instead of cutting the row off before them (#860).

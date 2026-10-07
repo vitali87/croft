@@ -1,0 +1,1 @@
+fix: croft no longer re-sends linkedEditingRange for an unmoved caret on every UI wake when the server answers `null` (about 45 requests per keypress to vtsls); a position is asked once, and again only after the caret moves or the buffer changes
