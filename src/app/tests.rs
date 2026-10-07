@@ -11811,19 +11811,17 @@ fn the_palette_opens_the_zoxide_jump_from_any_pane() {
     assert!(app.zoxide_jump.is_some());
 }
 
-/// Guard (#843): `Ctrl`+`Z` in the Explorer still opens nothing (LINUX.md
-/// lists the zoxide jump as having no `Ctrl` form), while Cmd+Z does.
+/// #1294: `Ctrl`+`Z` in the Explorer opens the zoxide jump, as Cmd+Z does,
+/// so a terminal that never sends Super reaches it.
 #[test]
-fn ctrl_z_in_the_explorer_does_not_open_the_zoxide_jump() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.focus_pane(Pane::Tree);
-    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
-        .unwrap();
-    assert!(app.zoxide_jump.is_none());
-    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER))
-        .unwrap();
-    assert!(app.zoxide_jump.is_some(), "Cmd+Z still opens it");
+fn ctrl_z_in_the_explorer_opens_the_zoxide_jump_like_cmd_z() {
+    for mods in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Tree);
+        app.handle_key(key(KeyCode::Char('z'), mods)).unwrap();
+        assert!(app.zoxide_jump.is_some(), "{mods:?}+Z opens it");
+    }
 }
 
 /// Guard (#843): "Go to Implementations" with no file open sends nothing,
