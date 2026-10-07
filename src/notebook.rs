@@ -261,7 +261,14 @@ pub fn render(
                     .into_iter()
                     .flatten()
                 {
-                    render_output(output, scratch, &mut lines, &mut images, dim, theme);
+                    let out = OutputSink {
+                        scratch,
+                        registry: &mut *registry,
+                        base_dir,
+                        lines: &mut lines,
+                        images: &mut images,
+                    };
+                    render_output(output, out, dim, theme);
                 }
                 lines.push(Line::default());
             }
@@ -271,14 +278,66 @@ pub fn render(
     Some((lines, images, runnables))
 }
 
-fn render_output(
-    output: &serde_json::Value,
-    scratch: &Path,
-    lines: &mut Vec<Line<'static>>,
-    images: &mut Vec<MdImage>,
-    dim: Style,
-    theme: Theme,
-) {
+/// Where an output's lines and pictures go, and what a Markdown output
+/// renders with.
+struct OutputSink<'a> {
+    scratch: &'a Path,
+    registry: &'a mut crate::highlight::LangRegistry,
+    base_dir: Option<&'a Path>,
+    lines: &'a mut Vec<Line<'static>>,
+    images: &'a mut Vec<MdImage>,
+}
+
+impl OutputSink<'_> {
+    /// Write a decoded picture to scratch and reserve rows for it. False
+    /// when it is not an image croft can size, or is too large.
+    fn picture(&mut self, bytes: &[u8], ext: &str) -> bool {
+        let Ok(Some((px_w, px_h))) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map(|r| r.into_dimensions().ok())
+        else {
+            return false;
+        };
+        if (px_w as u64) * (px_h as u64) > 64_000_000 {
+            return false;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash as _, Hasher as _};
+        bytes.hash(&mut hasher);
+        let name = format!("nb-{:016x}.{ext}", hasher.finish());
+        let path = self.scratch.join(name);
+        if !write_scratch_no_follow(self.scratch, &path, bytes) {
+            return false;
+        }
+        let rows = ((px_h as f32 / px_w.max(1) as f32) * 72.0 / 2.0)
+            .round()
+            .clamp(3.0, 18.0) as u16;
+        let first_line = self.lines.len();
+        for _ in 0..rows {
+            self.lines.push(Line::default());
+        }
+        self.images.push(MdImage {
+            first_line,
+            rows,
+            path,
+        });
+        true
+    }
+
+    /// Render `md` as a Markdown cell renders.
+    fn markdown(&mut self, md: &str, theme: Theme) {
+        let (mut md_lines, md_images) =
+            crate::markdown::render_markdown_with_images(md, theme, self.registry, self.base_dir);
+        let base = self.lines.len();
+        for mut img in md_images {
+            img.first_line += base;
+            self.images.push(img);
+        }
+        self.lines.append(&mut md_lines);
+    }
+}
+
+fn render_output(output: &serde_json::Value, mut out: OutputSink<'_>, dim: Style, theme: Theme) {
     let otype = output
         .get("output_type")
         .and_then(|v| v.as_str())
@@ -286,7 +345,7 @@ fn render_output(
     match otype {
         "stream" => {
             let text = output.get("text").map(joined).unwrap_or_default();
-            lines.extend(ansi_lines(&text, dim, theme, "  "));
+            out.lines.extend(ansi_lines(&text, dim, theme, "  "));
         }
         "error" => {
             let err = Style::default().fg(theme.ui(ERR));
@@ -296,66 +355,250 @@ fn render_output(
                 .into_iter()
                 .flatten()
             {
-                lines.extend(ansi_lines(tl.as_str().unwrap_or(""), err, theme, "  "));
+                out.lines
+                    .extend(ansi_lines(tl.as_str().unwrap_or(""), err, theme, "  "));
             }
         }
+        // The richest type croft can draw wins, in Jupyter's order (#1188):
+        // a picture, then Markdown, then HTML, and only then the
+        // `text/plain` fallback (`<IPython.core.display.Markdown object>`).
         "execute_result" | "display_data" => {
-            let picture = [("image/png", "png"), ("image/jpeg", "jpg")]
-                .iter()
-                .find_map(|(mime, ext)| {
-                    output
-                        .get("data")
-                        .and_then(|d| d.get(*mime))
-                        .map(joined)
-                        .filter(|s| !s.is_empty())
-                        .map(|b64| (b64, *ext))
-                });
-            if let Some((b64, ext)) = picture {
+            let data = |mime: &str| {
+                output
+                    .get("data")
+                    .and_then(|d| d.get(mime))
+                    .map(joined)
+                    .filter(|s| !s.trim().is_empty())
+            };
+            for (mime, ext) in [("image/png", "png"), ("image/jpeg", "jpg")] {
                 use base64::Engine as _;
+                let Some(b64) = data(mime) else { continue };
                 let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(compact)
-                    && let Ok(Some((px_w, px_h))) =
-                        image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
-                            .with_guessed_format()
-                            .map(|r| r.into_dimensions().ok())
-                    && (px_w as u64) * (px_h as u64) <= 64_000_000
+                    && out.picture(&bytes, ext)
                 {
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    use std::hash::{Hash as _, Hasher as _};
-                    bytes.hash(&mut hasher);
-                    let name = format!("nb-{:016x}.{ext}", hasher.finish());
-                    let path = scratch.join(name);
-                    let ok = write_scratch_no_follow(scratch, &path, &bytes);
-                    if ok {
-                        let rows = ((px_h as f32 / px_w.max(1) as f32) * 72.0 / 2.0)
-                            .round()
-                            .clamp(3.0, 18.0) as u16;
-                        let first_line = lines.len();
-                        for _ in 0..rows {
-                            lines.push(Line::default());
-                        }
-                        images.push(MdImage {
-                            first_line,
-                            rows,
-                            path,
-                        });
-                        return;
-                    }
+                    return;
                 }
             }
-            let text = strip_ansi(
-                &output
-                    .get("data")
-                    .and_then(|d| d.get("text/plain"))
-                    .map(joined)
-                    .unwrap_or_default(),
-            );
+            if let Some(svg) = data("image/svg+xml")
+                && let Ok((png, _, _)) = crate::svg::rasterize(svg.as_bytes())
+                && out.picture(&png, "png")
+            {
+                return;
+            }
+            if let Some(md) = data("text/markdown") {
+                out.markdown(&md, theme);
+                return;
+            }
+            if let Some(md) = data("text/html")
+                .map(|html| html_to_markdown(&html))
+                .filter(|md| !md.trim().is_empty())
+            {
+                out.markdown(&md, theme);
+                return;
+            }
+            let text = strip_ansi(&data("text/plain").unwrap_or_default());
             for l in text.lines() {
-                lines.push(Line::from(Span::styled(format!("  {l}"), dim)));
+                out.lines
+                    .push(Line::from(Span::styled(format!("  {l}"), dim)));
             }
         }
         _ => {}
     }
+}
+
+/// HTML elements whose content is never shown.
+const HTML_HIDDEN: &[&str] = &["style", "script", "head", "title", "template"];
+
+/// Turn an HTML output into Markdown for the notebook view (#1188): the
+/// structure a reader needs (headings, paragraphs, emphasis, lists, code,
+/// tables such as a pandas DataFrame's) survives, every other tag is
+/// dropped, and `<style>` / `<script>` contents never show.
+fn html_to_markdown(html: &str) -> String {
+    let mut md = String::new();
+    // Rows and cells of the open table, if any.
+    let mut table: Option<Vec<Vec<String>>> = None;
+    let mut hidden = 0usize;
+    let mut rest = html;
+    let push = |md: &mut String, table: &mut Option<Vec<Vec<String>>>, text: &str| match table {
+        None => md.push_str(text),
+        // A cell is one line of a pipe table; text between a table's cells
+        // is whitespace or junk.
+        Some(t) => {
+            if let Some(cell) = t.last_mut().and_then(|r| r.last_mut()) {
+                cell.push_str(&text.replace('\n', " "));
+            }
+        }
+    };
+    while !rest.is_empty() {
+        let Some(lt) = rest.find('<') else {
+            if hidden == 0 {
+                push(&mut md, &mut table, &html_text(rest));
+            }
+            break;
+        };
+        if hidden == 0 {
+            push(&mut md, &mut table, &html_text(&rest[..lt]));
+        }
+        rest = &rest[lt..];
+        if rest.starts_with("<!--") {
+            rest = rest.find("-->").map_or("", |end| &rest[end + 3..]);
+            continue;
+        }
+        let Some(gt) = rest.find('>') else { break };
+        let tag = &rest[1..gt];
+        rest = &rest[gt + 1..];
+        let closing = tag.starts_with('/');
+        let name: String = tag
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if HTML_HIDDEN.contains(&name.as_str()) {
+            if closing {
+                hidden = hidden.saturating_sub(1);
+            } else if !tag.ends_with('/') {
+                hidden += 1;
+            }
+            continue;
+        }
+        if hidden > 0 {
+            continue;
+        }
+        let mark = match (name.as_str(), closing) {
+            ("table", false) => {
+                table = Some(Vec::new());
+                ""
+            }
+            ("table", true) => {
+                if let Some(rows) = table.take() {
+                    md.push_str("\n\n");
+                    md.push_str(&pipe_table(rows));
+                    md.push('\n');
+                }
+                ""
+            }
+            ("tr", false) => {
+                if let Some(t) = table.as_mut() {
+                    t.push(Vec::new());
+                }
+                ""
+            }
+            ("td" | "th", false) => {
+                if let Some(row) = table.as_mut().and_then(|t| t.last_mut()) {
+                    row.push(String::new());
+                }
+                ""
+            }
+            ("b" | "strong", _) => "**",
+            ("i" | "em", _) => "*",
+            ("code", _) => "`",
+            ("br", _) => "  \n",
+            ("li", false) => "\n- ",
+            ("p" | "div" | "ul" | "ol" | "pre" | "blockquote", _) => "\n\n",
+            (h, false) if heading_level(h).is_some() => {
+                let hashes = "#".repeat(heading_level(h).unwrap_or(1));
+                push(&mut md, &mut table, &format!("\n\n{hashes} "));
+                ""
+            }
+            (h, true) if heading_level(h).is_some() => "\n\n",
+            _ => "",
+        };
+        push(&mut md, &mut table, mark);
+    }
+    if let Some(rows) = table.take() {
+        md.push_str("\n\n");
+        md.push_str(&pipe_table(rows));
+    }
+    md.trim().to_string()
+}
+
+/// The level of a heading tag name (`h1`..`h6`).
+fn heading_level(name: &str) -> Option<usize> {
+    match name.as_bytes() {
+        [b'h', n @ b'1'..=b'6'] => Some((n - b'0') as usize),
+        _ => None,
+    }
+}
+
+/// An HTML text run as Markdown text: entities decoded, whitespace
+/// collapsed as a browser does, Markdown's own characters escaped.
+fn html_text(raw: &str) -> String {
+    let mut text = String::new();
+    let mut rest = raw;
+    while let Some(amp) = rest.find('&') {
+        text.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let end = rest.find(';').filter(|&e| e <= 10);
+        let decoded = end.and_then(|e| match &rest[1..e] {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            n if n.starts_with("#x") || n.starts_with("#X") => u32::from_str_radix(&n[2..], 16)
+                .ok()
+                .and_then(char::from_u32),
+            n if n.starts_with('#') => n[1..].parse().ok().and_then(char::from_u32),
+            _ => None,
+        });
+        match (decoded, end) {
+            (Some(c), Some(e)) => {
+                text.push(c);
+                rest = &rest[e + 1..];
+            }
+            _ => {
+                text.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    text.push_str(rest);
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        // Whitespace between two tags still separates their text.
+        return if text.is_empty() {
+            text
+        } else {
+            String::from(" ")
+        };
+    }
+    let mut out = crate::docx::md_escape(&collapsed);
+    // Keep the spaces at either end: they separate this run from the
+    // emphasis or text beside it.
+    if text.starts_with(char::is_whitespace) {
+        out.insert(0, ' ');
+    }
+    if text.ends_with(char::is_whitespace) {
+        out.push(' ');
+    }
+    out
+}
+
+/// `rows` as a Markdown pipe table, the first row its header.
+fn pipe_table(rows: Vec<Vec<String>>) -> String {
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if cols == 0 {
+        return String::new();
+    }
+    let mut md = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        md.push('|');
+        for c in 0..cols {
+            md.push(' ');
+            md.push_str(row.get(c).map_or("", |s| s.trim()));
+            md.push_str(" |");
+        }
+        md.push('\n');
+        if i == 0 {
+            md.push('|');
+            md.push_str(&"---|".repeat(cols));
+            md.push('\n');
+        }
+    }
+    md
 }
 
 #[cfg(test)]
@@ -437,6 +680,115 @@ mod tests {
         // Rebuild reuses the SAME hash-named file.
         let (_, again, _) = render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).unwrap();
         assert_eq!(again[0].path, images[0].path);
+    }
+
+    /// One code cell whose single output carries `data`.
+    fn rich_output(data: &str) -> (tempfile::TempDir, Vec<Line<'static>>, Vec<MdImage>, String) {
+        let doc = nb(&format!(
+            "{{\"cell_type\":\"code\",\"execution_count\":1,\"source\":[\"show()\"],\
+              \"outputs\":[{{\"output_type\":\"display_data\",\"data\":{data}}}]}}"
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, images, _) =
+            render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).expect("parses");
+        let text = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (tmp, lines, images, text)
+    }
+
+    /// #1188: `display(Markdown(...))` shows its Markdown, not the
+    /// `<IPython.core.display.Markdown object>` fallback.
+    #[test]
+    fn a_markdown_output_renders_as_markdown() {
+        let (_tmp, _, _, text) = rich_output(
+            r###"{"text/markdown":"## Result\n\n| a | b |\n|---|---|\n| 1 | 2 |",
+                "text/plain":"<IPython.core.display.Markdown object>"}"###,
+        );
+        assert!(text.contains("Result"), "{text}");
+        assert!(!text.contains("##"), "the heading is rendered: {text}");
+        assert!(text.contains('│'), "the table is drawn: {text}");
+        assert!(!text.contains("Markdown object"), "{text}");
+    }
+
+    /// #1188: an SVG output is rasterised and placed like a PNG.
+    #[test]
+    fn an_svg_output_is_drawn_as_a_picture() {
+        let svg = r##"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"80\" height=\"40\"><rect width=\"80\" height=\"40\" fill=\"red\"/></svg>"##;
+        let (_tmp, _, images, text) = rich_output(&format!(
+            r##"{{"image/svg+xml":"{svg}","text/plain":"<IPython.core.display.SVG object>"}}"##
+        ));
+        assert_eq!(images.len(), 1, "{text}");
+        assert!(images[0].path.is_file());
+        assert_eq!(
+            images[0].path.extension().and_then(|e| e.to_str()),
+            Some("png")
+        );
+        assert!(!text.contains("SVG object"), "{text}");
+    }
+
+    /// #1188: an HTML output shows its text with its emphasis, not raw tags
+    /// or the fallback.
+    #[test]
+    fn an_html_output_renders_its_text() {
+        let (_tmp, lines, _, text) = rich_output(
+            r##"{"text/html":"<b>bold</b> and <i>more</i> &amp; done","text/plain":"<IPython.core.display.HTML object>"}"##,
+        );
+        assert!(text.contains("bold and more & done"), "{text}");
+        assert!(!text.contains("<b>"), "{text}");
+        assert!(!text.contains("HTML object"), "{text}");
+        let bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("bold"))
+            .unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// #1188: a pandas DataFrame's HTML is a table, and its `<style>` block
+    /// never shows.
+    #[test]
+    fn an_html_table_renders_as_a_table() {
+        let html = "<div><style scoped>.dataframe tbody tr th { vertical-align: top; }</style>\
+            <table border=\\\"1\\\" class=\\\"dataframe\\\"><thead><tr><th></th><th>name</th><th>n</th></tr></thead>\
+            <tbody><tr><th>0</th><td>apple</td><td>3</td></tr><tr><th>1</th><td>pear &lt;ripe&gt;</td><td>5</td></tr></tbody></table></div>";
+        let (_tmp, _, _, text) = rich_output(&format!(
+            r##"{{"text/html":"{html}","text/plain":"   name  n\n0  apple  3"}}"##
+        ));
+        assert!(!text.contains("vertical-align"), "{text}");
+        let row = text.lines().find(|l| l.contains("apple")).expect(&text);
+        assert!(row.contains('│') && row.contains('3'), "{text}");
+        assert!(text.contains("pear <ripe>"), "{text}");
+    }
+
+    /// #1188 negative: an output with only `text/plain` still shows it.
+    #[test]
+    fn a_plain_text_output_is_unchanged() {
+        let (_tmp, _, images, text) = rich_output(r##"{"text/plain":"42"}"##);
+        assert!(images.is_empty());
+        assert!(text.contains("  42"), "{text}");
+    }
+
+    /// #1188 negative: an SVG that will not parse, or HTML with nothing
+    /// to show, falls back to `text/plain`.
+    #[test]
+    fn unusable_rich_data_falls_back_to_plain_text() {
+        let (_tmp, _, images, text) =
+            rich_output(r##"{"image/svg+xml":"<svg nope","text/plain":"fallback one"}"##);
+        assert!(images.is_empty());
+        assert!(text.contains("fallback one"), "{text}");
+        let (_tmp, _, _, text) = rich_output(
+            r##"{"text/html":"<style>p { color: red }</style>","text/plain":"fallback two"}"##,
+        );
+        assert!(text.contains("fallback two"), "{text}");
     }
 
     #[test]

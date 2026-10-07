@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -29,6 +30,9 @@ pub const PROTOCOL_VERSION: &str = "2025-11-25";
 /// How long a single request waits for its matching response before erroring,
 /// so a wedged server can't hang croft's invocation forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a request whose server died waits for the rest of its stderr.
+const EXIT_REASON_WAIT: Duration = Duration::from_millis(500);
 
 /// Build a JSON-RPC 2.0 request envelope (the transport does not add `id`).
 pub fn request(id: i64, method: &str, params: Value) -> Value {
@@ -187,17 +191,30 @@ impl McpClient {
     /// interleaved server notifications), returning the `result` or an error.
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id();
-        self.transport.send(&request(id, method, params))?;
+        if let Err(e) = self.transport.send(&request(id, method, params)) {
+            // A server that already died closed its stdin: say why it died.
+            let broken_pipe = e
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
+            if broken_pipe {
+                bail!("{}", self.transport.exit_reason(EXIT_REASON_WAIT));
+            }
+            return Err(e);
+        }
         let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
         loop {
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .context("MCP request timed out")?;
-            let msg = self
-                .transport
-                .incoming
-                .recv_timeout(remaining)
-                .context("MCP server closed or timed out before responding")?;
+            let msg = match self.transport.incoming.recv_timeout(remaining) {
+                Ok(msg) => msg,
+                Err(RecvTimeoutError::Timeout) => bail!("MCP server timed out before responding"),
+                // stdout closed: the server died, and its stderr says why.
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("{}", self.transport.exit_reason(EXIT_REASON_WAIT))
+                }
+            };
             if is_response_to(&msg, id) {
                 return response_result(&msg);
             }
@@ -326,6 +343,73 @@ mod tests {
             ]
         });
         assert_eq!(tool_result_text(&result), "# Heading\n\nbody");
+    }
+
+    /// The env a test sidecar runs with: just PATH, so `/bin/sh` finds
+    /// `head` and `tr`.
+    fn path_env() -> BTreeMap<String, String> {
+        std::env::var("PATH")
+            .map(|p| BTreeMap::from([(String::from("PATH"), p)]))
+            .unwrap_or_default()
+    }
+
+    /// A sidecar that crashes on import (the pinned mcp-server-time under
+    /// mcp 2.x) must say why, not report a generic timeout (#1297).
+    #[test]
+    fn a_server_that_dies_before_answering_names_its_error() {
+        let script = "echo 'Traceback (most recent call last):' >&2; \
+             echo \"ImportError: cannot import name 'McpError' from 'mcp.shared.exceptions'\" >&2; \
+             echo >&2; exit 1";
+        let err = McpClient::connect(
+            "/bin/sh",
+            &[String::from("-c"), script.to_string()],
+            &std::env::temp_dir(),
+            &path_env(),
+            "croft",
+            "test",
+        )
+        .err()
+        .expect("a server that exits never connects")
+        .to_string();
+        assert_eq!(
+            err,
+            "the server exited: ImportError: cannot import name 'McpError' from 'mcp.shared.exceptions'"
+        );
+    }
+
+    /// A server that dies without a word still says it exited, rather than
+    /// that it timed out.
+    #[test]
+    fn a_silent_server_exit_is_reported_as_an_exit() {
+        let err = McpClient::connect(
+            "/bin/sh",
+            &[String::from("-c"), String::from("exit 3")],
+            &std::env::temp_dir(),
+            &path_env(),
+            "croft",
+            "test",
+        )
+        .err()
+        .expect("a server that exits never connects")
+        .to_string();
+        assert_eq!(err, "the server exited before responding");
+    }
+
+    /// Negative: a server that logs far past the 64 KiB pipe buffer before
+    /// answering still answers, since stderr is drained, not left to fill.
+    #[test]
+    fn a_server_logging_past_the_pipe_buffer_still_answers() {
+        let script = "head -c 300000 /dev/zero | tr '\\000' x >&2; read l; \
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; cat >/dev/null";
+        McpClient::connect(
+            "/bin/sh",
+            &[String::from("-c"), script.to_string()],
+            &std::env::temp_dir(),
+            &path_env(),
+            "croft",
+            "test",
+        )
+        .expect("a chatty server still completes the handshake");
     }
 
     /// End-to-end against a real MCP server process: a tiny hermetic Python
