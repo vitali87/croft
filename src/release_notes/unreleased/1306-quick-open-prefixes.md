@@ -1,0 +1,1 @@
+fix: Go to File (Ctrl+P) switches modes on VS Code's other prefixes: `>` opens the Command Palette, `@` Go to Symbol in Editor and `:12` goes to line 12, each carrying the rest of the query, and a pasted prefixed query switches too.

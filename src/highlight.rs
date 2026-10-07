@@ -728,6 +728,13 @@ pub enum LangKind {
     Ql,
     /// A CodeQL database schema (`.dbscheme`, #578).
     Dbscheme,
+    // Files most repositories carry whatever they are written in (#1226).
+    Java,
+    Ruby,
+    CSharp,
+    Sql,
+    Make,
+    Dockerfile,
 }
 
 /// The bare tree-sitter grammar handle for `kind` — the parser the
@@ -755,6 +762,12 @@ pub fn language_for(kind: LangKind) -> tree_sitter::Language {
         LangKind::Lua => tree_sitter_lua::LANGUAGE.into(),
         LangKind::Ql => tree_sitter_ql::LANGUAGE.into(),
         LangKind::Dbscheme => tree_sitter_ql_dbscheme::LANGUAGE.into(),
+        LangKind::Java => tree_sitter_java::LANGUAGE.into(),
+        LangKind::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        LangKind::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        LangKind::Sql => tree_sitter_sequel::LANGUAGE.into(),
+        LangKind::Make => tree_sitter_make::LANGUAGE.into(),
+        LangKind::Dockerfile => tree_sitter_containerfile::LANGUAGE.into(),
     }
 }
 
@@ -780,8 +793,34 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         // CodeQL queries and libraries (#578).
         "ql" | "qll" => LangKind::Ql,
         "dbscheme" => LangKind::Dbscheme,
+        "java" => LangKind::Java,
+        "rb" | "rake" | "gemspec" | "ru" => LangKind::Ruby,
+        "cs" | "csx" => LangKind::CSharp,
+        "sql" => LangKind::Sql,
+        "mk" | "mak" => LangKind::Make,
+        "dockerfile" | "containerfile" => LangKind::Dockerfile,
         _ => return None,
     })
+}
+
+/// The language for `path`: its extension, else a well-known file name
+/// with none of its own (`Dockerfile`, `Makefile`, `Gemfile`, #1226).
+pub fn lang_for_path(path: &std::path::Path) -> Option<LangKind> {
+    let name = path.file_name()?.to_str()?;
+    let by_name = match name {
+        "Dockerfile" | "Containerfile" | "dockerfile" | "containerfile" => {
+            Some(LangKind::Dockerfile)
+        }
+        "Makefile" | "makefile" | "GNUmakefile" => Some(LangKind::Make),
+        "Gemfile" | "Rakefile" | "Guardfile" | "Vagrantfile" => Some(LangKind::Ruby),
+        // `Dockerfile.dev`, `Containerfile.prod`: the suffix names a stage,
+        // not a language.
+        _ if name.starts_with("Dockerfile.") || name.starts_with("Containerfile.") => {
+            Some(LangKind::Dockerfile)
+        }
+        _ => None,
+    };
+    by_name.or_else(|| path.extension()?.to_str().and_then(lang_for_extension))
 }
 
 /// Map a fenced code block's info string to a highlighter language. Accepts
@@ -798,8 +837,39 @@ pub fn lang_for_fence(info: &str) -> Option<LangKind> {
         "golang" => LangKind::Go,
         "shell" | "console" | "terminal" => LangKind::Bash,
         "codeql" => LangKind::Ql,
+        "csharp" | "c#" => LangKind::CSharp,
+        "ruby" => LangKind::Ruby,
+        "make" | "makefile" => LangKind::Make,
+        "docker" => LangKind::Dockerfile,
         other => return lang_for_extension(other),
     })
+}
+
+/// Rename the older nvim-treesitter capture names some bundled queries use
+/// (`@conditional`, `@repeat`, `@field`, ...) to the ones in
+/// [`HIGHLIGHT_NAMES`], so their keywords and fields colour like every
+/// other language's (#1226).
+fn standard_captures(query: &str) -> String {
+    static RENAMES: std::sync::OnceLock<[(regex::Regex, &str); 6]> = std::sync::OnceLock::new();
+    let renames = RENAMES.get_or_init(|| {
+        let re = |names: &str| regex::Regex::new(&format!(r"@(?:{names})\b")).expect("static");
+        [
+            (
+                re(r"conditional|include|repeat|exception|storageclass|type\.qualifier"),
+                "@keyword",
+            ),
+            (re("float"), "@number"),
+            (re("field"), "@property"),
+            (re("parameter"), "@variable.parameter"),
+            (re(r"function\.call"), "@function"),
+            (re(r"constant\.macro"), "@constant"),
+        ]
+    });
+    let mut out = query.to_string();
+    for (re, to) in renames {
+        out = re.replace_all(&out, *to).into_owned();
+    }
+    out
 }
 
 fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
@@ -1063,6 +1133,54 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             tree_sitter_ql_dbscheme::LANGUAGE.into(),
             "ql_dbscheme",
             DBSCHEME_HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Java => HighlightConfiguration::new(
+            tree_sitter_java::LANGUAGE.into(),
+            "java",
+            tree_sitter_java::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Ruby => HighlightConfiguration::new(
+            tree_sitter_ruby::LANGUAGE.into(),
+            "ruby",
+            tree_sitter_ruby::HIGHLIGHTS_QUERY,
+            "",
+            tree_sitter_ruby::LOCALS_QUERY,
+        )
+        .ok()?,
+        LangKind::CSharp => HighlightConfiguration::new(
+            tree_sitter_c_sharp::LANGUAGE.into(),
+            "c_sharp",
+            tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Sql => HighlightConfiguration::new(
+            tree_sitter_sequel::LANGUAGE.into(),
+            "sql",
+            &standard_captures(tree_sitter_sequel::HIGHLIGHTS_QUERY),
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Make => HighlightConfiguration::new(
+            tree_sitter_make::LANGUAGE.into(),
+            "make",
+            &standard_captures(tree_sitter_make::HIGHLIGHTS_QUERY),
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Dockerfile => HighlightConfiguration::new(
+            tree_sitter_containerfile::LANGUAGE.into(),
+            "dockerfile",
+            tree_sitter_containerfile::HIGHLIGHTS_QUERY,
             "",
             "",
         )
@@ -2713,5 +2831,92 @@ def f() -> Config:\n\
             konst.is_none_or(|sp| sp.style != palette_style_for_name(&p, "keyword")),
             "the script body is not highlighted as JavaScript: {konst:?}"
         );
+    }
+
+    /// #1226: the files most repositories carry, whatever they are written
+    /// in, get a language: by extension, or by a well-known name for the
+    /// ones that have none.
+    #[test]
+    fn common_repository_files_get_a_language() {
+        let cases = [
+            ("Dockerfile", LangKind::Dockerfile),
+            ("Containerfile", LangKind::Dockerfile),
+            ("Dockerfile.dev", LangKind::Dockerfile),
+            ("build.dockerfile", LangKind::Dockerfile),
+            ("Makefile", LangKind::Make),
+            ("GNUmakefile", LangKind::Make),
+            ("rules.mk", LangKind::Make),
+            ("schema.sql", LangKind::Sql),
+            ("App.java", LangKind::Java),
+            ("app.rb", LangKind::Ruby),
+            ("Gemfile", LangKind::Ruby),
+            ("Program.cs", LangKind::CSharp),
+            // The supported ones still resolve by extension.
+            ("main.rs", LangKind::Rust),
+        ];
+        for (name, want) in cases {
+            let path = std::path::Path::new("/repo/sub").join(name);
+            assert_eq!(lang_for_path(&path), Some(want), "{name}");
+        }
+    }
+
+    /// #1226 negative: a name that only looks like one stays Plain Text.
+    #[test]
+    fn lookalike_file_names_stay_plain_text() {
+        for name in [
+            "README",
+            "notes.txt",
+            "Makefile.am",
+            "mydockerfile",
+            "Dockerfiles",
+        ] {
+            let path = std::path::Path::new("/repo").join(name);
+            assert_eq!(lang_for_path(&path), None, "{name}");
+        }
+    }
+
+    /// #1226: older capture names map onto the standard ones, and a name
+    /// that merely starts like one is left alone.
+    #[test]
+    fn older_capture_names_map_onto_the_standard_ones() {
+        assert_eq!(
+            standard_captures("(a) @conditional (b) @float (c) @field (d) @parameter"),
+            "(a) @keyword (b) @number (c) @property (d) @variable.parameter"
+        );
+        assert_eq!(
+            standard_captures("(a) @fieldset (b) @keyword"),
+            "(a) @fieldset (b) @keyword"
+        );
+    }
+
+    /// #1226: each new grammar loads and colours its keywords.
+    #[test]
+    fn each_new_grammar_colours_its_keywords() {
+        let cases = [
+            (LangKind::Java, "class A { int x = 1; }\n", "class"),
+            (LangKind::Ruby, "def greet\n  puts 1\nend\n", "def"),
+            (LangKind::CSharp, "public class A { }\n", "class"),
+            (
+                LangKind::Sql,
+                "SELECT id FROM users WHERE id = 1;\n",
+                "SELECT",
+            ),
+            (LangKind::Make, "ifeq ($(CC),gcc)\nendif\n", "ifeq"),
+            (LangKind::Dockerfile, "FROM alpine\nRUN echo hi\n", "FROM"),
+        ];
+        let p = SyntaxPalette::BASE16;
+        for (kind, src, keyword) in cases {
+            let mut reg = LangRegistry::new();
+            let ls = compute_line_starts(src.as_bytes());
+            let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+            let line0 = src.lines().next().unwrap();
+            let span = span_at(&h[0], line0, keyword)
+                .unwrap_or_else(|| panic!("{kind:?}: no span on {keyword:?}"));
+            assert_eq!(
+                span.style,
+                palette_style_for_name(&p, "keyword"),
+                "{kind:?}: {keyword:?} is a keyword"
+            );
+        }
     }
 }

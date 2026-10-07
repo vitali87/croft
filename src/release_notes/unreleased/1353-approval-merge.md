@@ -1,0 +1,1 @@
+fix: Completing the merge of an agent's proposal with your unsaved edits approves it without trying to stage croft's scratch copy (no more "Stage failed: … outside repository"), and the merge editor says it is that merge: save to approve, close unsaved to go back.
