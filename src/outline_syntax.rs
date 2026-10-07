@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Parser, Query, QueryCursor};
+use tree_sitter::{Language, Parser, Point, Query, QueryCursor};
 
 use crate::highlight::LangKind;
 use crate::lsp::manager::{OutlineKind, OutlineSymbol};
@@ -58,7 +58,7 @@ pub fn symbols_for(kind: LangKind, source: &[u8]) -> Vec<OutlineSymbol> {
         let mut name: Option<&str> = None;
         let mut kind_sym: Option<OutlineKind> = None;
         let mut sel: Option<(u32, u32)> = None;
-        let mut full: Option<(usize, usize, u32, u32)> = None;
+        let mut full: Option<(usize, usize, Point, Point)> = None;
         for cap in m.captures {
             let cap_name = names[cap.index as usize];
             let node = cap.node;
@@ -66,8 +66,8 @@ pub fn symbols_for(kind: LangKind, source: &[u8]) -> Vec<OutlineSymbol> {
                 full = Some((
                     node.start_byte(),
                     node.end_byte(),
-                    node.start_position().row as u32,
-                    node.end_position().row as u32,
+                    node.start_position(),
+                    node.end_position(),
                 ));
             } else if let Some(suffix) = cap_name.strip_prefix("name.") {
                 name = node.utf8_text(source).ok();
@@ -76,7 +76,7 @@ pub fn symbols_for(kind: LangKind, source: &[u8]) -> Vec<OutlineSymbol> {
                 kind_sym = Some(kind_from_suffix(suffix));
             }
         }
-        if let (Some(name), Some(kind), Some((line, character)), Some((sb, eb, rsl, rel))) =
+        if let (Some(name), Some(kind), Some((line, character)), Some((sb, eb, start, end))) =
             (name, kind_sym, sel, full)
         {
             raw.push(Raw {
@@ -86,8 +86,10 @@ pub fn symbols_for(kind: LangKind, source: &[u8]) -> Vec<OutlineSymbol> {
                 character,
                 start_byte: sb,
                 end_byte: eb,
-                range_start_line: rsl,
-                range_end_line: rel,
+                range_start_line: start.row as u32,
+                range_end_line: end.row as u32,
+                range_start_character: start.column as u32,
+                range_end_character: end.column as u32,
             });
         }
     }
@@ -119,6 +121,8 @@ pub fn symbols_for(kind: LangKind, source: &[u8]) -> Vec<OutlineSymbol> {
             character: r.character,
             range_start_line: r.range_start_line,
             range_end_line: r.range_end_line,
+            range_start_character: r.range_start_character,
+            range_end_character: r.range_end_character,
         });
     }
     out
@@ -135,6 +139,8 @@ struct Raw {
     end_byte: usize,
     range_start_line: u32,
     range_end_line: u32,
+    range_start_character: u32,
+    range_end_character: u32,
 }
 
 struct Compiled {
