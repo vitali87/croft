@@ -285,6 +285,15 @@ pub struct Prefs {
     /// matching VS Code.
     #[serde(default)]
     pub copy_on_select: bool,
+    /// Globs hidden from the Explorer, Go to File and Search (VS Code's
+    /// `files.exclude`, #1345). Matched against workspace-relative paths;
+    /// a folder's match hides everything inside it.
+    #[serde(default)]
+    pub files_exclude: Vec<String>,
+    /// Globs kept out of Search, Replace All and Go to File, on top of
+    /// `files_exclude` (VS Code's `search.exclude`, #1345).
+    #[serde(default)]
+    pub search_exclude: Vec<String>,
     /// Opt-out for tailspin highlighting in the rendered log view (#466):
     /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
     /// are coloured on lines that carry no colour of their own. Stored as

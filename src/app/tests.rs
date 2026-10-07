@@ -13919,6 +13919,153 @@ fn discard_all_requires_confirmation_and_then_reverts_tracked_changes() {
     );
 }
 
+/// The issue's repo (#1352): `value_1`..`value_20` committed, then line 5
+/// changed to `value_FIVE` and line 9 deleted, open in an editor tab with
+/// its change bars computed.
+fn app_with_change_bars() -> (App, tempfile::TempDir) {
+    let tmp = make_committed_repo();
+    let root = tmp.path();
+    let f = root.join("v.txt");
+    let body: String = (1..=20).map(|i| format!("value_{i}\n")).collect();
+    std::fs::write(&f, &body).unwrap();
+    for args in [&["add", "v.txt"][..], &["commit", "-q", "-m", "values"]] {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+    let edited: String = (1..=20)
+        .filter(|&i| i != 9)
+        .map(|i| {
+            if i == 5 {
+                String::from("value_FIVE\n")
+            } else {
+                format!("value_{i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&f, edited).unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.sync_git_gutters();
+    (app, tmp)
+}
+
+/// #1352: F7 in an editor tab walks its change bars (line 5, then the
+/// deletion boundary at line 9) and wraps; Shift+F7 goes back.
+#[test]
+fn next_change_in_the_editor_walks_the_change_bars_and_wraps() {
+    let (mut app, _t) = app_with_change_bars();
+    app.editor.cursor_row = 0;
+    let f7 = |app: &mut App, m: KeyModifiers| {
+        app.handle_key(key(KeyCode::F(7), m)).unwrap();
+        app.editor.cursor_row
+    };
+    assert_eq!(f7(&mut app, KeyModifiers::NONE), 4);
+    assert_eq!(f7(&mut app, KeyModifiers::NONE), 8);
+    assert_eq!(f7(&mut app, KeyModifiers::NONE), 4, "wraps to the first");
+    assert_eq!(f7(&mut app, KeyModifiers::SHIFT), 8, "Shift+F7 wraps back");
+    assert_eq!(f7(&mut app, KeyModifiers::SHIFT), 4);
+}
+
+/// #1352: the palette's Go to Next/Previous Change run the same walk as
+/// F7, and VS Code's command ids import onto them.
+#[test]
+fn go_to_next_change_is_a_palette_command() {
+    use crate::widgets::command_palette::Command;
+    let (mut app, _t) = app_with_change_bars();
+    app.editor.cursor_row = 0;
+    app.run_command(Command::from_id("next_change").expect("next_change id"));
+    assert_eq!(app.editor.cursor_row, 4);
+    app.run_command(Command::from_id("previous_change").expect("previous_change id"));
+    assert_eq!(app.editor.cursor_row, 8, "wraps back to the last change");
+    let mut report = crate::import_vscode::Report::default();
+    crate::import_vscode::convert_keybindings(
+        &serde_json::json!([
+            { "key": "alt+f5", "command": "workbench.action.editor.nextChange" }
+        ]),
+        &mut report,
+    );
+    assert!(
+        report.keybindings.iter().any(|(_, c)| c == "next_change"),
+        "{:?}",
+        report.keybindings
+    );
+}
+
+/// #1352: Git: Revert Hunk with the caret on line 5 of an editor tab
+/// restores `value_5`, in the file and the tab, and leaves line 9's
+/// deletion alone.
+#[test]
+fn revert_hunk_in_the_editor_restores_the_head_lines() {
+    let (mut app, t) = app_with_change_bars();
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::RevertHunk);
+    assert!(app.pending_revert_hunk.is_some(), "{}", app.status);
+    app.confirm_pending_revert_hunk();
+    let disk = std::fs::read_to_string(t.path().join("v.txt")).unwrap();
+    assert!(
+        disk.contains("value_5\n") && !disk.contains("value_FIVE"),
+        "{disk}"
+    );
+    assert!(!disk.contains("value_9\n"), "the other hunk stays");
+    assert_eq!(
+        app.editor.lines[4], "value_5",
+        "the tab shows the reverted text"
+    );
+}
+
+/// #1352: Git: Stage Hunk from an editor tab stages only that hunk.
+#[test]
+fn stage_hunk_in_the_editor_stages_only_that_hunk() {
+    let (mut app, t) = app_with_change_bars();
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::StageHunk);
+    let staged = git_stdout(t.path(), &["diff", "--cached"]);
+    assert!(staged.contains("+value_FIVE"), "{staged}\n{}", app.status);
+    assert!(!staged.contains("-value_9"), "{staged}");
+    let unstaged = git_stdout(t.path(), &["diff"]);
+    assert!(unstaged.contains("-value_9"), "{unstaged}");
+}
+
+/// #1352 negative: with unsaved edits the hunk actions refuse, since they
+/// work on the file on disk, and say to save first.
+#[test]
+fn hunk_actions_in_the_editor_refuse_a_dirty_buffer() {
+    let (mut app, t) = app_with_change_bars();
+    app.editor.cursor_row = 4;
+    app.editor.insert_str("x");
+    app.run_command(crate::widgets::command_palette::Command::RevertHunk);
+    assert!(app.pending_revert_hunk.is_none());
+    assert!(app.status.contains("Save"), "{}", app.status);
+    assert!(
+        std::fs::read_to_string(t.path().join("v.txt"))
+            .unwrap()
+            .contains("value_FIVE")
+    );
+}
+
+/// #1352 negative: on an unchanged line there is no hunk to act on, and
+/// F7 in a file with no changes leaves the caret where it is.
+#[test]
+fn an_unchanged_line_has_no_hunk_and_a_clean_file_no_next_change() {
+    let (mut app, t) = app_with_change_bars();
+    app.editor.cursor_row = 0;
+    app.run_command(crate::widgets::command_palette::Command::StageHunk);
+    assert!(app.status.contains("No change"), "{}", app.status);
+    assert_eq!(git_stdout(t.path(), &["diff", "--cached"]), "");
+    app.editor.open_pinned(&t.path().join("seed.txt")).unwrap();
+    app.sync_git_gutters();
+    app.editor.cursor_row = 0;
+    app.handle_key(key(KeyCode::F(7), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 0);
+}
+
 #[test]
 fn create_tag_via_the_menu_opens_an_input_then_creates_the_tag() {
     use crate::widgets::input_prompt::InputPurpose;
@@ -25518,6 +25665,132 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
     );
     app.search.type_char('x');
     assert_eq!(app.search.include, "*.md", "the seeded include is intact");
+}
+
+/// The issue's repo (#1345): a committed `.vscode/settings.json` hides
+/// `**/generated` from files and `**/tests/fixtures` from search, and
+/// `parse_order` has one real hit, six fixture hits and one generated one.
+fn app_with_vscode_excludes() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in [".vscode", "src", "tests/fixtures", "generated"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join(".vscode/settings.json"),
+        r#"{ "files.exclude": { "**/generated": true },
+  "search.exclude": { "**/tests/fixtures": true } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("src/orders.py"), "def parse_order(x): return x\n").unwrap();
+    for i in 1..=6 {
+        std::fs::write(
+            root.join(format!("tests/fixtures/case{i}.txt")),
+            format!("parse_order fixture {i}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        root.join("generated/api_pb2.py"),
+        "# parse_order generated stub\n",
+    )
+    .unwrap();
+    let app = App::new(root.to_path_buf()).unwrap();
+    (app, tmp)
+}
+
+/// Run the Search panel's query to completion; the hit paths, relative
+/// and sorted.
+fn search_hit_paths(app: &mut App, root: &std::path::Path, query: &str) -> Vec<String> {
+    app.search.query = String::from(query);
+    app.submit_search_query();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.search.complete && std::time::Instant::now() < deadline {
+        app.drain_search_results();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(app.search.complete, "the search must finish");
+    let mut paths: Vec<String> = app
+        .search
+        .hits
+        .iter()
+        .map(|h| {
+            h.path
+                .strip_prefix(root)
+                .unwrap_or(&h.path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// #1345: `.vscode/settings.json`'s `files.exclude` and `search.exclude`
+/// keep their folders out of Search, so the one real hit is all there is.
+#[test]
+fn search_honours_the_vscode_exclude_settings() {
+    let (mut app, t) = app_with_vscode_excludes();
+    assert_eq!(
+        search_hit_paths(&mut app, t.path(), "parse_order"),
+        vec![String::from("src/orders.py")]
+    );
+}
+
+/// #1345: the exclude box adds to the project's exclusions rather than
+/// replacing them.
+#[test]
+fn the_exclude_box_adds_to_the_project_excludes() {
+    let (mut app, t) = app_with_vscode_excludes();
+    app.search.exclude = String::from("src");
+    assert!(
+        search_hit_paths(&mut app, t.path(), "parse_order").is_empty(),
+        "src is excluded by the box and the rest by the project"
+    );
+}
+
+/// #1345 negative: turning the project exclusions off (VS Code's "Use
+/// Exclude Settings and Ignore Files") searches everything again.
+#[test]
+fn project_excludes_can_be_switched_off_for_one_search() {
+    let (mut app, t) = app_with_vscode_excludes();
+    app.toggle_project_excludes();
+    assert!(!app.search.use_exclude_settings);
+    assert_eq!(search_hit_paths(&mut app, t.path(), "parse_order").len(), 8);
+}
+
+/// #1345: the Explorer hides a `files.exclude` folder, and only that:
+/// `search.exclude` leaves the fixtures listed, as in VS Code.
+#[test]
+fn the_explorer_hides_files_exclude_folders_only() {
+    let (app, t) = app_with_vscode_excludes();
+    let listed: Vec<_> = app.tree.nodes.iter().map(|n| n.path.clone()).collect();
+    assert!(!listed.contains(&t.path().join("generated")), "{listed:?}");
+    assert!(listed.contains(&t.path().join("tests")), "{listed:?}");
+    assert!(listed.contains(&t.path().join("src")), "{listed:?}");
+}
+
+/// #1345: Go to File skips excluded files, as VS Code's file search does
+/// for both settings, and still finds the rest.
+#[test]
+fn quick_open_skips_excluded_files() {
+    let (mut app, _t) = app_with_vscode_excludes();
+    app.open_file_finder();
+    let rels: Vec<String> = app
+        .file_finder
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.rel.clone())
+        .collect();
+    assert!(rels.contains(&String::from("src/orders.py")), "{rels:?}");
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.starts_with("generated/") || r.starts_with("tests/")),
+        "{rels:?}"
+    );
 }
 
 /// Open a file into the focused editor group of a fresh App.

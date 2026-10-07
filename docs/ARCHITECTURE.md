@@ -975,7 +975,7 @@ A three-way merge editor following VS Code's 2022 merge-editor model. `MergeView
 
 The Jupyter rendered view. An `.ipynb` file parses into the same `(lines, images)` state the Markdown preview machinery already renders, so wrap, scroll, the inline-image overlay and Reopen as Text (the raw JSON, sticky via `force_text`) all come for free.
 
-**Cell rendering.** Markdown cells go through the markdown builder, with anchors offset into the merged document. Code cells render as fenced blocks in the kernelspec language under an `In [n]` frame. Stream and error outputs paint dim or red with ANSI stripped, and `image/png` outputs decode into hash-named scratch files that reserve overlay rows the way Markdown pictures do.
+**Cell rendering.** Markdown cells go through the markdown builder, with anchors offset into the merged document. Code cells render as fenced blocks in the kernelspec language under an `In [n]` frame. Stream and error outputs paint dim or red with ANSI stripped, and a rich output shows the richest type croft can draw, in Jupyter's order (#1188): `image/png` and `image/jpeg` decode into hash-named scratch files that reserve overlay rows the way Markdown pictures do, `image/svg+xml` is rasterised through `svg::rasterize` and placed the same way, `text/markdown` renders as a Markdown cell does, and `text/html` is turned into Markdown first (`html_to_markdown`: headings, paragraphs, emphasis, lists, code and tables such as a DataFrame's survive, `<style>` and `<script>` contents are dropped). Only then does `text/plain` show.
 
 **Dispatch.** The preview carries a `notebook` flag so the stale-rebuild and theme-switch paths route to this builder rather than the plain Markdown one.
 

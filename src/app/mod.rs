@@ -2986,6 +2986,9 @@ pub struct App {
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
     copy_on_select: bool,
+    /// The project's `files_exclude` globs (#1345), as last applied to the
+    /// Explorer, so a settings reload re-lists the tree only on a change.
+    files_exclude: Vec<String>,
     /// Tailspin highlighting in rendered log views (#466): the inverse of
     /// the `disable_log_highlight` preference. Pushed into `log_view`'s
     /// default for views opened later and into every open view on toggle.
@@ -5596,6 +5599,7 @@ impl App {
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
+            files_exclude: Vec::new(),
             log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
@@ -6290,6 +6294,7 @@ impl App {
         }
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
+        app.apply_project_excludes(&loaded_prefs);
         app.agent_ledger = app.load_agent_ledger(&root);
         app.sync_agent_lane_decorations();
         Ok(app)
@@ -8109,7 +8114,7 @@ impl App {
         // next scan honours them (VS Code's Search filter inputs).
         let _ = self.search_query_tx.send(SearchRequest::SetFilter(
             self.search.include.clone(),
-            self.search.exclude.clone(),
+            self.search.effective_exclude(),
         ));
         let _ = self.search_query_tx.send(SearchRequest::Query(
             self.search.query.clone(),
@@ -35187,11 +35192,7 @@ impl App {
         let Some(file) = collab_file_key(&self.tree.root, &path) else {
             return false;
         };
-        let Some(kind) = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(crate::highlight::lang_for_extension)
-        else {
+        let Some(kind) = crate::highlight::lang_for_path(&path) else {
             return false;
         };
         let Some(old) = host.last_seen(&file) else {
@@ -36930,7 +36931,7 @@ impl App {
     /// active tab isn't a working-tree diff or no hunk is at the cursor.
     fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
         let built = match self.editor.diff.as_ref() {
-            None => Err("Hunk actions work inside a Source Control diff"),
+            None => self.editor_hunk_patch_at_caret(),
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control")
             }
@@ -36952,6 +36953,59 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Stage / Unstage / Revert Hunk from an editor tab (#1352): the hunk
+    /// whose change bar the caret is on, as a patch of the file on disk
+    /// against HEAD, the same pair the gutter's bars come from. Refused
+    /// with unsaved edits, since the patch is applied to the saved file.
+    fn editor_hunk_patch_at_caret(&mut self) -> Result<(String, String), &'static str> {
+        let Some(path) = self.editor.path.clone() else {
+            return Err("Hunk actions need a file in a git repository");
+        };
+        if self.editor.dirty {
+            return Err("Save the file first: hunk actions apply to the file on disk");
+        }
+        let row = self.editor.cursor_row;
+        let Some(mark) = self.editor.current_git_mark_at(row) else {
+            return Err("No change at the cursor");
+        };
+        let rel = self
+            .repo_relative_path(&path)
+            .ok_or("File is outside the repository")?;
+        let head = crate::git::read_file_at_head(&self.scm_root(), &rel)
+            .map_err(|_| "This file has no version in HEAD")?;
+        let disk = std::fs::read_to_string(&path).map_err(|_| "Could not read the file")?;
+        let data = crate::widgets::diff::DiffData::build_with_byte_check(
+            PathBuf::from(&rel),
+            path,
+            head.lines().map(str::to_string).collect(),
+            disk.lines().map(str::to_string).collect(),
+            Some(&head),
+            Some(&disk),
+        );
+        // The diff row showing this line; a deletion bar sits on the line
+        // after the removed run, so its hunk is the row just above.
+        use crate::widgets::diff::DiffRow;
+        let at = data
+            .rows
+            .iter()
+            .position(|r| match *r {
+                DiffRow::Equal { right, .. }
+                | DiffRow::Added { right }
+                | DiffRow::Replaced { right, .. } => right == row,
+                DiffRow::Removed { .. } => false,
+            })
+            .map(|i| {
+                if mark == crate::widgets::editor::GitMark::Deleted {
+                    i.saturating_sub(1)
+                } else {
+                    i
+                }
+            })
+            .ok_or("No change at the cursor")?;
+        let range = data.hunk_range_at(at).ok_or("No change at the cursor")?;
+        Ok((rel.clone(), data.hunk_patch(&rel, range)))
     }
 
     /// The workspace-relative path + patch for the SELECTED lines of the
@@ -37180,6 +37234,11 @@ impl App {
             Ok(_) => {
                 self.status = format!("Reverted hunk in {}", pr.rel_path);
                 self.refresh_after_hunk_op();
+                // Reverted from an editor tab (#1352): show the restored text
+                // now rather than on the next file-system sweep.
+                if self.editor.diff.is_none() && self.editor.reload_if_clean().is_some() {
+                    self.sync_open_file_poll_mtime();
+                }
                 // The revert rewrote the working file; force the HEAD-side rebuild
                 // of the open view so it refreshes even if the rewrite landed
                 // within the stamp's granularity. Forced by the root the VIEW is
@@ -39491,11 +39550,8 @@ impl App {
         }
         // Highlighting only: no language server hears about a tab with no
         // file behind it.
-        self.editor.set_language(
-            path.extension()
-                .and_then(|x| x.to_str())
-                .and_then(crate::highlight::lang_for_extension),
-        );
+        self.editor
+            .set_language(crate::highlight::lang_for_path(&path));
         self.close_scrubber_for_tab();
         self.status = format!("{rel} at {} — {}", commit.short_hash, commit.summary);
     }
@@ -41257,6 +41313,12 @@ impl App {
         // exist, so F7 keeps its normal meaning everywhere else.
         if matches!(key.code, KeyCode::F(7)) && !self.editor.conflicts().is_empty() {
             self.jump_conflict(key.modifiers.contains(KeyModifiers::SHIFT));
+            return;
+        }
+        // F7 / Shift+F7 elsewhere: Go to Next / Previous Change over the
+        // gutter's change bars (#1352), as the diff view walks its hunks.
+        if matches!(key.code, KeyCode::F(7)) && self.editor.merge.is_none() {
+            self.jump_editor_change(!key.modifiers.contains(KeyModifiers::SHIFT));
             return;
         }
         // Merge editor (#253): F7 hops the tracked Result regions (the
@@ -47270,8 +47332,9 @@ impl App {
                 let arc = std::sync::Arc::new(entries);
                 self.file_finder_index = Some(arc.clone());
                 self.file_finder_index_rx = None;
+                let visible = self.without_project_excludes(arc);
                 if let Some(finder) = self.file_finder.as_mut() {
-                    finder.replace_entries(arc);
+                    finder.replace_entries(visible);
                 }
                 if self.file_finder_index_dirty {
                     self.kick_file_finder_index_rebuild();
@@ -47326,6 +47389,7 @@ impl App {
             .file_finder_index
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
+        let entries = self.without_project_excludes(entries);
         let count = entries.len();
         self.file_finder = Some(crate::widgets::file_finder::FileFinder::new(entries));
         self.overlays.file_finder_clear.request();
@@ -48875,6 +48939,8 @@ impl App {
                     self.jump_conflict(false)
                 }
             }
+            Cmd::GoToNextChange => self.jump_editor_change(true),
+            Cmd::GoToPrevChange => self.jump_editor_change(false),
             Cmd::MergePrevConflict => {
                 if self.editor.merge.is_some() {
                     self.merge_jump(true);
@@ -53897,6 +53963,10 @@ impl App {
                         self.run_search_replace_all();
                         return;
                     }
+                    if self.search.project_exclude_toggle_at(m.column, m.row) {
+                        self.toggle_project_excludes();
+                        return;
+                    }
                     // Click inside one of the input boxes focuses that field.
                     if let Some(field) = self.search.field_at(m.column, m.row) {
                         self.search.focus_field(field);
@@ -57235,6 +57305,65 @@ impl App {
         }
     }
 
+    /// Flip the Search panel's project exclusions on or off (#1345), VS
+    /// Code's "Use Exclude Settings and Ignore Files", and search again.
+    fn toggle_project_excludes(&mut self) {
+        self.search.use_exclude_settings = !self.search.use_exclude_settings;
+        self.status = String::from(if self.search.use_exclude_settings {
+            "Search: project exclusions on"
+        } else {
+            "Search: project exclusions off, searching every folder"
+        });
+        if !crate::widgets::search::as_typed(&self.search.query).is_empty() {
+            self.submit_search_query();
+        }
+    }
+
+    /// Apply the project's `files_exclude` / `search_exclude` globs
+    /// (#1345): the Explorer hides `files_exclude`, Search and Go to File
+    /// leave out both. Re-lists the tree and re-runs a live search only
+    /// when the globs changed.
+    fn apply_project_excludes(&mut self, p: &crate::prefs::Prefs) {
+        let mut search = p.files_exclude.clone();
+        search.extend(p.search_exclude.iter().cloned());
+        if search != self.search.project_exclude {
+            self.search.project_exclude = search;
+            if !crate::widgets::search::as_typed(&self.search.query).is_empty() {
+                self.submit_search_query();
+            }
+        }
+        if p.files_exclude != self.files_exclude {
+            self.files_exclude = p.files_exclude.clone();
+            self.tree.exclude = crate::widgets::search::PathFilter::excluding(&self.files_exclude);
+            self.tree.refresh_children(0);
+        }
+    }
+
+    /// The Go to File index without the files the project excludes
+    /// (#1345): VS Code's file search honours both exclude settings.
+    fn without_project_excludes(
+        &self,
+        entries: std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>,
+    ) -> std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>> {
+        if self.search.project_exclude.is_empty() {
+            return entries;
+        }
+        let filter = crate::widgets::search::PathFilter::excluding(&self.search.project_exclude);
+        let kept = entries
+            .iter()
+            .filter(|e| {
+                let root = self
+                    .roots
+                    .iter()
+                    .find(|r| e.path.starts_with(r))
+                    .map_or_else(|| self.roots.primary().to_path_buf(), |r| r.to_path_buf());
+                !filter.excludes(&root, &e.path)
+            })
+            .cloned()
+            .collect();
+        std::sync::Arc::new(kept)
+    }
+
     /// Re-run the layered settings merge (#251) and apply everything that can
     /// apply live: theme, editor toggles, save behavior, host accents. Called
     /// when any file of the chain is saved in the editor; layout and other
@@ -57274,6 +57403,7 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        self.apply_project_excludes(p);
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
@@ -60182,6 +60312,29 @@ impl App {
     /// full viewport, Home/End jump to the first/last row, Tab/Shift+Tab
     /// switch worksheets. Anything else is swallowed so a stray keystroke
     /// can't insert characters into a buffer the user can't see.
+    /// Go to Next / Previous Change (#1352): in a diff tab its hunks, in a
+    /// buffer with merge conflicts its conflicts, otherwise the editor's
+    /// change bars, wrapping at the ends.
+    fn jump_editor_change(&mut self, forward: bool) {
+        if self.editor.diff.is_some() {
+            self.jump_diff_change(forward);
+            return;
+        }
+        if !self.editor.conflicts().is_empty() {
+            self.jump_conflict(!forward);
+            return;
+        }
+        let row = self.editor.cursor_row;
+        match self.editor.git_change_from(row, forward) {
+            Some(line) => {
+                self.editor.clear_selection();
+                self.editor.goto_line_centered(line);
+                self.status = format!("Change at line {}", line + 1);
+            }
+            None => self.status = String::from("No changes in this file"),
+        }
+    }
+
     /// Scroll the active diff to the next change hunk (forward=true) or
     /// the previous one (forward=false), wrapping around the ends so a
     /// user can keep clicking the same arrow to cycle through every
@@ -68532,7 +68685,7 @@ fn collab_caret_color(navigator_sites: &[u64], site: u64) -> Color {
 /// The tree-sitter grammar for `path`, by extension: what symbol tabs
 /// (#369) parse to re-find a renamed or displaced symbol.
 fn syntax_kind_of(path: &Path) -> Option<crate::highlight::LangKind> {
-    crate::highlight::lang_for_extension(path.extension()?.to_str()?)
+    crate::highlight::lang_for_path(path)
 }
 
 /// `path` relative to `repo_root` with forward slashes, as GitHub names it.

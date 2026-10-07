@@ -201,11 +201,30 @@ impl PathFilter {
             return false;
         }
         if let Some(exc) = &self.exclude
-            && exc.is_match(rel)
+            && rel
+                .ancestors()
+                .any(|p| !p.as_os_str().is_empty() && exc.is_match(p))
         {
             return false;
         }
         true
+    }
+
+    /// True when `path` (under `root`) or a folder above it matches an
+    /// exclude glob. An excluded folder hides everything inside it, as VS
+    /// Code's exclude settings do (#1345).
+    pub fn excludes(&self, root: &Path, path: &Path) -> bool {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        self.exclude.as_ref().is_some_and(|exc| {
+            rel.ancestors()
+                .any(|p| !p.as_os_str().is_empty() && exc.is_match(p))
+        })
+    }
+
+    /// An exclude-only filter from a list of globs (the project's exclude
+    /// settings, #1345).
+    pub fn excluding(globs: &[String]) -> Self {
+        Self::new("", &globs.join(", "))
     }
 }
 
@@ -1108,6 +1127,16 @@ pub struct SearchPanel {
     pub replace_input_rect: Rect,
     pub include_input_rect: Rect,
     pub exclude_input_rect: Rect,
+    /// The "use the project's exclusions" checkbox row under the exclude box
+    /// (#1345); zero-sized when the project excludes nothing.
+    pub project_exclude_rect: Rect,
+    /// The project's exclusion globs (`files_exclude` then
+    /// `search_exclude`, #1345), applied on top of the exclude box while
+    /// `use_exclude_settings` is on.
+    pub project_exclude: Vec<String>,
+    /// VS Code's "Use Exclude Settings and Ignore Files" toggle: off, a
+    /// search covers the folders the project hides.
+    pub use_exclude_settings: bool,
     /// Row offset (from `inner.y`) where the results list starts. Recomputed
     /// each render because expanding Replace / details rows pushes results
     /// down. `results_viewport_height` and `hit_at_y` read this so scrolling
@@ -1178,6 +1207,9 @@ impl SearchPanel {
             replace_input_rect: Rect::default(),
             include_input_rect: Rect::default(),
             exclude_input_rect: Rect::default(),
+            project_exclude_rect: Rect::default(),
+            project_exclude: Vec::new(),
+            use_exclude_settings: true,
             results_start_offset: 5,
             caret_cell: None,
         }
@@ -1435,7 +1467,21 @@ impl SearchPanel {
 
     /// Compile the current include/exclude inputs into a `PathFilter`.
     pub fn path_filter(&self) -> PathFilter {
-        PathFilter::new(&self.include, &self.exclude)
+        PathFilter::new(&self.include, &self.effective_exclude())
+    }
+
+    /// The exclude box plus, while `use_exclude_settings` is on, the
+    /// project's exclusion globs (#1345): what the next scan leaves out.
+    pub fn effective_exclude(&self) -> String {
+        if !self.use_exclude_settings || self.project_exclude.is_empty() {
+            return self.exclude.clone();
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        if !self.exclude.trim().is_empty() {
+            parts.push(&self.exclude);
+        }
+        parts.extend(self.project_exclude.iter().map(String::as_str));
+        parts.join(", ")
     }
 
     /// True when `(col, row)` lands on the expand chevron (toggle Replace row).
@@ -1530,6 +1576,13 @@ impl SearchPanel {
             return Some(SearchField::Exclude);
         }
         None
+    }
+
+    /// True when a click lands on the project-exclusions checkbox row
+    /// (#1345).
+    pub fn project_exclude_toggle_at(&self, col: u16, row: u16) -> bool {
+        let r = self.project_exclude_rect;
+        r.width != 0 && row == r.y && col >= r.x && col < r.x + r.width
     }
 
     /// Replace every match in every distinct file among the current hits with
@@ -2280,6 +2333,7 @@ impl Widget for &mut SearchPanel {
         // single filled field.
         self.include_input_rect = Rect::default();
         self.exclude_input_rect = Rect::default();
+        self.project_exclude_rect = Rect::default();
         if self.details_open {
             let detail_fill_right = inner_right.saturating_sub(1).max(bar_x + 1);
             let caption_style = Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)));
@@ -2360,6 +2414,30 @@ impl Widget for &mut SearchPanel {
                     &mut caret,
                 );
                 next_y += 1;
+                if !self.project_exclude.is_empty() && next_y + 1 < inner.y + inner.height {
+                    // VS Code's "Use Exclude Settings and Ignore Files", as a
+                    // checkbox naming what the project hides (#1345): one
+                    // click searches everything.
+                    let text = format!(
+                        "[{}] project excludes: {}",
+                        if self.use_exclude_settings { "x" } else { " " },
+                        self.project_exclude.join(", ")
+                    );
+                    let width = detail_fill_right.saturating_sub(bar_x) + 1;
+                    let style = if self.use_exclude_settings {
+                        caption_style
+                    } else {
+                        caption_style.add_modifier(Modifier::CROSSED_OUT)
+                    };
+                    buf.set_stringn(bar_x, next_y, &text, width as usize, style);
+                    self.project_exclude_rect = Rect {
+                        x: bar_x,
+                        y: next_y,
+                        width: (text.chars().count() as u16).min(width),
+                        height: 1,
+                    };
+                    next_y += 1;
+                }
             }
         }
         // Commit the focused field's caret now that the whole input cluster is
@@ -3991,6 +4069,20 @@ mod tests {
         assert!(f.allows(root, Path::new("/proj/src/a.ts")));
     }
 
+    /// #1345: excluding a folder excludes what is inside it, as in VS
+    /// Code, so `**/generated` and a bare `target` hide their files.
+    #[test]
+    fn an_excluded_folder_hides_the_files_inside_it() {
+        let f = PathFilter::new("", "**/generated, target");
+        let root = Path::new("/proj");
+        assert!(!f.allows(root, Path::new("/proj/generated/api_pb2.py")));
+        assert!(!f.allows(root, Path::new("/proj/a/generated/deep/x.py")));
+        assert!(!f.allows(root, Path::new("/proj/target/debug/x.rs")));
+        // Negative: a name that only starts like the folder stays.
+        assert!(f.allows(root, Path::new("/proj/generated_stub.py")));
+        assert!(f.allows(root, Path::new("/proj/src/targets/x.rs")));
+    }
+
     #[test]
     fn path_filter_invalid_exclude_hides_nothing() {
         // Negative: a broken exclude entry drops only itself.
@@ -4025,6 +4117,54 @@ mod tests {
             .join("\n");
         assert!(text.contains("invalid glob: *.{ts"), "{text}");
         assert!(text.contains("files to exclude\u{20}"), "{text}");
+    }
+
+    /// #1345: the project's exclusions show under the exclude box as a
+    /// checkbox, clickable, and stay out of the box's own text; with none
+    /// the row is not drawn.
+    #[test]
+    fn project_excludes_are_listed_under_the_exclude_box() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.details_open = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 70,
+            height: 16,
+        };
+        let render = |panel: &mut SearchPanel| {
+            let mut buf = Buffer::empty(area);
+            ratatui::widgets::Widget::render(panel, area, &mut buf);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(!render(&mut panel).contains("project excludes"));
+        assert_eq!(panel.project_exclude_rect, Rect::default());
+        panel.project_exclude = vec![
+            String::from("**/generated"),
+            String::from("**/tests/fixtures"),
+        ];
+        let text = render(&mut panel);
+        assert!(
+            text.contains("[x] project excludes: **/generated, **/tests/fixtures"),
+            "{text}"
+        );
+        let r = panel.project_exclude_rect;
+        assert!(panel.project_exclude_toggle_at(r.x + 1, r.y));
+        assert!(!panel.project_exclude_toggle_at(r.x + 1, r.y + 1));
+        assert_eq!(panel.exclude, "", "the box keeps only what was typed");
+        assert_eq!(panel.effective_exclude(), "**/generated, **/tests/fixtures");
+        panel.use_exclude_settings = false;
+        assert!(render(&mut panel).contains("[ ] project excludes"));
+        assert_eq!(panel.effective_exclude(), "");
     }
 
     #[test]

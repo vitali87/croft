@@ -131,6 +131,20 @@ fn as_scrollback(v: &Value) -> Option<Value> {
     v.as_u64().map(Value::from)
 }
 
+/// VS Code's `files.exclude` / `search.exclude` object (#1345): the globs
+/// set to `true`. A `false` entry switches a glob off, and a `when` clause
+/// hides a file only next to a sibling croft does not look for, so both are
+/// left out: a dropped entry shows a file, a misread one would hide it.
+fn as_enabled_globs(v: &Value) -> Option<Value> {
+    let obj = v.as_object()?;
+    Some(Value::from(
+        obj.iter()
+            .filter(|(_, on)| on.as_bool() == Some(true))
+            .map(|(glob, _)| glob.clone())
+            .collect::<Vec<String>>(),
+    ))
+}
+
 const SETTINGS: &[SettingMap] = &[
     SettingMap {
         vscode: "editor.formatOnSave",
@@ -182,6 +196,16 @@ const SETTINGS: &[SettingMap] = &[
         croft: "copy_on_select",
         convert: as_bool,
     },
+    SettingMap {
+        vscode: "files.exclude",
+        croft: "files_exclude",
+        convert: as_enabled_globs,
+    },
+    SettingMap {
+        vscode: "search.exclude",
+        croft: "search_exclude",
+        convert: as_enabled_globs,
+    },
 ];
 
 /// VS Code command id to croft palette command id.
@@ -203,6 +227,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("explorer.newFolder", "new_folder"),
     ("editor.action.selectAll", "select_all"),
     ("workbench.action.quickOpen", "quick_open"),
+    ("workbench.action.editor.nextChange", "next_change"),
+    ("workbench.action.editor.previousChange", "previous_change"),
     ("workbench.action.gotoSymbol", "go_to_symbol"),
     ("workbench.action.showAllSymbols", "go_to_workspace_symbol"),
     ("workbench.action.closeActiveEditor", "close_editor"),
@@ -1120,6 +1146,52 @@ mod tests {
                 "{key} is not a field of Prefs, so croft would ignore it"
             );
         }
+    }
+
+    /// #1345: `files.exclude` / `search.exclude` carry the globs set to
+    /// `true`; a `false` entry or a `when` clause (sibling-file rule croft
+    /// has no equivalent for) is left out rather than hiding files.
+    #[test]
+    fn exclude_settings_keep_only_the_globs_set_to_true() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "files.exclude": {
+                    "**/generated": true,
+                    "**/keep": false,
+                    "**/*.js": { "when": "$(basename).ts" }
+                },
+                "search.exclude": { "**/tests/fixtures": true }
+            }),
+            &mut report,
+        );
+        assert_eq!(report.settings["files_exclude"], json!(["**/generated"]));
+        assert_eq!(
+            report.settings["search_exclude"],
+            json!(["**/tests/fixtures"])
+        );
+        let parsed: crate::prefs::Prefs = serde_json::from_value(serde_json::Value::Object(
+            report.settings.clone().into_iter().collect(),
+        ))
+        .unwrap();
+        assert_eq!(parsed.files_exclude, vec![String::from("**/generated")]);
+    }
+
+    /// #1345 negative: an exclude setting that is not an object maps to
+    /// nothing and is reported, not read as "exclude everything".
+    #[test]
+    fn a_malformed_exclude_setting_maps_to_nothing() {
+        let mut report = Report::default();
+        convert_settings(&json!({ "files.exclude": "**/generated" }), &mut report);
+        assert!(!report.settings.contains_key("files_exclude"));
+        assert!(
+            report
+                .unmapped_settings
+                .iter()
+                .any(|k| k.starts_with("files.exclude")),
+            "{:?}",
+            report.unmapped_settings
+        );
     }
 
     /// A converted value must ROUND-TRIP through the consumer that reads it.

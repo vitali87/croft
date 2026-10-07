@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::highlight::{
-    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens, lang_for_extension,
+    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens,
 };
 use crate::widgets::scrollbar;
 
@@ -4154,10 +4154,7 @@ impl Editor {
         if e.lines.is_empty() {
             e.lines.push(String::new());
         }
-        e.lang = path
-            .extension()
-            .and_then(|x| x.to_str())
-            .and_then(lang_for_extension);
+        e.lang = crate::highlight::lang_for_path(path);
         // Built off the UI thread, and no tick polls a scrubber view: take
         // the whole pass here rather than leaving it to land later.
         e.recompute_highlights_within(None);
@@ -4193,10 +4190,52 @@ impl Editor {
         self.content_cols();
     }
 
+    /// Go to Next / Previous Change in an editor tab (#1352): the first
+    /// line of the next (or previous) run of change-bar lines, wrapping at
+    /// either end as the diff view's F7 does. `None` when the file has no
+    /// change bars.
+    pub fn git_change_from(&mut self, row: usize, forward: bool) -> Option<usize> {
+        self.refresh_git_marks();
+        let mut lines: Vec<usize> = self.git_marks.keys().copied().collect();
+        lines.sort_unstable();
+        let starts: Vec<usize> = lines
+            .iter()
+            .copied()
+            .filter(|&l| l == 0 || !self.git_marks.contains_key(&(l - 1)))
+            .collect();
+        if forward {
+            starts
+                .iter()
+                .copied()
+                .find(|&s| s > row)
+                .or_else(|| starts.first().copied())
+        } else {
+            // From inside a run, "previous" is the run before this one.
+            let here = starts.iter().copied().rev().find(|&s| s <= row);
+            let from = match here {
+                Some(s) if self.git_marks.contains_key(&row) => s,
+                _ => row,
+            };
+            starts
+                .iter()
+                .copied()
+                .rev()
+                .find(|&s| s < from)
+                .or_else(|| starts.last().copied())
+        }
+    }
+
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
     /// last computed marks (call after a render, or after `refresh_git_marks`).
     pub fn git_mark_at(&self, line: usize) -> Option<GitMark> {
         self.git_marks.get(&line).copied()
+    }
+
+    /// `git_mark_at` after bringing the marks up to date with the buffer,
+    /// for callers outside the render pass that computes them.
+    pub fn current_git_mark_at(&mut self, line: usize) -> Option<GitMark> {
+        self.refresh_git_marks();
+        self.git_mark_at(line)
     }
 
     /// Soft-wrap mode: long lines fold onto multiple visual rows instead of
@@ -4973,10 +5012,7 @@ impl Editor {
         // encoded as is no longer this tab's problem.
         self.encoding_loss = false;
         self.lossy_save_armed = false;
-        self.lang = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(lang_for_extension);
+        self.lang = crate::highlight::lang_for_path(path);
         self.wrap_override = None;
         // Folds are line numbers into the OLD file. A preview tab is reused for
         // the next single-click, so without this the incoming file arrives with
@@ -9504,10 +9540,7 @@ impl Editor {
         self.disk_conflict = false;
         let outcome = self.write_buffer_to_disk();
         if matches!(outcome, Ok(SaveOutcome::Saved)) {
-            let lang = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .and_then(lang_for_extension);
+            let lang = crate::highlight::lang_for_path(path);
             if lang != self.lang {
                 self.set_language(lang);
             }
@@ -12318,8 +12351,12 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         Some(LangKind::Python)
         | Some(LangKind::Yaml)
         | Some(LangKind::Toml)
-        | Some(LangKind::Bash) => Some("#"),
-        Some(LangKind::Lua) => Some("--"),
+        | Some(LangKind::Bash)
+        | Some(LangKind::Ruby)
+        | Some(LangKind::Make)
+        | Some(LangKind::Dockerfile) => Some("#"),
+        Some(LangKind::Java) | Some(LangKind::CSharp) => Some("//"),
+        Some(LangKind::Lua) | Some(LangKind::Sql) => Some("--"),
         _ => None,
     }
 }
@@ -12342,6 +12379,7 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
         Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
         Some(LangKind::Lua) => Some(("--[[", "]]")),
+        Some(LangKind::Java) | Some(LangKind::CSharp) | Some(LangKind::Sql) => Some(("/*", "*/")),
         // Python has no true block comment; VS Code's language config maps
         // Toggle Block Comment onto a triple-quoted string (`""" """`).
         Some(LangKind::Python) => Some(("\"\"\"", "\"\"\"")),
@@ -13235,6 +13273,12 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Lua) => "Lua",
         Some(LangKind::Ql) => "CodeQL",
         Some(LangKind::Dbscheme) => "CodeQL Database Scheme",
+        Some(LangKind::Java) => "Java",
+        Some(LangKind::Ruby) => "Ruby",
+        Some(LangKind::CSharp) => "C#",
+        Some(LangKind::Sql) => "SQL",
+        Some(LangKind::Make) => "Makefile",
+        Some(LangKind::Dockerfile) => "Dockerfile",
     }
 }
 
@@ -13263,6 +13307,12 @@ pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Lua) => "lua",
         Some(LangKind::Ql) => "ql",
         Some(LangKind::Dbscheme) => "dbscheme",
+        Some(LangKind::Java) => "java",
+        Some(LangKind::Ruby) => "ruby",
+        Some(LangKind::CSharp) => "csharp",
+        Some(LangKind::Sql) => "sql",
+        Some(LangKind::Make) => "makefile",
+        Some(LangKind::Dockerfile) => "dockerfile",
     }
 }
 
@@ -13287,6 +13337,12 @@ pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
     LangKind::Lua,
     LangKind::Ql,
     LangKind::Dbscheme,
+    LangKind::Java,
+    LangKind::Ruby,
+    LangKind::CSharp,
+    LangKind::Sql,
+    LangKind::Make,
+    LangKind::Dockerfile,
 ];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
@@ -13325,7 +13381,9 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
         | Some(LangKind::Go)
         | Some(LangKind::Css)
         | Some(LangKind::Lua)
-        | Some(LangKind::Ql) => matches!(last, '(' | '[' | '{'),
+        | Some(LangKind::Ql)
+        | Some(LangKind::Java)
+        | Some(LangKind::CSharp) => matches!(last, '(' | '[' | '{'),
         _ => false,
     }
 }
@@ -13418,6 +13476,8 @@ fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Optio
             | Some(LangKind::Css)
             | Some(LangKind::Lua)
             | Some(LangKind::Ql)
+            | Some(LangKind::Java)
+            | Some(LangKind::CSharp)
     );
     if !bracket_aware {
         return false;
@@ -23888,6 +23948,37 @@ mod tests {
         let out = std::fs::read(tmp.path()).unwrap();
         assert_eq!(&out[..3], &[0xEF, 0xBB, 0xBF], "the UTF-8 BOM must survive");
         assert_eq!(&out[3..6], b"hi!");
+    }
+
+    /// #1226: a Dockerfile, a Makefile, SQL and Java open in their own
+    /// language, so Toggle Line Comment uses that language's marker.
+    #[test]
+    fn common_repository_files_open_in_their_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            ("Dockerfile", "FROM alpine", "Dockerfile", "# FROM alpine"),
+            ("Makefile", "all: build", "Makefile", "# all: build"),
+            ("q.sql", "SELECT 1;", "SQL", "-- SELECT 1;"),
+            ("A.java", "int x = 1;", "Java", "// int x = 1;"),
+            ("app.rb", "puts 1", "Ruby", "# puts 1"),
+            ("P.cs", "int x = 1;", "C#", "// int x = 1;"),
+        ];
+        for (name, text, label, commented) in cases {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            let mut e = Editor::new();
+            e.open(&path).unwrap();
+            assert_eq!(e.language_label(), label, "{name}");
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec![commented], "{name}");
+        }
+        // Negative: an unknown file stays Plain Text with no comment marker.
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "hello").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert_eq!(e.language_label(), "Plain Text");
+        assert!(!e.toggle_line_comment());
     }
 
     #[test]
