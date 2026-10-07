@@ -487,6 +487,8 @@ mod tests {
             character: 0,
             range_start_line: start,
             range_end_line: end,
+            range_start_character: 0,
+            range_end_character: u32::MAX,
         }
     }
 

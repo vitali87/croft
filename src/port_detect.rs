@@ -97,19 +97,32 @@ fn is_clock_time(text: &str, start: usize, digits: &str) -> bool {
 
 /// A general http(s) URL token, for Cmd/Ctrl+click in the terminal (any host,
 /// not just loopback). Stops at whitespace and the brackets/quotes that
-/// commonly surround a URL in log output.
+/// commonly surround a URL in log output. Parentheses are taken, since paths
+/// use them (`/wiki/Rust_(programming_language)`, #1355); [`url_at`] drops
+/// a closing one the URL did not open.
 static CLICK_URL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s'"<>()\[\]]+"#).expect("click url regex"));
+    LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s'"<>\[\]]+"#).expect("click url regex"));
 
 /// The http(s) URL covering character index `col` in `text`, if any — used to
 /// resolve which printed link a Cmd/Ctrl+click landed on. Trailing sentence
-/// punctuation is trimmed so a link at the end of a line doesn't grab the dot.
+/// punctuation is trimmed so a link at the end of a line doesn't grab the dot,
+/// and so is a closing parenthesis the URL has no opening one for, so
+/// `(see https://x.dev/a)` keeps its link and loses the prose's bracket.
 pub fn url_at(text: &str, col: usize) -> Option<String> {
     for m in CLICK_URL_RE.find_iter(text) {
         let start = text[..m.start()].chars().count();
         let end = start + m.as_str().chars().count();
         if col >= start && col < end {
-            let url = m.as_str().trim_end_matches(['.', ',', ';', ':', '!', '?']);
+            let mut url = m.as_str();
+            loop {
+                url = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+                let unbalanced =
+                    url.ends_with(')') && url.matches(')').count() > url.matches('(').count();
+                if !unbalanced {
+                    break;
+                }
+                url = &url[..url.len() - 1];
+            }
             return Some(url.to_string());
         }
     }
@@ -697,6 +710,38 @@ mod tests {
             url_at(line, 10).as_deref(),
             Some("https://example.com/docs")
         );
+    }
+
+    /// #1355: Wikipedia, MSDN and many docs sites put `(...)` in paths;
+    /// the click opened `…/wiki/Rust_`, a different page.
+    #[test]
+    fn url_at_keeps_parentheses_that_belong_to_the_url() {
+        let line = "see https://en.wikipedia.org/wiki/Rust_(programming_language) for history";
+        assert_eq!(
+            url_at(line, 10).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Rust_(programming_language)")
+        );
+        let line = "docs: https://learn.microsoft.com/en-us/previous-versions/ms123(v=vs.85).";
+        assert_eq!(
+            url_at(line, 10).as_deref(),
+            Some("https://learn.microsoft.com/en-us/previous-versions/ms123(v=vs.85)")
+        );
+    }
+
+    #[test]
+    fn url_at_still_leaves_out_the_parenthesis_around_a_url() {
+        let line = "(see https://x.dev/a)";
+        assert_eq!(url_at(line, 8).as_deref(), Some("https://x.dev/a"));
+        let line = "(docs at https://x.dev/a).";
+        assert_eq!(url_at(line, 12).as_deref(), Some("https://x.dev/a"));
+        let line = "(https://en.wikipedia.org/wiki/Rust_(programming_language))";
+        assert_eq!(
+            url_at(line, 5).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Rust_(programming_language)"),
+            "only the unmatched closing parenthesis is dropped"
+        );
+        let line = "a [link](https://x.dev/b) in markdown";
+        assert_eq!(url_at(line, 12).as_deref(), Some("https://x.dev/b"));
     }
 
     #[test]
