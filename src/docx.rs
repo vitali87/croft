@@ -97,7 +97,7 @@ pub fn extension_is_doc(ext: &str) -> bool {
 /// Escape markdown metacharacters in document text (#200 review): the
 /// walker SYNTHESISES markdown, so literal #, -, *, _, |, etc. in the
 /// document must not become structure.
-fn md_escape(text: &str) -> String {
+pub(crate) fn md_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if matches!(
@@ -213,6 +213,64 @@ fn rel_targets(rels: &str) -> std::collections::HashMap<String, String> {
     out
 }
 
+/// Most copies a `number-*-repeated` count may make. LibreOffice pads a row
+/// to the sheet's full width (and a table to its full height) this way, so
+/// the count can be a million; the trailing blanks are trimmed anyway.
+const MAX_REPEAT: usize = 256;
+
+/// The count in attribute `name` (a span or repeat), at least 1.
+fn attr_count(
+    e: &quick_xml::events::BytesStart,
+    dec: quick_xml::encoding::Decoder,
+    name: &[u8],
+) -> usize {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.local_name().as_ref() == name)
+        .and_then(|a| a.decode_and_unescape_value(dec).ok()?.parse().ok())
+        .unwrap_or(1)
+        .clamp(1, MAX_REPEAT)
+}
+
+/// Repeat the last item until it appears `n` times in all.
+fn repeat_last<T: Clone>(items: &mut Vec<T>, n: usize) {
+    if let Some(last) = items.last().cloned() {
+        items.extend(std::iter::repeat_n(last, n.saturating_sub(1)));
+    }
+}
+
+/// Write `rows` as a pipe table, header first. Trailing columns and rows
+/// with nothing in them are dropped, so padding never widens the table.
+fn push_table(md: &mut String, mut rows: Vec<Vec<String>>) {
+    let cols = rows
+        .iter()
+        .filter_map(|r| r.iter().rposition(|c| !c.is_empty()))
+        .max()
+        .map_or(0, |last| last + 1);
+    while rows.last().is_some_and(|r| r.iter().all(String::is_empty)) {
+        rows.pop();
+    }
+    if cols == 0 || rows.is_empty() {
+        return;
+    }
+    for (i, row) in rows.iter().enumerate() {
+        md.push('|');
+        for c in 0..cols {
+            md.push_str(row.get(c).map(String::as_str).unwrap_or(""));
+            md.push('|');
+        }
+        md.push('\n');
+        if i == 0 {
+            md.push('|');
+            for _ in 0..cols {
+                md.push_str("---|");
+            }
+            md.push('\n');
+        }
+    }
+    md.push('\n');
+}
+
 fn docx_to_md(
     xml: &str,
     rels: &str,
@@ -230,6 +288,8 @@ fn docx_to_md(
     let mut italic = false;
     let mut in_rpr = false;
     let mut table: Option<Vec<Vec<String>>> = None;
+    // How many grid columns the open cell covers (`<w:gridSpan>`, #1225).
+    let mut span = 1usize;
     while let Ok(ev) = r.read_event() {
         match &ev {
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
@@ -238,6 +298,7 @@ fn docx_to_md(
                     heading = 0;
                     listed = false;
                 }
+                b"gridSpan" => span = attr_count(e, dec, b"val"),
                 b"rPr" => in_rpr = true,
                 b"b" if in_rpr => bold = true,
                 b"i" if in_rpr => italic = true,
@@ -259,6 +320,7 @@ fn docx_to_md(
                     }
                 }
                 b"tc" => {
+                    span = 1;
                     if let Some(row) = table.as_mut().and_then(|t| t.last_mut()) {
                         row.push(String::new());
                     }
@@ -307,27 +369,17 @@ fn docx_to_md(
                     }
                     para.clear();
                 }
+                // A merged cell holds every grid column it covers, so the
+                // cells after it stay under their own headers.
+                b"tc" => {
+                    if let Some(row) = table.as_mut().and_then(|t| t.last_mut()) {
+                        row.extend(std::iter::repeat_n(String::new(), span - 1));
+                    }
+                    span = 1;
+                }
                 b"tbl" => {
-                    if let Some(rows) = table.take()
-                        && !rows.is_empty()
-                    {
-                        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-                        for (i, row) in rows.iter().enumerate() {
-                            md.push('|');
-                            for c in 0..cols {
-                                md.push_str(row.get(c).map(String::as_str).unwrap_or(""));
-                                md.push('|');
-                            }
-                            md.push('\n');
-                            if i == 0 {
-                                md.push('|');
-                                for _ in 0..cols {
-                                    md.push_str("---|");
-                                }
-                                md.push('\n');
-                            }
-                        }
-                        md.push('\n');
+                    if let Some(rows) = table.take() {
+                        push_table(&mut md, rows);
                     }
                 }
                 _ => {}
@@ -361,9 +413,36 @@ fn odt_to_md(xml: &str, z: &mut zip::ZipArchive<std::fs::File>, scratch: &Path) 
     let mut para = String::new();
     let mut heading = 0usize;
     let mut list_depth = 0usize;
+    let mut table: Option<Vec<Vec<String>>> = None;
+    // The open row's and cell's `number-*-repeated` counts.
+    let mut row_repeat = 1usize;
+    let mut cell_repeat = 1usize;
     while let Ok(ev) = r.read_event() {
+        let empty = matches!(&ev, Event::Empty(_));
         match &ev {
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
+                b"table" if !empty => table = Some(Vec::new()),
+                b"table-row" => {
+                    if let Some(t) = table.as_mut() {
+                        t.push(Vec::new());
+                        row_repeat = attr_count(e, dec, b"number-rows-repeated");
+                        if empty {
+                            repeat_last(t, row_repeat);
+                        }
+                    }
+                }
+                // A spanned cell is followed by a covered cell for each
+                // column it covers, so a covered cell is an empty one and
+                // the span itself needs no padding.
+                b"table-cell" | b"covered-table-cell" => {
+                    if let Some(row) = table.as_mut().and_then(|t| t.last_mut()) {
+                        row.push(String::new());
+                        cell_repeat = attr_count(e, dec, b"number-columns-repeated");
+                        if empty {
+                            repeat_last(row, cell_repeat);
+                        }
+                    }
+                }
                 b"h" => {
                     heading = 1;
                     for a in e.attributes().flatten() {
@@ -390,6 +469,45 @@ fn odt_to_md(xml: &str, z: &mut zip::ZipArchive<std::fs::File>, scratch: &Path) 
                 _ => {}
             },
             Event::End(e) => match e.local_name().as_ref() {
+                b"table" => {
+                    if let Some(rows) = table.take() {
+                        push_table(&mut md, rows);
+                    }
+                }
+                b"table-row" => {
+                    if let Some(t) = table.as_mut() {
+                        repeat_last(t, row_repeat);
+                    }
+                    row_repeat = 1;
+                }
+                b"table-cell" | b"covered-table-cell" => {
+                    if let Some(row) = table.as_mut().and_then(|t| t.last_mut()) {
+                        repeat_last(row, cell_repeat);
+                    }
+                    cell_repeat = 1;
+                }
+                // Text inside a table cell joins that cell (#1225).
+                b"h" | b"p"
+                    if table
+                        .as_ref()
+                        .and_then(|t| t.last())
+                        .is_some_and(|r| !r.is_empty()) =>
+                {
+                    let text = para.trim();
+                    if let Some(cell) = table
+                        .as_mut()
+                        .and_then(|t| t.last_mut())
+                        .and_then(|r| r.last_mut())
+                        && !text.is_empty()
+                    {
+                        if !cell.is_empty() {
+                            cell.push(' ');
+                        }
+                        cell.push_str(text);
+                    }
+                    heading = 0;
+                    para.clear();
+                }
                 b"h" => {
                     if !para.trim().is_empty() {
                         md.push_str(&"#".repeat(heading.clamp(1, 6)));
@@ -582,6 +700,124 @@ mod tests {
         assert!(md.contains("## Sub Head"), "{md}");
         assert!(md.contains("body words"), "{md}");
         assert!(md.contains("- li"), "{md}");
+    }
+
+    fn odt_fixture(p: &Path, body: &str) {
+        let f = std::fs::File::create(p).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let o = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.start_file("content.xml", o).unwrap();
+        let xml = format!(
+            r#"<?xml version="1.0"?>
+<office:document-content xmlns:office="o" xmlns:text="t" xmlns:table="b">
+<office:body><office:text>{body}</office:text></office:body></office:document-content>"#
+        );
+        z.write_all(xml.as_bytes()).unwrap();
+        z.finish().unwrap();
+    }
+
+    fn odt_row(cells: &[&str]) -> String {
+        let cells: String = cells
+            .iter()
+            .map(|c| format!("<table:table-cell><text:p>{c}</text:p></table:table-cell>"))
+            .collect();
+        format!("<table:table-row>{cells}</table:table-row>")
+    }
+
+    /// #1225: an .odt table is a table, not one paragraph per cell, and the
+    /// text around it stays paragraphs.
+    #[test]
+    fn odt_tables_render_as_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("budget.odt");
+        let rows = [
+            odt_row(&["Region", "Q1", "Q2"]),
+            odt_row(&["North", "10", "12"]),
+            odt_row(&["South", "8", "9"]),
+        ]
+        .concat();
+        odt_fixture(
+            &p,
+            &format!(
+                "<text:p>before</text:p><table:table>{rows}</table:table><text:p>after</text:p>"
+            ),
+        );
+        let md = to_markdown(&p, tmp.path()).expect("recognised");
+        assert_eq!(
+            md,
+            "before\n\n|Region|Q1|Q2|\n|---|---|---|\n|North|10|12|\n|South|8|9|\n\nafter\n\n"
+        );
+    }
+
+    /// #1225: a spanned .odt cell is followed by covered cells, which hold
+    /// their columns, so the next cell stays under its own header.
+    #[test]
+    fn odt_spanned_cells_keep_the_row_under_its_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("t.odt");
+        let total = "<table:table-row>\
+<table:table-cell table:number-columns-spanned=\"2\"><text:p>Total Q2</text:p></table:table-cell>\
+<table:covered-table-cell/>\
+<table:table-cell><text:p>21</text:p></table:table-cell></table:table-row>";
+        let rows = [odt_row(&["Region", "Q1", "Q2"]), total.to_string()].concat();
+        odt_fixture(&p, &format!("<table:table>{rows}</table:table>"));
+        let md = to_markdown(&p, tmp.path()).expect("recognised");
+        assert!(md.contains("|Total Q2||21|"), "{md}");
+    }
+
+    /// #1225: LibreOffice writes runs of equal cells once with a repeat
+    /// count. A repeated cell fills its columns; the trailing run of empty
+    /// cells a whole-width row ends in does not widen the table.
+    #[test]
+    fn odt_repeated_cells_fill_their_columns_without_widening_the_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("t.odt");
+        let row = "<table:table-row>\
+<table:table-cell table:number-columns-repeated=\"2\"><text:p>x</text:p></table:table-cell>\
+<table:table-cell><text:p>y</text:p></table:table-cell>\
+<table:table-cell table:number-columns-repeated=\"1021\"/></table:table-row>\
+<table:table-row table:number-rows-repeated=\"1048572\">\
+<table:table-cell table:number-columns-repeated=\"1024\"/></table:table-row>";
+        odt_fixture(&p, &format!("<table:table>{row}</table:table>"));
+        let md = to_markdown(&p, tmp.path()).expect("recognised");
+        assert_eq!(md, "|x|x|y|\n|---|---|---|\n\n");
+    }
+
+    /// #1225: a .docx cell merged across two columns (`gridSpan`) holds both,
+    /// so the cell after it stays under its own header.
+    #[test]
+    fn a_merged_docx_cell_keeps_the_rest_of_its_row_under_its_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("budget.docx");
+        let f = std::fs::File::create(&p).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let o = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.start_file("word/document.xml", o).unwrap();
+        let cell = |v: &str| format!("<w:tc><w:p><w:r><w:t>{v}</w:t></w:r></w:p></w:tc>");
+        let row = |cells: &[&str]| {
+            format!(
+                "<w:tr>{}</w:tr>",
+                cells.iter().map(|c| cell(c)).collect::<String>()
+            )
+        };
+        let total = "<w:tr><w:tc><w:tcPr><w:gridSpan w:val=\"2\"/></w:tcPr>\
+<w:p><w:r><w:t>Total Q2</w:t></w:r></w:p></w:tc>\
+<w:tc><w:p><w:r><w:t>21</w:t></w:r></w:p></w:tc></w:tr>";
+        let xml = format!(
+            r#"<w:document xmlns:w="x"><w:body><w:tbl>{}{}{}</w:tbl></w:body></w:document>"#,
+            row(&["Region", "Q1", "Q2"]),
+            row(&["North", "10", "12"]),
+            total
+        );
+        z.write_all(xml.as_bytes()).unwrap();
+        z.finish().unwrap();
+        let md = to_markdown(&p, tmp.path()).unwrap();
+        assert!(md.contains("|Region|Q1|Q2|"), "{md}");
+        assert!(md.contains("|Total Q2||21|"), "21 stays under Q2: {md}");
+        // Negative: an unmerged row is untouched.
+        assert!(md.contains("|North|10|12|"), "{md}");
     }
 
     #[test]
