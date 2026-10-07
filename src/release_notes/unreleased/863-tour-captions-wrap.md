@@ -1,0 +1,2 @@
+fix: `croft demo` captions wrap so the Enter/Esc hint always shows, stay clear of the theme picker, and name Ctrl instead of Cmd on Linux (#863).
+fix: `croft demo` clears the sample project an earlier tour left behind when croft was closed mid-tour (a marked folder whose croft has exited), and Esc in the palette or picker a tour step opened leaves the tour, as its keys row says, instead of only closing the picker (#863).

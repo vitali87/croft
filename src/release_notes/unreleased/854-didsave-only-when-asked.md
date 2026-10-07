@@ -1,0 +1,1 @@
+fix: croft sends save notifications only to language servers that ask for them, so ruff no longer logs a "no handler for didSave" warning on every save, and servers that request the saved text get it (#854).
