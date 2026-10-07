@@ -53,6 +53,10 @@ pub struct VscodeCommand {
     pub cwd: Option<String>,
     /// `options.env`, in file order.
     pub env: Vec<(String, String)>,
+    /// Why croft can't run this entry (a provider `type` it doesn't know,
+    /// or a `dependsOn`-only compound task). The task is still listed, so
+    /// its build-default slot is never handed to another task (#1185).
+    pub unrunnable: Option<String>,
 }
 
 impl Task {
@@ -67,6 +71,9 @@ impl Task {
         let Some(v) = &self.vscode else {
             return Ok(self.command.clone());
         };
+        if let Some(why) = &v.unrunnable {
+            return Err(why.clone());
+        }
         // The command's literal text keeps its shell meaning (`&&`, globs);
         // an argument's is quoted only when it must stay one word.
         let mut line = expand_task_text(&v.command, ctx, false)?;
@@ -229,16 +236,19 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
     tasks
         .iter()
         .filter_map(|t| {
-            let command = t.get("command")?.as_str()?;
-            let args: Vec<String> = t
-                .get("args")
-                .and_then(|a| a.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|a| a.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let entry = provider_command(root, t)?;
+            let command = entry.command.as_str();
+            let mut args: Vec<String> = entry.args;
+            args.extend(
+                t.get("args")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|a| a.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+            );
             let options = t.get("options");
             let vscode = VscodeCommand {
                 command: command.to_string(),
@@ -246,7 +256,9 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
                 cwd: options
                     .and_then(|o| o.get("cwd"))
                     .and_then(|c| c.as_str())
-                    .map(str::to_string),
+                    .map(str::to_string)
+                    .or(entry.cwd),
+                unrunnable: entry.unrunnable,
                 env: options
                     .and_then(|o| o.get("env"))
                     .and_then(|e| e.as_object())
@@ -273,8 +285,9 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
             let label = t
                 .get("label")
                 .and_then(|l| l.as_str())
-                .unwrap_or(&line)
-                .to_string();
+                .map(str::to_string)
+                .or(entry.label)
+                .unwrap_or(line.clone());
             let is_build = match t.get("group") {
                 Some(serde_json::Value::String(s)) => s == "build",
                 Some(g) => g.get("kind").and_then(|k| k.as_str()) == Some("build"),
@@ -296,6 +309,87 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
             })
         })
         .collect()
+}
+
+/// What a tasks.json entry runs, before its own `args` and `options`.
+struct ProviderCommand {
+    command: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    /// VS Code's label for a provider task with none of its own.
+    label: Option<String>,
+    unrunnable: Option<String>,
+}
+
+/// The command a tasks.json entry runs. One with a `command` runs it. One
+/// without is a provider task (`"type": "npm", "script": "compile"` is what
+/// VS Code's Configure Default Build Task writes for an npm script) or a
+/// `dependsOn`-only compound task: an npm script runs with the runner the
+/// repo's lockfile picks, from its `path` package; anything else is kept
+/// as an entry croft refuses to run, so a default build is never swapped
+/// for another task (#1185). `None` only for an entry that is not a task.
+fn provider_command(root: &Path, t: &serde_json::Value) -> Option<ProviderCommand> {
+    if let Some(command) = t.get("command").and_then(|c| c.as_str()) {
+        return Some(ProviderCommand {
+            command: command.to_string(),
+            args: Vec::new(),
+            cwd: None,
+            label: None,
+            unrunnable: None,
+        });
+    }
+    let kind = t.get("type").and_then(|k| k.as_str());
+    let path = t
+        .get("path")
+        .and_then(|p| p.as_str())
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty());
+    if kind == Some("npm")
+        && let Some(script) = t.get("script").and_then(|s| s.as_str())
+    {
+        let runner = js_runner(root);
+        return Some(ProviderCommand {
+            command: runner.to_string(),
+            args: vec![script.to_string()],
+            cwd: path.map(|p| format!("${{workspaceFolder}}/{p}")),
+            label: Some(match path {
+                Some(p) => format!("npm: {script} - {p}"),
+                None => format!("npm: {script}"),
+            }),
+            unrunnable: None,
+        });
+    }
+    let (label, why) = match kind {
+        Some(k) if k != "shell" && k != "process" => (
+            format!("{k} task"),
+            format!("it uses type \"{k}\", which croft cannot run"),
+        ),
+        _ if t.get("dependsOn").is_some() => (
+            String::from("compound task"),
+            String::from("it only runs its dependsOn tasks, which croft cannot chain yet"),
+        ),
+        _ => return None,
+    };
+    Some(ProviderCommand {
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        label: Some(label),
+        unrunnable: Some(why),
+    })
+}
+
+/// The package script runner a JS repo uses, by its lockfile.
+fn js_runner(root: &Path) -> &'static str {
+    if root.join("bun.lockb").exists() || root.join("bun.lock").exists() {
+        "bun run"
+    } else if root.join("pnpm-lock.yaml").exists() {
+        "pnpm run"
+    } else if root.join("yarn.lock").exists() {
+        "yarn"
+    } else {
+        "npm run"
+    }
 }
 
 fn makefile_tasks(root: &Path) -> Vec<Task> {
@@ -387,15 +481,7 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
         return Vec::new();
     };
     // Pick the runner the repo actually uses, by its lockfile.
-    let runner = if root.join("bun.lockb").exists() || root.join("bun.lock").exists() {
-        "bun run"
-    } else if root.join("pnpm-lock.yaml").exists() {
-        "pnpm run"
-    } else if root.join("yarn.lock").exists() {
-        "yarn"
-    } else {
-        "npm run"
-    };
+    let runner = js_runner(root);
     scripts
         .keys()
         .map(|name| Task {
@@ -954,6 +1040,109 @@ mod tests {
             "build B",
             "the explicit default build outranks the first build-group task"
         );
+    }
+
+    /// A workspace with `package.json` scripts and the given tasks.json.
+    fn npm_workspace(tasks_json: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{ "name": "demo", "scripts": { "build": "echo FULL-PROD-BUILD", "compile": "echo quick-compile" } }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(tmp.path().join(".vscode/tasks.json"), tasks_json).unwrap();
+        tmp
+    }
+
+    fn ctx_at(root: &Path) -> crate::dap::configs::SubstCtx {
+        crate::dap::configs::SubstCtx {
+            workspace_folder: root.to_path_buf(),
+            file: None,
+        }
+    }
+
+    /// VS Code's Configure Default Build Task writes `"type": "npm"` with no
+    /// `command`; that entry is the default build, not package.json's
+    /// `build` script (#1185).
+    #[test]
+    fn an_npm_provider_task_is_the_default_build() {
+        let tmp = npm_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                { "type": "npm", "script": "compile", "group": { "kind": "build", "isDefault": true },
+                  "problemMatcher": [], "label": "npm: compile" } ] }"#,
+        );
+        let tasks = discover_tasks(tmp.path());
+        let build = default_build_task(&tasks).unwrap();
+        assert_eq!(build.label, "npm: compile");
+        assert_eq!(
+            build.command_line(&ctx_at(tmp.path())).unwrap(),
+            "npm run compile"
+        );
+    }
+
+    /// An npm task runs with the lockfile's runner, from its `path` package,
+    /// and is labelled the way VS Code labels it when it has no label.
+    #[test]
+    fn an_npm_provider_task_uses_the_lockfile_runner_and_its_path() {
+        let tmp = npm_workspace(
+            r#"{ "tasks": [ { "type": "npm", "script": "compile", "path": "packages/app/" } ] }"#,
+        );
+        std::fs::write(tmp.path().join("pnpm-lock.yaml"), "").unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let t = tasks.iter().find(|t| t.source == "tasks.json").unwrap();
+        assert_eq!(t.label, "npm: compile - packages/app");
+        let line = t.command_line(&ctx_at(tmp.path())).unwrap();
+        assert!(
+            line.starts_with("(cd ") && line.contains("/packages/app"),
+            "{line}"
+        );
+        assert!(line.ends_with(" && pnpm run compile)"), "{line}");
+    }
+
+    /// A provider croft can't run, or a `dependsOn`-only compound task, is
+    /// listed and refused with the reason; as the default build it is the
+    /// one Run Build Task names, never a stand-in that runs something else.
+    #[test]
+    fn an_unsupported_provider_or_compound_task_is_listed_and_refused() {
+        let tmp = npm_workspace(
+            r#"{ "tasks": [
+                { "type": "typescript", "tsconfig": "tsconfig.json", "group": { "kind": "build", "isDefault": true } },
+                { "label": "Build all", "dependsOn": ["lint", "compile"] } ] }"#,
+        );
+        let tasks = discover_tasks(tmp.path());
+        let build = default_build_task(&tasks).unwrap();
+        assert_eq!(build.label, "typescript task");
+        let err = build.command_line(&ctx_at(tmp.path())).unwrap_err();
+        assert!(err.contains("type \"typescript\""), "{err}");
+        let all = tasks.iter().find(|t| t.label == "Build all").unwrap();
+        assert!(
+            all.command_line(&ctx_at(tmp.path()))
+                .unwrap_err()
+                .contains("dependsOn")
+        );
+    }
+
+    /// Negative: an entry that is neither a command nor a task croft can
+    /// name stays out, and a plain `command` entry runs exactly as before.
+    #[test]
+    fn a_command_entry_is_unchanged_and_a_bare_entry_is_still_skipped() {
+        let tmp = npm_workspace(
+            r#"{ "tasks": [ { "label": "nothing" }, { "label": "shell-only", "type": "shell" },
+                { "label": "lint", "type": "shell", "command": "eslint", "args": ["src"] } ] }"#,
+        );
+        let tasks = discover_tasks(tmp.path());
+        assert!(
+            !tasks
+                .iter()
+                .any(|t| t.label == "nothing" || t.label == "shell-only")
+        );
+        let lint = tasks.iter().find(|t| t.label == "lint").unwrap();
+        assert_eq!(
+            lint.command_line(&ctx_at(tmp.path())).unwrap(),
+            "eslint src"
+        );
+        assert_eq!(default_build_task(&tasks).unwrap().label, "npm run build");
     }
 
     #[test]

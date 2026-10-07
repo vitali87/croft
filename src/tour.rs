@@ -5,6 +5,11 @@
 //! action and the caption shown while it is on screen. Contributors extend
 //! it, and a platform can ship its own (a Termux tour driven by the
 //! on-screen keyboard, say) without touching this code.
+//!
+//! A caption writes the command modifier as `{mod}` (`{mod}+P`), and the
+//! tour spells it as this platform's: `Cmd` on macOS, `Ctrl` elsewhere
+//! (#863). A literal `Cmd+P` told a Linux user to press a key that does
+//! nothing there.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -45,6 +50,20 @@ pub enum TourAction {
 pub struct TourStep {
     pub action: TourAction,
     pub caption: String,
+}
+
+impl TourStep {
+    /// The caption as shown: `{mod}` spelled as this platform's command
+    /// modifier.
+    pub fn caption_text(&self) -> String {
+        expand_caption(&self.caption, crate::keymap::mod_key_name())
+    }
+}
+
+/// `caption` with every `{mod}` spelled `modifier`. Takes the name rather
+/// than asking for it so a test can expand for a platform it is not on.
+pub fn expand_caption(caption: &str, modifier: &str) -> String {
+    caption.replace("{mod}", modifier)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -162,6 +181,43 @@ pub fn create_scratch(parent: &Path) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Delete the scratch folders under `parent` that a tour ended by killing
+/// croft left behind (#863): closing the terminal mid-tour never reaches
+/// [`remove_scratch`], and the next `croft demo` made a folder of its own
+/// beside the old one. A folder goes only when its name is
+/// `croft-demo-<pid>-<stamp>`, `<pid>` is neither this process nor one
+/// `is_alive` says still runs, it is a real directory (not a link to one),
+/// and it carries [`SCRATCH_MARKER`]; anything else under `parent` stays.
+/// Returns how many were removed.
+pub fn sweep_dead_scratch(parent: &Path, is_alive: impl Fn(u32) -> bool) -> usize {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    let me = std::process::id();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(scratch_pid) else {
+            continue;
+        };
+        if pid == me || is_alive(pid) || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if remove_scratch(&entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// The `<pid>` in a scratch folder's `croft-demo-<pid>-<stamp>` name.
+fn scratch_pid(name: &str) -> Option<u32> {
+    let (pid, stamp) = name.strip_prefix("croft-demo-")?.split_once('-')?;
+    if stamp.is_empty() || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 /// Delete a scratch folder, but only one that carries [`SCRATCH_MARKER`].
 pub fn remove_scratch(dir: &Path) -> Result<(), String> {
     if !dir.join(SCRATCH_MARKER).is_file() {
@@ -227,6 +283,16 @@ mod tests {
         }
         assert_eq!(actions.last(), Some(&&TourAction::Done));
         assert!(tour.steps.iter().all(|s| !s.caption.is_empty()));
+        // #863: a chord is written with the placeholder, never one
+        // platform's own modifier, and nothing unexpanded reaches the screen.
+        for s in &tour.steps {
+            assert!(
+                !s.caption.contains("Cmd"),
+                "spell the modifier {{mod}}: {}",
+                s.caption
+            );
+            assert!(!s.caption_text().contains('{'), "{}", s.caption_text());
+        }
         // Every file the tour opens exists in the sample project.
         let files: Vec<&str> = sample_files().iter().map(|(p, _)| *p).collect();
         for s in &tour.steps {
@@ -234,6 +300,107 @@ mod tests {
                 assert!(files.contains(&p.as_str()), "{p} is in the sample");
             }
         }
+    }
+
+    #[test]
+    fn captions_name_the_platform_s_command_modifier() {
+        // #863: `{mod}` is Cmd on macOS and Ctrl elsewhere, as `mod` is in
+        // keybindings.json.
+        assert_eq!(expand_caption("{mod}+P finds", "Cmd"), "Cmd+P finds");
+        assert_eq!(
+            expand_caption("{mod}+Shift+P, or {mod}+click", "Ctrl"),
+            "Ctrl+Shift+P, or Ctrl+click"
+        );
+        let want = if cfg!(target_os = "macos") {
+            "Cmd+P"
+        } else {
+            "Ctrl+P"
+        };
+        let step = TourStep {
+            action: TourAction::QuickOpen,
+            caption: String::from("{mod}+P"),
+        };
+        assert_eq!(step.caption_text(), want);
+        let tour = Tour::parse(TOUR_JSON).unwrap();
+        assert!(
+            tour.steps
+                .iter()
+                .any(|s| s.caption_text().contains(&format!("{want} "))),
+            "the built-in tour teaches {want}"
+        );
+    }
+
+    /// #863 negative: only the exact `{mod}` placeholder is spelled out; a
+    /// caption that names a fixed key (`Ctrl+J` is Ctrl on every platform)
+    /// or braces anything else is shown as written.
+    #[test]
+    fn a_caption_without_the_placeholder_is_left_as_written() {
+        for caption in [
+            "Ctrl+J opens a real terminal inside croft.",
+            "{modifier} and {MOD} are not the placeholder",
+            "",
+        ] {
+            assert_eq!(expand_caption(caption, "Cmd"), caption);
+        }
+        assert_eq!(expand_caption("{mod}{mod}", "Ctrl"), "CtrlCtrl");
+    }
+
+    /// A scratch-shaped folder named `name` under `parent`, with the marker
+    /// when `marked`.
+    fn scratch_like(parent: &Path, name: &str, marked: bool) -> PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        if marked {
+            std::fs::write(dir.join(SCRATCH_MARKER), "croft demo scratch\n").unwrap();
+        }
+        dir
+    }
+
+    /// #863: a marked scratch folder whose croft has exited is swept.
+    #[test]
+    fn a_dead_tour_s_marked_scratch_folder_is_swept() {
+        let parent = tempfile::tempdir().unwrap();
+        let dead = scratch_like(parent.path(), "croft-demo-585-1790000000000", true);
+        assert_eq!(sweep_dead_scratch(parent.path(), |_| false), 1);
+        assert!(!dead.exists());
+    }
+
+    /// #863 negative: the sweep leaves this process's folder, a live pid's
+    /// folder, an unmarked folder of a dead pid, a link to a marked folder,
+    /// and any name not of the scratch shape.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_keeps_live_unmarked_and_foreign_folders() {
+        let parent = tempfile::tempdir().unwrap();
+        let p = parent.path();
+        let me = std::process::id();
+        let mine = scratch_like(p, &format!("croft-demo-{me}-1"), true);
+        let live = scratch_like(p, "croft-demo-4242-1", true);
+        let unmarked = scratch_like(p, "croft-demo-585-2", false);
+        let foreign = [
+            scratch_like(p, "croft-demo-585", true),
+            scratch_like(p, "croft-demo-585-x1", true),
+            scratch_like(p, "croft-demo-pid-1", true),
+            scratch_like(p, "my-project", true),
+        ];
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = scratch_like(elsewhere.path(), "real", true);
+        std::os::unix::fs::symlink(&target, p.join("croft-demo-586-1")).unwrap();
+        // Everyone but 4242 reads as dead, this process included.
+        let removed = sweep_dead_scratch(p, |pid| pid == 4242);
+        assert_eq!(removed, 0);
+        for dir in [&mine, &live, &unmarked] {
+            assert!(dir.is_dir(), "{} kept", dir.display());
+        }
+        for dir in &foreign {
+            assert!(dir.is_dir(), "{} kept", dir.display());
+        }
+        assert!(
+            target.join(SCRATCH_MARKER).is_file(),
+            "a link's target kept"
+        );
+        assert_eq!(sweep_dead_scratch(&p.join("missing"), |_| false), 0);
     }
 
     #[test]
