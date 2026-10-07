@@ -73787,7 +73787,9 @@ fn secondary_outline_app(tmp: &tempfile::TempDir, n: u32) -> (App, std::path::Pa
             line: 2 * i,
             character: 4,
             range_start_line: 2 * i,
+            range_start_character: 0,
             range_end_line: 2 * i + 1,
+            range_end_character: 12,
         })
         .collect();
     app.outline.set_symbols(f.clone(), syms);
