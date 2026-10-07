@@ -1,0 +1,1 @@
+fix: Opening a tiny .ods whose repeated cells expand to millions, or an .xlsx with values at opposite corners, no longer exhausts memory and crashes croft; a sheet over 10 million cells is refused with its size.
