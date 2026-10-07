@@ -73642,6 +73642,7 @@ fn committed_readme(root: &std::path::Path) -> String {
 fn commit_refuses_while_merge_conflicts_are_unresolved() {
     let (mut app, tmp) = app_in_a_conflicted_merge();
     app.commit_source_control();
+    wait_for_git_net(&mut app);
     assert!(
         !committed_readme(tmp.path()).contains("<<<<<<<"),
         "the conflict markers were committed"
